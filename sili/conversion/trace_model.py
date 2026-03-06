@@ -338,79 +338,47 @@ def _layer_comment(d: LayerDesc, indent: int = 4) -> str:
     return line
 
 
-def _block_forward_fn(block_idx: int, descs):
+def _detect_block_config(groups):
     """
-    Return source lines for a top-level block_N(x, w, mask) function.
+    Examine the first transformer block's weight dict to detect architecture:
+      - n_heads, n_kv_heads, head_dim  (from q/k projection shapes)
+      - has_swiglu                     (gate_proj present)
+      - norm suffix names              (pre/post attention)
 
-    Blocks are plain functions (not methods) so they are:
-      - easy to unit-test with synthetic CSR tensors
-      - JIT/trace friendly
-      - grad-engine agnostic (no self references)
+    Returns a dict of config values used when emitting transformer_block().
     """
-    attn_sfx  = ("q_proj", "k_proj", "v_proj", "query", "key", "value",
-                 "c_attn", "qkv", "in_proj", "o_proj", "out_proj")
-    mlp_sfx   = ("gate_proj", "up_proj", "down_proj", "fc1", "fc2", "c_fc", "c_proj")
-    norm_sfx  = ("layernorm", "layer_norm", "rmsnorm",
-                 "input_layernorm", "post_attention_layernorm")
+    attn_sfx = ("q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+                "query", "key", "value", "in_proj")
+    norm_sfx = ("input_layernorm", "post_attention_layernorm",
+                "layernorm", "layer_norm", "rmsnorm")
 
-    attn  = [d for d in descs if any(k in d.suffix for k in attn_sfx)]
-    mlp   = [d for d in descs if any(k in d.suffix for k in mlp_sfx)]
-    norms = [d for d in descs if any(k in d.suffix for k in norm_sfx)]
-    swiglu = any("gate_proj" in d.suffix for d in mlp)
+    cfg = {
+        "pre_norm":  "input_layernorm.weight",
+        "post_norm": "post_attention_layernorm.weight",
+        "has_swiglu": False,
+        "has_gqa": False,
+    }
 
-    L = []
-    a = L.append
+    for bidx, bdescs in groups:
+        if bidx is None:
+            continue
+        norms = [d.suffix.lstrip(".") for d in bdescs
+                 if any(k in d.suffix for k in norm_sfx)]
+        if len(norms) >= 1:
+            cfg["pre_norm"]  = norms[0]
+        if len(norms) >= 2:
+            cfg["post_norm"] = norms[1]
 
-    a(f"def block_{block_idx}(x, w, mask=None):")
-    a( '    """')
-    a(f"    Transformer block {block_idx}.")
-    a( "")
-    a( "    Args:")
-    a( "      x    : (B, T, D)  hidden state -- CSR in sili")
-    a( "      w    : weight dict keyed by suffix after 'layers.N.'")
-    a( "      mask : (B,1,T,T) additive attention mask or None")
-    a( "")
-    a( "    Available weights in w:")
-    for d in descs:
-        key = d.suffix.lstrip(".")
-        a(f"      {key:<48} {str(d.shape):<22} {d.annotation}")
-    a( '    """')
+        # Detect GQA: q_proj out != k_proj out
+        q_shape = next((d.shape for d in bdescs if "q_proj" in d.suffix), None)
+        k_shape = next((d.shape for d in bdescs if "k_proj" in d.suffix), None)
+        if q_shape and k_shape and len(q_shape) >= 1 and len(k_shape) >= 1:
+            cfg["has_gqa"] = q_shape[0] != k_shape[0]
 
-    # Pre-attention norm
-    if norms:
-        pre = norms[0].suffix.lstrip(".")
-        a( "    # -- Pre-attention norm -----------------------------------------------")
-        a(f"    x_normed = rmsnorm(x, w['{pre}'])")
-    else:
-        a( "    x_normed = x")
+        cfg["has_swiglu"] = any("gate_proj" in d.suffix for d in bdescs)
+        break   # only need block 0
 
-    # Attention
-    a( "    # -- Self-attention --------------------------------------------------")
-    a( "    # sparse_linear: out = (weight_csr @ x_normed.T).T")
-    for d in attn:
-        key    = d.suffix.lstrip(".")
-        layout = "CSR" if d.fmt == "sparse" else "dense"
-        a(f"    # w['{key}']  {d.shape}  [{layout}]")
-    a( "    raise NotImplementedError(")
-    a(f"        'block_{block_idx}: attention not yet wired up.'")
-    a( "        'Implement here, then remove this raise.'")
-    a( "    )")
-
-    # MLP (commented skeleton so it is visible but does not run yet)
-    if norms and len(norms) >= 2:
-        post = norms[1].suffix.lstrip(".")
-        a(f"    # x_normed2 = rmsnorm(x, w['{post}'])")
-    if swiglu:
-        a( "    # gate   = sparse_linear(x_normed2, w['mlp.gate_proj.weight'])")
-        a( "    # up     = sparse_linear(x_normed2, w['mlp.up_proj.weight'])")
-        a( "    # x      = x + sparse_linear(swiglu(gate, up), w['mlp.down_proj.weight'])")
-    elif mlp:
-        a( "    # hidden = sparse_linear(x_normed2, w['mlp.fc1.weight'])")
-        a( "    # x      = x + sparse_linear(gelu(hidden), w['mlp.fc2.weight'])")
-
-    a( "    return x")
-    a( "")
-    return L
+    return cfg
 
 
 def generate_trace_file(
@@ -421,15 +389,12 @@ def generate_trace_file(
     gm             = None,
 ):
     """
-    Write the trace file and return the output path.
+    Write the trace file.
 
-    The generated file has four sections mirroring the natural split of a
-    transformer implementation.  Section headers carry a "Suggested split"
-    note so it is obvious what goes where once each section is working.
-
-        ops.py    -- primitive ops (embed, rmsnorm, sparse_linear, attention)
-        blocks.py -- block_N() functions assembled from those ops
-        model.py  -- SiliModel class: embed -> blocks -> norm -> lm_head
+    Generated file layout (four sections, each with a suggested split target):
+        ops.py    -- sili imports (the actual leaf ops live in sili)
+        blocks.py -- transformer_block() for this architecture
+        model.py  -- SiliModel: embed -> block loop -> norm -> lm_head
         run.py    -- weight loading, example inputs, inference harness
     """
     from datetime import datetime
@@ -437,18 +402,12 @@ def generate_trace_file(
     descs  = structural_trace(payload)
     groups = group_into_blocks(descs)
     inp    = infer_example_inputs(payload)
-
-    n_sp  = sum(1 for d in descs if d.fmt == "sparse")
-    n_dn  = sum(1 for d in descs if d.fmt == "dense")
-    n_fo  = sum(1 for d in descs if d.fmt == "folded")
-    n_ni  = sum(1 for d in descs if d.not_impl)
+    cfg    = _detect_block_config(groups)
 
     block_indices = sorted(
         set(d.block_idx for d in descs if d.block_idx is not None), key=int
     )
     n_blocks   = len(block_indices)
-    has_swiglu = any("gate_proj" in d.suffix
-                     for d in descs if d.block_idx is not None)
     has_vision = inp["has_vision"]
     vocab      = inp["vocab_size"]
     d_model    = inp["d_model"]
@@ -456,59 +415,57 @@ def generate_trace_file(
     in_chans   = inp["in_chans"]
     img_h      = inp["img_h"]
     img_w      = inp["img_w"]
+    has_swiglu = cfg["has_swiglu"]
+    has_gqa    = cfg["has_gqa"]
+    pre_norm   = cfg["pre_norm"]
+    post_norm  = cfg["post_norm"]
     now        = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    L = []      # collected output lines
+    L = []
     e = L.append
 
-    # ─────────────────────────────────────────────────────────────────────────
     def section(title, split_to, *notes):
-        """Emit a prominent section banner."""
         e("")
         e("# " + "=" * 70)
         e(f"# {title}")
         e(f"# Suggested split -> {split_to}")
-        if notes:
-            e("#")
         for n in notes:
             e(f"# {n}")
         e("# " + "=" * 70)
         e("")
 
-    def blank():
-        e("")
-
     def lines(*ls):
         for l in ls:
             e(l)
-    # ─────────────────────────────────────────────────────────────────────────
 
     # =========================================================================
     # File header
     # =========================================================================
+    vision_note = (
+        f"yes  ({in_chans}ch  {img_h}x{img_w})" if has_vision else "no"
+    )
     lines(
         "#!/usr/bin/env python3",
         '"""',
         f"model_trace.py  --  auto-generated by trace_model.py  {now}",
-        f"Source : {sparse_path}",
-        "",
-        f"  Sparse CSR layers  : {n_sp}",
-        f"  Dense layers       : {n_dn}",
-        f"  Folded RNN layers  : {n_fo}",
-        f"  Transformer blocks : {n_blocks}",
-        f"  !IMPLEMENT ME      : {n_ni}",
+        f"Source      : {sparse_path}",
+        f"Blocks      : {n_blocks}",
+        f"d_model     : {d_model}",
+        f"vocab_size  : {vocab}",
+        f"vision      : {vision_note}",
+        f"GQA         : {has_gqa}",
+        f"activation  : {'swiglu' if has_swiglu else 'gelu'}",
         "",
         "HOW TO USE",
         "  python model_trace.py",
-        "  Stops at the first NotImplementedError.",
-        "  Implement that op, re-run to advance to the next.",
+        "  Fails at the first ImportError from sili.",
+        "  Implement that function in sili, then re-run.",
         "",
         "FILE SPLIT PLAN",
-        "  Once the full forward pass works, split into:",
-        "    ops.py    -- embed, rmsnorm, sparse_linear, attention, swiglu/gelu",
-        "    blocks.py -- block_N() functions assembled from ops",
-        "    model.py  -- SiliModel class orchestrating the full forward",
-        "    run.py    -- weight loading, example inputs, inference/training loop",
+        "  ops.py    -- sili import list (already this file's Section 1)",
+        "  blocks.py -- transformer_block() (Section 2)",
+        "  model.py  -- SiliModel class (Section 3)",
+        "  run.py    -- weight loading and inference harness (Section 4)",
         '"""',
         "",
     )
@@ -521,171 +478,141 @@ def generate_trace_file(
         "from typing import Optional",
         "import torch",
         "",
-        "# SILi -- Sparse Intelligence Library",
-        "# CSR is the default tensor layout; weights arrive as CSR from sparse_prune.",
-        "# Replace torch calls with sili equivalents as each op is implemented.",
-        "import sili",
-        "from sili import Module, Tensor",
+    )
+
+    # =========================================================================
+    # SECTION 1 -- OPS  (just imports -- sili provides the implementations)
+    # =========================================================================
+    section(
+        "SECTION 1 -- OPS", "ops.py",
+        "All leaf ops are imported from sili.",
+        "If something is missing, add it to sili and re-run -- no edits needed here.",
+    )
+
+    activation_import = "swiglu" if has_swiglu else "gelu"
+    lines(
+        "from sili import (",
+        "    Module,",
+        "    Tensor,",
+        "    embed,            # embed(token_ids, weight) -> (B, T, D)",
+        "    rmsnorm,          # rmsnorm(x, weight, eps) -> (B, T, D)",
+        "    sparse_linear,    # sparse_linear(x, weight_csr, bias) -> (B, T, out)",
+        f"    {activation_import},",
+    )
+    if activation_import == "swiglu":
+        e("    #   swiglu(gate, up) = silu(gate) * up")
+    else:
+        e("    #   gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))")
+    lines(
+        "    attention,        # attention(q, k, v, mask, n_heads, n_kv_heads)",
+        "    rope,             # rope(x, position_ids) -> rotary-position-encoded x",
+        ")",
         "",
         "from sparse_runtime import load_sparse_runtime",
         "",
     )
 
     # =========================================================================
-    # Layer inventory comment block
+    # SECTION 2 -- BLOCKS  (single transformer_block, not N copies)
     # =========================================================================
-    blank()
-    e("# " + "=" * 70)
-    e("# LAYER INVENTORY  (natural order)")
-    e("# fmt: name  shape  [SPARSE X% | DENSE | FOLDED]  [!IMPLEMENT ME]")
-    e("# " + "=" * 70)
-    for d in descs:
-        e(f"#  {d.name:<60} {str(d.shape):<22} {d.annotation}")
-        if d.not_impl:
-            e(f"#      -> {d.not_impl_reason}")
-    blank()
 
-    # =========================================================================
-    # SECTION 1 -- OPS
-    # =========================================================================
+    # Collect the first block's weight list for the docstring
+    first_block_descs = next(
+        (bd for bi, bd in groups if bi is not None), []
+    )
+
     section(
-        "SECTION 1 -- OPS", "ops.py",
-        "Pure functions -- no Module state, no self references.",
-        "Grad-engine agnostic: works with sili autograd, torch, or manual.",
-        "Implement one at a time; the math is in the comments above each raise.",
+        "SECTION 2 -- BLOCKS", "blocks.py",
+        "Single transformer_block() covers all N blocks -- they share the same",
+        "architecture; only their weights differ.  SiliModel passes the right",
+        "weight dict for each index via self._w(i).",
     )
 
     lines(
         "",
-        "def embed(token_ids, weight):",
-        f"    # weight : (vocab_size={vocab}, d_model={d_model})  dense",
-        f"    # out    : (B, T, {d_model})",
-        "    # math   : out = weight[token_ids]",
-        "    # sili   : output is dense; sparse_linear accepts dense input.",
-        "    raise NotImplementedError(",
-        "        'embed(): index weight rows by token_ids'",
-        "        '  torch ref: F.embedding(token_ids, weight)'",
-        "    )",
+        "def transformer_block(x, w, mask=None):",
+        "    # One Qwen/LLaMA-style transformer block.",
+        "    # Args:",
+        "    #   x    : (B, T, D)  hidden state",
+        "    #   w    : weight dict keyed by suffix after 'layers.N.'",
+        "    #   mask : (B, 1, T, T) additive causal mask, or None",
+        "    # Weight keys expected in w:",
+    )
+    for d in first_block_descs:
+        key    = d.suffix.lstrip(".")
+        layout = "CSR" if d.fmt == "sparse" else "dense"
+        e(f"    #   {key:<50} {str(d.shape):<22} [{layout}]")
+    lines(
         "",
+        f"    # -- Pre-attention norm  (key: '{pre_norm}')",
+        f"    x_normed = rmsnorm(x, w['{pre_norm}'])",
         "",
-        "def rmsnorm(x, weight, eps=1e-6):",
-        "    # x      : (B, T, D)",
-        "    # weight : (D,)  learned scale  --  always dense",
-        "    # math   : rms = sqrt(mean(x**2, dim=-1, keepdim=True) + eps)",
-        "    #           out = x / rms * weight",
-        "    # Note: mean + rsqrt touch all elements -- no sparsity benefit here.",
-        "    raise NotImplementedError(",
-        "        'rmsnorm()'",
-        "        '  torch ref:'",
-        "        '    rms = x.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()'",
-        "        '    return x * rms * weight'",
-        "    )",
+        "    # -- Q / K / V projections  (CSR sparse_linear)",
+        "    q = sparse_linear(x_normed, w['self_attn.q_proj.weight'])",
+        "    k = sparse_linear(x_normed, w['self_attn.k_proj.weight'])",
+        "    v = sparse_linear(x_normed, w['self_attn.v_proj.weight'])",
         "",
+        "    # -- Rotary position encoding",
+        "    q = rope(q)",
+        "    k = rope(k)",
         "",
-        "def sparse_linear(x, weight_csr, bias=None):",
-        "    # x          : (B, T, in_features)    dense or CSR",
-        "    # weight_csr : (out_features, in_features)  CSR",
-        "    # out        : (B, T, out_features)",
-        "    # math       : out = x @ weight_csr.T  (+ bias)",
-        "    # sili note  : weight is already in the correct CSR layout from sparse_prune.",
-        "    raise NotImplementedError(",
-        "        'sparse_linear()'",
-        "        '  dense fallback: x @ weight_csr.to_dense().T'",
-        "    )",
+        "    # -- Scaled dot-product attention",
+        "    #    GQA: sili's attention handles n_kv_heads < n_heads automatically",
+        "    attn_out = attention(q, k, v, mask=mask)",
+        "",
+        "    # -- Output projection + residual",
+        "    x = x + sparse_linear(attn_out, w['self_attn.o_proj.weight'])",
+        "",
+        f"    # -- Post-attention norm  (key: '{post_norm}')",
+        f"    x_normed2 = rmsnorm(x, w['{post_norm}'])",
         "",
     )
 
     if has_swiglu:
         lines(
-            "",
-            "def swiglu(gate, up):",
-            "    # gate, up : (B, T, intermediate)",
-            "    # out      : (B, T, intermediate)",
-            "    # math     : silu(gate) * up    where silu(x) = x * sigmoid(x)",
-            "    raise NotImplementedError(",
-            "        'swiglu()  torch ref: F.silu(gate) * up'",
-            "    )",
-            "",
+            "    # -- SwiGLU MLP",
+            "    gate = sparse_linear(x_normed2, w['mlp.gate_proj.weight'])",
+            "    up   = sparse_linear(x_normed2, w['mlp.up_proj.weight'])",
+            "    x    = x + sparse_linear(swiglu(gate, up), w['mlp.down_proj.weight'])",
         )
     else:
         lines(
-            "",
-            "def gelu(x):",
-            "    # math: x * 0.5 * (1 + erf(x / sqrt(2)))",
-            "    raise NotImplementedError('gelu()  torch ref: F.gelu(x)')",
-            "",
+            "    # -- GELU MLP",
+            "    hidden = sparse_linear(x_normed2, w['mlp.fc1.weight'])",
+            "    x      = x + sparse_linear(gelu(hidden), w['mlp.fc2.weight'])",
         )
 
     lines(
         "",
-        "def attention(q, k, v, mask=None, n_heads=1, n_kv_heads=1):",
-        "    # q    : (B, n_heads,    T, head_dim)",
-        "    # k, v : (B, n_kv_heads, T, head_dim)  GQA when n_kv_heads < n_heads",
-        "    # mask : (B, 1, T, T)  additive (-inf blocked, 0 allowed), or None",
-        "    # out  : (B, n_heads, T, head_dim)",
-        "    # math :",
-        "    #   if GQA: repeat k, v  n_heads // n_kv_heads  times along head dim",
-        "    #   scale  = 1 / sqrt(head_dim)",
-        "    #   scores = q @ k.transpose(-2, -1) * scale    -- always dense",
-        "    #   if mask: scores = scores + mask",
-        "    #   out    = softmax(scores, dim=-1) @ v",
-        "    # Note: scores are dense even when Q/K/V projections are sparse.",
-        "    raise NotImplementedError(",
-        "        'attention()'",
-        "        '  torch ref: F.scaled_dot_product_attention(q, k, v, attn_mask=mask)'",
-        "    )",
+        "    return x",
         "",
     )
-
-    # =========================================================================
-    # SECTION 2 -- BLOCKS
-    # =========================================================================
-    section(
-        "SECTION 2 -- BLOCKS", "blocks.py",
-        "One pure function per transformer block.",
-        "  block_N(x, w, mask=None) -> x",
-        "    x    : (B, T, D)  hidden state",
-        "    w    : weight dict keyed by suffix after 'layers.N.'",
-        "    mask : additive attention mask or None",
-        "Implement block_0 fully; the remaining blocks are usually identical.",
-        "Copy block_0's body to the others once it works.",
-    )
-
-    seen: set = set()
-    for bidx, bdescs in groups:
-        if bidx is None or bidx in seen:
-            continue
-        seen.add(bidx)
-        for line in _block_forward_fn(bidx, bdescs):
-            e(line)
 
     # =========================================================================
     # SECTION 3 -- MODEL
     # =========================================================================
     section(
         "SECTION 3 -- MODEL", "model.py",
-        "SiliModel owns the runtime weight store and orchestrates forward().",
-        "Weight access:",
-        "  self.sparse[name].weight_csr  -> CSR tensor (from sparse_prune)",
-        "  self.dense[name]              -> dense tensor (norms, embeddings, bias)",
-        "Full dotted parameter name is the key, e.g.:",
-        "  'model.layers.0.self_attn.q_proj.weight'",
+        "SiliModel orchestrates embed -> block loop -> norm -> lm_head.",
+        "self.sparse  : {name: SparseLinear}  CSR weights from sparse_prune",
+        "self.dense   : {name: Tensor}         dense weights (norms, embeds)",
     )
 
     lines(
         "",
         "class SiliModel(Module):",
-        '    """Full forward pass wired to the sparse runtime."""',
+        "    # Full Qwen/LLaMA forward pass backed by the sparse runtime.",
         "",
         "    def __init__(self, runtime) -> None:",
         "        super().__init__()",
         "        base = getattr(runtime, 'inner', runtime)  # unwrap RNNAllLayer",
-        "        self.sparse = base.sparse_layers   # {name: SparseLinear}  CSR weights",
-        "        self.dense  = base._dense_buffers  # {name: Tensor}  norms / embeds",
-        "        self.fl     = base.folded_layers   # FoldedRNNLayer list",
+        "        self.sparse = base.sparse_layers   # {name: SparseLinear}",
+        "        self.dense  = base._dense_buffers  # {name: Tensor}",
+        "        self.fl     = base.folded_layers",
+        f"        self.n_blocks = {n_blocks}",
         "",
         "    def _w(self, block_idx: int) -> dict:",
-        '        """Weight dict for one block, keyed by suffix after layers.N."""',
+        "        # Weight dict for one block, keyed by suffix after layers.N.",
         "        prefix = f'model.layers.{block_idx}.'",
         "        w = {}",
         "        for name, layer in self.sparse.items():",
@@ -708,24 +635,21 @@ def generate_trace_file(
         fwd.append("        pixel_values: Optional[Tensor] = None,")
     fwd.append("    ) -> Tensor:")
     lines(*fwd)
-    blank()
+    e("")
 
     if has_vision:
         lines(
             "        # -- Vision tokens (Qwen3-VL) -----------------------------------",
-            "        # Implement: patch_embed + ViT blocks + merger in ops.py,",
-            "        # then replace this raise with a call to those ops.",
+            "        # patch_embed + ViT blocks + merger should live in ops.py.",
             "        vision_tokens = None",
             "        if pixel_values is not None:",
-            "            raise NotImplementedError(",
-            "                'SiliModel.forward(): vision encoding not implemented.'",
-            "                'See _Qwen3VLVisionEncoder in model_reconstruct.py.'",
-            "            )",
+            "            from sili import vit_encode  # add to sili when ready",
+            "            vision_tokens = vit_encode(pixel_values, self.sparse, self.dense)",
             "",
         )
 
     lines(
-        "        # -- Text embedding ---------------------------------------------",
+        "        # -- Text embedding",
         "        embed_w = self.dense.get('model.embed_tokens.weight')",
         "        if embed_w is None:",
         "            embed_w = next((v for k, v in self.dense.items()",
@@ -747,20 +671,13 @@ def generate_trace_file(
             "",
         )
 
-    e("        # -- Transformer blocks -----------------------------------------")
-    prev = None
-    for bidx, bdescs in sorted(
-        [(b, bd) for b, bd in groups if b is not None],
-        key=lambda t: int(t[0]),
-    ):
-        if bidx != prev:
-            e(f"        print(f'[forward]  block {bidx}/{n_blocks - 1}  x={{x.shape}}')")
-            e(f"        x = block_{bidx}(x, self._w({bidx}), mask=attention_mask)")
-        prev = bidx
-
     lines(
+        "        # -- Transformer blocks",
+        "        for i in range(self.n_blocks):",
+        "            print(f'[forward]  block {i}/{self.n_blocks - 1}  x={x.shape}')",
+        "            x = transformer_block(x, self._w(i), mask=attention_mask)",
         "",
-        "        # -- Final norm + lm_head ---------------------------------------",
+        "        # -- Final norm",
         "        norm_w = self.dense.get('model.norm.weight')",
         "        if norm_w is None:",
         "            norm_w = next(",
@@ -770,6 +687,7 @@ def generate_trace_file(
         "            )",
         "        x = rmsnorm(x, norm_w)",
         "",
+        "        # -- LM head",
         "        lm_w = self.dense.get('lm_head.weight')",
         "        if lm_w is None:",
         "            lm_w = next((v for k, v in self.dense.items()",
@@ -788,18 +706,10 @@ def generate_trace_file(
         "For training: add a loss function and call sili's backward() here.",
     )
 
-    vision_note = (
-        f"yes  ({in_chans}ch  {img_h}x{img_w})" if has_vision else "no"
-    )
     lines(
         f'SPARSE_PATH = "{sparse_path}"  # update if you moved the file',
         f"SEQ_LEN    = {seq_len}",
         f"VOCAB_SIZE = {vocab}",
-        "",
-        f"#  vocab_size : {vocab}",
-        f"#  d_model    : {d_model}",
-        f"#  seq_len    : {seq_len}  (change freely)",
-        f"#  vision     : {vision_note}",
         "",
         "",
         "if __name__ == '__main__':",
@@ -814,7 +724,6 @@ def generate_trace_file(
         "    runtime = load_sparse_runtime(SPARSE_PATH, generate_trace=False)",
         "    model   = SiliModel(runtime)",
         "",
-        "    # Example inputs -- replace with real tokeniser output",
         "    input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))",
     )
     if has_vision:
@@ -829,8 +738,7 @@ def generate_trace_file(
         "",
         "    print()",
         "    print('─' * 60)",
-        "    print('[run]  Forward pass -- stops at first NotImplementedError')",
-        "    print('[run]  Implement that op in SECTION 1, then re-run.')",
+        "    print('[run]  Forward pass')",
         "    print('─' * 60)",
         "    print()",
         "",
@@ -840,19 +748,13 @@ def generate_trace_file(
         e("        out = model(input_ids, pixel_values=pixel_values)")
     else:
         e("        out = model(input_ids)")
-
     lines(
-        "        print(f'✓  Forward complete -- output shape: {out.shape}')",
-        "        print(f'   logits range: {out.min():.3f} .. {out.max():.3f}')",
+        "        print(f'✓  output shape: {out.shape}')",
+        "        print(f'   logits: {out.min():.3f} .. {out.max():.3f}')",
         "",
-        "    except NotImplementedError as exc:",
-        "        tb  = _tb.extract_tb(exc.__traceback__)",
-        "        loc = next((f for f in reversed(tb)",
-        "                    if 'model_trace' in (f.filename or '')), tb[-1])",
-        "        print(f'->  NotImplementedError in {loc.name}()  line {loc.lineno}')",
-        "        print(f'    {exc}')",
-        "        print()",
-        "        print('[run]  Implement the op above, then re-run.')",
+        "    except ImportError as exc:",
+        "        print(f'->  ImportError: {exc}')",
+        "        print('[run]  Add the missing function to sili, then re-run.')",
         "",
         "    except Exception:",
         "        _tb.print_exc()",

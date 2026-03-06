@@ -1,3 +1,14 @@
-notepad
-to_convert
+build/
+.cache
+*.spv
+*.pyr
+*.mp4
+*.webm
 .idea
+__pycache__/
+test/build_tests
+docs/
+*.egg-info
+*.prof
+to_convert
+compile_commands.json
