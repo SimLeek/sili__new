@@ -27,9 +27,12 @@ set(HEADER_FILES
     ../sili/lib/headers/parallel.hpp
 
     ../sili/lib/headers/linear_sisldo.hpp
+    ../sili/lib/headers/linear_disldo.hpp
 
     #PASSED TESTS
     ../sili/lib/headers/csr.hpp
+    ../sili/lib/headers/loss.hpp
+
     #../sili/lib/headers/unique_vector.hpp
     #../sili/lib/headers/coo.hpp
 
@@ -46,7 +49,8 @@ find_package(OpenMP REQUIRED)
 add_executable(
     sili_tests
 
-    unittest_sisldo.cpp
+    #unittest_sisldo.cpp
+    integration_test_sisldo.cpp
 
     #test_parallel.cpp
     #test_fiber.cpp

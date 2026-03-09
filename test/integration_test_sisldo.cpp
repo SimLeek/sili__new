@@ -9,46 +9,6 @@
 #include <numeric>
 #include <vector>
 
-// ── Allocation helpers (duplicated from unittest for standalone compilation) ──
-
-template <typename SIZE_TYPE, typename VALUE_TYPE>
-CSRInput<SIZE_TYPE, VALUE_TYPE> make_csr_input(
-    SIZE_TYPE rows, SIZE_TYPE cols,
-    std::vector<SIZE_TYPE> ptrs,
-    std::vector<SIZE_TYPE> indices,
-    std::vector<VALUE_TYPE> values)
-{
-    CSRInput<SIZE_TYPE, VALUE_TYPE> t;
-    t.rows       = rows;
-    t.cols       = cols;
-    t.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::move(ptrs));
-    t.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::move(indices));
-    t.values[0]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    return t;
-}
-
-template <typename SIZE_TYPE, typename VALUE_TYPE>
-SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
-    SIZE_TYPE rows, SIZE_TYPE cols,
-    std::vector<SIZE_TYPE> ptrs,
-    std::vector<SIZE_TYPE> indices,
-    std::vector<VALUE_TYPE> values,
-    std::vector<VALUE_TYPE> grads,
-    std::vector<VALUE_TYPE> importance)
-{
-    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
-    w.connections.rows      = rows;
-    w.connections.cols      = cols;
-    w.connections.ptrs[0]   = std::make_shared<std::vector<SIZE_TYPE>>(std::move(ptrs));
-    w.connections.indices[0]= std::make_shared<std::vector<SIZE_TYPE>>(std::move(indices));
-    w.connections.values[0] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    w.connections.values[1] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(grads));
-    w.connections.values[2] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
-    w.probes.rows = rows;
-    w.probes.cols = cols;
-    return w;
-}
-
 // Compute MSE gradient: -2*(desired-output)/n, returns dense vector
 template <typename VALUE_TYPE>
 std::vector<VALUE_TYPE> mse_grad(
@@ -98,7 +58,7 @@ TEST_CASE("integration_train_loop", "[integration_train_loop]") {
     const SIZE_TYPE n_inputs  = 4;
     const SIZE_TYPE n_outputs = 3;
     const SIZE_TYPE batch_size= 2;
-    const int       num_cpus  = 1;
+    const int       num_cpus  = 4;
     const VALUE_TYPE lr       = 0.01f;
     const VALUE_TYPE solidify = 0.01f;
     const SIZE_TYPE  max_weights = 8;
@@ -218,7 +178,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
     const SIZE_TYPE n_inputs  = 4;
     const SIZE_TYPE n_outputs = 3;
     const SIZE_TYPE k         = 2;  // top-2 inputs, top-2 outputs
-    const int       num_cpus  = 1;
+    const int       num_cpus  = 4;
 
     auto input = make_csr_input<SIZE_TYPE, VALUE_TYPE>(
         1, n_inputs,
@@ -259,19 +219,14 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
     std::vector<VALUE_TYPE> neuron_grad_accum (n_outputs, 0.0f);
     std::vector<VALUE_TYPE> input_gradients   (n_inputs,  0.0f);
 
-    // sisldo_backward returns early with no connections, but we manually
-    // accumulate since backward is the right place to measure activity.
-    // With no connections, backward is a no-op. So accumulate manually
-    // to simulate what N backward passes would produce.
+
     const int accum_iters = 5;
     for (int i = 0; i < accum_iters; ++i) {
-        // Direct accumulation of input magnitudes (normally done in backward)
-        // Since there are no connections, backward early-returns, so we simulate
-        // what an echo-network or skip-connection layer would provide.
-        neuron_input_accum[1] += std::abs(3.0f); // input 1
-        neuron_input_accum[3] += std::abs(1.0f); // input 3
-        neuron_grad_accum[0]  += std::abs(2.0f); // output 0
-        neuron_grad_accum[2]  += std::abs(0.5f); // output 2
+        std::fill(input_gradients.begin(), input_gradients.end(), 0.0f);
+        sisldo_backward(input, weights, out_grad_sparse,
+                        input_gradients.data(), output_gradients.data(),
+                        neuron_input_accum.data(), neuron_grad_accum.data(),
+                        num_cpus);
     }
 
     // Verify accumulators reflect dominant neurons

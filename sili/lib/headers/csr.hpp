@@ -3,7 +3,7 @@
 
 #include "sparse_struct.hpp"
 
-//#include "coo.hpp"
+#include "coo.hpp"
 //#include "unique_vector.hpp"
 
 #include <algorithm>
@@ -241,6 +241,239 @@ void clear_csr(sparse_struct<SIZE_TYPE, PTRS, INDICES, VALUES>& csr) {
     // Set rows and columns to zero
     csr.rows = 0;
     csr.cols = 0;
+}
+
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+CSRInput<SIZE_TYPE, VALUE_TYPE> make_csr_input(
+    SIZE_TYPE rows, SIZE_TYPE cols,
+    std::vector<SIZE_TYPE>  ptrs,
+    std::vector<SIZE_TYPE>  indices,
+    std::vector<VALUE_TYPE> values)
+{
+    CSRInput<SIZE_TYPE, VALUE_TYPE> t;
+    t.rows       = rows;
+    t.cols       = cols;
+    t.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>> (std::move(ptrs));
+    t.indices[0] = std::make_shared<std::vector<SIZE_TYPE>> (std::move(indices));
+    t.values[0]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
+    return t;
+}
+
+// ptrs:       rows+1 entries
+// indices / values / grads / importance: nnz entries each
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
+    SIZE_TYPE rows, SIZE_TYPE cols,
+    std::vector<SIZE_TYPE>  ptrs,
+    std::vector<SIZE_TYPE>  indices,
+    std::vector<VALUE_TYPE> values,
+    std::vector<VALUE_TYPE> grads,
+    std::vector<VALUE_TYPE> importance)
+{
+    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
+    w.connections.rows       = rows;
+    w.connections.cols       = cols;
+    w.connections.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>> (std::move(ptrs));
+    w.connections.indices[0] = std::make_shared<std::vector<SIZE_TYPE>> (std::move(indices));
+    w.connections.values[0]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
+    w.connections.values[1]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(grads));
+    w.connections.values[2]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
+    w.probes.rows = rows;
+    w.probes.cols = cols;
+    return w;
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+std::vector<SIZE_TYPE> top_k_indices_biased(VALUE_TYPE *values, CSRInput<SIZE_TYPE,  VALUE_TYPE>& bias, size_t size, size_t k, int num_threads) {    
+    // Each thread processes a chunk of the array
+    size_t chunk_size = (size + num_threads - 1) / num_threads;
+    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> thread_pairs(num_threads);
+
+    if(k>size){
+        k=size;
+    }
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int thread_id = omp_get_thread_num();
+        SIZE_TYPE start = thread_id * chunk_size;
+        SIZE_TYPE end = std::min(start + chunk_size, size);
+
+        SIZE_TYPE bias_ptr = bias.ptrs[0][start/bias.cols];  // start at the correct row
+
+        // Collect indices for this thread
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> local_pairs;
+        for (size_t i = start; i < end; ++i) {
+            SIZE_TYPE bias_row = i/bias.cols;
+            while (bias.indices[0][bias_ptr] < i%bias.cols && bias_ptr<bias.ptrs[0][bias_row+1]) {
+                ++bias_ptr;
+            }
+            if (bias.indices[0][bias_ptr] == i%bias.cols && bias_ptr<=bias.ptrs[0][bias_row+1]) {
+                local_pairs.emplace_back(i, bias.values[0][bias_ptr] + values[i]);
+                ++bias_ptr;
+            }else{
+                local_pairs.emplace_back(i, values[i]);
+            }
+        }
+
+        // Sort local indices by values
+        std::partial_sort(local_pairs.begin(), local_pairs.begin() + std::min(k, local_pairs.size()), local_pairs.end(),
+                          [](std::pair<SIZE_TYPE, VALUE_TYPE>& a, std::pair<SIZE_TYPE, VALUE_TYPE>& b) { return a.second > b.second; });
+
+        // Keep only the smallest k elements
+        if (local_pairs.size() > k) {
+            local_pairs.resize(k);
+        }
+
+        thread_pairs[thread_id] = std::move(local_pairs);
+    }
+
+    // Merge results from all threads
+    std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> merged_pairs;
+    for (const auto &pairs : thread_pairs) {
+        merged_pairs.insert(merged_pairs.end(), pairs.begin(), pairs.end());
+    }
+
+    // Find the global bottom-k indices
+    std::partial_sort(merged_pairs.begin(), merged_pairs.begin() + k, merged_pairs.end(),
+                      [](std::pair<SIZE_TYPE, VALUE_TYPE>& a, std::pair<SIZE_TYPE, VALUE_TYPE>& b) { return a.second > b.second; });
+
+    merged_pairs.resize(k);
+    std::vector<SIZE_TYPE> indices;
+    for(const auto & pair : merged_pairs){
+        indices.push_back(pair.first);
+    }
+
+    return indices;
+}
+
+template <class SIZE_TYPE, class VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr_biased(VALUE_TYPE *values, CSRInput<SIZE_TYPE,  VALUE_TYPE>& bias, size_t rows, size_t cols, size_t k, int num_threads) {
+    // Step 1: Get the top-k indices
+    std::vector<SIZE_TYPE> top_k = top_k_indices_biased(values, bias, rows * cols, k, num_threads);
+
+    // Step 2: Prepare space for row/column indices
+    std::unique_ptr<SIZE_TYPE[]> row_indices(new SIZE_TYPE[k]);
+    std::unique_ptr<SIZE_TYPE[]> col_indices(new SIZE_TYPE[k]);
+    std::unique_ptr<VALUE_TYPE[]> top_values(new VALUE_TYPE[k]);
+
+    // Step 3: Convert flat indices to row/column indices in parallel
+    #pragma omp parallel for num_threads(num_threads)
+    for (size_t i = 0; i < k; ++i) {
+        size_t flat_idx = top_k[i];
+        row_indices[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
+        col_indices[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
+        top_values[i] = values[flat_idx];
+    }
+
+    // Step 4: Create the COO sparse struct
+    COOPointers<SIZE_TYPE> ptrs = k; // Store nnz directly
+    COOIndices<SIZE_TYPE> indices{
+        std::move(row_indices),
+        std::move(col_indices)
+    };
+    UnaryValues<VALUE_TYPE> coo_values{
+        std::move(top_values)
+    };
+
+    merge_sort_coo(indices, coo_values, k);  //there better not be any duplicates. However, Todo: check there are no duplicates
+
+    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>> coo_result(
+        ptrs, indices, coo_values, rows, cols, k);
+
+    return to_csr(coo_result, num_threads);
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {    
+    if (k > size) k = size;
+
+    size_t chunk_size = (size + num_threads - 1) / num_threads;
+    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> thread_pairs(num_threads);
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int thread_id = omp_get_thread_num();
+        SIZE_TYPE start = static_cast<SIZE_TYPE>(thread_id * chunk_size);
+        SIZE_TYPE end = static_cast<SIZE_TYPE>(std::min(static_cast<size_t>(start + chunk_size), size));
+
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> local_pairs;
+        local_pairs.reserve(end - start);
+
+        for (SIZE_TYPE i = start; i < end; ++i) {
+            local_pairs.emplace_back(i, values[i]);
+        }
+
+        size_t local_k = std::min(k, local_pairs.size());
+        std::partial_sort(local_pairs.begin(), local_pairs.begin() + local_k, local_pairs.end(),
+                          [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                              return a.second > b.second;
+                          });
+
+        if (local_pairs.size() > k) local_pairs.resize(k);
+        thread_pairs[thread_id] = std::move(local_pairs);
+    }
+
+    std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> merged_pairs;
+    for (auto &pairs : thread_pairs) {
+        merged_pairs.insert(merged_pairs.end(), pairs.begin(), pairs.end());
+    }
+
+    size_t final_k = std::min(k, merged_pairs.size());
+    std::partial_sort(merged_pairs.begin(), merged_pairs.begin() + final_k, merged_pairs.end(),
+                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                          return a.second > b.second;
+                      });
+
+    std::vector<SIZE_TYPE> indices;
+    indices.reserve(final_k);
+    for (size_t i = 0; i < final_k; ++i) {
+        indices.push_back(merged_pairs[i].first);
+    }
+
+    return indices;
+}
+
+template <class SIZE_TYPE, class VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_threads) {
+    // Step 1: Get the unbiased top-k indices
+    std::vector<SIZE_TYPE> top_k = top_k_indices<SIZE_TYPE, VALUE_TYPE>(values, rows * cols, k, num_threads);
+    size_t actual_k = top_k.size();
+
+    // Step 2: Allocate shared vectors for COO
+    auto row_vec = std::make_shared<std::vector<SIZE_TYPE>>(actual_k);
+    auto col_vec = std::make_shared<std::vector<SIZE_TYPE>>(actual_k);
+    auto val_vec = std::make_shared<std::vector<VALUE_TYPE>>(actual_k);
+
+    // Step 3: Map flat indices to 2D coordinates in parallel
+    // We use .data() for thread-safe concurrent writing to pre-allocated indices
+    SIZE_TYPE* r_ptr = row_vec->data();
+    SIZE_TYPE* c_ptr = col_vec->data();
+    VALUE_TYPE* v_ptr = val_vec->data();
+
+    #pragma omp parallel for num_threads(num_threads)
+    for (size_t i = 0; i < actual_k; ++i) {
+        SIZE_TYPE flat_idx = top_k[i];
+        r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
+        c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
+        v_ptr[i] = values[flat_idx];
+    }
+
+    // Step 4: Wrap into your struct types
+    COOPointers<SIZE_TYPE> ptrs = static_cast<SIZE_TYPE>(actual_k);
+    COOIndices<SIZE_TYPE> indices = {row_vec, col_vec};
+    UnaryValues<VALUE_TYPE> coo_values = {val_vec};
+
+    // Keep the sort to ensure indices are row-major for the CSR conversion
+    merge_sort_coo(indices, coo_values, actual_k);
+
+    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>> coo_result(
+        ptrs, indices, coo_values, rows, cols, actual_k);
+
+    return to_csr(coo_result, num_threads);
 }
 
 #endif

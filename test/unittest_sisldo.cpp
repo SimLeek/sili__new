@@ -7,46 +7,6 @@
 #include <limits>
 #include <vector>
 
-// ── Allocation helpers ────────────────────────────────────────────────────────
-// Reduces boilerplate of make_shared<vector> throughout tests.
-
-template <typename SIZE_TYPE, typename VALUE_TYPE>
-CSRInput<SIZE_TYPE, VALUE_TYPE> make_csr_input(
-    SIZE_TYPE rows, SIZE_TYPE cols,
-    std::vector<SIZE_TYPE> ptrs,
-    std::vector<SIZE_TYPE> indices,
-    std::vector<VALUE_TYPE> values)
-{
-    CSRInput<SIZE_TYPE, VALUE_TYPE> t;
-    t.rows      = rows;
-    t.cols      = cols;
-    t.ptrs[0]   = std::make_shared<std::vector<SIZE_TYPE>>(std::move(ptrs));
-    t.indices[0]= std::make_shared<std::vector<SIZE_TYPE>>(std::move(indices));
-    t.values[0] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    return t;
-}
-
-template <typename SIZE_TYPE, typename VALUE_TYPE>
-SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
-    SIZE_TYPE rows, SIZE_TYPE cols,
-    std::vector<SIZE_TYPE> ptrs,
-    std::vector<SIZE_TYPE> indices,
-    std::vector<VALUE_TYPE> values,
-    std::vector<VALUE_TYPE> grads,
-    std::vector<VALUE_TYPE> importance)
-{
-    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
-    w.connections.rows     = rows;
-    w.connections.cols     = cols;
-    w.connections.ptrs[0]  = std::make_shared<std::vector<SIZE_TYPE>>(std::move(ptrs));
-    w.connections.indices[0]= std::make_shared<std::vector<SIZE_TYPE>>(std::move(indices));
-    w.connections.values[0] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    w.connections.values[1] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(grads));
-    w.connections.values[2] = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
-    w.probes.rows = rows;
-    w.probes.cols = cols;
-    return w;
-}
 
 // ── Check helpers ─────────────────────────────────────────────────────────────
 

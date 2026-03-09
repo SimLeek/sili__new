@@ -1,15 +1,19 @@
 from setuptools import setup, find_packages, Extension
 import pybind11
 
-reqs   = open("requirements.txt").read().splitlines()
-readme = open("README.md").read()
-
+reqs   = [
+'numpy',
+'pybind11'
+]
+#readme = open("README.md").read()
+readme = "sili"
 cpu_ext = Extension(
     name="sili._cpu",
     sources=["sili/cpu_backend.cpp"],
     include_dirs=[
         pybind11.get_include(),   # pybind11 headers
-        "sili/lib",               # csr.hpp, coo.hpp, linear_sisldo.hpp, etc.
+        #"sili/lib",               # csr.hpp, coo.hpp, linear_sisldo.hpp, etc.
+        "sili/lib/headers",  # linear_sisldo.hpp, linear_disldo.hpp, etc.
     ],
     extra_compile_args=[
         "-O3",

@@ -127,6 +127,14 @@ void sisldo_forward(
     const auto& conn_val0    = *weights.connections.values[0];
     auto&       conn_val2    = *weights.connections.values[2];
 
+    // ── Phase 1 setup: one output buffer slice per thread ────────────────────
+    // Threads write to disjoint slices — no synchronization needed during scatter.
+    // Extra memory: num_cpus × num_outputs × sizeof(VALUE_TYPE).
+    std::vector<VALUE_TYPE> all_outputs((size_t)num_cpus * num_outputs, VALUE_TYPE(0));
+    std::vector<VALUE_TYPE> all_contributions(
+        original_contributions_output ? (size_t)num_cpus * num_inputs : 0,
+        VALUE_TYPE(0));
+
     std::vector<SIZE_TYPE> work_offsets;
 
     #pragma omp parallel num_threads(num_cpus)
@@ -134,15 +142,16 @@ void sisldo_forward(
         const int tid      = omp_get_thread_num();
         const int nthreads = omp_get_num_threads();
 
-        std::vector<VALUE_TYPE> thread_output(num_outputs, VALUE_TYPE(0));
-        std::vector<VALUE_TYPE> thread_contributions;
-        if (original_contributions_output != nullptr)
-            thread_contributions.resize(num_inputs, VALUE_TYPE(0));
+        VALUE_TYPE* thread_output = all_outputs.data() + (size_t)tid * num_outputs;
+        VALUE_TYPE* thread_contributions = original_contributions_output
+            ? all_contributions.data() + (size_t)tid * num_inputs
+            : nullptr;
 
+        // ── Phase 1: scatter — each thread owns its own output slice ─────────
         for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
-            const SIZE_TYPE batch_start = (*input_tensor.ptrs[0])[batch];
-            const SIZE_TYPE batch_end   = (*input_tensor.ptrs[0])[batch + 1];
-            const SIZE_TYPE batch_nnz   = batch_end - batch_start;
+            const SIZE_TYPE batch_start  = (*input_tensor.ptrs[0])[batch];
+            const SIZE_TYPE batch_end    = (*input_tensor.ptrs[0])[batch + 1];
+            const SIZE_TYPE batch_nnz    = batch_end - batch_start;
             const SIZE_TYPE batch_offset = batch * out_cols;
 
             #pragma omp single
@@ -169,34 +178,55 @@ void sisldo_forward(
                 for (SIZE_TYPE w = w_start; w < w_end; ++w) {
                     while (ip + 1 < batch_nnz && work_offsets[ip + 1] <= w) ++ip;
 
-                    const SIZE_TYPE  in_idx   = (*input_tensor.indices[0])[batch_start + ip];
-                    const VALUE_TYPE in_val   = (*input_tensor.values[0]) [batch_start + ip];
-                    const SIZE_TYPE  wptr     = conn_ptrs[in_idx] + (w - work_offsets[ip]);
-                    const VALUE_TYPE wval     = conn_val0[wptr];
-                    const SIZE_TYPE  out_idx  = conn_indices[wptr];
-                    const VALUE_TYPE contrib  = wval * in_val;
+                    const SIZE_TYPE  in_idx  = (*input_tensor.indices[0])[batch_start + ip];
+                    const VALUE_TYPE in_val  = (*input_tensor.values[0]) [batch_start + ip];
+                    const SIZE_TYPE  wptr    = conn_ptrs[in_idx] + (w - work_offsets[ip]);
+                    const VALUE_TYPE wval    = conn_val0[wptr];
+                    const SIZE_TYPE  out_idx = conn_indices[wptr];
+                    const VALUE_TYPE contrib = wval * in_val;
 
                     if (train) conn_val2[wptr] += contrib * solidify;
 
                     thread_output[batch_offset + out_idx] += contrib;
 
-                    if (original_contributions_output != nullptr)
+                    if (thread_contributions)
                         thread_contributions[in_idx] += in_val * wval;
                 }
             }
             #pragma omp barrier
         }
 
-        #pragma omp critical
-        {
-            for (SIZE_TYPE i = 0; i < num_outputs; ++i)
-                output[i] += thread_output[i];
+        // ── Phase 2: parallel tree reduction — no critical, no atomics ───────
+        // Each pass halves active threads. Active pairs write to disjoint
+        // destinations so no synchronization is needed within a pass.
+        // The implicit OpenMP barrier between passes is the only sync required.
+        for (int stride = 1; stride < nthreads; stride <<= 1) {
+            #pragma omp barrier
+            const int src = tid + stride;
+            if (tid % (stride << 1) == 0 && src < nthreads) {
+                const VALUE_TYPE* src_out = all_outputs.data() + (size_t)src * num_outputs;
+                for (SIZE_TYPE i = 0; i < num_outputs; ++i)
+                    thread_output[i] += src_out[i];
 
-            if (original_contributions_output != nullptr) {
-                for (SIZE_TYPE i = 0; i < num_inputs; ++i)
-                    original_contributions_output[i] += thread_contributions[i];
+                if (thread_contributions) {
+                    const VALUE_TYPE* src_con =
+                        all_contributions.data() + (size_t)src * num_inputs;
+                    for (SIZE_TYPE i = 0; i < num_inputs; ++i)
+                        thread_contributions[i] += src_con[i];
+                }
             }
         }
+    }   // implicit barrier — thread 0's slice now holds the full reduction
+
+    // Copy thread 0's result into the caller's output buffer.
+    const VALUE_TYPE* result = all_outputs.data();
+    for (SIZE_TYPE i = 0; i < num_outputs; ++i)
+        output[i] += result[i];
+
+    if (original_contributions_output) {
+        const VALUE_TYPE* con_result = all_contributions.data();
+        for (SIZE_TYPE i = 0; i < num_inputs; ++i)
+            original_contributions_output[i] += con_result[i];
     }
 }
 
@@ -395,21 +425,6 @@ void genesis_build_probes(
         csr.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(n);
         std::iota(csr.indices[0]->begin(), csr.indices[0]->end(), SIZE_TYPE(0));
 
-        // Non-owning view — no-op deleter on the shared_ptr<vector>,
-        // inner vector wraps the raw pointer without owning it
-        csr.values[0] = std::shared_ptr<std::vector<VALUE_TYPE>>(
-            new std::vector<VALUE_TYPE>(),
-            [](std::vector<VALUE_TYPE>* p){ delete p; });
-        // assign data pointer without taking ownership via a non-owning trick:
-        // use the aliasing constructor to share lifetime with a dummy owner
-        auto dummy = std::make_shared<int>(0);
-        csr.values[0] = std::shared_ptr<std::vector<VALUE_TYPE>>(
-            dummy,
-            // aliasing: the vector is a non-owning wrapper around accum
-            // We construct a vector that views the memory but doesn't own it
-            // — safest to just copy for the accumulator size, it's 1 row
-            [](std::vector<VALUE_TYPE>*){}
-        );
         // Simplest correct approach: just copy the accumulator into a vector.
         // It's num_inputs or num_outputs floats — negligible vs model size.
         csr.values[0] = std::make_shared<std::vector<VALUE_TYPE>>(accum, accum + n);
@@ -481,11 +496,279 @@ void copy_matching_weights(
         }
     }
 }
+// ── Importance decay ──────────────────────────────────────────────────────────
+// Decays toward zero. Step size = rate / (1 + |importance|):
+//   near 0   → step ≈ rate        (fast pruning of weak connections)
+//   large    → step ≈ rate/|imp|  (stable, high-importance connections barely move)
 
-// ── optim_synaptogenesis ──────────────────────────────────────────────────────
-// Three-way sorted merge: output = (connections \ to_remove) ∪ probes
-// Enforces max_weights — reserves once, resizes down after merge.
-// importance_beta: rate at which probe outer-product values become importance scores.
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+void sisldo_decay_importance(
+    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE>& weights,
+    const VALUE_TYPE rate,
+    const int num_cpus)
+{
+    if (connections_empty(weights.connections)) return;
+
+    const SIZE_TYPE nnz = weights.connections.nnz();
+    auto& imp = *weights.connections.values[2];
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (SIZE_TYPE i = 0; i < nnz; ++i) {
+        const VALUE_TYPE v = imp[i];
+        imp[i] = v - std::copysign(rate / (VALUE_TYPE(1) + std::abs(v)), v);
+    }
+}
+
+// ── Synaptogenesis sub-functions ──────────────────────────────────────────────
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+void synap_mark_duplicates(
+    const SIZE_TYPE nnz_c,
+    const SIZE_TYPE nnz_p,
+    const std::vector<SIZE_TYPE>& cp,
+    const std::vector<SIZE_TYPE>& ci,
+    const std::vector<VALUE_TYPE>& cv2,
+    const std::vector<SIZE_TYPE>& pp,
+    const std::vector<SIZE_TYPE>& pi,
+    const std::vector<VALUE_TYPE>& pv,
+    const SIZE_TYPE rows,
+    std::vector<VALUE_TYPE>& merged_imp_c,   // out: per-connection merged importance
+    std::vector<int8_t>& is_dup_p,           // out: 1 if probe is duplicate of connection
+    const int num_cpus)
+{
+    auto row_of_c = [&](SIZE_TYPE c) -> SIZE_TYPE {
+        return static_cast<SIZE_TYPE>(
+            std::upper_bound(cp.begin(), cp.end(), c) - cp.begin()) - 1;
+    };
+
+    auto find_probe = [&](SIZE_TYPE row, SIZE_TYPE col) -> SIZE_TYPE {
+        const SIZE_TYPE p0 = pp[row], p1 = pp[row + 1];
+        auto it = std::lower_bound(pi.begin() + p0, pi.begin() + p1, col);
+        const SIZE_TYPE pos = static_cast<SIZE_TYPE>(it - pi.begin());
+        return (pos < p1 && pi[pos] == col) ? pos : nnz_p;
+    };
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (SIZE_TYPE c = 0; c < nnz_c; ++c) {
+        const SIZE_TYPE r_c = row_of_c(c);
+        const SIZE_TYPE pp_ = find_probe(r_c, ci[c]);
+        if (pp_ != nnz_p) {
+            merged_imp_c[c] = std::max(cv2[c], pv[pp_]);
+            is_dup_p[pp_]   = 1;
+        } else {
+            merged_imp_c[c] = cv2[c];
+        }
+    }
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+VALUE_TYPE synap_compute_cutoff(
+    const SIZE_TYPE nnz_c,
+    const SIZE_TYPE nnz_p,
+    const SIZE_TYPE max_weights,
+    const std::vector<VALUE_TYPE>& merged_imp_c,
+    const std::vector<VALUE_TYPE>& pv,
+    const std::vector<int8_t>& is_dup_p)
+{
+    const SIZE_TYPE dup_count     = static_cast<SIZE_TYPE>(
+        std::count(is_dup_p.begin(), is_dup_p.end(), int8_t(1)));
+    const SIZE_TYPE total_merged  = nnz_c + nnz_p - dup_count;
+
+    if (total_merged <= max_weights)
+        return std::numeric_limits<VALUE_TYPE>::lowest();
+
+    std::vector<VALUE_TYPE> all_imp;
+    all_imp.reserve(total_merged);
+    for (SIZE_TYPE c = 0; c < nnz_c; ++c)
+        all_imp.push_back(merged_imp_c[c]);
+    for (SIZE_TYPE p = 0; p < nnz_p; ++p)
+        if (!is_dup_p[p]) all_imp.push_back(pv[p]);
+
+    const SIZE_TYPE drop_count = total_merged - max_weights;
+    std::nth_element(all_imp.begin(), all_imp.begin() + drop_count, all_imp.end());
+    return all_imp[drop_count];
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+void synap_build_scans(
+    const SIZE_TYPE nnz_c,
+    const SIZE_TYPE nnz_p,
+    const VALUE_TYPE importance_cutoff,
+    const std::vector<VALUE_TYPE>& merged_imp_c,
+    const std::vector<VALUE_TYPE>& pv,
+    const std::vector<int8_t>& is_dup_p,
+    std::vector<SIZE_TYPE>& scan_c,   // out: size nnz_c + 1
+    std::vector<SIZE_TYPE>& scan_p)   // out: size nnz_p + 1
+{
+    scan_c.resize(nnz_c + 1);
+    scan_p.resize(nnz_p + 1);
+
+    scan_c[0] = 0;
+    for (SIZE_TYPE c = 0; c < nnz_c; ++c)
+        scan_c[c + 1] = scan_c[c] + (merged_imp_c[c] >= importance_cutoff ? 1 : 0);
+
+    scan_p[0] = 0;
+    for (SIZE_TYPE p = 0; p < nnz_p; ++p)
+        scan_p[p + 1] = scan_p[p]
+            + (!is_dup_p[p] && pv[p] >= importance_cutoff ? 1 : 0);
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+void synap_parallel_fill(
+    const SIZE_TYPE nnz_c,
+    const SIZE_TYPE nnz_p,
+    const SIZE_TYPE rows,
+    const SIZE_TYPE new_nnz,
+    const VALUE_TYPE importance_cutoff,
+    const std::vector<SIZE_TYPE>& cp,
+    const std::vector<SIZE_TYPE>& ci,
+    const std::vector<VALUE_TYPE>& cv0,
+    const std::vector<VALUE_TYPE>& cv1,
+    const std::vector<VALUE_TYPE>& cv2,
+    const std::vector<SIZE_TYPE>& pp,
+    const std::vector<SIZE_TYPE>& pi,
+    const std::vector<VALUE_TYPE>& pv,
+    const std::vector<VALUE_TYPE>& merged_imp_c,
+    const std::vector<int8_t>&    is_dup_p,
+    const std::vector<SIZE_TYPE>& scan_c,
+    const std::vector<SIZE_TYPE>& scan_p,
+    std::vector<SIZE_TYPE>&  out_i,
+    std::vector<VALUE_TYPE>& out_v0,
+    std::vector<VALUE_TYPE>& out_v1,
+    std::vector<VALUE_TYPE>& out_v2,
+    const int num_cpus)
+{
+    constexpr SIZE_TYPE SENTINEL = std::numeric_limits<SIZE_TYPE>::max();
+
+    auto row_of = [&](const std::vector<SIZE_TYPE>& ptrs, SIZE_TYPE idx) -> SIZE_TYPE {
+        return static_cast<SIZE_TYPE>(
+            std::upper_bound(ptrs.begin(), ptrs.end(), idx) - ptrs.begin()) - 1;
+    };
+
+    // co_rank: given output position w_start, find (c, p) such that exactly
+    // w_start kept entries from connections[0..c) and probes[0..p) precede it.
+    auto co_rank = [&](SIZE_TYPE w_start) -> std::pair<SIZE_TYPE, SIZE_TYPE> {
+        if (w_start == 0)       return {0, 0};
+        if (w_start >= new_nnz) return {nnz_c, nnz_p};
+
+        SIZE_TYPE lo = 0, hi = nnz_c;
+        while (lo < hi) {
+            const SIZE_TYPE mid   = lo + (hi - lo) / 2;
+            const SIZE_TYPE r_mid = row_of(cp, mid);
+            const SIZE_TYPE prk   = pp[r_mid] + static_cast<SIZE_TYPE>(
+                std::lower_bound(pi.begin() + pp[r_mid], pi.begin() + pp[r_mid + 1], ci[mid])
+                - (pi.begin() + pp[r_mid]));
+            if (scan_c[mid] + scan_p[prk] < w_start) lo = mid + 1;
+            else                                      hi = mid;
+        }
+        const SIZE_TYPE c_start = lo;
+        const SIZE_TYPE k       = w_start - scan_c[c_start];
+        const SIZE_TYPE p_start = static_cast<SIZE_TYPE>(
+            std::lower_bound(scan_p.begin() + 1, scan_p.end(), k + 1)
+            - scan_p.begin()) - 1;
+        return {c_start, p_start};
+    };
+
+    #pragma omp parallel num_threads(num_cpus)
+    {
+        const int      tid      = omp_get_thread_num();
+        const int      nthreads = omp_get_num_threads();
+        const SIZE_TYPE chunk   = (new_nnz + nthreads - 1) / nthreads;
+        const SIZE_TYPE w_start = std::min((SIZE_TYPE)tid * chunk, new_nnz);
+        const SIZE_TYPE w_end   = std::min(w_start + chunk, new_nnz);
+        const SIZE_TYPE w_count = w_end - w_start;
+
+        std::vector<SIZE_TYPE>  local_i (w_count);
+        std::vector<VALUE_TYPE> local_v0(w_count);
+        std::vector<VALUE_TYPE> local_v1(w_count, VALUE_TYPE(0));
+        std::vector<VALUE_TYPE> local_v2(w_count);
+
+        if (w_count > 0) {
+            auto [c, p] = co_rank(w_start);
+
+            SIZE_TYPE r_c = (c < nnz_c) ? row_of(cp, c) : rows;
+            SIZE_TYPE r_p = (p < nnz_p) ? row_of(pp, p) : rows;
+
+            for (SIZE_TYPE w = 0; w < w_count; ++w) {
+                while (c < nnz_c && merged_imp_c[c] < importance_cutoff) {
+                    ++c;
+                    while (r_c + 1 < rows && cp[r_c + 1] <= c) ++r_c;
+                }
+                while (p < nnz_p && (is_dup_p[p] || pv[p] < importance_cutoff)) {
+                    ++p;
+                    while (r_p + 1 < rows && pp[r_p + 1] <= p) ++r_p;
+                }
+
+                const SIZE_TYPE row_c_val = (c < nnz_c) ? r_c   : rows;
+                const SIZE_TYPE col_c_val = (c < nnz_c) ? ci[c]  : SENTINEL;
+                const SIZE_TYPE row_p_val = (p < nnz_p) ? r_p   : rows;
+                const SIZE_TYPE col_p_val = (p < nnz_p) ? pi[p]  : SENTINEL;
+
+                const bool c_first =
+                    (row_c_val < row_p_val) ||
+                    (row_c_val == row_p_val && col_c_val < col_p_val);
+
+                if (c_first) {
+                    local_i [w] = col_c_val;
+                    local_v0[w] = cv0[c];
+                    local_v1[w] = VALUE_TYPE(0);
+                    local_v2[w] = merged_imp_c[c];
+                    ++c;
+                    while (r_c + 1 < rows && cp[r_c + 1] <= c) ++r_c;
+                } else {
+                    local_i [w] = col_p_val;
+                    local_v0[w] = VALUE_TYPE(0);
+                    local_v1[w] = VALUE_TYPE(0);
+                    local_v2[w] = pv[p];
+                    ++p;
+                    while (r_p + 1 < rows && pp[r_p + 1] <= p) ++r_p;
+                }
+            }
+        }
+
+        // All reads done — resize in-place (no realloc; capacity guaranteed)
+        #pragma omp single
+        {
+            out_i .resize(new_nnz);
+            out_v0.resize(new_nnz);
+            out_v1.resize(new_nnz, VALUE_TYPE(0));
+            out_v2.resize(new_nnz);
+        }
+
+        for (SIZE_TYPE w = 0; w < w_count; ++w) {
+            out_i [w_start + w] = local_i [w];
+            out_v0[w_start + w] = local_v0[w];
+            out_v1[w_start + w] = local_v1[w];
+            out_v2[w_start + w] = local_v2[w];
+        }
+    }
+}
+
+template <typename SIZE_TYPE>
+std::shared_ptr<std::vector<SIZE_TYPE>> synap_build_ptrs(
+    const SIZE_TYPE rows,
+    const std::vector<SIZE_TYPE>& cp,
+    const std::vector<SIZE_TYPE>& pp,
+    const std::vector<SIZE_TYPE>& scan_c,
+    const std::vector<SIZE_TYPE>& scan_p,
+    const int num_cpus)
+{
+    auto new_ptrs_vec = std::make_shared<std::vector<SIZE_TYPE>>(rows + 1);
+    auto& new_ptrs = *new_ptrs_vec;
+    new_ptrs[0] = 0;
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (SIZE_TYPE r = 0; r < rows; ++r)
+        new_ptrs[r + 1] = (scan_c[cp[r + 1]] - scan_c[cp[r]])
+                        + (scan_p[pp[r + 1]] - scan_p[pp[r]]);
+
+    for (SIZE_TYPE r = 0; r < rows; ++r)
+        new_ptrs[r + 1] += new_ptrs[r];
+
+    return new_ptrs_vec;
+}
+
+// ── sisldo_optim_synaptogenesis ───────────────────────────────────────────────
 
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void sisldo_optim_synaptogenesis(
@@ -501,9 +784,7 @@ void sisldo_optim_synaptogenesis(
 
     const SIZE_TYPE rows  = weights.connections.rows;
     const SIZE_TYPE nnz_c = weights.connections.nnz();
-    constexpr SIZE_TYPE SENTINEL = std::numeric_limits<SIZE_TYPE>::max();
 
-    // ── Convert probe importance scores ──────────────────────────────────────
     {
         auto& pval = *weights.probes.values[0];
         const SIZE_TYPE pnnz = weights.probes.nnz();
@@ -512,11 +793,9 @@ void sisldo_optim_synaptogenesis(
             pval[i] = -(pval[i] / learning_rate) * importance_beta;
     }
 
-    auto probes_csr = to_csr(weights.probes, num_cpus);
+    auto probes_csr    = to_csr(weights.probes, num_cpus);
     const SIZE_TYPE nnz_p = probes_csr.nnz();
 
-    // Const refs to old data — valid until resize (which won't reallocate
-    // because reserve_connections guarantees capacity >= max_weights >= new_nnz)
     const auto& cp  = *weights.connections.ptrs[0];
     const auto& ci  = *weights.connections.indices[0];
     const auto& cv0 = *weights.connections.values[0];
@@ -526,84 +805,17 @@ void sisldo_optim_synaptogenesis(
     const auto& pi  = *probes_csr.indices[0];
     const auto& pv  = *probes_csr.values[0];
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    // Row of flat connection index c — O(log rows)
-    auto row_of_c = [&](SIZE_TYPE c) -> SIZE_TYPE {
-        return static_cast<SIZE_TYPE>(
-            std::upper_bound(cp.begin(), cp.end(), c) - cp.begin()) - 1;
-    };
-
-    // Row of flat probe index p — O(log rows)
-    auto row_of_p = [&](SIZE_TYPE p) -> SIZE_TYPE {
-        return static_cast<SIZE_TYPE>(
-            std::upper_bound(pp.begin(), pp.end(), p) - pp.begin()) - 1;
-    };
-
-    // Flat probe index for (row, col). Returns nnz_p if absent.
-    auto find_probe = [&](SIZE_TYPE row, SIZE_TYPE col) -> SIZE_TYPE {
-        const SIZE_TYPE p0 = pp[row], p1 = pp[row + 1];
-        auto it = std::lower_bound(pi.begin() + p0, pi.begin() + p1, col);
-        const SIZE_TYPE pos = static_cast<SIZE_TYPE>(it - pi.begin());
-        return (pos < p1 && pi[pos] == col) ? pos : nnz_p;
-    };
-
-    // # probes whose key (row, col) is strictly less than key of connection c.
-    // = flat probe index at which a probe matching c's key would sit.
-    auto p_rank_for_c = [&](SIZE_TYPE c, SIZE_TYPE r_c) -> SIZE_TYPE {
-        return pp[r_c] + static_cast<SIZE_TYPE>(
-            std::lower_bound(pi.begin() + pp[r_c], pi.begin() + pp[r_c + 1], ci[c])
-            - (pi.begin() + pp[r_c]));
-    };
-
-    // ── Phase 1: Mark duplicates, compute merged importances (parallel) ───────
     std::vector<VALUE_TYPE> merged_imp_c(nnz_c);
     std::vector<int8_t>     is_dup_p(nnz_p, 0);
+    synap_mark_duplicates(nnz_c, nnz_p, cp, ci, cv2, pp, pi, pv, rows,
+                          merged_imp_c, is_dup_p, num_cpus);
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
-    for (SIZE_TYPE c = 0; c < nnz_c; ++c) {
-        const SIZE_TYPE r_c  = row_of_c(c);
-        const SIZE_TYPE pp_  = find_probe(r_c, ci[c]);
-        if (pp_ != nnz_p) {
-            // Each (row,col) is unique in connections, so no two connections
-            // map to the same probe — no write-write race on is_dup_p.
-            merged_imp_c[c] = std::max(cv2[c], pv[pp_]);
-            is_dup_p[pp_] = 1;
-        } else {
-            merged_imp_c[c] = cv2[c];
-        }
-    }
+    const VALUE_TYPE importance_cutoff = synap_compute_cutoff(
+        nnz_c, nnz_p, max_weights, merged_imp_c, pv, is_dup_p);
 
-    // ── Phase 1b: Importance cutoff via nth_element if over budget ────────────
-    SIZE_TYPE dup_count = 0;
-    for (SIZE_TYPE p = 0; p < nnz_p; ++p) dup_count += is_dup_p[p];
-    const SIZE_TYPE total_merged = nnz_c + nnz_p - dup_count;
-
-    VALUE_TYPE importance_cutoff = std::numeric_limits<VALUE_TYPE>::lowest();
-
-    if (total_merged > max_weights) {
-        std::vector<VALUE_TYPE> all_imp;
-        all_imp.reserve(total_merged);
-        for (SIZE_TYPE c = 0; c < nnz_c; ++c)
-            all_imp.push_back(merged_imp_c[c]);
-        for (SIZE_TYPE p = 0; p < nnz_p; ++p)
-            if (!is_dup_p[p]) all_imp.push_back(pv[p]);
-
-        const SIZE_TYPE drop_count = total_merged - max_weights;
-        std::nth_element(all_imp.begin(), all_imp.begin() + drop_count, all_imp.end());
-        importance_cutoff = all_imp[drop_count];
-    }
-
-    // ── Phase 2: Exclusive prefix scans — O(nnz_c + nnz_p) serial ───────────
-    // scan_c[c] = # kept connections in [0..c)
-    // scan_p[p] = # kept probes     in [0..p)
-    std::vector<SIZE_TYPE> scan_c(nnz_c + 1), scan_p(nnz_p + 1);
-    scan_c[0] = 0;
-    for (SIZE_TYPE c = 0; c < nnz_c; ++c)
-        scan_c[c + 1] = scan_c[c] + (merged_imp_c[c] >= importance_cutoff ? 1 : 0);
-    scan_p[0] = 0;
-    for (SIZE_TYPE p = 0; p < nnz_p; ++p)
-        scan_p[p + 1] = scan_p[p] + (!is_dup_p[p] && pv[p] >= importance_cutoff ? 1 : 0);
+    std::vector<SIZE_TYPE> scan_c, scan_p;
+    synap_build_scans(nnz_c, nnz_p, importance_cutoff,
+                      merged_imp_c, pv, is_dup_p, scan_c, scan_p);
 
     const SIZE_TYPE new_nnz = scan_c[nnz_c] + scan_p[nnz_p];
 
@@ -621,145 +833,23 @@ void sisldo_optim_synaptogenesis(
         return;
     }
 
-    // ── Co-rank ───────────────────────────────────────────────────────────────
-    // Finds (c_start, p_start) such that exactly w_start kept elements from
-    // connections[0..c_start) and probes[0..p_start) precede output[w_start].
-    //
-    // out_pos(c) = scan_c[c] + scan_p[p_rank_for_c(c)] is non-decreasing in c.
-    // Binary search for first c where out_pos(c) >= w_start: O(log(nnz_c) * log(rows)).
-    // Then p_start derived from: # kept probes before w_start = w_start - scan_c[c_start].
-    auto co_rank = [&](SIZE_TYPE w_start) -> std::pair<SIZE_TYPE, SIZE_TYPE> {
-        if (w_start == 0)       return {0, 0};
-        if (w_start >= new_nnz) return {nnz_c, nnz_p};
+    synap_parallel_fill(nnz_c, nnz_p, rows, new_nnz, importance_cutoff,
+                        cp, ci, cv0, cv1, cv2, pp, pi, pv,
+                        merged_imp_c, is_dup_p, scan_c, scan_p,
+                        *weights.connections.indices[0],
+                        *weights.connections.values[0],
+                        *weights.connections.values[1],
+                        *weights.connections.values[2],
+                        num_cpus);
 
-        SIZE_TYPE lo = 0, hi = nnz_c;
-        while (lo < hi) {
-            const SIZE_TYPE mid   = lo + (hi - lo) / 2;
-            const SIZE_TYPE r_mid = row_of_c(mid);
-            const SIZE_TYPE prk   = p_rank_for_c(mid, r_mid);
-            if (scan_c[mid] + scan_p[prk] < w_start) lo = mid + 1;
-            else                                      hi = mid;
-        }
-        const SIZE_TYPE c_start = lo;
+    /*
+    note: synap_build_ptrs captures cp by const ref. That's still pointing into the old ptrs[0] vector, 
+    which is fine because synap_build_ptrs only reads it and the new shared_ptr is assigned afterward. 
+    If you reorder those two operations, cp becomes a dangling ref, so the ptrs[0] = assignment must stay last.
+    */
+    weights.connections.ptrs[0] = synap_build_ptrs(
+        rows, cp, pp, scan_c, scan_p, num_cpus);
 
-        // k-th kept probe (0-indexed k) has raw index:
-        //   lower_bound(scan_p[1..end], k+1) - scan_p.begin() - 1
-        const SIZE_TYPE k = w_start - scan_c[c_start];
-        const SIZE_TYPE p_start = static_cast<SIZE_TYPE>(
-            std::lower_bound(scan_p.begin() + 1, scan_p.end(), k + 1)
-            - scan_p.begin()) - 1;
-
-        return {c_start, p_start};
-    };
-
-    // ── Phase 3: Parallel read into local buffers, then resize, then write ────
-    //
-    // READ before RESIZE: reserve_connections guarantees ci.data() remains valid
-    // after resize (no reallocation). But raw indices into ci[c] for c >= new_nnz
-    // would be formally OOB after resize. omp single provides implicit barriers
-    // before and after, separating all reads from the resize and all writes.
-    #pragma omp parallel num_threads(num_cpus)
-    {
-        const int      tid      = omp_get_thread_num();
-        const int      nthreads = omp_get_num_threads();
-        const SIZE_TYPE chunk   = (new_nnz + nthreads - 1) / nthreads;
-        const SIZE_TYPE w_start = std::min((SIZE_TYPE)tid * chunk, new_nnz);
-        const SIZE_TYPE w_end   = std::min(w_start + chunk, new_nnz);
-        const SIZE_TYPE w_count = w_end - w_start;
-
-        // Local buffers bounded by new_nnz / num_cpus entries
-        std::vector<SIZE_TYPE>  local_i (w_count);
-        std::vector<VALUE_TYPE> local_v0(w_count);
-        std::vector<VALUE_TYPE> local_v1(w_count, VALUE_TYPE(0));
-        std::vector<VALUE_TYPE> local_v2(w_count);
-
-        if (w_count > 0) {
-            auto [c, p] = co_rank(w_start);
-
-            // Maintain current rows incrementally — O(1) amortized per advance
-            SIZE_TYPE r_c = (c < nnz_c) ? row_of_c(c) : rows;
-            SIZE_TYPE r_p = (p < nnz_p) ? row_of_p(p) : rows;
-
-            for (SIZE_TYPE w = 0; w < w_count; ++w) {
-                // Skip non-kept connections
-                while (c < nnz_c && merged_imp_c[c] < importance_cutoff) {
-                    ++c;
-                    while (r_c + 1 < rows && cp[r_c + 1] <= c) ++r_c;
-                }
-                // Skip duplicate or non-kept probes
-                while (p < nnz_p && (is_dup_p[p] || pv[p] < importance_cutoff)) {
-                    ++p;
-                    while (r_p + 1 < rows && pp[r_p + 1] <= p) ++r_p;
-                }
-
-                const SIZE_TYPE row_c_val = (c < nnz_c) ? r_c  : rows;
-                const SIZE_TYPE col_c_val = (c < nnz_c) ? ci[c] : SENTINEL;
-                const SIZE_TYPE row_p_val = (p < nnz_p) ? r_p  : rows;
-                const SIZE_TYPE col_p_val = (p < nnz_p) ? pi[p] : SENTINEL;
-
-                // Keys are disjoint (duplicates removed), so strict < is correct
-                const bool c_first =
-                    (row_c_val < row_p_val) ||
-                    (row_c_val == row_p_val && col_c_val < col_p_val);
-
-                if (c_first) {
-                    local_i [w] = col_c_val;
-                    local_v0[w] = cv0[c];
-                    local_v1[w] = VALUE_TYPE(0);  // grad reset on restructure
-                    local_v2[w] = merged_imp_c[c];
-                    ++c;
-                    while (r_c + 1 < rows && cp[r_c + 1] <= c) ++r_c;
-                } else {
-                    local_i [w] = col_p_val;
-                    local_v0[w] = VALUE_TYPE(0);  // new connection, no weight yet
-                    local_v1[w] = VALUE_TYPE(0);
-                    local_v2[w] = pv[p];
-                    ++p;
-                    while (r_p + 1 < rows && pp[r_p + 1] <= p) ++r_p;
-                }
-            }
-        }
-        // ── All reads complete. omp single resizes (implicit barrier before+after).
-        #pragma omp single
-        {
-            weights.connections.indices[0]->resize(new_nnz);
-            weights.connections.values[0] ->resize(new_nnz);
-            weights.connections.values[1] ->resize(new_nnz, VALUE_TYPE(0));
-            weights.connections.values[2] ->resize(new_nnz);
-        }
-        // ── Write local buffers to output ─────────────────────────────────────
-        auto& out_i  = *weights.connections.indices[0];
-        auto& out_v0 = *weights.connections.values[0];
-        auto& out_v1 = *weights.connections.values[1];
-        auto& out_v2 = *weights.connections.values[2];
-
-        for (SIZE_TYPE w = 0; w < w_count; ++w) {
-            out_i [w_start + w] = local_i [w];
-            out_v0[w_start + w] = local_v0[w];
-            out_v1[w_start + w] = local_v1[w];
-            out_v2[w_start + w] = local_v2[w];
-        }
-    }
-
-    // ── Phase 4: Update ptrs ──────────────────────────────────────────────────
-    // scan_c and scan_p give per-row kept counts directly.
-    // Note: cp is still valid here (we only resized the data vectors, not ptrs).
-    auto new_ptrs_vec = std::make_shared<std::vector<SIZE_TYPE>>(rows + 1);
-    auto& new_ptrs = *new_ptrs_vec;
-    new_ptrs[0] = 0;
-
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
-    for (SIZE_TYPE r = 0; r < rows; ++r)
-        new_ptrs[r + 1] = (scan_c[cp[r + 1]] - scan_c[cp[r]])
-                        + (scan_p[pp[r + 1]] - scan_p[pp[r]]);
-
-    // Serial prefix sum over counts — O(rows), negligible
-    for (SIZE_TYPE r = 0; r < rows; ++r)
-        new_ptrs[r + 1] += new_ptrs[r];
-
-    weights.connections.ptrs[0] = new_ptrs_vec;
-
-    // ── Clear probes ──────────────────────────────────────────────────────────
     weights.probes.ptrs       = 0;
     weights.probes.indices[0] = nullptr;
     weights.probes.indices[1] = nullptr;

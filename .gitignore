@@ -12,3 +12,8 @@ docs/
 *.prof
 to_convert
 compile_commands.json
+*.zip
+*.npz
+pong_sports
+*.bin
+*.so
