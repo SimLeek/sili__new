@@ -15,7 +15,15 @@ import signal
 import numpy as np
 import gymnasium as gym
 
+import faulthandler
+faulthandler.enable()
 
+# todo: init direct connections or o-[i-w,i+w] connections, in a diagonal line from 0,0 to max_i, max_o
+# todo: actions should take from ALL state neurons, averaging chunks, NOT [:num_actions].
+#   Could use another sparse net but averaging chunks is easier and does about the same
+# todo: also try doing that with inputs. The state should be chunked with averages matching inputs, and thus should be larger than inputs.
+# todo: add actor critic back in to action output and add direct-ish sparse connections to actor critic
+#   While we may rarely have external feedback, we can route the energy aux_loss here for better motion learning
 # ── Config ────────────────────────────────────────────────────────────────────
 
 GAME      = sys.argv[1] if len(sys.argv) > 1 else "ALE/Pong-v5"
@@ -26,18 +34,18 @@ SAVE_FILE = "sparse_agent.npz"
 OBS_SIZE = 210 * 160 * 3
 
 # State size: how many recurrent neurons.
-STATE_SIZE = 10_000
+STATE_SIZE = 100_000
 
 # Network capacity (per layer)
-MAX_WEIGHTS = 500_000
+MAX_WEIGHTS = 2_000_000
 NUM_CPUS    = 4
 
 # Training hyperparameters
-LR                   = 1e-3
+LR                   = 1e-1
 IMPORTANCE_BETA      = 0.01
-IMPORTANCE_DECAY     = 1e-3
-SYNAPTOGENESIS_K     = 64
-SYNAPTOGENESIS_EVERY = 200
+IMPORTANCE_DECAY     = 1e-3*0.03*.03  # needs to be related to sparsity
+SYNAPTOGENESIS_K     = 32
+SYNAPTOGENESIS_EVERY = 20
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -57,6 +65,7 @@ def main():
         importance_decay     = IMPORTANCE_DECAY,
         synaptogenesis_k     = SYNAPTOGENESIS_K,
         synaptogenesis_every = SYNAPTOGENESIS_EVERY,
+        percent_active= 0.03
     )
 
     if os.path.exists(SAVE_FILE):

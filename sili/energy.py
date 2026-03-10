@@ -242,7 +242,9 @@ def _apply_energy_dynamics(
 
     c_np = (energy_flat + drive + noise).reshape(original_shape)
     c_t = Tensor(c_np.astype(dtype), backend=h.backend)
-    new_energy_t = c_t - activation_cost * h
+    # Abs backward in sili is defined in every backend with `grad[a == 0.0] = 1.0`
+    # in pytorch, you would use `h_abs = torch.where(h == 0, h, torch.abs(h))` and then use h_abs instead of abs(h)
+    new_energy_t = c_t - activation_cost * abs(h)
     energy_loss  = (reactivity / 2.0) * ((new_energy_t - setpoint)**2).sum()
     aux_loss     = kl_val + energy_loss     # float + Tensor -> Tensor via _coerce
 
@@ -287,6 +289,8 @@ class EnergyDynamics(Module):
         assert 0.01 <= activation_cost <= 0.5, "activation_cost (gamma) must be in [0.01, 0.5]"
         assert 0.0  <  density         < 1.0,  "density (beta) must be in (0, 1)"
         assert 0.0  <  p               <= 1.0, "p must be in (0, 1]"
+
+        self._energy_start = max(0.0,2.0-drive*10)  # allow 10 steps for noise, but don't wait forever for more noise
 
         self.drive           = float(drive)
         self.activation_cost = float(activation_cost)
@@ -333,7 +337,7 @@ class EnergyDynamics(Module):
         """
         if self.energy is None or self.energy.shape != h.shape:
             # Reset energy on shape change (e.g. body switch, region resize)
-            self.energy = np.zeros(h.shape, dtype=np.float32)
+            self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
 
         h_out, self.energy, self.aux_loss, self.actual_p = _apply_energy_dynamics(
             h, self.energy,

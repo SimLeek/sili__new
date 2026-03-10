@@ -71,6 +71,8 @@ struct sparse_struct {
     SIZE_TYPE cols;
     SIZE_TYPE _reserved_space = 0;
 
+    using size_type = SIZE_TYPE;   // Exporting the type
+
     static constexpr std::size_t n_index_arrays = num_indices<INDICES>;
     static constexpr std::size_t n_value_arrays = num_indices<VALUES>;
     static constexpr std::size_t n_pointer_arrays = num_indices<PTRS>;
@@ -144,8 +146,18 @@ using COOSynaptogenesis = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIn
 
 template <class SYNAPSES, class SYNAPTOGENESIS>
 struct sparse_weights{
+    using size_type = typename SYNAPSES::size_type;
+
     SYNAPSES connections;
     SYNAPTOGENESIS probes;
+    // out_degree[j] = #weights targeting output neuron j.
+    // Cached because computing it requires O(nnz) — maintained incrementally by synaptogenesis.
+    std::vector<size_type> out_degree;
+
+    // in_degree is free from CSR ptrs — no storage needed.
+    inline size_type in_degree(size_type i) const {
+        return (*connections.ptrs[0])[i + 1] - (*connections.ptrs[0])[i];
+    }
 };
 
 template <class SIZE_TYPE, class VALUE_TYPE>

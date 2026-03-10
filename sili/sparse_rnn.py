@@ -108,6 +108,9 @@ class _SparseLayerBase(Module):
     def num_cpus(self)     -> int: return self._c.num_cpus
 
     @property
+    def out_degree(self) -> int: return self._c.out_degree
+
+    @property
     def weights(self)    -> np.ndarray: return self._c.weights_vals
     @property
     def importance(self) -> np.ndarray: return self._c.importance
@@ -268,6 +271,7 @@ class SparseRNNCell(Module):
         # recurrent layer needs it. Storing CSR here would force the recurrent
         # input to be the energy-gated pattern (2.0 / 0) rather than the
         # actual activation values.
+        print(self.input_proj.nnz, self.recurrent.nnz, end='\r')
         return new_state, aux_loss, actual_p
 
     def reset(self):
@@ -318,8 +322,8 @@ class SparseRNNAgent(Module):
     def __init__(self, n_inputs: int, n_actions: int, state_size: int, max_weights: int,
                  num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
                  lr: float = 1e-3, importance_beta: float = 0.01,
-                 importance_decay: float = 1e-3, synaptogenesis_k: int = 64,
-                 synaptogenesis_every: int = 200):
+                 importance_decay: float = 1e-3*0.03, synaptogenesis_k: int = 64,
+                 synaptogenesis_every: int = 20):
         assert n_actions <= state_size
 
         self.cell = SparseRNNCell(n_inputs, state_size, max_weights, num_cpus,

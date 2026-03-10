@@ -53,6 +53,7 @@ class Tensor:
     def __neg__(self):             return neg(self)
     def relu(self):                return relu(self)
     def sum(self, axis=None):      return reduce_sum(self, axis)
+    def __abs__(self):             return tensor_abs(self)
 
     def __radd__(self, o): return add(self._coerce(o), self)
     def __sub__(self, o):  return add(self, neg(self._coerce(o)))
@@ -139,6 +140,11 @@ def reduce_sum(a: Tensor, axis=None) -> Tensor:
     out._backward = _bwd
     return out
 
+def tensor_abs(a: Tensor) -> Tensor:
+    out = Tensor(a.backend.tensor_abs(a.data), (a,), "abs", a.backend)
+    def _bwd(): _acc(a, a.backend.abs_backward(a.data, out.grad))
+    out._backward = _bwd
+    return out
 
 def silu(a: Tensor) -> Tensor:
     out = Tensor(a.backend.silu(a.data), (a,), "silu", a.backend)

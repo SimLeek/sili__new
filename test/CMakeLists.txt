@@ -49,8 +49,8 @@ find_package(OpenMP REQUIRED)
 add_executable(
     sili_tests
 
-    #unittest_sisldo.cpp
-    integration_test_sisldo.cpp
+    unittest_sisldo.cpp
+    #integration_test_sisldo.cpp
 
     #test_parallel.cpp
     #test_fiber.cpp

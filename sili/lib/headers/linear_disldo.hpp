@@ -91,6 +91,13 @@ void disldo_backward(
     VALUE_TYPE*       neuron_grad_accum,    // [out_cols]
     const int         num_cpus = 4)
 {
+    for (SIZE_TYPE b = 0; b < batch; ++b)
+        for (SIZE_TYPE ic = 0; ic < in_cols; ++ic)
+            neuron_input_accum[ic] += std::abs(input[b * in_cols + ic]);
+    for (SIZE_TYPE b = 0; b < batch; ++b)
+        for (SIZE_TYPE oc = 0; oc < weights.connections.cols; ++oc)
+            neuron_grad_accum[oc] += std::abs(output_grad[b * weights.connections.cols + oc]);
+
     if (connections_empty(weights.connections)) return;
 
     const SIZE_TYPE out_cols     = weights.connections.cols;

@@ -87,6 +87,19 @@ class CpuBackend(Backend):
         sig = 1.0 / (1.0 + np.exp(-x))
         return np.asarray(grad, dtype=np.float32) * sig * (1.0 + x * (1.0 - sig))
 
+    def tensor_abs(self, a) -> np.ndarray:
+        return np.abs(np.asarray(a, dtype=np.float32))
+
+    def abs_backward(self, a, grad) -> np.ndarray:
+        local_gradient = np.sign(np.asarray(a, dtype=np.float32))
+        # The fix for synaptogenesis from zero:
+        # np.sign(0.0) returns 0.0, which severs the gradient flow.
+        # We assign a valid subgradient (e.g., 1.0 or a small positive value)
+        # to force the optimizer to push the weights and "wake up" the neuron.
+        local_gradient[a == 0.0] = 1.0
+
+        return local_gradient * grad
+
     # ── linear algebra ────────────────────────────────────────────────────────
 
     def matmul(self, a, b) -> np.ndarray:

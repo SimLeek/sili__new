@@ -48,6 +48,7 @@ public:
 
         neuron_input_accum.assign(n_inputs,  V(0));
         neuron_grad_accum .assign(n_outputs, V(0));
+        weights.out_degree.assign(n_outputs, S(0));
     }
 
     // ── Scalar properties ─────────────────────────────────────────────────────
@@ -79,20 +80,15 @@ public:
                   py::array_t<V> vals, py::array_t<V> imp) {
         auto pb = ptrs.request(), ib = indices.request(),
             vb = vals.request(), impb = imp.request();
-        
-        const S nnz_new = (S)ib.size;
-        
-        // .assign() reuses existing capacity if nnz_new <= max_weights.
-        // This prevents the 2x memory spike.
-        weights.connections.ptrs[0]->assign((S*)pb.ptr, (S*)pb.ptr + pb.size);
-        weights.connections.indices[0]->assign((S*)ib.ptr, (S*)ib.ptr + nnz_new);
-        weights.connections.values[0]->assign((V*)vb.ptr, (V*)vb.ptr + nnz_new);
-        
-        // Reset gradients to zero
-        weights.connections.values[1]->assign(nnz_new, V(0));
-        
-        // Load importance data
-        weights.connections.values[2]->assign((V*)impb.ptr, (V*)impb.ptr + nnz_new);
+        const S rows = weights.connections.rows;
+        const S cols = weights.connections.cols;
+        weights = make_weights<S, V>(
+            rows, cols,
+            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
+            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
+            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
+            std::vector<V>((S)ib.size,   V(0)),
+            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
     }
 
     // ── Forward (use module-level dense_to_csr to prepare input first) ─────────
@@ -245,6 +241,7 @@ public:
         reserve_connections(weights.connections, max_weights);
         neuron_input_accum.assign(n_inputs,  V(0));
         neuron_grad_accum .assign(n_outputs, V(0));
+        weights.out_degree.assign(n_outputs, S(0));
     }
 
     S n_inputs()  const { return weights.connections.rows; }
@@ -305,16 +302,18 @@ public:
         std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
     }
     void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                  py::array_t<V> vals, py::array_t<V> imp) {
-        auto pb = ptrs.request(), ib = indices.request(),
-            vb = vals.request(), impb = imp.request();
-        const S nnz_new = (S)ib.size;
-
-        weights.connections.ptrs[0]->assign((S*)pb.ptr, (S*)pb.ptr + pb.size);
-        weights.connections.indices[0]->assign((S*)ib.ptr, (S*)ib.ptr + nnz_new);
-        weights.connections.values[0]->assign((V*)vb.ptr, (V*)vb.ptr + nnz_new);
-        weights.connections.values[1]->assign(nnz_new, V(0));
-        weights.connections.values[2]->assign((V*)impb.ptr, (V*)impb.ptr + nnz_new);
+                      py::array_t<V> vals,  py::array_t<V> imp) {
+        auto pb=ptrs.request(), ib=indices.request(),
+             vb=vals.request(), impb=imp.request();
+        const S rows = weights.connections.rows;
+        const S cols = weights.connections.cols;
+        weights = make_weights<S, V>(
+            rows, cols,
+            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
+            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
+            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
+            std::vector<V>((S)ib.size,   V(0)),
+            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -368,8 +367,6 @@ PYBIND11_MODULE(_cpu, m)
         .def("optim_synaptogenesis", &SISLDOLayer::optim_synaptogenesis,
              py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
         .def("zero_accum",           &SISLDOLayer::zero_accum)
-        .def("load_weights",         &SISLDOLayer::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
 
         .def_property_readonly("neuron_input_accum", &SISLDOLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &SISLDOLayer::get_neuron_grad_accum)
@@ -379,6 +376,15 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("indices",            &SISLDOLayer::get_indices)
         .def_property_readonly("ptrs",               &SISLDOLayer::get_ptrs)
 
+        .def("load_weights",        &SISLDOLayer::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def_property_readonly("out_degree", [](const SISLDOLayer& self) {
+            return py::array_t<SISLDOLayer::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(SISLDOLayer::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
         .def_readonly ("num_cpus",  &SISLDOLayer::num_cpus)
         .def_readwrite("solidify",  &SISLDOLayer::solidify)
         .def_property_readonly("n_inputs",  &SISLDOLayer::n_inputs)
@@ -402,14 +408,21 @@ PYBIND11_MODULE(_cpu, m)
         .def("optim_synaptogenesis", &DISLDOLayer::optim_synaptogenesis,
              py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
         .def("zero_accum",           &DISLDOLayer::zero_accum)
-        .def("load_weights",         &DISLDOLayer::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
         .def_property_readonly("neuron_input_accum", &DISLDOLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &DISLDOLayer::get_neuron_grad_accum)
         .def_property_readonly("weights_vals",       &DISLDOLayer::get_weights_vals)
         .def_property_readonly("importance",         &DISLDOLayer::get_importance)
         .def_property_readonly("indices",            &DISLDOLayer::get_indices)
         .def_property_readonly("ptrs",               &DISLDOLayer::get_ptrs)
+        .def("load_weights",        &DISLDOLayer::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def_property_readonly("out_degree", [](const DISLDOLayer& self) {
+            return py::array_t<DISLDOLayer::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(DISLDOLayer::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
         .def_readonly ("num_cpus",  &DISLDOLayer::num_cpus)
         .def_readwrite("solidify",  &DISLDOLayer::solidify)
         .def_property_readonly("n_inputs",  &DISLDOLayer::n_inputs)

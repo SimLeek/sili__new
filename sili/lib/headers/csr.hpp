@@ -281,6 +281,9 @@ SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
     w.connections.values[2]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
     w.probes.rows = rows;
     w.probes.cols = cols;
+    w.out_degree.assign(cols, SIZE_TYPE(0));
+    for (const auto& idx : *w.connections.indices[0])
+        w.out_degree[idx]++;
     return w;
 }
 
