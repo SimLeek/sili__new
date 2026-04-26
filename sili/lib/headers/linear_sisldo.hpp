@@ -10,15 +10,13 @@
 
 //SISLDO: Sparse Input, Sparse Linear, Dense Output
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
+///Returns true if connections are unallocated or empty.
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 inline bool connections_empty(const CSRSynapses<SIZE_TYPE, VALUE_TYPE>& c) {
     return !c.values[0] || c.values[0]->empty();
 }
 
-// Reserve all value/index vectors to max_weights if not already large enough.
-// Called once at model init — after this, vectors never reallocate.
+///Ensure capacity for at least @p max_weights connections.
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void reserve_connections(
     CSRSynapses<SIZE_TYPE, VALUE_TYPE>& c,
@@ -37,8 +35,7 @@ void reserve_connections(
     }
 }
 
-// ── outer_product ─────────────────────────────────────────────────────────────
-
+///Populates @p gen with the outer product of @p input_tensor and @p output_gradient_tensor
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void outer_product(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
@@ -66,10 +63,7 @@ void outer_product(
     }
 }
 
-// ── generate_new_weights_coo ──────────────────────────────────────────────────
-// Outer product of top-k inputs × top-k outputs → k² candidate connections.
-// Caller tunes k knowing the cost is O(k²) — this is intentional.
-
+///Returns a COO of new weights to add to a linear layer based on accumulated @p input_tensor and @p output_gradient_tensor
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
@@ -102,8 +96,7 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
     return gen_coo;
 }
 
-// ── forward ───────────────────────────────────────────────────────────────────
-
+///Populates @p output with the sparse matmul of @p weights and @p input_tensor while calculating weight contributions and importance
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void sisldo_forward(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
@@ -126,8 +119,6 @@ void sisldo_forward(
     auto&       conn_val2    = *weights.connections.values[2];
 
     // ── Phase 1 setup: one output buffer slice per thread ────────────────────
-    // Threads write to disjoint slices — no synchronization needed during scatter.
-    // Extra memory: num_cpus × num_outputs × sizeof(VALUE_TYPE).
     std::vector<VALUE_TYPE> all_outputs((size_t)num_cpus * num_outputs, VALUE_TYPE(0));
     std::vector<VALUE_TYPE> all_contributions(
         original_contributions_output ? (size_t)num_cpus * num_inputs : 0,
@@ -195,9 +186,6 @@ void sisldo_forward(
         }
 
         // ── Phase 2: parallel tree reduction — no critical, no atomics ───────
-        // Each pass halves active threads. Active pairs write to disjoint
-        // destinations so no synchronization is needed within a pass.
-        // The implicit OpenMP barrier between passes is the only sync required.
         for (int stride = 1; stride < nthreads; stride <<= 1) {
             #pragma omp barrier
             const int src = tid + stride;
@@ -214,9 +202,8 @@ void sisldo_forward(
                 }
             }
         }
-    }   // implicit barrier — thread 0's slice now holds the full reduction
+    }
 
-    // Copy thread 0's result into the caller's output buffer.
     const VALUE_TYPE* result = all_outputs.data();
     for (SIZE_TYPE i = 0; i < num_outputs; ++i)
         output[i] += result[i];
@@ -228,8 +215,7 @@ void sisldo_forward(
     }
 }
 
-// ── backward ──────────────────────────────────────────────────────────────────
-
+///Calculates @p input_gradients and @p weights gradients from @p in_tensor and @p out_grad_sparse or the accums
 template <class SIZE_TYPE, class VALUE_TYPE>
 void sisldo_backward(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& in_tensor,
@@ -371,8 +357,7 @@ void sisldo_backward(
     }
 }
 
-// ── optim_weights ─────────────────────────────────────────────────────────────
-
+///Optimizes @p weights based on stored gradient and importance values
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void sisldo_optim_weights(
     SparseLinearWeights<SIZE_TYPE, VALUE_TYPE>& weights,
@@ -393,10 +378,7 @@ void sisldo_optim_weights(
     }
 }
 
-// ── genesis_build_probes ──────────────────────────────────────────────────────
-// Runs on genesis thread. Wraps dense accumulators as single-row CSR views,
-// runs top_k + outer product to build probes for weights_b.
-
+///Generated @p weights_b probes based on input and gradient accum: fire together wire together.
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void genesis_build_probes(
     SparseLinearWeights<SIZE_TYPE, VALUE_TYPE>& weights_b,
@@ -407,8 +389,6 @@ void genesis_build_probes(
     const SIZE_TYPE k,
     const int num_cpus)
 {
-    // Build single-row CSR views over the dense accumulators.
-    // indices are identity [0..n), values point into caller's array via no-op deleter.
     auto make_view_csr = [](const VALUE_TYPE* accum, SIZE_TYPE n)
         -> CSRInput<SIZE_TYPE, VALUE_TYPE>
     {
@@ -423,17 +403,11 @@ void genesis_build_probes(
         csr.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(n);
         std::iota(csr.indices[0]->begin(), csr.indices[0]->end(), SIZE_TYPE(0));
 
-        // Simplest correct approach: just copy the accumulator into a vector.
-        // It's num_inputs or num_outputs floats — negligible vs model size.
         csr.values[0] = std::make_shared<std::vector<VALUE_TYPE>>(accum, accum + n);
 
         return csr;
     };
 
-    // ── Degree-weighted accumulator scores ───────────────────────────────────
-    // Input degree is free from CSR ptrs. Output degree is cached on the
-    // weights struct and maintained incrementally by sisldo_optim_synaptogenesis
-    // — no O(nnz) recount here.
     std::vector<VALUE_TYPE> weighted_in(num_inputs);
     #pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (SIZE_TYPE i = 0; i < num_inputs; ++i)
@@ -448,157 +422,9 @@ void genesis_build_probes(
     auto out_csr = top_k_csr<SIZE_TYPE, VALUE_TYPE>(weighted_out.data(), 1, num_outputs, k,  num_cpus);
 
     weights_b.probes = generate_new_weights_coo(in_csr, out_csr, num_cpus);
-
-    /*
-    // ── Filter out connections that already exist ─────────────────────────────
-    // Without this, the top-k accumulators keep proposing the same high-activity
-    // neuron pairs, which are already connected. synap_mark_duplicates would
-    // exclude them from being added, but they consume the entire probe budget,
-    // leaving no room for genuinely novel connections.
-    //
-    // We filter here — before storing as probes — so the budget is spent only
-    // on connections the network does not yet have.
-    //
-    // The existing weights are CSR over inputs: conn_ptrs[in_row] → out_cols.
-    // A probe entry (in_row, out_col) is novel iff out_col does not appear in
-    // connections[conn_ptrs[in_row] .. conn_ptrs[in_row+1]).
-    if (!connections_empty(weights_b.connections) &&
-        raw_probes.indices[0] && !raw_probes.indices[0]->empty())
-    {
-        const auto& cp  = *weights_b.connections.ptrs[0];
-        const auto& ci  = *weights_b.connections.indices[0];
-        const SIZE_TYPE probe_nnz = raw_probes.nnz();
-
-        const SIZE_TYPE* row_ptr = raw_probes.indices[0]->data();  // in_row per probe
-        const SIZE_TYPE* col_ptr = raw_probes.indices[1]->data();  // out_col per probe
-        const VALUE_TYPE* val_ptr = raw_probes.values[0]->data();
-
-        std::vector<SIZE_TYPE>  new_rows, new_cols;
-        std::vector<VALUE_TYPE> new_vals;
-        new_rows.reserve(probe_nnz);
-        new_cols.reserve(probe_nnz);
-        new_vals.reserve(probe_nnz);
-
-        // ── Parallel stream compaction ────────────────────────────────────────
-        // Phase 1: mark novel probes (parallel, read-only on connections)
-        // Phase 2: exclusive prefix scan to get write positions
-        // Phase 3: parallel scatter into output arrays
-        //
-        // Each probe lookup is an independent binary search — embarrassingly
-        // parallel. The only sequential work is the O(probe_nnz) prefix scan,
-        // which is negligible compared to the searches.
-
-        std::vector<SIZE_TYPE> keep(probe_nnz, SIZE_TYPE(0));
-
-        #pragma omp parallel for num_threads(num_cpus) schedule(static)
-        for (SIZE_TYPE p = 0; p < probe_nnz; ++p) {
-            const SIZE_TYPE r  = row_ptr[p];
-            const SIZE_TYPE c  = col_ptr[p];
-            const SIZE_TYPE w0 = cp[r];
-            const SIZE_TYPE w1 = cp[r + 1];
-            keep[p] = std::binary_search(ci.begin() + w0, ci.begin() + w1, c)
-                      ? SIZE_TYPE(0) : SIZE_TYPE(1);
-        }
-
-        // Exclusive prefix scan — gives each kept probe its write position.
-        std::vector<SIZE_TYPE> scan(probe_nnz + 1, SIZE_TYPE(0));
-        for (SIZE_TYPE p = 0; p < probe_nnz; ++p)
-            scan[p + 1] = scan[p] + keep[p];
-        const SIZE_TYPE new_nnz = scan[probe_nnz];
-
-        if (new_nnz == 0) {
-            raw_probes.ptrs       = 0;
-            raw_probes.indices[0] = nullptr;
-            raw_probes.indices[1] = nullptr;
-            raw_probes.values[0]  = nullptr;
-        } else {
-            std::vector<SIZE_TYPE>  new_rows(new_nnz);
-            std::vector<SIZE_TYPE>  new_cols(new_nnz);
-            std::vector<VALUE_TYPE> new_vals(new_nnz);
-
-            #pragma omp parallel for num_threads(num_cpus) schedule(static)
-            for (SIZE_TYPE p = 0; p < probe_nnz; ++p) {
-                if (keep[p]) {
-                    const SIZE_TYPE out = scan[p];
-                    new_rows[out] = row_ptr[p];
-                    new_cols[out] = col_ptr[p];
-                    new_vals[out] = val_ptr[p];
-                }
-            }
-
-            raw_probes.ptrs        = new_nnz;
-            *raw_probes.indices[0] = std::move(new_rows);
-            *raw_probes.indices[1] = std::move(new_cols);
-            *raw_probes.values[0]  = std::move(new_vals);
-        }
-    }*/
-
-    //weights_b.probes = std::move(raw_probes);
 }
 
-// ── copy_matching_weights ─────────────────────────────────────────────────────
-// O(nnz) parallel copy of weight/importance values from src into dst
-// for every connection that exists in both. New connections in dst stay zero.
-
-template <typename SIZE_TYPE, typename VALUE_TYPE>
-void copy_matching_weights(
-    const CSRSynapses<SIZE_TYPE, VALUE_TYPE>& src,
-    CSRSynapses<SIZE_TYPE, VALUE_TYPE>& dst,
-    const int num_cpus)
-{
-    const SIZE_TYPE rows    = dst.rows;
-    const SIZE_TYPE dst_nnz = dst.ptrs[0] ? (*dst.ptrs[0])[rows] : 0;
-    if (dst_nnz == 0) return;
-
-    const auto& src_ptrs    = *src.ptrs[0];
-    const auto& src_indices = *src.indices[0];
-    const auto& src_val0    = *src.values[0];
-    const auto& src_val2    = *src.values[2];
-    const auto& dst_ptrs    = *dst.ptrs[0];
-    const auto& dst_indices = *dst.indices[0];
-    auto&       dst_val0    = *dst.values[0];
-    auto&       dst_val2    = *dst.values[2];
-
-    #pragma omp parallel num_threads(num_cpus)
-    {
-        const int      tid      = omp_get_thread_num();
-        const int      nthreads = omp_get_num_threads();
-        const SIZE_TYPE chunk   = (dst_nnz + nthreads - 1) / nthreads;
-        const SIZE_TYPE w_start = std::min((SIZE_TYPE)tid * chunk, dst_nnz);
-        const SIZE_TYPE w_end   = std::min(w_start + chunk, dst_nnz);
-
-        if (w_start < w_end) {
-            SIZE_TYPE r = static_cast<SIZE_TYPE>(
-                std::upper_bound(dst_ptrs.begin(), dst_ptrs.end(), w_start)
-                - dst_ptrs.begin()) - 1;
-
-            SIZE_TYPE s = src_ptrs[r];
-            const SIZE_TYPE first_dst_col = dst_indices[w_start];
-            while (s < src_ptrs[r + 1] && src_indices[s] < first_dst_col) ++s;
-
-            for (SIZE_TYPE w = w_start; w < w_end; ++w) {
-                while (r + 1 < rows && dst_ptrs[r + 1] <= w) {
-                    ++r;
-                    s = src_ptrs[r];
-                }
-
-                const SIZE_TYPE dst_col = dst_indices[w];
-                while (s < src_ptrs[r + 1] && src_indices[s] < dst_col) ++s;
-
-                if (s < src_ptrs[r + 1] && src_indices[s] == dst_col) {
-                    dst_val0[w] = src_val0[s];
-                    dst_val2[w] = src_val2[s];
-                    // values[1] (grad) intentionally left zero
-                }
-            }
-        }
-    }
-}
-// ── Importance decay ──────────────────────────────────────────────────────────
-// Decays toward zero. Step size = rate / (1 + |importance|):
-//   near 0   → step ≈ rate        (fast pruning of weak connections)
-//   large    → step ≈ rate/|imp|  (stable, high-importance connections barely move)
-
+///Decays @p weights importance to zero over time. Step size = rate / (1 + |importance|):
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void sisldo_decay_importance(
     SparseLinearWeights<SIZE_TYPE, VALUE_TYPE>& weights,
@@ -617,8 +443,8 @@ void sisldo_decay_importance(
     }
 }
 
-// ── Synaptogenesis sub-functions ──────────────────────────────────────────────
 
+///Mark duplicate weights during synaptogenesis and take max importance
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void synap_mark_duplicates(
     const SIZE_TYPE nnz_c,
@@ -659,6 +485,7 @@ void synap_mark_duplicates(
     }
 }
 
+///Find the cutoff importance value for adding new weights
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 VALUE_TYPE synap_compute_cutoff(
     const SIZE_TYPE nnz_c,
@@ -687,6 +514,7 @@ VALUE_TYPE synap_compute_cutoff(
     return all_imp[drop_count];
 }
 
+///run simple scan operations on connections and probes
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void synap_build_scans(
     const SIZE_TYPE nnz_c,
@@ -711,6 +539,7 @@ void synap_build_scans(
             + (!is_dup_p[p] && pv[p] >= importance_cutoff ? 1 : 0);
 }
 
+///parallel fill connections and probes
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void synap_parallel_fill(
     const SIZE_TYPE nnz_c,
@@ -842,6 +671,7 @@ void synap_parallel_fill(
     }
 }
 
+///build new pointers for CSRs for synaptogenesis
 template <typename SIZE_TYPE>
 std::shared_ptr<std::vector<SIZE_TYPE>> synap_build_ptrs(
     const SIZE_TYPE rows,
@@ -866,8 +696,7 @@ std::shared_ptr<std::vector<SIZE_TYPE>> synap_build_ptrs(
     return new_ptrs_vec;
 }
 
-// ── sisldo_optim_synaptogenesis ───────────────────────────────────────────────
-
+///Add or remove weights to a sparse linear layer based on accumulated importance and probes
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 void sisldo_optim_synaptogenesis(
     SparseLinearWeights<SIZE_TYPE, VALUE_TYPE>& weights,
@@ -962,6 +791,7 @@ void sisldo_optim_synaptogenesis(
     weights.out_degree.assign(n_out, 0u);
     if (new_nnz > 0) {
         const auto& new_ci = *weights.connections.indices[0];
+        //todo: replace with a proper compute reduction
         #pragma omp parallel for num_threads(num_cpus) schedule(static)
         for (SIZE_TYPE w = 0; w < new_nnz; ++w) {
             #pragma omp atomic
