@@ -10,10 +10,6 @@ The real implementation (fiber.hpp, old_fiber.hpp) lives on the
 (included fiber.hpp, which doesn't exist in this branch's lib/headers at
 all) carried into optim_merge's test folder without its dependency.
 When cpu_sparse_io is catalogued, the real fiber.hpp/old_fiber.hpp/
-test_fiber.cpp/test_parallel.cpp set should land here together as one
+test_fiber.cpp set should land here together as one
 coherent, clearly-labeled unit -- not integrated into the active build.
 
-There was reportedly a working neurogenesis test built on this (see
-test_sisldo_neurogenesis.cpp) -- worth preserving for reference even while
-backburnered, since it may be directly relevant once dynamic growth is
-revisited.
