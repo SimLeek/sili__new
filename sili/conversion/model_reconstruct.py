@@ -322,7 +322,9 @@ class LlamaModel(nn.Module):
 
 def _infer_llama_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     """Infer LLaMA hyperparameters from weight shapes."""
-    embed = sd.get("model.embed_tokens.weight") or sd.get("embed_tokens.weight")
+    embed = sd.get("model.embed_tokens.weight")
+    if embed is None:
+        embed = sd.get("embed_tokens.weight")
     vocab_size, d_model = embed.shape
 
     n_layers = _count_layers(sd, r"layers\.(\d+)\.")
@@ -451,7 +453,9 @@ class GPT2Model(nn.Module):
 
 
 def _infer_gpt2_hparams(sd: Dict[str, torch.Tensor]) -> dict:
-    embed = sd.get("transformer.wte.weight") or sd.get("wte.weight")
+    embed = sd.get("transformer.wte.weight")
+    if embed is None:
+        embed = sd.get("wte.weight")
     vocab_size, d_model = embed.shape
     n_layers = _count_layers(sd, r"\.h\.(\d+)\.")
     # c_attn is [d_model, 3*d_model] (Conv1D stores transposed)
@@ -472,7 +476,9 @@ def _infer_gpt2_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     fc = next((v for k, v in sd.items() if "mlp.c_fc.weight" in k), None)
     intermediate = fc.shape[1] if fc is not None else 4 * d_model
     # pos embedding tells us max_seq
-    wpe = sd.get("transformer.wpe.weight") or sd.get("wpe.weight")
+    wpe = sd.get("transformer.wpe.weight")
+    if wpe is None:
+        wpe = sd.get("wpe.weight")
     max_seq = wpe.shape[0] if wpe is not None else 2048
     return dict(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
                 n_heads=n_heads, intermediate=intermediate, max_seq=max_seq)

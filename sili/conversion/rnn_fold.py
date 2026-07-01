@@ -805,10 +805,25 @@ def fold_sparse_payload(
     cleaned_ssd = {k: v for k, v in ssd.items() if k not in removed_names}
 
     # Compute fold statistics
+    #
+    # original_nnz must count ACTUAL nonzero content regardless of whether a
+    # given tensor started as CSR or dense/strided layout -- the old
+    # `flat[n].layout == torch.sparse_csr` filter silently EXCLUDED
+    # dense-format entries (LayerNorm weights, and anything that fell back to
+    # dense via min_sparsity/max_sparse_ratio) from this count entirely,
+    # while folded_nnz correctly counts EVERYTHING post-stacking (fold_block_group
+    # converts dense entries to CSR too, see line ~654). That asymmetry made
+    # "lossless stacking" read False whenever any dense-format layer
+    # participated in a fold group -- not because stacking actually lost or
+    # duplicated data, but because the "before" count was silently smaller
+    # than the true content it was supposed to represent.
+    def _real_nnz(t: torch.Tensor) -> int:
+        if t.layout == torch.sparse_csr:
+            return int(t.values().numel())
+        return int((t != 0).sum().item())   # dense/strided: count real nonzeros
+
     original_nnz = sum(
-        int(flat[n].values().numel())
-        for n in removed_names
-        if n in flat and flat[n].layout == torch.sparse_csr
+        _real_nnz(flat[n]) for n in removed_names if n in flat
     )
     folded_nnz = sum(
         int(csr.values().numel())
@@ -1113,7 +1128,8 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
 
         if not is_sparse_entry and isinstance(entry, torch.Tensor):
             # Plain tensor input — return plain tensor
-            new_entry = new_entry.get("raw") or new_entry.get("csr")
+            _raw = new_entry.get("raw")
+            new_entry = _raw if _raw is not None else new_entry.get("csr")
 
         new_ssd[name] = new_entry
 
@@ -1329,7 +1345,9 @@ def main() -> None:
         flat: Dict[str, torch.Tensor] = {}
         for name, entry in payload["sparse_state_dict"].items():
             if isinstance(entry, dict):
-                t = entry.get("csr") or entry.get("raw")
+                t = entry.get("csr")
+                if t is None:
+                    t = entry.get("raw")
                 if t is not None:
                     flat[name] = t
             elif isinstance(entry, torch.Tensor):

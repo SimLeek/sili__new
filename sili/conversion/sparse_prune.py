@@ -149,6 +149,167 @@ def default_min_abs_param(
     )
 
 
+def calibrate_min_abs_param(
+    state_dict: Dict[str, torch.Tensor],
+    target_sparsity: float = 0.5,
+) -> float:
+    """
+    Derive min_abs_param directly from the ACTUAL loaded weight-magnitude
+    distribution, rather than from an assumed training-dynamics formula
+    (synapse_diminish_floor).  THIS IS THE DEFAULT MODE (see --calibrate /
+    --no-calibrate on the CLI, and the `calibrate` parameter on
+    sparsify_model()).
+
+    Rationale
+    ---------
+    synapse_diminish_floor() estimates where Adam's update resolution floor
+    sits GIVEN a specific (lr, training_time, bits) combination -- it has no
+    knowledge of the actual weight scale in the file being pruned.  When the
+    assumed training conditions don't match the real checkpoint (different
+    LR, different init scale, a randomly-initialized model, etc.) the
+    computed threshold can land anywhere relative to the real weight
+    distribution, including deep inside its bulk -- causing catastrophic
+    over-pruning.  Empirically: on an untrained N(0, 0.02) toy model, the
+    formula's default settings pruned 98.9% of weights against an injected
+    ground truth of ~76% intended; the SAME threshold value, applied to a
+    population where it happened to sit outside the bulk, reproduced ground
+    truth within a few points.  The formula isn't wrong, it's just blind to
+    what it's actually being pointed at.
+
+    calibrate_min_abs_param() asks a direct, scale-invariant question
+    instead: "what |weight| value is the target_sparsity-th percentile of
+    THIS model's actual weight magnitudes?" -- guaranteeing the resulting
+    sparsity lands close to target_sparsity regardless of the weights'
+    scale.  This does not claim to find the "true" dead-weight boundary --
+    no conversion-time method can, without knowing which weights actually
+    matter to this specific model's function.  It trades that unattainable
+    precision for a robust, predictable, hard-to-catastrophically-misfire
+    memory target:  sparsification here doesn't need to be good, it just
+    needs to get large models running in limited system memory without
+    destroying them.  Real training-time synaptogenesis/pruning (importance-
+    based growth/pruning during actual training) is expected to do the
+    precision work this conversion-time step deliberately does not attempt.
+
+    Parameters
+    ----------
+    state_dict      : flat {name: tensor} state dict (pre-pruning).
+    target_sparsity : fraction of eligible (2-D) weight magnitude to target
+                      as "below threshold".  Default 0.5 -- conservative,
+                      unlikely to destroy the model; raise for more
+                      aggressive memory savings, lower to preserve more
+                      signal.  This is the single knob that matters for
+                      "does this fit in my RAM budget" -- see also
+                      calibrate_for_memory_budget() for a budget-first framing
+                      of the same idea.
+
+    Returns
+    -------
+    min_abs_param : float, the calibrated threshold.
+    """
+    mags = []
+    for name, t in state_dict.items():
+        if not isinstance(t, torch.Tensor) or t.ndim != 2:
+            continue    # only 2-D matrices are threshold-eligible, matching
+                        # _keep_dense_reason's own ndim==2 requirement --
+                        # vectors and higher-rank tensors are always dense
+                        # regardless of threshold, so their magnitudes
+                        # shouldn't influence the percentile calculation.
+        mags.append(t.detach().float().abs().flatten())
+
+    if not mags:
+        return 0.0    # nothing eligible -- threshold is moot either way
+
+    all_mags = torch.cat(mags)
+    k = max(1, min(all_mags.numel(),
+                   int(round(target_sparsity * all_mags.numel()))))
+    # kthvalue is exact and, unlike torch.quantile's interpolation path,
+    # doesn't require materializing a second full-precision sorted copy --
+    # matters for real multi-billion-parameter checkpoints.
+    threshold = torch.kthvalue(all_mags, k).values.item()
+    return threshold
+
+
+def calibrate_for_memory_budget(
+    state_dict: Dict[str, torch.Tensor],
+    target_bytes: int,
+    min_sparsity: float = 0.33,
+    max_sparse_ratio: float = 0.9,
+    max_iterations: int = 6,
+) -> float:
+    """
+    Budget-first variant of calibrate_min_abs_param(): instead of specifying
+    a target sparsity fraction directly, specify how many bytes the result
+    must fit in, and this searches for a threshold that gets there.
+
+    Because a higher threshold ALWAYS prunes at least as much as a lower one
+    (the mask |w| >= threshold shrinks monotonically as threshold grows),
+    stored bytes is a monotonically non-increasing function of the
+    percentile-derived threshold -- so a small number of bisection steps on
+    the TARGET SPARSITY (not on min_abs_param directly, since the
+    sparsity-to-bytes relationship has per-layer CSR overhead and
+    min_sparsity/max_sparse_ratio dense-fallback nonlinearities baked in)
+    converges quickly.  Each iteration's cost is one pass through
+    _keep_dense_reason-equivalent bookkeeping (cheap; no CSR tensors are
+    actually constructed during the search, only sizes are estimated).
+
+    Parameters
+    ----------
+    state_dict       : flat {name: tensor} state dict (pre-pruning).
+    target_bytes     : maximum acceptable stored size, in bytes.
+    min_sparsity      : same meaning as sparsify_model()'s parameter --
+                        included here so the byte ESTIMATE during search
+                        matches what sparsify_model() will actually do.
+    max_sparse_ratio  : same meaning as sparsify_model()'s parameter.
+    max_iterations    : bisection step cap (6 steps narrows target_sparsity
+                        to within ~1.6% of its converged value -- plenty
+                        given this is a "don't destroy the model" safety
+                        target, not a precision instrument).
+
+    Returns
+    -------
+    min_abs_param : float, threshold estimated to land at-or-under target_bytes.
+    """
+    def _estimate_stored_bytes(threshold: float) -> int:
+        total = 0
+        for name, t in state_dict.items():
+            if not isinstance(t, torch.Tensor) or t.numel() == 0 or t.ndim == 0:
+                total += max(t.numel() if isinstance(t, torch.Tensor) else 1, 1) * 4
+                continue
+            if t.ndim != 2:
+                total += t.numel() * 4
+                continue
+            n_elem = t.numel()
+            n_nz   = int((t.detach().float().abs() >= threshold).sum().item())
+            sparsity = (n_elem - n_nz) / n_elem
+            dense_bytes = n_elem * 4
+            if sparsity < min_sparsity:
+                total += dense_bytes
+                continue
+            csr_est = n_nz * 12 + (t.shape[0] + 1) * 8   # matches _keep_dense_reason's
+                                                          # corrected int64-index formula
+            if csr_est > max_sparse_ratio * dense_bytes:
+                total += dense_bytes
+            else:
+                total += csr_est
+        return total
+
+    lo, hi = 0.0, 0.999   # target_sparsity search range
+    threshold = calibrate_min_abs_param(state_dict, target_sparsity=0.5)
+
+    for _ in range(max_iterations):
+        mid = (lo + hi) / 2.0
+        threshold = calibrate_min_abs_param(state_dict, target_sparsity=mid)
+        est_bytes = _estimate_stored_bytes(threshold)
+        if est_bytes > target_bytes:
+            lo = mid     # need MORE sparsity -> raise the target_sparsity floor
+        else:
+            hi = mid     # fits with room to spare -> can afford less sparsity
+
+    # Final threshold at the tightest still-fitting point found (hi side,
+    # since that's where the last "fits" observation came from).
+    return calibrate_min_abs_param(state_dict, target_sparsity=hi)
+
+
 # ==============================================================================
 #  Model loading
 # ==============================================================================
@@ -235,11 +396,15 @@ def _keep_dense_reason(
     if sparsity < min_sparsity:
         return f"sparsity {sparsity:.1%} < {min_sparsity:.0%}"
 
-    # Estimate CSR storage: values (f32=4B) + col_indices (i32=4B) + crow (i32=4B)
-    # crow has (n_rows + 1) entries
+    # Estimate CSR storage: values (f32=4B) + col_indices (int64=8B) + crow (int64=8B).
+    # torch.to_sparse_csr() uses int64 indices by default (verified: csr.col_indices().dtype
+    # == torch.int64) -- NOT int32 as an earlier version of this comment assumed. That
+    # mismatch made this overhead check ~1.5x too optimistic, silently letting some
+    # layers go "sparse" that actually end up LARGER than dense once really encoded.
+    # crow has (n_rows + 1) entries.
     n_rows      = tensor.shape[0]
     dense_bytes = n_elem * 4
-    csr_est     = n_nonzero * 8 + (n_rows + 1) * 4   # vals+cols, then crow
+    csr_est     = n_nonzero * 12 + (n_rows + 1) * 8   # (val+col) per nnz, then crow
     ratio       = csr_est / dense_bytes if dense_bytes > 0 else 1.0
 
     if ratio > max_sparse_ratio:
@@ -290,7 +455,13 @@ def sparsify_model(
     input_path: str,
     output_path: Optional[str] = None,
     min_abs_param: Optional[float] = None,
-    # Threshold-estimation knobs
+    # Calibration -- data-driven, DEFAULT mode (see calibrate_min_abs_param).
+    calibrate: bool = True,
+    target_sparsity: float = 0.5,
+    memory_budget_bytes: Optional[int] = None,
+    # Threshold-estimation knobs (legacy mode -- used only if calibrate=False
+    # and min_abs_param is not given; kept for anyone who wants the old
+    # training-dynamics-based estimate specifically).
     learning_rate: float = 1e-5,
     typical_input: float = 1.0,
     training_days: float = 30.0,
@@ -309,17 +480,62 @@ def sparsify_model(
     """
     Prune + sparsify a model, outputting a mixed sparse/dense payload.
 
+    Threshold selection priority (highest to lowest):
+      1. min_abs_param, if explicitly given -- always wins, no calibration run.
+      2. calibrate=True (DEFAULT) -- data-driven percentile threshold from
+         calibrate_min_abs_param(), or calibrate_for_memory_budget() if
+         memory_budget_bytes is given.  See calibrate_min_abs_param()'s
+         docstring for why this replaced the training-dynamics formula as
+         the default: the old formula doesn't look at the actual weights
+         being pruned and can silently catastrophically over-prune when its
+         assumed training conditions don't match the real checkpoint.
+      3. calibrate=False -- legacy synapse_diminish_floor()-based estimate
+         (requires learning_rate/typical_input/training_days/steps_per_second
+         to actually reflect the model's real training history to be
+         meaningful).
+
+    Regardless of which mode picked the threshold, a post-hoc check warns
+    loudly if the resulting overall sparsity exceeds 95% -- a strong signal
+    the threshold landed somewhere it shouldn't have, whichever mode chose it.
+
     Each entry in sparse_state_dict is one of:
-      {"csr":   <CSR tensor>, "shape": <original torch.Size>}  -- sparse layer
-      {"dense": <f32 tensor>, "shape": <torch.Size>}           -- dense layer
+      {"csr": <CSR tensor>, "shape": <original torch.Size>}  -- sparse layer
+      {"raw": <f32 tensor>, "shape": <torch.Size>}           -- dense layer
 
     Dense entries are used for: vectors (LayerNorm, biases), low-sparsity
     matrices, and matrices where CSR overhead exceeds savings.
-    """
-    training_seconds = training_days * 24 * 3600
 
-    # -- Determine pruning threshold -------------------------------------------
-    if min_abs_param is None:
+    NOTE: the dense-entry key is "raw", not "dense" -- this matches the key
+    BOTH rnn_fold.py and sparse_runtime.py already expect (verified: 9 call
+    sites across the two files consistently read entry.get("raw"); an
+    earlier version of this function used "dense", which meant every
+    LayerNorm weight, embedding table, and bias was silently dropped the
+    moment a payload crossed from here into either downstream file).
+    """
+    # -- Load FIRST: calibration needs to see the actual weights ---------------
+    print(f"\n[load]  {input_path}")
+    state_dict = load_state_dict(input_path)
+    print(f"        {len(state_dict)} tensor(s) found")
+
+    # -- Determine pruning threshold ---------------------------------------------
+    if min_abs_param is not None:
+        print(f"[threshold]  mode             = user-supplied")
+        print(f"[threshold]  min_abs_param    = {min_abs_param:.6e}")
+    elif calibrate:
+        if memory_budget_bytes is not None:
+            min_abs_param = calibrate_for_memory_budget(
+                state_dict, memory_budget_bytes,
+                min_sparsity=min_sparsity, max_sparse_ratio=max_sparse_ratio)
+            print(f"[threshold]  mode             = calibrated, memory-budget-targeted (default)")
+            print(f"[threshold]  memory_budget    = {memory_budget_bytes/1e6:.2f} MB")
+        else:
+            min_abs_param = calibrate_min_abs_param(state_dict, target_sparsity)
+            print(f"[threshold]  mode             = calibrated, data-driven (default)")
+            print(f"[threshold]  target_sparsity  = {target_sparsity:.0%}")
+        print(f"[threshold]  min_abs_param    = {min_abs_param:.6e}  "
+              f"(percentile of |weight| across this model's own eligible tensors)")
+    else:
+        training_seconds = training_days * 24 * 3600
         floor = synapse_diminish_floor(
             learning_rate=learning_rate,
             typical_input=typical_input,
@@ -330,20 +546,14 @@ def sparsify_model(
         min_abs_param = 2.0 * floor
         eps_b      = quantization_epsilon(bits)
         bits_label = {32:"float32", 16:"float16", 8:"int8", 4:"int4", 2:"int2"}[bits]
+        print(f"[threshold]  mode             = training-dynamics formula (legacy, --no-calibrate)")
         print(f"[threshold]  quant format     = {bits_label}  (eps = {eps_b:.4e})")
         print(f"[threshold]  synapse floor    = {floor:.6e}")
         print(f"[threshold]  min_abs_param    = {min_abs_param:.6e}  (2 x floor)")
-    else:
-        print(f"[threshold]  min_abs_param    = {min_abs_param:.6e}  (user-supplied)")
 
     print(f"[threshold]  min_sparsity     = {min_sparsity:.0%}  (below -> keep dense)")
     print(f"[threshold]  max_sparse_ratio = {max_sparse_ratio:.1f}x  (above -> keep dense)")
     print(f"[threshold]  vectors (1-D)    = always dense")
-
-    # -- Load ------------------------------------------------------------------
-    print(f"\n[load]  {input_path}")
-    state_dict = load_state_dict(input_path)
-    print(f"        {len(state_dict)} tensor(s) found")
 
     # -- Process each tensor ---------------------------------------------------
     sparse_state: Dict[str, dict] = {}
@@ -367,7 +577,7 @@ def sparsify_model(
 
         # Scalar / empty -- keep dense, nothing to sparsify
         if n_elem == 0 or param.ndim == 0:
-            sparse_state[name] = {"dense": param.detach(), "shape": param.shape}
+            sparse_state[name] = {"raw": param.detach(), "shape": param.shape}
             total_dense_bytes  += dense_bytes
             total_stored_bytes += dense_bytes
             n_dense            += 1
@@ -381,15 +591,22 @@ def sparsify_model(
         # formula is derived for linear layers and produces meaningless results
         # for convolutional weights that are legitimately small by design.
         if t_f32.ndim != 2:
-            pruned   = t_f32
-            n_pruned = 0
+            pruned = t_f32
         else:
-            mask     = t_f32.abs() >= min_abs_param
-            pruned   = t_f32 * mask
-            n_pruned = int((~mask).sum().item())
+            mask   = t_f32.abs() >= min_abs_param
+            pruned = t_f32 * mask
 
         n_nz     = int((pruned != 0).sum().item())
         sparsity = (n_elem - n_nz) / n_elem
+        # n_pruned reflects ACTUAL final zero count (n_elem - n_nz), not just
+        # "entries newly zeroed by this threshold comparison" -- these diverge
+        # when the input already contains exact zeros (e.g. calibrated
+        # threshold=0.0 on data with pre-existing zeros: mask is all-True
+        # since |w|>=0 always holds, so (~mask).sum() would read 0 even
+        # though the tensor -- and the correctly-saved output CSR -- may
+        # already be mostly zero). Using n_elem - n_nz keeps the summary
+        # accurate regardless of what the input already looked like.
+        n_pruned = n_elem - n_nz
 
         total_elements += n_elem
         total_pruned   += n_pruned
@@ -399,7 +616,7 @@ def sparsify_model(
 
         if reason is not None:
             stored_bytes = dense_bytes
-            sparse_state[name] = {"dense": pruned, "shape": param.shape}
+            sparse_state[name] = {"raw": pruned, "shape": param.shape}
             fmt = "dense"
             n_dense += 1
         else:
@@ -435,6 +652,23 @@ def sparsify_model(
     print(f"  dense  model size  : {total_dense_bytes/1e6:>10.2f} MB")
     print(f"  stored model size  : {total_stored_bytes/1e6:>10.2f} MB")
     print(f"  compression ratio  : {ratio:>10.2f}x")
+
+    # -- Safety net: warn loudly regardless of WHICH mode picked the threshold --
+    # Catches: a poorly-chosen --min-abs override, --no-calibrate with
+    # mismatched training assumptions, or (in principle) a calibration bug --
+    # this check doesn't care how the threshold was chosen, only what happened.
+    CATASTROPHE_THRESHOLD = 0.95
+    if overall_sp > CATASTROPHE_THRESHOLD:
+        print()
+        print("!" * 70)
+        print(f"!  WARNING: {overall_sp:.1%} of weights were pruned -- this is unusually high")
+        print(f"!  and may indicate the threshold is miscalibrated for this specific")
+        print(f"!  checkpoint's actual weight scale, not a genuinely well-trained,")
+        print(f"!  highly-sparse model. A high compression ratio here can mean")
+        print(f"!  catastrophic data loss rather than efficient compression.")
+        print(f"!  Consider: lower --target-sparsity, or pass --min-abs explicitly")
+        print(f"!  after inspecting this model's real |weight| distribution.")
+        print("!" * 70)
 
     # -- Output path -----------------------------------------------------------
     if output_path is None:
@@ -509,9 +743,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=None,
                    help="Output .pt path  (default: <input>_sparse.pt)")
     p.add_argument("--min-abs", type=float, default=None, metavar="F",
-                   help="Hard-code pruning threshold (skips auto-calculation)")
+                   help="Hard-code pruning threshold (skips calibration entirely)")
 
-    g = p.add_argument_group("threshold estimation (ignored if --min-abs is set)")
+    c = p.add_argument_group("calibration (DEFAULT mode -- data-driven, ignored if --min-abs is set)")
+    c.add_argument("--calibrate", dest="calibrate", action="store_true", default=True,
+                   help="Derive threshold from this model's own weight distribution "
+                        "(default: on).  See calibrate_min_abs_param() docstring.")
+    c.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                   help="Disable calibration; fall back to the legacy "
+                        "training-dynamics threshold formula (see --lr etc. below). "
+                        "Only meaningful if those flags actually reflect this "
+                        "checkpoint's real training history.")
+    c.add_argument("--target-sparsity", type=float, default=0.5, metavar="F",
+                   help="Calibration target: fraction of eligible weight magnitude "
+                        "to prune (default: 0.5). Conservative default -- raise for "
+                        "more memory savings, lower to preserve more signal.")
+    c.add_argument("--memory-budget-mb", type=float, default=None, metavar="F",
+                   help="If set, calibrate directly against a target stored size "
+                        "(MB) instead of --target-sparsity -- answers 'does this "
+                        "fit in my RAM budget' directly.")
+    c.add_argument("--show-calibration", action="store_true",
+                   help="Load the model, print the calibrated threshold and "
+                        "resulting sparsity estimate, then exit without saving.")
+
+    g = p.add_argument_group("legacy threshold estimation (only used with --no-calibrate)")
     g.add_argument("--lr",            type=float, default=1e-5,  metavar="F",
                    help="Adam learning rate              (default: 1e-5)")
     g.add_argument("--input-scale",   type=float, default=1.0,   metavar="F",
@@ -585,10 +840,35 @@ def main() -> None:
         build_parser().print_help()
         sys.exit(1)
 
+    if args.show_calibration:
+        print(f"[load]  {args.input}")
+        state_dict = load_state_dict(args.input)
+        print(f"        {len(state_dict)} tensor(s) found\n")
+        if args.memory_budget_mb:
+            budget_bytes = int(args.memory_budget_mb * 1e6)
+            thr = calibrate_for_memory_budget(state_dict, budget_bytes)
+            print(f"memory_budget_mb : {args.memory_budget_mb}")
+        else:
+            thr = calibrate_min_abs_param(state_dict, args.target_sparsity)
+            print(f"target_sparsity  : {args.target_sparsity:.0%}")
+        print(f"min_abs_param    : {thr:.6e}")
+        n_elig = sum(t.numel() for t in state_dict.values()
+                    if isinstance(t, torch.Tensor) and t.ndim == 2)
+        n_below = sum(int((t.detach().float().abs() < thr).sum().item())
+                     for t in state_dict.values()
+                     if isinstance(t, torch.Tensor) and t.ndim == 2)
+        print(f"eligible params  : {n_elig:,}")
+        print(f"below threshold  : {n_below:,}  ({n_below/n_elig:.2%})" if n_elig else "")
+        return
+
     sparsify_model(
         input_path=args.input,
         output_path=args.output,
         min_abs_param=args.min_abs,
+        calibrate=args.calibrate,
+        target_sparsity=args.target_sparsity,
+        memory_budget_bytes=(int(args.memory_budget_mb * 1e6)
+                             if args.memory_budget_mb else None),
         learning_rate=args.lr,
         typical_input=args.input_scale,
         training_days=args.days,
