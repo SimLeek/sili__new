@@ -1,11 +1,15 @@
+#include <cstdint>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <sys/types.h>
+#include <vector>
 
 #include "linear_sisldo.hpp"
 #include "linear_disldo.hpp"
 #include "csr.hpp"
 #include "loss.hpp"
+#include "fp4quant.hpp"
 
 namespace py = pybind11;
 
@@ -19,6 +23,183 @@ namespace py = pybind11;
 //   output_buf holds the last forward output for the energy wrapper to read
 //   without a copy — invalidated on the next forward() call.
 
+class SISLDOLayerV {
+public:
+    using S = int;
+    using V = float;
+
+    SparseLinearWeightsV<S, V> weights;
+    std::vector<V>            neuron_input_accum;
+    std::vector<V>            neuron_grad_accum;
+    std::vector<V>            output_buf;
+    int                       num_cpus;
+
+    SISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+        : num_cpus(cpus)
+    {
+        weights.connections.rows    = n_inputs;
+        weights.connections.cols    = n_outputs;
+        weights.connections.ptrs[0] = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
+        weights.connections.indices[0] = std::make_shared<std::vector<S>>();
+        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
+        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
+        weights.probes.rows = n_inputs;
+        weights.probes.cols = n_outputs;
+
+        reserve_connections(weights.connections, max_weights);
+
+        neuron_input_accum.assign(n_inputs,  V(0));
+        neuron_grad_accum .assign(n_outputs, V(0));
+        weights.out_degree.assign(n_outputs, S(0));
+    }
+
+    // ── Scalar properties ─────────────────────────────────────────────────────
+
+    S n_inputs()  const { return weights.connections.rows; }
+    S n_outputs() const { return weights.connections.cols; }
+    S nnz()       const { return weights.connections.nnz(); }
+
+    // ── Input construction ───────────────────────────────────────────────────
+
+    CSRInput<S, V> numpy_to_sparse_input(
+        py::array_t<S> ptrs,
+        py::array_t<S> indices,
+        py::array_t<V> values,
+        S batch, S cols)
+    {
+        auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
+        const S nnz_in = (S)ib.size;
+        CSRInput<S, V> csr;
+        csr.rows       = batch;
+        csr.cols       = cols;
+        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nnz_in);
+        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nnz_in);
+        return csr;
+    }
+
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
+                  py::array_t<V> vals, py::array_t<V> imp) {
+        auto pb = ptrs.request(), ib = indices.request(),
+            vb = vals.request(), impb = imp.request();
+        const S rows = weights.connections.rows;
+        const S cols = weights.connections.cols;
+        weights = make_weights_v<S, V>(
+            rows, cols,
+            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
+            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
+            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
+            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
+    }
+
+    // ── Forward (use module-level dense_to_csr to prepare input first) ─────────
+
+    py::array_t<V> forward_sparse(
+        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
+        S batch, V learning_rate)
+    {
+        output_buf.assign(batch * n_outputs(), V(0));
+        auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
+        sisldo_forward(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
+
+        return py::array_t<V>(
+            {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
+            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
+            output_buf.data(), py::cast(this));
+    }
+
+    // ── Backward ─────────────────────────────────────────────────────────────
+    // dy:           dense [batch, n_outputs] — weight gradient kernel
+    // dy_sparse_*:  sparse dy — input gradient kernel
+    //               if all outputs are active, pass dy converted to a single CSR row
+
+    py::array_t<V> backward(
+        py::array_t<S> x_ptrs,
+        py::array_t<S> x_indices,
+        py::array_t<V> x_values,
+        py::array_t<V> dy,
+        py::array_t<S> dy_sparse_ptrs,
+        py::array_t<S> dy_sparse_indices,
+        py::array_t<V> dy_sparse_values,
+        V learning_rate,
+        S batch, S cols)
+    {
+        auto dybuf    = dy.request();
+
+        std::vector<V> dx(batch * n_inputs(), V(0));
+        auto input_csr    = numpy_to_sparse_input(x_ptrs, x_indices, x_values, batch, cols);
+        auto out_grad_csr = numpy_to_sparse_input(
+            dy_sparse_ptrs, dy_sparse_indices, dy_sparse_values, batch, n_outputs());
+
+        sisldo_backward(
+            input_csr, weights, out_grad_csr,
+            dx.data(), (V*)dybuf.ptr,
+            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate,
+            num_cpus);
+
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    // ── Optimization ─────────────────────────────────────────────────────────
+
+    void decay_importance(V rate) {
+        sisldo_decay_importance(weights, rate, num_cpus);
+    }
+
+    // ── Neurogenesis ──────────────────────────────────────────────────────────
+
+    void build_probes(S k) {
+        genesis_build_probes(
+            weights,
+            neuron_input_accum.data(), neuron_grad_accum.data(),
+            n_inputs(), n_outputs(), k, num_cpus);
+    }
+
+    void optim_synaptogenesis(V learning_rate, V importance_beta, S max_weights) {
+        sisldo_optim_synaptogenesis(
+            weights, learning_rate, importance_beta, max_weights, num_cpus);
+    }
+
+    void zero_accum() {
+        std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
+        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+    }
+
+    // ── Zero-copy numpy views ─────────────────────────────────────────────────
+
+    py::array_t<V> get_neuron_input_accum() {
+        return py::array_t<V>({(py::ssize_t)n_inputs()},  {sizeof(V)},
+                              neuron_input_accum.data(), py::cast(this));
+    }
+    py::array_t<V> get_neuron_grad_accum() {
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
+                              neuron_grad_accum.data(), py::cast(this));
+    }
+    py::array_t<V> get_output_buf() {
+        return py::array_t<V>({(py::ssize_t)output_buf.size()}, {sizeof(V)},
+                              output_buf.data(), py::cast(this));
+    }
+    py::array_t<V> get_weights_vals() {
+        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
+                              weights.connections.values[0]->data(), py::cast(this));
+    }
+    py::array_t<V> get_importance() {
+        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
+                              weights.connections.values[1]->data(), py::cast(this));
+    }
+    py::array_t<S> get_indices() {
+        return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
+                              weights.connections.indices[0]->data(), py::cast(this));
+    }
+    py::array_t<S> get_ptrs() {
+        return py::array_t<S>({(py::ssize_t)(n_inputs() + 1)}, {sizeof(S)},
+                              weights.connections.ptrs[0]->data(), py::cast(this));
+    }
+};
+
+
 class SISLDOLayer {
 public:
     using S = int;
@@ -29,18 +210,15 @@ public:
     std::vector<V>            neuron_grad_accum;
     std::vector<V>            output_buf;
     int                       num_cpus;
-    V                         solidify;
 
-    SISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4, V solidify_ = 0.01f)
-        : num_cpus(cpus), solidify(solidify_)
+    SISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+        : num_cpus(cpus)
     {
         weights.connections.rows    = n_inputs;
         weights.connections.cols    = n_outputs;
         weights.connections.ptrs[0] = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
         weights.connections.indices[0] = std::make_shared<std::vector<S>>();
-        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[2]  = std::make_shared<std::vector<V>>();
+        weights.connections.values  = FP4BiPacked();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
 
@@ -86,20 +264,18 @@ public:
             rows, cols,
             std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
             std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
-            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
-            std::vector<V>((S)ib.size,   V(0)),
-            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
+            FP4BiPacked::deserialize(std::vector<uint8_t>((V*)vb.ptr,   (V*)vb.ptr   + vb.size)));
     }
 
     // ── Forward (use module-level dense_to_csr to prepare input first) ─────────
 
     py::array_t<V> forward_sparse(
         py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch, bool train = true)
+        S batch, V learning_rate)
     {
         output_buf.assign(batch * n_outputs(), V(0));
         auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
-        sisldo_forward(input_csr, weights, output_buf.data(), train, solidify, num_cpus);
+        sisldo_forward(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
 
         return py::array_t<V>(
             {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
@@ -120,6 +296,7 @@ public:
         py::array_t<S> dy_sparse_ptrs,
         py::array_t<S> dy_sparse_indices,
         py::array_t<V> dy_sparse_values,
+        V learning_rate,
         S batch, S cols)
     {
         auto dybuf    = dy.request();
@@ -132,7 +309,7 @@ public:
         sisldo_backward(
             input_csr, weights, out_grad_csr,
             dx.data(), (V*)dybuf.ptr,
-            neuron_input_accum.data(), neuron_grad_accum.data(),
+            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate,
             num_cpus);
 
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
@@ -141,10 +318,6 @@ public:
     }
 
     // ── Optimization ─────────────────────────────────────────────────────────
-
-    void optim_weights(V learning_rate) {
-        sisldo_optim_weights(weights, learning_rate, num_cpus);
-    }
 
     void decay_importance(V rate) {
         sisldo_decay_importance(weights, rate, num_cpus);
@@ -183,13 +356,9 @@ public:
         return py::array_t<V>({(py::ssize_t)output_buf.size()}, {sizeof(V)},
                               output_buf.data(), py::cast(this));
     }
-    py::array_t<V> get_weights_vals() {
-        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
-                              weights.connections.values[0]->data(), py::cast(this));
-    }
-    py::array_t<V> get_importance() {
-        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
-                              weights.connections.values[2]->data(), py::cast(this));
+    py::array_t<uint8_t> get_weights_vals() {
+        return py::array_t<uint8_t>({(py::ssize_t)nnz()}, {sizeof(uint8_t)},
+                              weights.connections.values.serialize().data(), py::cast(this));
     }
     py::array_t<S> get_indices() {
         return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
@@ -219,15 +388,14 @@ public:
     std::vector<V>            neuron_grad_accum;
     std::vector<V>            output_buf;
     int                       num_cpus;
-    V                         solidify;
 
     // Last dense input — stored for backward.
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
 
-    DISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4, V solidify_ = 0.01f)
-        : num_cpus(cpus), solidify(solidify_)
+    DISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+        : num_cpus(cpus)
     {
         weights.connections.rows       = n_inputs;
         weights.connections.cols       = n_outputs;
@@ -235,7 +403,6 @@ public:
         weights.connections.indices[0] = std::make_shared<std::vector<S>>();
         weights.connections.values[0]  = std::make_shared<std::vector<V>>();
         weights.connections.values[1]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[2]  = std::make_shared<std::vector<V>>();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
         reserve_connections(weights.connections, max_weights);
@@ -250,7 +417,7 @@ public:
 
     // ── Forward ───────────────────────────────────────────────────────────────
 
-    py::array_t<V> forward(py::array_t<V> x, bool train = true) {
+    py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
@@ -260,7 +427,7 @@ public:
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), train, solidify, num_cpus);
+                       output_buf.data(), learning_rate, num_cpus);
 
         return py::array_t<V>(
             {(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()},
@@ -270,7 +437,7 @@ public:
 
     // ── Backward ─────────────────────────────────────────────────────────────
 
-    py::array_t<V> backward(py::array_t<V> dy) {
+    py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward(
@@ -278,6 +445,7 @@ public:
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
+            learning_rate,
             num_cpus);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -286,7 +454,128 @@ public:
 
     // ── Optimization (same as SISLDO) ────────────────────────────────────────
 
-    void optim_weights(V lr)          { sisldo_optim_weights(weights, lr, num_cpus); }
+    void decay_importance(V rate)     { sisldo_decay_importance(weights, rate, num_cpus); }
+
+    void build_probes(S k) {
+        genesis_build_probes(weights,
+            neuron_input_accum.data(), neuron_grad_accum.data(),
+            n_inputs(), n_outputs(), k, num_cpus);
+    }
+    void optim_synaptogenesis(V lr, V imp_beta, S max_w) {
+        sisldo_optim_synaptogenesis(weights, lr, imp_beta, max_w, num_cpus);
+    }
+    void zero_accum() {
+        std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
+        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+    }
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
+                      py::array_t<V> vals) {
+        auto pb=ptrs.request(), ib=indices.request(),
+             vb=vals.request();
+        const S rows = weights.connections.rows;
+        const S cols = weights.connections.cols;
+        weights = make_weights<S, V>(
+            rows, cols,
+            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
+            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
+            FP4BiPacked(std::move(std::vector<uint8_t>((uint8_t*)vb.ptr, (uint8_t*)vb.ptr + vb.size)))
+            );
+    }
+
+    // ── Zero-copy numpy views ────────────────────────────────────────────────
+    py::array_t<V> get_neuron_input_accum() {
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
+                              neuron_input_accum.data(), py::cast(this)); }
+    py::array_t<V> get_neuron_grad_accum() {
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
+                              neuron_grad_accum.data(), py::cast(this)); }
+    py::array_t<uint8_t> get_weights() {  //todo: dangerous: replace with returning the fp4quant pybind11 object
+        return py::array_t<uint8_t>({(py::ssize_t)nnz()}, {sizeof(uint8_t)},
+                              weights.connections.values._data->data(), py::cast(this)); }
+    py::array_t<S> get_indices() {
+        return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
+                              weights.connections.indices[0]->data(), py::cast(this)); }
+    py::array_t<S> get_ptrs() {
+        return py::array_t<S>({(py::ssize_t)(n_inputs()+1)}, {sizeof(S)},
+                              weights.connections.ptrs[0]->data(), py::cast(this)); }
+};
+
+class DISLDOLayerV {
+public:
+    using S = int;
+    using V = float;
+
+    SparseLinearWeightsV<S, V> weights;
+    std::vector<V>            neuron_input_accum;
+    std::vector<V>            neuron_grad_accum;
+    std::vector<V>            output_buf;
+    int                       num_cpus;
+
+    // Last dense input — stored for backward.
+    std::vector<V> _last_input;
+    S              _last_batch = 0;
+    S              _last_cols  = 0;
+
+    DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+        : num_cpus(cpus)
+    {
+        weights.connections.rows       = n_inputs;
+        weights.connections.cols       = n_outputs;
+        weights.connections.ptrs[0]    = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
+        weights.connections.indices[0] = std::make_shared<std::vector<S>>();
+        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
+        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
+        weights.probes.rows = n_inputs;
+        weights.probes.cols = n_outputs;
+        reserve_connections(weights.connections, max_weights);
+        neuron_input_accum.assign(n_inputs,  V(0));
+        neuron_grad_accum .assign(n_outputs, V(0));
+        weights.out_degree.assign(n_outputs, S(0));
+    }
+
+    S n_inputs()  const { return weights.connections.rows; }
+    S n_outputs() const { return weights.connections.cols; }
+    S nnz()       const { return weights.connections.nnz(); }
+
+    // ── Forward ───────────────────────────────────────────────────────────────
+
+    py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
+        auto xbuf     = x.request();
+        _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+
+        const V* src  = (V*)xbuf.ptr;
+        _last_input.assign(src, src + _last_batch * _last_cols);
+
+        output_buf.assign(_last_batch * n_outputs(), V(0));
+        disldo_forward(src, _last_batch, _last_cols, weights,
+                       output_buf.data(), learning_rate, num_cpus);
+
+        return py::array_t<V>(
+            {(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()},
+            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
+            output_buf.data(), py::cast(this));
+    }
+
+    // ── Backward ─────────────────────────────────────────────────────────────
+
+    py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
+        auto dybuf = dy.request();
+        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        disldo_backward(
+            _last_input.data(), _last_batch, _last_cols,
+            (V*)dybuf.ptr, weights,
+            dx.data(),
+            neuron_input_accum.data(), neuron_grad_accum.data(),
+            learning_rate,
+            num_cpus);
+        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    // ── Optimization (same as SISLDO) ────────────────────────────────────────
+
     void decay_importance(V rate)     { sisldo_decay_importance(weights, rate, num_cpus); }
 
     void build_probes(S k) {
@@ -307,12 +596,11 @@ public:
              vb=vals.request(), impb=imp.request();
         const S rows = weights.connections.rows;
         const S cols = weights.connections.cols;
-        weights = make_weights<S, V>(
+        weights = make_weights_v<S, V>(
             rows, cols,
             std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
             std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
             std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
-            std::vector<V>((S)ib.size,   V(0)),
             std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
     }
 
@@ -328,7 +616,7 @@ public:
                               weights.connections.values[0]->data(), py::cast(this)); }
     py::array_t<V> get_importance() {
         return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
-                              weights.connections.values[2]->data(), py::cast(this)); }
+                              weights.connections.values[1]->data(), py::cast(this)); }
     py::array_t<S> get_indices() {
         return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
                               weights.connections.indices[0]->data(), py::cast(this)); }
@@ -342,24 +630,23 @@ PYBIND11_MODULE(_cpu, m)
     // ── SISLDOLayer ───────────────────────────────────────────────────────────
 
     py::class_<SISLDOLayer>(m, "SISLDOLayer")
-        .def(py::init<int, int, int, int, float>(),
+        .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"),
              py::arg("n_outputs"),
              py::arg("max_weights"),
-             py::arg("num_cpus") = 4,
-             py::arg("solidify") = 0.01f)
+             py::arg("num_cpus") = 4
+            )
 
         .def("forward_sparse",       &SISLDOLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"), py::arg("train") = true)
+             py::arg("batch"), py::arg("learning_rate") = 0.01)
         .def("backward",             &SISLDOLayer::backward,
              py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"),
              py::arg("dy"),
              py::arg("dy_sparse_ptrs"), py::arg("dy_sparse_indices"),
              py::arg("dy_sparse_values"),
+             py::arg("learning_rate"),
              py::arg("batch"), py::arg("cols"))
-        .def("optim_weights",        &SISLDOLayer::optim_weights,
-             py::arg("learning_rate"))
         .def("decay_importance",     &SISLDOLayer::decay_importance,
              py::arg("rate"))
         .def("build_probes",         &SISLDOLayer::build_probes,
@@ -386,7 +673,6 @@ PYBIND11_MODULE(_cpu, m)
                 py::cast(&self));
         })
         .def_readonly ("num_cpus",  &SISLDOLayer::num_cpus)
-        .def_readwrite("solidify",  &SISLDOLayer::solidify)
         .def_property_readonly("n_inputs",  &SISLDOLayer::n_inputs)
         .def_property_readonly("n_outputs", &SISLDOLayer::n_outputs)
         .def_property_readonly("nnz",       &SISLDOLayer::nnz);
@@ -395,14 +681,13 @@ PYBIND11_MODULE(_cpu, m)
     // ── DISLDOLayer ───────────────────────────────────────────────────────────
 
     py::class_<DISLDOLayer>(m, "DISLDOLayer")
-        .def(py::init<int, int, int, int, float>(),
+        .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4, py::arg("solidify") = 0.01f)
+             py::arg("num_cpus") = 4)
         .def("forward",              &DISLDOLayer::forward,
              py::arg("x"), py::arg("train") = true)
         .def("backward",             &DISLDOLayer::backward,
-             py::arg("dy"))
-        .def("optim_weights",        &DISLDOLayer::optim_weights, py::arg("learning_rate"))
+             py::arg("dy"), py::arg("learning_rate"))
         .def("decay_importance",     &DISLDOLayer::decay_importance, py::arg("rate"))
         .def("build_probes",         &DISLDOLayer::build_probes, py::arg("k"))
         .def("optim_synaptogenesis", &DISLDOLayer::optim_synaptogenesis,
@@ -424,7 +709,6 @@ PYBIND11_MODULE(_cpu, m)
                 py::cast(&self));
         })
         .def_readonly ("num_cpus",  &DISLDOLayer::num_cpus)
-        .def_readwrite("solidify",  &DISLDOLayer::solidify)
         .def_property_readonly("n_inputs",  &DISLDOLayer::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayer::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayer::nnz);

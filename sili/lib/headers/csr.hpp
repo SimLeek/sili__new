@@ -1,6 +1,7 @@
 #ifndef __CSR__HPP_
 #define __CSR__HPP_
 
+#include "fp4quant.hpp"
 #include "sparse_struct.hpp"
 
 #include "coo.hpp"
@@ -265,11 +266,31 @@ CSRInput<SIZE_TYPE, VALUE_TYPE> make_csr_input(
 template <typename SIZE_TYPE, typename VALUE_TYPE>
 SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
     SIZE_TYPE rows, SIZE_TYPE cols,
-    std::vector<SIZE_TYPE>  ptrs,
-    std::vector<SIZE_TYPE>  indices,
-    std::vector<VALUE_TYPE> values,
-    std::vector<VALUE_TYPE> grads,
-    std::vector<VALUE_TYPE> importance)
+    std::vector<SIZE_TYPE>&&  ptrs,
+    std::vector<SIZE_TYPE>&&  indices,
+    FP4BiPacked&& values_and_importances)
+{
+    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
+    w.connections.rows       = rows;
+    w.connections.cols       = cols;
+    w.connections.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>> (std::move(ptrs));
+    w.connections.indices[0] = std::make_shared<std::vector<SIZE_TYPE>> (std::move(indices));
+    w.connections.values  = values_and_importances;
+    w.probes.rows = rows;
+    w.probes.cols = cols;
+    w.out_degree.assign(cols, SIZE_TYPE(0));
+    for (const auto& idx : *w.connections.indices[0])
+        w.out_degree[idx]++;
+    return w;
+}
+
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+SparseLinearWeightsV<SIZE_TYPE, VALUE_TYPE> make_weights_v(
+    SIZE_TYPE rows, SIZE_TYPE cols,
+    std::vector<SIZE_TYPE>&&  ptrs,
+    std::vector<SIZE_TYPE>&&  indices,
+    std::vector<VALUE_TYPE>&& values,
+    std::vector<VALUE_TYPE>&& importance)
 {
     SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
     w.connections.rows       = rows;
@@ -277,8 +298,7 @@ SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> make_weights(
     w.connections.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>> (std::move(ptrs));
     w.connections.indices[0] = std::make_shared<std::vector<SIZE_TYPE>> (std::move(indices));
     w.connections.values[0]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    w.connections.values[1]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(grads));
-    w.connections.values[2]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
+    w.connections.values[1]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
     w.probes.rows = rows;
     w.probes.cols = cols;
     w.out_degree.assign(cols, SIZE_TYPE(0));
@@ -353,7 +373,7 @@ std::vector<SIZE_TYPE> top_k_indices_biased(VALUE_TYPE *values, CSRInput<SIZE_TY
 
 template <class SIZE_TYPE, class VALUE_TYPE>
 sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
-top_k_csr_biased(VALUE_TYPE *values, CSRInput<SIZE_TYPE,  VALUE_TYPE>& bias, size_t rows, size_t cols, size_t k, int num_threads) {
+top_k_csr_biased_v(VALUE_TYPE *values, CSRInput<SIZE_TYPE,  VALUE_TYPE>& bias, size_t rows, size_t cols, size_t k, int num_threads) {
     // Step 1: Get the top-k indices
     std::vector<SIZE_TYPE> top_k = top_k_indices_biased(values, bias, rows * cols, k, num_threads);
 
