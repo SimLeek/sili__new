@@ -209,11 +209,23 @@ public:
 
 // ── SparseLinearLayer ───────────────────────────────────────────────────────────────
 // Rewritten (see conversation) to use SparseLinearWeightsDelta<S,FP4BiPacked,
-// COL_TYPE> -- the delta-CSR/generic-ValueAccessor generation, matching what
-// disldo_forward/disldo_backward now require. Previously used
-// SparseLinearWeights<S,V> (absolute CSR, no delta encoding, no FP4 packing
-// despite the class existing alongside an FP4-packed SISLDOLayer) and had NO
-// synaptogenesis methods at all -- build_probes/synap_row_step below are new.
+// COL_TYPE> -- the delta-CSR/generic-ValueAccessor generation. Previously
+// (as DISLDOLayer) used SparseLinearWeights<S,V> (absolute CSR, no delta
+// encoding, no FP4 packing) and had NO synaptogenesis at all --
+// build_probes/synap_row_step were added along with the rewiring.
+//
+// CORRECTION (see conversation): renaming DISLDOLayer -> SparseLinearLayer
+// and dropping the old SISLDOLayer (non-V) together left this class
+// DISLDO-only (dense input) -- SISLDO's sparse-input forward/backward
+// (genuinely different code, not just a naming variant: different kernel
+// structure, and legitimately needed when input activations really are
+// sparse, e.g. after a top-k/threshold step run BETWEEN layers -- that
+// sparsification is intentionally a separate operation, not something this
+// class decides for itself) had no surviving implementation anywhere in
+// this repo. forward_sparse/backward_sparse below close that gap, using
+// delta_csr_forward/delta_csr_backward (already existed in this file,
+// generic over VALUES_TYPE, verified correct against a hand-computed
+// reference before wiring up -- see conversation).
 
 class SparseLinearLayer {
 public:
@@ -289,6 +301,57 @@ public:
             learning_rate,
             num_cpus);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    // ── Sparse-input forward/backward (SISLDO) ──────────────────────────────────
+    // Genuinely different from forward/backward above, not a naming variant:
+    // only touches the input's nonzero positions (via CSR), vs dense's
+    // iterate-every-row structure. Use when activations are ACTUALLY sparse
+    // (e.g. after a top-k/threshold sparsification step run between layers --
+    // that decision belongs outside this class, see class comment) --
+    // meaningless/wasteful to force through here when input is genuinely dense.
+
+    CSRInput<S, V> _numpy_to_csr_input(py::array_t<S> ptrs, py::array_t<S> indices,
+                                       py::array_t<V> values, S batch, S cols) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
+        const S nz = (S)ib.size;
+        CSRInput<S, V> csr;
+        csr.rows = batch; csr.cols = cols;
+        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nz);
+        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
+        return csr;
+    }
+
+    py::array_t<V> forward_sparse(
+        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
+        S batch, V learning_rate = 0.0f)
+    {
+        auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
+        output_buf.assign(batch * n_outputs(), V(0));
+        delta_csr_forward<S, FP4BiPacked, COL_TYPE>(
+            input, weights, output_buf.data(), learning_rate, num_cpus);
+        return py::array_t<V>(
+            {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
+            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
+            output_buf.data(), py::cast(this));
+    }
+
+    py::array_t<V> backward_sparse(
+        py::array_t<S> x_ptrs, py::array_t<S> x_indices, py::array_t<V> x_values,
+        py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
+        S batch, V learning_rate = 0.01f)
+    {
+        auto input    = _numpy_to_csr_input(x_ptrs,  x_indices,  x_values,  batch, n_inputs());
+        auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
+        std::vector<V> dx(batch * n_inputs(), V(0));
+        std::vector<V> dy_dense(batch * n_outputs(), V(0));   // scratch, unused by caller
+        delta_csr_backward<S, FP4BiPacked, COL_TYPE>(
+            input, weights, out_grad, dx.data(), dy_dense.data(),
+            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
@@ -535,6 +598,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"), py::arg("learning_rate") = 0.01f)
         .def("backward",             &SparseLinearLayer::backward,
              py::arg("dy"), py::arg("learning_rate"))
+        .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
+             py::arg("batch"), py::arg("learning_rate") = 0.0f)
+        .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
+             py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"),
+             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+             py::arg("batch"), py::arg("learning_rate") = 0.01f)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
