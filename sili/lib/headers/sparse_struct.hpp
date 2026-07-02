@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <omp.h>
+#include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
 
@@ -445,7 +446,8 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_weights,
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_importance,
     std::size_t rows, std::size_t cols,
-    std::size_t index_bytes, std::size_t values_bytes)
+    std::size_t index_bytes, std::size_t values_bytes,
+    float blank_fraction = 0.2f)
 {
     // Let the shifting and gradual modification handle blank space fragmenting
     // We don't know row sizes or byte lengths for each index, so if we try to evenly assign spaces, we could run out of memory
@@ -488,7 +490,11 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     // 0.2 (20% headroom, elementwise and bytewise) mirrors this session's own
     // delta_csr_from_absolute (1.2x multiplier) -- proven sufficient for
     // ordinary synaptogenesis rates in testing throughout this project.
-    const float blank_fraction = 0.2f;
+    // blank_fraction is now a parameter (default 0.2, matching the original
+    // fixed value -- see conversation for the earlier bug where this was
+    // accidentally hardcoded via an incomplete assignment). Exposed so
+    // expand() can offer real caller control over how much headroom to
+    // restore, rather than reusing a fixed amount unconditionally.
     L.byte_start[0] = 0;
     L.elem_start[0] = 0;
     for (std::size_t r = 0; r < rows; ++r) {
@@ -872,7 +878,38 @@ bool delta_csr_synap_row_step(
         merged_imp  = std::move(final_imp);
     }
 
-    delta_csr_row_rebuild(dc, row, merged_cols, merged_w, merged_imp);
+    // BUG FIX (see conversation): row_rebuild's return value was discarded --
+    // on failure (insufficient reserved headroom, e.g. right after compact(),
+    // which deliberately leaves zero headroom on both axes) this function
+    // reported did_work=true and updated out_degree as if the merge had been
+    // written, while nnz silently never changed. A silent failure here is
+    // worse than a crash: training just stops improving with no signal why.
+    // Now throws (pybind converts std::runtime_error to a catchable Python
+    // exception) BEFORE touching out_degree, so bookkeeping can't be
+    // corrupted by a rebuild that didn't actually happen. Only the genuine
+    // "growth was attempted and failed" case throws -- the "nothing to do"
+    // no-op above (line ~811) is a legitimate, quiet false, not an error.
+    // See compact()/expand() in this file: call expand() to restore growth
+    // headroom before resuming synaptogenesis on a compacted layer.
+    const bool rebuilt = delta_csr_row_rebuild(dc, row, merged_cols, merged_w, merged_imp);
+    if (!rebuilt) {
+        uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
+        std::size_t needed_bytes = 0;
+        COL_TYPE prev = 0;
+        for (std::size_t k = 0; k < merged_cols.size(); ++k) {
+            needed_bytes += uleb128_encode<COL_TYPE>(merged_cols[k] - prev, tmp);
+            prev = merged_cols[k];
+        }
+        throw std::runtime_error(
+            "delta_csr_synap_row_step: row " + std::to_string(row) +
+            " needs " + std::to_string(needed_bytes) + " index bytes / " +
+            std::to_string(merged_cols.size()) + " elements, but only has " +
+            std::to_string(L.row_alloc_bytes(row)) + " bytes / " +
+            std::to_string(L.row_alloc_elems(row)) + " elements of reserved "
+            "headroom. Call expand_headroom() on this layer's weights.connections "
+            "before resuming synaptogenesis -- growth headroom was likely "
+            "removed by a prior compact() call.");
+    }
 
     if (!weights.out_degree.empty()) {
         for (std::size_t k = 0; k < n_exist; ++k)
@@ -1026,6 +1063,54 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> compact(
     out.max_values_bytes  = dc.max_values_bytes;
 
     return out;
+}
+
+// ── expand ─────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Opposite of compact(): restore growth headroom to a DeltaCSRWeights
+ * that has none (or not enough) -- typically because compact() removed it.
+ *
+ * Reuses delta_csr_from_absolute()'s already-tested headroom-reservation
+ * logic (extract to absolute CSR via delta_csr_to_absolute, then rebuild)
+ * rather than duplicating it. blank_fraction is the SAME parameter
+ * delta_csr_from_absolute takes -- 0.2 (20%) restores the same headroom a
+ * freshly-converted layer gets by default; pass a larger value before a
+ * synaptogenesis-heavy phase, smaller if memory is tight and only modest
+ * growth is expected.
+ *
+ * NOTE (test): after compact() then expand(), row_rebuild/synap_row_step
+ * must succeed on rows that failed immediately post-compact (this is the
+ * actual bug this function exists to let callers work around -- see
+ * conversation, "silent failure is the worst case"). Also verify expand()
+ * is lossless (same content as compact() already checks).
+ *
+ * Behavior note: expand() NORMALIZES headroom to exactly blank_fraction of
+ * current content size -- it does not add blank_fraction on top of
+ * whatever headroom the input already had (delta_csr_to_absolute extracts
+ * only the actual synapses, not existing slack, so there's nothing to add
+ * to). Calling expand() on an already-roomy layer with a smaller
+ * blank_fraction than it currently has will shrink its headroom, same as
+ * compact() would, just not all the way to zero. Consistent with compact()
+ * normalizing to exactly 0% -- expand() normalizes to exactly
+ * blank_fraction, not "at least blank_fraction."
+ */
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom(
+    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+    float blank_fraction = 0.2f)
+{
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    std::vector<SIZE_TYPE>  ptrs, idx;
+    std::vector<value_type> w, imp;
+    delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, ptrs, idx, w, imp);
+
+    const std::size_t n = idx.size();
+    return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
+        ptrs, idx, w, imp, dc.layout.rows, dc.layout.cols,
+        n * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
+        static_cast<std::size_t>(n * (1.0 + blank_fraction)) + 64,
+        blank_fraction);
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>

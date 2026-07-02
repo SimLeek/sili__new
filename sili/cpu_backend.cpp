@@ -268,9 +268,9 @@ public:
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
 
-    // ── Forward ───────────────────────────────────────────────────────────────
+    // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
-    py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
+    py::array_t<V> forward_dense(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
@@ -288,9 +288,9 @@ public:
             output_buf.data(), py::cast(this));
     }
 
-    // ── Backward ─────────────────────────────────────────────────────────────
+    // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
 
-    py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
+    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE>(
@@ -306,12 +306,17 @@ public:
     }
 
     // ── Sparse-input forward/backward (SISLDO) ──────────────────────────────────
-    // Genuinely different from forward/backward above, not a naming variant:
-    // only touches the input's nonzero positions (via CSR), vs dense's
-    // iterate-every-row structure. Use when activations are ACTUALLY sparse
-    // (e.g. after a top-k/threshold sparsification step run between layers --
-    // that decision belongs outside this class, see class comment) --
-    // meaningless/wasteful to force through here when input is genuinely dense.
+    // Genuinely different from forward_dense/backward_dense above, not a
+    // naming variant: only touches the input's nonzero positions (via CSR),
+    // vs dense's iterate-every-row structure. Use when activations are
+    // ACTUALLY sparse (e.g. after a top-k/threshold sparsification step run
+    // between layers -- that decision belongs outside this class, see class
+    // comment) -- meaningless/wasteful to force through here when input is
+    // genuinely dense. No bare forward()/backward() on this class
+    // deliberately -- see TODO.md for the planned auto-dispatching version
+    // and why a bare name isn't here yet: an unqualified default risks
+    // everyone reaching for dense out of habit and losing a real 10-100x
+    // speedup on genuinely sparse activations.
 
     CSRInput<S, V> _numpy_to_csr_input(py::array_t<S> ptrs, py::array_t<S> indices,
                                        py::array_t<V> values, S batch, S cols) {
@@ -376,6 +381,15 @@ public:
     // this model is about to resume training rather than just be deployed.
     void compact() {
         weights.connections = ::compact<S, FP4BiPacked, COL_TYPE>(weights.connections);
+    }
+
+    // Opposite of compact(): restores growth headroom, normalized to exactly
+    // blank_fraction of current content (not "at least" -- see expand() in
+    // sparse_struct.hpp). Call before resuming synaptogenesis on a layer
+    // that's been compact()ed -- synap_row_step now throws a catchable
+    // exception rather than silently doing nothing if headroom is missing.
+    void expand_headroom(float blank_fraction = 0.2f) {
+        weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
     }
 
     void zero_accum() {
@@ -594,9 +608,9 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer::forward,
+        .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"), py::arg("learning_rate") = 0.01f)
-        .def("backward",             &SparseLinearLayer::backward,
+        .def("backward_dense",       &SparseLinearLayer::backward_dense,
              py::arg("dy"), py::arg("learning_rate"))
         .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
@@ -613,6 +627,11 @@ PYBIND11_MODULE(_cpu, m)
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
+        .def("expand_headroom",      &SparseLinearLayer::expand_headroom,
+             py::arg("blank_fraction") = 0.2f,
+             "Opposite of compact(): restores growth headroom, normalized to\n"
+             "exactly blank_fraction of current content. Call before resuming\n"
+             "synaptogenesis on a compact()ed layer.")
         .def("zero_accum",           &SparseLinearLayer::zero_accum)
         .def_property_readonly("neuron_input_accum", &SparseLinearLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer::get_neuron_grad_accum)
