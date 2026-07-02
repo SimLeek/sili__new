@@ -55,40 +55,40 @@ TEST_CASE("hoyer_sparsify_row: mixed-magnitude vector selects the genuinely larg
         CHECK(std::find(r.indices.begin(), r.indices.end(), expected) != r.indices.end());
 }
 
-TEST_CASE("hoyer_sparsify_batch: per-row k_estimate genuinely differs, not shared across batch",
+TEST_CASE("hoyer_sparsify_per_batch: per-row k_estimate genuinely differs, not shared across batch",
          "[hoyer][batch]") {
     std::vector<float> batch(2 * 10, 0.0f);
     batch[0] = 1.0f; batch[1] = 1.0f;                    // row 0: 2 nonzero
     for (int i = 0; i < 8; ++i) batch[10 + i] = 1.0f;    // row 1: 8 nonzero
-    auto rows = hoyer_sparsify_batch<float>(batch.data(), 2, 10);
+    auto rows = hoyer_sparsify_per_batch<float>(batch.data(), 2, 10);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].k_estimate == 2);
     CHECK(rows[1].k_estimate == 8);
 }
 
-// ── hoyer_score_batch: the actual routing-decision quantity ──────────────────
+// ── hoyer_score: the actual routing-decision quantity ──────────────────
 //
 // Per conversation: per-row k_estimate isn't actionable for deciding
 // forward_dense vs forward_sparse, since that call happens once for the
-// WHOLE batch. hoyer_score_batch aggregates over the flattened batch to
+// WHOLE batch. hoyer_score aggregates over the flattened batch to
 // give the one number that decision actually needs.
 
-TEST_CASE("hoyer_score_batch: distinguishes a mostly-sparse batch from a mostly-dense one",
+TEST_CASE("hoyer_score: distinguishes a mostly-sparse batch from a mostly-dense one",
          "[hoyer][batch][routing]") {
     std::vector<float> mostly_sparse(5 * 100, 0.0f);
     for (int r = 0; r < 5; ++r)
         for (int i = 0; i < 3; ++i) mostly_sparse[r*100 + i] = 1.0f;   // 3/100 per row, every row
-    auto agg_sparse = hoyer_score_batch<float>(mostly_sparse.data(), 5, 100);
+    auto agg_sparse = hoyer_score<float>(mostly_sparse.data(), 5, 100);
 
     std::vector<float> mostly_dense(5 * 100, 1.0f);
-    auto agg_dense = hoyer_score_batch<float>(mostly_dense.data(), 5, 100);
+    auto agg_dense = hoyer_score<float>(mostly_dense.data(), 5, 100);
 
     CHECK(agg_sparse.hoyer_score > agg_dense.hoyer_score);
     CHECK(agg_dense.hoyer_score  < 0.01f);   // ~0 -> correctly signals "use forward_dense"
     CHECK(agg_sparse.hoyer_score > 0.5f);    // high -> correctly signals "use forward_sparse"
 }
 
-TEST_CASE("hoyer_score_batch: aggregate is genuinely distinct from any single row's own value",
+TEST_CASE("hoyer_score: aggregate is genuinely distinct from any single row's own value",
          "[hoyer][batch][routing]") {
     // Same construction as the per-row test: row0 very sparse, row1 medium,
     // row2 fully dense -- the aggregate must reflect the WHOLE batch, not
@@ -98,8 +98,8 @@ TEST_CASE("hoyer_score_batch: aggregate is genuinely distinct from any single ro
     for (int i = 0; i < 10; ++i) batch[20 + i] = 1.0f;
     for (int i = 0; i < 20; ++i) batch[40 + i] = 1.0f;
 
-    auto per_row = hoyer_sparsify_batch<float>(batch.data(), 3, 20);
-    auto agg     = hoyer_score_batch<float>(batch.data(), 3, 20);
+    auto per_row = hoyer_sparsify_per_batch<float>(batch.data(), 3, 20);
+    auto agg     = hoyer_score<float>(batch.data(), 3, 20);
 
     REQUIRE(agg.k_estimate > 0);
     REQUIRE(agg.k_estimate <= 60);

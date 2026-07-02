@@ -114,12 +114,12 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
  * batch together; a per-sample "is this one sparse enough" answer isn't
  * actionable at that granularity, since you can't send some samples
  * through one kernel and some through the other in a single call. For the
- * actual dense-vs-sparse ROUTING decision, use hoyer_score_batch() below,
+ * actual dense-vs-sparse ROUTING decision, use hoyer_score() below,
  * which aggregates over the whole batch to produce the one number that
  * question actually needs.
  */
 template <typename VALUE_TYPE>
-std::vector<HoyerSparsifyRow> hoyer_sparsify_batch(
+std::vector<HoyerSparsifyRow> hoyer_sparsify_per_batch(
     const VALUE_TYPE* x, std::size_t rows, std::size_t cols)
 {
     std::vector<HoyerSparsifyRow> result;
@@ -140,11 +140,11 @@ std::vector<HoyerSparsifyRow> hoyer_sparsify_batch(
  * batch-wide k_estimate -- what a threshold comparison should actually use
  * to decide which of forward_dense/forward_sparse to call for this batch.
  * Per-sample construction of the actual CSR data, once that decision is
- * made, should still use hoyer_sparsify_batch() above (or a fixed/shared k
+ * made, should still use hoyer_sparsify_per_batch() above (or a fixed/shared k
  * if uniform treatment across the batch is preferred) -- this function
  * only answers "which kernel", not "which elements to keep per row".
  */
 template <typename VALUE_TYPE>
-HoyerSparsifyRow hoyer_score_batch(const VALUE_TYPE* x, std::size_t rows, std::size_t cols) {
+HoyerSparsifyRow hoyer_score(const VALUE_TYPE* x, std::size_t rows, std::size_t cols) {
     return hoyer_sparsify_row<VALUE_TYPE>(x, rows * cols);
 }

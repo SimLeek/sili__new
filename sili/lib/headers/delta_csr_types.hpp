@@ -1,0 +1,448 @@
+/**
+ * @file sparse_matrix.hpp
+ * @brief Sparse matrix library with CSR and COO format support.
+ */
+
+#ifndef __DELTA_CSR_TYPES_HPP_
+#define __DELTA_CSR_TYPES_HPP_
+
+// Split out of sparse_struct.hpp to keep files under ~1k lines (see
+// conversation). Core type definitions only: sparse_struct template,
+// ValueAccessor<FP4BiPacked>/ValueAccessor<DeltaCSRBiValues<T>>,
+// DeltaCSRLayout/DeltaCSRRowCursor/DeltaCSRWeights, SparseLinearWeightsDelta.
+// Free functions operating on these types are in delta_csr_memory.hpp and
+// delta_csr_ops.hpp. sparse_struct.hpp remains a valid, working include
+// (umbrella of all three) for any existing code.
+
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstring>
+#include <memory>
+#include <numeric>
+#include <omp.h>
+#include <stdexcept>
+#include <vector>
+#include "fp4quant.hpp"
+
+/**
+ * @brief Type trait to check if a type is a std::array.
+ * @tparam T The type to check.
+ */
+template <typename T>
+struct is_std_array : std::false_type {};
+
+/**
+ * @brief Specialization of is_std_array for std::array types.
+ * @tparam T The element type of the array.
+ * @tparam N The size of the array.
+ */
+template <typename T, std::size_t N>
+struct is_std_array<std::array<T, N>> : std::true_type {};
+
+/**
+ * @brief Helper variable template to check if a type is a std::array.
+ * @tparam T The type to check.
+ */
+template <typename T>
+constexpr bool is_std_array_v = is_std_array<T>::value;
+
+template <class SIZE_TYPE>
+using CSRPointers = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
+
+template <class SIZE_TYPE>
+using CSRIndices = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
+
+template <class SIZE_TYPE>
+using COOPointers = SIZE_TYPE;  // just store nnz
+
+template <class SIZE_TYPE>
+using COOIndices = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 2>;
+
+template <class VALUE_TYPE>
+using UnaryValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 1>;
+
+using BiValuesFP4 = FP4BiPacked;
+
+template <class VALUE_TYPE>
+using BiValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 2>;
+
+template <class VALUE_TYPE>
+using TriValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 3>;
+
+template <class VALUE_TYPE>
+using QuadValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 4>;
+
+template <class VALUE_TYPE>
+using PentaValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 5>;
+
+template <typename INDEX_ARRAYS>
+constexpr std::size_t num_indices = std::tuple_size<INDEX_ARRAYS>::value;
+
+template <class SIZE_TYPE, class PTRS, class INDICES, class VALUES>
+struct sparse_struct {
+    PTRS ptrs;               // Pointers sub-template
+    INDICES indices;         // Indices sub-template
+    VALUES values;           // Values sub-template
+    SIZE_TYPE rows;
+    SIZE_TYPE cols;
+    SIZE_TYPE _reserved_space = 0;
+
+    using size_type = SIZE_TYPE;   // Exporting the type
+
+    static constexpr std::size_t n_index_arrays = num_indices<INDICES>;
+    static constexpr std::size_t n_value_arrays = num_indices<VALUES>;
+    static constexpr std::size_t n_pointer_arrays = num_indices<PTRS>;
+
+    /**
+     * @brief Default constructor, initializes an empty sparse matrix.
+     */
+    sparse_struct()
+        : rows(0), cols(0), _reserved_space(0) {}
+
+    /**
+     * @brief Constructor for pre-allocated arrays with reserved space.
+     * @param p Pointers sub-template (moved into the structure).
+     * @param ind Indices sub-template (moved into the structure).
+     * @param val Values sub-template (moved into the structure).
+     * @param num_p Number of rows.
+     * @param max_idx Number of columns.
+     * @param reserved Reserved space for future expansion.
+     */
+    sparse_struct(PTRS& p, INDICES& ind, VALUES& val, SIZE_TYPE num_p, SIZE_TYPE max_idx, SIZE_TYPE reserved)
+        : ptrs(std::move(p)), indices(std::move(ind)), values(std::move(val)),
+          rows(num_p), cols(max_idx), _reserved_space(reserved) {}
+
+    /**
+     * @brief Constructor for pre-allocated arrays without reserved space.
+     * @param p Pointers sub-template (moved into the structure).
+     * @param ind Indices sub-template (moved into the structure).
+     * @param val Values sub-template (moved into the structure).
+     * @param num_p Number of rows.
+     * @param max_idx Number of columns.
+     */
+    sparse_struct(PTRS& p, INDICES& ind, VALUES& val, SIZE_TYPE num_p, SIZE_TYPE max_idx)
+        : sparse_struct(std::move(p), std::move(ind), std::move(val), num_p, max_idx, 0) {}
+
+    /**
+     * @brief Get the number of non-zero elements in the sparse matrix.
+     *
+     * If PTRS is an array type (e.g., CSR), returns the last pointer value.
+     * If PTRS is a single value (e.g., COO), returns that value directly.
+     *
+     * @return The number of non-zero elements.
+     */
+    SIZE_TYPE nnz() const {
+        if constexpr (std::is_array_v<decltype(ptrs)> || is_std_array_v<decltype(ptrs)>) { // Check if ptrs is an array type
+            return (ptrs[ptrs.size()-1] && !ptrs[ptrs.size()-1]->empty()) ? (*ptrs[ptrs.size()-1])[rows] : 0;
+        } else { // ptrs is a single nnz value
+            return ptrs;
+        }
+    }
+
+    /**
+     * @brief Clear all values in the sparse structure.
+     */
+    void clear() {
+        if constexpr (is_std_array_v<VALUES>) {
+            for (auto& v : values) {
+                v.clear();
+            }
+        } else {
+            values.clear();
+        }
+    }
+
+};
+
+// bi = weight multiplier, importance (for optim). Adagrad would use 2 for optim, using quad.
+// Since all these have the same indices, it's much cheaper to store them in the same csr.
+template <class SIZE_TYPE>
+using CSRSynapses = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValuesFP4 >;
+// easier to use in some algorithms
+template <class SIZE_TYPE>
+using COOSynapses = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValuesFP4 >;
+
+template <class SIZE_TYPE, class VALUE_TYPE>
+using CSRSynapsesV = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValues<VALUE_TYPE> >;
+// easier to use in some algorithms
+template <class SIZE_TYPE, class VALUE_TYPE>
+using COOSynapsesV = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValues<VALUE_TYPE> >;
+
+template <class SIZE_TYPE, class VALUE_TYPE>
+using CSRInput = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE> >;
+
+//easier to use in some algorithms
+template <class SIZE_TYPE, class VALUE_TYPE>
+using COOSynaptogenesis = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE> >;
+
+template <class SYNAPSES, class SYNAPTOGENESIS>
+struct sparse_weights{
+    using size_type = typename SYNAPSES::size_type;
+
+    SYNAPSES connections;
+    SYNAPTOGENESIS probes;
+    // out_degree[j] = #weights targeting output neuron j.
+    // Cached because computing it requires O(nnz) — maintained incrementally by synaptogenesis.
+    std::vector<size_type> out_degree;
+
+    // in_degree is free from CSR ptrs — no storage needed.
+    inline size_type in_degree(size_type i) const {
+        return (*connections.ptrs[0])[i + 1] - (*connections.ptrs[0])[i];
+    }
+};
+
+template <class SIZE_TYPE, class VALUE_TYPE>
+using SparseLinearWeights = sparse_weights<CSRSynapses<SIZE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
+template <class SIZE_TYPE, class VALUE_TYPE>
+using SparseLinearWeightsV = sparse_weights<CSRSynapsesV<SIZE_TYPE, VALUE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
+
+// Delta CSR section
+
+/// Maximum bytes to encode an integer as ULEB128.
+// fake ULEB128, but in practice we're not going to have more than 2^28 zeroes between items in a single row
+template <typename T = uint32_t>
+constexpr std::size_t uleb128_max_bytes() {
+    return (sizeof(T) * 8 + 6) / 7;
+}
+
+/// Encode @p value into @p buf as ULEB128. Returns bytes written.
+template <typename T = uint32_t>
+inline std::size_t uleb128_encode(T value, uint8_t* buf) {
+    std::size_t n = 0;
+    do {
+        uint8_t byte = static_cast<uint8_t>(value & 0x7Fu);
+        value >>= 7;
+        if (value) byte |= 0x80u;
+        buf[n++] = byte;
+    } while (value);
+    return n;
+}
+
+/// Decode one ULEB128 value from @p buf at byte offset *pos. Advances *pos.
+template <typename T = uint32_t>
+inline T uleb128_decode(const uint8_t* buf, std::size_t& pos) {
+    T result = 0;
+    int shift = 0;
+    uint8_t byte;
+    do {
+        byte = buf[pos++];
+        result |= static_cast<T>(byte & 0x7Fu) << shift;
+        shift += 7;
+    } while (byte & 0x80u);
+    return result;
+}
+
+template <typename V, typename = void>
+struct ValueAccessor;
+
+/// Trait to handle FP4BiPacked natively
+template <>
+struct ValueAccessor<FP4BiPacked> {
+    using value_type = float;
+    static value_type get_w(const FP4BiPacked& v, std::size_t i) { return v[0][i]; }
+    static value_type get_imp(const FP4BiPacked& v, std::size_t i) { return v[1][i]; }
+    static void set(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v[0][i] = w;
+        v[1][i] = imp;
+    }
+    static void reserve(FP4BiPacked& v, std::size_t n) { 
+        v.reserve(n); 
+    }
+    static void resize(FP4BiPacked& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) { 
+        v.resize(n, val, imp); 
+    }
+    static void move(FP4BiPacked& v, std::size_t dest, std::size_t src, std::size_t count) {
+        if (count == 0 || !v._data) return;
+        std::memmove(v._data->data() + dest, v._data->data() + src, count);
+    }
+
+    static std::size_t projected_byte_size(std::size_t n) {
+        return n; 
+    }
+};
+
+/// Fallback standard vector equivalent for floats (e.g. CSRSynapsesV uses)
+template <typename T>
+struct DeltaCSRBiValues {
+    std::vector<T> weights;
+    std::vector<T> importance;
+};
+
+
+
+template <typename T>
+struct ValueAccessor<DeltaCSRBiValues<T>> {
+    using value_type = T;
+    static value_type get_w(const DeltaCSRBiValues<T>& v, std::size_t i) { return v.weights[i]; }
+    static value_type get_imp(const DeltaCSRBiValues<T>& v, std::size_t i) { return v.importance[i]; }
+    static void set(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = w;
+        v.importance[i] = imp;
+    }
+    static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0), value_type imp = value_type(0)) {
+        v.weights.resize(n, val);
+        v.importance.resize(n, imp);
+    }
+    static void move(DeltaCSRBiValues<T>& v, std::size_t dest, std::size_t src, std::size_t count) {
+        if (count == 0) return;
+        std::memmove(v.weights.data() + dest, v.weights.data() + src, count * sizeof(value_type));
+        std::memmove(v.importance.data() + dest, v.importance.data() + src, count * sizeof(value_type));
+    }
+    static void reserve(DeltaCSRBiValues<T>& v, std::size_t n) {
+        v.weights.reserve(n);
+        v.importance.reserve(n);
+    }
+
+    static std::size_t projected_byte_size(std::size_t n) {
+        return n * sizeof(T) * 2; 
+    }
+};
+
+// ── Layout metadata ───────────────────────────────────────────────────────────
+
+struct DeltaCSRLayout {
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+
+    std::vector<std::size_t> byte_start;   // size rows+1
+    std::vector<std::size_t> byte_end;     // size rows
+
+    std::vector<std::size_t> elem_start;   // size rows+1
+    std::vector<std::size_t> elem_end;     // size rows
+
+    std::size_t total_nnz = 0;
+
+    std::size_t row_nnz        (std::size_t r) const { return elem_end[r] - elem_start[r]; }
+    std::size_t row_byte_len   (std::size_t r) const { return byte_end[r] - byte_start[r]; }
+    std::size_t row_alloc_bytes(std::size_t r) const { return byte_start[r+1] - byte_start[r]; }
+    std::size_t row_alloc_elems(std::size_t r) const { return elem_start[r+1] - elem_start[r]; }
+    std::size_t row_blank_bytes(std::size_t r) const { return byte_start[r+1] - byte_end[r]; }
+    std::size_t row_blank_elems(std::size_t r) const { return elem_start[r+1] - elem_end[r]; }
+
+    std::size_t total_alloc_bytes() const { return byte_start.empty() ? 0 : byte_start.back(); }
+    std::size_t total_alloc_elems() const { return elem_start.empty() ? 0 : elem_start.back(); }
+
+    std::size_t total_blank_bytes() const {
+        std::size_t b = 0;
+        for (std::size_t r = 0; r < rows; ++r) b += row_blank_bytes(r);
+        return b;
+    }
+    std::size_t total_blank_elems() const {
+        std::size_t b = 0;
+        for (std::size_t r = 0; r < rows; ++r) b += row_blank_elems(r);
+        return b;
+    }
+
+    std::size_t num_rows() const { return rows; }
+};
+
+// ── Forward-only row cursor ───────────────────────────────────────────────────
+
+template <typename COL_TYPE = uint32_t>
+struct DeltaCSRRowCursor {
+    const uint8_t* buf      = nullptr;
+    std::size_t    byte_pos = 0;
+    std::size_t    byte_end = 0;
+    COL_TYPE       cur_col  = 0;
+    std::size_t    n_decoded = 0;
+
+    DeltaCSRRowCursor() = default;
+
+    DeltaCSRRowCursor(const uint8_t* indices_buf, const DeltaCSRLayout& L, std::size_t row)
+        : buf(indices_buf)
+        , byte_pos(L.byte_start[row])
+        , byte_end(L.byte_end[row])
+        , cur_col(0)
+        , n_decoded(0)
+    {}
+
+    bool at_end() const { return byte_pos >= byte_end; }
+
+    COL_TYPE advance() {
+        cur_col += uleb128_decode<COL_TYPE>(buf, byte_pos);
+        ++n_decoded;
+        return cur_col;
+    }
+
+    void advance_to(std::size_t target) {
+        while (n_decoded <= target) advance();
+    }
+
+    COL_TYPE col() const { return cur_col; }
+};
+
+// ── DeltaCSRWeights ──────────────────────────────────────────────────────────
+
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+struct DeltaCSRWeights {
+    DeltaCSRLayout       layout;
+    std::vector<uint8_t> indices_buf;
+    VALUES_TYPE          values;
+
+    std::size_t          max_indices_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t          max_values_bytes  = std::numeric_limits<std::size_t>::max();
+
+    using size_type  = SIZE_TYPE;
+    using col_type   = COL_TYPE;
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+
+    bool        empty()    const { return layout.total_nnz == 0; }
+    std::size_t nnz()      const { return layout.total_nnz; }
+    std::size_t num_rows() const { return layout.rows; }
+    std::size_t total_blank_bytes() const { return layout.total_blank_bytes(); }
+
+    DeltaCSRRowCursor<COL_TYPE> row_cursor(std::size_t row) const {
+        return DeltaCSRRowCursor<COL_TYPE>(indices_buf.data(), layout, row);
+    }
+
+    void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {
+        max_indices_bytes = indices_limit_bytes;
+        max_values_bytes  = values_limit_bytes;
+    }
+
+    void reserve_indices(std::size_t target_bytes) {
+        if (target_bytes > max_indices_bytes) {
+            throw std::bad_alloc(); 
+        }
+        indices_buf.reserve(target_bytes);
+    }
+
+    void reserve_values(std::size_t target_nnz) {
+        std::size_t target_bytes = ValueAccessor<VALUES_TYPE>::projected_byte_size(target_nnz);
+        if (target_bytes > max_values_bytes) {
+            throw std::bad_alloc();
+        }
+        ValueAccessor<VALUES_TYPE>::reserve(values, target_nnz);
+    }
+};
+
+// ── SparseLinearWeightsDelta ─────────────────────────────────────────────────
+
+template <class SIZE_TYPE, class VALUES_TYPE = FP4BiPacked, class COL_TYPE = uint32_t>
+struct SparseLinearWeightsDelta {
+    using size_type  = SIZE_TYPE;
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
+    COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
+    std::vector<SIZE_TYPE>                            out_degree;
+
+    inline SIZE_TYPE in_degree(SIZE_TYPE i) const {
+        return static_cast<SIZE_TYPE>(connections.layout.row_nnz(i));
+    }
+
+    inline void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {
+        connections.set_limits(indices_limit_bytes, values_limit_bytes);
+    }
+
+    inline void reserve_indices(std::size_t target_bytes) {
+        connections.reserve_indices(target_bytes);
+    }
+
+    inline void reserve_values(std::size_t target_nnz) {
+        connections.reserve_values(target_nnz);
+    }
+};
+
+#endif

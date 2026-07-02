@@ -781,7 +781,7 @@ PYBIND11_MODULE(_cpu, m)
             const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
             float* src = (float*)buf.ptr;
 
-            auto per_row = hoyer_sparsify_batch<float>(src, rows, cols);
+            auto per_row = hoyer_sparsify_per_batch<float>(src, rows, cols);
 
             std::vector<int>   ptrs(rows + 1, 0);
             std::vector<int>   indices;
@@ -843,18 +843,18 @@ PYBIND11_MODULE(_cpu, m)
         "path -- it is NOT the right thing to base that routing decision on\n"
         "(forward_dense/forward_sparse are each called once for the WHOLE\n"
         "batch, so a per-sample answer isn't actionable there). For the\n"
-        "actual dense-vs-sparse routing decision, use hoyer_score_batch().\n"
+        "actual dense-vs-sparse routing decision, use hoyer_score().\n"
         "Not wired into any automatic dispatch yet -- see TODO.md.");
 
-    // ── hoyer_score_batch ─────────────────────────────────────────────────────
-    m.def("hoyer_score_batch",
+    // ── hoyer_score ─────────────────────────────────────────────────────
+    m.def("hoyer_score",
         [](py::array_t<float> x) -> py::dict {
             auto buf   = x.request();
             const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
             const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
             float* src = (float*)buf.ptr;
 
-            auto agg = hoyer_score_batch<float>(src, rows, cols);
+            auto agg = hoyer_score<float>(src, rows, cols);
 
             py::dict result;
             result["hoyer_score"] = agg.hoyer_score;
