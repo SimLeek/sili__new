@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <omp.h>
 #include <vector>
 #include "fp4quant.hpp"
@@ -475,7 +476,19 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     }
 
 
-    std::size_t blank_fraction = 
+    // BUG FIX (see conversation): this was `std::size_t blank_fraction = `
+    // with nothing after the `=` before the next statement -- valid C++ that
+    // silently parsed as the chained assignment `blank_fraction = (L.byte_start[0] = 0)`,
+    // zeroing the intended growth-headroom fraction. Confirmed via direct
+    // testing: delta_csr_row_rebuild() failed silently on every row of a
+    // freshly-imported layer (row_alloc_bytes/row_alloc_elems left almost no
+    // slack), so synaptogenesis could never actually grow a connection --
+    // exactly matching this function's own TODO comment above ("we could run
+    // out of memory... can guarantee we won't by assuming uleb128_max_bytes").
+    // 0.2 (20% headroom, elementwise and bytewise) mirrors this session's own
+    // delta_csr_from_absolute (1.2x multiplier) -- proven sufficient for
+    // ordinary synaptogenesis rates in testing throughout this project.
+    const float blank_fraction = 0.2f;
     L.byte_start[0] = 0;
     L.elem_start[0] = 0;
     for (std::size_t r = 0; r < rows; ++r) {
@@ -487,7 +500,7 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
         
         L.elem_end[r]       = L.elem_start[r] + n;
         const std::size_t elem_blank = std::max(std::size_t(1),
-                                                static_cast<std::size_t>(n * blank_fraction));
+                                                static_cast<std::size_t>(n * blank_fraction) + 1);
         L.elem_start[r + 1] = L.elem_end[r] + elem_blank;
     }
     L.total_nnz = static_cast<std::size_t>(csr_ptrs[rows]);
@@ -651,6 +664,16 @@ bool delta_csr_row_rebuild(
 {
     auto& L = dc.layout;
     const std::size_t n = cols.size();
+    // BUG FIX (see conversation): must capture the OLD row_nnz BEFORE
+    // L.elem_end[row] is overwritten below -- row_nnz(row) reads
+    // elem_end[row]-elem_start[row], so calling it AFTER the write (as the
+    // original code did, a few lines down) always returns the NEW count,
+    // making nnz_delta = n - n = 0 unconditionally. Confirmed via direct
+    // testing: delta_csr_row_rebuild reported success and correctly wrote
+    // new synapse data, but dc.nnz()/total_nnz never changed -- so every
+    // caller relying on nnz() to observe growth (including synaptogenesis
+    // callers checking "did this actually grow") silently saw no change.
+    const std::size_t old_row_nnz = L.row_nnz(row);
 
     uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
     std::size_t needed_bytes = 0;
@@ -678,7 +701,7 @@ bool delta_csr_row_rebuild(
 
     const std::ptrdiff_t nnz_delta =
         static_cast<std::ptrdiff_t>(n) -
-        static_cast<std::ptrdiff_t>(dc.layout.row_nnz(row));
+        static_cast<std::ptrdiff_t>(old_row_nnz);
     L.total_nnz = static_cast<std::size_t>(
         static_cast<std::ptrdiff_t>(L.total_nnz) + nnz_delta);
 
@@ -862,19 +885,190 @@ bool delta_csr_synap_row_step(
     return true;
 }
 
+// ── Probe generation (outer product, top-k) ───────────────────────────────────
+
+/**
+ * @brief Build COO probe candidates for synaptogenesis via outer product.
+ *
+ * Selects the top-@p k input neurons by neuron_input_accum and top-@p k output
+ * neurons by neuron_grad_accum, then forms the outer product of those two
+ * sets. Pairs that already have a connection are skipped. Each novel pair
+ * gets importance = accum_in * accum_out. Existing probes are cleared and
+ * replaced.
+ *
+ * Generic over VALUES_TYPE via ValueAccessor -- works identically for
+ * FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit) with no
+ * separate implementation, matching delta_csr_synap_row_step (which
+ * applies these probes) and delta_csr_forward/backward.
+ *
+ * Existing-connection check uses DeltaCSRRowCursor directly (no full row
+ * materialization) -- O(row_nnz) per candidate input row, same complexity
+ * class as scanning the row any other way.
+ *
+ * Complexity: O(n_inputs + n_outputs) for the top-k selection, O(k^2 *
+ * avg_row_nnz) for the existing-connection filter -- fine for small k
+ * (typically 64-256, matching genesis_build_probes' historical usage).
+ *
+ * @param weights             Layer state -- probes are replaced.
+ * @param neuron_input_accum  [n_inputs] accumulated |x| across recent passes.
+ * @param neuron_grad_accum   [n_outputs] accumulated |grad| across recent passes.
+ * @param k                   Top-k candidates per side.
+ * @param per_row             false (default): ONE shared top-k output set
+ *                            computed globally, outer-producted against the
+ *                            top-k input rows, THEN filtered for existing
+ *                            connections -- cheap (one O(n_out log k) sort
+ *                            total), but a row can lose probe slots to
+ *                            duplicates it already has, so it may end up
+ *                            with fewer than k genuinely-new candidates.
+ *                            true: EACH candidate row gets its OWN top-k
+ *                            search over ALL n_out outputs with existing
+ *                            connections excluded DURING selection (not
+ *                            after) -- guarantees up to k genuinely-new
+ *                            candidates per row, at the cost of one
+ *                            O(n_out) scan PER candidate row instead of
+ *                            one shared O(n_out log k) sort. Matters more
+ *                            for large layers, where a shared top-k set is
+ *                            a much smaller fraction of all outputs and the
+ *                            wasted-slots effect is more pronounced -- not
+ *                            worth the extra cost for small layers.
+ *
+ * NOTE (test): with k >= n_inputs and k >= n_outputs, every input/output is
+ * a candidate, so probe count == (n_inputs*n_outputs - existing_nnz) minus
+ * any duplicate outer-product collisions (none possible here since inputs
+ * and outputs are each selected without repetition) -- a useful upper-bound
+ * regression check.
+ * NOTE (test): a pair that already exists in connections must never appear
+ * in probes, regardless of how high its accum-derived importance would be.
+ * NOTE (test): per_row=true must yield >= as many probes as per_row=false
+ * for the same (weights, accum, k) -- guaranteed since per_row never wastes
+ * a candidate slot on an already-connected pair. Construct a case where a
+ * row's shared-top-k output set is dominated by its own existing
+ * connections (global mode starves it) to see the difference concretely.
+ */
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void delta_csr_build_probes(
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    const typename ValueAccessor<VALUES_TYPE>::value_type* neuron_input_accum,
+    const typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
+    SIZE_TYPE k,
+    bool per_row = false)
+{
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    auto& dc = weights.connections;
+    auto& L  = dc.layout;
+    const std::size_t n_in  = L.rows;
+    const std::size_t n_out = L.cols;
+    if (n_in == 0 || n_out == 0 || k <= 0) {
+        weights.probes.ptrs = 0;
+        return;
+    }
+
+    const std::size_t kk_in  = std::min(static_cast<std::size_t>(k), n_in);
+    const std::size_t kk     = static_cast<std::size_t>(k);
+
+    // ── Top-k inputs by accumulated activity (shared by both modes) ──────────
+    std::vector<std::size_t> in_idx(n_in);
+    std::iota(in_idx.begin(), in_idx.end(), 0);
+    std::partial_sort(in_idx.begin(), in_idx.begin() + kk_in, in_idx.end(),
+        [&](std::size_t a, std::size_t b) {
+            return neuron_input_accum[a] > neuron_input_accum[b];
+        });
+    in_idx.resize(kk_in);
+
+    std::vector<SIZE_TYPE>   prow, pcol;
+    std::vector<value_type>  pval;
+
+    if (!per_row) {
+        // ── Global mode: one shared top-k output set, outer product, filter after ──
+        const std::size_t kk_out = std::min(kk, n_out);
+        std::vector<std::size_t> out_idx(n_out);
+        std::iota(out_idx.begin(), out_idx.end(), 0);
+        std::partial_sort(out_idx.begin(), out_idx.begin() + kk_out, out_idx.end(),
+            [&](std::size_t a, std::size_t b) {
+                return neuron_grad_accum[a] > neuron_grad_accum[b];
+            });
+        out_idx.resize(kk_out);
+
+        prow.reserve(kk_in * kk_out);
+        pcol.reserve(kk_in * kk_out);
+        pval.reserve(kk_in * kk_out);
+
+        for (std::size_t r : in_idx) {
+            const std::size_t n_exist = L.row_nnz(r);
+            std::vector<COL_TYPE> exist_cols(n_exist);
+            {
+                auto cur = dc.row_cursor(r);
+                for (std::size_t i = 0; i < n_exist; ++i) exist_cols[i] = cur.advance();
+            }
+            for (std::size_t c : out_idx) {
+                if (std::binary_search(exist_cols.begin(), exist_cols.end(),
+                                       static_cast<COL_TYPE>(c))) continue;
+                prow.push_back(static_cast<SIZE_TYPE>(r));
+                pcol.push_back(static_cast<SIZE_TYPE>(c));
+                pval.push_back(neuron_input_accum[r] * neuron_grad_accum[c]);
+            }
+        }
+    } else {
+        // ── Per-row mode: independent top-k per row, existing conns excluded
+        //    DURING selection -- guarantees up to k genuinely-new candidates
+        //    per row instead of losing slots to duplicates found afterward.
+        prow.reserve(kk_in * kk);
+        pcol.reserve(kk_in * kk);
+        pval.reserve(kk_in * kk);
+
+        for (std::size_t r : in_idx) {
+            const std::size_t n_exist = L.row_nnz(r);
+            std::vector<COL_TYPE> exist_cols(n_exist);
+            {
+                auto cur = dc.row_cursor(r);
+                for (std::size_t i = 0; i < n_exist; ++i) exist_cols[i] = cur.advance();
+            }
+
+            // Candidates = all outputs NOT already connected to this row.
+            std::vector<std::size_t> cand;
+            cand.reserve(n_out);
+            for (std::size_t c = 0; c < n_out; ++c)
+                if (!std::binary_search(exist_cols.begin(), exist_cols.end(),
+                                        static_cast<COL_TYPE>(c)))
+                    cand.push_back(c);
+
+            const std::size_t kk_row = std::min(kk, cand.size());
+            if (kk_row == 0) continue;
+            std::partial_sort(cand.begin(), cand.begin() + kk_row, cand.end(),
+                [&](std::size_t a, std::size_t b) {
+                    return neuron_grad_accum[a] > neuron_grad_accum[b];
+                });
+
+            for (std::size_t i = 0; i < kk_row; ++i) {
+                const std::size_t c = cand[i];
+                prow.push_back(static_cast<SIZE_TYPE>(r));
+                pcol.push_back(static_cast<SIZE_TYPE>(c));
+                pval.push_back(neuron_input_accum[r] * neuron_grad_accum[c]);
+            }
+        }
+    }
+
+    weights.probes.rows       = static_cast<SIZE_TYPE>(n_in);
+    weights.probes.cols       = static_cast<SIZE_TYPE>(n_out);
+    weights.probes.ptrs       = static_cast<SIZE_TYPE>(prow.size());
+    weights.probes.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::move(prow));
+    weights.probes.indices[1] = std::make_shared<std::vector<SIZE_TYPE>>(std::move(pcol));
+    weights.probes.values[0]  = std::make_shared<std::vector<value_type>>(std::move(pval));
+}
+
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_forward(
     const CSRInput<SIZE_TYPE, typename ValueAccessor<VALUES_TYPE>::value_type>& input_tensor,
-    const SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     typename ValueAccessor<VALUES_TYPE>::value_type* output,
     typename ValueAccessor<VALUES_TYPE>::value_type   learning_rate = 0.01f,
     const int    num_cpus = 4,
     typename ValueAccessor<VALUES_TYPE>::value_type* original_contributions_output = nullptr)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
-    const auto& dc = weights.connections;
+    auto& dc = weights.connections;
     if (dc.empty()) return;
 
     const auto& L           = dc.layout;

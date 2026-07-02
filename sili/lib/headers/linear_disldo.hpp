@@ -1,158 +1,191 @@
+#pragma once
 #include "csr.hpp"
+#include "sparse_struct.hpp"
 #include "parallel.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
 // ── DISLDO: Dense Input, Sparse Linear, Dense Output ─────────────────────────
+//
+// Generic over VALUES_TYPE via ValueAccessor -- works identically for
+// FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit fallback),
+// matching delta_csr_forward/delta_csr_backward (the SISLDO/sparse-input
+// equivalents in sparse_struct.hpp) and delta_csr_synap_row_step /
+// delta_csr_build_probes, which already use this same pattern.
+//
+// Supersedes the previous float32/absolute-CSR disldo_forward/disldo_backward
+// (which never used DeltaCSRLayout/FP4BiPacked at all -- see conversation).
+// Dense-input walk is embarrassingly parallel by input row, unlike the
+// sparse-input SISLDO path which needs a work-offset table to balance
+// threads across a variable-density CSR batch.
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
-template <typename WEIGHTS_T, 
-          typename VALUE_TYPE = typename WEIGHTS_T::value_type,
-          typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
+/**
+ * @brief Dense-input forward pass with inline Hebbian importance update.
+ *
+ * @param input          [batch x in_cols] row-major dense.
+ * @param batch, in_cols Input dimensions.
+ * @param weights        Layer state (importance updated in place if learning_rate != 0).
+ * @param output         [batch x out_cols] accumulated into (caller zeroes first).
+ * @param learning_rate  Hebbian importance update rate (0 = off).
+ * @param num_cpus       OpenMP thread count.
+ *
+ * NOTE (test): with learning_rate=0, output must equal the dense matmul
+ * input @ W_dense where W_dense[r,c] = weight of synapse (r->c). Same
+ * reference check used for delta_csr_forward and for this session's
+ * standalone disldo_ops.hpp (see conversation) -- both passed it.
+ */
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void disldo_forward(
-    const VALUE_TYPE* input,          // [batch, in_cols] row-major
-    const SIZE_TYPE   batch,
-    const SIZE_TYPE   in_cols,
-    const WEIGHTS_T& weights,
-    VALUE_TYPE*       output,         // [batch, out_cols] zeroed by caller
-    VALUE_TYPE        learning_rate = 0.01f,
-    const int         num_cpus = 4)
+    const typename ValueAccessor<VALUES_TYPE>::value_type* input,
+    SIZE_TYPE    batch,
+    SIZE_TYPE    in_cols,
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    typename ValueAccessor<VALUES_TYPE>::value_type* output,
+    typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
+    int          num_cpus = 4)
 {
-    if (connections_empty(weights.connections)) return;
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    auto& dc = weights.connections;
+    const auto& L  = dc.layout;
+    if (dc.empty()) return;
 
-    const SIZE_TYPE out_cols     = weights.connections.cols;
-    const auto&     conn_ptrs    = *weights.connections.ptrs[0];
-    const auto&     conn_indices = *weights.connections.indices[0];
-    const auto&     conn_val0    = *weights.connections.values[0];
-    auto&           conn_str     = *weights.connections.values[1]; // importance/strength
+    const std::size_t n_in  = L.rows;
+    const std::size_t n_out = L.cols;
+    const std::size_t ost   = static_cast<std::size_t>(batch) * n_out;
 
-    const SIZE_TYPE out_size = batch * out_cols;
-
-    std::vector<VALUE_TYPE> all_out((size_t)num_cpus * out_size, VALUE_TYPE(0));
+    std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
-        VALUE_TYPE* my_out = all_out.data() + (size_t)tid * out_size;
+        value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
 
         #pragma omp for schedule(static)
-        for (SIZE_TYPE ic = 0; ic < in_cols; ++ic) {
-            const SIZE_TYPE wp_start = conn_ptrs[ic];
-            const SIZE_TYPE wp_end   = conn_ptrs[ic + 1];
-            if (wp_start == wp_end) continue;
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n_row = L.row_nnz(r);
+            if (n_row == 0) continue;
 
-            for (SIZE_TYPE b = 0; b < batch; ++b) {
-                const VALUE_TYPE iv = input[b * in_cols + ic];
-                for (SIZE_TYPE wp = wp_start; wp < wp_end; ++wp) {
-                    const VALUE_TYPE w  = conn_val0[wp];
-                    const SIZE_TYPE  oc = conn_indices[wp];
-                    const VALUE_TYPE c  = w * iv;
-                    my_out[b * out_cols + oc] += c;
-                    if (learning_rate!=0) conn_str[wp] += c * learning_rate / (VALUE_TYPE(1) + std::abs(conn_str[wp]));
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n_row; ++e) {
+                const COL_TYPE    col = cursor.advance();
+                const std::size_t vb  = L.elem_start[r] + e;
+                const value_type  w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
+                    if (iv == value_type(0)) continue;
+                    const value_type contrib = w * iv;
+                    mo[static_cast<std::size_t>(b) * n_out + col] += contrib;
+
+                    if (learning_rate != value_type(0)) {
+                        value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                        imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, imp);
+                    }
                 }
             }
         }
     }
 
-    for (int stride = 1; stride < num_cpus; stride <<= 1) {
-        #pragma omp parallel for num_threads(num_cpus) schedule(static)
-        for (int tid = 0; tid < num_cpus; tid += stride << 1) {
-            const int src = tid + stride;
-            if (src >= num_cpus) continue;
-            VALUE_TYPE*       dst     = all_out.data() + (size_t)tid * out_size;
-            const VALUE_TYPE* src_buf = all_out.data() + (size_t)src * out_size;
-            for (SIZE_TYPE i = 0; i < out_size; ++i)
-                dst[i] += src_buf[i];
-        }
+    for (int t = 0; t < num_cpus; ++t) {
+        const value_type* s = t_out.data() + static_cast<std::size_t>(t) * ost;
+        for (std::size_t i = 0; i < ost; ++i) output[i] += s[i];
     }
-
-    const VALUE_TYPE* result = all_out.data();
-    for (SIZE_TYPE i = 0; i < out_size; ++i)
-        output[i] += result[i];
 }
 
 // ── backward ─────────────────────────────────────────────────────────────────
-///@note To inspect gradients without modifying weights, run forward+backward at
-///      lr=+x then lr=-x and diff values[1]; the delta isolates the raw gradient.
-template <typename WEIGHTS_T, 
-          typename VALUE_TYPE = typename WEIGHTS_T::value_type,
-          typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
+
+/**
+ * @brief Dense-input backward: weight + importance update, dx, accumulators.
+ *
+ * Weight/importance update is parallelised over ROWS (not synapses) since
+ * DeltaCSRRowCursor decodes sequentially within a row -- each row is
+ * independent (unique elem_start range), so no races.
+ *
+ * @param input             [batch x in_cols].
+ * @param output_grad       [batch x out_cols].
+ * @param weights           Layer state, modified in place.
+ * @param input_grad        [batch x in_cols], accumulated into (caller zeroes).
+ * @param neuron_input_accum [in_cols]  |input| accumulator for synaptogenesis.
+ * @param neuron_grad_accum  [out_cols] |output_grad| accumulator for synaptogenesis.
+ * @param learning_rate     Update step.
+ * @param num_cpus          Thread count.
+ *
+ * NOTE (test): with learning_rate=0, input_grad must equal W_dense^T @ output_grad
+ * per batch sample, weights/importance unchanged. Same reference check as
+ * delta_csr_backward.
+ */
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void disldo_backward(
-    const VALUE_TYPE* input,          // [batch, in_cols]
-    const SIZE_TYPE   batch,
-    const SIZE_TYPE   in_cols,
-    const VALUE_TYPE* output_grad,    // [batch, out_cols]
-    WEIGHTS_T& weights,
-    VALUE_TYPE*       input_grad,     // [batch, in_cols] zeroed by caller
-    VALUE_TYPE*       neuron_input_accum,   // [in_cols]
-    VALUE_TYPE*       neuron_grad_accum,    // [out_cols]
-    const VALUE_TYPE  learning_rate = 0.01,
-    const int         num_cpus = 4)
+    const typename ValueAccessor<VALUES_TYPE>::value_type* input,
+    SIZE_TYPE    batch,
+    SIZE_TYPE    in_cols,
+    const typename ValueAccessor<VALUES_TYPE>::value_type* output_grad,
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    typename ValueAccessor<VALUES_TYPE>::value_type* input_grad,
+    typename ValueAccessor<VALUES_TYPE>::value_type* neuron_input_accum,
+    typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
+    typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
+    int          num_cpus = 4)
 {
-    for (SIZE_TYPE b = 0; b < batch; ++b)
-        for (SIZE_TYPE ic = 0; ic < in_cols; ++ic)
-            neuron_input_accum[ic] += std::abs(input[b * in_cols + ic]);
-    for (SIZE_TYPE b = 0; b < batch; ++b)
-        for (SIZE_TYPE oc = 0; oc < weights.connections.cols; ++oc)
-            neuron_grad_accum[oc] += std::abs(output_grad[b * weights.connections.cols + oc]);
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    auto& dc = weights.connections;
+    const auto& L = dc.layout;
+    const std::size_t n_in  = L.rows;
+    const std::size_t n_out = L.cols;
 
-    if (connections_empty(weights.connections)) return;
+    for (SIZE_TYPE b = 0; b < batch; ++b) {
+        for (std::size_t r = 0; r < n_in; ++r)
+            neuron_input_accum[r] += std::abs(input[static_cast<std::size_t>(b) * in_cols + r]);
+        for (std::size_t c = 0; c < n_out; ++c)
+            neuron_grad_accum[c]  += std::abs(output_grad[static_cast<std::size_t>(b) * n_out + c]);
+    }
 
-    const SIZE_TYPE out_cols     = weights.connections.cols;
-    const auto&     conn_ptrs    = *weights.connections.ptrs[0];
-    const auto&     conn_indices = *weights.connections.indices[0];
-    auto&           conn_val    = weights.connections.values[0];
-    auto&           conn_str     = weights.connections.values[1];
+    if (dc.empty()) return;
 
-    const SIZE_TYPE ig_size = batch * in_cols;
-    std::vector<VALUE_TYPE> all_ig((size_t)num_cpus * ig_size,  VALUE_TYPE(0));
-    std::vector<VALUE_TYPE> all_ga((size_t)num_cpus * out_cols, VALUE_TYPE(0));
+    const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
+    std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
-        VALUE_TYPE* my_ig = all_ig.data() + (size_t)tid * ig_size;
-        VALUE_TYPE* my_ga = all_ga.data() + (size_t)tid * out_cols;
+        value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
 
         #pragma omp for schedule(static)
-        for (SIZE_TYPE ic = 0; ic < in_cols; ++ic) {
-            const SIZE_TYPE wp_start = conn_ptrs[ic];
-            const SIZE_TYPE wp_end   = conn_ptrs[ic + 1];
-            if (wp_start == wp_end) continue;
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n_row = L.row_nnz(r);
+            if (n_row == 0) continue;
 
-            for (SIZE_TYPE b = 0; b < batch; ++b) {
-                const VALUE_TYPE iv = input[b * in_cols + ic];
-                for (SIZE_TYPE wp = wp_start; wp < wp_end; ++wp) {
-                    const SIZE_TYPE  oc   = conn_indices[wp];
-                    const VALUE_TYPE grad = output_grad[b * out_cols + oc] * iv;
-                    conn_str[wp]  -= grad * learning_rate;
-                    conn_val[wp] += (-learning_rate * grad)
-                                   / (VALUE_TYPE(1) + std::abs(conn_str[wp]));
-                    my_ig[b * in_cols + ic] += conn_val[wp] * output_grad[b * out_cols + oc];
-                    my_ga[oc]               += std::abs(output_grad[b * out_cols + oc]);
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n_row; ++e) {
+                const COL_TYPE    col = cursor.advance();
+                const std::size_t vb  = L.elem_start[r] + e;
+                value_type cw  = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+                value_type ci  = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
+                    const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
+                    const value_type g   = dyv * iv;
+
+                    if (learning_rate != value_type(0)) {
+                        ci -= g * learning_rate;
+                        cw += (-learning_rate * g) / (value_type(1) + std::abs(ci));
+                    }
+                    mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
+                if (learning_rate != value_type(0))
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, ci);
             }
         }
     }
 
-    for (int stride = 1; stride < num_cpus; stride <<= 1) {
-        #pragma omp parallel for num_threads(num_cpus) schedule(static)
-        for (int tid = 0; tid < num_cpus; tid += stride << 1) {
-            const int src = tid + stride;
-            if (src >= num_cpus) continue;
-            VALUE_TYPE*       dig = all_ig.data() + (size_t)tid * ig_size;
-            const VALUE_TYPE* sig = all_ig.data() + (size_t)src * ig_size;
-            for (SIZE_TYPE i = 0; i < ig_size; ++i) dig[i] += sig[i];
-
-            VALUE_TYPE*       dga = all_ga.data() + (size_t)tid * out_cols;
-            const VALUE_TYPE* sga = all_ga.data() + (size_t)src * out_cols;
-            for (SIZE_TYPE i = 0; i < out_cols; ++i) dga[i] += sga[i];
-        }
+    for (int t = 0; t < num_cpus; ++t) {
+        const value_type* s = t_dx.data() + static_cast<std::size_t>(t) * dst;
+        for (std::size_t i = 0; i < dst; ++i) input_grad[i] += s[i];
     }
-
-    const VALUE_TYPE* rig = all_ig.data();
-    for (SIZE_TYPE i = 0; i < ig_size; ++i)  input_grad[i]        += rig[i];
-    const VALUE_TYPE* rga = all_ga.data();
-    for (SIZE_TYPE i = 0; i < out_cols; ++i) neuron_grad_accum[i] += rga[i];
 }
