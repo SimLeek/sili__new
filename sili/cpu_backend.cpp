@@ -834,7 +834,46 @@ PYBIND11_MODULE(_cpu, m)
         "'effective' significant-element count otherwise. Returns CSR\n"
         "(ptrs, indices, values) using k_estimate as the per-row top-k, plus\n"
         "the diagnostics (hoyer_score, k_estimate, l1_norm, l2_norm) so the\n"
-        "not-obvious behavior can actually be inspected. Not wired into any\n"
+        "not-obvious behavior can actually be inspected.\n"
+        "NOTE: 'row' here means one row of the [batch,cols] array, i.e. one\n"
+        "BATCH SAMPLE -- not a weight-matrix row (DeltaCSRWeights elsewhere\n"
+        "uses 'row' for input neuron, a different axis). This per-sample\n"
+        "granularity is for CONSTRUCTING an accurate sparse representation\n"
+        "once you've already decided to route a batch through the sparse\n"
+        "path -- it is NOT the right thing to base that routing decision on\n"
+        "(forward_dense/forward_sparse are each called once for the WHOLE\n"
+        "batch, so a per-sample answer isn't actionable there). For the\n"
+        "actual dense-vs-sparse routing decision, use hoyer_score_batch().\n"
+        "Not wired into any automatic dispatch yet -- see TODO.md.");
+
+    // ── hoyer_score_batch ─────────────────────────────────────────────────────
+    m.def("hoyer_score_batch",
+        [](py::array_t<float> x) -> py::dict {
+            auto buf   = x.request();
+            const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
+            const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
+            float* src = (float*)buf.ptr;
+
+            auto agg = hoyer_score_batch<float>(src, rows, cols);
+
+            py::dict result;
+            result["hoyer_score"] = agg.hoyer_score;
+            result["k_estimate"]  = agg.k_estimate;
+            result["l1_norm"]     = agg.l1_norm;
+            result["l2_norm"]     = agg.l2_norm;
+            result["n_total"]     = (int)(rows * cols);
+            return result;
+        },
+        py::arg("x"),
+        "Batch-level aggregate Hoyer's measure -- the quantity a dense-vs-\n"
+        "sparse ROUTING decision should actually use, computed over the\n"
+        "WHOLE flattened batch (all rows*cols elements together), since\n"
+        "forward_dense/forward_sparse are each invoked once for the entire\n"
+        "batch in a single call, not once per sample. Returns hoyer_score\n"
+        "(threshold this to decide forward_dense vs forward_sparse),\n"
+        "k_estimate, l1_norm, l2_norm, n_total. Does not return indices/\n"
+        "values -- for constructing the actual sparse CSR once routing has\n"
+        "decided 'sparse', use hoyer_sparsify() instead. Not wired into any\n"
         "automatic dispatch yet -- see TODO.md.");
 
     // ── make_csr_input ────────────────────────────────────────────────────────

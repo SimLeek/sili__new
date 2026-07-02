@@ -68,40 +68,48 @@ design notes from that era — different scope, not merged into this file.
   defaults into dense out of habit and silently loses a real 10-100x
   speedup on genuinely sparse activations.
 
-  Future auto-dispatching `forward`/`backward`: should decide dense vs.
-  sparse using **Hoyer's Sparsity Measure**, not a naive "count near-zero
-  elements" threshold. For a vector x of length n:
+  DONE: the underlying ops for a future auto-dispatching `forward`/
+  `backward` now exist and are tested (`sili/lib/headers/hoyer_sparsify.hpp`,
+  exposed as `hoyer_sparsify(x)` and `hoyer_score_batch(x)`), using
+  **Hoyer's Sparsity Measure** rather than a naive "count near-zero
+  elements" threshold:
 
       hoyer(x) = (sqrt(n) - ||x||_1/||x||_2) / (sqrt(n) - 1)     in [0, 1]
 
-  The relevant fact: for a vector with exactly k nonzero entries of equal
-  magnitude, ||x||_1/||x||_2 = sqrt(k) exactly. For a realistic activation
-  vector (a mix of large and small nonzero values, not exactly k-sparse),
-  the same ratio still gives a smooth, principled estimate of the
-  "effective" number of significant elements — k_estimate = (||x||_1 /
-  ||x||_2)^2 — without needing an arbitrary epsilon-threshold count.
+  For a vector with exactly k nonzero entries of equal magnitude,
+  ||x||_1/||x||_2 = sqrt(k) exactly (verified, not just asserted). For a
+  realistic vector, the same ratio gives a smooth estimate of the
+  "effective" significant-element count: k_estimate = (||x||_1/||x||_2)^2.
 
-  Proposed algorithm for the auto-dispatching forward/backward:
-    1. Compute ratio = ||x||_1 / ||x||_2 on the input (forward) or the
-       output gradient (backward).
-    2. k_estimate = ratio^2.
-    3. Compare against a threshold (informed by where dense-vs-sparse
-       execution cost actually crosses over for this layer's shape — not
-       decided yet, needs benchmarking) to decide dense or sparse.
-    4. If sparse: use k_estimate as the target k for a top-k sparsification
-       pass (keep only the k_estimate largest-magnitude elements, zero the
-       rest — discarding the long tail as noise, not just whatever happens
-       to be exactly zero), convert the result to CSR, then call
-       forward_sparse/backward_sparse.
-    5. If dense: call forward_dense/backward_dense directly, no conversion
-       overhead.
+  Two-stage design, clarified after an early mistake (see conversation —
+  the first version only had per-row granularity, which sounds
+  mathematically fine but isn't actionable for what this is actually for):
+    1. **Routing decision** (which kernel to call): `hoyer_score_batch(x)`
+       aggregates over the WHOLE flattened batch (all rows*cols elements
+       together) into one hoyer_score, since forward_dense/forward_sparse
+       are each invoked ONCE for the entire batch in a single call — a
+       per-sample answer isn't actionable at that granularity, you can't
+       send some samples through one kernel and some through the other in
+       one call. Verified this actually separates cases correctly: a
+       mostly-dense batch scores ~0 (correctly signals forward_dense), a
+       mostly-sparse batch scores ~0.87 (correctly signals forward_sparse).
+    2. **Construction** (once routing has decided "sparse"): `hoyer_sparsify(x)`
+       gives each row (batch sample) its own independently-computed
+       k_estimate and top-k selection, for building an accurate CSR
+       representation of a batch that's already been routed to the sparse
+       path — NOT for making the routing decision itself.
 
-  This does NOT contradict "sparsification between layers is a separate
-  function" (see class comment on SparseLinearLayer) — the top-k step
-  stays a distinct, independently-callable operation; this auto-dispatch
-  layer would just be a convenience orchestrator that decides whether to
-  invoke it and with what k, rather than requiring the caller to always
-  decide and call it manually.
+  REMAINING: neither function is wired into an actual `forward`/`backward`
+  auto-dispatch yet. Still needs: (a) a threshold on hoyer_score_batch
+  informed by where dense-vs-sparse execution cost actually crosses over
+  for a given layer's shape (not decided, needs benchmarking), (b) the
+  orchestration itself (call hoyer_score_batch, compare to threshold, if
+  sparse call hoyer_sparsify + convert to CSR + forward_sparse, else
+  forward_dense directly). This does NOT contradict "sparsification
+  between layers is a separate function" (see class comment on
+  SparseLinearLayer) — the top-k step stays a distinct, independently-
+  callable operation (already true today); the dispatch layer would just
+  decide whether to invoke it, not replace it.
 
 - **SISLDOLayerV / DISLDOLayerV → one unified high-precision class.**
   SparseLinearLayer already unifies DISLDO-dense-input +
