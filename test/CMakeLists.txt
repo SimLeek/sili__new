@@ -49,8 +49,20 @@ find_package(OpenMP REQUIRED)
 add_executable(
     sili_tests
 
-    unittest_sisldo.cpp
+    # unittest_sisldo.cpp -- PARKED (see conversation): tests the older
+    # TriValues (3-separate-float32-array) high-precision path specifically,
+    # not FP4 at all. Calls make_weights() with the OLD 7-arg signature
+    # (shape, ptrs, indices, values, importance, backprop-array) -- current
+    # signature is 5 args (shape, ptrs, indices, FP4BiPacked-values), since
+    # backward now always updates value/importance internally (lr=0 to
+    # disable) rather than taking a separate backprop flag/array. Per
+    # project decision, high-precision support is backburner priority;
+    # revisit this file's 7 TEST_CASEs individually when that's picked
+    # back up rather than blocking the main (4-bit) build on it now.
+    #unittest_sisldo.cpp
     #integration_test_sisldo.cpp
+
+    test_disldo_synaptogenesis.cpp
 
     #test_parallel.cpp
     #test_fiber.cpp
@@ -73,8 +85,12 @@ add_executable(
     ${HEADER_FILES}
 )
 
-# set(Python3_LIBRARY "/usr/lib/python3.11/config-3.11-x86_64-linux-gnu/libpython3.11.a")
-set(Python3_LIBRARY "/usr/lib/python3.14/config-3.14-x86_64-linux-gnu/libpython3.14.a")
+# PORTABLE FIX (see conversation): was hardcoded to one specific machine's
+# Python install path (originally /usr/lib/python3.14/... -- broke on any
+# other machine/Python version, including the sandbox this was verified in,
+# which has 3.12). find_package(Python3) locates whatever's actually
+# installed, on any machine, without editing this file per-environment.
+find_package(Python3 COMPONENTS Development REQUIRED)
 
 
 # currently, torch is broken in arch linux. Package is marked out of date. Should be fixed in a week or so.
@@ -83,7 +99,7 @@ set(Python3_LIBRARY "/usr/lib/python3.14/config-3.14-x86_64-linux-gnu/libpython3
 target_include_directories(sili_tests PRIVATE "../sili/" )
 target_include_directories(sili_tests PRIVATE "../sili/lib/headers" )
 target_include_directories(sili_tests PRIVATE "../sili/lib/src")
-target_link_libraries(sili_tests Catch2::Catch2WithMain OpenMP::OpenMP_CXX ${Python3_LIBRARY} )
+target_link_libraries(sili_tests Catch2::Catch2WithMain OpenMP::OpenMP_CXX ${Python3_LIBRARIES} )
 
 option(ENABLE_AVX "Enable AVX support" ON)
 option(ENABLE_FMA "Enable FMA support" ON)
@@ -108,10 +124,9 @@ set_target_properties(sili_tests PROPERTIES
 #    CXX_EXTENSIONS OFF
 )
 
-set(Python3_INCLUDE_DIR "/usr/include/python3.14")
 message("Include dirs:")
-message(${Python3_INCLUDE_DIR})
-include_directories(${Python3_INCLUDE_DIR})
+message(${Python3_INCLUDE_DIRS})
+include_directories(${Python3_INCLUDE_DIRS})
 
 # Enable testing
 include(CTest)

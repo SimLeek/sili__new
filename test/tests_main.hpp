@@ -152,8 +152,8 @@ std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::vector<T> &p)
  * @return Reference to the diff vector.
  */
 template <typename VecA, typename VecB>
-inline typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value, VecA>::type&
-vector_diff(const VecA &a, const VecB &b, VecA&& diff=VecA()) {
+inline typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value, VecA>::type
+vector_diff(const VecA &a, const VecB &b, VecA diff=VecA()) {
     std::set_symmetric_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(diff));
     return diff;
 }
