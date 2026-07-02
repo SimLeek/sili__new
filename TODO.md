@@ -6,15 +6,26 @@ design notes from that era — different scope, not merged into this file.
 
 ## Correctness / not-yet-fixed
 
-- **SISLDOLayerV::load_weights doesn't compile.** `make_weights_v`'s call
-  into `make_weights` has an internal type mismatch (`csr.hpp:307`, "could
-  not convert 'w' from FP4BiPacked-typed sparse_weights to
-  TriValues-typed"). Confirmed genuine and separate from the FP4/TriValues
-  confusion that broke two other errors last pass (those were resolved by
-  deleting the non-V SISLDOLayer/DISLDOLayer, which were the only callers
-  mixing FP4BiPacked into TriValues-designed helpers). Not investigated —
-  needs looking at `make_weights`/`make_weights_v`'s actual template chain
-  in csr.hpp.
+- **Two separate stale-signature bugs block the full module build**, not
+  one. Traced precisely while testing hoyer_sparsify (see below) by
+  temporarily stubbing each out in an uncommitted diagnostic build:
+  1. The standalone `m.def("make_weights", ...)` registration (module-level,
+     not inside any class) calls the base `make_weights<int,float>` template
+     with the OLD signature (rows, cols, ptrs, indices, values, grads,
+     importance -- 7 args including a separate backprop-adjacent grads
+     array) that no longer matches the current 5-arg definition (shape,
+     ptrs, indices, FP4BiPacked-values). Originally misattributed to
+     "SISLDOLayerV::load_weights" -- that was imprecise, this one has
+     nothing to do with that class.
+  2. `SISLDOLayerV::load_weights` separately calls `make_weights_v`, which
+     has its own internal type-conversion bug inside `csr.hpp:307` ("could
+     not convert 'w' from FP4BiPacked-typed sparse_weights to
+     TriValues-typed") -- a real bug in make_weights_v's own template
+     chain, unrelated to bug #1.
+  Neither investigated for a real fix yet -- both were only stubbed out
+  (`(void)rows; (void)cols;` style no-ops) in a throwaway /tmp build to
+  unblock testing hoyer_sparsify end-to-end from Python. Not committed
+  anywhere.
 
 - **Synaptogenesis after compact() needs automatic handling, not just a
   loud failure.** FIXED this pass: synap_row_step now throws a catchable

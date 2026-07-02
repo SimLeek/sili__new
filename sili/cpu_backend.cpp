@@ -9,6 +9,7 @@
 #include "linear_disldo.hpp"
 #include "csr.hpp"
 #include "loss.hpp"
+#include "hoyer_sparsify.hpp"
 #include "fp4quant.hpp"
 
 namespace py = pybind11;
@@ -765,6 +766,76 @@ PYBIND11_MODULE(_cpu, m)
         py::arg("x"), py::arg("k"), py::arg("num_threads") = 4,
         "Exact top-k sparsity conversion for forward and backward passes."
     );
+
+    // ── hoyer_sparsify ────────────────────────────────────────────────────────
+    // NOT wired into an automatic dense/sparse dispatch (see TODO.md) -- this
+    // is the standalone Hoyer's-Sparsity-Measure operation, exposed so its
+    // actual behavior on real data can be explored/tested from Python before
+    // deciding on dispatch thresholds. Returns diagnostics (hoyer_score,
+    // k_estimate, l1/l2 norms) alongside the CSR result, since the point is
+    // to make the not-obvious behavior actually inspectable.
+    m.def("hoyer_sparsify",
+        [](py::array_t<float> x) -> py::dict {
+            auto buf   = x.request();
+            const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
+            const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
+            float* src = (float*)buf.ptr;
+
+            auto per_row = hoyer_sparsify_batch<float>(src, rows, cols);
+
+            std::vector<int>   ptrs(rows + 1, 0);
+            std::vector<int>   indices;
+            std::vector<float> values;
+            py::array_t<float> hoyer_scores({(py::ssize_t)rows});
+            py::array_t<int>   k_estimates ({(py::ssize_t)rows});
+            py::array_t<float> l1_norms    ({(py::ssize_t)rows});
+            py::array_t<float> l2_norms    ({(py::ssize_t)rows});
+
+            float* hs = (float*)hoyer_scores.request().ptr;
+            int*   ke = (int*)  k_estimates.request().ptr;
+            float* l1 = (float*)l1_norms.request().ptr;
+            float* l2 = (float*)l2_norms.request().ptr;
+
+            for (std::size_t r = 0; r < rows; ++r) {
+                ptrs[r] = (int)indices.size();
+                for (std::size_t j = 0; j < per_row[r].indices.size(); ++j) {
+                    indices.push_back(per_row[r].indices[j]);
+                    values .push_back(per_row[r].values[j]);
+                }
+                hs[r] = per_row[r].hoyer_score;
+                ke[r] = per_row[r].k_estimate;
+                l1[r] = per_row[r].l1_norm;
+                l2[r] = per_row[r].l2_norm;
+            }
+            ptrs[rows] = (int)indices.size();
+
+            py::array_t<int>   out_ptrs   ({(py::ssize_t)(rows + 1)});
+            py::array_t<int>   out_indices({(py::ssize_t)indices.size()});
+            py::array_t<float> out_values ({(py::ssize_t)values.size()});
+            std::copy(ptrs.begin(),    ptrs.end(),    (int*)  out_ptrs.request().ptr);
+            std::copy(indices.begin(), indices.end(), (int*)  out_indices.request().ptr);
+            std::copy(values.begin(),  values.end(),  (float*)out_values.request().ptr);
+
+            py::dict result;
+            result["ptrs"]         = out_ptrs;
+            result["indices"]      = out_indices;
+            result["values"]       = out_values;
+            result["hoyer_score"]  = hoyer_scores;
+            result["k_estimate"]   = k_estimates;
+            result["l1_norm"]      = l1_norms;
+            result["l2_norm"]      = l2_norms;
+            return result;
+        },
+        py::arg("x"),
+        "Hoyer's Sparsity Measure top-k sparsification, per row.\n"
+        "hoyer(x) = (sqrt(n) - ||x||_1/||x||_2) / (sqrt(n) - 1), in [0,1].\n"
+        "k_estimate = (||x||_1/||x||_2)^2 -- exact for a vector with exactly\n"
+        "k nonzero entries of equal magnitude, a principled estimate of the\n"
+        "'effective' significant-element count otherwise. Returns CSR\n"
+        "(ptrs, indices, values) using k_estimate as the per-row top-k, plus\n"
+        "the diagnostics (hoyer_score, k_estimate, l1_norm, l2_norm) so the\n"
+        "not-obvious behavior can actually be inspected. Not wired into any\n"
+        "automatic dispatch yet -- see TODO.md.");
 
     // ── make_csr_input ────────────────────────────────────────────────────────
     m.def("make_csr_input",

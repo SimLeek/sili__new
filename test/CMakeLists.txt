@@ -63,6 +63,7 @@ add_executable(
     #integration_test_sisldo.cpp
 
     test_disldo_synaptogenesis.cpp
+    test_hoyer_sparsify.cpp
 
     #test_parallel.cpp
     #test_fiber.cpp
