@@ -200,175 +200,6 @@ public:
 };
 
 
-class SISLDOLayer {
-public:
-    using S = int;
-    using V = float;
-
-    SparseLinearWeights<S, V> weights;
-    std::vector<V>            neuron_input_accum;
-    std::vector<V>            neuron_grad_accum;
-    std::vector<V>            output_buf;
-    int                       num_cpus;
-
-    SISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus)
-    {
-        weights.connections.rows    = n_inputs;
-        weights.connections.cols    = n_outputs;
-        weights.connections.ptrs[0] = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
-        weights.connections.indices[0] = std::make_shared<std::vector<S>>();
-        weights.connections.values  = FP4BiPacked();
-        weights.probes.rows = n_inputs;
-        weights.probes.cols = n_outputs;
-
-        reserve_connections(weights.connections, max_weights);
-
-        neuron_input_accum.assign(n_inputs,  V(0));
-        neuron_grad_accum .assign(n_outputs, V(0));
-        weights.out_degree.assign(n_outputs, S(0));
-    }
-
-    // ── Scalar properties ─────────────────────────────────────────────────────
-
-    S n_inputs()  const { return weights.connections.rows; }
-    S n_outputs() const { return weights.connections.cols; }
-    S nnz()       const { return weights.connections.nnz(); }
-
-    // ── Input construction ───────────────────────────────────────────────────
-
-    CSRInput<S, V> numpy_to_sparse_input(
-        py::array_t<S> ptrs,
-        py::array_t<S> indices,
-        py::array_t<V> values,
-        S batch, S cols)
-    {
-        auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
-        const S nnz_in = (S)ib.size;
-        CSRInput<S, V> csr;
-        csr.rows       = batch;
-        csr.cols       = cols;
-        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
-        csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nnz_in);
-        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nnz_in);
-        return csr;
-    }
-
-    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                  py::array_t<V> vals, py::array_t<V> imp) {
-        auto pb = ptrs.request(), ib = indices.request(),
-            vb = vals.request(), impb = imp.request();
-        const S rows = weights.connections.rows;
-        const S cols = weights.connections.cols;
-        weights = make_weights<S, V>(
-            rows, cols,
-            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
-            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
-            FP4BiPacked::deserialize(std::vector<uint8_t>((V*)vb.ptr,   (V*)vb.ptr   + vb.size)));
-    }
-
-    // ── Forward (use module-level dense_to_csr to prepare input first) ─────────
-
-    py::array_t<V> forward_sparse(
-        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch, V learning_rate)
-    {
-        output_buf.assign(batch * n_outputs(), V(0));
-        auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
-        sisldo_forward(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
-
-        return py::array_t<V>(
-            {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
-            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
-            output_buf.data(), py::cast(this));
-    }
-
-    // ── Backward ─────────────────────────────────────────────────────────────
-    // dy:           dense [batch, n_outputs] — weight gradient kernel
-    // dy_sparse_*:  sparse dy — input gradient kernel
-    //               if all outputs are active, pass dy converted to a single CSR row
-
-    py::array_t<V> backward(
-        py::array_t<S> x_ptrs,
-        py::array_t<S> x_indices,
-        py::array_t<V> x_values,
-        py::array_t<V> dy,
-        py::array_t<S> dy_sparse_ptrs,
-        py::array_t<S> dy_sparse_indices,
-        py::array_t<V> dy_sparse_values,
-        V learning_rate,
-        S batch, S cols)
-    {
-        auto dybuf    = dy.request();
-
-        std::vector<V> dx(batch * n_inputs(), V(0));
-        auto input_csr    = numpy_to_sparse_input(x_ptrs, x_indices, x_values, batch, cols);
-        auto out_grad_csr = numpy_to_sparse_input(
-            dy_sparse_ptrs, dy_sparse_indices, dy_sparse_values, batch, n_outputs());
-
-        sisldo_backward(
-            input_csr, weights, out_grad_csr,
-            dx.data(), (V*)dybuf.ptr,
-            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate,
-            num_cpus);
-
-        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
-        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
-        return result;
-    }
-
-    // ── Optimization ─────────────────────────────────────────────────────────
-
-    void decay_importance(V rate) {
-        sisldo_decay_importance(weights, rate, num_cpus);
-    }
-
-    // ── Neurogenesis ──────────────────────────────────────────────────────────
-
-    void build_probes(S k) {
-        genesis_build_probes(
-            weights,
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            n_inputs(), n_outputs(), k, num_cpus);
-    }
-
-    void optim_synaptogenesis(V learning_rate, V importance_beta, S max_weights) {
-        sisldo_optim_synaptogenesis(
-            weights, learning_rate, importance_beta, max_weights, num_cpus);
-    }
-
-    void zero_accum() {
-        std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
-        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
-    }
-
-    // ── Zero-copy numpy views ─────────────────────────────────────────────────
-
-    py::array_t<V> get_neuron_input_accum() {
-        return py::array_t<V>({(py::ssize_t)n_inputs()},  {sizeof(V)},
-                              neuron_input_accum.data(), py::cast(this));
-    }
-    py::array_t<V> get_neuron_grad_accum() {
-        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
-                              neuron_grad_accum.data(), py::cast(this));
-    }
-    py::array_t<V> get_output_buf() {
-        return py::array_t<V>({(py::ssize_t)output_buf.size()}, {sizeof(V)},
-                              output_buf.data(), py::cast(this));
-    }
-    py::array_t<uint8_t> get_weights_vals() {
-        return py::array_t<uint8_t>({(py::ssize_t)nnz()}, {sizeof(uint8_t)},
-                              weights.connections.values.serialize().data(), py::cast(this));
-    }
-    py::array_t<S> get_indices() {
-        return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
-                              weights.connections.indices[0]->data(), py::cast(this));
-    }
-    py::array_t<S> get_ptrs() {
-        return py::array_t<S>({(py::ssize_t)(n_inputs() + 1)}, {sizeof(S)},
-                              weights.connections.ptrs[0]->data(), py::cast(this));
-    }
-};
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -376,7 +207,7 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── DISLDOLayer ───────────────────────────────────────────────────────────────
+// ── SparseLinearLayer ───────────────────────────────────────────────────────────────
 // Rewritten (see conversation) to use SparseLinearWeightsDelta<S,FP4BiPacked,
 // COL_TYPE> -- the delta-CSR/generic-ValueAccessor generation, matching what
 // disldo_forward/disldo_backward now require. Previously used
@@ -384,7 +215,7 @@ public:
 // despite the class existing alongside an FP4-packed SISLDOLayer) and had NO
 // synaptogenesis methods at all -- build_probes/synap_row_step below are new.
 
-class DISLDOLayer {
+class SparseLinearLayer {
 public:
     using S = int;
     using V = float;
@@ -401,7 +232,7 @@ public:
     S              _last_batch = 0;
     S              _last_cols  = 0;
 
-    DISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+    SparseLinearLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus)
     {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
@@ -474,6 +305,16 @@ public:
             weights, row, importance_cutoff, max_row_weights);
     }
 
+    // Repack in place: every row occupies exactly its active bytes/elements,
+    // zero inter-row blank space (see compact() in sparse_struct.hpp for the
+    // full rationale). Call before saving/measuring a freshly converted or
+    // long-since-pruned model. Zeroes growth headroom -- call
+    // weights.connections.reserve_indices()/reserve_values() again after if
+    // this model is about to resume training rather than just be deployed.
+    void compact() {
+        weights.connections = ::compact<S, FP4BiPacked, COL_TYPE>(weights.connections);
+    }
+
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
         std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
@@ -538,7 +379,7 @@ public:
 };
 
 // ── DISLDOLayerV ──────────────────────────────────────────────────────────────
-// Same rewrite as DISLDOLayer, VALUES_TYPE=DeltaCSRBiValues<float> instead of
+// Same rewrite as SparseLinearLayer, VALUES_TYPE=DeltaCSRBiValues<float> instead of
 // FP4BiPacked — the exact same disldo_forward/backward/build_probes/
 // synap_row_step functions, generic via ValueAccessor, no separate
 // implementation needed. This is the concrete realization of "run_tests_4_bit
@@ -683,93 +524,47 @@ public:
 
 PYBIND11_MODULE(_cpu, m)
 {
-    // ── SISLDOLayer ───────────────────────────────────────────────────────────
 
-    py::class_<SISLDOLayer>(m, "SISLDOLayer")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"),
-             py::arg("n_outputs"),
-             py::arg("max_weights"),
-             py::arg("num_cpus") = 4
-            )
+    // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
-        .def("forward_sparse",       &SISLDOLayer::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01)
-        .def("backward",             &SISLDOLayer::backward,
-             py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"),
-             py::arg("dy"),
-             py::arg("dy_sparse_ptrs"), py::arg("dy_sparse_indices"),
-             py::arg("dy_sparse_values"),
-             py::arg("learning_rate"),
-             py::arg("batch"), py::arg("cols"))
-        .def("decay_importance",     &SISLDOLayer::decay_importance,
-             py::arg("rate"))
-        .def("build_probes",         &SISLDOLayer::build_probes,
-             py::arg("k"))
-        .def("optim_synaptogenesis", &SISLDOLayer::optim_synaptogenesis,
-             py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
-        .def("zero_accum",           &SISLDOLayer::zero_accum)
-
-        .def_property_readonly("neuron_input_accum", &SISLDOLayer::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SISLDOLayer::get_neuron_grad_accum)
-        .def_property_readonly("output_buf",         &SISLDOLayer::get_output_buf)
-        .def_property_readonly("weights_vals",       &SISLDOLayer::get_weights_vals)
-        .def_property_readonly("importance",         &SISLDOLayer::get_importance)
-        .def_property_readonly("indices",            &SISLDOLayer::get_indices)
-        .def_property_readonly("ptrs",               &SISLDOLayer::get_ptrs)
-
-        .def("load_weights",        &SISLDOLayer::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def_property_readonly("out_degree", [](const SISLDOLayer& self) {
-            return py::array_t<SISLDOLayer::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SISLDOLayer::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SISLDOLayer::num_cpus)
-        .def_property_readonly("n_inputs",  &SISLDOLayer::n_inputs)
-        .def_property_readonly("n_outputs", &SISLDOLayer::n_outputs)
-        .def_property_readonly("nnz",       &SISLDOLayer::nnz);
-
-
-    // ── DISLDOLayer ───────────────────────────────────────────────────────────
-
-    py::class_<DISLDOLayer>(m, "DISLDOLayer")
+    py::class_<SparseLinearLayer>(m, "SparseLinearLayer")
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &DISLDOLayer::forward,
+        .def("forward",              &SparseLinearLayer::forward,
              py::arg("x"), py::arg("learning_rate") = 0.01f)
-        .def("backward",             &DISLDOLayer::backward,
+        .def("backward",             &SparseLinearLayer::backward,
              py::arg("dy"), py::arg("learning_rate"))
-        .def("build_probes",         &DISLDOLayer::build_probes,
+        .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &DISLDOLayer::synap_row_step,
+        .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
              py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
-        .def("zero_accum",           &DISLDOLayer::zero_accum)
-        .def_property_readonly("neuron_input_accum", &DISLDOLayer::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &DISLDOLayer::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &DISLDOLayer::get_weights_vals)
-        .def_property_readonly("importance",         &DISLDOLayer::get_importance)
-        .def_property_readonly("indices",            &DISLDOLayer::get_indices)
-        .def_property_readonly("ptrs",               &DISLDOLayer::get_ptrs)
-        .def("load_weights",        &DISLDOLayer::load_weights,
+        .def("compact",              &SparseLinearLayer::compact,
+             "Repack in place: every row occupies exactly its active bytes/elements,\n"
+             "zero inter-row blank space. Call before saving/measuring a freshly\n"
+             "converted model. Zeroes growth headroom.")
+        .def("zero_accum",           &SparseLinearLayer::zero_accum)
+        .def_property_readonly("neuron_input_accum", &SparseLinearLayer::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",       &SparseLinearLayer::get_weights_vals)
+        .def_property_readonly("importance",         &SparseLinearLayer::get_importance)
+        .def_property_readonly("indices",            &SparseLinearLayer::get_indices)
+        .def_property_readonly("ptrs",               &SparseLinearLayer::get_ptrs)
+        .def("load_weights",        &SparseLinearLayer::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def_property_readonly("out_degree", [](const DISLDOLayer& self) {
-            return py::array_t<DISLDOLayer::S>(
+        .def_property_readonly("out_degree", [](const SparseLinearLayer& self) {
+            return py::array_t<SparseLinearLayer::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(DISLDOLayer::S)},
+                {sizeof(SparseLinearLayer::S)},
                 self.weights.out_degree.data(),
                 py::cast(&self));
         })
-        .def_readonly ("num_cpus",  &DISLDOLayer::num_cpus)
-        .def_property_readonly("n_inputs",  &DISLDOLayer::n_inputs)
-        .def_property_readonly("n_outputs", &DISLDOLayer::n_outputs)
-        .def_property_readonly("nnz",       &DISLDOLayer::nnz);
+        .def_readonly ("num_cpus",  &SparseLinearLayer::num_cpus)
+        .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
+        .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
+        .def_property_readonly("nnz",       &SparseLinearLayer::nnz);
 
-    // DISLDOLayerV: identical API surface to DISLDOLayer, DeltaCSRBiValues<float>
+    // DISLDOLayerV: identical API surface to SparseLinearLayer, DeltaCSRBiValues<float>
     // (32-bit) instead of FP4BiPacked -- same disldo_forward/backward/
     // build_probes/synap_row_step functions, generic via ValueAccessor.
     // Was never registered with pybind at all before this (see conversation).

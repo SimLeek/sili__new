@@ -945,6 +945,89 @@ bool delta_csr_synap_row_step(
  * row's shared-top-k output set is dominated by its own existing
  * connections (global mode starves it) to see the difference concretely.
  */
+// ── compact ────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Repack a DeltaCSRWeights so every row occupies exactly its active
+ * bytes/elements, zero inter-row blank space -- both the index buffer
+ * (byte_start/byte_end) AND the values buffer (elem_start/elem_end) are
+ * separate growth-headroom axes and both get compacted here.
+ *
+ * delta_csr_from_absolute()'s reserved headroom (the blank_fraction fixed
+ * earlier this session) is correct and necessary for a LIVE, training
+ * model -- rows need O(1) append room for synaptogenesis. For a freshly
+ * converted or long-since-pruned model being saved/measured for
+ * deployment, that headroom is pure unused padding that nnz()/
+ * total_alloc_bytes() otherwise count as consumed. Use compact() before
+ * saving/measuring; call reserve_indices()/reserve_values() again after
+ * loading if this model is about to resume training rather than just be
+ * measured or deployed.
+ *
+ * Generic over VALUES_TYPE via ValueAccessor -- one implementation for both
+ * FP4BiPacked and DeltaCSRBiValues<float>, matching the rest of this file's
+ * pattern (delta_csr_forward/backward/build_probes/synap_row_step).
+ *
+ * NOTE (test): must be lossless -- decode every synapse from the input and
+ * the output (column indices via row_cursor, weight/importance via
+ * ValueAccessor::get_w/get_imp), compare row by row; must match exactly.
+ * Also verify total_alloc_bytes()/total_alloc_elems() strictly decrease (or
+ * stay equal) after compacting a delta_csr_from_absolute()-constructed
+ * layer, and that a second compact() call is idempotent (sizes unchanged).
+ */
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> compact(
+    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc)
+{
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    const auto& L = dc.layout;
+
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> out;
+    out.layout.rows = L.rows;
+    out.layout.cols = L.cols;
+    out.layout.byte_start.resize(L.rows + 1);
+    out.layout.byte_end.resize(L.rows);
+    out.layout.elem_start.resize(L.rows + 1);
+    out.layout.elem_end.resize(L.rows);
+
+    std::size_t total_bytes = 0, total_elems = 0;
+    for (std::size_t r = 0; r < L.rows; ++r) {
+        total_bytes += L.row_byte_len(r);
+        total_elems += L.row_nnz(r);
+    }
+
+    out.indices_buf.assign(total_bytes, uint8_t(0));
+    ValueAccessor<VALUES_TYPE>::resize(out.values, total_elems, value_type(0));
+
+    std::size_t bcursor = 0, ecursor = 0;
+    for (std::size_t r = 0; r < L.rows; ++r) {
+        const std::size_t blen = L.row_byte_len(r);
+        if (blen > 0)
+            std::memcpy(out.indices_buf.data() + bcursor,
+                       dc.indices_buf.data() + L.byte_start[r], blen);
+        out.layout.byte_start[r] = bcursor;
+        out.layout.byte_end[r]   = bcursor + blen;
+        bcursor += blen;
+
+        const std::size_t n = L.row_nnz(r);
+        for (std::size_t k = 0; k < n; ++k) {
+            const value_type w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, L.elem_start[r] + k);
+            const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k);
+            ValueAccessor<VALUES_TYPE>::set(out.values, ecursor + k, w, imp);
+        }
+        out.layout.elem_start[r] = ecursor;
+        out.layout.elem_end[r]   = ecursor + n;
+        ecursor += n;
+    }
+    out.layout.byte_start[L.rows] = bcursor;
+    out.layout.elem_start[L.rows] = ecursor;
+    out.layout.total_nnz = L.total_nnz;
+
+    out.max_indices_bytes = dc.max_indices_bytes;
+    out.max_values_bytes  = dc.max_values_bytes;
+
+    return out;
+}
+
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_build_probes(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
