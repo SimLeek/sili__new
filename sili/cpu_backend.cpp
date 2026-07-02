@@ -377,13 +377,20 @@ public:
 
 
 // ── DISLDOLayer ───────────────────────────────────────────────────────────────
+// Rewritten (see conversation) to use SparseLinearWeightsDelta<S,FP4BiPacked,
+// COL_TYPE> -- the delta-CSR/generic-ValueAccessor generation, matching what
+// disldo_forward/disldo_backward now require. Previously used
+// SparseLinearWeights<S,V> (absolute CSR, no delta encoding, no FP4 packing
+// despite the class existing alongside an FP4-packed SISLDOLayer) and had NO
+// synaptogenesis methods at all -- build_probes/synap_row_step below are new.
 
 class DISLDOLayer {
 public:
     using S = int;
     using V = float;
+    using COL_TYPE = uint32_t;
 
-    SparseLinearWeights<S, V> weights;
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
     std::vector<V>            neuron_input_accum;
     std::vector<V>            neuron_grad_accum;
     std::vector<V>            output_buf;
@@ -397,23 +404,26 @@ public:
     DISLDOLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus)
     {
-        weights.connections.rows       = n_inputs;
-        weights.connections.cols       = n_outputs;
-        weights.connections.ptrs[0]    = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
-        weights.connections.indices[0] = std::make_shared<std::vector<S>>();
-        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
+        std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
+        std::vector<S> empty_idx;
+        std::vector<V> empty_w, empty_imp;
+        // Budget is generous headroom (reserve, not allocate-and-init) --
+        // 8 bytes/synapse covers worst-case ULEB128 (5) + value byte (1) + margin.
+        weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+            empty_ptrs, empty_idx, empty_w, empty_imp,
+            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            static_cast<std::size_t>(max_weights) + 64);
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
-        reserve_connections(weights.connections, max_weights);
         neuron_input_accum.assign(n_inputs,  V(0));
         neuron_grad_accum .assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
-    S n_inputs()  const { return weights.connections.rows; }
-    S n_outputs() const { return weights.connections.cols; }
-    S nnz()       const { return weights.connections.nnz(); }
+    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
 
     // ── Forward ───────────────────────────────────────────────────────────────
 
@@ -426,7 +436,7 @@ public:
         _last_input.assign(src, src + _last_batch * _last_cols);
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
-        disldo_forward(src, _last_batch, _last_cols, weights,
+        disldo_forward<S, FP4BiPacked, COL_TYPE>(src, _last_batch, _last_cols, weights,
                        output_buf.data(), learning_rate, num_cpus);
 
         return py::array_t<V>(
@@ -440,7 +450,7 @@ public:
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        disldo_backward(
+        disldo_backward<S, FP4BiPacked, COL_TYPE>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
@@ -452,34 +462,38 @@ public:
         return result;
     }
 
-    // ── Optimization (same as SISLDO) ────────────────────────────────────────
+    // ── Synaptogenesis (NEW — see class comment) ────────────────────────────────
 
-    void decay_importance(V rate)     { sisldo_decay_importance(weights, rate, num_cpus); }
+    void build_probes(S k, bool per_row = false) {
+        delta_csr_build_probes<S, FP4BiPacked, COL_TYPE>(
+            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
+    }
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
+        std::size_t row = static_cast<std::size_t>(current_row);
+        return delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
+            weights, row, importance_cutoff, max_row_weights);
+    }
 
-    void build_probes(S k) {
-        genesis_build_probes(weights,
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            n_inputs(), n_outputs(), k, num_cpus);
-    }
-    void optim_synaptogenesis(V lr, V imp_beta, S max_w) {
-        sisldo_optim_synaptogenesis(weights, lr, imp_beta, max_w, num_cpus);
-    }
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
         std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
     }
+
+    // ptrs/indices/vals: standard absolute CSR + true float weights (NOT
+    // pre-packed FP4 bytes — delta_csr_from_absolute quantizes internally,
+    // unlike the old make_weights(FP4BiPacked(raw_bytes)) contract).
     void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
                       py::array_t<V> vals) {
-        auto pb=ptrs.request(), ib=indices.request(),
-             vb=vals.request();
-        const S rows = weights.connections.rows;
-        const S cols = weights.connections.cols;
-        weights = make_weights<S, V>(
-            rows, cols,
-            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
-            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
-            FP4BiPacked(std::move(std::vector<uint8_t>((uint8_t*)vb.ptr, (uint8_t*)vb.ptr + vb.size)))
-            );
+        auto pb=ptrs.request(), ib=indices.request(), vb=vals.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
+        std::vector<S> idx((S*)ib.ptr, (S*)ib.ptr + ib.size);
+        std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
+        std::vector<V> imp(w.size(), V(0));
+        weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+            p, idx, w, imp, rows, cols,
+            idx.size() * 8 + 4096, idx.size() + 64);
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -489,29 +503,60 @@ public:
     py::array_t<V> get_neuron_grad_accum() {
         return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
                               neuron_grad_accum.data(), py::cast(this)); }
-    py::array_t<uint8_t> get_weights() {  //todo: dangerous: replace with returning the fp4quant pybind11 object
-        return py::array_t<uint8_t>({(py::ssize_t)nnz()}, {sizeof(uint8_t)},
-                              weights.connections.values._data->data(), py::cast(this)); }
+
+    // NOTE: no longer zero-copy (delta-CSR has no plain float array to view
+    // directly) — materializes absolute CSR + float weights/importance via
+    // delta_csr_to_absolute on each call. O(nnz), not O(1) like before.
+    py::array_t<V> get_weights_vals() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)ow.size());
+        std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
+        return result;
+    }
+    py::array_t<V> get_importance() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)oimp.size());
+        std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
+        return result;
+    }
     py::array_t<S> get_indices() {
-        return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
-                              weights.connections.indices[0]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)oi.size());
+        std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
+        return result;
+    }
     py::array_t<S> get_ptrs() {
-        return py::array_t<S>({(py::ssize_t)(n_inputs()+1)}, {sizeof(S)},
-                              weights.connections.ptrs[0]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)op.size());
+        std::copy(op.begin(), op.end(), (S*)result.request().ptr);
+        return result;
+    }
 };
+
+// ── DISLDOLayerV ──────────────────────────────────────────────────────────────
+// Same rewrite as DISLDOLayer, VALUES_TYPE=DeltaCSRBiValues<float> instead of
+// FP4BiPacked — the exact same disldo_forward/backward/build_probes/
+// synap_row_step functions, generic via ValueAccessor, no separate
+// implementation needed. This is the concrete realization of "run_tests_4_bit
+// and run_tests_32_bit should use the same functions" (see conversation).
 
 class DISLDOLayerV {
 public:
     using S = int;
     using V = float;
+    using COL_TYPE = uint32_t;
+    using VT = DeltaCSRBiValues<V>;
 
-    SparseLinearWeightsV<S, V> weights;
+    SparseLinearWeightsDelta<S, VT, COL_TYPE> weights;
     std::vector<V>            neuron_input_accum;
     std::vector<V>            neuron_grad_accum;
     std::vector<V>            output_buf;
     int                       num_cpus;
 
-    // Last dense input — stored for backward.
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
@@ -519,25 +564,24 @@ public:
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus)
     {
-        weights.connections.rows       = n_inputs;
-        weights.connections.cols       = n_outputs;
-        weights.connections.ptrs[0]    = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
-        weights.connections.indices[0] = std::make_shared<std::vector<S>>();
-        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
+        std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
+        std::vector<S> empty_idx;
+        std::vector<V> empty_w, empty_imp;
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
+            empty_ptrs, empty_idx, empty_w, empty_imp,
+            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            static_cast<std::size_t>(max_weights) + 64);
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
-        reserve_connections(weights.connections, max_weights);
         neuron_input_accum.assign(n_inputs,  V(0));
         neuron_grad_accum .assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
-    S n_inputs()  const { return weights.connections.rows; }
-    S n_outputs() const { return weights.connections.cols; }
-    S nnz()       const { return weights.connections.nnz(); }
-
-    // ── Forward ───────────────────────────────────────────────────────────────
+    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
 
     py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
@@ -548,7 +592,7 @@ public:
         _last_input.assign(src, src + _last_batch * _last_cols);
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
-        disldo_forward(src, _last_batch, _last_cols, weights,
+        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
                        output_buf.data(), learning_rate, num_cpus);
 
         return py::array_t<V>(
@@ -557,12 +601,10 @@ public:
             output_buf.data(), py::cast(this));
     }
 
-    // ── Backward ─────────────────────────────────────────────────────────────
-
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        disldo_backward(
+        disldo_backward<S, VT, COL_TYPE>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
@@ -574,17 +616,14 @@ public:
         return result;
     }
 
-    // ── Optimization (same as SISLDO) ────────────────────────────────────────
-
-    void decay_importance(V rate)     { sisldo_decay_importance(weights, rate, num_cpus); }
-
-    void build_probes(S k) {
-        genesis_build_probes(weights,
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            n_inputs(), n_outputs(), k, num_cpus);
+    void build_probes(S k, bool per_row = false) {
+        delta_csr_build_probes<S, VT, COL_TYPE>(
+            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
     }
-    void optim_synaptogenesis(V lr, V imp_beta, S max_w) {
-        sisldo_optim_synaptogenesis(weights, lr, imp_beta, max_w, num_cpus);
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
+        std::size_t row = static_cast<std::size_t>(current_row);
+        return delta_csr_synap_row_step<S, VT, COL_TYPE>(
+            weights, row, importance_cutoff, max_row_weights);
     }
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
@@ -594,14 +633,15 @@ public:
                       py::array_t<V> vals,  py::array_t<V> imp) {
         auto pb=ptrs.request(), ib=indices.request(),
              vb=vals.request(), impb=imp.request();
-        const S rows = weights.connections.rows;
-        const S cols = weights.connections.cols;
-        weights = make_weights_v<S, V>(
-            rows, cols,
-            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
-            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
-            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
-            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
+        std::vector<S> idx((S*)ib.ptr, (S*)ib.ptr + ib.size);
+        std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
+        std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
+            p, idx, w, imp_v, rows, cols,
+            idx.size() * 8 + 4096, idx.size() + 64);
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -612,17 +652,33 @@ public:
         return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
                               neuron_grad_accum.data(), py::cast(this)); }
     py::array_t<V> get_weights_vals() {
-        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
-                              weights.connections.values[0]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)ow.size());
+        std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
+        return result;
+    }
     py::array_t<V> get_importance() {
-        return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
-                              weights.connections.values[1]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)oimp.size());
+        std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
+        return result;
+    }
     py::array_t<S> get_indices() {
-        return py::array_t<S>({(py::ssize_t)nnz()}, {sizeof(S)},
-                              weights.connections.indices[0]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)oi.size());
+        std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
+        return result;
+    }
     py::array_t<S> get_ptrs() {
-        return py::array_t<S>({(py::ssize_t)(n_inputs()+1)}, {sizeof(S)},
-                              weights.connections.ptrs[0]->data(), py::cast(this)); }
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)op.size());
+        std::copy(op.begin(), op.end(), (S*)result.request().ptr);
+        return result;
+    }
 };
 
 PYBIND11_MODULE(_cpu, m)
@@ -685,13 +741,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward",              &DISLDOLayer::forward,
-             py::arg("x"), py::arg("train") = true)
+             py::arg("x"), py::arg("learning_rate") = 0.01f)
         .def("backward",             &DISLDOLayer::backward,
              py::arg("dy"), py::arg("learning_rate"))
-        .def("decay_importance",     &DISLDOLayer::decay_importance, py::arg("rate"))
-        .def("build_probes",         &DISLDOLayer::build_probes, py::arg("k"))
-        .def("optim_synaptogenesis", &DISLDOLayer::optim_synaptogenesis,
-             py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
+        .def("build_probes",         &DISLDOLayer::build_probes,
+             py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step",       &DISLDOLayer::synap_row_step,
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
         .def("zero_accum",           &DISLDOLayer::zero_accum)
         .def_property_readonly("neuron_input_accum", &DISLDOLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &DISLDOLayer::get_neuron_grad_accum)
@@ -700,7 +756,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("indices",            &DISLDOLayer::get_indices)
         .def_property_readonly("ptrs",               &DISLDOLayer::get_ptrs)
         .def("load_weights",        &DISLDOLayer::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
         .def_property_readonly("out_degree", [](const DISLDOLayer& self) {
             return py::array_t<DISLDOLayer::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -712,6 +768,43 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &DISLDOLayer::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayer::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayer::nnz);
+
+    // DISLDOLayerV: identical API surface to DISLDOLayer, DeltaCSRBiValues<float>
+    // (32-bit) instead of FP4BiPacked -- same disldo_forward/backward/
+    // build_probes/synap_row_step functions, generic via ValueAccessor.
+    // Was never registered with pybind at all before this (see conversation).
+    py::class_<DISLDOLayerV>(m, "DISLDOLayerV")
+        .def(py::init<int, int, int, int>(),
+             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
+             py::arg("num_cpus") = 4)
+        .def("forward",              &DISLDOLayerV::forward,
+             py::arg("x"), py::arg("learning_rate") = 0.01f)
+        .def("backward",             &DISLDOLayerV::backward,
+             py::arg("dy"), py::arg("learning_rate"))
+        .def("build_probes",         &DISLDOLayerV::build_probes,
+             py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum",           &DISLDOLayerV::zero_accum)
+        .def_property_readonly("neuron_input_accum", &DISLDOLayerV::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &DISLDOLayerV::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",       &DISLDOLayerV::get_weights_vals)
+        .def_property_readonly("importance",         &DISLDOLayerV::get_importance)
+        .def_property_readonly("indices",            &DISLDOLayerV::get_indices)
+        .def_property_readonly("ptrs",               &DISLDOLayerV::get_ptrs)
+        .def("load_weights",        &DISLDOLayerV::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def_property_readonly("out_degree", [](const DISLDOLayerV& self) {
+            return py::array_t<DISLDOLayerV::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(DISLDOLayerV::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
+        .def_readonly ("num_cpus",  &DISLDOLayerV::num_cpus)
+        .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
+        .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
+        .def_property_readonly("nnz",       &DISLDOLayerV::nnz);
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

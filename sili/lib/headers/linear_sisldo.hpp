@@ -117,12 +117,19 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
 
 ///Sparse matmul of @p weights and @p input_tensor; accumulates forward contributions
 ///into connection strength scaled by @p learning_rate.
+// BUG FIX (see conversation): was `const WEIGHTS_T&` but conditionally mutates
+// conn_str[wptr] (Hebbian importance update) when learning_rate != 0 -- same
+// pattern already found and fixed in delta_csr_forward (sparse_struct.hpp)
+// this session. This one "worked" only by accident for SparseLinearWeightsV
+// (TriValues, shared_ptr<vector> indirection -- const doesn't propagate
+// through the pointee) and genuinely fails for SparseLinearWeights
+// (FP4BiPacked as a direct, non-indirected member -- const DOES propagate).
 template <typename WEIGHTS_T, 
           typename VALUE_TYPE = typename WEIGHTS_T::value_type,
           typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
 void sisldo_forward(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
-    const WEIGHTS_T& weights,
+    WEIGHTS_T& weights,
     VALUE_TYPE* output,
     VALUE_TYPE learning_rate = 0.01,
     const int num_cpus = 4,
