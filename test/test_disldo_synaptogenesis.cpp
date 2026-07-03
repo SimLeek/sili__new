@@ -338,6 +338,132 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     CHECK(weights.connections.nnz() > nnz_before);
 }
 
+// ── delta_csr_backward_sparse_grad ────────────────────────────────────────────
+//
+// Dense input, sparse gradient -- deliberately the ONLY sparse-gradient
+// backward variant (see conversation: sparse-input backward was confirmed
+// wrong and removed). These tests exist specifically to verify the actual
+// point of that design, not just basic correctness.
+
+TEST_CASE("delta_csr_backward_sparse_grad: dx reaches a row whose input was exactly zero",
+         "[disldo][backward][regression]") {
+    // The core property this design exists for: a row that "didn't fire"
+    // (input==0) must still receive a correct, nonzero dx if its connected
+    // output has significant gradient -- proving the upstream layer gets
+    // told "you should have fired more here" despite this row contributing
+    // nothing to the forward pass. Sparse-input backward could never
+    // produce this (the row wouldn't be visited at all).
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, SIZE_TYPE(0));
+
+    std::vector<float> input = {1.0f, 0.0f, 2.0f};   // row 1 is exactly zero
+
+    CSRInput<SIZE_TYPE, float> dy;
+    dy.rows = 1; dy.cols = 4;
+    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
+    dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{1});
+    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
+
+    std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
+    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.0f, 1);
+
+    // dx[1] = W[1,1] * dy[1] = 0.5 * 0.8 = 0.4 -- weight-only, independent
+    // of input[1]'s own (zero) value.
+    CHECK(dx[1] == Catch::Approx(0.4f));
+    CHECK(dx[1] != 0.0f);
+
+    // Rows with no gradient on their connected outputs get dx=0, as expected.
+    CHECK(dx[0] == Catch::Approx(0.0f).margin(1e-5f));
+    CHECK(dx[2] == Catch::Approx(0.0f).margin(1e-5f));
+}
+
+TEST_CASE("delta_csr_backward_sparse_grad: weight update stays near-static for a row that didn't fire",
+         "[disldo][backward][regression]") {
+    // Complementary half of the same property: dx reaches the row (above),
+    // but the WEIGHT update should still scale with the true input value,
+    // staying appropriately small when that value was zero -- no separate
+    // handling needed, it falls out of `grad = dy_val * in_val` naturally.
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, SIZE_TYPE(0));
+
+    std::vector<float> input = {1.0f, 0.0f, 2.0f};
+    CSRInput<SIZE_TYPE, float> dy;
+    dy.rows = 1; dy.cols = 4;
+    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
+    dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{1});
+    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
+
+    std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
+    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.1f, 1);
+
+    auto cur = weights.connections.row_cursor(1);
+    cur.advance();
+    const float w1_after = ValueAccessor<FP4BiPacked>::get_w(
+        weights.connections.values, weights.connections.layout.elem_start[1]);
+    CHECK(w1_after == Catch::Approx(0.5f).margin(1e-3f));
+}
+
+TEST_CASE("delta_csr_backward_sparse_grad matches dense reference when gradient covers everything",
+         "[disldo][backward]") {
+    // Sanity check: with every output column present in the "sparse"
+    // gradient (i.e. it's not really sparse), results must match a plain
+    // dense reference exactly -- confirms the merge-based column matching
+    // isn't silently dropping or double-counting anything.
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, SIZE_TYPE(0));
+
+    std::vector<float> input = {1.0f, 0.6f, 2.0f};
+    CSRInput<SIZE_TYPE, float> dy;
+    dy.rows = 1; dy.cols = 4;
+    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 4});
+    dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1, 2, 3});
+    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.3f, -0.5f, 0.2f, 0.4f});
+
+    std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
+    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.0f, 1);
+
+    // Same reference as the disldo_backward dense test: dx[0]=0.05, dx[1]=-0.25, dx[2]=1.2
+    std::vector<float> expected_dx = {0.05f, -0.25f, 1.2f};
+    CHECK_VECTOR_ALMOST_EQUAL(dx, expected_dx, 1e-4f);
+}
+
+
 TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
          "[synaptogenesis][integration]") {
     using SIZE_TYPE = int;

@@ -223,10 +223,12 @@ public:
 // sparse, e.g. after a top-k/threshold step run BETWEEN layers -- that
 // sparsification is intentionally a separate operation, not something this
 // class decides for itself) had no surviving implementation anywhere in
-// this repo. forward_sparse/backward_sparse below close that gap, using
-// delta_csr_forward/delta_csr_backward (already existed in this file,
-// generic over VALUES_TYPE, verified correct against a hand-computed
-// reference before wiring up -- see conversation).
+// this repo. forward_sparse uses delta_csr_forward (already existed in
+// this file, generic over VALUES_TYPE); backward_sparse uses
+// delta_csr_backward_sparse_grad (dense input, sparse gradient -- see
+// forward_sparse/backward_sparse comment below for why these are NOT
+// mirror images of each other). Both verified correct against
+// hand-computed references before wiring up -- see conversation.
 
 class SparseLinearLayer {
 public:
@@ -306,18 +308,33 @@ public:
         return result;
     }
 
-    // ── Sparse-input forward/backward (SISLDO) ──────────────────────────────────
-    // Genuinely different from forward_dense/backward_dense above, not a
-    // naming variant: only touches the input's nonzero positions (via CSR),
-    // vs dense's iterate-every-row structure. Use when activations are
-    // ACTUALLY sparse (e.g. after a top-k/threshold sparsification step run
-    // between layers -- that decision belongs outside this class, see class
-    // comment) -- meaningless/wasteful to force through here when input is
-    // genuinely dense. No bare forward()/backward() on this class
-    // deliberately -- see TODO.md for the planned auto-dispatching version
-    // and why a bare name isn't here yet: an unqualified default risks
-    // everyone reaching for dense out of habit and losing a real 10-100x
-    // speedup on genuinely sparse activations.
+    // ── forward_sparse / backward_sparse ─────────────────────────────────────────
+    // NOT mirror images of each other (see conversation) -- forward's
+    // bottleneck is the ACTIVATIONS, backward's is the GRADIENT, and these
+    // are independent axes:
+    //   forward_sparse:  SPARSE input (CSR)   -- skips inactive input rows.
+    //   backward_sparse: DENSE input, SPARSE gradient (CSR) -- deliberately
+    //                     NOT sparse input. dx[r] = sum_c W[r,c]*dy[c]
+    //                     depends only on weights and the gradient, not on
+    //                     input[r] -- a row whose own activation was zero
+    //                     still gets a correct dx, correctly telling the
+    //                     upstream layer "you should have fired more here."
+    //                     Sparse input would skip that row entirely,
+    //                     permanently losing that correction path -- only
+    //                     "fired & shouldn't have" would ever get fixed,
+    //                     never "didn't fire & should have". The weight
+    //                     update still scales with the true (dense) input
+    //                     value, so it stays appropriately small for rows
+    //                     that didn't fire -- no separate handling needed.
+    // Use *_sparse when the relevant side (activations for forward, gradient
+    // for backward) is ACTUALLY sparse (e.g. after a top-k/threshold
+    // sparsification step run between layers -- that decision belongs
+    // outside this class, see class comment) -- meaningless/wasteful to
+    // force through here otherwise. No bare forward()/backward() on this
+    // class deliberately -- see TODO.md for the planned auto-dispatching
+    // version and why a bare name isn't here yet: an unqualified default
+    // risks everyone reaching for dense out of habit and losing a real
+    // 10-100x speedup when the relevant side actually is sparse.
 
     CSRInput<S, V> _numpy_to_csr_input(py::array_t<S> ptrs, py::array_t<S> indices,
                                        py::array_t<V> values, S batch, S cols) {
@@ -346,16 +363,15 @@ public:
     }
 
     py::array_t<V> backward_sparse(
-        py::array_t<S> x_ptrs, py::array_t<S> x_indices, py::array_t<V> x_values,
+        py::array_t<V> x,   // DENSE input -- see class comment for why
         py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
         S batch, V learning_rate = 0.01f)
     {
-        auto input    = _numpy_to_csr_input(x_ptrs,  x_indices,  x_values,  batch, n_inputs());
+        auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
-        std::vector<V> dy_dense(batch * n_outputs(), V(0));   // scratch, unused by caller
-        delta_csr_backward<S, FP4BiPacked, COL_TYPE>(
-            input, weights, out_grad, dx.data(), dy_dense.data(),
+        delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -617,7 +633,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
              py::arg("batch"), py::arg("learning_rate") = 0.0f)
         .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
-             py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"),
+             py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f)
         .def("build_probes",         &SparseLinearLayer::build_probes,

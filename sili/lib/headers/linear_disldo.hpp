@@ -11,9 +11,9 @@
 //
 // Generic over VALUES_TYPE via ValueAccessor -- works identically for
 // FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit fallback),
-// matching delta_csr_forward/delta_csr_backward (the SISLDO/sparse-input
-// equivalents in sparse_struct.hpp) and delta_csr_synap_row_step /
-// delta_csr_build_probes, which already use this same pattern.
+// matching delta_csr_forward (the SISLDO/sparse-input forward equivalent
+// in delta_csr_ops.hpp) and delta_csr_synap_row_step / delta_csr_build_probes,
+// which already use this same pattern.
 //
 // Supersedes the previous float32/absolute-CSR disldo_forward/disldo_backward
 // (which never used DeltaCSRLayout/FP4BiPacked at all -- see conversation).
