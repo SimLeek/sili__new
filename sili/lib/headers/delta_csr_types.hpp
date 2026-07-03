@@ -473,6 +473,17 @@ struct SparseLinearWeightsDelta {
     double     value_l2_sq        = 0.0;
     value_type value_max_abs      = value_type(0);
 
+    // Decay applied to max_abs on every update, BEFORE comparing against
+    // the new value -- new_max = max(old_max * decay, |new_val|). Default
+    // 1.0 (no decay, exact backward compat -- pure monotonic bound as
+    // before). A decay slightly below 1.0 (e.g. 0.9999) lets max_abs drift
+    // downward over time when the element that set it has since shrunk,
+    // rather than staying stuck at a stale peak forever -- an approximate,
+    // self-correcting live max rather than an exact one, which is judged
+    // sufficient here (see conversation). Python-settable/viewable, same
+    // spirit as importance_scale.
+    value_type max_abs_decay = value_type(1);
+
     inline value_type hoyer_importance() const {
         return _hoyer_from_stats(importance_l1, importance_l2_sq);
     }
@@ -483,15 +494,57 @@ struct SparseLinearWeightsDelta {
     // Call after any write to a synapse's stored importance -- old_val/
     // new_val must be the STORED (post-quantization) values, matching what
     // these stats track, not true units.
+    //
+    // THREAD SAFETY: these mutate shared state (importance_l1 etc.) with
+    // no locking -- safe to call from single-threaded code, or serially
+    // after a parallel region, but NOT safe to call concurrently from
+    // multiple OpenMP threads (a real bug found and fixed here -- see
+    // conversation: this was originally called directly inside
+    // #pragma omp parallel loops in all four kernels, racing on these
+    // exact fields, undetected because every test used num_cpus=1). For
+    // parallel kernels, each thread should accumulate locally (sum of
+    // |new|, sum of |old|, sum of new^2, sum of old^2, local max) and call
+    // update_importance_stats_aggregate()/update_value_stats_aggregate()
+    // ONCE per thread after the parallel region, not this method from
+    // inside one.
     inline void update_importance_stats(value_type old_val, value_type new_val) {
         importance_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
         importance_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
-        importance_max_abs  = std::max(importance_max_abs, std::abs(new_val));
+        importance_max_abs  = std::max(importance_max_abs * max_abs_decay, std::abs(new_val));
     }
     inline void update_value_stats(value_type old_val, value_type new_val) {
         value_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
         value_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
-        value_max_abs  = std::max(value_max_abs, std::abs(new_val));
+        value_max_abs  = std::max(value_max_abs * max_abs_decay, std::abs(new_val));
+    }
+
+    // Thread-safe: apply ONE thread's worth of pre-summed partial totals.
+    // Call once per thread after a parallel region (or serially, from
+    // single-threaded code -- equivalent to calling update_*_stats() for
+    // every synapse that thread touched, batched into 4 sums instead of
+    // per-synapse calls). sum_abs_new/sum_abs_old = that thread's running
+    // sum of |new_val|/|old_val| across every synapse it touched;
+    // sum_sq_new/sum_sq_old = the same for squares; local_max_new = the
+    // largest |new_val| that thread saw (NOT decayed -- decay is applied
+    // once here, matching update_*_stats' per-call semantics as closely as
+    // a batched call can).
+    inline void update_importance_stats_aggregate(
+        double sum_abs_new, double sum_abs_old,
+        double sum_sq_new,  double sum_sq_old,
+        value_type local_max_new)
+    {
+        importance_l1      += sum_abs_new - sum_abs_old;
+        importance_l2_sq   += sum_sq_new  - sum_sq_old;
+        importance_max_abs  = std::max(importance_max_abs * max_abs_decay, local_max_new);
+    }
+    inline void update_value_stats_aggregate(
+        double sum_abs_new, double sum_abs_old,
+        double sum_sq_new,  double sum_sq_old,
+        value_type local_max_new)
+    {
+        value_l1      += sum_abs_new - sum_abs_old;
+        value_l2_sq   += sum_sq_new  - sum_sq_old;
+        value_max_abs  = std::max(value_max_abs * max_abs_decay, local_max_new);
     }
 
     // Recompute all six stats from scratch -- O(nnz), call once after

@@ -64,6 +64,17 @@ void disldo_forward(
         const int tid = omp_get_thread_num();
         value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
 
+        // Per-thread local accumulators -- see update_importance_stats()'s
+        // THREAD SAFETY comment (delta_csr_types.hpp). Calling
+        // weights.update_importance_stats() directly from inside this
+        // parallel loop would race on the shared importance_l1/l2_sq/
+        // max_abs fields (a real bug found and fixed -- see conversation).
+        // Each thread sums locally here; one aggregate call per thread
+        // (not per synapse) after the loop applies the combined total.
+        double local_sum_abs_new = 0.0, local_sum_abs_old = 0.0;
+        double local_sum_sq_new  = 0.0, local_sum_sq_old  = 0.0;
+        value_type local_max_new = value_type(0);
+
         #pragma omp for schedule(static)
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n_row = L.row_nnz(r);
@@ -90,9 +101,25 @@ void disldo_forward(
                         // rounds to the nearest FP4_TABLE entry, so it can differ from what
                         // was just written. Stats must track what's really in the buffer.
                         const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        weights.update_importance_stats(stored_imp, actual_stored);
+                        local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
+                        local_sum_abs_old += std::abs(static_cast<double>(stored_imp));
+                        local_sum_sq_new  += static_cast<double>(actual_stored) * actual_stored;
+                        local_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
+                        local_max_new = std::max(local_max_new, std::abs(actual_stored));
                     }
                 }
+            }
+        }
+
+        // One aggregate call per THREAD (not per synapse) -- critical
+        // section cost is now O(num_cpus), not O(nnz).
+        if (learning_rate != value_type(0)) {
+            #pragma omp critical
+            {
+                weights.update_importance_stats_aggregate(
+                    local_sum_abs_new, local_sum_abs_old,
+                    local_sum_sq_new,  local_sum_sq_old,
+                    local_max_new);
             }
         }
     }
@@ -161,6 +188,15 @@ void disldo_backward(
         const int tid = omp_get_thread_num();
         value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
 
+        // Per-thread local accumulators -- see disldo_forward's comment
+        // and update_importance_stats()'s THREAD SAFETY note.
+        double local_sum_abs_new_w = 0.0, local_sum_abs_old_w = 0.0;
+        double local_sum_sq_new_w  = 0.0, local_sum_sq_old_w  = 0.0;
+        value_type local_max_new_w = value_type(0);
+        double local_sum_abs_new_i = 0.0, local_sum_abs_old_i = 0.0;
+        double local_sum_sq_new_i  = 0.0, local_sum_sq_old_i  = 0.0;
+        value_type local_max_new_i = value_type(0);
+
         #pragma omp for schedule(static)
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n_row = L.row_nnz(r);
@@ -192,9 +228,29 @@ void disldo_backward(
                     // Read back post-quantization actuals -- see disldo_forward's comment.
                     const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    weights.update_value_stats(cw_orig, actual_w);
-                    weights.update_importance_stats(ci_orig, actual_imp);
+                    local_sum_abs_new_w += std::abs(static_cast<double>(actual_w));
+                    local_sum_abs_old_w += std::abs(static_cast<double>(cw_orig));
+                    local_sum_sq_new_w  += static_cast<double>(actual_w) * actual_w;
+                    local_sum_sq_old_w  += static_cast<double>(cw_orig) * cw_orig;
+                    local_max_new_w = std::max(local_max_new_w, std::abs(actual_w));
+                    local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
+                    local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
+                    local_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
+                    local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
+                    local_max_new_i = std::max(local_max_new_i, std::abs(actual_imp));
                 }
+            }
+        }
+
+        if (learning_rate != value_type(0)) {
+            #pragma omp critical
+            {
+                weights.update_value_stats_aggregate(
+                    local_sum_abs_new_w, local_sum_abs_old_w,
+                    local_sum_sq_new_w,  local_sum_sq_old_w, local_max_new_w);
+                weights.update_importance_stats_aggregate(
+                    local_sum_abs_new_i, local_sum_abs_old_i,
+                    local_sum_sq_new_i,  local_sum_sq_old_i, local_max_new_i);
             }
         }
     }

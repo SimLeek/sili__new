@@ -180,6 +180,13 @@ void delta_csr_forward(
             ? all_contributions.data() + static_cast<std::size_t>(tid) * num_inputs
             : nullptr;
 
+        // Per-thread local accumulators, persisting across all batches --
+        // see disldo_forward's THREAD SAFETY comment. Aggregated once,
+        // after the batch loop below, not per synapse.
+        double local_sum_abs_new = 0.0, local_sum_abs_old = 0.0;
+        double local_sum_sq_new  = 0.0, local_sum_sq_old  = 0.0;
+        value_type local_max_new = value_type(0);
+
         for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
             const SIZE_TYPE batch_start  = (*input_tensor.ptrs[0])[batch];
             const SIZE_TYPE batch_end    = (*input_tensor.ptrs[0])[batch + 1];
@@ -237,7 +244,11 @@ void delta_csr_forward(
                         ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval, cur_imp / weights.importance_scale);
                         // Read back post-quantization actual -- see disldo_forward's comment.
                         const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
-                        weights.update_importance_stats(stored_imp, actual_stored);
+                        local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
+                        local_sum_abs_old += std::abs(static_cast<double>(stored_imp));
+                        local_sum_sq_new  += static_cast<double>(actual_stored) * actual_stored;
+                        local_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
+                        local_max_new = std::max(local_max_new, std::abs(actual_stored));
                     }
 
                     thread_output[batch_offset + out_idx] += contrib;
@@ -246,6 +257,15 @@ void delta_csr_forward(
                 }
             }
             #pragma omp barrier
+        }
+
+        if (learning_rate != 0) {
+            #pragma omp critical
+            {
+                weights.update_importance_stats_aggregate(
+                    local_sum_abs_new, local_sum_abs_old,
+                    local_sum_sq_new,  local_sum_sq_old, local_max_new);
+            }
         }
 
         for (int stride = 1; stride < nthreads; stride <<= 1) {
@@ -336,11 +356,36 @@ void delta_csr_backward_sparse_grad(
 
     if (dc.empty()) return;
 
+    // Across-batches accumulators -- each batch's #pragma omp parallel for
+    // is a SEPARATE parallel region (re-created every batch iteration, not
+    // one persistent region like disldo_forward/backward), so per-thread
+    // locals can't persist across batches here the same way. reduction()
+    // handles the within-one-batch thread-safety; these accumulate each
+    // batch's reduced total, with ONE final aggregate call after the whole
+    // loop -- see disldo_forward's THREAD SAFETY comment for the bug this
+    // is all avoiding.
+    double total_sum_abs_new_w = 0.0, total_sum_abs_old_w = 0.0;
+    double total_sum_sq_new_w  = 0.0, total_sum_sq_old_w  = 0.0;
+    value_type total_max_new_w = value_type(0);
+    double total_sum_abs_new_i = 0.0, total_sum_abs_old_i = 0.0;
+    double total_sum_sq_new_i  = 0.0, total_sum_sq_old_i  = 0.0;
+    value_type total_max_new_i = value_type(0);
+
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
         const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
 
-        #pragma omp parallel for num_threads(num_cpus) schedule(static)
+        double batch_sum_abs_new_w = 0.0, batch_sum_abs_old_w = 0.0;
+        double batch_sum_sq_new_w  = 0.0, batch_sum_sq_old_w  = 0.0;
+        value_type batch_max_new_w = value_type(0);
+        double batch_sum_abs_new_i = 0.0, batch_sum_abs_old_i = 0.0;
+        double batch_sum_sq_new_i  = 0.0, batch_sum_sq_old_i  = 0.0;
+        value_type batch_max_new_i = value_type(0);
+
+        #pragma omp parallel for num_threads(num_cpus) schedule(static) \
+            reduction(+:batch_sum_abs_new_w, batch_sum_abs_old_w, batch_sum_sq_new_w, batch_sum_sq_old_w) \
+            reduction(+:batch_sum_abs_new_i, batch_sum_abs_old_i, batch_sum_sq_new_i, batch_sum_sq_old_i) \
+            reduction(max:batch_max_new_w, batch_max_new_i)
         for (std::size_t r = 0; r < n_inputs; ++r) {
             const std::size_t n_row = L.row_nnz(r);
             if (n_row == 0) continue;
@@ -379,12 +424,36 @@ void delta_csr_backward_sparse_grad(
                     // Read back post-quantization actuals -- see disldo_forward's comment.
                     const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    weights.update_value_stats(w, actual_w);
-                    weights.update_importance_stats(stored_imp, actual_imp);
+                    batch_sum_abs_new_w += std::abs(static_cast<double>(actual_w));
+                    batch_sum_abs_old_w += std::abs(static_cast<double>(w));
+                    batch_sum_sq_new_w  += static_cast<double>(actual_w) * actual_w;
+                    batch_sum_sq_old_w  += static_cast<double>(w) * w;
+                    batch_max_new_w = std::max(batch_max_new_w, std::abs(actual_w));
+                    batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
+                    batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
+                    batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
+                    batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
+                    batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
         }
+
+        total_sum_abs_new_w += batch_sum_abs_new_w; total_sum_abs_old_w += batch_sum_abs_old_w;
+        total_sum_sq_new_w  += batch_sum_sq_new_w;  total_sum_sq_old_w  += batch_sum_sq_old_w;
+        total_max_new_w = std::max(total_max_new_w, batch_max_new_w);
+        total_sum_abs_new_i += batch_sum_abs_new_i; total_sum_abs_old_i += batch_sum_abs_old_i;
+        total_sum_sq_new_i  += batch_sum_sq_new_i;  total_sum_sq_old_i  += batch_sum_sq_old_i;
+        total_max_new_i = std::max(total_max_new_i, batch_max_new_i);
+    }
+
+    if (learning_rate != value_type(0)) {
+        weights.update_value_stats_aggregate(
+            total_sum_abs_new_w, total_sum_abs_old_w,
+            total_sum_sq_new_w,  total_sum_sq_old_w, total_max_new_w);
+        weights.update_importance_stats_aggregate(
+            total_sum_abs_new_i, total_sum_abs_old_i,
+            total_sum_sq_new_i,  total_sum_sq_old_i, total_max_new_i);
     }
 }
 

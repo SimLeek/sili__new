@@ -99,6 +99,55 @@ default.
    `max_abs` sits at or near the ceiling for a stretch), tracked
    specifically because of this gap.
 
+   FIXED, per follow-up: `max_abs` now DECAYS on every update
+   (`max_abs_decay`, default 1.0 = no decay, exact backward compat,
+   Python-settable/viewable same as `importance_scale`) -- `new_max =
+   max(old_max * decay, |new_val|)`. A decay slightly below 1.0 lets
+   `max_abs` drift downward over time when the element that set it has
+   since shrunk, rather than staying stuck at a stale peak forever -- an
+   approximate, self-correcting live max rather than an exact one, judged
+   sufficient (an exact live max under arbitrary decreases needs more
+   than O(1) bookkeeping). Verified directly (grows on a real increase,
+   decays correctly toward the true value over repeated updates when not
+   refreshed, `recompute_stats()` still gives the exact answer).
+
+   FIXED, a real bug found while testing multi-threaded correctness (not
+   hypothetical): the original `update_importance_stats()`/
+   `update_value_stats()` calls were made DIRECTLY inside each kernel's
+   `#pragma omp parallel` loop -- a genuine data race on the shared
+   `importance_l1`/`l2_sq`/`max_abs` fields (and `value_` equivalents),
+   completely undetected because every test up to that point used
+   `num_cpus=1`. Fixed in all four kernels via per-thread local
+   accumulation (4 running sums + a local max per thread) with ONE
+   aggregate call per THREAD (not per synapse) after the parallel region
+   -- `#pragma omp critical` for the two kernels with one persistent
+   parallel region spanning multiple batches (`disldo_forward`/
+   `disldo_backward`), OpenMP `reduction()` clauses for
+   `delta_csr_backward_sparse_grad` (whose `#pragma omp parallel for` is
+   re-created fresh every batch iteration, so persistent per-thread
+   locals don't apply the same way). Verified with num_cpus=1 vs.
+   num_cpus=8 giving matching stats, and num_cpus=8 giving deterministic
+   results across 5 repeated runs -- the actual test that would have
+   caught the original bug.
+
+   Finding a real, separate, PRE-EXISTING structural fact along the way,
+   not introduced this session: `FP4BiPacked`'s copy constructor/
+   assignment DELIBERATELY shares the underlying byte buffer (copies the
+   `shared_ptr`, not its contents) -- confirmed directly (mutating one
+   "copy" mutates a supposedly-independent second one). Not a bug to fix
+   unilaterally (it's explicit, intentional code, and something else in
+   the codebase may rely on the sharing) -- but a real footgun worth
+   documenting prominently: `objA = objB` does NOT give independent
+   storage for anything using `FP4BiPacked`. `delta_csr_from_absolute()`
+   (or any path starting from a default-constructed `FP4BiPacked`, which
+   legitimately allocates fresh storage) is the correct way to get
+   independent data. This is why the thread-safety verification above
+   needed a second pass -- the first attempt used copy-assignment for
+   "independent" trials and produced what looked exactly like a race
+   (values growing across repeated "independent" runs) but was actually
+   this. Documented with regression tests in
+   `test/test_stats_thread_safety.cpp`.
+
    NOT DONE, the actual next step: the adaptive POLICY itself (when to
    trigger `rescale_importance()`/an equivalent for value_scale, and what
    the new scale becomes) -- deliberately Python-side per explicit
