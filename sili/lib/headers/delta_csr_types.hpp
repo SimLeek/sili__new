@@ -428,8 +428,48 @@ struct SparseLinearWeightsDelta {
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
     std::vector<SIZE_TYPE>                            out_degree;
 
+    // Per-layer scale applied to STORED importance to get TRUE units before
+    // any importance arithmetic (the Hebbian `1+|imp|` denominator, the
+    // per-step decay). Motivation: FP4's smallest representable nonzero
+    // magnitude is 0.5, but well-conditioned weight init scales as roughly
+    // 1/sqrt(fan_in) -- for fan_in=1000 that's ~0.03, far below FP4's floor.
+    // Without a scale, importance would either underflow to zero
+    // immediately (losing all regularization signal) or need artificially
+    // inflated raw values that don't correspond to anything meaningful.
+    // Default 1.0 -- exact behavioral match to having no scale at all, so
+    // this is fully backward compatible with every existing test/caller.
+    // Read as: true_imp = stored_imp * importance_scale. Write as:
+    // stored_imp = true_imp / importance_scale. See rescale_importance()
+    // below for changing this mid-training without losing accumulated data.
+    value_type importance_scale = value_type(1);
+
     inline SIZE_TYPE in_degree(SIZE_TYPE i) const {
         return static_cast<SIZE_TYPE>(connections.layout.row_nnz(i));
+    }
+
+    // Change importance_scale mid-training without losing accumulated
+    // importance: re-reads every stored synapse's importance at the OLD
+    // scale into true units, re-encodes at the NEW scale, then updates
+    // importance_scale itself. Without this, just assigning a new scale
+    // directly would silently reinterpret all existing stored values as if
+    // they'd always been at the new scale -- corrupting every synapse's
+    // importance in one step, not just changing how future arithmetic
+    // treats it.
+    inline void rescale_importance(value_type new_scale) {
+        if (new_scale == importance_scale) return;
+        auto& dc = connections;
+        auto& L  = dc.layout;
+        for (std::size_t r = 0; r < L.rows; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const std::size_t vb = L.elem_start[r] + e;
+                const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+                const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                const value_type true_i   = stored_i * importance_scale;
+                ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, true_i / new_scale);
+            }
+        }
+        importance_scale = new_scale;
     }
 
     inline void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {

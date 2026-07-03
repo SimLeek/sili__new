@@ -82,9 +82,10 @@ void disldo_forward(
                     mo[static_cast<std::size_t>(b) * n_out + col] += contrib;
 
                     if (learning_rate != value_type(0)) {
-                        value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                        const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                        value_type imp = stored_imp * weights.importance_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, imp);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, imp / weights.importance_scale);
                     }
                 }
             }
@@ -165,7 +166,7 @@ void disldo_backward(
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 value_type cw  = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
-                value_type ci  = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                value_type ci  = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb) * weights.importance_scale;  // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -179,7 +180,7 @@ void disldo_backward(
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0))
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, ci);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, ci / weights.importance_scale);
             }
         }
     }

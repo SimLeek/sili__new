@@ -231,9 +231,10 @@ void delta_csr_forward(
                     const value_type  contrib = wval * in_val;
 
                     if (learning_rate != 0) {
-                        value_type cur_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
+                        value_type cur_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr)
+                                              * weights.importance_scale;   // -> true units
                         cur_imp += contrib * learning_rate / (value_type(1) + std::abs(cur_imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval, cur_imp);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval, cur_imp / weights.importance_scale);
                     }
 
                     thread_output[batch_offset + out_idx] += contrib;
@@ -366,11 +367,12 @@ void delta_csr_backward_sparse_grad(
 
                 if (learning_rate != value_type(0)) {
                     const value_type grad = dy_val * in_val;   // scales with true input value
-                    value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb)
+                                     * weights.importance_scale;   // -> true units
                     imp -= grad * learning_rate;
                     const value_type new_w = w + (-learning_rate * grad)
                                               / (value_type(1) + std::abs(imp));
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, imp);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, imp / weights.importance_scale);
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;

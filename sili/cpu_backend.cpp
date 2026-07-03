@@ -409,6 +409,23 @@ public:
         weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
     }
 
+    // Per-layer scale applied to stored importance to get true units before
+    // any importance arithmetic -- see SparseLinearWeightsDelta's own
+    // comment (delta_csr_types.hpp) for the full motivation. Default 1.0,
+    // exact backward compat.
+    V get_importance_scale() const { return weights.importance_scale; }
+
+    // Change importance_scale mid-training without corrupting existing
+    // stored importance -- see SparseLinearWeightsDelta::rescale_importance
+    // for what this actually does (re-reads every synapse's importance at
+    // the OLD scale, re-encodes at the NEW one). Do not just assign
+    // get_importance_scale()'s value directly -- that would silently
+    // reinterpret all existing stored values as if they'd always been at
+    // the new scale.
+    void rescale_importance(V new_scale) {
+        weights.rescale_importance(new_scale);
+    }
+
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
         std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
@@ -649,6 +666,15 @@ PYBIND11_MODULE(_cpu, m)
              "Opposite of compact(): restores growth headroom, normalized to\n"
              "exactly blank_fraction of current content. Call before resuming\n"
              "synaptogenesis on a compact()ed layer.")
+        .def_property_readonly("importance_scale", &SparseLinearLayer::get_importance_scale,
+             "Per-layer scale applied to stored importance to get true units.\n"
+             "Default 1.0, exact backward compat. Read-only -- use\n"
+             "rescale_importance() to change it, never assign directly.")
+        .def("rescale_importance",   &SparseLinearLayer::rescale_importance,
+             py::arg("new_scale"),
+             "Change importance_scale mid-training without corrupting existing\n"
+             "stored importance -- re-reads every synapse's importance at the\n"
+             "OLD scale into true units, re-encodes at the NEW scale.")
         .def("zero_accum",           &SparseLinearLayer::zero_accum)
         .def_property_readonly("neuron_input_accum", &SparseLinearLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer::get_neuron_grad_accum)

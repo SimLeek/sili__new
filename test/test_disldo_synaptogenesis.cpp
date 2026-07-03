@@ -464,6 +464,125 @@ TEST_CASE("delta_csr_backward_sparse_grad matches dense reference when gradient 
 }
 
 
+// ── importance_scale / rescale_importance ─────────────────────────────────────
+//
+// FP4_TABLE = {0, 0.5, 1, 1.5, 2, 3, 4, 6, ...} -- nearest-neighbor
+// quantization means any true value under 0.25 magnitude rounds straight
+// to exactly 0, losing all signal. This is the actual problem
+// importance_scale exists to solve: well-conditioned weight init scales as
+// roughly 1/sqrt(fan_in) -- 0.03 for fan_in=1000 -- well under that floor.
+
+TEST_CASE("importance_scale defaults to 1.0, exact backward compat", "[importance_scale]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 1};
+    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    CHECK(weights.importance_scale == Catch::Approx(1.0f));
+}
+
+TEST_CASE("importance_scale=1.0 loses a true importance of 0.03 entirely (quantizes to 0)",
+         "[importance_scale][regression]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 1};
+    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    // Store a "true" importance of 0.03 directly (scale=1.0 -- the
+    // motivating failure case): 0.03 is well under FP4's 0.25 rounding
+    // threshold, so it quantizes straight to 0.
+    ValueAccessor<FP4BiPacked>::set(dc.values, 0, 1.0f, 0.03f);
+    const float readback = ValueAccessor<FP4BiPacked>::get_imp(dc.values, 0);
+    CHECK(readback == 0.0f);   // confirmed lost, not approximately preserved
+}
+
+TEST_CASE("importance_scale=0.01 preserves the same true importance exactly",
+         "[importance_scale][regression]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 1};
+    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    const float true_imp    = 0.03f;
+    const float scale       = 0.01f;
+    const float stored_target = true_imp / scale;   // 3.0 -- exact FP4_TABLE entry
+    ValueAccessor<FP4BiPacked>::set(dc.values, 0, 1.0f, stored_target);
+
+    const float stored_readback = ValueAccessor<FP4BiPacked>::get_imp(dc.values, 0);
+    CHECK(stored_readback == Catch::Approx(3.0f));   // exact table entry, no rounding loss
+
+    const float true_readback = stored_readback * scale;
+    CHECK(true_readback == Catch::Approx(0.03f));    // recovers the true value exactly
+}
+
+TEST_CASE("disldo_forward's Hebbian update actually uses importance_scale, not just the field existing",
+         "[importance_scale][regression]") {
+    // Direct test that the KERNEL respects the scale, not just that the
+    // scale can be set and manually decoded (the three tests above).
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.importance_scale = 0.01f;
+    weights.out_degree.assign(1, S(0));
+
+    // A single forward pass with a small contribution -- the resulting
+    // Hebbian update should land in a range that scale=0.01 keeps
+    // representable, where scale=1.0 would round it away.
+    std::vector<float> input = {0.1f};
+    std::vector<float> output(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), /*learning_rate=*/1.0f, 1);
+
+    const float stored = ValueAccessor<FP4BiPacked>::get_imp(
+        weights.connections.values, weights.connections.layout.elem_start[0]);
+    const float true_imp = stored * weights.importance_scale;
+    CHECK(true_imp != 0.0f);   // survived, wouldn't have at scale=1.0 for a contribution this small
+}
+
+TEST_CASE("rescale_importance preserves the true value across a scale change",
+         "[importance_scale][regression]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 1};
+    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+
+    // Start at scale=1.0 with a true importance of 2.0 (well within FP4's
+    // range, no precision loss expected at this scale).
+    ValueAccessor<FP4BiPacked>::set(weights.connections.values, 0, 1.0f, 2.0f);
+    REQUIRE(weights.importance_scale == Catch::Approx(1.0f));
+
+    weights.rescale_importance(0.5f);
+    CHECK(weights.importance_scale == Catch::Approx(0.5f));
+
+    const float stored_after = ValueAccessor<FP4BiPacked>::get_imp(weights.connections.values, 0);
+    const float true_after   = stored_after * weights.importance_scale;
+    CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved, not corrupted
+}
+
+
 TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
          "[synaptogenesis][integration]") {
     using SIZE_TYPE = int;
