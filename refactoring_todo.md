@@ -52,6 +52,62 @@ default.
    verified at the FP4-encoding level, the kernel level, and end-to-end
    through the real Python pybind path (5 new regression tests, 26 total
    test cases / 94 assertions passing).
+
+   EXTENDED per follow-up discussion: `importance_scale`/`value_scale`
+   need to actually be MAINTAINED (not just settable), since the right
+   scale can drift as training progresses. Not backprop (importance is a
+   Hebbian, not gradient-based, quantity -- backprop doesn't fit the same
+   framework) -- instead, self-correcting via an inverse-Hoyer signal on
+   the STORED distribution: Hoyer's score near 0 means values are spread
+   evenly across FP4's representable range (good), near 1 means
+   concentrated (most values collapsing to the same point -- typically 0,
+   meaning underflow, meaning rescale is needed).
+
+   DONE (this pass): the O(1)-per-update infrastructure this needs.
+   `SparseLinearWeightsDelta` now maintains running `value_l1`/
+   `value_l2_sq`/`value_max_abs` and `importance_l1`/`importance_l2_sq`/
+   `importance_max_abs` incrementally (updated by every kernel that writes
+   a synapse, via `update_value_stats()`/`update_importance_stats()`) --
+   L1 as a running sum of `|new|-|old|` (not raw deltas -- `|a+d| != |a|+d`
+   in general), L2 as a running sum of squares updated via
+   `l2_sq - old^2 + new^2`, both O(1), no rescan needed. `hoyer_value()`/
+   `hoyer_importance()` compute Hoyer's measure from these in O(1).
+   `recompute_stats()` gives an exact, from-scratch answer when needed
+   (called automatically after every layer construction/load_weights).
+   Exposed on `SparseLinearLayer` for Python-side use.
+
+   Real bug found and fixed during this: FP4BiPacked's quantizer rounds to
+   the nearest FP4_TABLE entry, so the value passed to `update_*_stats()`
+   must be the value read back AFTER `set()` (the actual stored/quantized
+   value), not the pre-quantization float that was computed -- using the
+   latter caused real, measurable drift starting from the very first
+   update. Caught by testing the incremental tracking against a fresh
+   `recompute_stats()` after many forward+backward calls, not by
+   inspection.
+
+   CAVEAT, worth remembering when the policy below gets built: `max_abs`
+   is a MONOTONIC upper bound incrementally (can't decrease without a full
+   rescan, since maintaining an exact live max under arbitrary decreases
+   needs more than O(1) bookkeeping) -- fine as "has this ever touched the
+   ceiling," not as "what is the max right now." Also: the pure
+   "keep Hoyer near 0" objective catches UNDERFLOW (collapse toward 0)
+   but likely does NOT catch OVERFLOW/saturation (values piling up at
+   FP4's ceiling, ±6) -- a layer where every value is exactly 6.0 has the
+   same L1/L2 ratio as a fully dense, well-spread layer (Hoyer score 0
+   either way), so it wouldn't be flagged by Hoyer alone. `max_abs` is the
+   cheap complementary check for that case (e.g. trigger a rescale if
+   `max_abs` sits at or near the ceiling for a stretch), tracked
+   specifically because of this gap.
+
+   NOT DONE, the actual next step: the adaptive POLICY itself (when to
+   trigger `rescale_importance()`/an equivalent for value_scale, and what
+   the new scale becomes) -- deliberately Python-side per explicit
+   guidance ("newer and experimental, people might want to change it,
+   python is easier to change, people can see what it's doing"). C++ owns
+   the cheap running stats (near-free, since it's already touching every
+   synapse it updates); Python owns the decision heuristic. Should apply
+   broadly -- most layers, and specifically needed for rnn_fold (item 4).
+   Not started.
 4. **Get rnn_fold + gen_toy_mistral working again against the current
    API**, with the actual new piece: automatic dense/sparse dispatch using
    `hoyer_score()`, not just manually choosing forward_dense vs

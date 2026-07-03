@@ -260,6 +260,7 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
         neuron_input_accum.assign(n_inputs,  V(0));
@@ -426,6 +427,26 @@ public:
         weights.rescale_importance(new_scale);
     }
 
+    // Running L1/L2/max stats for the STORED (quantized) importance/value
+    // distribution, maintained incrementally at O(1) per synapse touched --
+    // see SparseLinearWeightsDelta's own comment (delta_csr_types.hpp) for
+    // the full design (including the max_abs monotonic-bound limitation).
+    // Underpins a Python-side adaptive rescaling policy, not built here --
+    // see refactoring_todo.md/TODO.md.
+    V get_value_l1()           const { return static_cast<V>(weights.value_l1); }
+    V get_value_l2_sq()        const { return static_cast<V>(weights.value_l2_sq); }
+    V get_value_max_abs()      const { return weights.value_max_abs; }
+    V get_importance_l1()      const { return static_cast<V>(weights.importance_l1); }
+    V get_importance_l2_sq()   const { return static_cast<V>(weights.importance_l2_sq); }
+    V get_importance_max_abs() const { return weights.importance_max_abs; }
+    V hoyer_value()            const { return weights.hoyer_value(); }
+    V hoyer_importance()       const { return weights.hoyer_importance(); }
+
+    // Recompute all six stats above from scratch -- O(nnz). Gives an EXACT
+    // max_abs (unlike the incrementally-maintained monotonic bound); call
+    // when that distinction matters, not routinely.
+    void recompute_stats() { weights.recompute_stats(); }
+
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
         std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
@@ -446,6 +467,7 @@ public:
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
             p, idx, w, imp, rows, cols,
             idx.size() * 8 + 4096, idx.size() + 64);
+        weights.recompute_stats();
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -524,6 +546,7 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
         neuron_input_accum.assign(n_inputs,  V(0));
@@ -594,6 +617,7 @@ public:
         weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
             p, idx, w, imp_v, rows, cols,
             idx.size() * 8 + 4096, idx.size() + 64);
+        weights.recompute_stats();
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -675,6 +699,24 @@ PYBIND11_MODULE(_cpu, m)
              "Change importance_scale mid-training without corrupting existing\n"
              "stored importance -- re-reads every synapse's importance at the\n"
              "OLD scale into true units, re-encodes at the NEW scale.")
+        .def_property_readonly("value_l1",           &SparseLinearLayer::get_value_l1)
+        .def_property_readonly("value_l2_sq",        &SparseLinearLayer::get_value_l2_sq)
+        .def_property_readonly("value_max_abs",      &SparseLinearLayer::get_value_max_abs)
+        .def_property_readonly("importance_l1",      &SparseLinearLayer::get_importance_l1)
+        .def_property_readonly("importance_l2_sq",   &SparseLinearLayer::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs", &SparseLinearLayer::get_importance_max_abs)
+        .def("hoyer_value",          &SparseLinearLayer::hoyer_value,
+             "Hoyer's sparsity measure on the STORED weight distribution, in\n"
+             "[0,1] -- 0 means values spread evenly across FP4's representable\n"
+             "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
+             "at one magnitude). O(1), from running stats -- see value_max_abs\n"
+             "for a cheap complementary saturation check this doesn't catch.")
+        .def("hoyer_importance",     &SparseLinearLayer::hoyer_importance,
+             "Same as hoyer_value() but for the STORED importance distribution.")
+        .def("recompute_stats",      &SparseLinearLayer::recompute_stats,
+             "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
+             "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
+             "maintained one is a monotonic upper bound, not a live exact max).")
         .def("zero_accum",           &SparseLinearLayer::zero_accum)
         .def_property_readonly("neuron_input_accum", &SparseLinearLayer::get_neuron_input_accum)
         .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer::get_neuron_grad_accum)

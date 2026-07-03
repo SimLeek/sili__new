@@ -583,6 +583,131 @@ TEST_CASE("rescale_importance preserves the true value across a scale change",
 }
 
 
+// ── Running L1/L2/max stats + hoyer_importance/hoyer_value ───────────────────
+//
+// Cheap O(1)-per-update tracking of the STORED (quantized) value/importance
+// distribution, maintained incrementally by every kernel that writes a
+// synapse -- underpins a future Python-side adaptive rescaling policy (see
+// refactoring_todo.md). These tests exist specifically to verify the
+// incremental tracking never drifts from a full recompute, since that's
+// the actual risk with any "maintain a running sum" design.
+
+TEST_CASE("recompute_stats matches a hand-computed reference", "[stats]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.recompute_stats();
+
+    CHECK(weights.value_l1    == Catch::Approx(1.5 + 2.0 + 0.5 + 3.0));
+    CHECK(weights.value_l2_sq == Catch::Approx(1.5*1.5 + 2.0*2.0 + 0.5*0.5 + 3.0*3.0));
+    CHECK(weights.value_max_abs == Catch::Approx(3.0f));
+}
+
+TEST_CASE("incremental stats match a fresh recompute after many forward+backward calls",
+         "[stats][regression]") {
+    // Regression test for a real bug found during development: the FP4
+    // quantizer rounds to the nearest FP4_TABLE entry, so the value passed
+    // to update_*_stats() must be the ACTUAL post-quantization stored value
+    // (read back after set()), not the pre-quantization float that was
+    // computed -- using the latter caused real, measurable drift starting
+    // from the very first update.
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, SIZE_TYPE(0));
+    weights.recompute_stats();
+
+    for (int step = 0; step < 15; ++step) {
+        const float a = 0.3f * (step % 5) - 0.6f, b = 0.2f * (step % 7) - 0.5f, c = 0.15f * (step % 3);
+        std::vector<float> input = {a, b, c};
+        std::vector<float> output(4, 0.0f);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 0.3f, 1);
+
+        std::vector<float> dy = {b, -a, c, a - b};
+        std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
+        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), dy.data(), weights, dx.data(),
+            in_acc.data(), gr_acc.data(), 0.3f, 1);
+
+        auto weights_copy = weights;
+        weights_copy.recompute_stats();
+
+        CHECK(weights.value_l1        == Catch::Approx(weights_copy.value_l1).margin(1e-3));
+        CHECK(weights.value_l2_sq     == Catch::Approx(weights_copy.value_l2_sq).margin(1e-3));
+        CHECK(weights.importance_l1    == Catch::Approx(weights_copy.importance_l1).margin(1e-3));
+        CHECK(weights.importance_l2_sq == Catch::Approx(weights_copy.importance_l2_sq).margin(1e-3));
+    }
+}
+
+TEST_CASE("max_abs is a monotonic upper bound, exact only after recompute -- documented, not a bug",
+         "[stats]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.recompute_stats();
+    REQUIRE(weights.value_max_abs == Catch::Approx(3.0f));
+
+    ValueAccessor<FP4BiPacked>::set(weights.connections.values, 0, 6.0f, 0.0f);
+    weights.update_value_stats(1.5f, 6.0f);
+    CHECK(weights.value_max_abs == Catch::Approx(6.0f));
+
+    // Shrink that same element back down -- incremental max_abs must NOT
+    // decrease (that's the documented tradeoff, not a bug).
+    ValueAccessor<FP4BiPacked>::set(weights.connections.values, 0, 0.5f, 0.0f);
+    weights.update_value_stats(6.0f, 0.5f);
+    CHECK(weights.value_max_abs == Catch::Approx(6.0f));
+
+    // recompute_stats() gives the exact current max.
+    weights.recompute_stats();
+    CHECK(weights.value_max_abs == Catch::Approx(3.0f));
+}
+
+TEST_CASE("hoyer_value/hoyer_importance stay in [0,1]", "[stats]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.recompute_stats();
+
+    const float hv = weights.hoyer_value();
+    const float hi = weights.hoyer_importance();
+    CHECK(hv >= 0.0f); CHECK(hv <= 1.0f);
+    CHECK(hi >= 0.0f); CHECK(hi <= 1.0f);
+}
+
+
 TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
          "[synaptogenesis][integration]") {
     using SIZE_TYPE = int;

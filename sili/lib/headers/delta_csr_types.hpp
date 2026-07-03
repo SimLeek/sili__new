@@ -443,10 +443,92 @@ struct SparseLinearWeightsDelta {
     // below for changing this mid-training without losing accumulated data.
     value_type importance_scale = value_type(1);
 
+    // Running L1 / L2^2 / max|.| for STORED (quantized) importance and
+    // weight values, maintained incrementally (O(1) per synapse touched,
+    // not a full-layer rescan) by update_importance_stats()/
+    // update_value_stats() below -- see conversation. These track the
+    // STORED distribution specifically (not true units), since the
+    // question they answer is "is the FP4 representable range being used
+    // well," which is about the quantized values as they actually sit in
+    // the buffer. double, not value_type(float) -- these are long-running
+    // sums across potentially millions of training steps, and float32
+    // accumulation drift is a real risk there even though individual
+    // synapse values stay float. hoyer_importance()/hoyer_value() compute
+    // Hoyer's measure from these in O(1); call recompute_stats() once
+    // after constructing a layer via delta_csr_from_absolute() (or any
+    // other path that writes values without going through
+    // update_*_stats()), since these start at zero otherwise.
+    //
+    // LIMITATION, stated plainly: max_abs is a MONOTONIC upper bound, not
+    // a live exact current max -- if the element currently holding the max
+    // shrinks, max_abs cannot decrease without rescanning (unlike L1/L2^2,
+    // which update exactly via O(1) arithmetic). Useful as "has this layer
+    // ever touched the ceiling," not as "what is the max right now" --
+    // call recompute_stats() to get an exact value if that distinction
+    // matters for a particular decision.
+    double     importance_l1      = 0.0;
+    double     importance_l2_sq   = 0.0;
+    value_type importance_max_abs = value_type(0);
+    double     value_l1           = 0.0;
+    double     value_l2_sq        = 0.0;
+    value_type value_max_abs      = value_type(0);
+
+    inline value_type hoyer_importance() const {
+        return _hoyer_from_stats(importance_l1, importance_l2_sq);
+    }
+    inline value_type hoyer_value() const {
+        return _hoyer_from_stats(value_l1, value_l2_sq);
+    }
+
+    // Call after any write to a synapse's stored importance -- old_val/
+    // new_val must be the STORED (post-quantization) values, matching what
+    // these stats track, not true units.
+    inline void update_importance_stats(value_type old_val, value_type new_val) {
+        importance_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
+        importance_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
+        importance_max_abs  = std::max(importance_max_abs, std::abs(new_val));
+    }
+    inline void update_value_stats(value_type old_val, value_type new_val) {
+        value_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
+        value_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
+        value_max_abs  = std::max(value_max_abs, std::abs(new_val));
+    }
+
+    // Recompute all six stats from scratch -- O(nnz), call once after
+    // constructing a layer via delta_csr_from_absolute() or any path that
+    // writes values without going through update_*_stats(), or whenever an
+    // exact (not monotonic-bound) max_abs is needed.
+    inline void recompute_stats() {
+        importance_l1 = importance_l2_sq = 0.0; importance_max_abs = value_type(0);
+        value_l1      = value_l2_sq      = 0.0; value_max_abs      = value_type(0);
+        auto& L = connections.layout;
+        for (std::size_t r = 0; r < L.rows; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const std::size_t vb = L.elem_start[r] + e;
+                update_value_stats(value_type(0),
+                    ValueAccessor<VALUES_TYPE>::get_w(connections.values, vb));
+                update_importance_stats(value_type(0),
+                    ValueAccessor<VALUES_TYPE>::get_imp(connections.values, vb));
+            }
+        }
+    }
+
     inline SIZE_TYPE in_degree(SIZE_TYPE i) const {
         return static_cast<SIZE_TYPE>(connections.layout.row_nnz(i));
     }
 
+private:
+    inline value_type _hoyer_from_stats(double l1, double l2_sq) const {
+        const std::size_t n = connections.nnz();
+        if (n <= 1) return value_type(0);
+        const double l2 = std::sqrt(l2_sq);
+        if (l2 <= 0.0) return value_type(1);   // all-zero -> maximally "sparse" by convention
+        const double sqrt_n = std::sqrt(static_cast<double>(n));
+        return static_cast<value_type>((sqrt_n - l1 / l2) / (sqrt_n - 1.0));
+    }
+
+public:
     // Change importance_scale mid-training without losing accumulated
     // importance: re-reads every stored synapse's importance at the OLD
     // scale into true units, re-encodes at the NEW scale, then updates

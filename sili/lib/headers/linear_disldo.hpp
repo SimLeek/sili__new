@@ -86,6 +86,11 @@ void disldo_forward(
                         value_type imp = stored_imp * weights.importance_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
                         ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, imp / weights.importance_scale);
+                        // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
+                        // rounds to the nearest FP4_TABLE entry, so it can differ from what
+                        // was just written. Stats must track what's really in the buffer.
+                        const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                        weights.update_importance_stats(stored_imp, actual_stored);
                     }
                 }
             }
@@ -165,8 +170,10 @@ void disldo_backward(
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
-                value_type cw  = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
-                value_type ci  = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb) * weights.importance_scale;  // -> true units
+                const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+                const value_type  ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                value_type cw  = cw_orig;
+                value_type ci  = ci_orig * weights.importance_scale;  // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -179,8 +186,15 @@ void disldo_backward(
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
-                if (learning_rate != value_type(0))
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, ci / weights.importance_scale);
+                if (learning_rate != value_type(0)) {
+                    const value_type new_stored_imp = ci / weights.importance_scale;
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, new_stored_imp);
+                    // Read back post-quantization actuals -- see disldo_forward's comment.
+                    const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+                    const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    weights.update_value_stats(cw_orig, actual_w);
+                    weights.update_importance_stats(ci_orig, actual_imp);
+                }
             }
         }
     }
