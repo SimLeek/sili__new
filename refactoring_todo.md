@@ -45,17 +45,13 @@ default.
    API (`forward()`/`forward_disldo()`-style names) -- need updating to
    the current split names. `test_sili.py` is already huge (1245 lines) --
    NEW tests for this go in a fresh file, not added to it.
-3. **Get `importance_scale`/`rescale_importance` working and tested.**
-   Elevated here from TODO.md per explicit instruction -- this is stuff
-   from the most recent (this-session) codebase and should be working
-   first, ahead of newer feature work. Per-layer fp32 scale so importance
-   accumulates in true units before FP4 quantization (well-conditioned
-   weight init puts natural Hebbian-trace magnitude below FP4's
-   representable floor for large fan-in layers -- same class of problem
-   value_scale solves for weights, just for the live-training importance
-   path instead of one-time conversion). Needs threading through
-   `delta_csr_forward`/`delta_csr_backward` and `disldo_forward`/
-   `disldo_backward`'s importance update (the `1+|imp|` denominator).
+3. ~~Get `importance_scale`/`rescale_importance` working and tested.~~
+   DONE -- field on `SparseLinearWeightsDelta`, threaded through
+   `disldo_forward`/`disldo_backward`/`delta_csr_forward`/
+   `delta_csr_backward_sparse_grad`, exposed on `SparseLinearLayer`,
+   verified at the FP4-encoding level, the kernel level, and end-to-end
+   through the real Python pybind path (5 new regression tests, 26 total
+   test cases / 94 assertions passing).
 4. **Get rnn_fold + gen_toy_mistral working again against the current
    API**, with the actual new piece: automatic dense/sparse dispatch using
    `hoyer_score()`, not just manually choosing forward_dense vs
