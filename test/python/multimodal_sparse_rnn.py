@@ -504,12 +504,25 @@ class MultimodalSparseRNN:
         """
         Quick debug accessor.  Example:
             model.debug_neuron("vision", 216, 12)
-            → SynapseView(Idx:210;W:2;I:1)
+        Returns a dict with the index, weight, and importance for that synapse.
         """
         layer = self.encoders.get(modality) or getattr(self, f"W_{modality}", None)
         if layer is None:
             raise KeyError(f"No layer for modality or weight name: {modality!r}")
-        return layer.buffer.neuron[neuron_idx].synapse[synapse_idx]
+        indices = layer.indices
+        weights = layer.importance
+        vals    = layer.weights_vals
+        # Count how many synapses belong to rows 0..neuron_idx-1 to find offset.
+        import numpy as np
+        ptrs = layer.ptrs   # row_ptr array
+        offset = int(ptrs[neuron_idx]) + synapse_idx
+        return {
+            "row":       neuron_idx,
+            "synapse":   synapse_idx,
+            "col_idx":   int(indices[offset]),
+            "weight":    float(vals[offset]),
+            "importance": float(weights[offset]),
+        }
 
     def __repr__(self) -> str:
         n = self.cfg.total_state_size
