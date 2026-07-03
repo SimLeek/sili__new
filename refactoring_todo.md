@@ -1,179 +1,249 @@
 # Refactoring status and plan
 
 High-level "where are we and what's left" for the cpu_sparse_io +
-optim_merge/master + sili_old consolidation into `sili_new`. For granular
-code-level bugs/features, see `TODO.md` instead — this document is the map,
-that one is the item list.
+optim_merge/master + sili_old consolidation into `sili_new`. This document
+is the active work queue for the refactoring itself. `TODO.md` is for
+backburner items -- things that wait until *after* this refactoring is
+done, not things blocking it.
 
 ## Goal / definition of done
 
 - `sili_new` contains the union of everything worth keeping from all three
   sources, actually working (tests passing), not just present.
-- The three source clone directories (`sili_cpu_sparse_io`, `sili_optim_merge`
-  /`sili_main`, `sili_old`) end up empty (or contain only a `.MIGRATED`
-  marker per file) — an empty directory is the "done" signal, not something
-  tracked separately.
-- No file over ~1k lines where reasonably avoidable (ongoing constraint, not
-  a one-time pass — see "File sizes" below).
+- The three source clone directories end up empty (or `.MIGRATED` markers
+  only) -- an empty directory is the "done" signal.
+- gen_toy_mistral + rnn_fold working end-to-end against the current
+  sili_new API, with the sparsity-metric-driven dense/sparse dispatch (see
+  active queue below) -- this is the concrete target that "done" cashes
+  out to right now, not an abstract completeness check.
+- File-size limit (~1k lines) applies to *new* files going forward, not
+  retroactively to old, already-tested files -- that cleanup is explicitly
+  the *last* step (see active queue), not ongoing.
 
-## Priority ordering (established this session, applies throughout)
+## Priority ordering
 
-1. **This session's own SILi work** (built in this chat, before the repo
-   consolidation started) — highest priority of all sources. Its C++ core
-   (delta-CSR, FP4, ULEB128, synaptogenesis, parallel pointers,
-   `importance_scale`) is more complete and more heavily tested than any
-   single source repo's own state. Its Python-level tests
+1. **This session's own SILi work** (built before the repo consolidation
+   started) -- highest priority of all sources. Python-level tests
    (`test_sili.py`, `multimodal_sparse_rnn.py`, `sparse_tcnn_audio.py`,
-   preserved in `test/python/`) are the **highest priority within that** —
-   explicit instruction: keep these as-is through the consolidation,
-   updated only for the `forward_dense`/`backward_dense` +
-   `forward_sparse`/`backward_sparse` rename (see "Immediate next step"
-   below — not yet done).
-2. **`optim_merge`/master** (the actual GitHub repo) — second priority.
-   Confirmed most-recent by both date and git ancestry (`optim_merge` =
-   `master` + one commit, 2026-07-01). This is what `sili_new` was branched
-   from.
-3. **`cpu_sparse_io`** — explicitly the old direction (2026-03-10, predates
-   master). Only relevant where it has something genuinely unique that
-   neither of the above covers.
-4. **`sili_old`** — oldest (Jan 2025), a different repo entirely, GPU/vision-
-   shader-focused. Mostly superseded; `to_csr`/`to_coo` are the confirmed
-   exception (see below).
+   preserved in `test/python/`) are highest priority within that.
+2. **optim_merge/master** (the actual GitHub repo, what `sili_new` was
+   branched from) -- second priority.
+3. **cpu_sparse_io** -- explicitly the old direction (2026-03-10, predates
+   master). Relevant only where it has something genuinely unique.
+4. **sili_old** -- oldest (Jan 2025), GPU/vision-shader-focused, mostly
+   superseded.
 
 Where two sources describe the same concept, higher priority wins by
-default — this has been the standing rule all session (e.g. delta-CSR
-always wins over absolute CSR for index encoding; the generic
-`sparse_struct`/`ValueAccessor` framework was kept over a from-scratch
-concrete reimplementation once confirmed to already exist).
+default.
 
-## File sizes
+## Active priority queue (in order)
 
-Checked this session (`find ... | xargs wc -l`, current as of this commit).
-Files over ~1k lines:
+1. ~~Write this document~~ / ~~write TODO.md~~ -- in progress, this pass.
+2. **Update tests for forward_dense/backward_dense + forward_sparse/
+   backward_sparse.** `test_sili.py` and `multimodal_sparse_rnn.py`
+   currently call this session's original unified `SparseLinearLayer`
+   API (`forward()`/`forward_disldo()`-style names) -- need updating to
+   the current split names. `test_sili.py` is already huge (1245 lines) --
+   NEW tests for this go in a fresh file, not added to it.
+3. **Get `importance_scale`/`rescale_importance` working and tested.**
+   Elevated here from TODO.md per explicit instruction -- this is stuff
+   from the most recent (this-session) codebase and should be working
+   first, ahead of newer feature work. Per-layer fp32 scale so importance
+   accumulates in true units before FP4 quantization (well-conditioned
+   weight init puts natural Hebbian-trace magnitude below FP4's
+   representable floor for large fan-in layers -- same class of problem
+   value_scale solves for weights, just for the live-training importance
+   path instead of one-time conversion). Needs threading through
+   `delta_csr_forward`/`delta_csr_backward` and `disldo_forward`/
+   `disldo_backward`'s importance update (the `1+|imp|` denominator).
+4. **Get rnn_fold + gen_toy_mistral working again against the current
+   API**, with the actual new piece: automatic dense/sparse dispatch using
+   `hoyer_score()`, not just manually choosing forward_dense vs
+   forward_sparse. Specifics:
+   - Lives in **Python-level** forward/backward wrapper methods (used
+     frequently, doesn't need to be in the hot C++ path the way the
+     underlying kernels do).
+   - Threshold: route to sparse when `hoyer_score > 0.8` (equivalently,
+     estimated active fraction under ~20%) -- otherwise dense.
+   - Note directly in the wrapper methods' own docstrings/comments, AND in
+     `TODO.md`: this fixed threshold could eventually become adaptive
+     based on measured time performance instead of a fixed constant --
+     don't build that now, just don't lose the idea.
+   - rnn_fold needs editing to support this (gen_toy_mistral depends on
+     rnn_fold) -- expected to be a straightforward refactor, not a
+     rewrite.
+5. **Cleanup, last step, only after gen_toy_mistral is converted, working,
+   and running**: delete the old files identified below as safe to
+   delete, then produce a directory-tree listing of what remains across
+   all four source locations as the final "here's where we ended up"
+   artifact. The ~1k-line-file split-up (currently skipped for old,
+   pre-existing, already-tested files) happens here too, if still wanted
+   at that point.
 
-- `sili/conversion/rnn_fold.py` (1389) — pre-existing (optim_merge), only
-  bug-fixed this session, not restructured. Not touched for size yet.
-- `test/python/test_sili.py` (1245) — this session's own test file,
-  **explicitly instructed to keep as-is** (content-wise) through the
-  consolidation. Splitting it is not obviously compatible with that
-  instruction — would need to ask before doing this one specifically.
-- `sili/conversion/model_reconstruct.py` (1195) — pre-existing, bug-fixed
-  only.
-- `sili/lib/headers/coo.hpp` (1145) — pre-existing, not touched at all yet.
-- `sili/conversion/sparse_runtime.py` (1005) — pre-existing, right at the
-  boundary.
+## Old-directory file verdicts
 
-`sparse_struct.hpp` (was the largest file in the repo, 1520 lines, the one
-grown most directly this session) has been split into
-`delta_csr_types.hpp` (448) / `delta_csr_memory.hpp` (676) /
-`delta_csr_ops.hpp` (435), with `sparse_struct.hpp` left as a 21-line
-umbrella include for backward compatibility. See TODO.md-adjacent commit
-history for the exact split rationale.
+Full pass taken this session incorporating direct review (not just this
+document's earlier categorization) -- verdicts below are as specific as
+given, not guessed at.
 
-The remaining oversized files are all pre-existing content this session
-hasn't deeply restructured (as opposed to bug-fixed) — splitting them
-would need enough familiarity with their internals to do safely, which
-hasn't been built up yet the way it has for the delta-CSR core. Flagging
-rather than attempting blind.
+### Confirmed safe to delete (cpu_sparse_io)
+- `sparse_struct.hpp` -- superseded: `delta_csr_forward`/`delta_csr_backward`
+  already do what this did.
+- `linear_sisldo.hpp` -- "just the old sparse input sparse layer, which we
+  already have."
+- `unique_vector.hpp` -- "Premature optimization tbh. A non-copy vector.
+  Makes maintaining hard. Remove it."
+- `quantized_arrays.hpp` -- "Old attempt at general quantization. Fp4 is
+  information theoretically optimal for reasonable compute times, so
+  we're just going with that now."
+- `outer_product.hpp` -- already deleted (earlier this session), confirmed.
 
-## Source directory status
+### Confirmed safe to delete (sili_old)
+- **Anything with "pyr" in the name** -- `modules/pyr_conv/`,
+  `modules/depth_pyr_conv/`, `modules/horiz_pyr_conv/`,
+  `modules/vert_pyr_conv/`, `modules/pyr_FAST/`,
+  `modules/pyr_FAST_rejection/`, `modules/pyr_local_max_sparsity_enforce/`,
+  `modules/pyr_patch_max_sparsity_enforce/`, `modules/image_pyramid/`
+  (and cpu_sparse_io's `modules/image_pyramid_float32/`,
+  `modules/image_pyramid_int8/`, `modules/pyramid_conv_d2d*/`). Verdict:
+  "All the pyr_conv ops are basically worthless. The reason is we can just
+  run a sparse layer as a kernel over the input and it works much
+  better/faster... Anything with 'pyr' on it, we drop."
+- `modules/radacon/`, `modules/adacon/` -- "GPU optim ops, r added random
+  noise to break lock step failures. Superseded by our current optim
+  stuff."
+- `modules/multi_matrix_inverse/` -- "A kompute example I made for some
+  forums. not really useful. Drop."
+- `modules/to_spvec/` -- "to_csr but one sparse vector instead of one per
+  row. to_csr does everything it does and actually works. Drop." (Also
+  contains two files literally named `*_not_working.comp` -- wasn't even
+  finished within sili_old's own history.)
+- `TODO.md` (sili_old's own) -- "Those sound like things that were
+  completed actually. Drop." No longer cross-referenced from this repo's
+  TODO.md.
 
-### This session's own SILi work
-- C++ core: fully absorbed into `sili_new`'s delta-CSR framework
-  (`SparseLinearWeightsDelta`/`ValueAccessor` generic pattern), not
-  copied wholesale — capabilities (synaptogenesis, `compact`,
-  `expand_headroom`) ported individually onto the real repo's existing
-  (more generic) type system rather than importing a second parallel
-  implementation. `importance_scale`/parallel pointers not yet ported
-  (see TODO.md).
-- Python tests: files preserved in `test/python/`, **not yet updated** to
-  the current API (see "Immediate next step").
+### Backburner (not deleted, not urgent, revisit only if a real need comes up)
+- `coo.hpp` (cpu_sparse_io) -- parallel COO generation/sorting for
+  synaptogenesis. "if we don't have those parallel versions then just
+  move that to the backburner, because most of the time we can either
+  just init a diagonal of zeroes or do maybe 100 or so synapse
+  generations/deletions, and we would need to work with the new memory
+  layout... I'd just say push that to backburner rather than look through
+  probably 1000s of lines."
+- `csf.h`/`csf.cpp` -- "Compressed sparse fiber. Backburner stuff."
+- `fiber.hpp`/`old_fiber.hpp` -- already backburnered (see TODO.md).
+- `modules/mse_loss/` -- "Just a simple mse_loss on gpu op." Low priority,
+  trivial to recreate if ever needed, not worth porting proactively.
+- `modules/reduction/` -- "Just a simple gpu reduction op." Same
+  treatment.
 
-### optim_merge / master
-- This *is* `sili_new`'s base (branched from `optim_merge`). "Status" here
-  is really "what's been fixed since branching" — see git log. Two
-  standalone-registration bugs remain uninvestigated
-  (`make_weights`/`make_weights_v`, see TODO.md).
-- `unittest_sisldo.cpp` parked (stale pre-refactor signature), 7 test cases
-  not yet triaged individually.
+### Needs real evaluation, not decided (don't guess)
+- `csr.hpp` (cpu_sparse_io) -- "a bunch of stuff that worked with sparse
+  struct. Since we're no longer using that structure I think a lot of it
+  doesn't actually work, though some might so it would be good to check
+  the functions to see if we have versions or not." Needs a
+  function-by-function check against sili_new's current headers, not a
+  blanket verdict either way.
+- `rolling_linear.hpp` -- "an attempt at sliding window attention. Might
+  be good to look at and compare to our version of sliding window
+  attention if we have sliding window attention in the newest repo." (The
+  `banded_attention_forward`/`sparse_banded_attention_forward` functions
+  from earlier this session are the likely comparison point -- not yet
+  actually compared.)
+- `cache_info.h`/`cache_info.cpp` -- "I honestly forgot what these were.
+  Idk." Genuinely unclear even to the source, low priority either way.
+- `modules/csr_matmul_csr/` (sili_old) -- "Basically a linear op that
+  doesn't require csr-csc. Could be useful idk." Uncertain value, not a
+  drop, not a confirmed-keep.
 
-### cpu_sparse_io
-Full inventory taken this session (`find sili_cpu_sparse_io/sili -type f`).
-Categorized, not deeply read line-by-line — confidence noted per category:
+### Genuinely valuable, worth porting (not yet started)
+- `linear_sidlso.hpp` (cpu_sparse_io) -- **Sparse Input, Dense Layer,
+  Sparse Output** (correcting an earlier mis-parse of the acronym as
+  "sidldo"). The dense-layer-with-sparse-input core (a layer whose WEIGHTS
+  are dense/unstructured but whose INPUT activations are sparse-CSR --
+  architecturally distinct from SparseLinearLayer, which assumes
+  connectivity-sparse weights) is genuinely useful for "odd scenarios,
+  like sub-manifold conv ops" -- doesn't need delta-CSR or any of the new
+  connectivity-sparsity machinery at all since the weights themselves
+  aren't row-sparse, but DOES need converting to FP4 for the weight
+  values (currently presumably float32). The auto-sparsification of the
+  OUTPUT specifically ("I made an attempt to use output
+  auto-sparsification and it didn't work well") is NOT worth preserving
+  -- drop that part, keep the dense-layer-with-sparse-input computation.
+  Relevant sooner than originally expected given the V-LLM vision-support
+  need below (submanifold conv is a real technique for sparse spatial
+  data).
+- System/hardware energy-and-thermal monitoring (`util/energy.py`,
+  `energy_2.py`, `system_energy.py`, `stress_2.py`, cpu_sparse_io) --
+  confirmed NOT superseded by the neural energy dynamics system from
+  earlier this session, genuinely complementary infrastructure. Design
+  intent, stated directly: this feeds the energy system's hard-ceiling
+  parameter so it can "work comfortably at temperatures that keep the
+  CPU/GPU lasting a long time," "work harder when focusing on tasks," and
+  "risk super high temperatures if it needs to do something critical,
+  like safely managing a fall in a robot body when the CPU is in that
+  robot body (no point in preserving long term temperatures when the
+  thing we're preserving might break in the short term)." The different
+  operating modes (conservative/long-term vs. aggressive/short-term-
+  critical) are envisioned as **output neurons or tokens the AI itself has
+  access to** -- i.e. the model can choose to push hardware limits when it
+  judges something more important than thermal longevity is happening,
+  not just a fixed external policy. Not started -- needs its own design
+  pass when energy-dynamics wiring is picked up.
 
-- **Already handled**: `outer_product.hpp` (confirmed superseded, deleted,
-  `.MIGRATED` marker left). `fiber.hpp`/`old_fiber.hpp` (backburnered,
-  tracked in TODO.md).
-- **High-confidence superseded, not yet deleted**: `sparse_struct.hpp`,
-  `csr.hpp`, `coo.hpp`, `linear_sisldo.hpp`, `linear_sidlso.hpp` — this is
-  the old (pre-generic-template, pre-delta-CSR) generation of the same
-  concepts `sili_new` already has in more current form. `scan.hpp`/
-  `unique_vector.hpp` likely same lineage (`sili_new`'s own `scan.hpp`,
-  inherited from optim_merge, does NOT depend on `unique_vector.hpp` at
-  all — different, newer implementation approach). Not yet deleted because
-  not yet individually confirmed the way `outer_product.hpp` was (grep for
-  callers, check dates) — should get the same treatment before removal,
-  not just assumed.
-- **Not yet evaluated, genuinely unclear**: `quantized_arrays.hpp`,
-  `rolling_linear.hpp`, `cache_info.h`/`cache_info.cpp`, `csf.h`/`csf.cpp`.
-  No obviously-named counterpart in `sili_new` (unlike the items above),
-  but also not read deeply enough this session to say whether they're
-  live, useful, unique concepts or further old-generation cruft. Genuinely
-  needs a real look, not a guess.
-- **Python-side device/runner abstraction** (`core/devices/gpu.py`,
-  `core/runners.py`, `core/strategies.py`, `core/module.py`, `core/perf.py`,
-  `core/serial.py`, `core/buffers.py`, `buffers/*.py`): this is the Kompute-
-  wrapper / GPU device abstraction layer. Directly relevant to the
-  already-tracked TODO.md backburner item ("eventually wants its own
-  runner system... GPU ops as part of a GPU 'device' abstraction") — a
-  source to draw from when that's picked up, not something to port now.
-- **`util/energy.py` / `energy_2.py` / `system_energy.py` / `stress_2.py`**:
-  checked directly — this is SYSTEM/HARDWARE power and clock-speed
-  monitoring (`psutil`, Hz tracking), NOT the neural homeostatic energy
-  dynamics system from earlier this session. Different "energy" entirely,
-  but plausibly a genuine, non-superseded piece: the real energy dynamics
-  function's own docstring says its hard ceiling (`p`) should be informed
-  by "GPU/CPU temperature monitors (thermal throttle)" and "battery level"
-  — this could be the infrastructure that *feeds* that constraint, not
-  something superseded by it. Worth a real look when energy dynamics
-  wiring is picked up, not before.
-- **Vision/image modules** (`buffers/image.py`, `buffers/pyramid.py`,
-  `buffers/conv.py`, `modules/image_pyramid_*`, `modules/pyramid_conv_*`,
-  `modules/unready/*`): image-pyramid and conv-pyramid GPU kernels for
-  vision processing specifically. Out of scope for the current sparse
-  neural network core consolidation — not evaluated further, no plan to
-  port unless a vision-specific need comes up later.
+## Elevated by the V-LLM realization (was backburner, now "later todo")
 
-### sili_old
-- **Confirmed valuable, tracked in TODO.md**: `modules/to_csr/`,
-  `modules/to_coo/` (fixed-IO-size GPU shader groups, real PCIe bandwidth
-  win). Not yet integrated.
-- **Everything else in `modules/`** (`csr_matmul_csr*`, `depth_pyr_conv`,
-  `horiz_pyr_conv`, `vert_pyr_conv`, `pyr_FAST*`, `pyr_conv`,
-  `pyr_local_max_sparsity_enforce`, `pyr_patch_max_sparsity_enforce`,
-  `image_pyramid`, `radacon`, `adacon`, `mse_loss`, `reduction`,
-  `multi_matrix_inverse`, `to_spvec`): vision/pyramid-conv GPU kernels,
-  same category as cpu_sparse_io's vision modules above — out of scope for
-  now, not evaluated further. `to_spvec` specifically has two files
-  literally named `*_not_working.comp` — a hint that even within
-  `sili_old`'s own history this particular thing wasn't finished/working,
-  lower priority than the rest even if vision work is picked up later.
-- `sili_old/TODO.md` — historical GPU design notes (workgroup sizing,
-  edge-detector separability), cross-referenced from this repo's `TODO.md`,
-  not merged in. Different scope (implementation notes for specific old
-  shaders, not a live task list).
+This project is porting Mistral 24B, which is a vision-language model --
+this changes the calculus on two previously-backburnered items:
 
-## Immediate next step (not started)
+- **GPU device/runner abstraction** (Kompute wrapper, `core/devices/gpu.py`
+  and friends, cpu_sparse_io) -- moves from backburner to "later todo."
+  Needed to handle vision input at decent speed. The CPU-side equivalent
+  of this abstraction is already effectively covered by the existing
+  direct-call architecture (`cpu_backend.cpp`/`SparseLinearLayer` calls
+  the C++ functions directly -- no separate "device" indirection layer
+  needed for CPU specifically); it's the GPU path that needs the real
+  abstraction, since GPU execution requires shader dispatch and buffer
+  management the CPU path doesn't.
+- **A "default" conv op** (explicitly NOT the pyramid-based ones, all of
+  which are dropped per above) -- needed for vision input, later todo,
+  not backburner. Not yet designed.
 
-Update `test/python/test_sili.py` and `test/python/multimodal_sparse_rnn.py`
-to use the current API: `forward_dense`/`backward_dense` instead of
-whatever they currently call for dense-input forward/backward, and
-`forward_sparse`/`backward_sparse` where sparse-input is intended. Per
-explicit instruction, this is the highest-priority concrete piece of work
-remaining — these tests were called out specifically as things to actively
-preserve and adapt, not just leave sitting in `test/python/` unrun.
-Haven't yet checked exactly what API surface these files currently assume
-(likely this session's original unified `SparseLinearLayer.forward()`/
-`.forward_disldo()` naming, which doesn't match either the old repo's
-naming or the new `forward_dense`/`forward_sparse` split) — that's the
-actual first step, not yet done.
+## Corrections to prior TODO.md entries
+
+- **"Parallel pointers" (mid-row resume mechanism) is the wrong design,
+  not just "not yet ported."** Original framing (built earlier this
+  session, before this repo's consolidation) was a resume-via-search
+  mechanism for parallelizing across chunks of one row. Per correction:
+  "This is supposed to be superseded by the work pointers iirc. The CSR
+  memory had 2 pointers, one set that would go to regions that were
+  almost exactly equal size, the other that would point to the row
+  beginnings. That's strictly better than the mid-row mechanism because
+  there's no searching required. It's O(1) at runtime instead of O(log n),
+  and synaptogenesis/pruning just needs to maintain a clean work pointer
+  set." Two pointer sets, not one: (1) roughly-equal-sized WORK regions
+  for load-balanced parallelization (not necessarily row-aligned), (2)
+  row-beginning pointers (the normal row_ptr array). Synaptogenesis/
+  pruning's job is just keeping the work-pointer set clean/valid, not
+  searching. TODO.md entry needs rewriting to this design, not the
+  original one.
+- **`make_weights`/`make_weights_v`'s bug may not need fixing at all.**
+  Clarified: the V/high-precision layers should NOT use FP4BiPacked --
+  they should use ULEB128 delta encoding (i.e. genuinely
+  `SparseLinearWeightsDelta<S, DeltaCSRBiValues<float>, COL_TYPE>`, the
+  same delta-CSR pattern DISLDOLayerV already correctly uses) with
+  **BiValues, not TriValues** (weight + importance only -- no longer
+  storing backprop in a third value list, since backward always updates
+  in place now). This means `SISLDOLayerV` itself is currently
+  architecturally wrong (still on `SparseLinearWeightsV`/TriValues/
+  absolute-CSR), not just calling a buggy function -- the fix is
+  rewiring it to the delta-CSR+BiValues pattern (exactly mirroring
+  DISLDOLayerV's already-verified upgrade), at which point the old
+  `make_weights_v` code path it currently depends on becomes unnecessary
+  rather than needing its own fix. Separately: `make_weights`'s actual
+  PURPOSE -- "give a csr in a few vectors with {1,2,3,...} and have the
+  usable CSR for testing" -- is already served by
+  `delta_csr_from_absolute`, used in every test written this session.
+  Explicit permission given to just replace the old standalone
+  `make_weights`/`make_weights_v` pybind bindings with something built on
+  `delta_csr_from_absolute` rather than debug the old ones.

@@ -1,153 +1,102 @@
-# TODO — sili_new consolidation
+# TODO — backburner, after the refactoring is done
 
-Tracks outstanding items from merging cpu_sparse_io + optim_merge + sili_old
-into one repo. See sili_old/TODO.md (if still present) for historical GPU
-design notes from that era — different scope, not merged into this file.
+Things that wait until *after* the active consolidation work is finished.
+See `refactoring_todo.md` for the active priority queue, old-directory
+verdicts, and anything currently blocking gen_toy_mistral working
+end-to-end -- that document is where most of what used to live here has
+moved (importance_scale, the parallel-pointers correction, the
+SISLDOLayerV architecture fix).
 
-## Correctness / not-yet-fixed
+## Correctness, needs a real fix eventually
 
-- **Two separate stale-signature bugs block the full module build**, not
-  one. Traced precisely while testing hoyer_sparsify (see below) by
-  temporarily stubbing each out in an uncommitted diagnostic build:
-  1. The standalone `m.def("make_weights", ...)` registration (module-level,
-     not inside any class) calls the base `make_weights<int,float>` template
-     with the OLD signature (rows, cols, ptrs, indices, values, grads,
-     importance -- 7 args including a separate backprop-adjacent grads
-     array) that no longer matches the current 5-arg definition (shape,
-     ptrs, indices, FP4BiPacked-values). Originally misattributed to
-     "SISLDOLayerV::load_weights" -- that was imprecise, this one has
-     nothing to do with that class.
-  2. `SISLDOLayerV::load_weights` separately calls `make_weights_v`, which
-     has its own internal type-conversion bug inside `csr.hpp:307` ("could
-     not convert 'w' from FP4BiPacked-typed sparse_weights to
-     TriValues-typed") -- a real bug in make_weights_v's own template
-     chain, unrelated to bug #1.
-  Neither investigated for a real fix yet -- both were only stubbed out
-  (`(void)rows; (void)cols;` style no-ops) in a throwaway /tmp build to
-  unblock testing hoyer_sparsify end-to-end from Python. Not committed
-  anywhere.
+- **The standalone `m.def("make_weights", ...)` pybind registration calls
+  a stale 7-arg signature.** Module-level, not inside any class -- calls
+  the base `make_weights<int,float>` template with an old signature (rows,
+  cols, ptrs, indices, values, grads, importance -- a separate
+  backprop-adjacent grads array that no longer exists as a concept) against
+  the current 5-arg definition. Per clarification (see
+  refactoring_todo.md): its actual purpose -- constructing a usable CSR
+  weight layer from a few plain vectors for testing -- is already served
+  by `delta_csr_from_absolute`, used in every test written this session.
+  Likely just needs replacing with something built on that rather than
+  debugging the old 7-arg call. Not done yet.
 
-- **Synaptogenesis after compact() needs automatic handling, not just a
-  loud failure.** FIXED this pass: synap_row_step now throws a catchable
+- **`SISLDOLayerV::load_weights` calls `make_weights_v`, which has its own
+  internal type-conversion bug** (`csr.hpp:307`, "could not convert 'w'
+  from FP4BiPacked-typed sparse_weights to TriValues-typed"). Per
+  clarification (see refactoring_todo.md), this is now understood to be
+  moot rather than needing its own fix: `SISLDOLayerV` is currently
+  architecturally wrong regardless of this specific bug (still on
+  `SparseLinearWeightsV`/TriValues/absolute-CSR when it should be on
+  `SparseLinearWeightsDelta<S, DeltaCSRBiValues<float>, COL_TYPE>` --
+  BiValues, not TriValues, since backward no longer stores a separate
+  backprop array). Once `SISLDOLayerV` is rewired to that pattern
+  (mirroring `DISLDOLayerV`'s already-verified upgrade), `make_weights_v`
+  won't be called from there at all. Tracked as part of the SISLDOLayerV
+  fix, not as a standalone bug to chase.
+
+- **Synaptogenesis after `compact()` needs automatic handling, not just a
+  loud failure.** FIXED: `synap_row_step` now throws a catchable
   `std::runtime_error` (with the row index and exact bytes/elements needed
   vs available) instead of silently reporting `did_work=true` while nnz
-  never changes — a silent failure here is the worst case, since training
-  just stops improving with no signal why. Also fixed a related bug this
-  exposed: out_degree bookkeeping was being updated even when the
-  underlying rebuild never actually wrote anything. Added
-  `expand_headroom()` (the opposite of `compact()` — normalizes headroom to
-  exactly `blank_fraction` of current content, reusing
-  `delta_csr_from_absolute`'s already-tested reservation logic rather than
-  duplicating it) as the explicit fix-it-yourself path; verified compact →
-  throws → expand_headroom → works again, end to end.
-  REMAINING: this is all manual. The real fix is automatic — e.g. a layer
-  transparently calling expand_headroom() itself the first time growth is
-  attempted and fails, or compact() taking a flag for "but keep enough
-  headroom for typical synaptogenesis rates" instead of normalizing all the
-  way to zero. Needs actual design thought (how much headroom is "enough"
-  without defeating compact's purpose), not a quick patch.
+  never changes. Also fixed a related bug this exposed: `out_degree`
+  bookkeeping was being updated even when the underlying rebuild never
+  actually wrote anything. Added `expand_headroom()` (the opposite of
+  `compact()` -- normalizes headroom to exactly `blank_fraction` of
+  current content) as the explicit fix-it-yourself path; verified
+  compact → throws → expand_headroom → works again, end to end.
+  REMAINING: this is all manual. The real fix is automatic -- e.g. a layer
+  transparently calling `expand_headroom()` itself the first time growth
+  is attempted and fails, or `compact()` taking a flag for "but keep
+  enough headroom for typical synaptogenesis rates" instead of
+  normalizing all the way to zero. Needs actual design thought (how much
+  headroom is "enough" without defeating compact's purpose), not a quick
+  patch.
 
-  Note on scope: `compact()`/`expand_headroom()` currently handle BOTH axes
-  together (the ULEB128 index-byte buffer AND the values/importance
-  buffer, keyed by byte_start/byte_end and elem_start/elem_end
+  Note on scope: `compact()`/`expand_headroom()` currently handle BOTH
+  axes together (the ULEB128 index-byte buffer AND the values/importance
+  buffer, keyed by `byte_start`/`byte_end` and `elem_start`/`elem_end`
   respectively) in one pass. These are genuinely independent axes with
-  independent headroom budgets — a row's byte-headroom and element-headroom
-  can differ, since ULEB128 cost varies with actual column gaps while
-  element slots are fixed-width — bundled here because both become useless
-  after compaction and reclaiming both together seemed natural, not because
-  they're the same operation. Splitting into compact_indices()/
-  compact_values() (and matching expand_ variants) if a use case needs
-  independent control hasn't come up yet but would be straightforward given
-  the current implementation.
+  independent headroom budgets -- bundled here because both become
+  useless after compaction, not because they're the same operation.
+  Splitting into `compact_indices()`/`compact_values()` (and matching
+  `expand_` variants) if a use case needs independent control hasn't come
+  up yet but would be straightforward given the current implementation.
 
 ## Architecture decisions made, not yet fully executed
 
-- **SparseLinearLayer has no bare `forward`/`backward`, deliberately, for
-  now.** Only `forward_dense`/`backward_dense` and `forward_sparse`/
-  `backward_sparse` exist — an explicit choice was required so nobody
-  defaults into dense out of habit and silently loses a real 10-100x
-  speedup on genuinely sparse activations.
-
-  DONE: the underlying ops for a future auto-dispatching `forward`/
-  `backward` now exist and are tested (`sili/lib/headers/hoyer_sparsify.hpp`,
-  exposed as `hoyer_sparsify(x)` and `hoyer_score_batch(x)`), using
-  **Hoyer's Sparsity Measure** rather than a naive "count near-zero
-  elements" threshold:
+- **`SparseLinearLayer` has no bare `forward`/`backward`, deliberately,
+  for now.** Only `forward_dense`/`backward_dense` and `forward_sparse`/
+  `backward_sparse` exist. Per the active queue (refactoring_todo.md),
+  the auto-dispatching version IS being built next (not indefinitely
+  deferred) -- the underlying ops already exist and are tested
+  (`hoyer_sparsify.hpp`, exposed as `hoyer_sparsify(x)` and
+  `hoyer_score(x)`), using Hoyer's Sparsity Measure:
 
       hoyer(x) = (sqrt(n) - ||x||_1/||x||_2) / (sqrt(n) - 1)     in [0, 1]
 
-  For a vector with exactly k nonzero entries of equal magnitude,
-  ||x||_1/||x||_2 = sqrt(k) exactly (verified, not just asserted). For a
-  realistic vector, the same ratio gives a smooth estimate of the
-  "effective" significant-element count: k_estimate = (||x||_1/||x||_2)^2.
+  Two-stage design: `hoyer_score(x)` aggregates over the whole flattened
+  batch (since forward_dense/forward_sparse are each invoked once per
+  batch, not once per sample -- a per-sample answer isn't actionable at
+  that granularity) for the ROUTING decision; `hoyer_sparsify(x)` gives
+  each row (batch sample) its own k_estimate for CONSTRUCTING the actual
+  CSR once routing has decided "sparse." Threshold decided (see active
+  queue): route to sparse when `hoyer_score > 0.8`. Lives in Python-level
+  wrapper methods, not the C++ hot path.
+  REMAINING (explicitly deferred, not forgotten): the 0.8 threshold is a
+  fixed constant for now. Could eventually become adaptive based on
+  measured time performance instead -- note this in the wrapper methods'
+  own docstrings when they're written, not just here.
 
-  Two-stage design, clarified after an early mistake (see conversation —
-  the first version only had per-row granularity, which sounds
-  mathematically fine but isn't actionable for what this is actually for):
-    1. **Routing decision** (which kernel to call): `hoyer_score_batch(x)`
-       aggregates over the WHOLE flattened batch (all rows*cols elements
-       together) into one hoyer_score, since forward_dense/forward_sparse
-       are each invoked ONCE for the entire batch in a single call — a
-       per-sample answer isn't actionable at that granularity, you can't
-       send some samples through one kernel and some through the other in
-       one call. Verified this actually separates cases correctly: a
-       mostly-dense batch scores ~0 (correctly signals forward_dense), a
-       mostly-sparse batch scores ~0.87 (correctly signals forward_sparse).
-    2. **Construction** (once routing has decided "sparse"): `hoyer_sparsify(x)`
-       gives each row (batch sample) its own independently-computed
-       k_estimate and top-k selection, for building an accurate CSR
-       representation of a batch that's already been routed to the sparse
-       path — NOT for making the routing decision itself.
-
-  REMAINING: neither function is wired into an actual `forward`/`backward`
-  auto-dispatch yet. Still needs: (a) a threshold on hoyer_score_batch
-  informed by where dense-vs-sparse execution cost actually crosses over
-  for a given layer's shape (not decided, needs benchmarking), (b) the
-  orchestration itself (call hoyer_score_batch, compare to threshold, if
-  sparse call hoyer_sparsify + convert to CSR + forward_sparse, else
-  forward_dense directly). This does NOT contradict "sparsification
-  between layers is a separate function" (see class comment on
-  SparseLinearLayer) — the top-k step stays a distinct, independently-
-  callable operation (already true today); the dispatch layer would just
-  decide whether to invoke it, not replace it.
-
-- **SISLDOLayerV / DISLDOLayerV → one unified high-precision class.**
-  SparseLinearLayer already unifies DISLDO-dense-input +
-  SISLDO-sparse-input (forward_dense/backward_dense +
-  forward_sparse/backward_sparse) in one class using
-  DeltaCSRWeights<...,FP4BiPacked,...>. The V-suffixed
-  classes should get the same treatment with
-  DeltaCSRWeights<...,DeltaCSRBiValues<float>,...> — probably named
-  something like SparseLinearLayerHighPrecision. DISLDOLayerV's
-  dense-input half already works (verified this session, same generic
-  functions as SparseLinearLayer). SISLDOLayerV's sparse-input half is
-  currently broken (see above) and its synaptogenesis
-  (sisldo_optim_synaptogenesis, using synap_mark_duplicates/
-  synap_parallel_fill from parallel.hpp/coo.hpp) hasn't been evaluated
-  against the newer delta_csr_build_probes/delta_csr_synap_row_step path.
-  Per explicit guidance: parallel.hpp/coo.hpp have genuinely fast parallel
-  ops (bitonic merge sort, exclusive scan) that might be worth adapting to
-  the new (different) memory layout rather than automatically replacing
-  with the simpler newer code — two ways to fix each broken piece, pick
-  per-case, not resolved by default to "use the new code."
-
-- **Parallel pointers not yet ported into sparse_struct.hpp.** Built and
-  tested earlier this session (in a separate, now-superseded codebase) —
-  a mid-row resume mechanism for parallelizing forward/backward across
-  chunks of a single row without a full row scan. Confirmed via grep at
-  the time: doesn't exist anywhere in this repo's history. Needed for
-  DISLDO/SISLDO forward's OpenMP parallelization to scale well on rows
-  with very uneven density.
-
-- **importance_scale / rescale_importance not yet ported.** Built and
-  tested earlier this session — per-layer fp32 scale so importance
-  accumulates in true units before FP4 quantization, avoiding underflow
-  for layers whose natural Hebbian-trace magnitude sits outside FP4's
-  representable range. Same class of fix as value_scale problem this
-  session's conversion pipeline needed, just for the live-training path
-  instead of one-time conversion. Needs threading through
-  delta_csr_forward/backward's importance update (the `1+|imp|`
-  denominator), matching how it was done for disldo_forward/backward.
+- **Work pointers, not a mid-row resume mechanism.** Corrected design
+  (see refactoring_todo.md for the full correction) -- two pointer sets:
+  (1) roughly-equal-sized WORK regions for load-balanced OpenMP
+  parallelization (not necessarily row-aligned), (2) row-beginning
+  pointers (the normal row_ptr array). O(1) at runtime, no searching --
+  strictly better than the originally-planned search-based mid-row resume
+  mechanism it replaces. Synaptogenesis/pruning's job is just keeping the
+  work-pointer set clean/valid. Not yet designed in detail or implemented
+  against this repo's actual `DeltaCSRLayout`.
 
 ## Backburner (deliberately deprioritized, not forgotten)
 
@@ -156,31 +105,52 @@ design notes from that era — different scope, not merged into this file.
   expansion (new larger buffer, copy) covers current needs. Revisit for
   future hardware where RAM can grow without a restart. There was
   reportedly a working neurogenesis test built on this
-  (test_sisldo_neurogenesis.cpp) — worth checking against once revisited.
+  (test_sisldo_neurogenesis.cpp) -- worth checking against once revisited.
 
 - **unittest_sisldo.cpp** (parked out of the active build). Tests the
   TriValues high-precision path specifically, calls the old 7-arg
-  make_weights signature (pre-refactor: took a separate backprop
-  array/flag that no longer exists — backward always updates value/
-  importance now, lr=0 to disable). Per guidance: many of its 7 test cases
-  probably test still-relevant concepts (outer_product, top-k probe
-  generation) that should become shared functions across the 4-bit/
-  32-bit paths rather than duplicated — triage each test case
-  individually (keep + update, or drop as stale) rather than blanket-fix.
+  make_weights signature. Many of its 7 test cases probably test
+  still-relevant concepts (outer_product, top-k probe generation) that
+  should become shared functions across the 4-bit/32-bit paths rather
+  than duplicated -- triage each test case individually (keep + update,
+  or drop as stale) rather than blanket-fix.
 
-- **from_csr / from_coo GPU shaders don't exist** (sili_old only has the
-  `to_` direction). Noted as a TODO since it could reduce PCIe bandwidth
-  pressure if sending dense activations/gradients to the GPU becomes the
-  bottleneck — to_csr/to_coo already solve half of that. Per guidance,
+- **`coo.hpp` (cpu_sparse_io) parallel COO generation/sorting** for
+  synaptogenesis. Current small-scale needs (diagonal init, or ~100
+  synapse gen/deletions at a time) don't need the parallel version, and
+  it would need adapting to the new memory layout regardless -- see
+  refactoring_todo.md for the full note.
+
+- **`csf.h`/`csf.cpp` (Compressed Sparse Fiber, cpu_sparse_io)** --
+  backburner per direct guidance, not evaluated further.
+
+## GPU / vision (mixed priority -- see refactoring_todo.md for the elevated items)
+
+Most GPU/vision work from `sili_old` was confirmed worthless and dropped
+(pyramid-conv variants, radacon/adacon, multi_matrix_inverse, to_spvec --
+see refactoring_todo.md for the full verdict list). What's left:
+
+- **`to_csr` / `to_coo` GPU shader groups (sili_old) confirmed genuinely
+  useful** (fixed-IO-size guarantee, real PCIe bandwidth win), not yet
+  integrated. Used a custom Kompute fork; kompute-python isn't well
+  supported, so eventually wants its own runner system with GPU ops as
+  part of a GPU "device" abstraction (this abstraction itself has been
+  elevated to "later todo, not backburner" given the V-LLM/vision
+  requirement -- see refactoring_todo.md). For now, normal Kompute is an
+  acceptable stopgap. No GPU available in the sandbox this consolidation
+  is being done in -- verification limited to "compiles, fails to find a
+  GPU gracefully" until run on real hardware.
+
+- **`from_csr` / `from_coo` GPU shaders don't exist** (only the `to_`
+  direction does). Could reduce PCIe bandwidth pressure if sending dense
+  activations/gradients to the GPU becomes the bottleneck. Per guidance,
   CSR-CSC conversion may work better for GPU purposes than from_csr/
-  from_coo specifically — cross-reference this session's disldo_gpu.py
-  CSC-construction-via-argsort work if picking this up.
-
-- **to_csr / to_coo GPU shader group** (sili_old, `sili/modules/to_csr/`,
-  `to_coo/`) confirmed genuinely useful (fixed-IO-size guarantee, real
-  PCIe bandwidth win) but not yet integrated. Used a custom Kompute
-  fork; kompute-python isn't well supported, so eventually wants its own
-  runner system with GPU ops as part of a GPU "device" abstraction. For
-  now, normal Kompute is an acceptable stopgap. No GPU available in the
-  sandbox this consolidation is being done in — verification limited to
-  "compiles, fails to find a GPU gracefully" until run on real hardware.
+  from_coo specifically -- cross-reference this session's disldo_gpu.py
+  CSC-construction-via-argsort work if picking this up. NEW: worth trying
+  whether Claude Fable 5 can generate working from_csr/from_coo shader
+  implementations directly -- per direct suggestion, genuinely plausible
+  given current model capability even though not a common benchmark task,
+  worth an actual attempt rather than assuming it can't. GPU shader code
+  can be tested without real hardware via glsl->spir-v->c++ transpilation
+  or a software implementation like llvmpipe -- relevant for verifying
+  whatever gets generated.
