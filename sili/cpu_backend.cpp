@@ -11,6 +11,7 @@
 #include "loss.hpp"
 #include "hoyer_sparsify.hpp"
 #include "fp4quant.hpp"
+#include "attention.hpp"
 
 namespace py = pybind11;
 
@@ -1066,6 +1067,65 @@ PYBIND11_MODULE(_cpu, m)
         py::arg("rows"), py::arg("cols"),
         py::arg("ptrs"), py::arg("indices"),
         py::arg("values"), py::arg("grads"), py::arg("importance"));
+
+    // ── Attention ops (ported from sparse_linear_ops.hpp) ────────────────────
+    // All three take numpy [T, d] Q/K/V arrays (float32) and return a
+    // numpy [T, d] output. The Python-facing names match exactly what
+    // multimodal_sparse_rnn.py calls (sparse_attention, sparse_banded_attention).
+
+    m.def("sparse_attention",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           std::size_t top_k, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request();
+            const std::size_t T = qb.shape[0], d = qb.shape[1];
+            py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
+            auto ob = out.request();
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
+            sparse_attention_forward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (float*)ob.ptr, T, d, top_k, num_cpus);
+            return out;
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("top_k") = 0, py::arg("num_cpus") = 4,
+        "Global top-k sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
+        "top_k=0 -> use sqrt(T). Returns [T, d] output.");
+
+    m.def("sparse_banded_attention",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
+            auto ob = out.request();
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
+            sparse_banded_attention_forward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (float*)ob.ptr, T, K, d, half_bandwidth, inner_k, num_cpus);
+            return out;
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
+        "Banded sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
+        "inner_k=0 -> use all keys in the band (dense banded). Returns [T, d] output.");
+
+    m.def("banded_attention",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           std::size_t half_bandwidth, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
+            auto ob = out.request();
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
+            banded_attention_forward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (float*)ob.ptr, T, K, d, half_bandwidth, num_cpus);
+            return out;
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("half_bandwidth"), py::arg("num_cpus") = 4,
+        "Dense banded attention. Q/K/V are [T, d] float32 numpy arrays.\n"
+        "Returns [T, d] output.");
 
     // ── Loss functions ────────────────────────────────────────────────────────
 
