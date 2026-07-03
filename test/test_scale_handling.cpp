@@ -218,6 +218,119 @@ TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer ac
     CHECK((r1_on / r0_on) < (r1_off / r0_off));                       // normalization measurably closes the gap
 }
 
+TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr once)",
+         "[scale][value_scale][gradient][regression]") {
+    // Chain rule: output += stored_w * val_scale * input, so
+    // dL/d(val_scale[r]) = sum_{e,b}(stored_w[e] * dy[b][col_e] * input[b][r])
+    // With 1 row, 1 output, 1 batch, this reduces to:
+    // delta_scale = -lr * stored_w * dy * input
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(0));
+    weights.set_value_scale_raw(0, 0.5f);   // true_w = 2.0 * 0.5 = 1.0
+
+    std::vector<float> input = {3.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    const float lr = 0.1f;
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), lr, 1);
+
+    // scale_grad = stored_w * dy * input = 2.0 * 1.0 * 3.0 = 6.0
+    // new value_scale = 0.5 - 0.1 * 6.0 = 0.5 - 0.6 = -0.1
+    const float expected_scale = 0.5f - lr * (2.0f * 1.0f * 3.0f);
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-5f));
+}
+
+TEST_CASE("value_scale gradient accumulates correctly across multiple synapses and batches",
+         "[scale][value_scale][gradient]") {
+    // 2 synapses, 2 batches -- verifies the full sum across both dimensions.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {2.0f, 3.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(2, S(0));
+    weights.set_value_scale_raw(0, 1.0f);
+
+    // batch=2: input[0]=1.0, input[1]=2.0; dy[0]=[1,1], dy[1]=[1,1]
+    std::vector<float> input = {1.0f, 2.0f};
+    std::vector<float> dy    = {1.0f, 1.0f, 1.0f, 1.0f};   // [batch=2, output=2]
+    std::vector<float> dx(2, 0.0f), in_acc(1, 0.0f), gr_acc(2, 0.0f);
+    const float lr = 0.01f;
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(2), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), lr, 1);
+
+    // scale_grad = sum_{e,b}(stored_w[e] * dy[b][col_e] * input[b][r=0])
+    // e=0 (col=0): b=0: 2.0*1.0*1.0=2; b=1: 2.0*1.0*2.0=4  -> 6
+    // e=1 (col=1): b=0: 3.0*1.0*1.0=3; b=1: 3.0*1.0*2.0=6  -> 9
+    // total scale_grad = 6 + 9 = 15
+    const float expected_scale = 1.0f - lr * 15.0f;
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+}
+
+TEST_CASE("value_scale gradient: sum-first-then-apply-lr outperforms per-synapse application near float32 epsilon",
+         "[scale][value_scale][epsilon][regression]") {
+    // The epsilon issue the 'sum first' design exists to solve: when
+    // lr * individual_contribution < ULP(value_scale), applying lr to each
+    // contribution individually inside the innermost loop causes every
+    // increment to be rounded to exactly 0 in float32, leaving value_scale
+    // unchanged despite a real nonzero gradient. Summing all contributions
+    // in a double accumulator first, then applying lr once, avoids this by
+    // giving the combined result a magnitude well above the precision floor.
+    //
+    // Concrete numbers: value_scale = 1000.0, lr = 1e-5, each per-synapse
+    // contribution = stored_w * dy * input = 1.0. ULP(1000.0) in float32
+    // is ~6.1e-5. A single per-synapse lr*contribution = 1e-5 < 6.1e-5 ->
+    // rounds to 0. With 10 synapses: sum = 10.0, lr*sum = 1e-4 > 6.1e-5 ->
+    // above the precision floor, correctly applied.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 10};
+    std::vector<S> idx;
+    for (int i = 0; i < 10; ++i) idx.push_back(i);
+    std::vector<float> w(10, 1.0f), imp(10, 0.0f);
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(10), std::size_t(512), std::size_t(512));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(10, S(0));
+    weights.set_value_scale_raw(0, 1000.0f);
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy(10, 1.0f);
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(10, 0.0f);
+
+    // lr = 1e-5. Per-synapse: 1e-5 * 1.0 = 1e-5 < ULP(1000) ~6.1e-5 -> rounds to 0.
+    // Sum-first: sum = 10.0, lr * 10.0 = 1e-4 > ULP(1000) -> above precision floor.
+    const float lr = 1e-5f;
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), lr, 1);
+
+    // scale_grad_sum = 10 * (1.0 * 1.0 * 1.0) = 10.0
+    // expected new scale = 1000.0 - 1e-5 * 10.0 = 1000.0 - 1e-4 = 999.9999
+    const float expected = 1000.0f - lr * 10.0f;
+    CHECK(weights.get_value_scale(0) != 1000.0f);   // actually changed, not lost to rounding
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected).margin(1e-3f));
+}
+
 TEST_CASE("importance_scale and value_scale work correctly together, per-row, in one forward+backward pass",
          "[scale][combined][regression]") {
     // Both scales active simultaneously, on the same synapse, through a

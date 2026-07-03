@@ -379,6 +379,15 @@ void delta_csr_backward_sparse_grad(
     double total_sum_sq_new_i  = 0.0, total_sum_sq_old_i  = 0.0;
     value_type total_max_new_i = value_type(0);
 
+    // value_scale gradient: serial per-row vector accumulated across batches
+    // (within each batch's parallel for, each r is unique per thread, so
+    // += into scale_grad_sums[r] is race-free; across batch iterations the
+    // outer loop is serial, so also race-free). Applied once after all
+    // batches -- "sum first, then apply lr" per conversation.
+    std::vector<double> scale_grad_sums(n_inputs, 0.0);
+    if (weights.value_scale.size() < n_inputs)
+        weights.value_scale.resize(n_inputs, value_type(1));
+
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
         const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
@@ -453,6 +462,13 @@ void delta_csr_backward_sparse_grad(
                     batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
                     batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
                     batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
+                    // value_scale gradient: w_stored * dy_val * in_val
+                    // (chain rule: output += w_stored * val_scale * in_val,
+                    // so d(output)/d(val_scale) = w_stored * in_val).
+                    // Accumulated in scale_grad_sums[r] (serial across
+                    // batches, parallel-safe within a batch since r is
+                    // unique per thread) -- applied once after all batches.
+                    scale_grad_sums[r] += static_cast<double>(w_stored) * dy_val * in_val;
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
@@ -473,6 +489,17 @@ void delta_csr_backward_sparse_grad(
         weights.update_importance_stats_aggregate(
             total_sum_abs_new_i, total_sum_abs_old_i,
             total_sum_sq_new_i,  total_sum_sq_old_i, total_max_new_i);
+
+        // Apply value_scale gradient once per row, after ALL batches.
+        for (std::size_t r = 0; r < n_inputs; ++r) {
+            if (scale_grad_sums[r] == 0.0) continue;
+            const std::size_t n_row = L.row_nnz(r);
+            if (n_row == 0) continue;
+            const value_type eff_lr = lr_per_row_nnz
+                ? learning_rate / static_cast<value_type>(n_row)
+                : learning_rate;
+            weights.value_scale[r] -= static_cast<value_type>(eff_lr * scale_grad_sums[r]);
+        }
     }
 }
 

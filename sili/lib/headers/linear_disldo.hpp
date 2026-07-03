@@ -187,6 +187,11 @@ void disldo_backward(
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
+    // Pre-size value_scale so that direct indexed writes from within the
+    // parallel region are safe (resize would race if called per-thread).
+    if (weights.value_scale.size() < n_in)
+        weights.value_scale.resize(n_in, value_type(1));
+
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
@@ -223,6 +228,13 @@ void disldo_backward(
             auto cursor = dc.row_cursor(r);
             const value_type imp_scale = weights.get_importance_scale(r);
             const value_type val_scale = weights.get_value_scale(r);
+            // value_scale gradient: sum first across ALL (synapse, batch)
+            // pairs for this row, then apply lr ONCE. See conversation:
+            // applying lr per-individual-contribution inside the innermost
+            // loop risks each increment falling below ULP(value_scale) in
+            // float32 and disappearing. The double accumulator + single
+            // application avoids that.
+            double scale_grad_sum = 0.0;
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
@@ -239,6 +251,10 @@ void disldo_backward(
                     if (learning_rate != value_type(0)) {
                         ci -= g * effective_lr;
                         cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
+                        // dL/d(val_scale[r]) += stored_w * dy * input
+                        // (chain rule: output += stored_w * val_scale * input,
+                        // so d(output)/d(val_scale) = stored_w * input)
+                        scale_grad_sum += static_cast<double>(cw_orig) * g;
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
@@ -258,6 +274,13 @@ void disldo_backward(
                     local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
                     local_max_new_i = std::max(local_max_new_i, std::abs(actual_imp));
                 }
+            }
+            // Apply the accumulated gradient to value_scale ONCE per row --
+            // this is the core of "sum first". Each row owns its own
+            // value_scale[r] (no other thread writes to the same r in this
+            // #pragma omp for schedule(static)), so no locking needed.
+            if (learning_rate != value_type(0)) {
+                weights.value_scale[r] -= static_cast<value_type>(effective_lr * scale_grad_sum);
             }
         }
 
