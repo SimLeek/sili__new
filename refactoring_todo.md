@@ -80,6 +80,27 @@ default.
    pre-existing, already-tested files) happens here too, if still wanted
    at that point.
 
+## Known editing pitfalls (watch for these, don't let them ship silently)
+
+- **str_replace anchor-consumption.** When `old_str` is a prefix of existing
+  text used purely as an insertion anchor ("put new content right before
+  this line"), `new_str` must repeat that anchor text at ITS OWN end, or
+  the anchor gets silently deleted rather than preserved. Happened five
+  times this session now (twice in `sparse_struct.hpp`/`TODO.md` during
+  earlier edits, twice in `test_disldo_synaptogenesis.cpp`, once in this
+  very document while writing this note about it). Every instance was
+  caught by actually compiling/running tests afterward or by grepping for
+  the anchor text -- never by re-reading the diff alone; the failure mode
+  (an orphaned string literal + brace, or a document section landing in
+  the wrong place / duplicated) can read as plausible on a quick visual
+  pass. Mitigation: after any str_replace that inserts content adjacent to
+  existing text rather than cleanly replacing a whole block, grep for the
+  anchor text's distinctive substring afterward to confirm it's still
+  present exactly once, in the right place -- in addition to (not instead
+  of) compiling/running tests before considering an edit done. The
+  compile/test/grep step has caught this every time so far -- the goal is
+  reducing how often it's needed, not replacing it.
+
 ## Old-directory file verdicts
 
 Full pass taken this session incorporating direct review (not just this
