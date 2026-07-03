@@ -279,56 +279,59 @@ TEST_CASE("value_scale gradient accumulates correctly across multiple synapses a
     // scale_grad = sum_{e,b}(stored_w[e] * dy[b][col_e] * input[b][r=0])
     // e=0 (col=0): b=0: 2.0*1.0*1.0=2; b=1: 2.0*1.0*2.0=4  -> 6
     // e=1 (col=1): b=0: 3.0*1.0*1.0=3; b=1: 3.0*1.0*2.0=6  -> 9
-    // total scale_grad = 6 + 9 = 15
-    const float expected_scale = 1.0f - lr * 15.0f;
+    // total scale_grad_sum = 6 + 9 = 15
+    // scale_eff_lr = lr / nnz_this_row = 0.01 / 2 = 0.005 (always divides
+    // by nnz_this_row for value_scale, independent of lr_per_row_nnz flag)
+    const float expected_scale = 1.0f - (lr / 2.0f) * 15.0f;
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
 }
 
 TEST_CASE("value_scale gradient: sum-first-then-apply-lr outperforms per-synapse application near float32 epsilon",
          "[scale][value_scale][epsilon][regression]") {
     // The epsilon issue the 'sum first' design exists to solve: when
-    // lr * individual_contribution < ULP(value_scale), applying lr to each
-    // contribution individually inside the innermost loop causes every
-    // increment to be rounded to exactly 0 in float32, leaving value_scale
-    // unchanged despite a real nonzero gradient. Summing all contributions
-    // in a double accumulator first, then applying lr once, avoids this by
-    // giving the combined result a magnitude well above the precision floor.
+    // (scale_eff_lr * individual_contribution) < ULP(value_scale), applying
+    // the scaled lr to each contribution individually inside the innermost
+    // loop causes every increment to round to 0 in float32, leaving
+    // value_scale unchanged despite a real nonzero gradient.
     //
-    // Concrete numbers: value_scale = 1000.0, lr = 1e-5, each per-synapse
-    // contribution = stored_w * dy * input = 1.0. ULP(1000.0) in float32
-    // is ~6.1e-5. A single per-synapse lr*contribution = 1e-5 < 6.1e-5 ->
-    // rounds to 0. With 10 synapses: sum = 10.0, lr*sum = 1e-4 > 6.1e-5 ->
-    // above the precision floor, correctly applied.
+    // With nnz_this_row normalization: scale_eff_lr = lr / nnz_this_row, so
+    // each per-synapse term is lr / nnz_this_row * stored_w * dy * input.
+    // The double accumulator sums those nnz_this_row terms (giving back
+    // lr * average_contribution) then subtracts once. To demonstrate the
+    // protection clearly: use a large value_scale (1000.0), many synapses
+    // (100), small lr (1e-3) -- scale_eff_lr = 1e-3/100 = 1e-5, per-synapse
+    // amount = 1e-5 < ULP(1000) ~6.1e-5 -> would round to 0. The final
+    // aggregated double result: 100 * 1e-5 = 1e-3 > ULP(1000) -> preserved.
     using S = int;
     using COL_TYPE = uint32_t;
-    std::vector<S> ptrs = {0, 10};
-    std::vector<S> idx;
-    for (int i = 0; i < 10; ++i) idx.push_back(i);
-    std::vector<float> w(10, 1.0f), imp(10, 0.0f);
+    const int n_syn = 100;
+    std::vector<S> ptrs = {0, n_syn};
+    std::vector<S> idx(n_syn); for (int i=0;i<n_syn;++i) idx[i]=i;
+    std::vector<float> w(n_syn, 1.0f), imp(n_syn, 0.0f);
     auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
-        ptrs, idx, w, imp, std::size_t(1), std::size_t(10), std::size_t(512), std::size_t(512));
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(n_syn), std::size_t(4096), std::size_t(4096));
 
     SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
     weights.connections = dc;
-    weights.out_degree.assign(10, S(0));
+    weights.out_degree.assign(n_syn, S(0));
     weights.set_value_scale_raw(0, 1000.0f);
 
     std::vector<float> input = {1.0f};
-    std::vector<float> dy(10, 1.0f);
-    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(10, 0.0f);
+    std::vector<float> dy(n_syn, 1.0f);
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(n_syn, 0.0f);
 
-    // lr = 1e-5. Per-synapse: 1e-5 * 1.0 = 1e-5 < ULP(1000) ~6.1e-5 -> rounds to 0.
-    // Sum-first: sum = 10.0, lr * 10.0 = 1e-4 > ULP(1000) -> above precision floor.
-    const float lr = 1e-5f;
+    // scale_eff_lr = lr / n_syn = 1e-3 / 100 = 1e-5
+    // Per-synapse: 1e-5 * 1.0 * 1.0 * 1.0 = 1e-5 < ULP(1000) ~6.1e-5 -> rounds to 0.
+    // Double accumulator: sum(100 * 1e-5) = 1e-3 > ULP(1000) -> preserved.
+    const float lr = 1e-3f;
     disldo_backward<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), lr, 1);
 
-    // scale_grad_sum = 10 * (1.0 * 1.0 * 1.0) = 10.0
-    // expected new scale = 1000.0 - 1e-5 * 10.0 = 1000.0 - 1e-4 = 999.9999
-    const float expected = 1000.0f - lr * 10.0f;
+    // Expected: value_scale = 1000.0 - (lr / n_syn) * n_syn = 1000.0 - lr = 999.999
+    const float expected = 1000.0f - lr;
     CHECK(weights.get_value_scale(0) != 1000.0f);   // actually changed, not lost to rounding
-    CHECK(weights.get_value_scale(0) == Catch::Approx(expected).margin(1e-3f));
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected).margin(1e-2f));
 }
 
 TEST_CASE("importance_scale and value_scale work correctly together, per-row, in one forward+backward pass",

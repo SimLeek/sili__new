@@ -197,33 +197,49 @@ void disldo_backward(
         const int tid = omp_get_thread_num();
         value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
 
-        // Per-thread local accumulators -- see disldo_forward's comment
-        // and update_importance_stats()'s THREAD SAFETY note.
-        double local_sum_abs_new_w = 0.0, local_sum_abs_old_w = 0.0;
-        double local_sum_sq_new_w  = 0.0, local_sum_sq_old_w  = 0.0;
-        value_type local_max_new_w = value_type(0);
+        // Per-thread importance stats accumulators -- see disldo_forward's
+        // comment and update_importance_stats()'s THREAD SAFETY note.
+        // Value stats (update_value_stats_aggregate) are intentionally NOT
+        // tracked here: stored weight values are only changed by backward,
+        // but value_scale is learned directly via gradient descent (see the
+        // scale_eff_lr update below), so there's no Hoyer-based adaptive
+        // policy decision that needs live weight stats between explicit
+        // recompute_stats() calls. Importance stats ARE needed in backward
+        // because importance gets gradient updates here as well as Hebbian
+        // updates in forward.
         double local_sum_abs_new_i = 0.0, local_sum_abs_old_i = 0.0;
         double local_sum_sq_new_i  = 0.0, local_sum_sq_old_i  = 0.0;
         value_type local_max_new_i = value_type(0);
 
         #pragma omp for schedule(static)
         for (std::size_t r = 0; r < n_in; ++r) {
-            const std::size_t n_row = L.row_nnz(r);
-            if (n_row == 0) continue;
-            // lr_row/row_nnz (per conversation): a row with more synapses
-            // gets more simultaneous per-synapse nudges each backward pass,
-            // so the AGGREGATE shift in that row's behavior scales roughly
-            // with row_nnz for a fixed learning_rate -- dividing by row_nnz
-            // keeps the aggregate update comparable across rows regardless
-            // of connection count (matters here specifically because
-            // synaptogenesis makes row_nnz genuinely vary within one layer).
-            // The layer-wide equivalent (lr_layer/nnz) needs no kernel
-            // support at all -- a caller can just pre-divide learning_rate
-            // by layer.nnz themselves, since that quantity doesn't vary
-            // within a single call the way row_nnz does.
+            const std::size_t nnz_this_row = L.row_nnz(r);
+            if (nnz_this_row == 0) continue;
+            // lr_row/nnz_this_row (per conversation): a row with more
+            // synapses gets more simultaneous per-synapse nudges each
+            // backward pass, so the AGGREGATE shift in that row's behavior
+            // scales roughly with nnz_this_row for a fixed learning_rate --
+            // dividing by nnz_this_row keeps the aggregate update comparable
+            // across rows regardless of connection count (matters here
+            // specifically because synaptogenesis makes nnz_this_row
+            // genuinely vary within one layer). The layer-wide equivalent
+            // (lr_layer/total_nnz) needs no kernel support at all -- a
+            // caller can just pre-divide learning_rate by layer.nnz
+            // themselves, since that quantity doesn't vary within a call.
             const value_type effective_lr = lr_per_row_nnz
-                ? learning_rate / static_cast<value_type>(n_row)
+                ? learning_rate / static_cast<value_type>(nnz_this_row)
                 : learning_rate;
+
+            // value_scale gradient ALWAYS divides by nnz_this_row,
+            // independent of lr_per_row_nnz. Reason: scale_grad_sum
+            // accumulates nnz_this_row*batch contributions (one per
+            // synapse per batch sample), so it's approximately
+            // nnz_this_row * batch * average_contribution. Dividing by
+            // nnz_this_row normalizes that back to the average, matching
+            // the semantics of a gradient on a single scalar parameter
+            // (not a vector of n weights).
+            const value_type scale_eff_lr =
+                learning_rate / static_cast<value_type>(nnz_this_row);
 
             auto cursor = dc.row_cursor(r);
             const value_type imp_scale = weights.get_importance_scale(r);
@@ -235,7 +251,7 @@ void disldo_backward(
             // float32 and disappearing. The double accumulator + single
             // application avoids that.
             double scale_grad_sum = 0.0;
-            for (std::size_t e = 0; e < n_row; ++e) {
+            for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
@@ -252,22 +268,13 @@ void disldo_backward(
                         ci -= g * effective_lr;
                         cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
                         // dL/d(val_scale[r]) += stored_w * dy * input
-                        // (chain rule: output += stored_w * val_scale * input,
-                        // so d(output)/d(val_scale) = stored_w * input)
                         scale_grad_sum += static_cast<double>(cw_orig) * g;
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
                     ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / val_scale, ci / imp_scale);
-                    // Read back post-quantization actuals -- see disldo_forward's comment.
-                    const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    local_sum_abs_new_w += std::abs(static_cast<double>(actual_w));
-                    local_sum_abs_old_w += std::abs(static_cast<double>(cw_orig));
-                    local_sum_sq_new_w  += static_cast<double>(actual_w) * actual_w;
-                    local_sum_sq_old_w  += static_cast<double>(cw_orig) * cw_orig;
-                    local_max_new_w = std::max(local_max_new_w, std::abs(actual_w));
                     local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
                     local_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
@@ -275,21 +282,14 @@ void disldo_backward(
                     local_max_new_i = std::max(local_max_new_i, std::abs(actual_imp));
                 }
             }
-            // Apply the accumulated gradient to value_scale ONCE per row --
-            // this is the core of "sum first". Each row owns its own
-            // value_scale[r] (no other thread writes to the same r in this
-            // #pragma omp for schedule(static)), so no locking needed.
             if (learning_rate != value_type(0)) {
-                weights.value_scale[r] -= static_cast<value_type>(effective_lr * scale_grad_sum);
+                weights.value_scale[r] -= static_cast<value_type>(scale_eff_lr * scale_grad_sum);
             }
         }
 
         if (learning_rate != value_type(0)) {
             #pragma omp critical
             {
-                weights.update_value_stats_aggregate(
-                    local_sum_abs_new_w, local_sum_abs_old_w,
-                    local_sum_sq_new_w,  local_sum_sq_old_w, local_max_new_w);
                 weights.update_importance_stats_aggregate(
                     local_sum_abs_new_i, local_sum_abs_old_i,
                     local_sum_sq_new_i,  local_sum_sq_old_i, local_max_new_i);

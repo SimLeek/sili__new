@@ -364,17 +364,13 @@ void delta_csr_backward_sparse_grad(
 
     if (dc.empty()) return;
 
-    // Across-batches accumulators -- each batch's #pragma omp parallel for
-    // is a SEPARATE parallel region (re-created every batch iteration, not
-    // one persistent region like disldo_forward/backward), so per-thread
-    // locals can't persist across batches here the same way. reduction()
-    // handles the within-one-batch thread-safety; these accumulate each
-    // batch's reduced total, with ONE final aggregate call after the whole
-    // loop -- see disldo_forward's THREAD SAFETY comment for the bug this
-    // is all avoiding.
-    double total_sum_abs_new_w = 0.0, total_sum_abs_old_w = 0.0;
-    double total_sum_sq_new_w  = 0.0, total_sum_sq_old_w  = 0.0;
-    value_type total_max_new_w = value_type(0);
+    // Importance stats accumulators across batches -- each batch's
+    // #pragma omp parallel for is a SEPARATE parallel region (re-created
+    // every batch iteration), so reduction() handles within-one-batch
+    // thread-safety and these accumulate each batch's reduced total for one
+    // final call after the whole loop. Value stats (update_value_stats_
+    // aggregate) are intentionally NOT tracked here -- see disldo_backward's
+    // comment for the same reasoning.
     double total_sum_abs_new_i = 0.0, total_sum_abs_old_i = 0.0;
     double total_sum_sq_new_i  = 0.0, total_sum_sq_old_i  = 0.0;
     value_type total_max_new_i = value_type(0);
@@ -392,29 +388,31 @@ void delta_csr_backward_sparse_grad(
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
         const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
 
-        double batch_sum_abs_new_w = 0.0, batch_sum_abs_old_w = 0.0;
-        double batch_sum_sq_new_w  = 0.0, batch_sum_sq_old_w  = 0.0;
-        value_type batch_max_new_w = value_type(0);
         double batch_sum_abs_new_i = 0.0, batch_sum_abs_old_i = 0.0;
         double batch_sum_sq_new_i  = 0.0, batch_sum_sq_old_i  = 0.0;
         value_type batch_max_new_i = value_type(0);
 
         #pragma omp parallel for num_threads(num_cpus) schedule(static) \
-            reduction(+:batch_sum_abs_new_w, batch_sum_abs_old_w, batch_sum_sq_new_w, batch_sum_sq_old_w) \
             reduction(+:batch_sum_abs_new_i, batch_sum_abs_old_i, batch_sum_sq_new_i, batch_sum_sq_old_i) \
-            reduction(max:batch_max_new_w, batch_max_new_i)
+            reduction(max:batch_max_new_i)
         for (std::size_t r = 0; r < n_inputs; ++r) {
-            const std::size_t n_row = L.row_nnz(r);
-            if (n_row == 0) continue;
+            const std::size_t nnz_this_row = L.row_nnz(r);
+            if (nnz_this_row == 0) continue;
             const value_type in_val = input[b * n_inputs + r];
-            // lr_row/row_nnz -- see disldo_backward's comment for the full
-            // reasoning (a row with more synapses gets more simultaneous
-            // per-synapse nudges each pass, so dividing by row_nnz keeps
-            // the aggregate update comparable across rows of different
+            // lr_row/nnz_this_row -- see disldo_backward's comment for the
+            // full reasoning (a row with more synapses gets more simultaneous
+            // per-synapse nudges each pass, so dividing by nnz_this_row keeps
+            // the aggregate weight update comparable across rows of different
             // connection counts).
             const value_type effective_lr = lr_per_row_nnz
-                ? learning_rate / static_cast<value_type>(n_row)
+                ? learning_rate / static_cast<value_type>(nnz_this_row)
                 : learning_rate;
+
+            // value_scale gradient ALWAYS divides by nnz_this_row -- see
+            // disldo_backward's scale_eff_lr comment for the full reasoning.
+            // Applied once after all batches, not per-synapse.
+            const value_type scale_eff_lr =
+                learning_rate / static_cast<value_type>(nnz_this_row);
 
             auto cursor = dc.row_cursor(r);
             SIZE_TYPE  og_ptr   = og_start;   // fresh per row -- each row does its own merge
@@ -422,14 +420,14 @@ void delta_csr_backward_sparse_grad(
             const value_type imp_scale = weights.get_importance_scale(r);
             const value_type val_scale = weights.get_value_scale(r);
 
-            for (std::size_t e = 0; e < n_row; ++e) {
+            for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 const value_type  w        = w_stored * val_scale;   // -> true units
 
                 // Merge-advance (both this row's columns and the gradient's
-                // columns are sorted ascending) -- O(row_nnz + grad_nnz)
+                // columns are sorted ascending) -- O(nnz_this_row + grad_nnz)
                 // per row, not a search per synapse.
                 while (og_ptr < og_end &&
                        (*out_grad_sparse.indices[0])[og_ptr] < static_cast<SIZE_TYPE>(col))
@@ -449,56 +447,36 @@ void delta_csr_backward_sparse_grad(
                     const value_type new_w = w + (-effective_lr * grad)
                                               / (value_type(1) + std::abs(imp));
                     ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / val_scale, imp / imp_scale);
-                    // Read back post-quantization actuals -- see disldo_forward's comment.
-                    const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    batch_sum_abs_new_w += std::abs(static_cast<double>(actual_w));
-                    batch_sum_abs_old_w += std::abs(static_cast<double>(w_stored));
-                    batch_sum_sq_new_w  += static_cast<double>(actual_w) * actual_w;
-                    batch_sum_sq_old_w  += static_cast<double>(w) * w;
-                    batch_max_new_w = std::max(batch_max_new_w, std::abs(actual_w));
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
                     batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
                     batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
                     batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
                     // value_scale gradient: w_stored * dy_val * in_val
-                    // (chain rule: output += w_stored * val_scale * in_val,
-                    // so d(output)/d(val_scale) = w_stored * in_val).
-                    // Accumulated in scale_grad_sums[r] (serial across
-                    // batches, parallel-safe within a batch since r is
-                    // unique per thread) -- applied once after all batches.
-                    scale_grad_sums[r] += static_cast<double>(w_stored) * dy_val * in_val;
+                    scale_grad_sums[r] += static_cast<double>(w_stored) * (scale_eff_lr * dy_val * in_val);
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
         }
 
-        total_sum_abs_new_w += batch_sum_abs_new_w; total_sum_abs_old_w += batch_sum_abs_old_w;
-        total_sum_sq_new_w  += batch_sum_sq_new_w;  total_sum_sq_old_w  += batch_sum_sq_old_w;
-        total_max_new_w = std::max(total_max_new_w, batch_max_new_w);
         total_sum_abs_new_i += batch_sum_abs_new_i; total_sum_abs_old_i += batch_sum_abs_old_i;
         total_sum_sq_new_i  += batch_sum_sq_new_i;  total_sum_sq_old_i  += batch_sum_sq_old_i;
         total_max_new_i = std::max(total_max_new_i, batch_max_new_i);
     }
 
     if (learning_rate != value_type(0)) {
-        weights.update_value_stats_aggregate(
-            total_sum_abs_new_w, total_sum_abs_old_w,
-            total_sum_sq_new_w,  total_sum_sq_old_w, total_max_new_w);
         weights.update_importance_stats_aggregate(
             total_sum_abs_new_i, total_sum_abs_old_i,
             total_sum_sq_new_i,  total_sum_sq_old_i, total_max_new_i);
 
         // Apply value_scale gradient once per row, after ALL batches.
+        // scale_grad_sums[r] already has scale_eff_lr folded in
+        // (multiplied per-synapse during accumulation above so the final
+        // subtraction is just a direct assignment-minus).
         for (std::size_t r = 0; r < n_inputs; ++r) {
             if (scale_grad_sums[r] == 0.0) continue;
-            const std::size_t n_row = L.row_nnz(r);
-            if (n_row == 0) continue;
-            const value_type eff_lr = lr_per_row_nnz
-                ? learning_rate / static_cast<value_type>(n_row)
-                : learning_rate;
-            weights.value_scale[r] -= static_cast<value_type>(eff_lr * scale_grad_sums[r]);
+            weights.value_scale[r] -= static_cast<value_type>(scale_grad_sums[r]);
         }
     }
 }
