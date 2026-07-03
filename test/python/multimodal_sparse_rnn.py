@@ -175,11 +175,21 @@ def _forward(layer: "_cpu.SparseLinearLayer",
 
 def _backward(layer: "_cpu.SparseLinearLayer",
               x: np.ndarray, dy: np.ndarray, lr: float) -> np.ndarray:
-    ptrs, idx, vals = _dense_to_csr(x)
-    batch = x.shape[0] if x.ndim == 2 else 1
-    return layer.backward(ptrs, idx, vals,
-                          np.asarray(dy, dtype=np.float32),
-                          lr, batch)
+    """Dense backward through a SparseLinearLayer.
+
+    x is accepted for API symmetry with _forward (and because callers
+    naturally have it on hand) but not passed through directly --
+    backward_dense relies on the layer's own _last_input, stored by the
+    preceding forward_dense call, rather than taking it as an explicit
+    argument. There is deliberately no sparse-input backward at all (see
+    conversation): dx = sum_c W[r,c]*dy[c] depends only on weights and the
+    gradient, not on the input value itself, so dense input is what lets
+    gradient reach a row whose own activation happened to be near zero --
+    sparse input would silently lose that. Only the GRADIENT toggles
+    sparse (backward_sparse) vs dense (this function) -- both always take
+    dense input.
+    """
+    return layer.backward_dense(np.asarray(dy, dtype=np.float32), lr)
 
 
 def _clip6(x: np.ndarray) -> np.ndarray:
@@ -448,10 +458,8 @@ class MultimodalSparseRNN:
                 continue
             sl = self.modality_slices[mod.name]
             d_enc = d_h[sl][np.newaxis, :]
-            x = np.asarray(inputs[mod.name], dtype=np.float32).ravel()[np.newaxis, :]
-            ptrs, idx, vals = _dense_to_csr(x)
-            dx = self.encoders[mod.name].backward(
-                ptrs, idx, vals, d_enc, lr, batch=1)
+            dx = self.encoders[mod.name].backward_dense(
+                np.asarray(d_enc, dtype=np.float32), lr)
             grad_inputs[mod.name] = dx.ravel()
 
         return grad_inputs

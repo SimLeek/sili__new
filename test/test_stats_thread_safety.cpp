@@ -89,6 +89,47 @@ static SparseLinearWeightsDelta<int, FP4BiPacked, uint32_t> build_test_layer(
     return weights;
 }
 
+TEST_CASE("delta_csr_synap_row_step's row cursor advances even when the merge itself throws",
+         "[synaptogenesis][regression]") {
+    // Underpins SparseLinearLayer::synap_step()'s stateful auto-advancing
+    // wrapper: a caller doing "for _ in range(n): layer.synap_step(...)"
+    // needs the sweep to keep moving even when one row's merge fails
+    // (insufficient headroom -- throws, per the loud-failure design), not
+    // get stuck repeatedly retrying the same row. Row advancement happens
+    // early in delta_csr_synap_row_step, before the throw -- verified
+    // directly here, not assumed from reading the code.
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+    std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
+    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
+    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
+
+    SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, SIZE_TYPE(0));
+
+    std::vector<float> input_accum = {5.0f, 3.0f, 4.0f};
+    std::vector<float> grad_accum  = {2.0f, 3.0f, 1.0f, 4.0f};
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
+
+    std::size_t cursor = 0;
+    std::vector<std::size_t> rows_visited;
+    for (int i = 0; i < 6; ++i) {
+        std::size_t before = cursor;
+        try {
+            delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, cursor, -1e9f, SIZE_TYPE(10));
+        } catch (const std::runtime_error&) {
+            // Expected on this tiny test layer -- headroom exhausts fast.
+        }
+        rows_visited.push_back(before);
+    }
+    CHECK(rows_visited == std::vector<std::size_t>({0,1,2,0,1,2}));
+}
+
 TEST_CASE("disldo_forward/backward: num_cpus=1 and num_cpus=8 give matching stats",
          "[thread_safety][regression]") {
     using S = int; using COL_TYPE = uint32_t;

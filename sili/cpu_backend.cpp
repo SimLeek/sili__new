@@ -391,6 +391,35 @@ public:
             weights, row, importance_cutoff, max_row_weights);
     }
 
+    // Stateful convenience wrapper around synap_row_step: advances an
+    // internal row cursor automatically (wraps via % n_inputs, matching
+    // delta_csr_synap_row_step's own semantics), so callers doing a "one
+    // step per call, many calls over time" synaptogenesis sweep don't need
+    // to track the row index themselves -- synap_row_step (above) stays
+    // available for callers who want explicit control instead. Separate
+    // cursor from equalizer_step below -- they serve different purposes
+    // (synaptogenesis vs. memory rebalancing) and may reasonably progress
+    // at different paces.
+    S      _synap_row = 0;
+    bool synap_step(V importance_cutoff, S max_row_weights) {
+        std::size_t row = static_cast<std::size_t>(_synap_row);
+        const bool did = delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
+            weights, row, importance_cutoff, max_row_weights);
+        _synap_row = static_cast<S>(row);
+        return did;
+    }
+
+    // Stateful convenience wrapper around delta_csr_equalize_step (memory
+    // rebalancing -- redistributes blank space between neighboring rows'
+    // territory so growth headroom stays reasonably even across the
+    // layer). Own internal cursor, separate from synap_step's.
+    S      _equalize_row = 0;
+    void equalizer_step() {
+        std::size_t row = static_cast<std::size_t>(_equalize_row);
+        delta_csr_equalize_step<S, FP4BiPacked, COL_TYPE>(weights.connections, row);
+        _equalize_row = static_cast<S>(row);
+    }
+
     // Repack in place: every row occupies exactly its active bytes/elements,
     // zero inter-row blank space (see compact() in sparse_struct.hpp for the
     // full rationale). Call before saving/measuring a freshly converted or
@@ -681,6 +710,16 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
              py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("synap_step",           &SparseLinearLayer::synap_step,
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             "Stateful convenience wrapper around synap_row_step -- advances an\n"
+             "internal row cursor automatically, so a caller doing repeated\n"
+             "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
+             "row index itself. Use synap_row_step directly for explicit control.")
+        .def("equalizer_step",       &SparseLinearLayer::equalizer_step,
+             "Memory rebalancing: redistributes blank space between neighboring\n"
+             "rows' territory so growth headroom stays reasonably even across the\n"
+             "layer. Own internal row cursor, separate from synap_step's.")
         .def("compact",              &SparseLinearLayer::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
