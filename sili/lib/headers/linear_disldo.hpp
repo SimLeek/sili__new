@@ -81,10 +81,13 @@ void disldo_forward(
             if (n_row == 0) continue;
 
             auto cursor = dc.row_cursor(r);
+            const value_type imp_scale = weights.get_importance_scale(r);
+            const value_type val_scale = weights.get_value_scale(r);
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
-                const value_type  w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type  w        = w_stored * val_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -94,9 +97,9 @@ void disldo_forward(
 
                     if (learning_rate != value_type(0)) {
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        value_type imp = stored_imp * weights.importance_scale;   // -> true units
+                        value_type imp = stored_imp * imp_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, imp / weights.importance_scale);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / imp_scale);
                         // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
                         // rounds to the nearest FP4_TABLE entry, so it can differ from what
                         // was just written. Stats must track what's really in the buffer.
@@ -163,7 +166,8 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_input_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         lr_per_row_nnz = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
@@ -201,15 +205,31 @@ void disldo_backward(
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n_row = L.row_nnz(r);
             if (n_row == 0) continue;
+            // lr_row/row_nnz (per conversation): a row with more synapses
+            // gets more simultaneous per-synapse nudges each backward pass,
+            // so the AGGREGATE shift in that row's behavior scales roughly
+            // with row_nnz for a fixed learning_rate -- dividing by row_nnz
+            // keeps the aggregate update comparable across rows regardless
+            // of connection count (matters here specifically because
+            // synaptogenesis makes row_nnz genuinely vary within one layer).
+            // The layer-wide equivalent (lr_layer/nnz) needs no kernel
+            // support at all -- a caller can just pre-divide learning_rate
+            // by layer.nnz themselves, since that quantity doesn't vary
+            // within a single call the way row_nnz does.
+            const value_type effective_lr = lr_per_row_nnz
+                ? learning_rate / static_cast<value_type>(n_row)
+                : learning_rate;
 
             auto cursor = dc.row_cursor(r);
+            const value_type imp_scale = weights.get_importance_scale(r);
+            const value_type val_scale = weights.get_value_scale(r);
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                 const value_type  ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                value_type cw  = cw_orig;
-                value_type ci  = ci_orig * weights.importance_scale;  // -> true units
+                value_type cw  = cw_orig * val_scale;   // -> true units
+                value_type ci  = ci_orig * imp_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -217,14 +237,13 @@ void disldo_backward(
                     const value_type g   = dyv * iv;
 
                     if (learning_rate != value_type(0)) {
-                        ci -= g * learning_rate;
-                        cw += (-learning_rate * g) / (value_type(1) + std::abs(ci));
+                        ci -= g * effective_lr;
+                        cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    const value_type new_stored_imp = ci / weights.importance_scale;
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw, new_stored_imp);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / val_scale, ci / imp_scale);
                     // Read back post-quantization actuals -- see disldo_forward's comment.
                     const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);

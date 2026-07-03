@@ -294,7 +294,7 @@ public:
 
     // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
 
-    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate) {
+    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE>(
@@ -303,7 +303,7 @@ public:
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus);
+            num_cpus, lr_per_row_nnz);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -366,14 +366,14 @@ public:
     py::array_t<V> backward_sparse(
         py::array_t<V> x,   // DENSE input -- see class comment for why
         py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
-        S batch, V learning_rate = 0.01f)
+        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false)
     {
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
         delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus);
+            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -439,21 +439,35 @@ public:
         weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
     }
 
-    // Per-layer scale applied to stored importance to get true units before
-    // any importance arithmetic -- see SparseLinearWeightsDelta's own
-    // comment (delta_csr_types.hpp) for the full motivation. Default 1.0,
+    // Per-ROW scale applied to stored importance/weight to get true units
+    // before any arithmetic -- see SparseLinearWeightsDelta's own comment
+    // (delta_csr_types.hpp) for the full motivation, including why per-row
+    // rather than per-layer. Default 1.0 for any row not yet touched,
     // exact backward compat.
-    V get_importance_scale() const { return weights.importance_scale; }
+    V get_importance_scale(S row) const { return weights.get_importance_scale(static_cast<std::size_t>(row)); }
+    V get_value_scale(S row)      const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
 
-    // Change importance_scale mid-training without corrupting existing
-    // stored importance -- see SparseLinearWeightsDelta::rescale_importance
-    // for what this actually does (re-reads every synapse's importance at
-    // the OLD scale, re-encodes at the NEW one). Do not just assign
-    // get_importance_scale()'s value directly -- that would silently
-    // reinterpret all existing stored values as if they'd always been at
-    // the new scale.
+    // Change ONE row's scale mid-training without corrupting that row's
+    // existing stored data -- see SparseLinearWeightsDelta::
+    // rescale_importance_row/rescale_value_row for what this actually does
+    // (re-reads at the OLD per-row scale, re-encodes at the NEW one). Do
+    // not just assign get_*_scale()'s value directly -- that would
+    // silently reinterpret existing stored values as if they'd always
+    // been at the new scale.
+    void rescale_importance_row(S row, V new_scale) {
+        weights.rescale_importance_row(static_cast<std::size_t>(row), new_scale);
+    }
+    void rescale_value_row(S row, V new_scale) {
+        weights.rescale_value_row(static_cast<std::size_t>(row), new_scale);
+    }
+
+    // Bulk convenience: set EVERY row to the same new_scale -- backward-
+    // compatible interface with the original per-layer-scalar design.
     void rescale_importance(V new_scale) {
         weights.rescale_importance(new_scale);
+    }
+    void rescale_value(V new_scale) {
+        weights.rescale_value(new_scale);
     }
 
     // Running L1/L2/max stats for the STORED (quantized) importance/value
@@ -698,14 +712,14 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"), py::arg("learning_rate") = 0.01f)
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"))
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false)
         .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
              py::arg("batch"), py::arg("learning_rate") = 0.0f)
         .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f)
+             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
@@ -729,15 +743,31 @@ PYBIND11_MODULE(_cpu, m)
              "Opposite of compact(): restores growth headroom, normalized to\n"
              "exactly blank_fraction of current content. Call before resuming\n"
              "synaptogenesis on a compact()ed layer.")
-        .def_property_readonly("importance_scale", &SparseLinearLayer::get_importance_scale,
-             "Per-layer scale applied to stored importance to get true units.\n"
-             "Default 1.0, exact backward compat. Read-only -- use\n"
-             "rescale_importance() to change it, never assign directly.")
+        .def("get_importance_scale", &SparseLinearLayer::get_importance_scale,
+             py::arg("row"),
+             "Per-ROW scale applied to that row's stored importance to get true\n"
+             "units. Default 1.0 for any row not yet touched, exact backward\n"
+             "compat. Use rescale_importance_row()/rescale_importance() to\n"
+             "change it, never assign directly.")
+        .def("get_value_scale",      &SparseLinearLayer::get_value_scale,
+             py::arg("row"),
+             "Same as get_importance_scale() but for stored weight values.")
+        .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
+             py::arg("row"), py::arg("new_scale"),
+             "Change ONE row's importance scale mid-training without corrupting\n"
+             "that row's existing stored data -- re-reads at the OLD per-row\n"
+             "scale, re-encodes at the NEW one.")
+        .def("rescale_value_row",    &SparseLinearLayer::rescale_value_row,
+             py::arg("row"), py::arg("new_scale"),
+             "Same as rescale_importance_row() but for stored weight values.")
         .def("rescale_importance",   &SparseLinearLayer::rescale_importance,
              py::arg("new_scale"),
-             "Change importance_scale mid-training without corrupting existing\n"
-             "stored importance -- re-reads every synapse's importance at the\n"
-             "OLD scale into true units, re-encodes at the NEW scale.")
+             "Bulk convenience: set EVERY row's importance scale to the same\n"
+             "value. Backward-compatible interface with the original\n"
+             "per-layer-scalar design.")
+        .def("rescale_value",        &SparseLinearLayer::rescale_value,
+             py::arg("new_scale"),
+             "Same as rescale_importance() but for stored weight values.")
         .def_property_readonly("value_l1",           &SparseLinearLayer::get_value_l1)
         .def_property_readonly("value_l2_sq",        &SparseLinearLayer::get_value_l2_sq)
         .def_property_readonly("value_max_abs",      &SparseLinearLayer::get_value_max_abs)

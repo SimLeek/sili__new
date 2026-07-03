@@ -482,7 +482,7 @@ TEST_CASE("importance_scale defaults to 1.0, exact backward compat", "[importanc
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
     SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE> weights;
     weights.connections = dc;
-    CHECK(weights.importance_scale == Catch::Approx(1.0f));
+    CHECK(weights.get_importance_scale(0) == Catch::Approx(1.0f));
 }
 
 TEST_CASE("importance_scale=1.0 loses a true importance of 0.03 entirely (quantizes to 0)",
@@ -539,7 +539,7 @@ TEST_CASE("disldo_forward's Hebbian update actually uses importance_scale, not j
 
     SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
     weights.connections = dc;
-    weights.importance_scale = 0.01f;
+    weights.set_importance_scale_raw(0, 0.01f);   // fresh layer, nothing to preserve -- direct set is fine
     weights.out_degree.assign(1, S(0));
 
     // A single forward pass with a small contribution -- the resulting
@@ -552,7 +552,7 @@ TEST_CASE("disldo_forward's Hebbian update actually uses importance_scale, not j
 
     const float stored = ValueAccessor<FP4BiPacked>::get_imp(
         weights.connections.values, weights.connections.layout.elem_start[0]);
-    const float true_imp = stored * weights.importance_scale;
+    const float true_imp = stored * weights.get_importance_scale(0);
     CHECK(true_imp != 0.0f);   // survived, wouldn't have at scale=1.0 for a contribution this small
 }
 
@@ -572,13 +572,13 @@ TEST_CASE("rescale_importance preserves the true value across a scale change",
     // Start at scale=1.0 with a true importance of 2.0 (well within FP4's
     // range, no precision loss expected at this scale).
     ValueAccessor<FP4BiPacked>::set(weights.connections.values, 0, 1.0f, 2.0f);
-    REQUIRE(weights.importance_scale == Catch::Approx(1.0f));
+    REQUIRE(weights.get_importance_scale(0) == Catch::Approx(1.0f));
 
     weights.rescale_importance(0.5f);
-    CHECK(weights.importance_scale == Catch::Approx(0.5f));
+    CHECK(weights.get_importance_scale(0) == Catch::Approx(0.5f));
 
     const float stored_after = ValueAccessor<FP4BiPacked>::get_imp(weights.connections.values, 0);
-    const float true_after   = stored_after * weights.importance_scale;
+    const float true_after   = stored_after * weights.get_importance_scale(0);
     CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved, not corrupted
 }
 

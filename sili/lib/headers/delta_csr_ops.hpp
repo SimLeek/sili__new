@@ -234,14 +234,21 @@ void delta_csr_forward(
 
                     const SIZE_TYPE   out_idx = static_cast<SIZE_TYPE>(cursor.col());
                     const std::size_t wptr    = L.elem_start[in_idx] + elem_offset;
-                    const value_type  wval    = ValueAccessor<VALUES_TYPE>::get_w(dc.values, wptr);
-                    const value_type  contrib = wval * in_val;
+                    const value_type  wval_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, wptr);
+                    // Scale lookups per-synapse, not hoisted: in_idx (the row) varies
+                    // within this loop (work-offset iteration, not a simple per-row
+                    // loop) -- unlike disldo_forward/backward, can't fix it once per
+                    // outer iteration.
+                    const value_type  val_scale = weights.get_value_scale(in_idx);
+                    const value_type  wval      = wval_stored * val_scale;   // -> true units
+                    const value_type  contrib   = wval * in_val;
 
                     if (learning_rate != 0) {
+                        const value_type imp_scale  = weights.get_importance_scale(in_idx);
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
-                        value_type cur_imp = stored_imp * weights.importance_scale;   // -> true units
+                        value_type cur_imp = stored_imp * imp_scale;   // -> true units
                         cur_imp += contrib * learning_rate / (value_type(1) + std::abs(cur_imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval, cur_imp / weights.importance_scale);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval_stored, cur_imp / imp_scale);
                         // Read back post-quantization actual -- see disldo_forward's comment.
                         const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
                         local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
@@ -339,7 +346,8 @@ void delta_csr_backward_sparse_grad(
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_input_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type   learning_rate = 0.01f,
-    const int    num_cpus = 4)
+    const int    num_cpus = 4,
+    bool         lr_per_row_nnz = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
@@ -390,15 +398,26 @@ void delta_csr_backward_sparse_grad(
             const std::size_t n_row = L.row_nnz(r);
             if (n_row == 0) continue;
             const value_type in_val = input[b * n_inputs + r];
+            // lr_row/row_nnz -- see disldo_backward's comment for the full
+            // reasoning (a row with more synapses gets more simultaneous
+            // per-synapse nudges each pass, so dividing by row_nnz keeps
+            // the aggregate update comparable across rows of different
+            // connection counts).
+            const value_type effective_lr = lr_per_row_nnz
+                ? learning_rate / static_cast<value_type>(n_row)
+                : learning_rate;
 
             auto cursor = dc.row_cursor(r);
             SIZE_TYPE  og_ptr   = og_start;   // fresh per row -- each row does its own merge
             value_type dx_accum = value_type(0);
+            const value_type imp_scale = weights.get_importance_scale(r);
+            const value_type val_scale = weights.get_value_scale(r);
 
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
-                const value_type  w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type  w        = w_stored * val_scale;   // -> true units
 
                 // Merge-advance (both this row's columns and the gradient's
                 // columns are sorted ascending) -- O(row_nnz + grad_nnz)
@@ -416,16 +435,16 @@ void delta_csr_backward_sparse_grad(
                 if (learning_rate != value_type(0)) {
                     const value_type grad = dy_val * in_val;   // scales with true input value
                     const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    value_type imp = stored_imp * weights.importance_scale;   // -> true units
-                    imp -= grad * learning_rate;
-                    const value_type new_w = w + (-learning_rate * grad)
+                    value_type imp = stored_imp * imp_scale;   // -> true units
+                    imp -= grad * effective_lr;
+                    const value_type new_w = w + (-effective_lr * grad)
                                               / (value_type(1) + std::abs(imp));
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, imp / weights.importance_scale);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / val_scale, imp / imp_scale);
                     // Read back post-quantization actuals -- see disldo_forward's comment.
                     const value_type actual_w   = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_w += std::abs(static_cast<double>(actual_w));
-                    batch_sum_abs_old_w += std::abs(static_cast<double>(w));
+                    batch_sum_abs_old_w += std::abs(static_cast<double>(w_stored));
                     batch_sum_sq_new_w  += static_cast<double>(actual_w) * actual_w;
                     batch_sum_sq_old_w  += static_cast<double>(w) * w;
                     batch_max_new_w = std::max(batch_max_new_w, std::abs(actual_w));

@@ -428,7 +428,7 @@ struct SparseLinearWeightsDelta {
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
     std::vector<SIZE_TYPE>                            out_degree;
 
-    // Per-layer scale applied to STORED importance to get TRUE units before
+    // Per-ROW scale applied to STORED importance to get TRUE units before
     // any importance arithmetic (the Hebbian `1+|imp|` denominator, the
     // per-step decay). Motivation: FP4's smallest representable nonzero
     // magnitude is 0.5, but well-conditioned weight init scales as roughly
@@ -436,12 +436,46 @@ struct SparseLinearWeightsDelta {
     // Without a scale, importance would either underflow to zero
     // immediately (losing all regularization signal) or need artificially
     // inflated raw values that don't correspond to anything meaningful.
-    // Default 1.0 -- exact behavioral match to having no scale at all, so
-    // this is fully backward compatible with every existing test/caller.
-    // Read as: true_imp = stored_imp * importance_scale. Write as:
-    // stored_imp = true_imp / importance_scale. See rescale_importance()
+    //
+    // Per-row, not per-layer: different rows can have very different
+    // natural Hebbian-trace magnitude within the SAME layer (different
+    // fan-in/connection counts, especially once synaptogenesis has been
+    // running a while and row_nnz has diverged across rows) -- a single
+    // layer-wide scale can't serve a sparsely-connected row and a
+    // densely-connected row equally well at the same time.
+    //
+    // Stored as a lazily-sized vector, not pre-sized at construction (this
+    // struct doesn't know L.rows until .connections is populated) --
+    // get_importance_scale()/set_importance_scale() below handle sizing
+    // safely, defaulting any not-yet-touched row to 1.0 (exact match to
+    // having no scale at all, so this is fully backward compatible with
+    // every existing test/caller that never touches per-row scale at all).
+    //
+    // Read as: true_imp = stored_imp * scale. Write as: stored_imp =
+    // true_imp / scale. See rescale_importance()/rescale_importance_row()
     // below for changing this mid-training without losing accumulated data.
-    value_type importance_scale = value_type(1);
+    std::vector<value_type> importance_scale;
+
+    inline value_type get_importance_scale(std::size_t row) const {
+        return row < importance_scale.size() ? importance_scale[row] : value_type(1);
+    }
+    inline void set_importance_scale_raw(std::size_t row, value_type v) {
+        if (row >= importance_scale.size()) importance_scale.resize(row + 1, value_type(1));
+        importance_scale[row] = v;
+    }
+
+    // Same per-row design, for STORED weight values instead of importance.
+    // Same motivation, same lazy-sizing/default-1.0 pattern, same
+    // read/write convention (true_w = stored_w * scale).
+    std::vector<value_type> value_scale;
+
+    inline value_type get_value_scale(std::size_t row) const {
+        return row < value_scale.size() ? value_scale[row] : value_type(1);
+    }
+    inline void set_value_scale_raw(std::size_t row, value_type v) {
+        if (row >= value_scale.size()) value_scale.resize(row + 1, value_type(1));
+        value_scale[row] = v;
+    }
 
     // Running L1 / L2^2 / max|.| for STORED (quantized) importance and
     // weight values, maintained incrementally (O(1) per synapse touched,
@@ -582,29 +616,60 @@ private:
     }
 
 public:
-    // Change importance_scale mid-training without losing accumulated
-    // importance: re-reads every stored synapse's importance at the OLD
-    // scale into true units, re-encodes at the NEW scale, then updates
-    // importance_scale itself. Without this, just assigning a new scale
-    // directly would silently reinterpret all existing stored values as if
-    // they'd always been at the new scale -- corrupting every synapse's
-    // importance in one step, not just changing how future arithmetic
-    // treats it.
-    inline void rescale_importance(value_type new_scale) {
-        if (new_scale == importance_scale) return;
+    // Change ONE row's importance_scale mid-training without losing that
+    // row's accumulated importance: re-reads its stored importance at
+    // whatever scale it currently has (each row can have a DIFFERENT scale
+    // -- see get_importance_scale()) into true units, re-encodes at the
+    // new scale. Without this, just assigning a new scale directly would
+    // silently reinterpret existing stored values as if they'd always
+    // been at the new scale -- corrupting every synapse's importance in
+    // one step, not just changing how future arithmetic treats it.
+    inline void rescale_importance_row(std::size_t row, value_type new_scale) {
+        const value_type old_scale = get_importance_scale(row);
+        if (new_scale == old_scale) return;
         auto& dc = connections;
         auto& L  = dc.layout;
-        for (std::size_t r = 0; r < L.rows; ++r) {
-            const std::size_t n = L.row_nnz(r);
-            for (std::size_t e = 0; e < n; ++e) {
-                const std::size_t vb = L.elem_start[r] + e;
-                const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
-                const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                const value_type true_i   = stored_i * importance_scale;
-                ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, true_i / new_scale);
-            }
+        if (row >= L.rows) return;
+        const std::size_t n = L.row_nnz(row);
+        for (std::size_t e = 0; e < n; ++e) {
+            const std::size_t vb = L.elem_start[row] + e;
+            const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+            const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+            const value_type true_i   = stored_i * old_scale;
+            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, true_i / new_scale);
         }
-        importance_scale = new_scale;
+        set_importance_scale_raw(row, new_scale);
+    }
+
+    // Bulk convenience: set EVERY row to the same new_scale. Backward-
+    // compatible interface with the original per-layer-scalar design --
+    // callers that never think about per-row scale at all can keep using
+    // this exactly as before.
+    inline void rescale_importance(value_type new_scale) {
+        auto& L = connections.layout;
+        for (std::size_t r = 0; r < L.rows; ++r) rescale_importance_row(r, new_scale);
+    }
+
+    // Same pattern, for STORED weight values instead of importance.
+    inline void rescale_value_row(std::size_t row, value_type new_scale) {
+        const value_type old_scale = get_value_scale(row);
+        if (new_scale == old_scale) return;
+        auto& dc = connections;
+        auto& L  = dc.layout;
+        if (row >= L.rows) return;
+        const std::size_t n = L.row_nnz(row);
+        for (std::size_t e = 0; e < n; ++e) {
+            const std::size_t vb = L.elem_start[row] + e;
+            const value_type stored_w = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+            const value_type imp      = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+            const value_type true_w   = stored_w * old_scale;
+            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, true_w / new_scale, imp);
+        }
+        set_value_scale_raw(row, new_scale);
+    }
+    inline void rescale_value(value_type new_scale) {
+        auto& L = connections.layout;
+        for (std::size_t r = 0; r < L.rows; ++r) rescale_value_row(r, new_scale);
     }
 
     inline void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {
