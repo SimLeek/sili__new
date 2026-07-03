@@ -186,21 +186,22 @@ default.
 - **str_replace anchor-consumption.** When `old_str` is a prefix of existing
   text used purely as an insertion anchor ("put new content right before
   this line"), `new_str` must repeat that anchor text at ITS OWN end, or
-  the anchor gets silently deleted rather than preserved. Happened five
-  times this session now (twice in `sparse_struct.hpp`/`TODO.md` during
-  earlier edits, twice in `test_disldo_synaptogenesis.cpp`, once in this
-  very document while writing this note about it). Every instance was
-  caught by actually compiling/running tests afterward or by grepping for
-  the anchor text -- never by re-reading the diff alone; the failure mode
-  (an orphaned string literal + brace, or a document section landing in
-  the wrong place / duplicated) can read as plausible on a quick visual
-  pass. Mitigation: after any str_replace that inserts content adjacent to
-  existing text rather than cleanly replacing a whole block, grep for the
-  anchor text's distinctive substring afterward to confirm it's still
-  present exactly once, in the right place -- in addition to (not instead
-  of) compiling/running tests before considering an edit done. The
-  compile/test/grep step has caught this every time so far -- the goal is
-  reducing how often it's needed, not replacing it.
+  the anchor gets silently deleted rather than preserved. Has now happened
+  8 times this session; a specific pattern has emerged: it happens almost
+  exclusively when the anchor is a `TEST_CASE(` macro opening (or an
+  orphaned closing fragment like `"[tag][tag]") {`). Root cause: these
+  strings occur many times in the files, so a vague prefix match during
+  an edit that inserts content "just before this test" is especially likely
+  to match and consume the one instance being targeted. Mitigation:
+  NEVER use a TEST_CASE opening macro as the anchor. Instead, anchor on
+  the closing `}` of the NEW content being inserted (unique, since it was
+  just written) and replicate the next test's full header inside new_str.
+  Or anchor on a unique internal line from the next test's body. After any
+  str_replace that inserts content adjacent to existing code rather than
+  cleanly replacing a whole block, grep for the anchor text's distinctive
+  substring immediately to confirm it's still present exactly once, in the
+  right place -- in addition to (not instead of) compiling/running tests.
+  The compile/test/grep step has caught this every time so far.
 
 ## Old-directory file verdicts
 
