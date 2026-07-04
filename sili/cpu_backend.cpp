@@ -247,9 +247,18 @@ public:
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
+    // Budget established at construction -- used by load_weights to avoid
+    // allocating a smaller limit that would then be exceeded by the per-row
+    // headroom calculation inside delta_csr_from_absolute, which was
+    // corrupting the heap (load_weights was passing idx.size()*8+4096 which
+    // could be SMALLER than the actual bytes written by indices_buf.assign).
+    std::size_t    _idx_budget_bytes = 4096;
+    std::size_t    _val_budget_nnz   = 64;
 
     SparseLinearLayer(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus)
+        : num_cpus(cpus),
+          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
     {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
         std::vector<S> empty_idx;
@@ -508,9 +517,20 @@ public:
         std::vector<S> idx((S*)ib.ptr, (S*)ib.ptr + ib.size);
         std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
         std::vector<V> imp(w.size(), V(0));
+        // Use the budget already established at construction (max_indices_bytes
+        // / max_values_bytes on the existing layout), not a recalculated smaller
+        // one from idx.size(). Using idx.size()*8+4096 here created a new
+        // DeltaCSRWeights with a SMALLER limit than the layer was constructed
+        // with, causing dc.indices_buf.assign(L.byte_start[rows]) to write
+        // beyond max_indices_bytes and corrupt the heap.
+        // Use the budget established at construction (see _idx_budget_bytes
+        // comment above): idx.size()*8+4096 can be SMALLER than the actual
+        // bytes written by indices_buf.assign(L.byte_start[rows]) due to
+        // per-row headroom, corrupting the heap when a second layer existed.
+        const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
+        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
-            p, idx, w, imp, rows, cols,
-            idx.size() * 8 + 4096, idx.size() + 64);
+            p, idx, w, imp, rows, cols, idx_budget, val_budget);
         weights.recompute_stats();
     }
 
@@ -578,9 +598,13 @@ public:
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
+    std::size_t    _idx_budget_bytes = 4096;
+    std::size_t    _val_budget_nnz   = 64;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus)
+        : num_cpus(cpus),
+          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
     {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
         std::vector<S> empty_idx;
@@ -660,7 +684,8 @@ public:
         std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
         weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
             p, idx, w, imp_v, rows, cols,
-            idx.size() * 8 + 4096, idx.size() + 64);
+            std::max(_idx_budget_bytes, idx.size() * 8 + 4096),
+            std::max(_val_budget_nnz,   idx.size() + 64));
         weights.recompute_stats();
     }
 

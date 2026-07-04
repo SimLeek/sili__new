@@ -754,3 +754,37 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
     // conversation for why a >= here would have masked the nnz_delta bug).
     CHECK(weights.connections.nnz() > nnz_before);
 }
+
+TEST_CASE("load_weights on two separate SparseLinearWeightsDelta layers does not corrupt either",
+         "[load_weights][regression]") {
+    // Regression: load_weights was calling delta_csr_from_absolute with
+    // idx.size()*8+4096 as the index budget -- a value that can be SMALLER
+    // than the actual bytes written by indices_buf.assign(L.byte_start[rows])
+    // once per-row headroom is added. The resulting buffer write exceeded the
+    // budget, corrupting the heap of any OTHER layer allocated nearby.
+    // Symptom: l0.nnz reading as ~32000 after loading 2 weights, bad_alloc
+    // on the second load_weights. Fix: store the construction-time budget in
+    // _idx_budget_bytes / _val_budget_nnz and use max(budget, idx.size()*8+4096).
+    using S = int;
+    using COL_TYPE = uint32_t;
+
+    std::vector<S> ptrs = {0, 1, 2};
+    std::vector<float> vals = {0.5f, 1.5f};
+
+    // Two independently constructed layers loaded in sequence -- previously
+    // the second load_weights corrupted the first layer's nnz.
+    auto dc0 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, std::vector<S>{0, 2}, vals, std::vector<float>{0.0f, 0.0f},
+        std::size_t(2), std::size_t(3), std::size_t(4096), std::size_t(256));
+    auto dc1 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, std::vector<S>{1, 0}, vals, std::vector<float>{0.0f, 0.0f},
+        std::size_t(2), std::size_t(3), std::size_t(4096), std::size_t(256));
+
+    // Both should have exactly 2 nonzeros, NOT ~32000.
+    CHECK(static_cast<int>(dc0.nnz()) == 2);
+    CHECK(static_cast<int>(dc1.nnz()) == 2);
+
+    // And a second delta_csr_from_absolute should not corrupt the first.
+    CHECK(static_cast<int>(dc0.layout.total_nnz) == 2);
+    CHECK(static_cast<int>(dc1.layout.total_nnz) == 2);
+}

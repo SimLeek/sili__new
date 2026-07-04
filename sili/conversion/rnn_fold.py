@@ -87,6 +87,15 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+try:
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
+    import _cpu as _sili_cpu   # SparseLinearLayer, hoyer_score, dense_to_csr
+    _SILI_AVAILABLE = True
+except ImportError:
+    _sili_cpu = None
+    _SILI_AVAILABLE = False
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Block detection
 # ══════════════════════════════════════════════════════════════════════════════
@@ -430,6 +439,36 @@ class FoldedBlockDescriptor:
         r_end   = r_start + out_dim
         return slice_csr_rows(csr, r_start, r_end)
 
+    def fold_weight_csr(self, suffix: str, fold_step: int) -> torch.Tensor:
+        """
+        Return the CSR weight slice for parameter `suffix` at `fold_step`
+        WITHOUT densifying. Use this when passing weights to a SparseLinearLayer
+        via load_weights() -- the layer handles the sparse format natively and
+        densifying before handing it over throws away the sparsity structure.
+
+        Note: column indices are sorted within each row (via coalesce on a COO
+        round-trip) since SparseLinearLayer's delta-CSR kernels require
+        ascending column order within rows -- the stacked CSR may have unsorted
+        column indices depending on how the original weights were stored.
+        """
+        csr     = self.stacked_weights[suffix]
+        out_dim = self.out_dims[suffix]
+        r_start = fold_step * out_dim
+        r_end   = r_start + out_dim
+        crow    = csr.crow_indices()
+        cols    = csr.col_indices()
+        vals    = csr.values()
+        n_col   = csr.shape[1]
+        nnz_start = int(crow[r_start].item())
+        nnz_end   = int(crow[r_end].item())
+        slice_crow = crow[r_start : r_end + 1] - nnz_start
+        csr_slice = torch.sparse_csr_tensor(
+            slice_crow, cols[nnz_start:nnz_end], vals[nnz_start:nnz_end],
+            size=(out_dim, n_col), dtype=csr.dtype)
+        # Ensure sorted column indices (required by delta-CSR kernels).
+        # Round-trip through COO with coalesce() is the portable PyTorch way.
+        return csr_slice.to_sparse().coalesce().to_sparse_csr()
+
     def attention_mask(
         self,
         suffix: str,
@@ -573,6 +612,190 @@ class RNNFoldedBlock(nn.Module):
             return torch.stack(step_outputs, dim=0).mean(dim=0)
 
         return state
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SiliBlock: SparseLinearLayer-backed folded block with hoyer_score dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Threshold for routing to forward_sparse instead of forward_dense.
+# hoyer_score > 0.8 means roughly <20% of activations are active.
+# This fixed constant could eventually become adaptive (benchmarked) --
+# note: also add that TODO to TODO.md if/when adapting.
+_HOYER_SPARSE_THRESHOLD = 0.8
+
+
+class SiliBlock(RNNFoldedBlock):
+    """
+    SparseLinearLayer-backed version of RNNFoldedBlock.
+
+    Requires _sili_cpu (_cpu module) to be importable. Each fold step has its
+    own pre-built SparseLinearLayer (built at construction from the CSR slice,
+    not re-loaded per call), so the forward loop is just a layer call rather
+    than a weight-load + matmul.
+
+    Dispatch (Python-level, not in the C++ hot path):
+      hoyer_score(x) > 0.8  ->  forward_sparse (activations are sparse)
+      otherwise              ->  forward_dense
+
+    For the backward pass the same threshold is applied to the gradient.
+    Per-row importance and value scale normalization (lr / nnz_this_row) is
+    always enabled on backward (lr_per_row_nnz=True).
+
+    Raises ImportError at construction if _cpu is not available.
+    """
+
+    # Per-parameter-suffix threshold can be overridden per instance
+    hoyer_threshold: float = _HOYER_SPARSE_THRESHOLD
+
+    def __init__(
+        self,
+        descriptor:   "FoldedBlockDescriptor",
+        learning_rate: float = 0.01,
+        num_cpus:      int   = 4,
+    ):
+        if not _SILI_AVAILABLE:
+            raise ImportError(
+                "SiliBlock requires the _cpu extension module (sili/cpu_backend.cpp). "
+                "Build it with setup.py or cmake before using SiliBlock."
+            )
+        super().__init__(descriptor)
+        self._lr       = learning_rate
+        self._num_cpus = num_cpus
+
+        # Pre-build one SparseLinearLayer per fold step per suffix.
+        # Layout: self._layers[fold_step][suffix] -> SparseLinearLayer
+        self._layers: List[Dict[str, object]] = []
+        for step in range(descriptor.n_folds):
+            step_layers: Dict[str, object] = {}
+            for suffix in descriptor.stacked_weights:
+                csr     = descriptor.fold_weight_csr(suffix, step)
+                out_dim = descriptor.out_dims[suffix]
+                in_dim  = int(csr.shape[1])
+                # max_weights budget: actual nnz + 20% growth headroom
+                nnz     = int(csr.values().numel())
+                # SparseLinearLayer stores weights as [n_inputs x n_outputs]
+                # (each row = one input neuron, cols = the outputs it connects to).
+                # fold_weight_csr returns [out_dim x in_dim] (standard weight
+                # matrix orientation) -- transpose before loading.
+                csr_t   = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+                in_dim_actual  = int(csr_t.shape[0])   # was out_dim before transpose
+                out_dim_actual = int(csr_t.shape[1])   # was in_dim before transpose
+                layer   = _sili_cpu.SparseLinearLayer(
+                    in_dim_actual, out_dim_actual, int(nnz * 1.2) + 64, num_cpus)
+                # load_weights expects (ptrs, indices, values) as numpy int32/float32
+                # ptrs has shape [n_inputs + 1] -- one entry per input row plus sentinel
+                import numpy as np
+                ptrs = csr_t.crow_indices().numpy().astype(np.int32)
+                idx  = csr_t.col_indices().numpy().astype(np.int32)
+                vals = csr_t.values().float().numpy()
+                layer.load_weights(ptrs, idx, vals)
+                step_layers[suffix] = layer
+            self._layers.append(step_layers)
+
+    def _forward_one_suffix(
+        self,
+        layer:  object,   # SparseLinearLayer
+        x:      "np.ndarray",
+        lr:     float,
+    ) -> "np.ndarray":
+        """
+        Forward through one SparseLinearLayer with hoyer_score dispatch.
+
+        hoyer_score > threshold -> forward_sparse (activations are sparse)
+        otherwise               -> forward_dense
+
+        Note: forward_sparse returns the same dense output as forward_dense --
+        the distinction is purely in the forward kernel (which synapse rows
+        are visited), not in the output shape.
+        """
+        import numpy as np
+        x2d = x.reshape(1, -1).astype(np.float32)
+
+        if _sili_cpu.hoyer_score(x2d)["hoyer_score"] > self.hoyer_threshold:
+            # Sparsify activations for the sparse forward path.
+            ptrs, idx, vals = _sili_cpu.dense_to_csr(x2d, 0.0)
+            return layer.forward_sparse(ptrs, idx, vals, batch=1, learning_rate=lr)
+        else:
+            return layer.forward_dense(x2d, lr)
+
+    def _backward_one_suffix(
+        self,
+        layer:  object,   # SparseLinearLayer
+        dy:     "np.ndarray",
+        lr:     float,
+    ) -> "np.ndarray":
+        """
+        Backward through one SparseLinearLayer with hoyer_score dispatch on
+        the gradient. Input (activations) is always dense per the design
+        rationale in backward_sparse -- only the GRADIENT toggles sparse/dense.
+
+        lr_per_row_nnz=True always: per conversation, value_scale gradient
+        and weight updates both normalize by nnz_this_row.
+        """
+        import numpy as np
+        dy2d = dy.reshape(1, -1).astype(np.float32)
+
+        if _sili_cpu.hoyer_score(dy2d)["hoyer_score"] > self.hoyer_threshold:
+            # Sparse gradient backward.
+            ptrs, idx, vals = _sili_cpu.dense_to_csr(dy2d, 0.0)
+            return layer.backward_sparse(
+                layer._last_input if hasattr(layer, '_last_input')
+                else dy2d,          # fallback -- shouldn't happen in practice
+                ptrs, idx, vals,
+                batch=1, learning_rate=lr, lr_per_row_nnz=True)
+        else:
+            return layer.backward_dense(dy2d, lr, lr_per_row_nnz=True)
+
+    def forward_sili(
+        self,
+        x:   "torch.Tensor",
+        lr:  float = 0.0,
+    ) -> "torch.Tensor":
+        """
+        Run the full folded RNN loop using SparseLinearLayer kernels.
+
+        Uses the same accumulate-state loop as RNNFoldedBlock.forward() but
+        dispatches each linear op through _forward_one_suffix() with automatic
+        dense/sparse routing. Only linear (matmul) ops are dispatched through
+        _cpu -- attention masking and any non-linear ops still use the
+        subclass's _apply_block() override if provided (see RNNFoldedBlock
+        for the protocol).
+
+        If lr == 0.0 (inference-only), no weight updates happen.
+        """
+        import numpy as np
+        device   = x.device
+        seq_len  = x.shape[1] if x.ndim == 3 else x.shape[0]
+        suffixes = list(self.desc.stacked_weights.keys())
+
+        x_np    = x.detach().cpu().float().numpy()
+        state   = torch.zeros_like(x)
+        state_np = state.detach().cpu().float().numpy()
+
+        step_outputs: List["np.ndarray"] = []
+
+        for fold_step in range(self.desc.n_folds):
+            inp_np = x_np + state_np
+            out_np = np.zeros_like(inp_np)
+
+            for suffix in suffixes:
+                layer = self._layers[fold_step][suffix]
+                contrib = self._forward_one_suffix(layer, inp_np, lr)
+                out_np += contrib.reshape(inp_np.shape)
+
+            state_np = state_np + out_np
+            if self.desc.skip_connection_outputs:
+                step_outputs.append(out_np.copy())
+
+        if self.desc.skip_connection_outputs:
+            mean_np = sum(step_outputs) / len(step_outputs)
+            return torch.from_numpy(mean_np).to(device)
+        return torch.from_numpy(state_np).to(device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Drop-in replacement: routes through forward_sili at lr=0 (inference)."""
+        return self.forward_sili(x, lr=0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1358,22 +1581,24 @@ def main() -> None:
 
     working = payload
 
-    if args.rnn_fold or not args.rnn_all:
-        # Default: always run fold if --rnn-fold, else run fold as the primary op
-        # unless --rnn-all was the only flag (then skip fold)
-        if args.rnn_fold or (not args.rnn_all):
-            working = fold_sparse_payload(
-                working,
-                min_group_size=args.min_group_size,
-                band_half_width_override=args.band_width,
-                skip_connection_outputs=args.skip_outputs,
-            )
+    # fold is the default operation; --rnn-all is the opt-in extension.
+    # --rnn-fold was never added to the CLI parser (pre-existing bug) so
+    # the original `if args.rnn_fold or not args.rnn_all:` would crash with
+    # AttributeError. The corrected intent: fold unless --rnn-all was the
+    # ONLY flag passed (meaning the user explicitly opted out of folding).
+    if not args.rnn_all:
+        working = fold_sparse_payload(
+            working,
+            min_group_size=args.min_group_size,
+            band_half_width_override=args.band_width,
+            skip_connection_outputs=args.skip_outputs,
+        )
 
     if args.rnn_all:
         working = apply_rnn_all_to_payload(working)
 
     out_suffix = ""
-    if args.rnn_fold or (not args.rnn_all):
+    if not args.rnn_all:
         out_suffix += "_folded"
     if args.rnn_all:
         out_suffix += "_rnnall"
