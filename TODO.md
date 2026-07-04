@@ -154,3 +154,45 @@ see refactoring_todo.md for the full verdict list). What's left:
   can be tested without real hardware via glsl->spir-v->c++ transpilation
   or a software implementation like llvmpipe -- relevant for verifying
   whatever gets generated.
+
+## Training target: Mandelbrot exploration via RL curiosity
+
+After backprop and synaptogenesis are wired up end-to-end, a good first
+training target is 2D complex-plane fractal navigation:
+
+- Model outputs: movement ops (pan left/right/up/down, zoom in/out)
+- Reward signal: compression complexity of the current viewport
+  (e.g. zlib ratio of the N x N escape-time matrix -- high complexity
+  = high information density = interesting region near the boundary)
+- The energy system already acts as implicit curiosity at the weight level
+  (unused neurons get pruned); the compression metric adds curiosity at
+  the task level
+- Token vocabulary size is flexible: from raw (x, y) float pairs that
+  feed directly into input neurons (no encoder/decoder), to discretised
+  coordinate tokens with learned embeddings
+- Self-similar structure at different zoom levels exercises the RNN state
+  explicitly -- the state needs to track "where we are in the scan"
+- The sparse structure of the Mandelbrot set (most of the complex plane
+  escapes quickly; complexity lives at the boundary) naturally exercises
+  sparsity enforcement: neurons should activate mainly for boundary inputs
+
+## Training target: Mandelbrot exploration via RL curiosity
+
+After backprop and synaptogenesis are wired up end-to-end, a good first
+training target is 2D complex-plane fractal navigation:
+
+- Model outputs: movement ops (pan left/right/up/down, zoom in/out)
+- Reward signal: compression complexity of the current viewport
+  (e.g. zlib ratio of the N x N escape-time matrix -- high complexity
+  = high information density = interesting region near the boundary)
+- The energy system already acts as implicit curiosity at the weight level
+  (unused neurons get pruned); the compression metric adds curiosity at
+  the task level
+- Token vocabulary size is flexible: from raw (x, y) float pairs that
+  feed directly into input neurons (no encoder/decoder), to discretised
+  coordinate tokens with learned embeddings
+- Self-similar structure at different zoom levels exercises the RNN state
+  explicitly -- the state needs to track "where we are in the scan"
+- The sparse structure of the Mandelbrot set (most of the complex plane
+  escapes quickly; complexity lives at the boundary) naturally exercises
+  sparsity enforcement: neurons should activate mainly for boundary inputs
