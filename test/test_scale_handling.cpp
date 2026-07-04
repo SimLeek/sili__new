@@ -484,42 +484,69 @@ TEST_CASE("set_value_scale_raw: pre-scaled load + raw scale set round-trips corr
     CHECK(stored_unscaled == Catch::Approx(0.0f).margin(1e-6f));  // lost entirely
 }
 
-TEST_CASE("backward fold-sum broadcast: dy tiles correctly to n_folds slots",
+TEST_CASE("disldo_backward with broadcast dy_raw: dx matches finite-difference gradient through fold-sum",
          "[siliblock][backward][regression]") {
-    // Forward reshape+sum: raw[batch, n_folds*out_dim]
-    //   -> reshape[batch, n_folds, out_dim] -> sum(axis=1) -> [batch, out_dim]
+    // Tests the actual kernel path used by backward_sili:
     //
-    // Backward: gradient of a sum is 1 to each summand, so
-    //   dy[batch, out_dim] -> tile -> [batch, n_folds, out_dim]
-    //   -> flatten -> [batch, n_folds*out_dim]
-    //   meaning dy_raw[fold * out_dim + i] == dy[i] for ALL fold values.
+    //   forward_sili:  x[in_dim] -> layer -> raw[n_folds*out_dim]
+    //                             -> reshape+sum -> out[out_dim]
+    //   backward_sili: dy[out_dim]
+    //                  -> broadcast dy_raw[fold*out_dim + i] = dy[i] for all fold
+    //                  -> disldo_backward(dy_raw) -> dx[in_dim]
     //
-    // Verified by constructing a simple case and checking the broadcast manually.
+    // Verifies the KERNEL gives correct dx, not just that tiling math works.
+    // 2 inputs, n_folds=2, out_dim=2. FP4-exact weights (3.0, 1.5, 6.0, 0.5).
+    using S = int;
+    using COL_TYPE = uint32_t;
 
-    const int n_folds = 3, out_dim = 2, batch = 1;
-    std::vector<float> dy = {1.5f, -0.5f};   // [batch=1, out_dim=2]
+    std::vector<S> ptrs = {0, 2, 4};
+    std::vector<S> idx  = {0, 2, 1, 3};
+    std::vector<float> w   = {3.0f, 1.5f, 6.0f, 0.5f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(2), std::size_t(4),
+        std::size_t(4096), std::size_t(256));
 
-    // Replicate via the tile formula: dy_raw[fold*out_dim + i] = dy[i]
-    std::vector<float> dy_raw(n_folds * out_dim);
-    for (int fold = 0; fold < n_folds; ++fold)
-        for (int i = 0; i < out_dim; ++i)
-            dy_raw[fold * out_dim + i] = dy[i];
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(4, S(0));
 
-    // Verify: every fold slot is identical to dy
-    for (int fold = 0; fold < n_folds; ++fold) {
-        CHECK(dy_raw[fold * out_dim + 0] == Catch::Approx(1.5f));
-        CHECK(dy_raw[fold * out_dim + 1] == Catch::Approx(-0.5f));
+    std::vector<float> x_in = {1.0f, 2.0f};
+
+    auto run_forward = [&](const std::vector<float>& x, std::vector<float>& out) {
+        std::fill(out.begin(), out.end(), 0.0f);
+        auto& L = dc.layout;
+        for (std::size_t r = 0; r < 2; ++r) {
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < L.row_nnz(r); ++e) {
+                COL_TYPE col = cursor.advance();
+                float wv = ValueAccessor<FP4BiPacked>::get_w(dc.values, L.elem_start[r]+e);
+                out[col] += wv * x[r];
+            }
+        }
+    };
+
+    // dy = [1, 1]; broadcast: dy_raw = [1, 1, 1, 1]
+    std::vector<float> dy_raw_in = {1.0f, 1.0f, 1.0f, 1.0f};
+    std::vector<float> dx(2, 0.0f), in_acc(2, 0.0f), gr_acc(4, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        x_in.data(), S(1), S(2), dy_raw_in.data(),
+        weights, dx.data(),
+        in_acc.data(), gr_acc.data(),
+        0.0f, 1);
+
+    // Analytic: dx[0] = W[0,0]*1 + W[0,2]*1 = 3.0 + 1.5 = 4.5
+    //           dx[1] = W[1,1]*1 + W[1,3]*1 = 6.0 + 0.5 = 6.5
+    CHECK(dx[0] == Catch::Approx(4.5f).margin(0.01f));
+    CHECK(dx[1] == Catch::Approx(6.5f).margin(0.01f));
+
+    // Finite-difference check: L = out[0]+out[2] + out[1]+out[3] (fold-sum)
+    const float eps = 1e-2f;
+    for (int i = 0; i < 2; ++i) {
+        std::vector<float> xp = x_in, xm = x_in, op(4), om(4);
+        xp[i] += eps; xm[i] -= eps;
+        run_forward(xp, op); run_forward(xm, om);
+        float num = ((op[0]+op[2]+op[1]+op[3]) - (om[0]+om[2]+om[1]+om[3])) / (2.0f*eps);
+        CHECK(dx[i] == Catch::Approx(num).margin(0.05f));
     }
-
-    // Cross-check: if we do the backward fold-sum on dy_raw (reshape->sum),
-    // we should recover dy.
-    std::vector<float> recovered(out_dim, 0.0f);
-    for (int fold = 0; fold < n_folds; ++fold)
-        for (int i = 0; i < out_dim; ++i)
-            recovered[i] += dy_raw[fold * out_dim + i];
-    // Each position sums n_folds copies of dy[i], NOT equal to dy[i].
-    // This confirms the broadcast is NOT a split (not dy/n_folds each) but
-    // a true broadcast -- each fold gets the whole gradient.
-    CHECK(recovered[0] == Catch::Approx(dy[0] * n_folds).margin(1e-5f));
-    CHECK(recovered[1] == Catch::Approx(dy[1] * n_folds).margin(1e-5f));
 }
