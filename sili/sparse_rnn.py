@@ -282,7 +282,9 @@ class FoldedLayer(Module):
                              override (e.g. worst-case: max_row_weights * 5).
         """
         import numpy as np
-        import torch as _torch
+        import torch as _torch   # local import: conversion step only -- sili does
+        # the compute. torch is used once here to densify+transpose the stacked
+        # CSR weights, then discarded. Do not use torch in forward/backward paths.
         import warnings; warnings.filterwarnings("ignore")
         _FP4_MAX = 6.0
 

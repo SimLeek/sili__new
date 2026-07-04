@@ -267,6 +267,13 @@ this changes the calculus on two previously-backburnered items:
   pruning's job is just keeping the work-pointer set clean/valid, not
   searching. TODO.md entry needs rewriting to this design, not the
   original one.
+
+  **GPU-specific -- defer until GPU kernel work.** The CPU path already has
+  `equalizer_step` for memory redistribution and OpenMP for parallelism; the
+  work-pointer set gives near-exact equal-size work (any workload is at most 1
+  off from others) which matters most for GPU warp/wavefront scheduling. When
+  GPU kernel work starts: implement the two pointer sets in the delta-CSR
+  layout, maintain them in synaptogenesis/pruning.
 - **`make_weights`/`make_weights_v`'s bug may not need fixing at all.**
   Clarified: the V/high-precision layers should NOT use FP4BiPacked --
   they should use ULEB128 delta encoding (i.e. genuinely

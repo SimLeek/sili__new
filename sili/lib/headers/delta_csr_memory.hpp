@@ -690,13 +690,16 @@ bool delta_csr_synap_row_step(
         if (!delta_csr_row_insert_col(dc, row, col, value_type(0), probe_scores[i])) {
             const std::size_t used  = dc.layout.byte_end[row] - dc.layout.byte_start[row];
             const std::size_t alloc = dc.layout.row_alloc_bytes(row);
+            // Include the probe index so callers can infer the exact split:
+            // probes[0..i-1] were successfully inserted, probes[i..n-1] remain.
             throw std::runtime_error(
                 "delta_csr_synap_row_step: row " + std::to_string(row) +
-                " ran out of blank space during insertion (used " +
-                std::to_string(used) + " / " + std::to_string(alloc) +
-                " bytes). Call equalizer_step() to redistribute space "
-                "from adjacent rows before retrying, or reduce "
-                "max_row_weights / raise importance_cutoff to prune.");
+                " ran out of blank space at probe_index=" + std::to_string(i) +
+                " col=" + std::to_string(col) +
+                " (used " + std::to_string(used) + " / " + std::to_string(alloc) +
+                " bytes, " + std::to_string(probe_cols.size() - i) + " insertions skipped)."
+                " Call equalizer_step() to redistribute space from adjacent rows"
+                " before retrying, or reduce max_row_weights / raise importance_cutoff.");
         }
         if (!weights.out_degree.empty())
             ++weights.out_degree[col];
