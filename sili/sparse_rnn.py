@@ -259,15 +259,30 @@ class FoldedLayer(Module):
 
     @classmethod
     def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
-                        num_cpus: int = 4) -> "FoldedLayer":
+                        num_cpus: int = 4,
+                        max_row_weights: int = 0,
+                        bytes_per_row: int = 0) -> "FoldedLayer":
         """
-        Build a FoldedLayer from a FoldedBlockDescriptor (produced by rnn_fold.py).
+        Build a FoldedLayer from a FoldedBlockDescriptor.
 
-        Uses torch once to densify and transpose the stacked CSR weights, then
-        discards it.  The returned FoldedLayer has no further torch dependency.
+        args:
+          max_row_weights -- peak connections per row for synaptogenesis.
+                             0 = n_out (the absolute ceiling). For real models,
+                             pass your expected synaptogenesis peak (e.g. 100
+                             for 2.4% density in a 4096-dim layer) to avoid
+                             allocating space for connections you'll never use.
+          bytes_per_row   -- index byte budget per row.
+                             0 = compute from max_row_weights and the typical
+                             ULEB128 cost for this layer's column range:
+                               typical_bytes = ceil(log2(n_out) / 7)
+                             For n_out <= 128: 1 byte/connection.
+                             For n_out <= 16384: 2 bytes/connection.
+                             The default adds a small margin for net growth per
+                             synaptogenesis step. Pass an explicit value to
+                             override (e.g. worst-case: max_row_weights * 5).
         """
         import numpy as np
-        import torch as _torch   # local import: conversion step only
+        import torch as _torch
         import warnings; warnings.filterwarnings("ignore")
         _FP4_MAX = 6.0
 
@@ -286,7 +301,6 @@ class FoldedLayer(Module):
             # ceiling for any max_row_weights value.
             budget = n_in * n_out
             layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
-
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
             idx  = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
@@ -320,15 +334,23 @@ class FoldedLayer(Module):
             for r in range(n_in):
                 layer.set_importance_scale_raw(r, imp_scale)
 
-            # One-time construction setup: give every row at least n_out
-            # elements of reserved space so grow-back after prune never runs
-            # out of room. This is called ONCE here, not at runtime.
-            # After this call the pool size is fixed; the staggered
-            # equalizer_step() in synaptogenesis redistributes within that
-            # fixed pool each cycle.
-            # n_out = n_folds * out_dim is the absolute ceiling for
-            # connections per input neuron.
-            layer.equalize_to_capacity(n_out)
+            # Choose capacity targets for equalize_to_capacity.
+            # max_row_weights defaults to n_out (absolute ceiling).
+            mrw = max_row_weights if max_row_weights > 0 else n_out
+
+            # bytes_per_row: use the ULEB128 cost for this layer's column range
+            # plus a small margin (~4 bytes) for net growth per step.
+            # ceil(bits_needed / 7) gives bytes per delta for column indices 0..n_out.
+            # This is the TYPICAL cost, not worst-case (uleb128_max=5).
+            # Pass bytes_per_row explicitly to override (e.g. worst-case: mrw*5).
+            if bytes_per_row > 0:
+                bpr = bytes_per_row
+            else:
+                bits = max(1, n_out - 1).bit_length()
+                typ  = (bits + 6) // 7    # ceil(bits / 7)
+                bpr  = mrw * typ + 4       # +4 bytes margin per step
+
+            layer.equalize_to_capacity(mrw, bpr)
 
             layers[suffix] = layer
 
@@ -485,6 +507,59 @@ class FoldedLayer(Module):
             }
         return out
 
+
+
+class LayerMemoryState:
+    """
+    Python-side tracker for a SparseLinearLayer's memory equalization cursor.
+
+    The C++ equalizer_step() advances an internal row cursor each call; this
+    class mirrors that cursor in Python and provides memory statistics. Use
+    it to integrate equalization into training loops with visibility.
+
+    Normal training loop:
+        mem = LayerMemoryState(sparse_layer)
+        for step in range(n_steps):
+            out = layer(x); loss.backward()
+            synap_schedule.step()
+            mem.step()            # one equalization step per training step
+
+    Synaptogenesis on a row that has no blank space will throw. The throw
+    signals that equalization hasn't caught up yet. Calling mem.step() once
+    per training step ensures blank space is continuously redistributed as
+    synaptogenesis adds and removes connections.
+    """
+
+    def __init__(self, layer):
+        self._layer  = layer   # SparseLinearLayer (_cpu object)
+        self._cursor = 0       # mirrors C++ _equalize_row
+        self._calls  = 0
+
+    def step(self) -> None:
+        """One equalization step (advance cursor by one row)."""
+        self._layer.equalizer_step()
+        self._cursor = (self._cursor + 1) % max(1, self._layer.n_inputs)
+        self._calls += 1
+
+    @property
+    def cursor_row(self) -> int:
+        """Which row will be equalized next."""
+        return self._cursor
+
+    @property
+    def calls(self) -> int:
+        """Total equalization steps taken."""
+        return self._calls
+
+    @property
+    def cycles(self) -> float:
+        """Full equalization cycles completed (n_inputs steps = 1 cycle)."""
+        n = max(1, self._layer.n_inputs)
+        return self._calls / n
+
+    @property
+    def nnz(self) -> int:
+        return self._layer.nnz
 
 
 class SynaptogenesisSchedule:

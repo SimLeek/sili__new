@@ -16,6 +16,9 @@
 // directly above the function it documents.
 
 #include "delta_csr_types.hpp"
+#include <unordered_set>
+#include <numeric>
+#include <algorithm>
 
 // ── Build from / convert to absolute CSR ─────────────────────────────────────
 
@@ -364,9 +367,210 @@ void delta_csr_row_remove(
     delta_csr_row_rebuild(dc, row, cols, weights, importance);
 }
 
-// ── Incremental synaptogenesis step ──────────────────────────────────────────
 
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+// ── In-place insert/remove for delta-encoded rows ────────────────────────────
+//
+// These replace the old "read all, rebuild from scratch" pattern in
+// delta_csr_synap_row_step. The key property: removing a connection shrinks
+// the row's byte count by (delta_A_bytes + delta_B_bytes - delta_AB_bytes),
+// which is at least 0 and usually positive. Inserting a connection expands by
+// delta_new_bytes + delta_updated_next_bytes - delta_old_next_bytes, which for
+// typical small-delta layers (column indices 0..n_out where n_out <= 16384) is
+// 1-2 bytes. Doing removals first then insertions means the freed bytes from
+// removals are immediately available for insertions -- synaptogenesis with
+// equal add/remove counts works with near-zero headroom.
+
+// Remove the connection at column `target_col` from row `row` in-place.
+// Returns false if target_col is not found (no-op).
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+bool delta_csr_row_remove_col(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+    std::size_t row,
+    COL_TYPE target_col)
+{
+    auto& L   = dc.layout;
+    auto& buf = dc.indices_buf;
+    const std::size_t n = L.row_nnz(row);
+    if (n == 0) return false;
+
+    std::size_t byte_pos  = L.byte_start[row];
+    std::size_t elem_pos  = L.elem_start[row];
+    COL_TYPE    prev_col  = 0;
+
+    for (std::size_t e = 0; e < n; ++e) {
+        std::size_t delta_len = 0;
+        const COL_TYPE delta  = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, delta_len);
+        const COL_TYPE col    = prev_col + delta;
+
+        if (col == target_col) {
+            const std::size_t next_byte_pos = byte_pos + delta_len;
+
+            if (e + 1 < n) {
+                // Merge this delta with the next one: next_col - prev_col
+                std::size_t next_delta_len = 0;
+                const COL_TYPE next_delta  =
+                    uleb128_decode<COL_TYPE>(buf.data() + next_byte_pos, next_delta_len);
+                const COL_TYPE merged_delta = delta + next_delta;
+
+                uint8_t merged_buf[uleb128_max_bytes<COL_TYPE>()];
+                const std::size_t merged_len = uleb128_encode<COL_TYPE>(merged_delta, merged_buf);
+
+                // Write merged delta at byte_pos
+                std::memcpy(buf.data() + byte_pos, merged_buf, merged_len);
+
+                // Shift the remainder of the row left to fill the freed gap
+                const std::size_t shift_from = next_byte_pos + next_delta_len;
+                const std::size_t shift_len  = L.byte_end[row] - shift_from;
+                const std::size_t freed      = delta_len + next_delta_len - merged_len;
+                if (shift_len > 0)
+                    std::memmove(buf.data() + byte_pos + merged_len,
+                                 buf.data() + shift_from, shift_len);
+                L.byte_end[row] -= freed;
+            } else {
+                // Last connection: just remove its delta bytes
+                L.byte_end[row] -= delta_len;
+            }
+
+            // Shift value elements left to fill the removed slot
+            const std::size_t row_end = L.elem_end[row];
+            if (elem_pos + 1 < row_end)
+                ValueAccessor<VALUES_TYPE>::move(dc.values,
+                    elem_pos, elem_pos + 1, row_end - elem_pos - 1);
+            L.elem_end[row]--;
+            L.total_nnz--;
+            return true;
+        }
+
+        prev_col  = col;
+        byte_pos += delta_len;
+        elem_pos++;
+    }
+    return false; // not found
+}
+
+// Insert a new connection at `new_col` in row `row` in sorted order, in-place.
+// Returns true on success, false if the row has insufficient blank space.
+// On false: the row's blank space is exhausted. Call equalizer_step() to
+// redistribute space from adjacent rows, then retry. Callers must not
+// silently skip on false -- check the return value and handle it.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+bool delta_csr_row_insert_col(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+    std::size_t row,
+    COL_TYPE    new_col,
+    typename ValueAccessor<VALUES_TYPE>::value_type weight,
+    typename ValueAccessor<VALUES_TYPE>::value_type importance)
+{
+    auto& L   = dc.layout;
+    auto& buf = dc.indices_buf;
+    const std::size_t n = L.row_nnz(row);
+
+    // Walk to find insertion point (first existing column > new_col)
+    std::size_t byte_pos      = L.byte_start[row];
+    std::size_t elem_pos      = L.elem_start[row];
+    COL_TYPE    prev_col      = 0;
+    std::size_t ins_byte_pos  = L.byte_end[row]; // default: append after last
+    std::size_t ins_elem_pos  = L.elem_end[row];
+    bool        has_next      = false;
+    COL_TYPE    next_col      = 0;
+    std::size_t next_dlen     = 0;
+
+    for (std::size_t e = 0; e < n; ++e) {
+        std::size_t dlen = 0;
+        const COL_TYPE delta = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, dlen);
+        const COL_TYPE col   = prev_col + delta;
+        if (col == new_col) return false; // duplicate, skip
+        if (col > new_col) {
+            ins_byte_pos = byte_pos;
+            ins_elem_pos = elem_pos;
+            has_next     = true;
+            next_col     = col;
+            next_dlen    = dlen;
+            break;
+        }
+        prev_col  = col;
+        byte_pos += dlen;
+        elem_pos++;
+    }
+
+    // Bytes for the new delta and (if inserting before an existing) the updated
+    // next delta. Net byte change for the index buffer.
+    uint8_t new_d_buf[uleb128_max_bytes<COL_TYPE>()];
+    const std::size_t new_d_len = uleb128_encode<COL_TYPE>(new_col - prev_col, new_d_buf);
+
+    uint8_t upd_d_buf[uleb128_max_bytes<COL_TYPE>()];
+    std::size_t upd_d_len = 0;
+    if (has_next)
+        upd_d_len = uleb128_encode<COL_TYPE>(next_col - new_col, upd_d_buf);
+
+    const std::ptrdiff_t idx_delta =
+        static_cast<std::ptrdiff_t>(new_d_len + upd_d_len) -
+        static_cast<std::ptrdiff_t>(next_dlen);
+
+    // Check headroom (byte and element)
+    const std::size_t used_bytes = L.byte_end[row] - L.byte_start[row];
+    if (idx_delta > 0 &&
+        static_cast<std::size_t>(idx_delta) > L.row_alloc_bytes(row) - used_bytes)
+        return false; // not enough index byte headroom
+    if (L.row_nnz(row) >= L.row_alloc_elems(row))
+        return false; // not enough element headroom
+
+    // Shift index bytes to make room (or shrink if idx_delta < 0)
+    if (idx_delta != 0) {
+        const std::size_t shift_from = ins_byte_pos;
+        const std::size_t shift_len  = L.byte_end[row] - shift_from;
+        if (shift_len > 0)
+            std::memmove(buf.data() + shift_from + idx_delta,
+                         buf.data() + shift_from, shift_len);
+        L.byte_end[row] = static_cast<std::size_t>(
+            static_cast<std::ptrdiff_t>(L.byte_end[row]) + idx_delta);
+    }
+
+    // Write new delta and (if applicable) the updated next delta
+    std::memcpy(buf.data() + ins_byte_pos, new_d_buf, new_d_len);
+    if (has_next)
+        std::memcpy(buf.data() + ins_byte_pos + new_d_len, upd_d_buf, upd_d_len);
+
+    // Shift value elements right and write the new one
+    if (ins_elem_pos < L.elem_end[row])
+        ValueAccessor<VALUES_TYPE>::move(dc.values,
+            ins_elem_pos + 1, ins_elem_pos, L.elem_end[row] - ins_elem_pos);
+    ValueAccessor<VALUES_TYPE>::set(dc.values, ins_elem_pos, weight, importance);
+    L.elem_end[row]++;
+    L.total_nnz++;
+    return true;
+}
+
+// ── Incremental synaptogenesis step ──────────────────────────────────────────
+//
+// Replaces the old "read all, merge, rebuild from scratch" approach with
+// in-place per-connection insert and remove. This eliminates the need to
+// pre-allocate uleb128_max (5) bytes per potential connection: for typical
+// layers (n_out <= 16384), deltas encode in 1-2 bytes, so the blank space per
+// row only needs to cover the NET GROWTH per step (additions - removals).
+//
+// Algorithm per row:
+//   1. Walk row once: collect (col, weight, importance) for all connections.
+//   2. Collect probes for this row from weights.probes.
+//   3. Determine removes: connections below importance_cutoff OR lowest-
+//      importance connections when n_exist > max_row_weights.
+//   4. Determine adds: top probes not already present, up to the slots freed by
+//      removes plus any remaining capacity below max_row_weights.
+//   5. Apply removes (O(n) each, but K << n so O(K*n) total).
+//      Removes always shrink the row -- freed bytes are immediately available.
+//   6. Apply adds using delta_csr_row_insert_col. Throws std::runtime_error
+//      on first insertion failure -- no silent skipping. Caller must handle
+//      the error by calling equalizer_step() to redistribute blank space from
+//      adjacent rows, then retry. If the total pool is exhausted, the error
+//      message explains what to do (prune more / lower max_row_weights).
+//
+// out_degree update mirrors the old implementation: decrement for removed
+// columns, increment for added columns.
+
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
 bool delta_csr_synap_row_step(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     std::size_t& current_row,
@@ -378,33 +582,31 @@ bool delta_csr_synap_row_step(
     auto& L  = dc.layout;
     if (L.rows == 0) return false;
 
-    const std::size_t row   = current_row % L.rows;
+    const std::size_t row = current_row % L.rows;
     current_row = (current_row + 1) % L.rows;
 
     const std::size_t n_exist = L.row_nnz(row);
-
-    // Skip when there is genuinely nothing to do: no existing connections AND
-    // no probe candidates. Do NOT skip when n_exist > 0 just because probes
-    // are empty -- that would block the prune-only path (e.g. a fully-dense
-    // layer where n_exist > max_row_weights but all (row,col) pairs already
-    // exist so build_probes returns empty). Pruning must work regardless of
-    // whether growth candidates are available.
     const bool has_probes = weights.probes.indices[0] &&
                             !weights.probes.indices[0]->empty();
     if (n_exist == 0 && !has_probes) return false;
+
+    // ── Step 1: Read existing connections ──────────────────────────────────
     std::vector<COL_TYPE>   exist_cols(n_exist);
     std::vector<value_type> exist_w(n_exist), exist_imp(n_exist);
     {
         auto cursor = dc.row_cursor(row);
         for (std::size_t k = 0; k < n_exist; ++k) {
             exist_cols[k] = cursor.advance();
-            exist_w[k]    = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
-            exist_imp[k]  = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[row] + k);
+            exist_w[k]    = ValueAccessor<VALUES_TYPE>::get_w(
+                dc.values, L.elem_start[row] + k);
+            exist_imp[k]  = ValueAccessor<VALUES_TYPE>::get_imp(
+                dc.values, L.elem_start[row] + k);
         }
     }
 
+    // ── Step 2: Collect probes for this row ────────────────────────────────
     std::vector<COL_TYPE>   probe_cols;
-    std::vector<value_type> probe_imp;
+    std::vector<value_type> probe_scores;
     if (has_probes) {
         const auto& prow = *weights.probes.indices[0];
         const auto& pcol = *weights.probes.indices[1];
@@ -413,113 +615,90 @@ bool delta_csr_synap_row_step(
         for (SIZE_TYPE p = 0; p < pnnz; ++p) {
             if (static_cast<std::size_t>(prow[p]) == row) {
                 probe_cols.push_back(static_cast<COL_TYPE>(pcol[p]));
-                probe_imp .push_back(pval[p]);
+                probe_scores.push_back(pval[p]);
             }
         }
     }
 
-    if (probe_cols.empty() && n_exist == 0) return false;
+    // ── Step 3: Determine which connections to remove ──────────────────────
+    // Collect indices into exist_* sorted by importance ascending.
+    std::vector<std::size_t> by_imp(n_exist);
+    std::iota(by_imp.begin(), by_imp.end(), 0);
+    std::sort(by_imp.begin(), by_imp.end(),
+              [&](std::size_t a, std::size_t b) {
+                  return exist_imp[a] < exist_imp[b];
+              });
 
-    std::vector<COL_TYPE>   merged_cols;
-    std::vector<value_type> merged_w, merged_imp;
-    merged_cols.reserve(n_exist + probe_cols.size());
-    merged_w   .reserve(n_exist + probe_cols.size());
-    merged_imp .reserve(n_exist + probe_cols.size());
-
-    std::size_t ei = 0, pi = 0;
-    while (ei < n_exist || pi < probe_cols.size()) {
-        const COL_TYPE ec = (ei < n_exist)           ? exist_cols[ei]  : std::numeric_limits<COL_TYPE>::max();
-        const COL_TYPE pc = (pi < probe_cols.size()) ? probe_cols[pi]  : std::numeric_limits<COL_TYPE>::max();
-        
-        if (ec < pc) {
-            merged_cols.push_back(ec);
-            merged_w   .push_back(exist_w[ei]);
-            merged_imp .push_back(exist_imp[ei]);
-            ++ei;
-        } else if (pc < ec) {
-            merged_cols.push_back(pc);
-            merged_w   .push_back(value_type(0));
-            merged_imp .push_back(probe_imp[pi]);
-            ++pi;
-        } else {
-            merged_cols.push_back(ec);
-            merged_w   .push_back(exist_w[ei]);
-            merged_imp .push_back(std::max(exist_imp[ei], probe_imp[pi]));
-            ++ei; ++pi;
-        }
+    std::vector<COL_TYPE> to_remove;
+    const std::size_t max_rw = static_cast<std::size_t>(max_row_weights);
+    for (std::size_t rank = 0; rank < n_exist; ++rank) {
+        const std::size_t k    = by_imp[rank];
+        const std::size_t keep = n_exist - to_remove.size();
+        if (exist_imp[k] < importance_cutoff || keep > max_rw)
+            to_remove.push_back(exist_cols[k]);
     }
+    // Sort descending so we remove from high col first -- keeps byte positions
+    // of lower-col elements stable while we walk and remove.
+    std::sort(to_remove.rbegin(), to_remove.rend());
 
+    // ── Step 4: Determine which probes to add ─────────────────────────────
+    // Filter out probes that already have a connection.
     {
-        std::vector<std::size_t> keep_idx;
-        keep_idx.reserve(merged_cols.size());
-        for (std::size_t k = 0; k < merged_cols.size(); ++k)
-            if (merged_imp[k] >= importance_cutoff)
-                keep_idx.push_back(k);
+        std::unordered_set<COL_TYPE> exist_set(exist_cols.begin(), exist_cols.end());
+        // (Will also filter against to_remove to avoid immediately re-adding
+        // a just-removed connection. Not strictly necessary but clean.)
+        std::unordered_set<COL_TYPE> remove_set(to_remove.begin(), to_remove.end());
 
-        if (keep_idx.size() > static_cast<std::size_t>(max_row_weights)) {
-            std::partial_sort(keep_idx.begin(),
-                              keep_idx.begin() + max_row_weights,
-                              keep_idx.end(),
-                              [&](std::size_t a, std::size_t b){
-                                  return merged_imp[a] > merged_imp[b];
-                              });
-            keep_idx.resize(max_row_weights);
-            std::sort(keep_idx.begin(), keep_idx.end());
-        }
+        std::vector<std::size_t> pidx(probe_cols.size());
+        std::iota(pidx.begin(), pidx.end(), 0);
+        // Sort probes by score descending (highest score = best candidate)
+        std::sort(pidx.begin(), pidx.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return probe_scores[a] > probe_scores[b];
+                  });
 
-        std::vector<COL_TYPE>   final_cols;
-        std::vector<value_type> final_w, final_imp;
-        final_cols.reserve(keep_idx.size());
-        final_w   .reserve(keep_idx.size());
-        final_imp .reserve(keep_idx.size());
-        for (std::size_t k : keep_idx) {
-            final_cols.push_back(merged_cols[k]);
-            final_w   .push_back(merged_w   [k]);
-            final_imp .push_back(merged_imp [k]);
+        std::vector<COL_TYPE>   add_cols;
+        std::vector<value_type> add_scores;
+        const std::size_t slots = max_rw - (n_exist - to_remove.size());
+        for (std::size_t p : pidx) {
+            if (add_cols.size() >= slots) break;
+            const COL_TYPE c = probe_cols[p];
+            if (!exist_set.count(c) || remove_set.count(c))
+                if (!exist_set.count(c)) { // truly not present
+                    add_cols.push_back(c);
+                    add_scores.push_back(probe_scores[p]);
+                }
         }
-        merged_cols = std::move(final_cols);
-        merged_w    = std::move(final_w);
-        merged_imp  = std::move(final_imp);
+        probe_cols   = std::move(add_cols);
+        probe_scores = std::move(add_scores);
     }
 
-    // BUG FIX (see conversation): row_rebuild's return value was discarded --
-    // on failure (insufficient reserved headroom, e.g. right after compact(),
-    // which deliberately leaves zero headroom on both axes) this function
-    // reported did_work=true and updated out_degree as if the merge had been
-    // written, while nnz silently never changed. A silent failure here is
-    // worse than a crash: training just stops improving with no signal why.
-    // Now throws (pybind converts std::runtime_error to a catchable Python
-    // exception) BEFORE touching out_degree, so bookkeeping can't be
-    // corrupted by a rebuild that didn't actually happen. Only the genuine
-    // "growth was attempted and failed" case throws -- the "nothing to do"
-    // no-op above (line ~811) is a legitimate, quiet false, not an error.
-    // See compact()/expand() in this file: call expand() to restore growth
-    // headroom before resuming synaptogenesis on a compacted layer.
-    const bool rebuilt = delta_csr_row_rebuild(dc, row, merged_cols, merged_w, merged_imp);
-    if (!rebuilt) {
-        uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
-        std::size_t needed_bytes = 0;
-        COL_TYPE prev = 0;
-        for (std::size_t k = 0; k < merged_cols.size(); ++k) {
-            needed_bytes += uleb128_encode<COL_TYPE>(merged_cols[k] - prev, tmp);
-            prev = merged_cols[k];
-        }
-        throw std::runtime_error(
-            "delta_csr_synap_row_step: row " + std::to_string(row) +
-            " needs " + std::to_string(needed_bytes) + " index bytes / " +
-            std::to_string(merged_cols.size()) + " elements, but only has " +
-            std::to_string(L.row_alloc_bytes(row)) + " bytes / " +
-            std::to_string(L.row_alloc_elems(row)) + " elements of reserved "
-            "headroom. Call expand_headroom() on this layer's weights.connections "
-            "before resuming synaptogenesis -- growth headroom was likely "
-            "removed by a prior compact() call.");
+    // ── Step 5: Apply removes (in-place, high-col first) ──────────────────
+    for (COL_TYPE col : to_remove) {
+        delta_csr_row_remove_col(dc, row, col);
+        if (!weights.out_degree.empty() && weights.out_degree[col] > 0)
+            --weights.out_degree[col];
     }
 
-    if (!weights.out_degree.empty()) {
-        for (std::size_t k = 0; k < n_exist; ++k)
-            if (weights.out_degree[exist_cols[k]] > 0)
-                --weights.out_degree[exist_cols[k]];
-        for (COL_TYPE col : merged_cols)
+    // ── Step 6: Apply adds in-place ──────────────────────────────────────
+    // Throws on first insertion failure (no blank space in this row).
+    // Caller should call equalizer_step() to redistribute blank from adjacent
+    // rows before retrying. If the total pool is exhausted, prune more
+    // aggressively (lower max_row_weights or raise importance_cutoff).
+    for (std::size_t i = 0; i < probe_cols.size(); ++i) {
+        const COL_TYPE col = probe_cols[i];
+        if (!delta_csr_row_insert_col(dc, row, col, value_type(0), probe_scores[i])) {
+            const std::size_t used  = dc.layout.byte_end[row] - dc.layout.byte_start[row];
+            const std::size_t alloc = dc.layout.row_alloc_bytes(row);
+            throw std::runtime_error(
+                "delta_csr_synap_row_step: row " + std::to_string(row) +
+                " ran out of blank space during insertion (used " +
+                std::to_string(used) + " / " + std::to_string(alloc) +
+                " bytes). Call equalizer_step() to redistribute space "
+                "from adjacent rows before retrying, or reduce "
+                "max_row_weights / raise importance_cutoff to prune.");
+        }
+        if (!weights.out_degree.empty())
             ++weights.out_degree[col];
     }
 

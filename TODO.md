@@ -190,3 +190,27 @@ training target is 2D complex-plane fractal navigation:
 - The sparse structure of the Mandelbrot set (most of the complex plane
   escapes quickly; complexity lives at the boundary) naturally exercises
   sparsity enforcement: neurons should activate mainly for boundary inputs
+
+## Memory / synaptogenesis
+
+**In-place insert/delete per delta-encoded row (DONE):** `delta_csr_row_insert_col` /
+`delta_csr_row_remove_col` in `delta_csr_memory.hpp` replace the old
+"read all, re-encode entire row from scratch" approach. For typical layers
+(n_out <= 16384, column deltas fit in 1-2 bytes), each insertion needs 1-2
+bytes of blank space, and each removal FREES bytes. Equal add/remove per
+synaptogenesis step requires near-zero net blank space. `equalize_to_capacity`
+uses the actual ULEB128 cost for the layer's column range instead of worst-case
+(5 bytes/connection).
+
+**Blank space padding optimization (FUTURE, low priority):** Currently
+`equalize_to_capacity(max_row_weights)` sizes each row for exactly
+`max_row_weights` connections at typical delta cost. Giving rows slightly MORE
+blank (e.g. 10-20%) reduces the frequency of "no blank space" throws, which
+require the calling loop to call `equalizer_step` and retry. But this trades
+memory for reduced retry rate. Measure first on real model (Mandelbrot) before
+tuning this knob.
+
+**Work pointer set (FUTURE):** Two pointer sets (1) roughly-equal-size work
+regions for load-balanced parallelization, (2) row-beginning pointers. See the
+Corrections section in refactoring_todo.md.
+

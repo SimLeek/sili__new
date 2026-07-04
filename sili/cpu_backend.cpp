@@ -437,18 +437,29 @@ public:
     // synaptogenesis; subsequent cycles use the staggered equalizer_step()
     // for ongoing redistribution.
     // Last row handled separately (no memmove needed -- nothing follows it).
-    void equalize_to_capacity(int target_elems_per_row) {
-        // Grow each row until it has at least target_elems_per_row of
-        // reserved space for both index bytes and value elements.
-        //
-        // KEY SUBTLETY: delta_csr_shift_row updates elem_start[r+1..rows]
-        // but NOT elem_end[r+1..rows-1]. In the normal synaptogenesis
-        // workflow this is safe because synap_step rebuilds rows (resetting
-        // elem_end) before the equalizer touches them. In a bulk loop we
-        // must fix elem_end and byte_end ourselves after each shift,
-        // otherwise row_nnz(j) = elem_end[j] - elem_start[j] underflows.
+    // equalize_to_capacity(target_elems_per_row, target_bytes_per_row=0)
+    // Grow each row until it has at least target_elems_per_row elements and
+    // target_bytes_per_row index bytes of reserved space.
+    //
+    // target_bytes_per_row = 0 (default): derive as target_elems * uleb128_max
+    // (worst-case encoding; safe for any column range but wastes memory for
+    // models where column deltas are typically small). Pass an explicit byte
+    // count when you know the typical encoding -- e.g. 100 connections at
+    // 2 bytes each = 204 bytes, vs the default 100*5+4 = 504 bytes.
+    //
+    // This is a ONE-TIME CONSTRUCTION CALL. Call it from from_descriptor with
+    // the max_row_weights and bytes_per_row for this specific layer. After
+    // this, the pool is fixed and equalizer_step() only redistributes within
+    // it -- it never grows further.
+    //
+    // KEY SUBTLETY: delta_csr_shift_row updates elem_start[r+1..rows] and
+    // (after the fix applied to it) byte_end/elem_end for shifted rows. A
+    // bulk loop over all rows is therefore safe: no stale _end arrays remain.
+    void equalize_to_capacity(int target_elems_per_row, int target_bytes_per_row = 0) {
         const std::size_t tgt_e = static_cast<std::size_t>(target_elems_per_row);
-        const std::size_t tgt_b = tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
+        const std::size_t tgt_b = (target_bytes_per_row > 0)
+            ? static_cast<std::size_t>(target_bytes_per_row)
+            : tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
         auto& dc  = weights.connections;
         const std::size_t rows = dc.layout.rows;
 
@@ -836,12 +847,15 @@ PYBIND11_MODULE(_cpu, m)
              "pool is large enough for max_row_weights connections per row.")
         .def("equalize_to_capacity", &SparseLinearLayer::equalize_to_capacity,
              py::arg("target_elems_per_row"),
-             "Grow each row until it has at least target_elems_per_row\n"
-             "elements of reserved space. Unlike equalizer_step() which only\n"
-             "redistributes the existing pool, this ADDS memory for under-\n"
-             "allocated rows. Call once with max_row_weights before starting\n"
-             "synaptogenesis; subsequent cycles use the staggered\n"
-             "equalizer_step() for ongoing redistribution.")
+             py::arg("target_bytes_per_row") = 0,
+             "One-time construction call: grow each row to at least\n"
+             "target_elems_per_row elements and target_bytes_per_row index\n"
+             "bytes of reserved space. target_bytes_per_row=0 (default)\n"
+             "derives bytes as target_elems * uleb128_max (5) + 4 (safe\n"
+             "worst-case). Pass an explicit byte count for efficiency:\n"
+             "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
+             "the default 100*5+4=504. After this call the pool is fixed;\n"
+             "equalizer_step() only redistributes within it, never grows.")
         .def("compact",              &SparseLinearLayer::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"

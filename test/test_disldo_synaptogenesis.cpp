@@ -272,10 +272,13 @@ TEST_CASE("compact() is lossless and shrinks reserved headroom", "[memory]") {
     CHECK(compacted2.layout.total_alloc_bytes() == compacted.layout.total_alloc_bytes());
 }
 
-TEST_CASE("synap_row_step throws (not silently no-ops) when compact() removed all headroom",
+TEST_CASE("synap_row_step throws (not silently skips) when compact() removed all headroom",
          "[memory][synaptogenesis][regression]") {
-    // Regression test for the exact failure mode reported in conversation:
-    // training silently stops improving after compact(), with no error.
+    // After compact(), blank_bytes=0 per row. Synaptogenesis that tries to
+    // add connections must throw -- not silently skip. Silently skipping is
+    // never correct: the function would report success while not having done
+    // what it was asked. The throw tells calling code to call equalizer_step()
+    // to redistribute blank from adjacent rows, or to prune more aggressively.
     using SIZE_TYPE = int;
     using COL_TYPE  = uint32_t;
 
@@ -296,9 +299,13 @@ TEST_CASE("synap_row_step throws (not silently no-ops) when compact() removed al
         weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
     REQUIRE(weights.probes.nnz() > 0);
 
+    // importance_cutoff=0 and max_row_weights=10 means all existing connections
+    // are kept AND probes are attempted -- but blank_bytes=0 after compact(),
+    // so the first insertion must throw.
     std::size_t current_row = 0;
     REQUIRE_THROWS_AS(
-        (delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, current_row, 0.0f, SIZE_TYPE(10))),
+        (delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+            weights, current_row, 0.0f, SIZE_TYPE(10))),
         std::runtime_error);
 }
 
