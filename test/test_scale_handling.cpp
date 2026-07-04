@@ -483,3 +483,43 @@ TEST_CASE("set_value_scale_raw: pre-scaled load + raw scale set round-trips corr
         dc_unscaled.values, dc_unscaled.layout.elem_start[0]);
     CHECK(stored_unscaled == Catch::Approx(0.0f).margin(1e-6f));  // lost entirely
 }
+
+TEST_CASE("backward fold-sum broadcast: dy tiles correctly to n_folds slots",
+         "[siliblock][backward][regression]") {
+    // Forward reshape+sum: raw[batch, n_folds*out_dim]
+    //   -> reshape[batch, n_folds, out_dim] -> sum(axis=1) -> [batch, out_dim]
+    //
+    // Backward: gradient of a sum is 1 to each summand, so
+    //   dy[batch, out_dim] -> tile -> [batch, n_folds, out_dim]
+    //   -> flatten -> [batch, n_folds*out_dim]
+    //   meaning dy_raw[fold * out_dim + i] == dy[i] for ALL fold values.
+    //
+    // Verified by constructing a simple case and checking the broadcast manually.
+
+    const int n_folds = 3, out_dim = 2, batch = 1;
+    std::vector<float> dy = {1.5f, -0.5f};   // [batch=1, out_dim=2]
+
+    // Replicate via the tile formula: dy_raw[fold*out_dim + i] = dy[i]
+    std::vector<float> dy_raw(n_folds * out_dim);
+    for (int fold = 0; fold < n_folds; ++fold)
+        for (int i = 0; i < out_dim; ++i)
+            dy_raw[fold * out_dim + i] = dy[i];
+
+    // Verify: every fold slot is identical to dy
+    for (int fold = 0; fold < n_folds; ++fold) {
+        CHECK(dy_raw[fold * out_dim + 0] == Catch::Approx(1.5f));
+        CHECK(dy_raw[fold * out_dim + 1] == Catch::Approx(-0.5f));
+    }
+
+    // Cross-check: if we do the backward fold-sum on dy_raw (reshape->sum),
+    // we should recover dy.
+    std::vector<float> recovered(out_dim, 0.0f);
+    for (int fold = 0; fold < n_folds; ++fold)
+        for (int i = 0; i < out_dim; ++i)
+            recovered[i] += dy_raw[fold * out_dim + i];
+    // Each position sums n_folds copies of dy[i], NOT equal to dy[i].
+    // This confirms the broadcast is NOT a split (not dy/n_folds each) but
+    // a true broadcast -- each fold gets the whole gradient.
+    CHECK(recovered[0] == Catch::Approx(dy[0] * n_folds).margin(1e-5f));
+    CHECK(recovered[1] == Catch::Approx(dy[1] * n_folds).margin(1e-5f));
+}

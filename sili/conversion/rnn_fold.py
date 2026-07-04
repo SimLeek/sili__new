@@ -744,15 +744,71 @@ class SiliBlock(RNNFoldedBlock):
         dy:     "np.ndarray",
         lr:     float,
     ) -> "np.ndarray":
-        """Backward with hoyer_score dispatch on gradient. lr_per_row_nnz always True."""
+        """
+        Backward through one SparseLinearLayer. lr_per_row_nnz always True.
+
+        Sparse gradient path (hoyer_score > threshold): uses backward_sparse
+        with the explicitly stored last_input (now exposed as a Python property).
+        Falls back to backward_dense if no forward pass has been run or if the
+        gradient is dense.
+        """
         import numpy as np
         dy2d = dy.reshape(1, -1).astype(np.float32)
         if _sili_cpu.hoyer_score(dy2d)["hoyer_score"] > self.hoyer_threshold:
-            ptrs, idx, vals = _sili_cpu.dense_to_csr(dy2d, 0.0)
-            return layer.backward_sparse(
-                layer._last_input if hasattr(layer, "_last_input") else dy2d,
-                ptrs, idx, vals, batch=1, learning_rate=lr, lr_per_row_nnz=True)
+            x_last = layer.last_input   # None if no forward run yet
+            if x_last is not None:
+                ptrs, idx, vals = _sili_cpu.dense_to_csr(dy2d, 0.0)
+                return layer.backward_sparse(
+                    x_last, ptrs, idx, vals,
+                    batch=1, learning_rate=lr, lr_per_row_nnz=True)
         return layer.backward_dense(dy2d, lr, lr_per_row_nnz=True)
+
+    def backward_sili(
+        self,
+        dy:  "torch.Tensor",
+        lr:  float = 0.0,
+    ) -> "torch.Tensor":
+        """
+        Backward pass through the entire folded RNN block.
+
+        Reverses both levels of sum in forward_sili:
+
+          (1) Fold sum backward: dy[batch, out_dim]
+              -> broadcast to dy_raw[batch, n_folds, out_dim]
+              -> flatten to [batch, n_folds * out_dim]
+              Gradient of a sum is 1 for each summand, so every fold slot
+              gets the same dy -- not split across folds.
+
+          (2) Suffix sum backward: each suffix layer gets the same dy_raw;
+              returns dx_suffix[batch, in_dim]; final dx = sum(dx_suffix).
+
+        Weight updates happen inside _backward_one_suffix via backward_dense /
+        backward_sparse with lr_per_row_nnz=True.
+
+        dy shape: [batch, out_dim]  (same as forward output)
+        dx shape: [batch, in_dim]   (same as forward input x)
+        """
+        import numpy as np
+        device  = dy.device
+        dy_np   = dy.detach().cpu().float().numpy()
+        batch   = dy_np.shape[0]
+        out_dim = next(iter(self.desc.out_dims.values()))
+
+        # (1) Broadcast dy through the fold reshape+sum.
+        # Forward:   raw[batch, n_folds*out_dim] -> sum(axis=1) -> [batch, out_dim]
+        # Backward:  dy[batch, out_dim] -> tile to [batch, n_folds, out_dim]
+        #            -> flatten to [batch, n_folds*out_dim]
+        dy_raw = np.tile(
+            dy_np.reshape(batch, 1, out_dim),
+            (1, self.desc.n_folds, 1)
+        ).reshape(batch, self.desc.n_folds * out_dim).astype(np.float32)
+
+        # (2) Each suffix sees the same dy_raw; accumulate dx across suffixes.
+        dx_parts = [self._backward_one_suffix(layer, dy_raw, lr)
+                    for layer in self._layers.values()]
+        dx_np = sum(dx_parts).reshape(batch, -1)
+
+        return torch.from_numpy(dx_np).to(device)
 
     def forward_sili(
         self,

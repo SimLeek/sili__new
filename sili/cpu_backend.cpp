@@ -851,7 +851,23 @@ PYBIND11_MODULE(_cpu, m)
         .def_readonly ("num_cpus",  &SparseLinearLayer::num_cpus)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayer::nnz);
+        .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
+        .def_property_readonly("last_input",
+            [](const SparseLinearLayer& self) -> py::object {
+                if (self._last_input.empty()) return py::none();
+                // Return a zero-copy numpy view of the stored last input.
+                // Shape [_last_batch, _last_cols] -- needed by backward_sparse
+                // which requires the explicit forward input (can't retrieve it
+                // from inside the kernel the way backward_dense does via the
+                // stored member).
+                return py::array_t<float>(
+                    {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    self._last_input.data(), py::cast(&self));
+            },
+            "Dense input from the most recent forward_dense/forward_sparse call.\n"
+            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
+            "Used by backward_sparse which requires the explicit forward input.");
 
     // DISLDOLayerV: identical API surface to SparseLinearLayer, DeltaCSRBiValues<float>
     // (32-bit) instead of FP4BiPacked -- same disldo_forward/backward/
