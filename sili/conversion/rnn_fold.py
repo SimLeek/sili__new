@@ -663,35 +663,36 @@ class SiliBlock(RNNFoldedBlock):
         self._lr       = learning_rate
         self._num_cpus = num_cpus
 
-        # Pre-build one SparseLinearLayer per fold step per suffix.
-        # Layout: self._layers[fold_step][suffix] -> SparseLinearLayer
-        self._layers: List[Dict[str, object]] = []
-        for step in range(descriptor.n_folds):
-            step_layers: Dict[str, object] = {}
-            for suffix in descriptor.stacked_weights:
-                csr     = descriptor.fold_weight_csr(suffix, step)
-                out_dim = descriptor.out_dims[suffix]
-                in_dim  = int(csr.shape[1])
-                # max_weights budget: actual nnz + 20% growth headroom
-                nnz     = int(csr.values().numel())
-                # SparseLinearLayer stores weights as [n_inputs x n_outputs]
-                # (each row = one input neuron, cols = the outputs it connects to).
-                # fold_weight_csr returns [out_dim x in_dim] (standard weight
-                # matrix orientation) -- transpose before loading.
-                csr_t   = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
-                in_dim_actual  = int(csr_t.shape[0])   # was out_dim before transpose
-                out_dim_actual = int(csr_t.shape[1])   # was in_dim before transpose
-                layer   = _sili_cpu.SparseLinearLayer(
-                    in_dim_actual, out_dim_actual, int(nnz * 1.2) + 64, num_cpus)
-                # load_weights expects (ptrs, indices, values) as numpy int32/float32
-                # ptrs has shape [n_inputs + 1] -- one entry per input row plus sentinel
-                import numpy as np
-                ptrs = csr_t.crow_indices().numpy().astype(np.int32)
-                idx  = csr_t.col_indices().numpy().astype(np.int32)
-                vals = csr_t.values().float().numpy()
-                layer.load_weights(ptrs, idx, vals)
-                step_layers[suffix] = layer
-            self._layers.append(step_layers)
+        # ONE SparseLinearLayer per suffix -- loaded with the FULL stacked
+        # weight matrix, not individual fold-step slices.
+        #
+        # Design (per conversation): loading all N fold steps into ONE layer
+        # means forward_sili calls _forward_one_suffix EXACTLY ONCE, not N
+        # times. At initialisation the result is equivalent to running the N
+        # original transformer blocks sequentially. After synaptogenesis,
+        # redundant connections across fold steps are pruned -- only what is
+        # genuinely needed survives. Dense stacking would be an N-wide layer
+        # with no benefit; sparsity is what makes the single-call design
+        # viable, not a micro-optimisation.
+        #
+        # Weight orientation: SparseLinearLayer is [n_inputs x n_outputs].
+        # stacked_weights[suffix] is [n_folds*out_dim x in_dim] (standard
+        # weight-matrix orientation) -- transpose before loading so the layer
+        # has n_inputs=in_dim, n_outputs=n_folds*out_dim.
+        import numpy as np
+        self._layers: Dict[str, object] = {}
+        for suffix, csr in descriptor.stacked_weights.items():
+            csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+            n_in  = int(csr_t.shape[0])   # in_dim
+            n_out = int(csr_t.shape[1])   # n_folds * out_dim
+            nnz   = int(csr_t.values().numel())
+            layer = _sili_cpu.SparseLinearLayer(
+                n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
+            ptrs = csr_t.crow_indices().numpy().astype(np.int32)
+            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            vals = csr_t.values().float().numpy()
+            layer.load_weights(ptrs, idx, vals)
+            self._layers[suffix] = layer
 
     def _forward_one_suffix(
         self,
@@ -699,25 +700,13 @@ class SiliBlock(RNNFoldedBlock):
         x:      "np.ndarray",
         lr:     float,
     ) -> "np.ndarray":
-        """
-        Forward through one SparseLinearLayer with hoyer_score dispatch.
-
-        hoyer_score > threshold -> forward_sparse (activations are sparse)
-        otherwise               -> forward_dense
-
-        Note: forward_sparse returns the same dense output as forward_dense --
-        the distinction is purely in the forward kernel (which synapse rows
-        are visited), not in the output shape.
-        """
+        """Forward with hoyer_score dispatch. x=[batch,n_in] -> [batch,n_folds*out_dim]."""
         import numpy as np
         x2d = x.reshape(1, -1).astype(np.float32)
-
         if _sili_cpu.hoyer_score(x2d)["hoyer_score"] > self.hoyer_threshold:
-            # Sparsify activations for the sparse forward path.
             ptrs, idx, vals = _sili_cpu.dense_to_csr(x2d, 0.0)
             return layer.forward_sparse(ptrs, idx, vals, batch=1, learning_rate=lr)
-        else:
-            return layer.forward_dense(x2d, lr)
+        return layer.forward_dense(x2d, lr)
 
     def _backward_one_suffix(
         self,
@@ -725,27 +714,15 @@ class SiliBlock(RNNFoldedBlock):
         dy:     "np.ndarray",
         lr:     float,
     ) -> "np.ndarray":
-        """
-        Backward through one SparseLinearLayer with hoyer_score dispatch on
-        the gradient. Input (activations) is always dense per the design
-        rationale in backward_sparse -- only the GRADIENT toggles sparse/dense.
-
-        lr_per_row_nnz=True always: per conversation, value_scale gradient
-        and weight updates both normalize by nnz_this_row.
-        """
+        """Backward with hoyer_score dispatch on gradient. lr_per_row_nnz always True."""
         import numpy as np
         dy2d = dy.reshape(1, -1).astype(np.float32)
-
         if _sili_cpu.hoyer_score(dy2d)["hoyer_score"] > self.hoyer_threshold:
-            # Sparse gradient backward.
             ptrs, idx, vals = _sili_cpu.dense_to_csr(dy2d, 0.0)
             return layer.backward_sparse(
-                layer._last_input if hasattr(layer, '_last_input')
-                else dy2d,          # fallback -- shouldn't happen in practice
-                ptrs, idx, vals,
-                batch=1, learning_rate=lr, lr_per_row_nnz=True)
-        else:
-            return layer.backward_dense(dy2d, lr, lr_per_row_nnz=True)
+                layer._last_input if hasattr(layer, "_last_input") else dy2d,
+                ptrs, idx, vals, batch=1, learning_rate=lr, lr_per_row_nnz=True)
+        return layer.backward_dense(dy2d, lr, lr_per_row_nnz=True)
 
     def forward_sili(
         self,
@@ -753,48 +730,22 @@ class SiliBlock(RNNFoldedBlock):
         lr:  float = 0.0,
     ) -> "torch.Tensor":
         """
-        Run the full folded RNN loop using SparseLinearLayer kernels.
+        Single forward pass through the entire folded RNN block.
 
-        Uses the same accumulate-state loop as RNNFoldedBlock.forward() but
-        dispatches each linear op through _forward_one_suffix() with automatic
-        dense/sparse routing. Only linear (matmul) ops are dispatched through
-        _cpu -- attention masking and any non-linear ops still use the
-        subclass's _apply_block() override if provided (see RNNFoldedBlock
-        for the protocol).
-
-        If lr == 0.0 (inference-only), no weight updates happen.
+        _forward_one_suffix is called EXACTLY ONCE per suffix (not N times).
+        The full stacked weight matrix handles all N fold steps in one shot.
+        Output shape: [batch, n_folds * out_dim].
         """
         import numpy as np
-        device   = x.device
-        seq_len  = x.shape[1] if x.ndim == 3 else x.shape[0]
-        suffixes = list(self.desc.stacked_weights.keys())
-
-        x_np    = x.detach().cpu().float().numpy()
-        state   = torch.zeros_like(x)
-        state_np = state.detach().cpu().float().numpy()
-
-        step_outputs: List["np.ndarray"] = []
-
-        for fold_step in range(self.desc.n_folds):
-            inp_np = x_np + state_np
-            out_np = np.zeros_like(inp_np)
-
-            for suffix in suffixes:
-                layer = self._layers[fold_step][suffix]
-                contrib = self._forward_one_suffix(layer, inp_np, lr)
-                out_np += contrib.reshape(inp_np.shape)
-
-            state_np = state_np + out_np
-            if self.desc.skip_connection_outputs:
-                step_outputs.append(out_np.copy())
-
-        if self.desc.skip_connection_outputs:
-            mean_np = sum(step_outputs) / len(step_outputs)
-            return torch.from_numpy(mean_np).to(device)
-        return torch.from_numpy(state_np).to(device)
+        device = x.device
+        x_np   = x.detach().cpu().float().numpy()
+        out_parts = [self._forward_one_suffix(layer, x_np, lr)
+                     for layer in self._layers.values()]
+        out_np = sum(out_parts)
+        return torch.from_numpy(out_np).to(device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Drop-in replacement: routes through forward_sili at lr=0 (inference)."""
+        """Inference-mode drop-in: routes through forward_sili(lr=0)."""
         return self.forward_sili(x, lr=0.0)
 
 
