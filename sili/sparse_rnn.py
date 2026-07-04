@@ -214,6 +214,207 @@ class SISLDOLayer(_SparseLayerBase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FoldedLayer — runtime sili Module for a converted folded transformer block
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FoldedLayer(Module):
+    """
+    Runtime sili layer for a folded transformer block.
+
+    All N original transformer layers are stacked into ONE SparseLinearLayer
+    per weight suffix (Q, K, V, MLP, etc.).  A single forward() call replaces
+    N sequential matmuls.  After synaptogenesis, only connections that survived
+    energy-based pruning contribute nonzero terms -- which is why sparsity is
+    what makes the design efficient rather than just wider.
+
+    Weights live entirely in C++ (SparseLinearLayer).  parameters() returns []
+    -- nothing here participates in the Tensor autograd as a leaf, but the
+    layer IS in the graph: forward() returns a Tensor with _children=(x,) and
+    a _backward closure that calls backward_dense and uses _acc to accumulate
+    dx back into x.grad.
+
+    No torch dependency in forward/backward.  The from_descriptor() factory
+    method uses torch once at construction time (acceptable: construction is
+    part of the conversion pipeline, not the runtime hot path).
+
+    Shape contract (same as RNNFoldedBlock.forward):
+        input  [batch, in_dim]   -> output [batch, out_dim]
+    The stacked weights map in_dim -> n_folds*out_dim internally; the fold
+    dimension is summed away on the way out (reshape + sum(axis=1)).
+    """
+
+    def __init__(
+        self,
+        layers:        dict,   # {suffix: SparseLinearLayer}
+        n_folds:       int,
+        out_dims:      dict,   # {suffix: out_dim}
+        learning_rate: float = 0.01,
+    ):
+        self._sili_layers = layers
+        self._n_folds     = n_folds
+        self._out_dims    = out_dims
+        self.lr           = learning_rate
+
+    # ── Factory ------------------------------------------------------------------
+
+    @classmethod
+    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
+                        num_cpus: int = 4) -> "FoldedLayer":
+        """
+        Build a FoldedLayer from a FoldedBlockDescriptor (produced by rnn_fold.py).
+
+        Uses torch once to densify and transpose the stacked CSR weights, then
+        discards it.  The returned FoldedLayer has no further torch dependency.
+        """
+        import numpy as np
+        import torch as _torch   # local import: conversion step only
+        import warnings; warnings.filterwarnings("ignore")
+        _FP4_MAX = 6.0
+
+        layers = {}
+        for suffix, csr in descriptor.stacked_weights.items():
+            csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+            n_in  = int(csr_t.shape[0])
+            n_out = int(csr_t.shape[1])
+            nnz   = int(csr_t.values().numel())
+            layer = _cpu.SparseLinearLayer(n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
+
+            ptrs = csr_t.crow_indices().numpy().astype(np.int32)
+            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            vals = csr_t.values().float().numpy().copy()
+
+            # Per-row value scaling: map each row's max-abs to FP4_MAX so the
+            # quantizer uses its full resolution.  See conversation for why
+            # per-row (not per-layer) is critical for a stacked matrix that
+            # spans rows from N different original layers.
+            row_scales = np.ones(n_in, dtype=np.float32)
+            for r in range(n_in):
+                start, end = int(ptrs[r]), int(ptrs[r + 1])
+                if end > start:
+                    max_abs = float(np.abs(vals[start:end]).max())
+                    if max_abs > 0.0:
+                        row_scales[r] = max_abs / _FP4_MAX
+                        vals[start:end] /= row_scales[r]
+
+            layer.load_weights(ptrs, idx, vals)
+            for r in range(n_in):
+                if row_scales[r] != 1.0:
+                    layer.set_value_scale_raw(r, row_scales[r])
+
+            layers[suffix] = layer
+
+        return cls(layers, descriptor.n_folds, descriptor.out_dims, learning_rate)
+
+    # ── Module interface ---------------------------------------------------------
+
+    def parameters(self) -> list:
+        return []   # weights live in C++, not in the Tensor graph
+
+    # ── Properties --------------------------------------------------------------
+
+    @property
+    def in_features(self) -> int:
+        return next(iter(self._sili_layers.values())).n_inputs
+
+    @property
+    def out_features(self) -> int:
+        return next(iter(self._out_dims.values()))
+
+    # ── Forward ------------------------------------------------------------------
+
+    def forward(self, x: "Tensor") -> "Tensor":
+        """
+        x: sili Tensor [batch, in_dim]  (or [in_dim] -- squeezed automatically)
+        Returns: sili Tensor [batch, out_dim]
+
+        Wired into sili autograd: calling loss.backward() will propagate through
+        this layer automatically.  Weight updates (Hebbian + gradient) happen
+        inside the C++ kernels:
+          - Hebbian importance update: forward_dense(x, lr)  [this method]
+          - Gradient weight+importance update: backward_dense(dy, lr) [_backward]
+        """
+        x_np = np.asarray(x.data, dtype=np.float32)
+        squeezed = x_np.ndim == 1
+        if squeezed:
+            x_np = x_np[np.newaxis, :]
+        batch   = x_np.shape[0]
+        out_dim = next(iter(self._out_dims.values()))
+        lr      = self.lr
+
+        # Single call per suffix -- the full stacked matrix is one layer.
+        raw_parts = [layer.forward_dense(x_np, lr)
+                     for layer in self._sili_layers.values()]
+        raw_np = sum(raw_parts)   # [batch, n_folds * out_dim]
+
+        # Fold sum: [batch, n_folds, out_dim] -> [batch, out_dim]
+        summed = raw_np.reshape(batch, self._n_folds, out_dim).sum(axis=1)
+        if squeezed:
+            summed = summed.squeeze(0)
+
+        out = Tensor(summed, _children=(x,), _op="folded", backend=x.backend)
+
+        # Capture loop variables for the closure (Python late-binding risk).
+        _layers  = list(self._sili_layers.values())
+        _n_folds = self._n_folds
+        _sq      = squeezed
+
+        def _bwd():
+            if out.grad is None:
+                return
+            dy_np = np.asarray(out.grad, dtype=np.float32)
+            if dy_np.ndim == 1:
+                dy_np = dy_np[np.newaxis, :]
+            _batch = dy_np.shape[0]
+
+            # Backward of fold reshape+sum:
+            # grad of sum is 1 to each summand -> broadcast dy to all n_folds slots.
+            dy_raw = np.tile(
+                dy_np.reshape(_batch, 1, out_dim),
+                (1, _n_folds, 1)
+            ).reshape(_batch, _n_folds * out_dim).astype(np.float32)
+
+            # Each suffix layer gets the same dy_raw; accumulate dx.
+            dx_parts = [layer.backward_dense(dy_raw, lr, lr_per_row_nnz=True)
+                        for layer in _layers]
+            dx_np = sum(dx_parts).reshape(_batch, -1)
+            if _sq:
+                dx_np = dx_np.squeeze(0)
+            _acc(x, dx_np)
+
+        out._backward = _bwd
+        return out
+
+    # ── Synaptogenesis -----------------------------------------------------------
+
+    def synaptogenesis(self, k: int, importance_cutoff: float,
+                       max_row_weights: int) -> None:
+        """
+        Grow and prune connections across all suffix layers.
+        Call after backward() and before the next forward().
+        """
+        for layer in self._sili_layers.values():
+            layer.build_probes(k)
+            layer.synap_step(importance_cutoff, max_row_weights)
+            layer.equalizer_step()
+
+    # ── State persistence --------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        out = {}
+        for suffix, layer in self._sili_layers.items():
+            out[suffix] = {
+                "ptrs":       np.array(layer.ptrs),
+                "indices":    np.array(layer.indices),
+                "weights":    np.array(layer.weights_vals),
+                "importance": np.array(layer.importance),
+                "n_folds":    np.array([self._n_folds]),
+                "out_dim":    np.array([self._out_dims[suffix]]),
+                "lr":         np.array([self.lr], dtype=np.float32),
+            }
+        return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SparseRNNCell
 # ══════════════════════════════════════════════════════════════════════════════
 
