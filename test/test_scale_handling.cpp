@@ -430,3 +430,56 @@ TEST_CASE("SiliBlock mapping: reshape+sum of [batch, n_folds*out] equals sequent
     CHECK(summed[0] == Catch::Approx(1.5f).margin(1e-5f));
     CHECK(summed[1] == Catch::Approx(3.0f).margin(1e-5f));
 }
+
+TEST_CASE("set_value_scale_raw: pre-scaled load + raw scale set round-trips correctly",
+         "[scale][value_scale][load_weights][regression]") {
+    // The SiliBlock per-row scaling workflow:
+    //   1. Compute row_scale = max_abs / FP4_MAX
+    //   2. Pass pre-scaled weights (original / row_scale) to delta_csr_from_absolute
+    //      -> FP4 quantizes to good accuracy (max maps to 6.0)
+    //   3. Set value_scale[r] = row_scale WITHOUT re-encoding via rescale_value_row
+    //      (re-encoding would re-quantize the already-scaled values, corrupting them)
+    //
+    // Verified here: a weight of 0.1 with FP4_MAX=6.0 and row_scale=0.1/6.0
+    // correctly round-trips to approximately 0.1 after pre-scaling and raw-set.
+    // Without per-row scaling, 0.1 maps to 0.0 (below FP4's min nonzero of 0.5).
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+
+    // Original weight: 0.1 -- FAR below FP4's 0.5 minimum, rounds to 0 without scaling
+    const float original_w  = 0.1f;
+    const float fp4_max     = 6.0f;
+    const float row_scale   = original_w / fp4_max;         // 0.1/6 ~ 0.0167
+    const float scaled_w    = original_w / row_scale;       // = 6.0 exactly
+
+    std::vector<float> w = {scaled_w};
+    std::vector<float> imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(4096), std::size_t(256));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(0));
+
+    // Step 3: set scale WITHOUT re-encoding
+    weights.set_value_scale_raw(0, row_scale);
+
+    // Verify: stored value is ~6.0 (scaled), true value = stored * row_scale ~ 0.1
+    const float stored = ValueAccessor<FP4BiPacked>::get_w(
+        weights.connections.values, weights.connections.layout.elem_start[0]);
+    const float true_w = stored * weights.get_value_scale(0);
+
+    CHECK(stored == Catch::Approx(6.0f).margin(0.01f));   // scaled correctly into FP4 range
+    CHECK(true_w == Catch::Approx(original_w).margin(0.005f));  // round-trips to original
+
+    // Contrast: WITHOUT per-row scaling, 0.1 would have been loaded directly
+    // and quantized to 0.0 (below FP4's minimum nonzero of 0.5).
+    auto dc_unscaled = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, std::vector<float>{original_w}, imp,
+        std::size_t(1), std::size_t(1), std::size_t(4096), std::size_t(256));
+    const float stored_unscaled = ValueAccessor<FP4BiPacked>::get_w(
+        dc_unscaled.values, dc_unscaled.layout.elem_start[0]);
+    CHECK(stored_unscaled == Catch::Approx(0.0f).margin(1e-6f));  // lost entirely
+}

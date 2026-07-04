@@ -778,6 +778,26 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale",      &SparseLinearLayer::get_value_scale,
              py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
+        .def("set_value_scale_raw",
+             [](SparseLinearLayer& self, int row, float scale) {
+                 self.weights.set_value_scale_raw(
+                     static_cast<std::size_t>(row), scale);
+             },
+             py::arg("row"), py::arg("scale"),
+             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+             "Use this after pre-scaling weights before load_weights() -- calling\n"
+             "rescale_value_row() after a pre-scaled load would double-encode.\n"
+             "Typical pattern:\n"
+             "  row_scale = max_abs / FP4_MAX\n"
+             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def("set_importance_scale_raw",
+             [](SparseLinearLayer& self, int row, float scale) {
+                 self.weights.set_importance_scale_raw(
+                     static_cast<std::size_t>(row), scale);
+             },
+             py::arg("row"), py::arg("scale"),
+             "Same as set_value_scale_raw() but for importance.")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"

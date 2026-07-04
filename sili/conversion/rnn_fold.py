@@ -680,6 +680,8 @@ class SiliBlock(RNNFoldedBlock):
         # weight-matrix orientation) -- transpose before loading so the layer
         # has n_inputs=in_dim, n_outputs=n_folds*out_dim.
         import numpy as np
+        # FP4 table largest magnitude -- scale each row so its max maps here.
+        _FP4_MAX = 6.0
         self._layers: Dict[str, object] = {}
         for suffix, csr in descriptor.stacked_weights.items():
             csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
@@ -690,8 +692,36 @@ class SiliBlock(RNNFoldedBlock):
                 n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
             idx  = csr_t.col_indices().numpy().astype(np.int32)
-            vals = csr_t.values().float().numpy()
+            vals = csr_t.values().float().numpy().copy()
+
+            # Per-row value scaling (per conversation): the stacked matrix
+            # spans rows from N different original layers with potentially very
+            # different weight magnitudes. FP4's table is {0, +-0.5 ... +-6.0}
+            # so a row with max-abs ~0.1 maps almost entirely to 0 or +-0.5.
+            # Per-row scaling maps each row's max-abs to 6.0 before
+            # quantization, then records the inverse scale in value_scale[r]
+            # so the forward kernel recovers: true_w = stored_fp4 * value_scale.
+            #
+            # Workflow: pre-scale -> load_weights (quantizes accurately) ->
+            # set_value_scale_raw (metadata only, no re-encoding).
+            # DO NOT call rescale_value_row() after a pre-scaled load -- it
+            # would re-encode the already-scaled values.
+            row_scales = np.ones(n_in, dtype=np.float32)
+            for r in range(n_in):
+                start, end = int(ptrs[r]), int(ptrs[r + 1])
+                if end > start:
+                    max_abs = float(np.abs(vals[start:end]).max())
+                    if max_abs > 0.0:
+                        row_scales[r] = max_abs / _FP4_MAX
+                        vals[start:end] /= row_scales[r]
+
             layer.load_weights(ptrs, idx, vals)
+
+            # Set the per-row scale metadata (stored values are already scaled)
+            for r in range(n_in):
+                if row_scales[r] != 1.0:
+                    layer.set_value_scale_raw(r, row_scales[r])
+
             self._layers[suffix] = layer
 
     def _forward_one_suffix(
