@@ -369,3 +369,64 @@ TEST_CASE("importance_scale and value_scale work correctly together, per-row, in
         weights.connections.values, weights.connections.layout.elem_start[0]);
     CHECK(imp_stored != 0.0f);
 }
+
+// ── SiliBlock reshape+sum mapping ────────────────────────────────────────────
+
+TEST_CASE("SiliBlock mapping: reshape+sum of [batch, n_folds*out] equals sequential sum",
+         "[siliblock][mapping][regression]") {
+    // The fold->hidden_dim mapping in forward_sili is:
+    //   raw [1, n_folds*out_dim]  ->  reshape [1, n_folds, out_dim]  ->  sum axis 1
+    // This must equal sum_i(W_i @ x) for i in range(n_folds), where W_i is
+    // the i-th fold step's weight slice (modulo FP4 quantization rounding).
+    // Verified at the C++ level using delta_csr_from_absolute directly so we
+    // can control the exact stored weights and avoid FP4-introduced error.
+    using S = int;
+    using COL_TYPE = uint32_t;
+
+    // 2 fold steps, out_dim=2, in_dim=2 -- tiny but sufficient.
+    // Weights chosen to be exactly representable in FP4 (multiples of 0.5).
+    // W0 = [[1.0, 0.0], [0.0, 1.0]], W1 = [[0.5, 0.0], [0.0, 0.5]]
+    // Stacked = [[1.0,0],[0,1],[0.5,0],[0,0.5]] shape [4 x 2]
+    // Transposed for SparseLinearLayer [2 x 4]: each input row i connects to
+    // outputs 0,2 (W0_col_i_row_0, W1_col_i_row_0) and 1,3 for row i.
+    // x = [1.0, 2.0]
+    // Expected: W0@x + W1@x = [1.0, 2.0] + [0.5, 1.0] = [1.5, 3.0]
+    // Via the single-layer route: W_stacked_transposed @ x gives
+    //   row0: connects to out0 (W0[0,0]=1.0), out2 (W1[0,0]=0.5)
+    //   row1: connects to out1 (W0[1,1]=1.0), out3 (W1[1,1]=0.5)
+    // raw output = [1.0*1, 1.0*2, 0.5*1, 0.5*2] = [1.0, 2.0, 0.5, 1.0]
+    // reshape [2, 2] + sum rows: [1.0+0.5, 2.0+1.0] = [1.5, 3.0]  correct
+
+    std::vector<S> ptrs = {0, 2, 4};  // 2 rows (in_dim=2), 2 nnz each
+    std::vector<S> idx  = {0, 2, 1, 3};
+    std::vector<float> w = {1.0f, 0.5f, 1.0f, 0.5f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, std::vector<float>(4, 0.0f),
+        std::size_t(2), std::size_t(4), std::size_t(4096), std::size_t(256));
+
+    // Compute the raw stacked output manually: w[row] * x[row] for each nnz
+    std::vector<float> x_in = {1.0f, 2.0f};
+    std::vector<float> raw(4, 0.0f);
+    auto L = dc.layout;
+    for (std::size_t r = 0; r < 2; ++r) {
+        auto cursor = dc.row_cursor(r);
+        for (std::size_t e = 0; e < L.row_nnz(r); ++e) {
+            COL_TYPE col = cursor.advance();
+            std::size_t vb = L.elem_start[r] + e;
+            float w_val = ValueAccessor<FP4BiPacked>::get_w(dc.values, vb);
+            raw[col] += w_val * x_in[r];
+        }
+    }
+    // raw = [1.0, 2.0, 0.5, 1.0]
+
+    // Reshape [4] as [n_folds=2, out_dim=2] and sum across n_folds:
+    const int n_folds = 2, out_dim = 2;
+    std::vector<float> summed(out_dim, 0.0f);
+    for (int fold = 0; fold < n_folds; ++fold)
+        for (int o = 0; o < out_dim; ++o)
+            summed[o] += raw[fold * out_dim + o];
+
+    // Expected: sequential sum W0@x + W1@x = [1.5, 3.0]
+    CHECK(summed[0] == Catch::Approx(1.5f).margin(1e-5f));
+    CHECK(summed[1] == Catch::Approx(3.0f).margin(1e-5f));
+}

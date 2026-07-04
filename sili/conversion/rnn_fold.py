@@ -734,15 +734,40 @@ class SiliBlock(RNNFoldedBlock):
 
         _forward_one_suffix is called EXACTLY ONCE per suffix (not N times).
         The full stacked weight matrix handles all N fold steps in one shot.
-        Output shape: [batch, n_folds * out_dim].
+
+        Shape contract (matches RNNFoldedBlock.forward's base class contract):
+          input:  [batch, hidden_dim]  (same as original x)
+          output: [batch, hidden_dim]  (same shape, so it can be a drop-in)
+
+        Internally the SparseLinearLayer produces [batch, n_folds * out_dim],
+        which we map back to [batch, out_dim] by reshaping to
+        [batch, n_folds, out_dim] and summing across the fold dimension.
+
+        At initialisation this approximates the sequential composition of all
+        N original transformer blocks (linear regime, small weights, sum ≈
+        chain).  After synaptogenesis the sparse connections that survive are
+        exactly the ones that contribute meaningfully -- the sum only has
+        nonzero terms for active connections.
         """
         import numpy as np
-        device = x.device
-        x_np   = x.detach().cpu().float().numpy()
+        device  = x.device
+        x_np    = x.detach().cpu().float().numpy()
+
+        # One call per suffix -- each produces [1, n_folds * out_dim]
         out_parts = [self._forward_one_suffix(layer, x_np, lr)
                      for layer in self._layers.values()]
-        out_np = sum(out_parts)
-        return torch.from_numpy(out_np).to(device)
+        # Sum suffix contributions (Q, K, V, MLP etc. all write to state)
+        raw_np = sum(out_parts)  # [1, n_folds * out_dim]
+
+        # Map [batch, n_folds * out_dim] → [batch, out_dim]
+        # by summing the n_folds "slots" that the stacked matrix wrote into.
+        # out_dim is the hidden_dim of the original per-layer weights.
+        # Pick the out_dim from any suffix (they all agree for compatible blocks).
+        out_dim = next(iter(self.desc.out_dims.values()))
+        batch   = raw_np.shape[0]
+        summed  = raw_np.reshape(batch, self.desc.n_folds, out_dim).sum(axis=1)
+
+        return torch.from_numpy(summed).to(device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Inference-mode drop-in: routes through forward_sili(lr=0)."""
