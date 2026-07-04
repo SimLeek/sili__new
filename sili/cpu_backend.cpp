@@ -466,17 +466,8 @@ public:
                 static_cast<std::ptrdiff_t>(use_e) - static_cast<std::ptrdiff_t>(cur_e);
 
             delta_csr_shift_row<S, FP4BiPacked, COL_TYPE>(dc, r, use_b, use_e);
-
-            // Fix up byte_end and elem_end for rows r+1..rows-1.
-            // delta_csr_shift_row only updates the _start arrays; _end
-            // arrays for subsequent rows are stale until synap_step rebuilds
-            // them. In a bulk equalization we must fix them here.
-            for (std::size_t j = r + 1; j < rows; ++j) {
-                L.byte_end[j] = static_cast<std::size_t>(
-                    static_cast<std::ptrdiff_t>(L.byte_end[j]) + bd);
-                L.elem_end[j] = static_cast<std::size_t>(
-                    static_cast<std::ptrdiff_t>(L.elem_end[j]) + ed);
-            }
+            // delta_csr_shift_row now updates byte_end and elem_end for all
+            // rows r+1..rows-1 -- no additional fixup needed here.
         }
 
         // Last row: no rows follow it, so no memmove is needed -- just

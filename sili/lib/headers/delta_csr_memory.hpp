@@ -186,6 +186,16 @@ void delta_csr_shift_row(
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             L.byte_start[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.byte_start[r]) + byte_delta);
+        // byte_end[r] for r > row must shift by the same delta: the memmove
+        // physically relocated the data for those rows, so byte_end[r] is now
+        // pointing to the wrong (old) position. Without this update,
+        // row_nnz(r) reads as 0 or underflows for any r > row during a bulk
+        // equalization pass (safe in the one-per-cycle path only because
+        // synap_step rebuilds byte_end via row_rebuild before the equalizer
+        // touches each row).
+        for (std::size_t r = row + 1; r < L.rows; ++r)
+            L.byte_end[r] = static_cast<std::size_t>(
+                static_cast<std::ptrdiff_t>(L.byte_end[r]) + byte_delta);
     }
 
     // ── element side ─────────────────────────────────────────────────────────
@@ -212,6 +222,12 @@ void delta_csr_shift_row(
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             L.elem_start[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.elem_start[r]) + elem_delta);
+        // Same fix as byte side: elem_end for shifted rows must track the
+        // physical move. row_nnz(r) = elem_end[r] - elem_start[r] underflows
+        // if elem_start is updated but elem_end is not.
+        for (std::size_t r = row + 1; r < L.rows; ++r)
+            L.elem_end[r] = static_cast<std::size_t>(
+                static_cast<std::ptrdiff_t>(L.elem_end[r]) + elem_delta);
     }
 }
 

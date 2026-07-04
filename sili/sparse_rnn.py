@@ -277,7 +277,15 @@ class FoldedLayer(Module):
             n_in  = int(csr_t.shape[0])
             n_out = int(csr_t.shape[1])
             nnz   = int(csr_t.values().numel())
-            layer = _cpu.SparseLinearLayer(n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
+            # Budget for the delta-CSR pool: size for the fully-connected
+            # maximum (n_in * n_out), not for current nnz. This is the fixed
+            # total the staggered equalizer_step() will redistribute within --
+            # equalization only moves bytes between rows, never grows the pool.
+            # Sizing for n_in*n_out guarantees every row can hold n_out
+            # connections after a full equalization pass, which is the absolute
+            # ceiling for any max_row_weights value.
+            budget = n_in * n_out
+            layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
 
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
             idx  = csr_t.col_indices().numpy().astype(np.int32)
@@ -312,13 +320,14 @@ class FoldedLayer(Module):
             for r in range(n_in):
                 layer.set_importance_scale_raw(r, imp_scale)
 
-            # One-time capacity setup: grow every row to have at least
-            # n_out elements of reserved space so grow-back after prune
-            # never runs out of room. equalize_to_capacity ADDS memory for
-            # under-allocated rows; the staggered equalizer_step() in
-            # synaptogenesis then redistributes any freed space each cycle.
-            # n_out = n_folds * out_dim is a reasonable initial target --
-            # the absolute maximum useful connections per input neuron.
+            # One-time construction setup: give every row at least n_out
+            # elements of reserved space so grow-back after prune never runs
+            # out of room. This is called ONCE here, not at runtime.
+            # After this call the pool size is fixed; the staggered
+            # equalizer_step() in synaptogenesis redistributes within that
+            # fixed pool each cycle.
+            # n_out = n_folds * out_dim is the absolute ceiling for
+            # connections per input neuron.
             layer.equalize_to_capacity(n_out)
 
             layers[suffix] = layer
