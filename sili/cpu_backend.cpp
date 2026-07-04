@@ -1127,6 +1127,78 @@ PYBIND11_MODULE(_cpu, m)
         "Dense banded attention. Q/K/V are [T, d] float32 numpy arrays.\n"
         "Returns [T, d] output.");
 
+    m.def("banded_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           py::array_t<float> dO,
+           std::size_t half_bandwidth, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
+            py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
+            py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
+            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
+            banded_attention_backward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (const float*)dob.ptr,
+                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
+                T, K, d, half_bandwidth, num_cpus);
+            return py::make_tuple(dQ, dK, dV);
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
+        py::arg("half_bandwidth"), py::arg("num_cpus") = 4,
+        "Backward pass for banded_attention. Returns (dQ, dK, dV) each [T or K, d].");
+
+    m.def("sparse_banded_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           py::array_t<float> dO,
+           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
+            py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
+            py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
+            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
+            sparse_banded_attention_backward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (const float*)dob.ptr,
+                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
+                T, K, d, half_bandwidth, inner_k, num_cpus);
+            return py::make_tuple(dQ, dK, dV);
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
+        py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
+        "Backward pass for sparse_banded_attention. Returns (dQ, dK, dV).");
+
+    m.def("sparse_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           py::array_t<float> dO,
+           std::size_t top_k, int num_cpus) {
+            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            const std::size_t T = qb.shape[0], d = qb.shape[1];
+            py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
+            py::array_t<float> dK({(py::ssize_t)T, (py::ssize_t)d});
+            py::array_t<float> dV({(py::ssize_t)T, (py::ssize_t)d});
+            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + T*d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + T*d, 0.0f);
+            sparse_attention_backward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (const float*)dob.ptr,
+                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
+                T, d, top_k, num_cpus);
+            return py::make_tuple(dQ, dK, dV);
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
+        py::arg("top_k") = 0, py::arg("num_cpus") = 4,
+        "Backward pass for sparse_attention. Returns (dQ, dK, dV).");
+
     // ── Loss functions ────────────────────────────────────────────────────────
 
     m.def("mse_loss",
