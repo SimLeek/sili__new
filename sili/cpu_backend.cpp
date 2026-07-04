@@ -430,6 +430,76 @@ public:
         _equalize_row = static_cast<S>(row);
     }
 
+    // One-time setup: grow each row until it has at least target_elems
+    // elements of reserved space. Unlike equalizer_step() (which only
+    // redistributes the existing pool), this ADDS memory for rows below
+    // the target. Call once with max_row_weights before starting
+    // synaptogenesis; subsequent cycles use the staggered equalizer_step()
+    // for ongoing redistribution.
+    // Last row handled separately (no memmove needed -- nothing follows it).
+    void equalize_to_capacity(int target_elems_per_row) {
+        // Grow each row until it has at least target_elems_per_row of
+        // reserved space for both index bytes and value elements.
+        //
+        // KEY SUBTLETY: delta_csr_shift_row updates elem_start[r+1..rows]
+        // but NOT elem_end[r+1..rows-1]. In the normal synaptogenesis
+        // workflow this is safe because synap_step rebuilds rows (resetting
+        // elem_end) before the equalizer touches them. In a bulk loop we
+        // must fix elem_end and byte_end ourselves after each shift,
+        // otherwise row_nnz(j) = elem_end[j] - elem_start[j] underflows.
+        const std::size_t tgt_e = static_cast<std::size_t>(target_elems_per_row);
+        const std::size_t tgt_b = tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
+        auto& dc  = weights.connections;
+        const std::size_t rows = dc.layout.rows;
+
+        for (std::size_t r = 0; r + 1 < rows; ++r) {
+            auto& L = dc.layout;
+            const std::size_t cur_b = L.row_alloc_bytes(r);
+            const std::size_t cur_e = L.row_alloc_elems(r);
+            const std::size_t use_b = std::max(cur_b, tgt_b);
+            const std::size_t use_e = std::max(cur_e, tgt_e);
+            if (use_b == cur_b && use_e == cur_e) continue;
+
+            const std::ptrdiff_t bd =
+                static_cast<std::ptrdiff_t>(use_b) - static_cast<std::ptrdiff_t>(cur_b);
+            const std::ptrdiff_t ed =
+                static_cast<std::ptrdiff_t>(use_e) - static_cast<std::ptrdiff_t>(cur_e);
+
+            delta_csr_shift_row<S, FP4BiPacked, COL_TYPE>(dc, r, use_b, use_e);
+
+            // Fix up byte_end and elem_end for rows r+1..rows-1.
+            // delta_csr_shift_row only updates the _start arrays; _end
+            // arrays for subsequent rows are stale until synap_step rebuilds
+            // them. In a bulk equalization we must fix them here.
+            for (std::size_t j = r + 1; j < rows; ++j) {
+                L.byte_end[j] = static_cast<std::size_t>(
+                    static_cast<std::ptrdiff_t>(L.byte_end[j]) + bd);
+                L.elem_end[j] = static_cast<std::size_t>(
+                    static_cast<std::ptrdiff_t>(L.elem_end[j]) + ed);
+            }
+        }
+
+        // Last row: no rows follow it, so no memmove is needed -- just
+        // extend the flat buffers and update the end markers.
+        if (rows > 0) {
+            auto& L = dc.layout;
+            const std::size_t r   = rows - 1;
+            const std::size_t cur_b = L.row_alloc_bytes(r);
+            const std::size_t cur_e = L.row_alloc_elems(r);
+            const std::size_t use_b = std::max(cur_b, tgt_b);
+            const std::size_t use_e = std::max(cur_e, tgt_e);
+            if (use_b > cur_b) {
+                dc.indices_buf.resize(dc.indices_buf.size() + (use_b - cur_b), uint8_t(0));
+                L.byte_start[rows] = L.byte_start[r] + use_b;
+            }
+            if (use_e > cur_e) {
+                const std::size_t new_total = L.elem_start[rows] + (use_e - cur_e);
+                ValueAccessor<FP4BiPacked>::resize(dc.values, new_total);
+                L.elem_start[rows] = new_total;
+            }
+        }
+    }
+
     // Repack in place: every row occupies exactly its active bytes/elements,
     // zero inter-row blank space (see compact() in sparse_struct.hpp for the
     // full rationale). Call before saving/measuring a freshly converted or
@@ -447,6 +517,18 @@ public:
     // exception rather than silently doing nothing if headroom is missing.
     void expand_headroom(float blank_fraction = 0.2f) {
         weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
+    }
+
+    // Like expand_headroom() but guarantees each row has headroom for at
+    // least min_nnz_per_row connections. Required for grow-back after prune:
+    // a row pruned to 2 connections with plain expand_headroom() gets only
+    // ~2.4 connections of headroom, then fails when synap_step tries to grow
+    // back toward max_row_weights (which may be much larger).
+    void expand_headroom_to(int min_nnz_per_row, float blank_fraction = 0.2f) {
+        weights.connections = ::expand_headroom_to<S, FP4BiPacked, COL_TYPE>(
+            weights.connections,
+            static_cast<std::size_t>(min_nnz_per_row),
+            blank_fraction);
     }
 
     // Per-ROW scale applied to stored importance/weight to get true units
@@ -757,18 +839,33 @@ PYBIND11_MODULE(_cpu, m)
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
         .def("equalizer_step",       &SparseLinearLayer::equalizer_step,
-             "Memory rebalancing: redistributes blank space between neighboring\n"
-             "rows' territory so growth headroom stays reasonably even across the\n"
-             "layer. Own internal row cursor, separate from synap_step's.")
+             "One row of staggered memory redistribution -- call once per\n"
+             "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
+             "add new memory. Use equalize_to_capacity() first to ensure the\n"
+             "pool is large enough for max_row_weights connections per row.")
+        .def("equalize_to_capacity", &SparseLinearLayer::equalize_to_capacity,
+             py::arg("target_elems_per_row"),
+             "Grow each row until it has at least target_elems_per_row\n"
+             "elements of reserved space. Unlike equalizer_step() which only\n"
+             "redistributes the existing pool, this ADDS memory for under-\n"
+             "allocated rows. Call once with max_row_weights before starting\n"
+             "synaptogenesis; subsequent cycles use the staggered\n"
+             "equalizer_step() for ongoing redistribution.")
         .def("compact",              &SparseLinearLayer::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
         .def("expand_headroom",      &SparseLinearLayer::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
-             "Opposite of compact(): restores growth headroom, normalized to\n"
-             "exactly blank_fraction of current content. Call before resuming\n"
-             "synaptogenesis on a compact()ed layer.")
+             "Restore per-row growth headroom (proportional to current nnz).\n"
+             "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
+             "cycle -- plain expand_headroom allocates headroom proportional\n"
+             "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
+        .def("expand_headroom_to",   &SparseLinearLayer::expand_headroom_to,
+             py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
+             "Like expand_headroom() but guarantees each row has headroom for\n"
+             "at least min_nnz_per_row connections. Call with max_row_weights\n"
+             "before synaptogenesis after a prune cycle.")
         .def("get_importance_scale", &SparseLinearLayer::get_importance_scale,
              py::arg("row"),
              "Per-ROW scale applied to that row's stored importance to get true\n"

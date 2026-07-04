@@ -141,6 +141,32 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom(
         static_cast<std::size_t>(n * (1.0 + blank_fraction)) + 64,
         blank_fraction);
 }
+
+// Like expand_headroom() but sizes the total budget for at least
+// min_nnz_per_row connections per row. Use before synaptogenesis on a
+// freshly loaded layer, then call equalizer_step() for each row to
+// redistribute the budget evenly. After a full equalization pass each row
+// has total_budget/rows = min_nnz_per_row elements of reserved headroom.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
+    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+    std::size_t min_nnz_per_row,
+    float blank_fraction = 0.2f)
+{
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    std::vector<SIZE_TYPE>  ptrs, idx;
+    std::vector<value_type> w, imp;
+    delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, ptrs, idx, w, imp);
+    const std::size_t rows   = dc.layout.rows;
+    const std::size_t n      = idx.size();
+    const std::size_t budget = std::max(n, rows * min_nnz_per_row);
+    return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
+        ptrs, idx, w, imp, rows, dc.layout.cols,
+        budget * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
+        static_cast<std::size_t>(budget * (1.0 + blank_fraction)) + 64,
+        blank_fraction);
+}
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>

@@ -301,6 +301,26 @@ class FoldedLayer(Module):
                 if row_scales[r] != 1.0:
                     layer.set_value_scale_raw(r, row_scales[r])
 
+            # Per-row importance_scale: same FP4 representability problem as
+            # value_scale but for importance. The Hebbian update magnitude is
+            # roughly w * x * lr ~ lr after our value scaling. FP4's minimum
+            # nonzero is 0.5, so a raw importance update of lr=0.01 rounds to 0.
+            # Setting importance_scale = lr / FP4_MAX maps FP4's range to
+            # [-6*lr, +6*lr], making updates of order lr representable from
+            # the very first step.
+            imp_scale = learning_rate / _FP4_MAX
+            for r in range(n_in):
+                layer.set_importance_scale_raw(r, imp_scale)
+
+            # One-time capacity setup: grow every row to have at least
+            # n_out elements of reserved space so grow-back after prune
+            # never runs out of room. equalize_to_capacity ADDS memory for
+            # under-allocated rows; the staggered equalizer_step() in
+            # synaptogenesis then redistributes any freed space each cycle.
+            # n_out = n_folds * out_dim is a reasonable initial target --
+            # the absolute maximum useful connections per input neuron.
+            layer.equalize_to_capacity(n_out)
+
             layers[suffix] = layer
 
         return cls(layers, descriptor.n_folds, descriptor.out_dims, learning_rate)
@@ -386,16 +406,59 @@ class FoldedLayer(Module):
 
     # ── Synaptogenesis -----------------------------------------------------------
 
-    def synaptogenesis(self, k: int, importance_cutoff: float,
-                       max_row_weights: int) -> None:
+    def synaptogenesis(
+        self,
+        k:                int,
+        importance_cutoff: float,
+        max_row_weights:   int,
+        rows_per_call:     int = 0,
+    ) -> None:
         """
         Grow and prune connections across all suffix layers.
-        Call after backward() and before the next forward().
+
+        Each call to synap_step() advances ONE row of the layer's internal
+        cursor, deciding for that row: remove synapses whose importance fell
+        below importance_cutoff, then grow new ones (from the top-k probes)
+        until the row reaches max_row_weights.
+
+        To prune and grow uniformly, the net effect of one full sweep
+        (all n_inputs rows visited) is:
+          - removed: synapses with importance < importance_cutoff
+          - added:   up to max_row_weights - surviving_nnz new synapses
+          - total:   capped at max_row_weights per row (constant if all rows
+                     were already at max_row_weights before pruning)
+
+        args:
+          k                 -- probes to build (how many candidate connections
+                               per row to consider for growth).  Rule of thumb:
+                               k ~ 4 * max_row_weights gives good coverage.
+          importance_cutoff -- prune synapses whose stored importance magnitude
+                               falls below this threshold (in FP4 stored units;
+                               multiply by get_importance_scale(r) for true units)
+          max_row_weights   -- target connections per row after this sweep.
+                               Vary this over time (e.g. sine wave) to test
+                               that the layer can both grow AND shrink.
+          rows_per_call     -- 0 (default) = full sweep (all n_inputs rows);
+                               N > 0 = advance exactly N rows (staggered mode,
+                               useful when called every training step to spread
+                               the work across many steps rather than a single
+                               large pause).
+
+        Call AFTER backward() and BEFORE the next forward().
+        Accumulators are zeroed at the end of each call -- they are valid only
+        for the interval between the last zero_accum and this synaptogenesis call.
         """
         for layer in self._sili_layers.values():
             layer.build_probes(k)
-            layer.synap_step(importance_cutoff, max_row_weights)
-            layer.equalizer_step()
+            n = rows_per_call if rows_per_call > 0 else layer.n_inputs
+            for _ in range(n):
+                layer.synap_step(importance_cutoff, max_row_weights)
+            layer.equalizer_step()   # staggered 1-row redistribution
+            layer.zero_accum()
+
+    def nnz_total(self) -> int:
+        """Total live connections across all suffix layers (for monitoring)."""
+        return sum(layer.nnz for layer in self._sili_layers.values())
 
     # ── State persistence --------------------------------------------------------
 
@@ -412,6 +475,93 @@ class FoldedLayer(Module):
                 "lr":         np.array([self.lr], dtype=np.float32),
             }
         return out
+
+
+
+class SynaptogenesisSchedule:
+    """
+    Schedule for calling FoldedLayer.synaptogenesis() at regular intervals
+    with a (optionally varying) max_row_weights target.
+
+    Constant connections (default):
+        sched = SynaptogenesisSchedule(layer, base_connections=64,
+                                       every_n_steps=20)
+
+    Sine-wave connections (useful for testing grow/shrink both work):
+        sched = SynaptogenesisSchedule(layer, base_connections=64,
+                                       amplitude=0.3, period=200,
+                                       every_n_steps=20)
+
+    During training:
+        for step, (x, y) in enumerate(data):
+            out  = layer(x)
+            loss = criterion(out, y)
+            loss.backward()
+            sched.step()           # handles synaptogenesis cadence internally
+
+    The sine wave is:
+        max_row_weights(t) = round(base * (1 + amplitude * sin(2*pi*t/period)))
+
+    With amplitude=0, this is constant at base.  The sine wave exercises both
+    growth (max > base) and pruning (max < base) and is a clean regression:
+    after many full cycles, nnz_total should oscillate around base * n_rows.
+    """
+
+    def __init__(
+        self,
+        layer:             "FoldedLayer",
+        base_connections:  int,
+        k_factor:          int   = 4,        # probes = k_factor * max_row_weights
+        importance_cutoff: float = 0.0,      # stored-unit importance threshold
+        amplitude:         float = 0.0,      # 0 = constant, 0.3 = +-30%
+        period:            int   = 200,      # steps per full sine cycle
+        every_n_steps:     int   = 20,       # run synaptogenesis every N steps
+        rows_per_call:     int   = 0,        # 0 = full sweep
+    ):
+        self._layer             = layer
+        self._base              = base_connections
+        self._k_factor          = k_factor
+        self._importance_cutoff = importance_cutoff
+        self._amplitude         = amplitude
+        self._period            = period
+        self._every             = every_n_steps
+        self._rows_per_call     = rows_per_call
+        self._t                 = 0      # training steps counted
+        self._synap_t           = 0      # synaptogenesis calls counted
+
+    def current_max_row_weights(self) -> int:
+        """Current target based on the sine wave at this step."""
+        if self._amplitude == 0.0:
+            return self._base
+        import math
+        factor = 1.0 + self._amplitude * math.sin(
+            2.0 * math.pi * self._synap_t / self._period)
+        return max(1, round(self._base * factor))
+
+    def step(self) -> bool:
+        """
+        Advance one training step. Runs synaptogenesis if the cadence fires.
+        Returns True if synaptogenesis ran this step.
+        """
+        self._t += 1
+        if self._t % self._every != 0:
+            return False
+        mrw = self.current_max_row_weights()
+        k   = max(1, self._k_factor * mrw)
+        self._layer.synaptogenesis(
+            k, self._importance_cutoff, mrw, self._rows_per_call)
+        self._synap_t += 1
+        return True
+
+    @property
+    def t(self) -> int:
+        """Training steps elapsed."""
+        return self._t
+
+    @property
+    def synap_calls(self) -> int:
+        """Synaptogenesis calls made so far."""
+        return self._synap_t
 
 
 # ══════════════════════════════════════════════════════════════════════════════

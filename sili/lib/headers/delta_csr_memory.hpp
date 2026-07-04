@@ -358,8 +358,6 @@ bool delta_csr_synap_row_step(
     SIZE_TYPE max_row_weights)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
-    if (!weights.probes.indices[0] || weights.probes.indices[0]->empty()) return false;
-
     auto& dc = weights.connections;
     auto& L  = dc.layout;
     if (L.rows == 0) return false;
@@ -368,6 +366,16 @@ bool delta_csr_synap_row_step(
     current_row = (current_row + 1) % L.rows;
 
     const std::size_t n_exist = L.row_nnz(row);
+
+    // Skip when there is genuinely nothing to do: no existing connections AND
+    // no probe candidates. Do NOT skip when n_exist > 0 just because probes
+    // are empty -- that would block the prune-only path (e.g. a fully-dense
+    // layer where n_exist > max_row_weights but all (row,col) pairs already
+    // exist so build_probes returns empty). Pruning must work regardless of
+    // whether growth candidates are available.
+    const bool has_probes = weights.probes.indices[0] &&
+                            !weights.probes.indices[0]->empty();
+    if (n_exist == 0 && !has_probes) return false;
     std::vector<COL_TYPE>   exist_cols(n_exist);
     std::vector<value_type> exist_w(n_exist), exist_imp(n_exist);
     {
@@ -381,7 +389,7 @@ bool delta_csr_synap_row_step(
 
     std::vector<COL_TYPE>   probe_cols;
     std::vector<value_type> probe_imp;
-    {
+    if (has_probes) {
         const auto& prow = *weights.probes.indices[0];
         const auto& pcol = *weights.probes.indices[1];
         const auto& pval = *weights.probes.values[0];
