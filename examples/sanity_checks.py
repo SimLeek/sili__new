@@ -133,9 +133,11 @@ def run(task='rare', steps=2000, hidden=32, lr=0.01,
 
             # Plain dense output -- no energy on predictions
             pred=head.forward(h_out.data)
-            # EnergyWrapper pattern: predict CURRENT step's class.
-            # For sine, next-step makes sense (temporal prediction).
-            # For classification tasks (char/copy/rare), predict current input.
+            # Target selection:
+            #   sine: predict NEXT step (temporal prediction is the point)
+            #   char/copy/rare: predict CURRENT step (sanity check that learning
+            #     and gradient flow work -- current-step is near-trivial but
+            #     confirms the stack is working before tackling harder tasks)
             tgt=seq[t+1,:n_out] if task=='sine' else seq[t,:n_out]
 
             # Task loss gradient

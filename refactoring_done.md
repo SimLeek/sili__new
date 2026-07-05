@@ -36,7 +36,7 @@ Done (refactoring_todo.md written, TODO.md maintained separately).
 - `equalize_to_capacity(target_elems_per_row)`: new method on `SparseLinearLayer` -- grows each row to at least target_elems reserved space. Fixes up `byte_end`/`elem_end` for all subsequent rows after each shift (delta_csr_shift_row only updates _start arrays; stale _end causes `row_nnz` underflow in bulk equalization).
 - `SparseLinearLayer.expand_headroom_to` pybind binding.
 - `SparseLinearLayer.equalize_to_capacity` pybind binding.
-- Per-row `importance_scale = lr / FP4_MAX` set at `from_descriptor` time so Hebbian updates of magnitude ~lr are representable from the first step.
+- Per-row `importance_scale = lr / FP4_MAX` set at `from_descriptor` time so activity-correlation importance updates of magnitude ~lr are representable from the first step. (Weight values are only changed by backward_dense() -- importance updates in forward_dense() do NOT change weight values.)
 - `FoldedLayer.synaptogenesis()`: full-sweep (all n_inputs rows), staggered `equalizer_step` (1 row per call), `zero_accum()` after.
 - `FoldedLayer.nnz_total()`: monitoring helper.
 - `SynaptogenesisSchedule`: wrapper with configurable cadence and optional sine-wave `max_row_weights` for grow/shrink testing.

@@ -326,12 +326,14 @@ class FoldedLayer(Module):
                     layer.set_value_scale_raw(r, row_scales[r])
 
             # Per-row importance_scale: same FP4 representability problem as
-            # value_scale but for importance. The Hebbian update magnitude is
-            # roughly w * x * lr ~ lr after our value scaling. FP4's minimum
-            # nonzero is 0.5, so a raw importance update of lr=0.01 rounds to 0.
-            # Setting importance_scale = lr / FP4_MAX maps FP4's range to
-            # [-6*lr, +6*lr], making updates of order lr representable from
-            # the very first step.
+            # value_scale but for importance.
+            # Importance is updated via activity correlation in forward_dense
+            # (magnitude ~ |x| * |h| * lr ~ lr after value scaling).
+            # FP4 minimum nonzero is 0.5, so a raw update of lr=0.01 rounds to 0.
+            # Setting importance_scale = lr / FP4_MAX maps FP4 range to
+            # [-6*lr, +6*lr], making importance updates of order lr representable
+            # from the first step. Weight VALUES are NOT changed in forward_dense;
+            # they are updated only by backward_dense() via the task gradient.
             imp_scale = learning_rate / _FP4_MAX
             for r in range(n_in):
                 layer.set_importance_scale_raw(r, imp_scale)
@@ -380,11 +382,22 @@ class FoldedLayer(Module):
         x: sili Tensor [batch, in_dim]  (or [in_dim] -- squeezed automatically)
         Returns: sili Tensor [batch, out_dim]
 
-        Wired into sili autograd: calling loss.backward() will propagate through
-        this layer automatically.  Weight updates (Hebbian + gradient) happen
-        inside the C++ kernels:
-          - Hebbian importance update: forward_dense(x, lr)  [this method]
-          - Gradient weight+importance update: backward_dense(dy, lr) [_backward]
+        Wired into sili autograd: calling loss.backward() propagates through
+        this layer automatically. Two separate update paths run in the C++ kernels:
+
+          - forward_dense(x, lr) [this method]:
+              Computes output AND updates IMPORTANCE via activity correlation
+              (|x| * |h| * lr). This does NOT change weight values.
+              Importance tracks which connections are actively used, guiding
+              synaptogenesis pruning/growing decisions later.
+
+          - backward_dense(dy, lr) [_backward, called by loss.backward()]:
+              Updates WEIGHT VALUES via task gradient (standard backprop).
+              Also updates importance via gradient magnitude.
+              This is what enables the network to learn tasks.
+
+        Note: calling forward_dense with lr=0 disables importance tracking.
+        Weight values never change without a backward() call.
         """
         x_np = np.asarray(x.data, dtype=np.float32)
         squeezed = x_np.ndim == 1

@@ -24,13 +24,16 @@
 // ── forward ───────────────────────────────────────────────────────────────────
 
 /**
- * @brief Dense-input forward pass with inline Hebbian importance update.
+ * @brief Dense-input forward pass with inline importance tracking update.
  *
  * @param input          [batch x in_cols] row-major dense.
  * @param batch, in_cols Input dimensions.
  * @param weights        Layer state (importance updated in place if learning_rate != 0).
  * @param output         [batch x out_cols] accumulated into (caller zeroes first).
- * @param learning_rate  Hebbian importance update rate (0 = off).
+ * @param learning_rate  Importance update rate (0 = off). Controls activity-based
+ *                       importance tracking (|x|*|h|*lr). Does NOT change weight
+ *                       values -- those are updated only by backward_dense() via
+ *                       the task gradient.
  * @param num_cpus       OpenMP thread count.
  *
  * NOTE (test): with learning_rate=0, output must equal the dense matmul
@@ -205,8 +208,8 @@ void disldo_backward(
         // scale_eff_lr update below), so there's no Hoyer-based adaptive
         // policy decision that needs live weight stats between explicit
         // recompute_stats() calls. Importance stats ARE needed in backward
-        // because importance gets gradient updates here as well as Hebbian
-        // updates in forward.
+        // because importance gets gradient updates here (backward) as well as
+        // activity-correlation updates in forward_dense() (forward).
         double local_sum_abs_new_i = 0.0, local_sum_abs_old_i = 0.0;
         double local_sum_sq_new_i  = 0.0, local_sum_sq_old_i  = 0.0;
         value_type local_max_new_i = value_type(0);

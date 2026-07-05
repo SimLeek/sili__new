@@ -118,7 +118,7 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
 ///Sparse matmul of @p weights and @p input_tensor; accumulates forward contributions
 ///into connection strength scaled by @p learning_rate.
 // BUG FIX (see conversation): was `const WEIGHTS_T&` but conditionally mutates
-// conn_str[wptr] (Hebbian importance update) when learning_rate != 0 -- same
+// conn_str[wptr] (activity-correlation importance update) when learning_rate != 0 -- same
 // pattern already found and fixed in delta_csr_forward (sparse_struct.hpp)
 // this session. This one "worked" only by accident for SparseLinearWeightsV
 // (TriValues, shared_ptr<vector> indirection -- const doesn't propagate

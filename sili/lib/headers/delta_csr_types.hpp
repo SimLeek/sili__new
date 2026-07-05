@@ -429,7 +429,7 @@ struct SparseLinearWeightsDelta {
     std::vector<SIZE_TYPE>                            out_degree;
 
     // Per-ROW scale applied to STORED importance to get TRUE units before
-    // any importance arithmetic (the Hebbian `1+|imp|` denominator, the
+    // any importance arithmetic (the activity-correlation `1+|imp|` denominator, the
     // per-step decay). Motivation: FP4's smallest representable nonzero
     // magnitude is 0.5, but well-conditioned weight init scales as roughly
     // 1/sqrt(fan_in) -- for fan_in=1000 that's ~0.03, far below FP4's floor.
@@ -438,7 +438,7 @@ struct SparseLinearWeightsDelta {
     // inflated raw values that don't correspond to anything meaningful.
     //
     // Per-row, not per-layer: different rows can have very different
-    // natural Hebbian-trace magnitude within the SAME layer (different
+    // natural importance-trace magnitude within the SAME layer (different
     // fan-in/connection counts, especially once synaptogenesis has been
     // running a while and row_nnz has diverged across rows) -- a single
     // layer-wide scale can't serve a sparsely-connected row and a
