@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 
 import sili.cpu
-from sili.tensor import Tensor
+from sili.tensor import Tensor, tanh as sili_tanh
 from sili.energy import EnergyDynamics
 
 
@@ -76,7 +76,8 @@ def make_weights(shapes: dict, scale=0.05, seed=0) -> dict:
 # ── sili implementation ────────────────────────────────────────────────────────
 
 def run_sili(task, steps, hidden, d_k, window, lr, aux_weight,
-             clip, report_every, init_weights):
+             clip, report_every, init_weights,
+             nonlinearity="energy", peaked_init=False):
     n_in = 2; n_out = 2
 
     W  = Tensor(init_weights['W'].copy())
@@ -94,6 +95,16 @@ def run_sili(task, steps, hidden, d_k, window, lr, aux_weight,
     energy = EnergyDynamics(drive=1./hidden, activation_cost=0.05,
                             precision=0.01, density=frac/2,
                             exploration=0.001, p=frac)
+
+    if peaked_init:
+        # Init Wq = Wk at larger scale so softmax peaks on same-token
+        # positions from step 1 rather than waiting for gradient to sharpen.
+        # Same-token matching: for bit=[1,0], K[i] = Wk[0]; for [0,1], K[i] = Wk[1].
+        # Q = h_out @ Wq; with Wq initialized to project h_out onto token-like
+        # directions, same-token positions get high dot product immediately.
+        Wk[:] = init_weights['Wk'].copy() * 5.0   # larger scale -> sharper softmax
+        Wv[:] = init_weights['Wv'].copy() * 5.0
+        # Wq not changed: gradient from task loss shapes Q toward K
 
     mse_log = []
 
@@ -115,7 +126,11 @@ def run_sili(task, steps, hidden, d_k, window, lr, aux_weight,
             # RNN step
             xh    = Tensor(np.concatenate([tok, state]))
             h_raw = xh @ W + bW
-            h_out, aux, _ = energy.forward(h_raw)
+            if nonlinearity == "tanh":
+                h_out = sili_tanh(h_raw)
+                aux   = None
+            else:
+                h_out, aux, _ = energy.forward(h_raw)
 
             # Attention: Q from hidden (in autograd), K/V from token history
             if len(K_hist) > 0:
@@ -183,7 +198,7 @@ def run_sili(task, steps, hidden, d_k, window, lr, aux_weight,
 # ── PyTorch implementation (identical architecture, tanh instead of energy) ──
 
 def run_pytorch(task, steps, hidden, d_k, window, lr, clip,
-                report_every, init_weights):
+                report_every, init_weights, peaked_init=False):
     n_in = 2; n_out = 2
     scale_att = math.sqrt(d_k)
 
@@ -197,6 +212,10 @@ def run_pytorch(task, steps, hidden, d_k, window, lr, clip,
     Vh = torch.tensor(init_weights['Vh'].copy(), requires_grad=True)
     bh = torch.zeros(n_out, requires_grad=True)
     pt_params = [W, bW, Wq, Wo, Vh, bh]
+
+    if peaked_init:
+        Wk = torch.tensor(init_weights['Wk'].copy() * 5.0)
+        Wv = torch.tensor(init_weights['Wv'].copy() * 5.0)
 
     mse_log = []
 
@@ -257,7 +276,8 @@ def run_pytorch(task, steps, hidden, d_k, window, lr, clip,
 # ── Comparison runner ─────────────────────────────────────────────────────────
 
 def run(task='copy', steps=2000, hidden=32, d_k=8, window=20,
-        lr=0.005, aux_weight=0.05, clip=1.0, report_every=400, seed=42):
+        lr=0.005, aux_weight=0.05, clip=1.0, report_every=400, seed=42,
+        nonlinearity='energy', peaked_init=False):
     n_in = 2
     np.random.seed(seed); torch.manual_seed(seed)
 
@@ -281,18 +301,20 @@ def run(task='copy', steps=2000, hidden=32, d_k=8, window=20,
     print(f"\n{'='*60}")
     print(f"TRANSFORMER COMPARISON  task={task}  steps={steps}")
     print(f"hidden={hidden}  d_k={d_k}  window={window}  lr={lr}")
-    print(f"sili: energy gating on hidden; torch: tanh on hidden")
+    print(f"sili: {nonlinearity} on hidden; torch: tanh on hidden")
     print(f"Both: K/V from input tokens; Q from hidden; shared init")
+    if peaked_init: print("peaked_init: Wk/Wv scaled 5x for sharper softmax from step 1")
     if task == 'copy':
         print(f"Copy: induction head should learn to attend {period-1} steps back")
     print(f"{'='*60}")
     print(f"\n--- sili run ---")
     sili_mse = run_sili(task, steps, hidden, d_k, window, lr, aux_weight,
-                        clip, report_every, init_weights)
+                        clip, report_every, init_weights,
+                        nonlinearity=nonlinearity, peaked_init=peaked_init)
 
     print(f"\n--- PyTorch run ---")
     pt_mse = run_pytorch(task, steps, hidden, d_k, window, lr, clip,
-                         report_every, init_weights)
+                         report_every, init_weights, peaked_init=peaked_init)
 
     # Summary comparison
     sili_final = float(np.mean(sili_mse[-report_every:]))
@@ -323,9 +345,13 @@ def main():
     ap.add_argument("--aux-weight",   type=float, default=0.05)
     ap.add_argument("--report-every", type=int,   default=400)
     ap.add_argument("--seed",         type=int,   default=42)
+    ap.add_argument("--nonlinearity",  default="energy", choices=["energy","tanh"])
+    ap.add_argument("--peaked-init",   action="store_true",
+                        help="Scale Wk/Wv 5x for sharper softmax from step 1")
     a = ap.parse_args()
     run(a.task, a.steps, a.hidden, a.d_k, a.window, a.lr, a.aux_weight,
-        a.clip if hasattr(a,'clip') else 1.0, a.report_every, a.seed)
+        1.0, a.report_every, a.seed,
+        nonlinearity=a.nonlinearity, peaked_init=a.peaked_init)
 
 if __name__ == "__main__":
     main()

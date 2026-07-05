@@ -1,4 +1,5 @@
 from __future__ import annotations
+import numpy as np
 from sili.backend import Backend, get_backend
 
 
@@ -52,6 +53,7 @@ class Tensor:
     def __pow__(self, exp):        return power(self, exp)
     def __neg__(self):             return neg(self)
     def relu(self):                return relu(self)
+    def tanh(self):                return tanh(self)
     def sum(self, axis=None):      return reduce_sum(self, axis)
     def __abs__(self):             return tensor_abs(self)
 
@@ -131,6 +133,14 @@ def neg(a: Tensor) -> Tensor:
 def relu(a: Tensor) -> Tensor:
     out = Tensor(a.backend.relu(a.data), (a,), "relu", a.backend)
     def _bwd(): _acc(a, a.backend.relu_backward(a.data, out.grad))
+    out._backward = _bwd
+    return out
+
+
+def tanh(a: Tensor) -> Tensor:
+    t   = np.tanh(np.asarray(a.data, dtype=np.float32))
+    out = Tensor(t, (a,), "tanh", a.backend)
+    def _bwd(): _acc(a, (1.0 - t * t) * np.asarray(out.grad, dtype=np.float32))
     out._backward = _bwd
     return out
 
