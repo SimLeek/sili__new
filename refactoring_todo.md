@@ -294,3 +294,22 @@ this changes the calculus on two previously-backburnered items:
   Explicit permission given to just replace the old standalone
   `make_weights`/`make_weights_v` pybind bindings with something built on
   `delta_csr_from_absolute` rather than debug the old ones.
+
+---
+
+## Performance tests (deferred)
+
+Integration tests (`tests/integration/`) validate correctness before merge but
+take tens of minutes to run. A separate performance test suite should:
+
+- Re-run the same tasks (pass_through, rare, copy, transformer) at fixed step
+  counts and assert MSE <= known thresholds, flagging regression.
+- Include the PyTorch comparison from `test_transformer.py` and assert the
+  sili/torch MSE ratio stays within 1.5x. Ratios > 3x indicate a backprop bug.
+- Be run on a reference machine (or CI) with recorded baselines so that changes
+  to the C++ kernels or autograd can be caught before merge.
+- Keep run-time under 10 minutes on a laptop CPU for the core set.
+
+Current status: not implemented. Add after the gen_toy_mistral -> FoldedLayer
+pipeline is working end-to-end so the sparse performance tests have a real
+pre-trained weight source rather than random initialization.

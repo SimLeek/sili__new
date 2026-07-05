@@ -1,5 +1,5 @@
 """
-Sanity checks for sili EnergyDynamics + sili autograd.
+Integration test: EnergyDynamics + sili autograd RNN.
 
 Two separate test categories:
 
@@ -42,7 +42,7 @@ Run:
 import argparse, math, zlib
 import numpy as np
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import sili.cpu
 from sili.tensor import Tensor

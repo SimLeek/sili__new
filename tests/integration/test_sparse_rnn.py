@@ -1,5 +1,5 @@
 """
-Sanity checks using FoldedLayer (FP4 + delta-CSR sparse) with sili autograd.
+Integration test: FoldedLayer (FP4 + delta-CSR sparse) with sili autograd.
 
 FoldedLayer has a proper backward pass through the sparse weights, so task
 gradients reach the sparse connections. This is what enables actual learning.
@@ -22,7 +22,7 @@ Run: python -m examples.sparse_sanity_checks --task rare --steps 3000
 import argparse, math, zlib
 import numpy as np
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import sili.cpu
 from sili.tensor import Tensor
