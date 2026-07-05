@@ -66,7 +66,8 @@ class Tensor:
     # ── backward ──────────────────────────────────────────────────────────────
 
     def backward(self) -> None:
-        self.grad = self.backend.ones_like(self.data)
+        if self.grad is None:
+            self.grad = self.backend.ones_like(self.data)
         for node in reversed(_topo_sort(self)):
             node._backward()
 

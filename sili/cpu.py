@@ -110,7 +110,18 @@ class CpuBackend(Backend):
         a_  = np.asarray(a,    dtype=np.float32)
         b_  = np.asarray(b,    dtype=np.float32)
         g_  = np.asarray(grad, dtype=np.float32)
-        return g_ @ b_.T, a_.T @ g_
+        # 1D a: forward was (n,)@(n,m)->(m,); db must be outer product
+        if a_.ndim == 1 and b_.ndim == 2:
+            da = g_ @ b_.T      # (m,)@(m,n) -> (n,)
+            db = np.outer(a_, g_)  # (n,m)
+        # 1D b: forward was (n,m)@(m,)->(n,); da needs outer, db needs a.T@g
+        elif a_.ndim == 2 and b_.ndim == 1:
+            da = np.outer(g_, b_)  # (n,m)
+            db = a_.T @ g_         # (m,n)@(n,) -> (m,)
+        else:
+            da = g_ @ b_.T
+            db = a_.T @ g_
+        return da, db
 
     # ── reduction / broadcast ─────────────────────────────────────────────────
 
