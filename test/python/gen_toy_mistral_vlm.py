@@ -17,17 +17,31 @@ Reproduces the two structural quirks the old toy missed:
      Toy: 4*16=64 vs hidden 32 -> q_proj (64,32), k/v (32,32), o_proj (32,64).
      This exercises the non-square fold path.
 
-Also includes the 4-D patch_conv.weight (conv patch embed) -- CSR is 2-D only,
-so pruning must reshape (out, -1) and record the original shape.
+Also includes the 4-D patch_conv.weight (conv patch embed, (1024,3,14,14) in
+the real model). Kept DENSE throughout -- not pruned, not reshaped to CSR.
+~602K params, small in every dimension; prior sparsification attempts on
+vision-tower-scale tensors found poor ratios vs the 21M-scale text matrices
+where CSR actually pays off. Sparsifying it is later-todo, not in scope here
+(see refactoring_todo.md).
 
-Prefix vintages (transformers refactored VLM key layout ~v4.52):
-  default        : model.language_model.layers.* / model.vision_tower.* / lm_head.weight
-  --legacy-prefix: language_model.model.layers.* / vision_tower.* /
-                   language_model.lm_head.weight
-See docs/requirements_vlm_streaming_rtac.md section 1.2. Names are
-high-confidence from the transformers mistral3/pixtral module structure but
-MUST be diffed against the real 2503 model.safetensors.index.json when a
-download exists (expected_names() below is built for exactly that diff).
+Prefix schema: VERIFIED against the real
+mistralai/Mistral-Small-3.1-24B-Base-2503 model.safetensors.index.json
+(fetched directly, July 2026). There is NO "model." top-level wrapper --
+language_model.*, vision_tower.*, and multi_modal_projector.* are top-level
+keys (e.g. language_model.lm_head.weight, vision_tower.patch_conv.weight).
+This is the module's default schema. An `--alt-prefix` flag exists for a
+"model."-wrapped variant this file previously (and wrongly) defaulted to,
+based on an uncited memory of a transformers refactor -- no evidence for that
+variant was found against the real download; it is kept only as a cheap
+defensive alternate, not because a second real vintage is confirmed to exist.
+See _prefixes() docstring below and docs/requirements_vlm_streaming_rtac.md
+section 1.2 for the full account of this correction.
+
+All numeric dimensions (hidden sizes, layer counts, head counts, head_dim,
+intermediate sizes, spatial_merge_size, vocab_size) are VERIFIED against the
+real config.json -- every value in the real/toy table below matched exactly
+on first fetch; the toy's dimension choices needed no correction, only the
+prefix schema did.
 """
 import argparse
 import torch
@@ -49,29 +63,53 @@ def _sparse_normal(shape, zero_frac, rng):
     return t.float()
 
 
-def _prefixes(legacy: bool):
-    if legacy:
-        return dict(lang="language_model.model.layers.",
-                    lang_embed="language_model.model.embed_tokens.weight",
-                    lang_norm="language_model.model.norm.weight",
-                    lm_head="language_model.lm_head.weight",
-                    vis="vision_tower.transformer.layers.",
-                    vis_conv="vision_tower.patch_conv.weight",
-                    vis_ln="vision_tower.ln_pre.weight",
-                    proj="multi_modal_projector.")
-    return dict(lang="model.language_model.layers.",
-                lang_embed="model.language_model.embed_tokens.weight",
-                lang_norm="model.language_model.norm.weight",
-                lm_head="lm_head.weight",
-                vis="model.vision_tower.transformer.layers.",
-                vis_conv="model.vision_tower.patch_conv.weight",
-                vis_ln="model.vision_tower.ln_pre.weight",
-                proj="model.multi_modal_projector.")
+def _prefixes(alt_prefix: bool = False):
+    """
+    default (alt_prefix=False): VERIFIED against the real
+    mistralai/Mistral-Small-3.1-24B-Base-2503 model.safetensors.index.json
+    (fetched directly, July 2026). No "model." top-level wrapper exists --
+    language_model.*, vision_tower.*, and multi_modal_projector.* are all
+    top-level keys.
+
+    alt_prefix=True: a "model."-wrapped variant this file previously
+    defaulted to, based on a vague, uncited memory of "transformers
+    refactored VLM key layout ~v4.52." No evidence for this variant was
+    found when checked against the real download -- it may not exist for
+    mistral3 at all. Kept only as a defensive/unlikely-but-cheap-to-support
+    alternate structure, NOT because there is a known second vintage.
+    Remove this branch entirely if nothing ever surfaces using it.
+    """
+    if alt_prefix:
+        return dict(lang="model.language_model.layers.",
+                    lang_embed="model.language_model.embed_tokens.weight",
+                    lang_norm="model.language_model.norm.weight",
+                    lm_head="lm_head.weight",
+                    vis="model.vision_tower.transformer.layers.",
+                    vis_conv="model.vision_tower.patch_conv.weight",
+                    vis_ln="model.vision_tower.ln_pre.weight",
+                    proj="model.multi_modal_projector.")
+    # VERIFIED (see docstring above): real index.json weight_map keys, e.g.
+    #   language_model.lm_head.weight
+    #   language_model.model.embed_tokens.weight
+    #   language_model.model.layers.{i}.self_attn.q_proj.weight
+    #   language_model.model.norm.weight
+    #   vision_tower.patch_conv.weight
+    #   vision_tower.ln_pre.weight
+    #   vision_tower.transformer.layers.{i}.attention.q_proj.weight
+    #   multi_modal_projector.linear_1.weight
+    return dict(lang="language_model.model.layers.",
+                lang_embed="language_model.model.embed_tokens.weight",
+                lang_norm="language_model.model.norm.weight",
+                lm_head="language_model.lm_head.weight",
+                vis="vision_tower.transformer.layers.",
+                vis_conv="vision_tower.patch_conv.weight",
+                vis_ln="vision_tower.ln_pre.weight",
+                proj="multi_modal_projector.")
 
 
-def build_toy_mistral_vlm_state_dict(seed: int = 1234, legacy_prefix: bool = False):
+def build_toy_mistral_vlm_state_dict(seed: int = 1234, alt_prefix: bool = False):
     rng = np.random.default_rng(seed)
-    P = _prefixes(legacy_prefix)
+    P = _prefixes(alt_prefix)
     sd, izf = {}, {}
 
     def add(name, shape, zf, dense=False):
@@ -130,21 +168,34 @@ def build_toy_mistral_vlm_state_dict(seed: int = 1234, legacy_prefix: bool = Fal
     return sd, izf
 
 
-def expected_names(legacy_prefix: bool = False):
-    """For diffing against a real model.safetensors.index.json weight_map."""
-    sd, _ = build_toy_mistral_vlm_state_dict(legacy_prefix=legacy_prefix)
+def expected_names(alt_prefix: bool = False):
+    """
+    For diffing against a real model.safetensors.index.json weight_map.
+    Default (alt_prefix=False) matches the VERIFIED schema -- diff against
+    this first. Confirmed exact match against mistralai/Mistral-Small-3.1-
+    24B-Base-2503's real index.json (July 2026): every language_model.*,
+    vision_tower.*, and multi_modal_projector.* key name and layer count
+    (40 language layers, 24 vision layers -- toy uses 12/6 as a scaled-down
+    stand-in) lines up with the ground truth. Only the layer COUNT and the
+    numeric dims differ (toy uses TXT_LAYERS=12 not 40, VIS_LAYERS=6 not 24,
+    etc. -- see the real/toy table this module's docstring points to).
+    """
+    sd, _ = build_toy_mistral_vlm_state_dict(alt_prefix=alt_prefix)
     return sorted(sd.keys())
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--legacy-prefix", action="store_true")
+    ap.add_argument("--alt-prefix", action="store_true",
+                    help="Use the UNVERIFIED 'model.'-wrapped schema instead "
+                         "of the verified default (see _prefixes docstring)")
     ap.add_argument("--out", default="/tmp/toy_mistral_vlm.pt")
     a = ap.parse_args()
-    sd, izf = build_toy_mistral_vlm_state_dict(legacy_prefix=a.legacy_prefix)
+    sd, izf = build_toy_mistral_vlm_state_dict(alt_prefix=a.alt_prefix)
     n = sum(t.numel() for t in sd.values())
     print(f"toy Mistral 3.1 VLM: {len(sd)} tensors, {n:,} params, "
-          f"{n*4/1024:.0f} KB fp32, vintage={'legacy' if a.legacy_prefix else 'new'}")
+          f"{n*4/1024:.0f} KB fp32, "
+          f"schema={'ALT (unverified)' if a.alt_prefix else 'VERIFIED'}")
     torch.save(sd, a.out)
     import json
     with open(a.out.replace('.pt', '_ground_truth.json'), 'w') as f:

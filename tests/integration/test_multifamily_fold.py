@@ -46,9 +46,9 @@ def run(verbose: bool = True) -> bool:
     threshold = default_min_abs_param()
     all_pass = True
 
-    for legacy in (False, True):
-        vintage = "legacy" if legacy else "new"
-        sd, _ = build_toy_mistral_vlm_state_dict(legacy_prefix=legacy)
+    for alt in (False, True):
+        vintage = "ALT (unverified)" if alt else "VERIFIED"
+        sd, _ = build_toy_mistral_vlm_state_dict(alt_prefix=alt)
         payload = _prune_to_payload(sd, threshold)
 
         # -- detection: exactly 2 groups, correct sizes, correct prefixes --
