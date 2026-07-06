@@ -94,6 +94,25 @@ _cpu` (or transitively through `import sili`), never as a bare top-level
 `.so` file, and pybind11 will raise `generic_type: ... already registered`
 if both paths ever get exercised in one process.
 
+## API documentation
+
+```bash
+apt-get install doxygen graphviz     # C++ doc generator + graph rendering
+pip install pdoc                     # Python doc generator
+bash docs/generate_docs.sh
+```
+
+Generates two browsable static sites (both gitignored -- build artifacts,
+not source):
+
+- `docs/doxygen/html/index.html` -- the C++ core (`sili/lib/headers/*.hpp`,
+  `sili/cpu_backend.cpp`). The project's documentation style is minimal
+  `///` one-liners rather than exhaustive `@param` blocks for every
+  argument, so Doxygen's undocumented-parameter warnings during generation
+  are expected, not a sign of misconfiguration.
+- `docs/pdoc/index.html` -- the Python package (`sili/*`), including the
+  compiled `sili._cpu` extension's pybind11-exposed classes and methods.
+
 ## Testing
 
 ```bash
