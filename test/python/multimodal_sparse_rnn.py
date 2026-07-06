@@ -64,9 +64,14 @@ from typing import Optional
 import numpy as np
 
 try:
-    import _cpu
-except ImportError:
+    # Package-qualified first: keeps sys.modules keyed consistently as
+    # 'sili._cpu' everywhere, avoiding the double-registration bug that
+    # occurs when a bare 'import _cpu' and 'sili._cpu' both execute the
+    # compiled extension's init code under two different sys.modules
+    # keys (see sili/conversion/rnn_fold.py for the full account).
     from sili import _cpu
+except ImportError:
+    import _cpu
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration

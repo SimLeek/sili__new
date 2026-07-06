@@ -21,9 +21,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
-    import _cpu
-except ImportError:
+    # Package-qualified first -- see sili/conversion/rnn_fold.py for why
+    # import order matters here (double pybind11 registration otherwise).
     from sili import _cpu
+except ImportError:
+    import _cpu
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers

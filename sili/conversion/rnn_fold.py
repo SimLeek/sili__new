@@ -88,9 +88,21 @@ import torch
 import torch.nn as nn
 
 try:
-    import sys as _sys, os as _os
-    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
-    import _cpu as _sili_cpu   # SparseLinearLayer, hoyer_score, dense_to_csr
+    # Package-qualified import ONLY. A previous version of this block did
+    # `sys.path.insert(0, .../sili)` then a bare `import _cpu`, which makes
+    # the compiled extension importable under TWO DIFFERENT sys.modules keys
+    # ('_cpu' and 'sili._cpu') depending on which import path some other
+    # module in the process happens to use first. Since each key triggers a
+    # SEPARATE execution of the extension's module-init code, pybind11's
+    # static type registrations run twice, raising "generic_type ... already
+    # registered" the moment both paths get exercised in one process --
+    # exactly what happened repeatedly when this file was transitively
+    # imported alongside sili/sparse_rnn.py's `import sili._cpu as _cpu`.
+    # A single, consistent, package-qualified import path everywhere makes
+    # sys.modules naturally deduplicate the extension regardless of import
+    # order, which is also required for tools that walk the whole `sili`
+    # package tree (pdoc, Sphinx autodoc) without controlling import order.
+    from sili import _cpu as _sili_cpu   # SparseLinearLayer, hoyer_score, dense_to_csr
     _SILI_AVAILABLE = True
 except ImportError:
     _sili_cpu = None
