@@ -39,7 +39,8 @@ import sili.cpu
 from sili.sparse_rnn import FoldedLayer
 from sili.tensor import Tensor
 
-from gen_toy_mistral_vlm import build_toy_mistral_vlm_state_dict, TXT_LAYERS, VIS_LAYERS
+from gen_toy_mistral_vlm import (build_toy_mistral_vlm_state_dict, TXT_LAYERS,
+                                  VIS_LAYERS, save_and_verify_safetensors)
 from sili.conversion.streaming_prune import (
     streaming_sparsify, streaming_fold_suffix, estimate_suffix_bytes, _tensor_path,
 )
@@ -72,9 +73,20 @@ def run(verbose: bool = True) -> bool:
         model_dir = os.path.join(tmp, "model")
         out_dir   = os.path.join(tmp, "out")
         sd, _ = build_toy_mistral_vlm_state_dict()
+
+        # Belt-and-suspenders: confirm every tensor survives real safetensors
+        # serialization exactly (single-file check) before also exercising
+        # the sharded multi-file path below. If this ever fails, the bug is
+        # in save/load itself, not in the sharding or streaming logic.
+        single_file = os.path.join(tmp, "single_file_check.safetensors")
+        assert save_and_verify_safetensors(sd, single_file, verbose=False), \
+            "toy VLM must survive a plain safetensors round-trip before " \
+            "testing the sharded streaming path built on top of it"
+
         _write_sharded_safetensors(sd, model_dir, n_shards=3)
         if verbose:
             print(f"\n=== streaming_prune: {len(sd)} tensors across 3 shards ===")
+            print(f"  single-file safetensors round-trip: exact match -- OK")
 
         # -- Phase 1: real safe_open-based sparsify --
         manifest = streaming_sparsify(model_dir, out_dir, verbose=False)

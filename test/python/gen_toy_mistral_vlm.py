@@ -164,9 +164,63 @@ def expected_names():
     return sorted(sd.keys())
 
 
+def save_and_verify_safetensors(sd: dict, path: str, verbose: bool = True) -> bool:
+    """
+    Write sd to a real .safetensors file, then load it back via the SAME
+    tensor-at-a-time safe_open API streaming_prune.py actually uses (not the
+    bulk load_file convenience wrapper) and verify every tensor round-trips
+    exactly: same keys, same shape, same dtype, same values bit-for-bit.
+
+    safetensors is a lossless binary format (no compression, no quantization)
+    so exact equality is the correct bar -- any mismatch here means either a
+    contiguity issue (safetensors requires contiguous tensors and will
+    silently reorder/copy on save if not handled) or a real bug, not
+    numerical noise. This exists to be "absolutely sure" the toy's tensors
+    survive real on-disk serialization identically to how they were built in
+    memory, before anything downstream (streaming_sparsify, fold_one_suffix,
+    etc.) is trusted to consume them.
+    """
+    from safetensors.torch import save_file
+    from safetensors import safe_open
+
+    to_save = {k: v.contiguous() for k, v in sd.items()}
+    save_file(to_save, path)
+
+    all_ok = True
+    with safe_open(path, framework="pt") as f:
+        loaded_keys = set(f.keys())
+        if loaded_keys != set(sd.keys()):
+            missing = set(sd.keys()) - loaded_keys
+            extra   = loaded_keys - set(sd.keys())
+            print(f"  KEY MISMATCH: missing={missing} extra={extra}")
+            all_ok = False
+        for name, original in sd.items():
+            if name not in loaded_keys:
+                continue
+            reloaded = f.get_tensor(name)
+            if reloaded.shape != original.shape:
+                print(f"  SHAPE MISMATCH {name}: {reloaded.shape} != {original.shape}")
+                all_ok = False
+            elif reloaded.dtype != original.dtype:
+                print(f"  DTYPE MISMATCH {name}: {reloaded.dtype} != {original.dtype}")
+                all_ok = False
+            elif not torch.equal(reloaded, original):
+                max_diff = (reloaded.float() - original.float()).abs().max().item()
+                print(f"  VALUE MISMATCH {name}: max abs diff = {max_diff}")
+                all_ok = False
+
+    if verbose:
+        status = "PASS -- exact round-trip" if all_ok else "FAIL -- see mismatches above"
+        print(f"  safetensors round-trip ({len(sd)} tensors, {path}): {status}")
+    return all_ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/tmp/toy_mistral_vlm.pt")
+    ap.add_argument("--safetensors", action="store_true",
+                    help="Also save as .safetensors and verify the round-trip "
+                         "via safe_open (same API streaming_prune.py uses)")
     a = ap.parse_args()
     sd, izf = build_toy_mistral_vlm_state_dict()
     n = sum(t.numel() for t in sd.values())
@@ -177,3 +231,9 @@ if __name__ == "__main__":
     with open(a.out.replace('.pt', '_ground_truth.json'), 'w') as f:
         json.dump(izf, f, indent=1)
     print(f"saved: {a.out}")
+
+    if a.safetensors:
+        st_path = a.out.rsplit('.', 1)[0] + '.safetensors'
+        ok = save_and_verify_safetensors(sd, st_path)
+        if not ok:
+            raise SystemExit(1)
