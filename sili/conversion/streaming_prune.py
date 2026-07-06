@@ -19,12 +19,19 @@ makes two-phase streaming trivial:
            mem_budget_gb, falls back to per-layer descriptors (n_folds=1
            each, no stacking) instead of OOMing.
 
-Initial implementation. Follow-up edge cases (requirements doc section 7):
-gated-repo auth, fsck of partial .pt after crash, tied-weight dedup, MoE
-expert-merge (later TODO). Conv-kernel tensors (ndim > 2, e.g. Pixtral's
-patch_conv.weight) are kept DENSE, not pruned -- see the ndim==2 branch below
-for the full rationale (small-in-every-dimension tensors don't sparsify well;
-also deferred to later-todo alongside MoE).
+Initial implementation. Resume is a real fsck, not a bare existence check:
+_tensor_file_ok() calls torch.load() on the existing file before trusting it,
+so a truncated file from a process killed mid-write (crash, OOM-kill) gets
+regenerated instead of silently accepted -- a plain os.path.exists() check
+would pass for such a file and corrupt the pipeline much later, at
+streaming_fold_suffix time, with a far less obvious error.
+
+Follow-up edge cases (requirements doc section 7): gated-repo auth,
+tied-weight dedup (resolved as a non-issue, see requirements doc section
+1.2), MoE expert-merge (later TODO). Conv-kernel tensors (ndim > 2, e.g.
+Pixtral's patch_conv.weight) are kept DENSE, not pruned -- see the ndim==2
+branch below for the full rationale (small-in-every-dimension tensors don't
+sparsify well; also deferred to later-todo alongside MoE).
 """
 from __future__ import annotations
 import json
@@ -40,6 +47,24 @@ _SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9._-]')
 
 def _tensor_path(out_dir: str, name: str) -> str:
     return os.path.join(out_dir, "tensors", _SAFE_NAME_RE.sub("_", name) + ".pt")
+
+
+def _tensor_file_ok(path: str) -> bool:
+    """
+    fsck for a single tensor file: existence alone is not enough. A process
+    killed mid-write (e.g. torch.save interrupted by a crash or OOM-kill)
+    leaves a truncated file that os.path.exists() reports as present but
+    torch.load() cannot parse. Resume must not silently trust such a file --
+    that would leave a corrupted entry in place until it fails much later
+    (mid streaming_fold_suffix, with a much less obvious error).
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        torch.load(path, weights_only=False)
+        return True
+    except Exception:
+        return False
 
 
 def _iter_shards(model_dir: str):
@@ -105,7 +130,7 @@ def streaming_sparsify(model_dir: str, out_dir: str,
         with safe_open(shard_path, framework="pt") as f:
             keys = names if names is not None else sorted(f.keys())
             for name in keys:
-                if name in manifest and os.path.exists(_tensor_path(out_dir, name)):
+                if name in manifest and _tensor_file_ok(_tensor_path(out_dir, name)):
                     continue
                 t = f.get_tensor(name)                     # ONE tensor in RAM
                 orig_shape = list(t.shape)
