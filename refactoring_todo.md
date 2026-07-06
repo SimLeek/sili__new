@@ -348,3 +348,59 @@ is shown to actually cost something. If/when this is picked up: reshape
 inference load time. Test first whether it sparsifies well at all before
 building the restore path -- if density stays high, it may not be worth
 doing regardless of whether the machinery exists.
+
+
+## RTAC ADVANCED FEATURES (later)
+
+Two items deferred from the RTAC curiosity agent (see
+docs/requirements_vlm_streaming_rtac.md section 4 for the base implementation
+-- PopArt and double critic are done; these two are not).
+
+**Critic-through-trunk.** rtac.py recomputes values from the SHARED hidden
+representation so the critic's gradient reaches the trunk weights, not just
+the value head. In the current online loop this needs the PREVIOUS step's
+forward pass to still be a LIVE Tensor with its autograd graph intact when
+the critic loss is computed one step later -- but the current loop applies
+SGD and clears every Tensor's graph at the end of each step (h_prev is
+stored as a detached numpy array specifically to avoid holding stale graphs
+across iterations). Two ways to fix this, both real refactors, not a small
+patch:
+  (a) Defer the SGD apply by one step: compute forward at t, hold the Tensor
+      graph, do the critic-through-trunk backward at t+1 using weights as
+      they were at t (values become slightly stale by one step, which
+      one-step TD already tolerates for the target net).
+  (b) Recompute h_prev's forward pass fresh at the critic step (rerun
+      core_net.forward on the stored raw inputs) so a live graph exists
+      again -- doubles the forward-pass cost per step and needs the raw
+      inputs (not just h_prev) retained.
+Not attempted when the base RTAC agent was built -- wanted correctness
+confidence before landing it, and (a) touches the main loop's control flow
+in a way that risks regressing the working zero-init learning signal.
+
+**Replay buffer / batched updates.** rtac.py samples batches from a large
+replay memory (Memory class, size 500k-1M in the paper's configs); the
+current loop is strictly online (one transition, one gradient step,
+immediately discarded). Adding replay means: a ring-buffer transition store,
+batched forward/backward (currently every op in the RL training loop is
+single-sample, e.g. EnergyDynamics.forward expects a single vector not a
+batch dimension -- needs a batch-axis audit before this is safe), and a
+decision on whether curiosity reward is recomputed at sample time (correct
+but requires storing enough to re-render the Mandelbrot view) or cached at
+collection time (cheaper, slightly off-policy). Substantially larger than
+anything else in the RTAC work; not attempted given the emphasis on the
+working pipeline over expanding scope.
+
+## VISION: PER-PATCH SEQUENCE + SPATIAL MERGE (later)
+
+Current test_mandelbrot_rl.py --core mistral uses a mean-pooled-patch
+simplification: the whole image is reduced to one vector before entering the
+recurrent core, rather than the real Pixtral architecture's per-patch token
+sequence + attention + 2x2 spatial merge (multi_modal_projector.patch_merger,
+spatial_merge_size=2 per the real config.json). Implementing this properly
+needs: patches kept as a sequence (not mean-pooled), the vision tower's
+attention operating over that sequence, and the 2x2 merge implemented as a
+constant gather/matmul (group 2x2 neighboring patch tokens, concatenate their
+channels, project down) matching patch_merger.merging_layer.weight's real
+shape (VIS_HIDDEN, VIS_HIDDEN*MERGE*MERGE). This is a real architecture
+change from the current simplification, not a small patch -- deferred
+alongside the RTAC items above.
