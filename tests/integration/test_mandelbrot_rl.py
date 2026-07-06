@@ -56,7 +56,7 @@ warnings.filterwarnings('ignore')
 
 import torch  # CSR construction only -- not in the compute path
 import sili.cpu
-from sili.tensor import Tensor, tanh as sili_tanh
+from sili.tensor import Tensor, tanh as sili_tanh, combine_losses
 from sili.sparse_rnn import FoldedLayer
 from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
 from sili.energy import EnergyDynamics
@@ -177,9 +177,12 @@ class MistralCore:
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
-def run(core='zero', policy='curiosity', max_steps=2000, timeout=60.0,
+def run(core='zero', policy='curiosity', agent='reinforce',
+        max_steps=2000, timeout=60.0,
         view=32, lr=0.01, aux_weight=0.05, pol_weight=0.3,
-        group=4, report_every=200, verbose=True, seed=0):
+        group=4, report_every=200, verbose=True, seed=0,
+        display=False, gamma=0.99, entropy_scale=0.01,
+        loss_alpha=0.2, target_update=0.005):
     N_ACT = 7
     ACT_NAMES = ['pan<','pan>','pan^','panv','zoom+','zoom-','reset']
     np.random.seed(seed); torch.manual_seed(seed)
@@ -235,12 +238,36 @@ def run(core='zero', policy='curiosity', max_steps=2000, timeout=60.0,
     for a in range(N_ACT):
         Gm[a*group:(a+1)*group, a] = 1.0 / group
 
+    # -- RTAC value heads: real-time input = [h ; onehot(prev_action)] --
+    # (rtrl/rtac.py: model((next_obs, action)) -- action is part of the state)
+    Wv_h = Tensor(np.zeros((hidden, 1), np.float32) if zero_mode else
+                  (np.random.randn(hidden, 1) * 0.05).astype(np.float32))
+    Wv_a = Tensor(np.zeros((N_ACT, 1), np.float32))
+    Wvh_t = Wv_h.data.copy(); Wva_t = Wv_a.data.copy()   # EMA target net
+    h_prev = None; a_prev = 0; a_prevprev = 0; r_prev = 0.0
+
+    # -- optional live display: view | reconstruction, 8x nearest upscale --
+    show = None
+    if display:
+        try:
+            import cv2
+            def show(v, p):
+                img = np.hstack([v, np.clip(p, 0, 1).reshape(view, view)])
+                img = cv2.resize((img * 255).astype(np.uint8),
+                                 (view * 16, view * 8),
+                                 interpolation=cv2.INTER_NEAREST)
+                cv2.imshow('mandelbrot: view | reconstruction', img)
+                cv2.waitKey(1)
+        except ImportError:
+            print('    --display requested but opencv-python not installed; '
+                  'continuing headless')
+
     # -- reconstruction head (numpy SGD; zero-init learns once hidden fires) --
     Vr = (np.zeros((hidden, view*view), np.float32) if zero_mode else
           (np.random.randn(hidden, view*view) * 0.02).astype(np.float32))
     br = np.zeros(view*view, np.float32)
 
-    dense_params = [Wp, Wa] + core_net.params
+    dense_params = [Wp, Wa, Wv_h, Wv_a] + core_net.params
 
     # -- navigation --
     cx, cy, zoom = -0.75, 0.0, 50.0
@@ -281,7 +308,7 @@ def run(core='zero', policy='curiosity', max_steps=2000, timeout=60.0,
     step = 0
 
     if verbose:
-        print(f"\n=== Mandelbrot RL v2  core={core}  policy={policy} ===")
+        print(f"\n=== Mandelbrot RL v2  core={core}  policy={policy}  agent={agent} ===")
         print(f"    hidden={hidden}  view={view}x{view}  out_neurons={n_out_neurons} "
               f"({N_ACT} actions x {group} grouped)")
         print(f"    limits: steps={max_steps}  timeout={timeout:.0f}s")
@@ -344,21 +371,53 @@ def run(core='zero', policy='curiosity', max_steps=2000, timeout=60.0,
         Vr -= lr * np.outer(h_out.data, g_pred)
         br -= lr * g_pred
 
-        # -- REINFORCE (curiosity policy only): reward = novelty (recon error) --
+        if show is not None:
+            show(varr, pred)
+
+        # -- intrinsic reward: novelty + homeostatic pressure --
+        # (requirements doc 4.1: r = w_r*recon + w_e*energy_aux; the critic
+        # learns V of this combined intrinsic return)
+        aux_h_val = float(np.asarray(aux_h.data).ravel()[0]) if aux_h is not None else 0.0
+        reward = rmse + 0.1 * aux_h_val
+
+        onehot = np.zeros(N_ACT, np.float32); onehot[action] = 1.
         G_pol = np.zeros(N_ACT, np.float32)
-        if policy == 'curiosity':
-            reward = rmse
+        terms = [(h_out, g_h_recon)]
+        if aux_h is not None: terms.append((aux_h, aux_weight))
+        if aux_o is not None: terms.append((aux_o, aux_weight))
+
+        if policy == 'curiosity' and agent == 'reinforce':
             adv = reward - reward_baseline
             reward_baseline = 0.99*reward_baseline + 0.01*reward
-            onehot = np.zeros(N_ACT, np.float32); onehot[action] = 1.
             G_pol = pol_weight * adv * (probs - onehot)
 
-        # -- SINGLE backward via loss proxy (avoids multi-root double-count) --
-        proxy = (h_out * g_h_recon).sum() + (l7 * G_pol).sum()
-        if aux_h is not None: proxy = proxy + aux_h * aux_weight
-        if aux_o is not None: proxy = proxy + aux_o * aux_weight
-        proxy.grad = np.ones(1, np.float32) if proxy.data.ndim else np.float32(1.)
-        proxy.backward()
+        elif policy == 'curiosity' and agent == 'rtac':
+            # rtrl/rtac.py pattern, discrete-online adaptation (initial code;
+            # simplifications listed in requirements doc 4.2):
+            #   loss_total = alpha*loss_actor + (1-alpha)*loss_critic
+            oh_prev = np.zeros(N_ACT, np.float32); oh_prev[a_prev] = 1.
+            v_now = h_out @ Wv_h + Tensor(oh_prev) @ Wv_a        # (1,) in graph
+            # actor: advantage vs LEARNED value baseline + entropy bonus
+            adv = reward - float(np.asarray(v_now.data).ravel()[0])
+            G_pol = loss_alpha * pol_weight * adv * (probs - onehot)
+            H = -(probs * np.log(probs + 1e-9)).sum()
+            # descend -entropy_scale*H: dH/dl_i = -p_i(log p_i + H)
+            G_pol += loss_alpha * entropy_scale * probs * (np.log(probs + 1e-9) + H)
+            # critic: one-step TD on stored previous transition, heads-only
+            # recompute (h_prev is a constant leaf; trunk-through-critic is a
+            # follow-up item). Target from the EMA target net (rtac).
+            if h_prev is not None:
+                oh_pp = np.zeros(N_ACT, np.float32); oh_pp[a_prevprev] = 1.
+                v_prev = Tensor(h_prev) @ Wv_h + Tensor(oh_pp) @ Wv_a
+                v_targ = float((h_out.data @ Wvh_t + oh_prev @ Wva_t).ravel()[0])
+                y = r_prev + gamma * v_targ
+                g_c = (1.0 - loss_alpha) * 2.0 * (float(np.asarray(v_prev.data).ravel()[0]) - y)
+                terms.append((v_prev, np.array([g_c], np.float32)))
+            Wvh_t += target_update * (Wv_h.data - Wvh_t)
+            Wva_t += target_update * (Wv_a.data - Wva_t)
+
+        terms.append((l7, G_pol))
+        combine_losses(*terms).backward()
 
         for p in dense_params:
             if p.grad is not None:
@@ -366,6 +425,7 @@ def run(core='zero', policy='curiosity', max_steps=2000, timeout=60.0,
                 p.data -= lr * p.grad; p.grad = None
 
         state = h_out.data.copy()
+        h_prev = state.copy(); a_prevprev = a_prev; a_prev = action; r_prev = reward
         view_buf.append(varr); hid_buf.append(state.copy())
         if len(view_buf) > 60: view_buf.pop(0)
         if len(hid_buf) > 60: hid_buf.pop(0)
@@ -432,6 +492,9 @@ def compare(core, max_steps, timeout, **kw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--core',    default='zero', choices=['zero', 'mistral'])
+    ap.add_argument('--agent',   default='reinforce', choices=['reinforce', 'rtac'])
+    ap.add_argument('--display', action='store_true',
+                    help='cv2 window: current view | reconstruction')
     ap.add_argument('--policy',  default='curiosity', choices=['curiosity', 'random'])
     ap.add_argument('--compare', action='store_true',
                     help='run curiosity AND random policies, print side-by-side')
@@ -441,7 +504,8 @@ def main():
     ap.add_argument('--group',   type=int,   default=4)
     ap.add_argument('--report-every', type=int, default=200)
     a = ap.parse_args()
-    kw = dict(lr=a.lr, group=a.group, report_every=a.report_every)
+    kw = dict(lr=a.lr, group=a.group, report_every=a.report_every,
+              agent=a.agent, display=a.display)
     if a.compare:
         compare(a.core, a.steps, a.timeout, **kw)
     else:

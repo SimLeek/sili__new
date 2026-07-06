@@ -313,3 +313,24 @@ take tens of minutes to run. A separate performance test suite should:
 Current status: not implemented. Add after the gen_toy_mistral -> FoldedLayer
 pipeline is working end-to-end so the sparse performance tests have a real
 pre-trained weight source rather than random initialization.
+
+---
+
+## STREAMING (layer-by-layer) CONVERSION -- TOP PRIORITY, NOT AFTER REFACTORING
+
+The working pipeline has top priority, and the pipeline must convert models on
+the same 32-96 GB machine that runs them (24B bf16 = ~48 GB on disk; whole
+state-dict load is impossible at 32 GB). Initial implementation landed in
+sili/conversion/streaming_prune.py (two-phase: per-tensor sparsify -> per-
+suffix fold, --no-stack fallback when suffix nnz exceeds mem budget). See
+docs/requirements_vlm_streaming_rtac.md section 3 for the memory math and
+section 7 for the remaining edge-case checklist.
+
+## MoE EXPERT-MERGE (later)
+
+No non-MoE 100B+ dense models exist to test truly-larger-than-RAM conversion,
+so large-model conversion requires merging mixture-of-experts experts into one
+giant sparse layer: CSR sparsity subsumes MoE routing sparsity (router picks
+block-columns; CSR picks individual weights). Design: concat expert weights
+block-wise, fold router scores into per-block importance at conversion time.
+Later work -- after the dense streaming path is verified on 24B.

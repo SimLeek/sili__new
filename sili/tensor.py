@@ -214,3 +214,32 @@ def _topo_sort(root) -> list:
             topo.append(v)
     _visit(root)
     return topo
+
+def combine_losses(*terms):
+    """
+    Build ONE scalar loss from heterogeneous terms so a single backward()
+    traverses the shared graph exactly once. Calling backward() from multiple
+    roots double-counts shared subgraphs in sili (each traversal re-pushes the
+    accumulated grad of shared nodes), so multi-loss training must combine
+    first. This is the standard pattern for energy aux + task loss + RL terms.
+
+    Term forms:
+      (tensor, grad_array)  -- inject d(total)/d(tensor) = grad_array,
+                               via (tensor * grad_array).sum()
+      (tensor, weight)      -- weighted scalar-loss term: (tensor*w).sum()
+      tensor                -- bare scalar-loss term, weight 1.0
+
+    Returns a scalar Tensor; caller does total.backward() exactly once.
+    """
+    total = None
+    for term in terms:
+        if isinstance(term, tuple):
+            t, g = term
+            if isinstance(g, (int, float)):
+                contrib = (t * float(g)).sum()
+            else:
+                contrib = (t * np.asarray(g, dtype=np.float32)).sum()
+        else:
+            contrib = term.sum()
+        total = contrib if total is None else total + contrib
+    return total
