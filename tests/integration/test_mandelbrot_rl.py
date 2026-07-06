@@ -240,10 +240,21 @@ def run(core='zero', policy='curiosity', agent='reinforce',
 
     # -- RTAC value heads: real-time input = [h ; onehot(prev_action)] --
     # (rtrl/rtac.py: model((next_obs, action)) -- action is part of the state)
-    Wv_h = Tensor(np.zeros((hidden, 1), np.float32) if zero_mode else
-                  (np.random.randn(hidden, 1) * 0.05).astype(np.float32))
-    Wv_a = Tensor(np.zeros((N_ACT, 1), np.float32))
-    Wvh_t = Wv_h.data.copy(); Wva_t = Wv_a.data.copy()   # EMA target net
+    # DOUBLE CRITIC (rtrl/rtac.py: reduce(torch.min, next_value_target)):
+    # two independently-initialized value heads, both trained toward the
+    # same TD target; advantage/bootstrap use min(v1,v2) to counter
+    # overestimation bias. Wv_h2/Wv_a2 mirror Wv_h/Wv_a exactly.
+    def _mk_value_head():
+        wh = Tensor(np.zeros((hidden, 1), np.float32) if zero_mode else
+                    (np.random.randn(hidden, 1) * 0.05).astype(np.float32))
+        wa = Tensor(np.zeros((N_ACT, 1), np.float32))
+        return wh, wa
+    Wv_h,  Wv_a  = _mk_value_head()
+    Wv_h2, Wv_a2 = _mk_value_head()
+    Wvh_t,  Wva_t  = Wv_h.data.copy(),  Wv_a.data.copy()   # EMA target nets
+    Wvh_t2, Wva_t2 = Wv_h2.data.copy(), Wv_a2.data.copy()
+    from sili.rl_utils import PopArt
+    popart = PopArt(beta=0.0003, start_pop=8)
     h_prev = None; a_prev = 0; a_prevprev = 0; r_prev = 0.0
 
     # -- optional live display: view | reconstruction, 8x nearest upscale --
@@ -267,7 +278,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
           (np.random.randn(hidden, view*view) * 0.02).astype(np.float32))
     br = np.zeros(view*view, np.float32)
 
-    dense_params = [Wp, Wa, Wv_h, Wv_a] + core_net.params
+    dense_params = [Wp, Wa, Wv_h, Wv_a, Wv_h2, Wv_a2] + core_net.params
 
     # -- navigation --
     cx, cy, zoom = -0.75, 0.0, 50.0
@@ -392,29 +403,57 @@ def run(core='zero', policy='curiosity', agent='reinforce',
             G_pol = pol_weight * adv * (probs - onehot)
 
         elif policy == 'curiosity' and agent == 'rtac':
-            # rtrl/rtac.py pattern, discrete-online adaptation (initial code;
-            # simplifications listed in requirements doc 4.2):
+            # rtrl/rtac.py pattern, discrete-online adaptation:
             #   loss_total = alpha*loss_actor + (1-alpha)*loss_critic
+            # DOUBLE CRITIC: v_now = min(v1, v2) for the actor's advantage,
+            # both heads trained toward the same PopArt-normalized TD target.
             oh_prev = np.zeros(N_ACT, np.float32); oh_prev[a_prev] = 1.
-            v_now = h_out @ Wv_h + Tensor(oh_prev) @ Wv_a        # (1,) in graph
-            # actor: advantage vs LEARNED value baseline + entropy bonus
-            adv = reward - float(np.asarray(v_now.data).ravel()[0])
+            v1_now = h_out @ Wv_h  + Tensor(oh_prev) @ Wv_a
+            v2_now = h_out @ Wv_h2 + Tensor(oh_prev) @ Wv_a2
+            v_now_min = min(float(np.asarray(v1_now.data).ravel()[0]),
+                            float(np.asarray(v2_now.data).ravel()[0]))
+            v_now_orig = popart.unnormalize(v_now_min)
+
+            # actor: advantage vs LEARNED (denormalized) value baseline + entropy
+            adv = reward - v_now_orig
             G_pol = loss_alpha * pol_weight * adv * (probs - onehot)
             H = -(probs * np.log(probs + 1e-9)).sum()
-            # descend -entropy_scale*H: dH/dl_i = -p_i(log p_i + H)
             G_pol += loss_alpha * entropy_scale * probs * (np.log(probs + 1e-9) + H)
+
             # critic: one-step TD on stored previous transition, heads-only
-            # recompute (h_prev is a constant leaf; trunk-through-critic is a
-            # follow-up item). Target from the EMA target net (rtac).
+            # recompute (h_prev is a constant leaf; trunk-through-critic
+            # remains a follow-up item, see requirements doc 4.2). Target
+            # bootstraps from min(target_net_1, target_net_2), PopArt-
+            # normalized before computing the critic loss gradient.
             if h_prev is not None:
                 oh_pp = np.zeros(N_ACT, np.float32); oh_pp[a_prevprev] = 1.
-                v_prev = Tensor(h_prev) @ Wv_h + Tensor(oh_pp) @ Wv_a
-                v_targ = float((h_out.data @ Wvh_t + oh_prev @ Wva_t).ravel()[0])
-                y = r_prev + gamma * v_targ
-                g_c = (1.0 - loss_alpha) * 2.0 * (float(np.asarray(v_prev.data).ravel()[0]) - y)
-                terms.append((v_prev, np.array([g_c], np.float32)))
-            Wvh_t += target_update * (Wv_h.data - Wvh_t)
-            Wva_t += target_update * (Wv_a.data - Wva_t)
+                v1_prev = Tensor(h_prev) @ Wv_h  + Tensor(oh_pp) @ Wv_a
+                v2_prev = Tensor(h_prev) @ Wv_h2 + Tensor(oh_pp) @ Wv_a2
+
+                v1_targ = float((h_out.data @ Wvh_t  + oh_prev @ Wva_t ).ravel()[0])
+                v2_targ = float((h_out.data @ Wvh_t2 + oh_prev @ Wva_t2).ravel()[0])
+                v_targ_min_norm = min(v1_targ, v2_targ)          # normalized space
+                v_targ_min_orig = popart.unnormalize(v_targ_min_norm)
+
+                y_orig = r_prev + gamma * v_targ_min_orig        # raw TD target
+                # PopArt update: rescales ALL FOUR value-head weight/bias
+                # arrays (both online critics AND both target nets) in the
+                # SAME call, so nothing is left numerically inconsistent by
+                # this stats update alone -- only actual gradient/polyak
+                # steps should move any of them afterward.
+                y_norm = popart.update_and_rescale(
+                    y_orig,
+                    weight_arrays=[Wv_h.data, Wv_h2.data, Wvh_t, Wvh_t2],
+                    bias_arrays=[Wv_a.data, Wv_a2.data, Wva_t, Wva_t2])
+                g_c1 = (1.0 - loss_alpha) * 2.0 * (float(np.asarray(v1_prev.data).ravel()[0]) - y_norm)
+                g_c2 = (1.0 - loss_alpha) * 2.0 * (float(np.asarray(v2_prev.data).ravel()[0]) - y_norm)
+                terms.append((v1_prev, np.array([g_c1], np.float32)))
+                terms.append((v2_prev, np.array([g_c2], np.float32)))
+
+            Wvh_t  += target_update * (Wv_h.data  - Wvh_t)
+            Wva_t  += target_update * (Wv_a.data  - Wva_t)
+            Wvh_t2 += target_update * (Wv_h2.data - Wvh_t2)
+            Wva_t2 += target_update * (Wv_a2.data - Wva_t2)
 
         terms.append((l7, G_pol))
         combine_losses(*terms).backward()
