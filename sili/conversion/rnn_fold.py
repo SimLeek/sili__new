@@ -126,12 +126,12 @@ def _parse_block_key(name: str) -> Optional[Tuple[str, int, str]]:
 def detect_repeated_block_groups(
     state_dict: Dict[str, torch.Tensor],
     min_group_size: int = 2,
-) -> List[List[int]]:
+) -> List[Tuple[str, List[int]]]:
     """
     Find runs of consecutive blocks that share identical parameter structure.
 
     Two blocks are considered structurally identical if every parameter suffix
-    maps to the same tensor shape in both.
+    maps to the same tensor shape in both, AND they share the same prefix.
 
     Parameters
     ----------
@@ -140,59 +140,75 @@ def detect_repeated_block_groups(
 
     Returns
     -------
-    List of groups.  Each group is a sorted list of block indices that can be
-    folded together.  Non-repeated or structurally inconsistent blocks are
-    excluded.
+    List of (prefix, indices) pairs. Each `indices` is a sorted list of block
+    indices sharing `prefix` that can be folded together. Non-repeated or
+    structurally inconsistent blocks are excluded.
 
     Example
     -------
-    Blocks 0–23 identical → [[0,1,2,...,23]]
-    Blocks 0–11 one shape, 12–23 another → [[0..11], [12..23]]
+    Blocks 0-23 under "model.layers." identical
+        -> [("model.layers.", [0,1,...,23])]
+    Blocks 0-11 one shape, 12-23 another, same prefix
+        -> [("model.layers.", [0..11]), ("model.layers.", [12..23])]
+    Two DIFFERENT prefixes sharing an index range (e.g. a VLM's language and
+    vision towers, both indexed 0..N-1)
+        -> [("model.language_model.layers.", [0..11]),
+            ("model.vision_tower.transformer.layers.", [0..5])]
+
+    NOTE: keying on (prefix, index) rather than bare index is load-bearing,
+    not cosmetic. Bare-index keying merges unrelated block families that
+    happen to share index ranges -- caught by the toy VLM generator
+    (test/python/gen_toy_mistral_vlm.py): 12 language layers + 6 vision
+    layers were returned as two groups of 6 instead of one of 12 and one of
+    6, because indices 0-5 silently merged both families' suffixes into one
+    shape-dict, then diverged from indices 6-11 (language-only) once the
+    vision family ran out of blocks. Every downstream match on `_parse_block_key`
+    output must check the prefix too, not just the index (see
+    `report_block_groups` and `fold_sparse_payload` below, which had the same
+    latent bug and are fixed alongside this function).
     """
-    # Gather {block_index: {suffix: shape}}
-    block_params: Dict[int, Dict[str, torch.Size]] = defaultdict(dict)
+    # Gather {(prefix, block_index): {suffix: shape}}
+    block_params: Dict[Tuple[str, int], Dict[str, torch.Size]] = defaultdict(dict)
     for name, tensor in state_dict.items():
         parsed = _parse_block_key(name)
         if parsed is None:
             continue
-        _, idx, suffix = parsed
+        prefix, idx, suffix = parsed
         shape = tensor.shape if isinstance(tensor, torch.Tensor) else None
         if shape is not None:
-            block_params[idx][suffix] = shape
+            block_params[(prefix, idx)][suffix] = shape
 
     if not block_params:
         return []
 
-    sorted_indices = sorted(block_params.keys())
+    # Process each prefix's index range independently -- two families must
+    # never merge into one group even if their index ranges overlap.
+    prefixes = sorted({p for p, _ in block_params.keys()})
+    groups: List[Tuple[str, List[int]]] = []
 
-    # Walk through sorted indices and group consecutive structurally-equal blocks
-    groups: List[List[int]] = []
-    current_group: List[int] = [sorted_indices[0]]
+    for prefix in prefixes:
+        indices = sorted(i for p, i in block_params.keys() if p == prefix)
+        current_group: List[int] = [indices[0]]
 
-    for prev_i, cur_i in zip(sorted_indices, sorted_indices[1:]):
-        # Consecutive index check (no gaps)
-        if cur_i != prev_i + 1:
-            if len(current_group) >= min_group_size:
-                groups.append(current_group)
-            current_group = [cur_i]
-            continue
+        for prev_i, cur_i in zip(indices, indices[1:]):
+            consecutive = (cur_i == prev_i + 1)
+            same_shape  = block_params[(prefix, prev_i)] == block_params[(prefix, cur_i)]
+            if consecutive and same_shape:
+                current_group.append(cur_i)
+            else:
+                if len(current_group) >= min_group_size:
+                    groups.append((prefix, current_group))
+                current_group = [cur_i]
 
-        if block_params[prev_i] == block_params[cur_i]:
-            current_group.append(cur_i)
-        else:
-            if len(current_group) >= min_group_size:
-                groups.append(current_group)
-            current_group = [cur_i]
-
-    if len(current_group) >= min_group_size:
-        groups.append(current_group)
+        if len(current_group) >= min_group_size:
+            groups.append((prefix, current_group))
 
     return groups
 
 
 def report_block_groups(
     state_dict: Dict[str, torch.Tensor],
-    groups: List[List[int]],
+    groups: List[Tuple[str, List[int]]],
 ) -> None:
     """Print a human-readable summary of detected fold groups."""
     if not groups:
@@ -200,14 +216,17 @@ def report_block_groups(
         return
 
     print(f"[rnn_fold]  Detected {len(groups)} foldable group(s):\n")
-    for g_idx, group in enumerate(groups):
+    for g_idx, (prefix, group) in enumerate(groups):
         n = len(group)
         sample_idx = group[0]
-        # Collect parameter suffixes for this block
+        # Collect parameter suffixes for this block. Must match prefix AND
+        # index -- matching index alone can pull suffixes from an unrelated
+        # block family that happens to share the same index (see
+        # detect_repeated_block_groups docstring).
         suffixes = sorted(
             suffix for name in state_dict
             if (parsed := _parse_block_key(name)) is not None
-            and parsed[1] == sample_idx
+            and parsed[0] == prefix and parsed[1] == sample_idx
             for suffix in [parsed[2]]
         )
         # Find Q/K/V projections
@@ -215,7 +234,7 @@ def report_block_groups(
                        ('q_proj', 'k_proj', 'v_proj', 'query', 'key', 'value',
                         'c_attn', 'in_proj'))]
 
-        print(f"  Group {g_idx}: blocks {group[0]}–{group[-1]}  ({n} blocks to fold into 1)")
+        print(f"  Group {g_idx}: prefix='{prefix}'  blocks {group[0]}–{group[-1]}  ({n} blocks to fold into 1)")
         print(f"    Parameters per block : {len(suffixes)}")
         print(f"    Attention projections: {attn_params or '(none detected)'}")
         print()
@@ -904,12 +923,17 @@ def fold_block_group(
     n_folds = len(group)
     sample_idx = group[0]
 
-    # Collect all parameter suffixes present in the sample block
+    # Collect all parameter suffixes present in the sample block.
+    # Must match prefix AND index -- index alone pulls in suffixes from an
+    # unrelated block family sharing the same index (e.g. a VLM's vision
+    # tower block 0 has the same bare index as its language block 0). This
+    # is the same root-cause bug fixed in detect_repeated_block_groups and
+    # report_block_groups above; see that docstring for the full story.
     suffixes: List[str] = sorted(
         parsed[2]
         for name in state_dict
         if (parsed := _parse_block_key(name)) is not None
-        and parsed[1] == sample_idx
+        and parsed[0] == prefix and parsed[1] == sample_idx
     )
 
     stacked_weights:  Dict[str, torch.Tensor]       = {}
@@ -1042,20 +1066,14 @@ def fold_sparse_payload(
         print("[rnn_fold]  No repeated block groups found.  Payload unchanged.")
         return payload
 
-    # Determine the prefix for each group from the first block's first param
-    def _group_prefix(group: List[int]) -> str:
-        idx = group[0]
-        for name in flat:
-            parsed = _parse_block_key(name)
-            if parsed and parsed[1] == idx:
-                return parsed[0]
-        return ""
+    # Prefix now comes directly from detect_repeated_block_groups -- no more
+    # reverse lookup by bare index, which was ambiguous whenever two block
+    # families (e.g. a VLM's language and vision towers) share an index range.
 
     folded_descriptors: List[dict] = []
     removed_names: set = set()
 
-    for group in groups:
-        prefix = _group_prefix(group)
+    for prefix, group in groups:
         print(f"[rnn_fold]  Folding blocks {group[0]}–{group[-1]} "
               f"(n={len(group)}, prefix='{prefix}')")
 
@@ -1068,11 +1086,13 @@ def fold_sparse_payload(
         print(desc.summary())
         print()
 
-        # Record which param names to remove from the flat state dict
+        # Record which param names to remove from the flat state dict.
+        # Must match prefix AND index -- index alone would also remove
+        # same-indexed tensors belonging to an unrelated block family.
         for block_idx in group:
             for name in list(flat.keys()):
                 parsed = _parse_block_key(name)
-                if parsed and parsed[1] == block_idx:
+                if parsed and parsed[0] == prefix and parsed[1] == block_idx:
                     removed_names.add(name)
 
         # Serialise descriptor for the payload

@@ -21,7 +21,10 @@ makes two-phase streaming trivial:
 
 Initial implementation. Follow-up edge cases (requirements doc section 7):
 gated-repo auth, fsck of partial .pt after crash, tied-weight dedup, MoE
-expert-merge (later TODO).
+expert-merge (later TODO). Conv-kernel tensors (ndim > 2, e.g. Pixtral's
+patch_conv.weight) are kept DENSE, not pruned -- see the ndim==2 branch below
+for the full rationale (small-in-every-dimension tensors don't sparsify well;
+also deferred to later-todo alongside MoE).
 """
 from __future__ import annotations
 import json
@@ -108,10 +111,8 @@ def streaming_sparsify(model_dir: str, out_dir: str,
                 orig_shape = list(t.shape)
                 entry = {"orig_shape": orig_shape, "numel": t.numel(),
                          "dtype": str(t.dtype)}
-                if t.ndim >= 2:
+                if t.ndim == 2:
                     t = t.float()
-                    if t.ndim > 2:
-                        t = t.reshape(t.shape[0], -1)      # e.g. 4-D patch_conv
                     t = t * (t.abs() >= threshold)
                     csr = t.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
                     entry.update(layout="csr",
@@ -120,6 +121,22 @@ def streaming_sparsify(model_dir: str, out_dir: str,
                     torch.save(csr, _tensor_path(out_dir, name))
                     del csr
                 else:
+                    # ndim <= 1 (norms, biases) or ndim > 2 (conv kernels, e.g.
+                    # patch_conv.weight (1024,3,14,14) in the Pixtral vision
+                    # tower): kept DENSE, not pruned. Two reasons, not one:
+                    #   (a) small in every dimension -- prior sparsification
+                    #       attempts on vision-tower-scale tensors found they
+                    #       don't sparsify well (density stays high relative
+                    #       to the text stack's 5120x5120 matrices), so the
+                    #       CSR overhead isn't worth it even where it's
+                    #       technically possible;
+                    #   (b) CSR is 2-D only, so ndim>2 would need a reshape
+                    #       to (out, -1) first, adding a reconstruction step
+                    #       for no proven benefit at this size (~600K params
+                    #       vs the ~21M-scale text matrices where sparsity
+                    #       actually pays off).
+                    # Deferred to later-todo alongside MoE expert-merge; see
+                    # docs/requirements_vlm_streaming_rtac.md section 7.
                     entry.update(layout="dense", csr_shape=None,
                                  nnz=int((t != 0).sum().item()))
                     torch.save(t.float(), _tensor_path(out_dir, name))

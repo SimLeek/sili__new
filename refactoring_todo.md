@@ -334,3 +334,17 @@ giant sparse layer: CSR sparsity subsumes MoE routing sparsity (router picks
 block-columns; CSR picks individual weights). Design: concat expert weights
 block-wise, fold router scores into per-block importance at conversion time.
 Later work -- after the dense streaming path is verified on 24B.
+
+## CONV-KERNEL SPARSIFICATION (later)
+
+Pixtral's patch_conv.weight (1024,3,14,14) = ~602K params, kept fully DENSE
+in streaming_prune.py for now (ndim>2 branch). Two reasons: small in every
+dimension (prior sparsification attempts on vision-tower-scale tensors found
+poor sparsify ratios vs the 21M-scale text matrices where CSR actually pays
+off), and CSR is 2-D only so ndim>2 needs a reshape-to-(out,-1) + orig_shape
+restore on the way back out -- extra machinery not worth building until dense
+is shown to actually cost something. If/when this is picked up: reshape
+(1024, 3*14*14)=(1024,588), prune, CSR, restore original 4-D shape at
+inference load time. Test first whether it sparsifies well at all before
+building the restore path -- if density stays high, it may not be worth
+doing regardless of whether the machinery exists.
