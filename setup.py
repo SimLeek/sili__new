@@ -5,8 +5,7 @@ reqs   = [
 'numpy',
 'pybind11'
 ]
-#readme = open("README.md").read()
-readme = "sili"
+readme = open("README.md").read()
 cpu_ext = Extension(
     name="sili._cpu",
     sources=["sili/cpu_backend.cpp"],
@@ -34,6 +33,7 @@ setup(
     version="0.0.3",
     description="SILi: Sparse Intelligence Library",
     long_description=readme,
+    long_description_content_type="text/markdown",
     url="https://github.com/simleek/SILi",
     author="SimLeek",
     author_email="simulator.leek@gmail.com",
