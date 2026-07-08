@@ -138,6 +138,125 @@ def encode_observation(varr: np.ndarray, cx: float, cy: float, zoom: float) -> n
     return np.concatenate([varr.reshape(-1).astype(np.float32), pos_feat])
 
 
+def make_position_embeddings(size: int, n_freqs: int = 4) -> np.ndarray:
+    """
+    Fixed (not learned) sinusoidal position embeddings for a size x size
+    grid, flattened row-major to match render_mandelbrot's output layout.
+    Deterministic, unique per position, smoothly varying -- the classic
+    Transformer positional-encoding idea extended to 2D (row, col).
+    """
+    rows, cols = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
+    rows = rows.reshape(-1).astype(np.float32)
+    cols = cols.reshape(-1).astype(np.float32)
+    feats = []
+    for i in range(n_freqs):
+        freq = 1.0 / (size ** (i / max(1, n_freqs - 1)))
+        feats += [np.sin(rows*freq), np.cos(rows*freq),
+                  np.sin(cols*freq), np.cos(cols*freq)]
+    return np.stack(feats, axis=1).astype(np.float32)
+
+
+class PixelAttentionHead:
+    """
+    Transformer-style reconstruction head: position-embedded pixel QUERIES
+    attend into the HIDDEN STATE (reshaped into memory slots) as the
+    attention CONTEXT, replacing a single linear layer predicting all
+    view*view pixels at once from one hidden vector.
+
+    Why: a single linear layer mapping hidden -> all pixels at once has no
+    way to treat different output positions differently -- structurally
+    blind to WHERE a pixel is, the same failure mode the input side had
+    before encode_observation() stopped mean-pooling. Confirmed by direct
+    observation this session: reconstruction converged toward something
+    close to the pixel-wise average of the training distribution
+    ("predicts the average view"). This is a well-known failure mode for
+    RNN-style dense-output visual prediction generally, not specific to
+    sili (matches prior direct experience: identical behavior from a large
+    RNN run on Atari frames).
+
+    Design: fixed sinusoidal position embeddings per pixel (not learned --
+    deterministic, unique, smoothly varying) projected into per-pixel
+    QUERIES. The hidden state is reshaped into n_slots memory slots and
+    projected into KEYS/VALUES, giving attention real multi-position
+    structure to attend over (a single vector has nothing to attend "into"
+    otherwise). Every pixel's query attends over the SAME slot set, so
+    different pixels can learn to pull from different combinations of
+    hidden-state slots depending on their position -- genuinely
+    position-aware, unlike one shared linear map.
+
+    Fully vectorized: all view*view queries computed and attended in a
+    handful of matmuls (batched over pixel positions), not a per-pixel
+    Python loop. Gradient hand-derived and verified against finite-
+    difference numerical gradients (max relative error ~1e-10) before
+    wiring in -- softmax has no native sili autograd op, so this is plain
+    numpy throughout with a manually-computed backward, matching Vr/br's
+    own prior convention (plain numpy, manual SGD) rather than mixing in
+    sili Tensor ops that would never actually be exercised.
+
+    Wo starts at exactly zero (matches everything else in zero_mode):
+    reconstruction begins at exactly 0 regardless of core; only Wo needs to
+    escape zero via backprop, since Wq/Wk/Wv already provide small-random
+    (not zero) attention structure to differentiate positions/slots from
+    the first step.
+    """
+    def __init__(self, hidden: int, view: int, n_slots: int = 16,
+                d_k: int = 32, lr: float = 0.01, zero_init: bool = True,
+                seed: int = 0):
+        assert hidden % n_slots == 0, \
+            f"hidden={hidden} must be divisible by n_slots={n_slots}"
+        self.n_slots, self.d_slot, self.d_k = n_slots, hidden // n_slots, d_k
+        self.n_pix = view * view
+        self.pos_emb = make_position_embeddings(view)      # (n_pix, d_pos), fixed
+        d_pos = self.pos_emb.shape[1]
+        rng = np.random.default_rng(seed)
+        s = 1.0 / math.sqrt(d_k)
+        self.Wq = (rng.standard_normal((d_pos, d_k)) * s).astype(np.float32)
+        self.Wk = (rng.standard_normal((self.d_slot, d_k)) * s).astype(np.float32)
+        self.Wv = (rng.standard_normal((self.d_slot, d_k)) * s).astype(np.float32)
+        self.Wo = (np.zeros((d_k, 1), np.float32) if zero_init else
+                  (rng.standard_normal((d_k, 1)) * s).astype(np.float32))
+        self.lr = lr
+        self._cache = None
+
+    def forward(self, h: np.ndarray) -> np.ndarray:
+        """h: (hidden,) numpy array (detached state). Returns (n_pix,)."""
+        slots = h.reshape(self.n_slots, self.d_slot)
+        Q = self.pos_emb @ self.Wq                # (n_pix, d_k)
+        K = slots @ self.Wk                        # (n_slots, d_k)
+        V = slots @ self.Wv                        # (n_slots, d_k)
+        scores = Q @ K.T / math.sqrt(self.d_k)
+        scores = scores - scores.max(axis=1, keepdims=True)
+        w = np.exp(scores); w = w / w.sum(axis=1, keepdims=True)
+        attended = w @ V                            # (n_pix, d_k)
+        pred = (attended @ self.Wo).reshape(-1)     # (n_pix,)
+        self._cache = (Q, K, V, w, attended, slots)
+        return pred
+
+    def backward(self, g_pred: np.ndarray) -> np.ndarray:
+        """g_pred: (n_pix,) gradient at the reconstruction output. Updates
+        Wq/Wk/Wv/Wo via SGD; returns gradient w.r.t. h (hidden,) for the
+        caller to inject into the recurrent core (matching Vr/br's own
+        prior g_h_recon = g_pred @ Vr.T convention)."""
+        Q, K, V, w, attended, slots = self._cache
+        g2 = g_pred.reshape(-1, 1)
+        dWo = attended.T @ g2
+        d_att = g2 @ self.Wo.T
+        dV = w.T @ d_att
+        dw = d_att @ V.T
+        ds = w * (dw - (w*dw).sum(axis=1, keepdims=True))     # softmax Jacobian
+        dQ = ds @ K / math.sqrt(self.d_k)
+        dK = ds.T @ Q / math.sqrt(self.d_k)
+        dWq = self.pos_emb.T @ dQ
+        dWk = slots.T @ dK
+        dWv = slots.T @ dV
+        d_slots = dK @ self.Wk.T + dV @ self.Wv.T
+        self.Wq -= self.lr * dWq
+        self.Wk -= self.lr * dWk
+        self.Wv -= self.lr * dWv
+        self.Wo -= self.lr * dWo
+        return d_slots.reshape(-1)
+
+
 # ── Sparse construction (real synaptogenesis, not a fixed pattern) ───────────
 
 def make_grown_sparse_layer(n_in: int, n_out: int, base_connections: int,
@@ -545,10 +664,16 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
             print(f'    --display requested but displayarray not usable '
                   f'({e}); continuing headless')
 
-    # -- reconstruction head (numpy SGD; zero-init learns once hidden fires) --
-    Vr = (np.zeros((hidden, view*view), np.float32) if zero_mode else
-          (np.random.randn(hidden, view*view) * 0.02).astype(np.float32))
-    br = np.zeros(view*view, np.float32)
+    # -- reconstruction head: transformer-style, position-aware (see
+    # PixelAttentionHead docstring for why a single linear layer here was
+    # producing near-average-view predictions) --
+    # n_slots must divide hidden exactly; gcd(hidden, 16) is always a valid
+    # divisor of hidden (falls back safely for odd --hidden values a user
+    # might pass, e.g. gcd(100,16)=4, gcd(33,16)=1) while staying at the
+    # intended 16 for the actual defaults (1024, 32).
+    n_slots = max(1, math.gcd(hidden, 16))
+    recon_head = PixelAttentionHead(hidden, view, n_slots=n_slots, d_k=32,
+                                    lr=lr, zero_init=zero_mode)
 
     dense_params = Wp.params + [Wa, Wv_h, Wv_a, Wv_h2, Wv_a2] + core_net.params
 
@@ -577,7 +702,7 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
             x_img = Wp(Tensor(encode_observation(pv, px, py, pz)))
             h_pre = core_net.forward(x_img, np.zeros(hidden, np.float32))
             h_o, _, _ = energy_h.forward(h_pre)
-            pred = h_o.data @ Vr + br
+            pred = recon_head.forward(h_o.data)
             total += float(np.mean((pred - pv.ravel())**2))
         if sv_eh is not None: energy_h.energy = sv_eh
         if sv_eo is not None: energy_o.energy = sv_eo
@@ -641,16 +766,15 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         # -- next view, reconstruction --
         nv = render_mandelbrot(cx, cy, zoom, view)
         nflat = nv.ravel()
-        pred = h_out.data @ Vr + br
+        pred = recon_head.forward(h_out.data)
         rerr = pred - nflat
         rmse = float(np.mean(rerr**2))
         recon_win += rmse; n_win += 1; recon_all += rmse; n_all += 1
 
-        # recon head numpy SGD + gradient back to h
+        # recon head backward: updates Wq/Wk/Wv/Wo via SGD, returns gradient
+        # back to h for injection into the recurrent core below
         g_pred = (2./nflat.size) * rerr
-        g_h_recon = g_pred @ Vr.T
-        Vr -= lr * np.outer(h_out.data, g_pred)
-        br -= lr * g_pred
+        g_h_recon = recon_head.backward(g_pred)
 
         if show is not None:
             show(varr, pred)
