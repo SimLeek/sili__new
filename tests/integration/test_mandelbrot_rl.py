@@ -26,8 +26,12 @@ WHAT THIS VERSION TESTS:
      uses GROUPED neurons (4 per action, averaged) to smooth the 2.0-fire
      twitching, per design discussion.
   3b. --core sparse (DEFAULT) vs --core dense (the alternative/comparison):
-     sparse is a large, genuinely sparse FoldedLayer-based core (--hidden
-     tunable, default 1024, --density controls connectivity fraction).
+     sparse is a large, genuinely sparse FoldedLayer-based core that starts
+     EMPTY and grows via real synaptogenesis (--hidden tunable, default 1024,
+     --base-connections is the per-row target reached via build_probes ->
+     synap_step, then held there via continual grow+prune churn -- this is
+     sili's actual distinguishing mechanism, not merely "some weight matrix
+     happens to be sparse"; see make_grown_sparse_layer's docstring).
      dense is the original plain-Tensor version, kept for comparison so
      sparse-vs-dense behavior at the same hidden size can be checked
      directly against each other. Previously the only "large" option was
@@ -69,8 +73,9 @@ warnings.filterwarnings('ignore')
 
 import torch  # CSR construction only -- not in the compute path
 import sili.cpu
+from sili import _cpu
 from sili.tensor import Tensor, tanh as sili_tanh, combine_losses
-from sili.sparse_rnn import FoldedLayer
+from sili.sparse_rnn import FoldedLayer, SynaptogenesisSchedule
 from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
 from sili.energy import EnergyDynamics
 
@@ -133,75 +138,105 @@ def encode_observation(varr: np.ndarray, cx: float, cy: float, zoom: float) -> n
     return np.concatenate([varr.reshape(-1).astype(np.float32), pos_feat])
 
 
-# ── Sparse construction (near-zero-init) ──────────────────────────────────────
+# ── Sparse construction (real synaptogenesis, not a fixed pattern) ───────────
 
-def make_near_zero_sparse_layer(n_in: int, n_out: int, density: float,
-                                lr: float, num_cpus: int = 1,
-                                seed: int = 0) -> FoldedLayer:
+def make_grown_sparse_layer(n_in: int, n_out: int, base_connections: int,
+                            lr: float, num_cpus: int = 1,
+                            k_factor: int = 4, importance_cutoff: float = 0.0,
+                            amplitude: float = 0.0, period: int = 200,
+                            every_n_steps: int = 1
+                            ) -> tuple[FoldedLayer, SynaptogenesisSchedule]:
     """
-    A genuinely sparse FoldedLayer with a fixed random connectivity pattern
-    and near-zero initial values, for the same "nothing works until energy
-    dynamics + backprop shape it" attribution property the exact-zero dense
-    cores use -- but exact zero does not survive this construction path.
+    A genuinely sparse FoldedLayer that starts EMPTY (nnz=0) and is grown
+    via REAL synaptogenesis (build_probes -> synap_step, driven by
+    importance), not a fixed random connectivity pattern with only trained
+    values.
 
-    CONFIRMED BY DIRECT TESTING (not assumed): building a torch sparse_csr
-    tensor with EXPLICIT STORED ZEROS at a fixed connectivity pattern (via
-    torch.sparse_csr_tensor with a values tensor of all 0.0, not via
-    tensor.to_sparse() on a dense zero tensor, which collapses to 0 nnz
-    regardless of any mask) DOES correctly preserve the intended nnz through
-    construction of the torch tensor itself -- but FoldedLayer.from_descriptor
-    silently drops every entry with value exactly 0.0 during construction
-    (verified: source csr had nnz=80, immediately after construction
-    layer.nnz == 0, before any forward/backward call at all). This is
-    presumably intentional for the NORMAL use case (loading real pretrained
-    weights, where a stored zero genuinely means "no meaningful connection"),
-    but is incompatible with wanting "connection exists structurally, value
-    is deliberately near-zero for now."
+    WHY THIS MATTERS (per direct correction): build_probes/synap_step are
+    not an initialization trick -- they are the mechanism that CONTINUALLY
+    reshapes the graph structure itself during training, based on gradient-
+    derived importance. A fixed random sparse pattern with only backprop-
+    trained VALUES is architecturally a sparse echo/reservoir network with
+    a trained readout -- a completely different system from one where the
+    connectivity itself is shaped by backprop and importance. An earlier
+    version of this function did exactly that (fixed random mask, near-zero
+    values, no growth calls at all) and was wrong for that reason, not for
+    any bug in it.
 
-    Fix: use a TINY nonzero value (1e-6) instead of exact 0.0. Confirmed by
-    direct testing that this survives construction intact down to at least
-    1e-8, and that a subsequent backward() call correctly updates the stored
-    values (unlike exact zero, which also silently failed to update even
-    when construction was worked around, due to a SEPARATE issue: per-row
-    value_scale for an all-zero row defaults to a scale that makes any
-    single realistic gradient step round back to zero under FP4 quantization
-    -- the exact same class of problem already solved for importance_scale
-    elsewhere in this codebase (imp_scale = learning_rate / FP4_MAX), just
-    not previously applied to the value scale for a from-scratch sparse
-    layer). Both fixes are needed together; each alone was insufficient
-    (confirmed by testing each in isolation before combining them).
+    CONSTRUCTION SEQUENCE (each step verified directly, not assumed):
+      1. _cpu.SparseLinearLayer(n_in, n_out, max_weights, num_cpus) starts
+         at nnz=0 -- confirmed empty, the natural bootstrap point for
+         growth-from-scratch. NOTE the row convention: rows = n_in (matches
+         this direct constructor's own (n_inputs, n_outputs, ...) parameter
+         order) -- DIFFERENT from FoldedBlockDescriptor/from_descriptor's
+         dense-weight-matrix convention (rows = n_out), which is what an
+         earlier version of this function used and is NOT the convention
+         used here.
+      2. equalize_to_capacity(...) reserves per-row headroom BEFORE any
+         connections exist. Without this, the first synap_step() growth
+         attempt fails immediately with "ran out of blank space" -- a fresh
+         empty layer has zero pre-allocated bytes to insert into.
+      3. set_value_scale_raw(row, lr/FP4_MAX) for every row, once, before
+         training starts. Same class of fix already used for
+         importance_scale elsewhere in this codebase, just not previously
+         applied to the value scale for a from-scratch sparse layer:
+         new connections (from probes) always start at value=0 (confirmed
+         against tests/unit/unittest_sisldo.cpp's sisldo_optim_synaptogenesis
+         test: "Values: existing kept, new connections = 0"), and without
+         this fix a single realistic backprop step on a newly-grown zero-
+         valued connection rounds back to zero under FP4 quantization --
+         the connection exists structurally but never actually learns
+         anything. Confirmed by direct testing: growth without this fix
+         reached the correct nnz but forward output stayed exactly zero
+         after 50 training steps; with this fix, real nonzero output.
+      4. SynaptogenesisSchedule drives ongoing growth. amplitude=0 (default)
+         means "grow to base_connections per row, then churn there forever"
+         -- every cadence, synap_step() removes connections below
+         importance_cutoff and regrows back up to base_connections, so the
+         density stays roughly constant while WHICH connections exist keeps
+         evolving. amplitude>0 sine-waves the target, explicitly exercising
+         both growth and pruning.
 
-    1e-6 is six orders of magnitude below typical operating signal scale in
-    this system (energy fires at 2.0, typical activations O(0.1-1)) --
-    negligible relative to any meaningful signal, functionally equivalent to
-    zero-init for all practical purposes, but NOT literally exact zero. This
-    is stated plainly rather than silently calling it "zero-init": the
-    distinction matters for the same attribution reasoning the exact-zero
-    dense cores exist for.
+    Caller MUST call the returned schedule's .step() every training step,
+    AFTER backward() and BEFORE the next forward() (matches
+    SynaptogenesisSchedule's own documented contract).
     """
-    TINY = 1e-6
     FP4_MAX = 6.0
-    torch.manual_seed(seed)
-    mask = torch.rand(n_out, n_in) < density
-    rows, cols = torch.nonzero(mask, as_tuple=True)
-    nnz = len(rows)
-    order = torch.argsort(rows, stable=True)
-    rows_sorted, cols_sorted = rows[order], cols[order]
-    counts = torch.bincount(rows_sorted, minlength=n_out)   # vectorized, not
-    crow = torch.cat([torch.zeros(1, dtype=torch.int64),     # a Python loop --
-                      torch.cumsum(counts, dim=0)])           # matters at scale
-    values = torch.full((nnz,), TINY, dtype=torch.float32)
-    csr = torch.sparse_csr_tensor(crow, cols_sorted, values, size=(n_out, n_in))
+    total_target = n_in * base_connections
+    # Budget with margin: sine-wave peaks can exceed base_connections by
+    # (1+amplitude), plus general slack so equalize_to_capacity/growth has
+    # room without immediately hitting the layer's overall budget.
+    max_weights = max(64, int(total_target * (1.0 + amplitude) * 1.5))
 
-    desc = FoldedBlockDescriptor(
-        n_folds=1, block_indices=[0], stacked_weights={'.w': csr},
-        out_dims={'.w': n_out}, band_half_widths={'.w': None}, prefix='sparse.')
-    layer = FoldedLayer.from_descriptor(desc, learning_rate=lr, num_cpus=num_cpus)
+    raw = _cpu.SparseLinearLayer(n_in, n_out, max_weights, num_cpus)
 
-    sub = layer._sili_layers['.w']
-    for r in range(n_out):
-        sub.set_value_scale_raw(r, lr / FP4_MAX)
-    return layer
+    target_elems = max(1, round(base_connections * (1.0 + amplitude) * 1.5))
+    bits = max(1, n_out - 1).bit_length()
+    target_bytes = target_elems * ((bits + 6) // 7) + 8
+    raw.equalize_to_capacity(target_elems, target_bytes)
+
+    for r in range(n_in):
+        raw.set_value_scale_raw(r, lr / FP4_MAX)
+
+    layer = FoldedLayer(layers={'.w': raw}, n_folds=1, out_dims={'.w': n_out},
+                        learning_rate=lr)
+    # k_factor is scaled by n_in (row count) here, not passed through as-is.
+    # SynaptogenesisSchedule computes k = k_factor * current_target_per_row,
+    # but build_probes(k) proposes k candidates GLOBALLY across the whole
+    # layer, not per row -- confirmed by direct testing: with the schedule's
+    # own (row-count-blind) k formula at n_in=128 rows, growth stalled at
+    # 1280/2048 target and never progressed past step 60 no matter how many
+    # further steps ran, because each call only ever proposed ~32 global
+    # candidates, nowhere near enough to eventually cover 128 rows x 8
+    # target each. Scaling k_factor by n_in gives build_probes enough
+    # candidates each call to actually reach the full target; verified this
+    # reaches and holds the target correctly (2048/2048) at the same layer
+    # size that stalled before the fix.
+    sched = SynaptogenesisSchedule(
+        layer, base_connections=base_connections, k_factor=k_factor * n_in,
+        importance_cutoff=importance_cutoff, amplitude=amplitude,
+        period=period, every_n_steps=every_n_steps)
+    return layer, sched
 
 
 class DenseProjection:
@@ -217,16 +252,21 @@ class DenseProjection:
 
 
 class SparseProjection:
-    """Wraps a FoldedLayer with the same call/.params interface as
-    DenseProjection. params is empty because folded layers self-update via
-    backward_dense (same reason core_net.params is empty for FoldedLayer-
-    based cores) -- the outer SGD loop must not also try to step them."""
-    def __init__(self, layer: FoldedLayer):
+    """Wraps a FoldedLayer + its SynaptogenesisSchedule with the same
+    call/.params interface as DenseProjection. params is empty because
+    folded layers self-update via backward_dense (same reason core_net.params
+    is empty for FoldedLayer-based cores) -- the outer SGD loop must not
+    also try to step them."""
+    def __init__(self, layer: FoldedLayer, sched: SynaptogenesisSchedule):
         self.layer = layer
+        self.sched = sched
         self.params = []
 
     def __call__(self, x: Tensor) -> Tensor:
         return self.layer(x)
+
+    def step_synaptogenesis(self):
+        self.sched.step()
 
 
 # ── Cores ─────────────────────────────────────────────────────────────────────
@@ -268,33 +308,50 @@ class DenseCore:
 class SparseCore:
     """
     Large, genuinely sparse recurrent cell -- the DEFAULT. sili's actual
-    distinguishing capability is sparse computation at scale; pairing
-    "sparse" with "tiny" (--core mistral, fixed at hidden=32 by its
-    pretrained toy weights) and "large" with "dense" (the old default)
-    tested neither property together. This core is sparse AND tunable to
-    large hidden sizes via --hidden.
+    distinguishing capability is DYNAMIC sparse structure driven by
+    backprop-derived importance (real synaptogenesis: build_probes ->
+    synap_step, continually growing and pruning), not merely "some weight
+    matrix happens to be sparse." Pairing "sparse" with "tiny" (--core
+    mistral, fixed at hidden=32 by its pretrained toy weights) and "large"
+    with "dense" (the old default) tested neither property together, and an
+    earlier version of THIS class used a FIXED random connectivity pattern
+    with only trained values -- architecturally a sparse echo/reservoir
+    network with a trained readout, a completely different system from what
+    sili actually is. This version starts genuinely empty (nnz=0) and grows
+    via SynaptogenesisSchedule; see make_grown_sparse_layer's docstring for
+    the full verified construction sequence.
 
-    Two SEPARATE sparse layers (image contribution, recurrent contribution)
+    Two SEPARATE grown layers (image contribution, recurrent contribution)
     summed, rather than one big lifted-and-concatenated matrix -- avoids the
     lift trick DenseCore needs (which exists specifically to route gradients
     through a single dense matrix multiply) and lets image-sparsity and
-    recurrent-sparsity be reasoned about/tuned independently if ever useful.
-    Same shape of fix as MistralCore's Wc_img/Wc_state split.
-
-    Near-zero (not exact-zero) init -- see make_near_zero_sparse_layer's
-    docstring for the two-part reason (exact zero doesn't survive
-    FoldedLayer construction; even a worked-around exact zero doesn't
-    reliably escape via backward due to a separate value_scale issue).
+    recurrent-sparsity grow/churn independently. Same shape of fix as
+    MistralCore's Wc_img/Wc_state split.
     """
-    def __init__(self, d_img, hidden, density=0.1, lr=0.01, num_cpus=1, seed=0):
-        self.core_img   = make_near_zero_sparse_layer(
-            d_img, hidden, density, lr, num_cpus, seed)
-        self.core_state = make_near_zero_sparse_layer(
-            hidden, hidden, density, lr, num_cpus, seed + 1)
+    def __init__(self, d_img, hidden, base_connections=6, lr=0.01,
+                num_cpus=1, k_factor=4, importance_cutoff=0.0,
+                amplitude=0.0, period=200, every_n_steps=1, seed=0):
+        self.core_img, self.sched_img = make_grown_sparse_layer(
+            d_img, hidden, base_connections, lr, num_cpus, k_factor,
+            importance_cutoff, amplitude, period, every_n_steps)
+        self.core_state, self.sched_state = make_grown_sparse_layer(
+            hidden, hidden, base_connections, lr, num_cpus, k_factor,
+            importance_cutoff, amplitude, period, every_n_steps)
         self.params = []   # folded layers self-update via backward_dense
 
     def forward(self, x_img: Tensor, state: np.ndarray) -> Tensor:
         return self.core_img(x_img) + self.core_state(Tensor(state))
+
+    def step_synaptogenesis(self):
+        """Call AFTER backward(), BEFORE the next forward() -- matches
+        SynaptogenesisSchedule's own documented contract. Each call advances
+        both cadences; each schedule only actually runs growth/pruning when
+        its own every_n_steps interval fires."""
+        self.sched_img.step()
+        self.sched_state.step()
+
+    def nnz_total(self) -> int:
+        return self.core_img.nnz_total() + self.core_state.nnz_total()
 
 
 class MistralCore:
@@ -362,7 +419,9 @@ class MistralCore:
 
 def run(core='sparse', policy='curiosity', agent='reinforce',
         max_steps=2000, timeout=60.0,
-        view=32, hidden=1024, density=0.1, num_cpus=1,
+        view=32, hidden=1024, base_connections=6, num_cpus=1,
+        k_factor=4, importance_cutoff=0.0, synap_amplitude=0.0,
+        synap_period=200, synap_every=10,
         lr=0.01, aux_weight=0.05, pol_weight=0.3,
         group=4, report_every=200, verbose=True, seed=0,
         display=False, gamma=0.99, entropy_scale=0.01,
@@ -377,20 +436,20 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
                   f"toy-Mistral weights fixed at hidden=32 (can't be widened)")
         hidden = 32
 
-    # zero_mode covers BOTH zero-init cores (sparse near-zero, dense exact-
-    # zero) -- mistral is the only core that starts from nonzero (pretrained
-    # toy) weights. Gates the SEPARATE small head matrices (action, value,
-    # reconstruction) that stay plain dense Tensors regardless of which core
-    # is active -- only the recurrent core + input projection differ between
-    # sparse/dense/mistral; the small heads are cheap enough that making
-    # them sparse too wasn't part of what was asked for here.
+    # zero_mode covers BOTH zero-init cores (sparse: genuinely empty, grown
+    # via synaptogenesis; dense: exact-zero) -- mistral is the only core
+    # that starts from nonzero (pretrained toy) weights. Gates the SEPARATE
+    # small head matrices (action, value, reconstruction) that stay plain
+    # dense Tensors regardless of which core is active -- only the
+    # recurrent core + input projection differ between sparse/dense/mistral.
     zero_mode = core in ('sparse', 'dense')
     raw_dim = view * view + 3   # full flattened view + (cx, cy, log-zoom)
 
     # -- input projection (the "V part" -- new weights, toy Mistral has none) --
     if core == 'sparse':
-        Wp = SparseProjection(make_near_zero_sparse_layer(
-            raw_dim, hidden, density, lr, num_cpus, seed))
+        Wp = SparseProjection(*make_grown_sparse_layer(
+            raw_dim, hidden, base_connections, lr, num_cpus, k_factor,
+            importance_cutoff, synap_amplitude, synap_period, synap_every))
     else:
         Wp = DenseProjection(Tensor(
             np.zeros((raw_dim, hidden), np.float32) if zero_mode else
@@ -398,7 +457,9 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
 
     # -- core --
     if core == 'sparse':
-        core_net = SparseCore(hidden, hidden, density, lr, num_cpus, seed + 100)
+        core_net = SparseCore(hidden, hidden, base_connections, lr, num_cpus,
+                              k_factor, importance_cutoff, synap_amplitude,
+                              synap_period, synap_every, seed + 100)
     elif core == 'dense':
         core_net = DenseCore(hidden, hidden)
     else:
@@ -534,7 +595,7 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
               f"({N_ACT} actions x {group} grouped)")
         print(f"    limits: steps={max_steps}  timeout={timeout:.0f}s")
         if zero_mode:
-            kind = "NEAR-ZERO" if core == 'sparse' else "ZERO"
+            kind = "EMPTY (grown via synaptogenesis)" if core == 'sparse' else "ZERO"
             print(f"    {kind} INIT everywhere; energy pre-charged 1.9 on hidden+output")
         else:
             print(f"    toy-Mistral folded core (v/o attn-collapse + gated MLP); "
@@ -667,6 +728,16 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         terms.append((l7, G_pol))
         combine_losses(*terms).backward()
 
+        # Synaptogenesis: AFTER backward() (importance/grad accumulators are
+        # populated), BEFORE the next forward() -- matches
+        # SynaptogenesisSchedule's documented contract exactly. No-op for
+        # dense/mistral (their .params-bearing objects don't have this method;
+        # only SparseCore/SparseProjection do).
+        if hasattr(core_net, 'step_synaptogenesis'):
+            core_net.step_synaptogenesis()
+        if hasattr(Wp, 'step_synaptogenesis'):
+            Wp.step_synaptogenesis()
+
         for p in dense_params:
             if p.grad is not None:
                 np.clip(p.grad, -1., 1., out=p.grad)
@@ -761,9 +832,33 @@ def main():
     ap.add_argument('--hidden',  type=int,   default=1024,
                     help='hidden size; forced to 32 for --core mistral '
                          '(folded weights are fixed-width)')
-    ap.add_argument('--density', type=float, default=0.1,
-                    help='connectivity fraction for --core sparse (default '
-                         '10%%); ignored for dense/mistral')
+    ap.add_argument('--base-connections', type=int, default=6,
+                    help='target connections per row for --core sparse '
+                         '(grown from empty via synaptogenesis, then held '
+                         'there via continual churn); ignored for dense/mistral')
+    ap.add_argument('--k-factor', type=int, default=4,
+                    help='probes built per synaptogenesis call = '
+                         'k_factor * current target (rule of thumb: 4x)')
+    ap.add_argument('--importance-cutoff', type=float, default=0.0,
+                    help='prune connections below this stored-unit importance '
+                         'each synaptogenesis call')
+    ap.add_argument('--synap-amplitude', type=float, default=0.0,
+                    help='0 (default) = constant target, grow-then-churn. '
+                         '>0 sine-waves the target +-amplitude fraction, '
+                         'explicitly exercising both growth and pruning')
+    ap.add_argument('--synap-period', type=int, default=200,
+                    help='steps per full sine cycle when --synap-amplitude > 0')
+    ap.add_argument('--synap-every', type=int, default=10,
+                    help='run synaptogenesis every N training steps. Real '
+                         'cost: build_probes scales with k_factor*n_rows, so '
+                         'running every single step is genuinely expensive '
+                         'at large --hidden (confirmed: 5 st/s at hidden=256, '
+                         'every_n_steps=1, vs 40 st/s at every_n_steps=10). '
+                         'This performance/quality tradeoff -- how often and '
+                         'how aggressively to reshape structure -- is exactly '
+                         'what an adaptive scheduler could tune dynamically; '
+                         'see docs/requirements or a future adaptive-'
+                         'synaptogenesis experiment file for that.')
     ap.add_argument('--num-cpus', type=int, default=1,
                     help='OpenMP threads for sparse layers. 1 is correct at '
                          'small hidden (thread-wakeup overhead exceeds any '
@@ -776,7 +871,10 @@ def main():
     a = ap.parse_args()
     kw = dict(lr=a.lr, group=a.group, report_every=a.report_every,
               agent=a.agent, display=a.display, hidden=a.hidden,
-              density=a.density, num_cpus=a.num_cpus)
+              base_connections=a.base_connections, num_cpus=a.num_cpus,
+              k_factor=a.k_factor, importance_cutoff=a.importance_cutoff,
+              synap_amplitude=a.synap_amplitude, synap_period=a.synap_period,
+              synap_every=a.synap_every)
     if a.compare:
         compare(a.core, a.steps, a.timeout, **kw)
     else:
