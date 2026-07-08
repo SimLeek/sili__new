@@ -392,18 +392,30 @@ working pipeline over expanding scope.
 
 ## VISION: PER-PATCH SEQUENCE + SPATIAL MERGE (later)
 
-Current test_mandelbrot_rl.py --core mistral uses a mean-pooled-patch
-simplification: the whole image is reduced to one vector before entering the
-recurrent core, rather than the real Pixtral architecture's per-patch token
-sequence + attention + 2x2 spatial merge (multi_modal_projector.patch_merger,
-spatial_merge_size=2 per the real config.json). Implementing this properly
-needs: patches kept as a sequence (not mean-pooled), the vision tower's
-attention operating over that sequence, and the 2x2 merge implemented as a
-constant gather/matmul (group 2x2 neighboring patch tokens, concatenate their
-channels, project down) matching patch_merger.merging_layer.weight's real
-shape (VIS_HIDDEN, VIS_HIDDEN*MERGE*MERGE). This is a real architecture
-change from the current simplification, not a small patch -- deferred
-alongside the RTAC items above.
+UPDATE: the worst part of the old simplification is fixed -- test_mandelbrot_rl.py
+used to mean-pool ALL patches together into one vector before projection,
+destroying every bit of spatial layout (confirmed: with view=32, patch=8,
+that was averaging all 16 separate 8x8 patches into a single 64-dim vector --
+the network had no way to know WHERE any feature was in the frame, only
+"what does an average local patch look like"). Now flattens the full view
+directly (raw_dim = view*view + 3, the +3 being explicit position/zoom) so
+every pixel occupies a fixed position in the input vector and a linear
+projection can in principle learn to treat different spatial regions
+differently.
+
+That is still NOT the real Pixtral architecture's per-patch token sequence +
+attention + 2x2 spatial merge (multi_modal_projector.patch_merger,
+spatial_merge_size=2 per the real config.json) -- there is still no
+attention operating over spatially-distinct patch tokens, just one big flat
+vector through one linear layer. Implementing the real version still needs:
+patches kept as a genuine sequence (not flattened into one vector either),
+the vision tower's attention operating over that sequence, and the 2x2 merge
+implemented as a constant gather/matmul (group 2x2 neighboring patch tokens,
+concatenate their channels, project down) matching
+patch_merger.merging_layer.weight's real shape
+(VIS_HIDDEN, VIS_HIDDEN*MERGE*MERGE). Still a real architecture change from
+the current (much improved, but still single-vector) input, not a small
+patch -- deferred alongside the RTAC items above.
 
 
 ## KNOWN ISSUE: test/python/test_sili.py is stale against the current SparseLinearLayer API

@@ -95,6 +95,31 @@ def entropy_nats(counts):
     return float(-(p * np.log(p)).sum())
 
 
+def encode_observation(varr: np.ndarray, cx: float, cy: float, zoom: float) -> np.ndarray:
+    """
+    Raw view + explicit position/zoom -> flat input vector.
+
+    Two fixes to what was here before (mean-pooling all patches into one
+    vector, no position signal at all):
+
+    1. Full flatten, not mean-pool. The old pipeline reshaped the view into
+       16 separate 8x8 patches then averaged ALL of them into one vector --
+       destroying every bit of spatial layout, leaving only "what does an
+       average local patch look like" with no information about WHERE any
+       feature sits in the frame. Flattening instead keeps every pixel at
+       a fixed position in the input vector, so a linear projection can in
+       principle learn to treat different spatial regions differently.
+    2. Explicit (cx, cy, zoom) as input, not left for the network to infer.
+       zoom is log-scaled (it spans 1 to 1e8) and everything is roughly
+       unit-scaled so it doesn't dominate the visual features by magnitude.
+       Without this, the network had literally no way to know where it is
+       except by guessing from ambiguous, now-flattened pixel content.
+    """
+    pos_feat = np.array([cx / 2.0, cy / 2.0, math.log2(max(zoom, 1.0)) / 10.0],
+                        dtype=np.float32)
+    return np.concatenate([varr.reshape(-1).astype(np.float32), pos_feat])
+
+
 # ── Cores ─────────────────────────────────────────────────────────────────────
 
 class ZeroCore:
@@ -163,10 +188,23 @@ class MistralCore:
         # GQA tile 16 -> 32 as a constant matmul (stays in autograd)
         self._tile = np.hstack([np.eye(16, dtype=np.float32),
                                 np.eye(16, dtype=np.float32)])  # (16, 32)
-        self.params = []  # folded layers self-update in backward
+        # Learned image/state combination (replaces raw x_img + state).
+        # The folded weights are fixed-width and pretrained-shaped, so they
+        # can't be widened, but there's no reason the way image content and
+        # recurrent memory get COMBINED before entering them has to be a raw
+        # element-wise sum -- that gives the network no way to weight "new
+        # visual input" against "old memory" differently per dimension.
+        # Two small learned projections, summed, give it that freedom
+        # (mathematically the same shape of fix as ZeroCore's separate
+        # input/recurrent weight blocks, just written as two matrices
+        # instead of one lifted-and-split matrix).
+        scale = 1.0 / math.sqrt(hidden)
+        self.Wc_img   = Tensor((np.random.randn(hidden, hidden) * scale).astype(np.float32))
+        self.Wc_state = Tensor((np.random.randn(hidden, hidden) * scale).astype(np.float32))
+        self.params = [self.Wc_img, self.Wc_state]  # folded layers self-update; these don't
 
     def forward(self, x_img: Tensor, state: np.ndarray) -> Tensor:
-        x_in  = x_img + state                       # (32,) graph
+        x_in  = x_img @ self.Wc_img + Tensor(state) @ self.Wc_state   # learned combine
         attn  = self.o(self.v(x_in) @ self._tile)   # o(tile(v(x)))
         h1    = x_in + attn
         g     = self.gate(h1)
@@ -179,7 +217,7 @@ class MistralCore:
 
 def run(core='zero', policy='curiosity', agent='reinforce',
         max_steps=2000, timeout=60.0,
-        view=32, lr=0.01, aux_weight=0.05, pol_weight=0.3,
+        view=32, hidden=1024, lr=0.01, aux_weight=0.05, pol_weight=0.3,
         group=4, report_every=200, verbose=True, seed=0,
         display=False, gamma=0.99, entropy_scale=0.01,
         loss_alpha=0.2, target_update=0.005):
@@ -187,17 +225,18 @@ def run(core='zero', policy='curiosity', agent='reinforce',
     ACT_NAMES = ['pan<','pan>','pan^','panv','zoom+','zoom-','reset']
     np.random.seed(seed); torch.manual_seed(seed)
 
-    hidden = 32                     # matches toy-Mistral HIDDEN
-    patch  = 8
-    n_patches = (view // patch) ** 2
-    d_patch   = patch * patch
+    if core == 'mistral' and hidden != 32:
+        if verbose:
+            print(f"    --hidden {hidden} ignored: --core mistral uses folded "
+                  f"toy-Mistral weights fixed at hidden=32 (can't be widened)")
+        hidden = 32
 
     zero_mode = (core == 'zero')
+    raw_dim = view * view + 3   # full flattened view + (cx, cy, log-zoom)
 
-    # -- patch projection (the "V part" -- new weights, toy Mistral has none) --
-    # mean-pool patches then project (identical to project-then-mean: linear).
-    Wp = Tensor(np.zeros((d_patch, hidden), np.float32) if zero_mode else
-                (np.random.randn(d_patch, hidden) * 0.05).astype(np.float32))
+    # -- input projection (the "V part" -- new weights, toy Mistral has none) --
+    Wp = Tensor(np.zeros((raw_dim, hidden), np.float32) if zero_mode else
+                (np.random.randn(raw_dim, hidden) * 0.05).astype(np.float32))
 
     # -- core --
     if zero_mode:
@@ -314,9 +353,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
         total = 0.
         for (px, py, pz) in PROBES:
             pv = render_mandelbrot(px, py, pz, view)
-            pm = pv.reshape(view//patch, patch, view//patch, patch) \
-                   .transpose(0,2,1,3).reshape(n_patches, d_patch).mean(axis=0)
-            x_img = Tensor(pm) @ Wp
+            x_img = Tensor(encode_observation(pv, px, py, pz)) @ Wp
             h_pre = core_net.forward(x_img, np.zeros(hidden, np.float32))
             h_o, _, _ = energy_h.forward(h_pre)
             pred = h_o.data @ Vr + br
@@ -332,14 +369,15 @@ def run(core='zero', policy='curiosity', agent='reinforce',
 
     if verbose:
         print(f"\n=== Mandelbrot RL v2  core={core}  policy={policy}  agent={agent} ===")
-        print(f"    hidden={hidden}  view={view}x{view}  out_neurons={n_out_neurons} "
+        print(f"    hidden={hidden}  view={view}x{view}  raw_dim={raw_dim} "
+              f"(full view + pos/zoom)  out_neurons={n_out_neurons} "
               f"({N_ACT} actions x {group} grouped)")
         print(f"    limits: steps={max_steps}  timeout={timeout:.0f}s")
         if zero_mode:
             print(f"    ZERO INIT everywhere; energy pre-charged 1.9 on hidden+output")
         else:
             print(f"    toy-Mistral folded core (v/o attn-collapse + gated MLP); "
-                  f"patch projection is NEW (no vision weights in Mistral)")
+                  f"input projection is NEW (no vision weights in Mistral)")
 
     for step in range(max_steps):
         if time.perf_counter() - start >= timeout:
@@ -348,9 +386,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
 
         # -- observe --
         varr = render_mandelbrot(cx, cy, zoom, view)
-        pmean = varr.reshape(view//patch, patch, view//patch, patch) \
-                    .transpose(0,2,1,3).reshape(n_patches, d_patch).mean(axis=0)
-        x_img = Tensor(pmean) @ Wp                       # (hidden,) graph
+        x_img = Tensor(encode_observation(varr, cx, cy, zoom)) @ Wp   # (hidden,) graph
 
         # -- core + hidden energy --
         h_pre = core_net.forward(x_img, state)
@@ -549,18 +585,21 @@ def main():
     ap.add_argument('--core',    default='zero', choices=['zero', 'mistral'])
     ap.add_argument('--agent',   default='reinforce', choices=['reinforce', 'rtac'])
     ap.add_argument('--display', action='store_true',
-                    help='cv2 window: current view | reconstruction')
+                    help='displayarray window: current view | reconstruction')
     ap.add_argument('--policy',  default='curiosity', choices=['curiosity', 'random'])
     ap.add_argument('--compare', action='store_true',
                     help='run curiosity AND random policies, print side-by-side')
     ap.add_argument('--steps',   type=int,   default=2000)
     ap.add_argument('--timeout', type=float, default=60.0)
+    ap.add_argument('--hidden',  type=int,   default=1024,
+                    help='hidden size; forced to 32 for --core mistral '
+                         '(folded weights are fixed-width)')
     ap.add_argument('--lr',      type=float, default=0.01)
     ap.add_argument('--group',   type=int,   default=4)
     ap.add_argument('--report-every', type=int, default=200)
     a = ap.parse_args()
     kw = dict(lr=a.lr, group=a.group, report_every=a.report_every,
-              agent=a.agent, display=a.display)
+              agent=a.agent, display=a.display, hidden=a.hidden)
     if a.compare:
         compare(a.core, a.steps, a.timeout, **kw)
     else:
