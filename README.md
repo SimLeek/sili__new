@@ -40,7 +40,7 @@ sili/                      Python package
                                 over-budget --no-stack fallback)
     model_reconstruct.py, sparse_runtime.py, trace_model.py
 
-test/                       C++ unit tests (Catch2) + legacy Python scripts.
+tests/unit/                 C++ unit tests (Catch2) + legacy Python scripts.
                              Fast; run on every commit.
   run_tests.sh                Runs both run_cpp_tests.sh and run_py_tests.sh
 
@@ -124,16 +124,16 @@ not source):
 ## Testing
 
 ```bash
-test/run_tests.sh              # C++ unit tests + legacy Python scripts
+tests/unit/run_tests.sh        # C++ unit tests + legacy Python scripts
 python -m tests.integration.<name>   # any individual integration test
 ```
 
-The C++ suite (`test/*.cpp`, Catch2, run via `run_cpp_tests.sh`) and every
-test in `tests/integration/` are reliable. **Known issue:** `test/run_tests.sh`
-currently exits nonzero because `test/python/test_sili.py` (legacy, run via
+The C++ suite (`tests/unit/*.cpp`, Catch2, run via `run_cpp_tests.sh`) and every
+test in `tests/integration/` are reliable. **Known issue:** `tests/unit/run_tests.sh`
+currently exits nonzero because `tests/unit/python/test_sili.py` (legacy, run via
 `run_py_tests.sh`) is stale against `SparseLinearLayer`'s current constructor
 signature -- pre-existing, unrelated to the C++ core itself, tracked in
-`refactoring_todo.md`. A failing `test/run_tests.sh` run does not mean the
+`refactoring_todo.md`. A failing `tests/unit/run_tests.sh` run does not mean the
 build or the `_cpu` extension is broken; check the C++ portion's own
 "All tests passed" line, or run `tests/integration/` directly.
 

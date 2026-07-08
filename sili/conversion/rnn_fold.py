@@ -170,7 +170,7 @@ def detect_repeated_block_groups(
     NOTE: keying on (prefix, index) rather than bare index is load-bearing,
     not cosmetic. Bare-index keying merges unrelated block families that
     happen to share index ranges -- caught by the toy VLM generator
-    (test/python/gen_toy_mistral_vlm.py): 12 language layers + 6 vision
+    (tests/unit/python/gen_toy_mistral_vlm.py): 12 language layers + 6 vision
     layers were returned as two groups of 6 instead of one of 12 and one of
     6, because indices 0-5 silently merged both families' suffixes into one
     shape-dict, then diverged from indices 6-11 (language-only) once the

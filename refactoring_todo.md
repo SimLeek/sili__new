@@ -25,7 +25,7 @@ done, not things blocking it.
 1. **This session's own SILi work** (built before the repo consolidation
    started) -- highest priority of all sources. Python-level tests
    (`test_sili.py`, `multimodal_sparse_rnn.py`, `sparse_tcnn_audio.py`,
-   preserved in `test/python/`) are highest priority within that.
+   preserved in `tests/unit/python/`) are highest priority within that.
 2. **optim_merge/master** (the actual GitHub repo, what `sili_new` was
    branched from) -- second priority.
 3. **cpu_sparse_io** -- explicitly the old direction (2026-03-10, predates
@@ -418,12 +418,12 @@ the current (much improved, but still single-vector) input, not a small
 patch -- deferred alongside the RTAC items above.
 
 
-## KNOWN ISSUE: test/python/test_sili.py is stale against the current SparseLinearLayer API
+## KNOWN ISSUE: tests/unit/python/test_sili.py is stale against the current SparseLinearLayer API
 
 Pre-existing, confirmed unrelated to any change made while fixing the
 `pip install -e .` build (dated via `git blame` to 2026-07-01, days before
 that fix). Surfaced because that fix was verified by running the FULL
-`test/run_tests.sh` end-to-end for the first time in a while, not because
+`tests/unit/run_tests.sh` end-to-end for the first time in a while, not because
 anything in `sili/cpu_backend.cpp`'s `SparseLinearLayer` binding changed
 today.
 
@@ -440,12 +440,12 @@ that have since been consolidated or moved to other methods:
         # 3rd positional is `max_weights` now, not a byte `budget`
 
 61 failed + 23 errored (out of 103 collected) when run via
-`test/python/run_py_tests.sh` / `test/run_tests.sh` -- all TypeErrors at
+`tests/unit/python/run_py_tests.sh` / `tests/unit/run_tests.sh` -- all TypeErrors at
 construction, all downstream of this one mismatch (TestConstruction,
 TestForward, TestBackward, TestSynaptogenesis, TestEqualizer, TestToAbsolute,
 TestPytorchLike, TestNumpyViews, TestSparseAttention, TestBandedAttention,
 TestParallelPointers, TestSerialisation, TestBufferAccess -- essentially the
-whole file). The C++ Catch2 suite (test/*.cpp, 612 assertions) and
+whole file). The C++ Catch2 suite (tests/unit/*.cpp, 612 assertions) and
 tests/integration/* are unaffected and reliable; this is isolated to this
 one legacy Python file.
 

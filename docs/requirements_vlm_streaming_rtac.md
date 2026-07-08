@@ -112,7 +112,7 @@ any other 2-D tensor. "Dedup" is only a disk-space/redundant-compute question
 (pruning both separately when they might be identical), not a correctness
 requirement. Downgraded from checklist item to a note; no code change needed.
 
-### 1.3 Toy generator: `test/python/gen_toy_mistral_vlm.py`
+### 1.3 Toy generator: `tests/unit/python/gen_toy_mistral_vlm.py`
 
 - Emits BOTH block families so `detect_repeated_block_groups` must find TWO
   groups (12 language layers AND 6 vision layers). Acceptance: exactly 2

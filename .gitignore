@@ -6,7 +6,7 @@ build/
 *.webm
 .idea
 __pycache__/
-test/build_tests
+tests/unit/build_tests
 docs/doxygen/
 docs/pdoc/
 *.egg-info

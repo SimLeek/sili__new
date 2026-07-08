@@ -21,7 +21,7 @@ Run: python -m tests.integration.test_toy_mistral
 
 import sys, os, warnings
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'test', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'unit', 'python'))
 warnings.filterwarnings('ignore')
 
 import torch

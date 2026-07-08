@@ -17,18 +17,30 @@ WHAT THIS VERSION TESTS:
      evaluated every report interval WITHOUT training on them.
        probe MSE falling + online MSE rising  -> curiosity working
        probe MSE rising                        -> model diverging (broken)
-  3. Zero-init attribution (--core zero): ALL weights start at exactly 0 and
-     energy is applied to hidden AND output neurons (pre-charged to 1.9).
-     Any exploration that emerges is attributable to energy dynamics, not to
-     random initialisation. Output uses GROUPED neurons (4 per action,
-     averaged) to smooth the 2.0-fire twitching, per design discussion.
+  3. Zero/near-zero-init attribution (--core sparse, --core dense): ALL
+     weights start at exactly 0 (dense) or near-zero (sparse -- see
+     make_near_zero_sparse_layer's docstring for why exact zero doesn't
+     survive sparse construction) and energy is applied to hidden AND
+     output neurons (pre-charged to 1.9). Any exploration that emerges is
+     attributable to energy dynamics, not to random initialisation. Output
+     uses GROUPED neurons (4 per action, averaged) to smooth the 2.0-fire
+     twitching, per design discussion.
+  3b. --core sparse (DEFAULT) vs --core dense (the alternative/comparison):
+     sparse is a large, genuinely sparse FoldedLayer-based core (--hidden
+     tunable, default 1024, --density controls connectivity fraction).
+     dense is the original plain-Tensor version, kept for comparison so
+     sparse-vs-dense behavior at the same hidden size can be checked
+     directly against each other. Previously the only "large" option was
+     dense and the only sparse option was --core mistral (fixed tiny at
+     hidden=32) -- neither tested "sparse AND large" together.
   4. Pipeline validation (--core mistral): the folded toy-Mistral weights
      (gen_toy_mistral -> prune -> per-suffix FoldedLayer) form the recurrent
-     core, driven by image input. NOTE the "V part": toy Mistral has NO
-     vision weights, so the patch projection is a new component (Mistral is
-     text-only; VLM variants add a separate vision encoder). Single-token
-     attention collapses exactly to o_proj(v_proj(x)) since softmax over one
-     position is 1, with GQA handled by tiling v from 16 to 32 dims.
+     core, driven by image input, fixed at hidden=32 (folded weights are
+     fixed-width). NOTE the "V part": toy Mistral has NO vision weights, so
+     the input projection is a new component (Mistral is text-only; VLM
+     variants add a separate vision encoder). Single-token attention
+     collapses exactly to o_proj(v_proj(x)) since softmax over one position
+     is 1, with GQA handled by tiling v from 16 to 32 dims.
   5. Policy baseline (--policy random, or --compare): identical run with
      uniform random actions and the same reconstruction learning. Coverage
      difference between curiosity and random isolates the policy effect.
@@ -42,7 +54,8 @@ LIMITS: --steps and --timeout; run stops at whichever hits first and always
 reports the last completed step and steps-per-second.
 
 Run:
-  python -m tests.integration.test_mandelbrot_rl --core zero --steps 2000
+  python -m tests.integration.test_mandelbrot_rl --core sparse --steps 2000
+  python -m tests.integration.test_mandelbrot_rl --core dense --steps 2000
   python -m tests.integration.test_mandelbrot_rl --core mistral --steps 500
   python -m tests.integration.test_mandelbrot_rl --compare --timeout 60
 """
@@ -51,7 +64,7 @@ import argparse, math, time, zlib, warnings
 import numpy as np
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'test', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'unit', 'python'))
 warnings.filterwarnings('ignore')
 
 import torch  # CSR construction only -- not in the compute path
@@ -120,13 +133,113 @@ def encode_observation(varr: np.ndarray, cx: float, cy: float, zoom: float) -> n
     return np.concatenate([varr.reshape(-1).astype(np.float32), pos_feat])
 
 
+# ── Sparse construction (near-zero-init) ──────────────────────────────────────
+
+def make_near_zero_sparse_layer(n_in: int, n_out: int, density: float,
+                                lr: float, num_cpus: int = 1,
+                                seed: int = 0) -> FoldedLayer:
+    """
+    A genuinely sparse FoldedLayer with a fixed random connectivity pattern
+    and near-zero initial values, for the same "nothing works until energy
+    dynamics + backprop shape it" attribution property the exact-zero dense
+    cores use -- but exact zero does not survive this construction path.
+
+    CONFIRMED BY DIRECT TESTING (not assumed): building a torch sparse_csr
+    tensor with EXPLICIT STORED ZEROS at a fixed connectivity pattern (via
+    torch.sparse_csr_tensor with a values tensor of all 0.0, not via
+    tensor.to_sparse() on a dense zero tensor, which collapses to 0 nnz
+    regardless of any mask) DOES correctly preserve the intended nnz through
+    construction of the torch tensor itself -- but FoldedLayer.from_descriptor
+    silently drops every entry with value exactly 0.0 during construction
+    (verified: source csr had nnz=80, immediately after construction
+    layer.nnz == 0, before any forward/backward call at all). This is
+    presumably intentional for the NORMAL use case (loading real pretrained
+    weights, where a stored zero genuinely means "no meaningful connection"),
+    but is incompatible with wanting "connection exists structurally, value
+    is deliberately near-zero for now."
+
+    Fix: use a TINY nonzero value (1e-6) instead of exact 0.0. Confirmed by
+    direct testing that this survives construction intact down to at least
+    1e-8, and that a subsequent backward() call correctly updates the stored
+    values (unlike exact zero, which also silently failed to update even
+    when construction was worked around, due to a SEPARATE issue: per-row
+    value_scale for an all-zero row defaults to a scale that makes any
+    single realistic gradient step round back to zero under FP4 quantization
+    -- the exact same class of problem already solved for importance_scale
+    elsewhere in this codebase (imp_scale = learning_rate / FP4_MAX), just
+    not previously applied to the value scale for a from-scratch sparse
+    layer). Both fixes are needed together; each alone was insufficient
+    (confirmed by testing each in isolation before combining them).
+
+    1e-6 is six orders of magnitude below typical operating signal scale in
+    this system (energy fires at 2.0, typical activations O(0.1-1)) --
+    negligible relative to any meaningful signal, functionally equivalent to
+    zero-init for all practical purposes, but NOT literally exact zero. This
+    is stated plainly rather than silently calling it "zero-init": the
+    distinction matters for the same attribution reasoning the exact-zero
+    dense cores exist for.
+    """
+    TINY = 1e-6
+    FP4_MAX = 6.0
+    torch.manual_seed(seed)
+    mask = torch.rand(n_out, n_in) < density
+    rows, cols = torch.nonzero(mask, as_tuple=True)
+    nnz = len(rows)
+    order = torch.argsort(rows, stable=True)
+    rows_sorted, cols_sorted = rows[order], cols[order]
+    counts = torch.bincount(rows_sorted, minlength=n_out)   # vectorized, not
+    crow = torch.cat([torch.zeros(1, dtype=torch.int64),     # a Python loop --
+                      torch.cumsum(counts, dim=0)])           # matters at scale
+    values = torch.full((nnz,), TINY, dtype=torch.float32)
+    csr = torch.sparse_csr_tensor(crow, cols_sorted, values, size=(n_out, n_in))
+
+    desc = FoldedBlockDescriptor(
+        n_folds=1, block_indices=[0], stacked_weights={'.w': csr},
+        out_dims={'.w': n_out}, band_half_widths={'.w': None}, prefix='sparse.')
+    layer = FoldedLayer.from_descriptor(desc, learning_rate=lr, num_cpus=num_cpus)
+
+    sub = layer._sili_layers['.w']
+    for r in range(n_out):
+        sub.set_value_scale_raw(r, lr / FP4_MAX)
+    return layer
+
+
+class DenseProjection:
+    """Wraps a dense Tensor with the same call/.params interface as
+    SparseProjection below, so call sites don't need to know or care which
+    mode (--core dense vs --core sparse) is active."""
+    def __init__(self, W: Tensor):
+        self.W = W
+        self.params = [W]
+
+    def __call__(self, x: Tensor) -> Tensor:
+        return x @ self.W
+
+
+class SparseProjection:
+    """Wraps a FoldedLayer with the same call/.params interface as
+    DenseProjection. params is empty because folded layers self-update via
+    backward_dense (same reason core_net.params is empty for FoldedLayer-
+    based cores) -- the outer SGD loop must not also try to step them."""
+    def __init__(self, layer: FoldedLayer):
+        self.layer = layer
+        self.params = []
+
+    def __call__(self, x: Tensor) -> Tensor:
+        return self.layer(x)
+
+
 # ── Cores ─────────────────────────────────────────────────────────────────────
 
-class ZeroCore:
+class DenseCore:
     """
-    Single dense hidden layer, ALL ZEROS. Escape path: pre-charged energy
-    fires neurons -> state becomes nonzero -> aux gradient shapes W -> input
+    Dense hidden layer, all zeros. The ALTERNATIVE/comparison test -- see
+    SparseCore below for the default. Escape path: pre-charged energy fires
+    neurons -> state becomes nonzero -> aux gradient shapes W -> input
     gradient reaches Wp. Any structure that emerges is energy-attributable.
+    Exact zero-init works cleanly here since a dense Tensor has no separate
+    "connectivity vs value" concept the way a sparse layer does (see
+    SparseCore's docstring for why exact zero does NOT survive there).
     """
     def __init__(self, d_img, hidden):
         self.W = Tensor(np.zeros((d_img + hidden, hidden), np.float32))
@@ -152,6 +265,38 @@ class ZeroCore:
         return x_full @ self.W
 
 
+class SparseCore:
+    """
+    Large, genuinely sparse recurrent cell -- the DEFAULT. sili's actual
+    distinguishing capability is sparse computation at scale; pairing
+    "sparse" with "tiny" (--core mistral, fixed at hidden=32 by its
+    pretrained toy weights) and "large" with "dense" (the old default)
+    tested neither property together. This core is sparse AND tunable to
+    large hidden sizes via --hidden.
+
+    Two SEPARATE sparse layers (image contribution, recurrent contribution)
+    summed, rather than one big lifted-and-concatenated matrix -- avoids the
+    lift trick DenseCore needs (which exists specifically to route gradients
+    through a single dense matrix multiply) and lets image-sparsity and
+    recurrent-sparsity be reasoned about/tuned independently if ever useful.
+    Same shape of fix as MistralCore's Wc_img/Wc_state split.
+
+    Near-zero (not exact-zero) init -- see make_near_zero_sparse_layer's
+    docstring for the two-part reason (exact zero doesn't survive
+    FoldedLayer construction; even a worked-around exact zero doesn't
+    reliably escape via backward due to a separate value_scale issue).
+    """
+    def __init__(self, d_img, hidden, density=0.1, lr=0.01, num_cpus=1, seed=0):
+        self.core_img   = make_near_zero_sparse_layer(
+            d_img, hidden, density, lr, num_cpus, seed)
+        self.core_state = make_near_zero_sparse_layer(
+            hidden, hidden, density, lr, num_cpus, seed + 1)
+        self.params = []   # folded layers self-update via backward_dense
+
+    def forward(self, x_img: Tensor, state: np.ndarray) -> Tensor:
+        return self.core_img(x_img) + self.core_state(Tensor(state))
+
+
 class MistralCore:
     """
     Folded toy-Mistral recurrent cell using real pruned weights.
@@ -163,7 +308,7 @@ class MistralCore:
       sigmoid(x) = 0.5*(1 + tanh(x/2))  ->  silu(x) = x * sigmoid(x)
     RMSNorm folded weights are 1-D and skipped (values ~1.0; noted).
     """
-    def __init__(self, sd_sparse, prefix, n_layers, hidden, lr):
+    def __init__(self, sd_sparse, prefix, n_layers, hidden, lr, num_cpus=1):
         def fold(suffix):
             per_block = []
             for i in range(n_layers):
@@ -177,7 +322,7 @@ class MistralCore:
                 stacked_weights={suffix: stacked},
                 out_dims={suffix: int(per_block[0].shape[0])},
                 band_half_widths={suffix: None}, prefix=prefix)
-            return FoldedLayer.from_descriptor(desc, learning_rate=lr, num_cpus=1)
+            return FoldedLayer.from_descriptor(desc, learning_rate=lr, num_cpus=num_cpus)
 
         self.v    = fold('.self_attn.v_proj.weight')   # 32 -> 16
         self.o    = fold('.self_attn.o_proj.weight')   # 32 -> 32
@@ -215,9 +360,10 @@ class MistralCore:
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
-def run(core='zero', policy='curiosity', agent='reinforce',
+def run(core='sparse', policy='curiosity', agent='reinforce',
         max_steps=2000, timeout=60.0,
-        view=32, hidden=1024, lr=0.01, aux_weight=0.05, pol_weight=0.3,
+        view=32, hidden=1024, density=0.1, num_cpus=1,
+        lr=0.01, aux_weight=0.05, pol_weight=0.3,
         group=4, report_every=200, verbose=True, seed=0,
         display=False, gamma=0.99, entropy_scale=0.01,
         loss_alpha=0.2, target_update=0.005):
@@ -231,16 +377,30 @@ def run(core='zero', policy='curiosity', agent='reinforce',
                   f"toy-Mistral weights fixed at hidden=32 (can't be widened)")
         hidden = 32
 
-    zero_mode = (core == 'zero')
+    # zero_mode covers BOTH zero-init cores (sparse near-zero, dense exact-
+    # zero) -- mistral is the only core that starts from nonzero (pretrained
+    # toy) weights. Gates the SEPARATE small head matrices (action, value,
+    # reconstruction) that stay plain dense Tensors regardless of which core
+    # is active -- only the recurrent core + input projection differ between
+    # sparse/dense/mistral; the small heads are cheap enough that making
+    # them sparse too wasn't part of what was asked for here.
+    zero_mode = core in ('sparse', 'dense')
     raw_dim = view * view + 3   # full flattened view + (cx, cy, log-zoom)
 
     # -- input projection (the "V part" -- new weights, toy Mistral has none) --
-    Wp = Tensor(np.zeros((raw_dim, hidden), np.float32) if zero_mode else
-                (np.random.randn(raw_dim, hidden) * 0.05).astype(np.float32))
+    if core == 'sparse':
+        Wp = SparseProjection(make_near_zero_sparse_layer(
+            raw_dim, hidden, density, lr, num_cpus, seed))
+    else:
+        Wp = DenseProjection(Tensor(
+            np.zeros((raw_dim, hidden), np.float32) if zero_mode else
+            (np.random.randn(raw_dim, hidden) * 0.05).astype(np.float32)))
 
     # -- core --
-    if zero_mode:
-        core_net = ZeroCore(hidden, hidden)
+    if core == 'sparse':
+        core_net = SparseCore(hidden, hidden, density, lr, num_cpus, seed + 100)
+    elif core == 'dense':
+        core_net = DenseCore(hidden, hidden)
     else:
         from gen_toy_mistral import build_toy_mistral_state_dict, N_LAYERS
         from sili.conversion.sparse_prune import default_min_abs_param
@@ -253,7 +413,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
                 sd_sparse[k] = (v*m).to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
             else:
                 sd_sparse[k] = v
-        core_net = MistralCore(sd_sparse, 'model.layers.', N_LAYERS, hidden, lr)
+        core_net = MistralCore(sd_sparse, 'model.layers.', N_LAYERS, hidden, lr, num_cpus)
 
     # -- energy: hidden (always) + output (grouped) --
     frac_h = max(0.1, min(0.4, 8. / hidden))
@@ -329,7 +489,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
           (np.random.randn(hidden, view*view) * 0.02).astype(np.float32))
     br = np.zeros(view*view, np.float32)
 
-    dense_params = [Wp, Wa, Wv_h, Wv_a, Wv_h2, Wv_a2] + core_net.params
+    dense_params = Wp.params + [Wa, Wv_h, Wv_a, Wv_h2, Wv_a2] + core_net.params
 
     # -- navigation --
     cx, cy, zoom = -0.75, 0.0, 50.0
@@ -353,7 +513,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
         total = 0.
         for (px, py, pz) in PROBES:
             pv = render_mandelbrot(px, py, pz, view)
-            x_img = Tensor(encode_observation(pv, px, py, pz)) @ Wp
+            x_img = Wp(Tensor(encode_observation(pv, px, py, pz)))
             h_pre = core_net.forward(x_img, np.zeros(hidden, np.float32))
             h_o, _, _ = energy_h.forward(h_pre)
             pred = h_o.data @ Vr + br
@@ -374,7 +534,8 @@ def run(core='zero', policy='curiosity', agent='reinforce',
               f"({N_ACT} actions x {group} grouped)")
         print(f"    limits: steps={max_steps}  timeout={timeout:.0f}s")
         if zero_mode:
-            print(f"    ZERO INIT everywhere; energy pre-charged 1.9 on hidden+output")
+            kind = "NEAR-ZERO" if core == 'sparse' else "ZERO"
+            print(f"    {kind} INIT everywhere; energy pre-charged 1.9 on hidden+output")
         else:
             print(f"    toy-Mistral folded core (v/o attn-collapse + gated MLP); "
                   f"input projection is NEW (no vision weights in Mistral)")
@@ -386,7 +547,7 @@ def run(core='zero', policy='curiosity', agent='reinforce',
 
         # -- observe --
         varr = render_mandelbrot(cx, cy, zoom, view)
-        x_img = Tensor(encode_observation(varr, cx, cy, zoom)) @ Wp   # (hidden,) graph
+        x_img = Wp(Tensor(encode_observation(varr, cx, cy, zoom)))   # (hidden,) graph
 
         # -- core + hidden energy --
         h_pre = core_net.forward(x_img, state)
@@ -582,7 +743,13 @@ def compare(core, max_steps, timeout, **kw):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--core',    default='zero', choices=['zero', 'mistral'])
+    ap.add_argument('--core',    default='sparse',
+                    choices=['sparse', 'dense', 'mistral'],
+                    help='sparse (default): large, genuinely sparse '
+                         'FoldedLayer core, near-zero-init. dense: the '
+                         'alternative/comparison, plain Tensor, exact-zero-'
+                         'init. mistral: folded toy-Mistral weights, fixed '
+                         'at hidden=32.')
     ap.add_argument('--agent',   default='reinforce', choices=['reinforce', 'rtac'])
     ap.add_argument('--display', action='store_true',
                     help='displayarray window: current view | reconstruction')
@@ -594,12 +761,22 @@ def main():
     ap.add_argument('--hidden',  type=int,   default=1024,
                     help='hidden size; forced to 32 for --core mistral '
                          '(folded weights are fixed-width)')
+    ap.add_argument('--density', type=float, default=0.1,
+                    help='connectivity fraction for --core sparse (default '
+                         '10%%); ignored for dense/mistral')
+    ap.add_argument('--num-cpus', type=int, default=1,
+                    help='OpenMP threads for sparse layers. 1 is correct at '
+                         'small hidden (thread-wakeup overhead exceeds any '
+                         'FLOP savings); worth experimenting with at large '
+                         '--hidden (1024+) where real compute starts to '
+                         'dominate per-call overhead.')
     ap.add_argument('--lr',      type=float, default=0.01)
     ap.add_argument('--group',   type=int,   default=4)
     ap.add_argument('--report-every', type=int, default=200)
     a = ap.parse_args()
     kw = dict(lr=a.lr, group=a.group, report_every=a.report_every,
-              agent=a.agent, display=a.display, hidden=a.hidden)
+              agent=a.agent, display=a.display, hidden=a.hidden,
+              density=a.density, num_cpus=a.num_cpus)
     if a.compare:
         compare(a.core, a.steps, a.timeout, **kw)
     else:

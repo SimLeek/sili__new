@@ -57,7 +57,7 @@ setup(
     author="SimLeek",
     author_email="simulator.leek@gmail.com",
     license="MIT License",
-    packages=find_packages(exclude=["test", "test.*"]),
+    packages=find_packages(exclude=["tests", "tests.*"]),
     ext_modules=[cpu_ext],
     install_requires=reqs,
     include_package_data=True,
