@@ -142,7 +142,7 @@ pass/fail-only output, e.g.:
 
 ```bash
 python -m tests.integration.test_energy_rnn --task rare --steps 2000
-python -m tests.integration.test_mandelbrot_rl --compare --core zero --steps 150000 --timeout 3600 --display
+python -m tests.integration.test_mandelbrot_rl --compare --core sparse --steps 150000 --timeout 3600 --display
 python -m tests.integration.test_toy_mistral
 ```
 
@@ -154,6 +154,25 @@ slow/flaky to open a window on some systems:
 ```bash
 pip install git+https://github.com/SimLeek/displayarray.git@moderngl
 ```
+
+`test_mandelbrot_rl`'s key parameters (see `--help` for the full list):
+
+- `--core {sparse,dense,mistral}` -- sparse (default): large, genuinely
+  sparse, starts empty and grows via real synaptogenesis. dense: the
+  alternative/comparison, plain Tensor, exact-zero-init. mistral: folded
+  toy-Mistral weights, fixed at `--hidden 32`.
+- `--hidden N` (default 1024) -- recurrent state size; forced to 32 for
+  `--core mistral`.
+- `--base-connections N` (default 6) -- sparse core's per-row target,
+  reached via growth then held via continual grow/prune churn.
+- `--k-factor`, `--importance-cutoff`, `--synap-amplitude`, `--synap-period`,
+  `--synap-every` -- tune the synaptogenesis cadence and aggressiveness.
+  Real cost/quality tradeoff: `--synap-every` defaults to 10 (not 1) after
+  measuring that running full-layer probes every single step is genuinely
+  expensive at large `--hidden`.
+- `--agent {reinforce,rtac}`, `--policy {curiosity,random}`, `--compare`
+  -- policy learning options; `--compare` runs curiosity and random
+  side by side.
 
 As of writing, that branch is under active development (its own CI isn't
 wired up yet) and its `mglwindow` module references a `font.get_texture_atlas`

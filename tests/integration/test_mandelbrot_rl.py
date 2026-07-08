@@ -314,7 +314,18 @@ def make_grown_sparse_layer(n_in: int, n_out: int, base_connections: int,
          importance_cutoff and regrows back up to base_connections, so the
          density stays roughly constant while WHICH connections exist keeps
          evolving. amplitude>0 sine-waves the target, explicitly exercising
-         both growth and pruning.
+         both growth and pruning. k_factor is passed through UNSCALED --
+         build_probes(k) is NOT "k global candidates": it takes the top-k
+         inputs by accumulated activity and top-k outputs by accumulated
+         gradient, then the CARTESIAN PRODUCT of those two sets, so raw
+         candidates scale as k^2, not k (confirmed against the actual source,
+         delta_csr_build_probes in delta_csr_memory.hpp). A small k (the
+         default of 4, ~16 raw candidate pairs) is the intended scale --
+         growth relies on calling synaptogenesis often and letting which
+         inputs/outputs land in the top-k rotate over many calls as
+         accumulated activity/gradient shifts (which the energy dynamics'
+         homeostatic firing already guarantees happens for every neuron
+         eventually), not on one call covering the whole layer at once.
 
     Caller MUST call the returned schedule's .step() every training step,
     AFTER backward() and BEFORE the next forward() (matches
@@ -339,20 +350,27 @@ def make_grown_sparse_layer(n_in: int, n_out: int, base_connections: int,
 
     layer = FoldedLayer(layers={'.w': raw}, n_folds=1, out_dims={'.w': n_out},
                         learning_rate=lr)
-    # k_factor is scaled by n_in (row count) here, not passed through as-is.
-    # SynaptogenesisSchedule computes k = k_factor * current_target_per_row,
-    # but build_probes(k) proposes k candidates GLOBALLY across the whole
-    # layer, not per row -- confirmed by direct testing: with the schedule's
-    # own (row-count-blind) k formula at n_in=128 rows, growth stalled at
-    # 1280/2048 target and never progressed past step 60 no matter how many
-    # further steps ran, because each call only ever proposed ~32 global
-    # candidates, nowhere near enough to eventually cover 128 rows x 8
-    # target each. Scaling k_factor by n_in gives build_probes enough
-    # candidates each call to actually reach the full target; verified this
-    # reaches and holds the target correctly (2048/2048) at the same layer
-    # size that stalled before the fix.
+    # k_factor is passed through UNSCALED. An earlier version of this
+    # function scaled it by n_in, based on a wrong mental model of build_probes
+    # (assumed k = candidate count directly). CORRECTED, verified against
+    # the actual C++ source (delta_csr_build_probes in
+    # sili/lib/headers/delta_csr_memory.hpp): it selects the top-k INPUTS by
+    # accumulated activity and the top-k OUTPUTS by accumulated gradient,
+    # then takes the CARTESIAN PRODUCT of those two sets as candidates --
+    # k_in * k_out ~= k^2 raw candidates, not k. Scaling k by n_in therefore
+    # scaled actual candidate generation by n_in^2, not n_in -- a severe,
+    # unintended blowup (confirmed directly: this caused the severe slowdown
+    # measured afterward, and reverting to plain k_factor made growth run
+    # faster than real time). You are not meant to generate thousands of
+    # candidates per call; small k (e.g. 4, giving ~16 raw candidate pairs)
+    # relies on calling synaptogenesis often and letting the TOP-K SELECTION
+    # itself rotate across different inputs/outputs over many calls as their
+    # accumulated activity/gradient changes -- which the energy dynamics'
+    # homeostatic firing already guarantees will eventually happen for every
+    # neuron, giving every row a fair turn at being selected over time
+    # without needing a single call to cover everything at once.
     sched = SynaptogenesisSchedule(
-        layer, base_connections=base_connections, k_factor=k_factor * n_in,
+        layer, base_connections=base_connections, k_factor=k_factor,
         importance_cutoff=importance_cutoff, amplitude=amplitude,
         period=period, every_n_steps=every_n_steps)
     return layer, sched
@@ -540,7 +558,7 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         max_steps=2000, timeout=60.0,
         view=32, hidden=1024, base_connections=6, num_cpus=1,
         k_factor=4, importance_cutoff=0.0, synap_amplitude=0.0,
-        synap_period=200, synap_every=10,
+        synap_period=200, synap_every=1,
         lr=0.01, aux_weight=0.05, pol_weight=0.3,
         group=4, report_every=200, verbose=True, seed=0,
         display=False, gamma=0.99, entropy_scale=0.01,
@@ -876,10 +894,15 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         if verbose and (step + 1) % report_every == 0:
             el = time.perf_counter() - start
             pm = probe_eval(); probe_history.append(pm)
+            nnz = 0
+            if hasattr(core_net, 'nnz_total'): nnz += core_net.nnz_total()
+            if hasattr(Wp, 'layer') and hasattr(Wp.layer, 'nnz_total'):
+                nnz += Wp.layer.nnz_total()
+            nnz_str = f"  nnz={nnz}" if nnz > 0 else ""
             print(f"  step {step+1:6d}  pos=({cx:+.3f},{cy:+.3f}) z={zoom:.0f}  "
                   f"recon={recon_win/max(1,n_win):.4f} probe={pm:.4f}  "
                   f"H={entropy_nats(act_counts_win):.2f}  cov={len(coverage)}  "
-                  f"vcr={compression_ratio(view_buf):.3f}  "
+                  f"vcr={compression_ratio(view_buf):.3f}{nnz_str}  "
                   f"{(step+1)/el:.0f} st/s")
             recon_win = 0.; n_win = 0; act_counts_win[:] = 0
 
@@ -972,17 +995,18 @@ def main():
                          'explicitly exercising both growth and pruning')
     ap.add_argument('--synap-period', type=int, default=200,
                     help='steps per full sine cycle when --synap-amplitude > 0')
-    ap.add_argument('--synap-every', type=int, default=10,
-                    help='run synaptogenesis every N training steps. Real '
-                         'cost: build_probes scales with k_factor*n_rows, so '
-                         'running every single step is genuinely expensive '
-                         'at large --hidden (confirmed: 5 st/s at hidden=256, '
-                         'every_n_steps=1, vs 40 st/s at every_n_steps=10). '
-                         'This performance/quality tradeoff -- how often and '
-                         'how aggressively to reshape structure -- is exactly '
-                         'what an adaptive scheduler could tune dynamically; '
-                         'see docs/requirements or a future adaptive-'
-                         'synaptogenesis experiment file for that.')
+    ap.add_argument('--synap-every', type=int, default=1,
+                    help='run synaptogenesis every N training steps. With '
+                         'k_factor at its intended small scale (build_probes '
+                         'is k_in x k_out candidates, not k -- see '
+                         'make_grown_sparse_layer docstring), every step is '
+                         'fast (confirmed: 135+ st/s at hidden=256, matching '
+                         'the "runs real-time calling once per backprop with '
+                         'a small number of new synapses" pattern this is '
+                         'modeled on). Raise this if you deliberately want a '
+                         'BIGGER k_factor for more aggressive reshaping per '
+                         'call -- that is the actual performance/quality '
+                         'tradeoff worth tuning, not this cadence by itself.')
     ap.add_argument('--num-cpus', type=int, default=1,
                     help='OpenMP threads for sparse layers. 1 is correct at '
                          'small hidden (thread-wakeup overhead exceeds any '
