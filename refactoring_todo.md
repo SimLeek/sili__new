@@ -462,3 +462,41 @@ CURRENT SparseLinearLayer binding's full method list in cpu_backend.cpp
 first, then decide per-test whether to update the call to the current API
 or whether the test itself is now redundant with something in
 tests/integration/.
+
+
+## C++-LEVEL PERFORMANCE TOOLING (later)
+
+Attempted to add a native Catch2 BENCHMARK for build_probes/synap_step
+(Catch2 v3 with benchmark support is genuinely installed and available).
+Blocked for now: SparseLinearLayer is defined directly inside
+sili/cpu_backend.cpp mixed with pybind11-dependent code (forward_dense/
+forward_sparse/backward_dense/backward_sparse all take py::array_t
+parameters), not in a separate pybind-free header the way the sparse
+math primitives it wraps (delta_csr_build_probes, delta_csr_synap_row_step
+in delta_csr_memory.hpp) already are. A pure C++ Catch2 test can't cleanly
+instantiate SparseLinearLayer without either including cpu_backend.cpp
+directly (risks a duplicate/conflicting pybind11 module registration
+against Catch2's own main) or linking pybind11 into the test binary just
+to construct py::array_t arguments it doesn't otherwise need.
+
+Real fix, not attempted here: extract SparseLinearLayer's definition into
+its own pybind-free header (sili/lib/headers/sparse_linear_layer.hpp or
+similar), with cpu_backend.cpp reduced to just the pybind11 bindings over
+it -- mirroring how delta_csr_build_probes/delta_csr_synap_row_step are
+already separated from their own binding layer. Once that split exists, a
+native Catch2 BENCHMARK block becomes straightforward and would also enable
+perf-based profiling directly on the class (this session's sandbox could
+not use perf at all -- kernel version mismatch with available
+linux-tools packages, and perf_event_paranoid=2 would likely block
+hardware counters anyway even with a matching version).
+
+Used instead, and committed as a real reusable tool rather than a
+one-off: tests/integration/benchmark_synaptogenesis.py, Python-level
+timing via the existing pybind11 bindings. Confirmed a full synaptogenesis
+call (build_probes once + synap_step once per row, matching
+FoldedLayer.synaptogenesis()'s actual structure) costs ~14x a regular
+backward_dense() call at a realistic size (n_in=1027, n_out=256, k=4) --
+not the ~500x informally recalled, which was almost certainly describing
+the since-reverted k_factor*n_in bug (build_probes(k) evaluates k_in*k_out
+candidates, so scaling k by row count caused a further n_in^2-fold blowup
+on top of whatever the true baseline ratio is).
