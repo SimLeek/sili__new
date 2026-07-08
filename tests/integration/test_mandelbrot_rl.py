@@ -277,11 +277,9 @@ def run(core='zero', policy='curiosity', agent='reinforce',
             def show(v, p):
                 img = np.hstack([v, np.clip(p, 0, 1).reshape(view, view)])
                 img_u8 = (img * 255).astype(np.uint8)
-                # nearest-neighbor upscale (no cv2 dependency): displayarray's
-                # update() has no size/scale parameter, and a raw 32x64 image
-                # would render tiny.
-                scale = 8
-                img_u8 = img_u8.repeat(scale, axis=0).repeat(scale, axis=1)
+                # No manual upscaling: displayarray scales on the GPU when
+                # rendering the window, so a CPU-side repeat() here is both
+                # unnecessary and wastes cycles better spent training.
                 d.update(img_u8, 'mandelbrot: view | reconstruction')
         except ImportError as e:
             print(f'    --display requested but displayarray not usable '
