@@ -146,6 +146,21 @@ python -m tests.integration.test_mandelbrot_rl --compare --core zero --steps 150
 python -m tests.integration.test_toy_mistral
 ```
 
+`--display` on `test_mandelbrot_rl` is optional and gated behind a graceful
+ImportError fallback (prints a message and continues headless if unusable).
+It uses `displayarray` rather than raw `cv2.imshow`, which is known to be
+slow/flaky to open a window on some systems:
+
+```bash
+pip install git+https://github.com/SimLeek/displayarray.git@moderngl
+```
+
+As of writing, that branch is under active development (its own CI isn't
+wired up yet) and its `mglwindow` module references a `font.get_texture_atlas`
+submodule that doesn't exist in the tree yet -- `--display` will cleanly
+fall back to headless with an explanatory message until that's resolved,
+rather than crashing the run.
+
 ## Contributing (internal)
 
 `main` is protected -- changes land via branches merged through pull

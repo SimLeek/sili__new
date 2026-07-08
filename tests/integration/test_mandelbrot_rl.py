@@ -258,20 +258,34 @@ def run(core='zero', policy='curiosity', agent='reinforce',
     h_prev = None; a_prev = 0; a_prevprev = 0; r_prev = 0.0
 
     # -- optional live display: view | reconstruction, 8x nearest upscale --
-    show = None
+    # Uses displayarray (ModernGL-backed) rather than cv2.imshow -- OpenCV's
+    # HighGUI window backend is known to be slow/flaky to open on some
+    # systems. Install with:
+    #   pip install git+https://github.com/SimLeek/displayarray.git@moderngl
+    # As of writing, that branch is under active development (its own CI
+    # isn't wired up yet) and may not import cleanly -- if
+    # displayarray.window.mglwindow fails to import (its font submodule is
+    # incomplete on this branch), this falls back to headless exactly like
+    # a missing dependency would, rather than crashing the run.
+    d = None; show = None
     if display:
         try:
-            import cv2
+            from displayarray import display as _da_display
+            d = _da_display(blocking=False)   # no initial source; windows are
+                                               # created lazily by the first
+                                               # d.update(arr, id) call below
             def show(v, p):
                 img = np.hstack([v, np.clip(p, 0, 1).reshape(view, view)])
-                img = cv2.resize((img * 255).astype(np.uint8),
-                                 (view * 16, view * 8),
-                                 interpolation=cv2.INTER_NEAREST)
-                cv2.imshow('mandelbrot: view | reconstruction', img)
-                cv2.waitKey(1)
-        except ImportError:
-            print('    --display requested but opencv-python not installed; '
-                  'continuing headless')
+                img_u8 = (img * 255).astype(np.uint8)
+                # nearest-neighbor upscale (no cv2 dependency): displayarray's
+                # update() has no size/scale parameter, and a raw 32x64 image
+                # would render tiny.
+                scale = 8
+                img_u8 = img_u8.repeat(scale, axis=0).repeat(scale, axis=1)
+                d.update(img_u8, 'mandelbrot: view | reconstruction')
+        except ImportError as e:
+            print(f'    --display requested but displayarray not usable '
+                  f'({e}); continuing headless')
 
     # -- reconstruction head (numpy SGD; zero-init learns once hidden fires) --
     Vr = (np.zeros((hidden, view*view), np.float32) if zero_mode else
@@ -507,6 +521,10 @@ def run(core='zero', policy='curiosity', agent='reinforce',
         print(f"  online recon (whole run): {result['recon_mse_all']:.4f}")
         print(f"  entropy={result['action_entropy']:.2f} (uniform={math.log(N_ACT):.2f})  "
               f"coverage={result['coverage']}")
+
+    if d is not None:
+        d.end()   # explicit cleanup rather than relying on __del__ timing
+
     return result
 
 
