@@ -292,13 +292,7 @@ SparseLinearWeightsV<SIZE_TYPE, VALUE_TYPE> make_weights_v(
     std::vector<VALUE_TYPE>&& values,
     std::vector<VALUE_TYPE>&& importance)
 {
-    SparseLinearWeights<SIZE_TYPE, VALUE_TYPE> w;
-    w.connections.rows       = rows;
-    w.connections.cols       = cols;
-    w.connections.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>> (std::move(ptrs));
-    w.connections.indices[0] = std::make_shared<std::vector<SIZE_TYPE>> (std::move(indices));
-    w.connections.values[0]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(values));
-    w.connections.values[1]  = std::make_shared<std::vector<VALUE_TYPE>>(std::move(importance));
+    SparseLinearWeightsV<SIZE_TYPE, VALUE_TYPE> w;
     w.probes.rows = rows;
     w.probes.cols = cols;
     w.out_degree.assign(cols, SIZE_TYPE(0));

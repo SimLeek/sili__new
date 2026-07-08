@@ -1,0 +1,10 @@
+[build-system]
+# PEP 517/518: pip builds this project in an ISOLATED environment that starts
+# empty except for whatever is listed here. setup.py needs pybind11 (for
+# pybind11.get_include()) merely to be IMPORTED -- without this section, pip
+# has no way to know that before it evaluates setup.py, causing exactly the
+# "ModuleNotFoundError: No module named 'pybind11'" failure this file exists
+# to fix (hit during `pip install -e .`'s "Getting requirements to build
+# editable" step, before requirements.txt is ever consulted).
+requires = ["setuptools>=64", "wheel", "pybind11>=3.0.2"]
+build-backend = "setuptools.build_meta"

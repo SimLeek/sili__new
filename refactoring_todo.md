@@ -404,3 +404,49 @@ channels, project down) matching patch_merger.merging_layer.weight's real
 shape (VIS_HIDDEN, VIS_HIDDEN*MERGE*MERGE). This is a real architecture
 change from the current simplification, not a small patch -- deferred
 alongside the RTAC items above.
+
+
+## KNOWN ISSUE: test/python/test_sili.py is stale against the current SparseLinearLayer API
+
+Pre-existing, confirmed unrelated to any change made while fixing the
+`pip install -e .` build (dated via `git blame` to 2026-07-01, days before
+that fix). Surfaced because that fix was verified by running the FULL
+`test/run_tests.sh` end-to-end for the first time in a while, not because
+anything in `sili/cpu_backend.cpp`'s `SparseLinearLayer` binding changed
+today.
+
+Current constructor (sili/cpu_backend.cpp, `py::init<int,int,int,int>()`):
+    SparseLinearLayer(n_inputs, n_outputs, max_weights, num_cpus=4)
+
+test_sili.py's `make_layer()` helper and ~8 direct `_cpu.SparseLinearLayer(...)`
+call sites assume an OLDER, more elaborate signature with separate concepts
+that have since been consolidated or moved to other methods:
+    _cpu.SparseLinearLayer(n_in, n_out, bw, budget, cpus)        # 5 args
+    _cpu.SparseLinearLayer(8, 8, 1, BUDGET, 1, 5)                 # 6 args
+    _cpu.SparseLinearLayer(1000, 1000, 10, 1)                     # 4 args,
+        # but semantically wrong even though the COUNT happens to match:
+        # 3rd positional is `max_weights` now, not a byte `budget`
+
+61 failed + 23 errored (out of 103 collected) when run via
+`test/python/run_py_tests.sh` / `test/run_tests.sh` -- all TypeErrors at
+construction, all downstream of this one mismatch (TestConstruction,
+TestForward, TestBackward, TestSynaptogenesis, TestEqualizer, TestToAbsolute,
+TestPytorchLike, TestNumpyViews, TestSparseAttention, TestBandedAttention,
+TestParallelPointers, TestSerialisation, TestBufferAccess -- essentially the
+whole file). The C++ Catch2 suite (test/*.cpp, 612 assertions) and
+tests/integration/* are unaffected and reliable; this is isolated to this
+one legacy Python file.
+
+Needs real investigation before fixing, not a blind signature patch: where
+did the old `bw` (bandwidth) concept go -- folded into `max_weights`
+entirely, or moved to a separate method? Is byte-level `budget` gone in
+favor of an element-count `max_weights`, or available elsewhere (e.g.
+`equalize_to_capacity`, discussed earlier this session)? What does the
+trailing 6th arg in some call sites (parallel-pointer count?) map to now --
+`TestParallelPointers` existing as its own test class suggests a
+`.set_parallel_ptrs(...)`-style method may already exist and just isn'''t
+what these older call sites use. Whoever picks this up should read the
+CURRENT SparseLinearLayer binding's full method list in cpu_backend.cpp
+first, then decide per-test whether to update the call to the current API
+or whether the test itself is now redundant with something in
+tests/integration/.

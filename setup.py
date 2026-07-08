@@ -1,16 +1,35 @@
 from setuptools import setup, find_packages, Extension
-import pybind11
 
 reqs   = [
 'numpy',
 'pybind11'
 ]
 readme = open("README.md").read()
+
+
+class get_pybind_include:
+    """
+    Lazily evaluated pybind11 include path (the pattern pybind11's own
+    official example projects use, e.g. pybind11/python_example). setuptools
+    calls str() on each include_dirs entry only when actually invoking the
+    compiler, during build_ext -- well after build-system dependencies
+    (declared in pyproject.toml) have been installed. This means setup.py
+    itself no longer needs pybind11 importable just to be evaluated, which
+    matters even with pyproject.toml's build-system.requires in place: this
+    is the second, independent layer of defense for anyone bypassing build
+    isolation (e.g. `pip install --no-build-isolation .`, or a very old pip
+    that doesn't honor pyproject.toml's [build-system] section).
+    """
+    def __str__(self):
+        import pybind11
+        return pybind11.get_include()
+
+
 cpu_ext = Extension(
     name="sili._cpu",
     sources=["sili/cpu_backend.cpp"],
     include_dirs=[
-        pybind11.get_include(),   # pybind11 headers
+        get_pybind_include(),   # pybind11 headers (lazy -- see class above)
         #"sili/lib",               # csr.hpp, coo.hpp, linear_sisldo.hpp, etc.
         "sili/lib/headers",  # linear_sisldo.hpp, linear_disldo.hpp, etc.
     ],

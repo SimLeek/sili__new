@@ -85,8 +85,16 @@ pip install -e .
 ```
 
 This compiles `sili/cpu_backend.cpp` into `sili._cpu` via pybind11
-(`setup.py`; requires a C++20 compiler and OpenMP). Python dependencies are
-pinned in `requirements.txt`.
+(`setup.py` + `pyproject.toml`; requires a C++20 compiler and OpenMP).
+Verified on a completely clean virtualenv (no pybind11 or numpy
+pre-installed) -- `pyproject.toml` declares `pybind11` as a build-system
+requirement so pip's isolated build environment has it available before
+`setup.py` is even evaluated. Without that file, `pip install -e .` fails
+at "Getting requirements to build editable" with `ModuleNotFoundError: No
+module named 'pybind11'`, since `setup.py` needs pybind11 importable just
+to be evaluated, and pip's isolated build env starts empty.
+
+Python dependencies are pinned in `requirements.txt`.
 
 **Import note:** always import the compiled extension via `from sili import
 _cpu` (or transitively through `import sili`), never as a bare top-level
@@ -116,9 +124,18 @@ not source):
 ## Testing
 
 ```bash
-test/run_tests.sh              # C++ unit tests + legacy Python scripts (fast)
+test/run_tests.sh              # C++ unit tests + legacy Python scripts
 python -m tests.integration.<name>   # any individual integration test
 ```
+
+The C++ suite (`test/*.cpp`, Catch2, run via `run_cpp_tests.sh`) and every
+test in `tests/integration/` are reliable. **Known issue:** `test/run_tests.sh`
+currently exits nonzero because `test/python/test_sili.py` (legacy, run via
+`run_py_tests.sh`) is stale against `SparseLinearLayer`'s current constructor
+signature -- pre-existing, unrelated to the C++ core itself, tracked in
+`refactoring_todo.md`. A failing `test/run_tests.sh` run does not mean the
+build or the `_cpu` extension is broken; check the C++ portion's own
+"All tests passed" line, or run `tests/integration/` directly.
 
 Each integration test is runnable standalone and takes `--quiet` for
 pass/fail-only output, e.g.:
