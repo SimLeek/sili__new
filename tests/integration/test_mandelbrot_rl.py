@@ -562,9 +562,18 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         lr=0.01, aux_weight=0.05, pol_weight=0.3,
         group=4, report_every=200, verbose=True, seed=0,
         display=False, gamma=0.99, entropy_scale=0.01,
-        loss_alpha=0.2, target_update=0.005):
+        loss_alpha=0.2, target_update=0.005, action_mode='discrete'):
     N_ACT = 7
     ACT_NAMES = ['pan<','pan>','pan^','panv','zoom+','zoom-','reset']
+
+    if action_mode == 'continuous' and agent == 'rtac':
+        if verbose:
+            print("    --action-mode continuous is not compatible with "
+                  "--agent rtac yet (RTAC's value heads assume a discrete "
+                  "one-hot previous action for their real-time input) -- "
+                  "falling back to --agent reinforce's advantage baseline "
+                  "for the continuous action gradient")
+        agent = 'reinforce'
     np.random.seed(seed); torch.manual_seed(seed)
 
     if core == 'mistral' and hidden != 32:
@@ -703,6 +712,7 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
     # -- trackers --
     view_buf, hid_buf = [], []
     act_counts_win = np.zeros(N_ACT, int); act_counts_all = np.zeros(N_ACT, int)
+    mag_accum_win  = np.zeros(N_ACT, np.float32); n_mag_win = 0
     coverage = set()
     recon_win = 0.; n_win = 0
     recon_all = 0.; n_all = 0
@@ -762,23 +772,70 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         e28, aux_o, _ = energy_o.forward(la28)
         l7  = e28 @ Gm                                   # grouped mean, in graph
 
-        if policy == 'random':
+        if action_mode == 'continuous':
+            # No forced single choice ("old actor methods"): every action
+            # dimension gets its own continuous, energy-earned magnitude via
+            # bounded_gate (see sili/tensor.py docstring), and all can act
+            # at once. A settled/quiet energy state naturally produces
+            # near-zero magnitudes everywhere -- "do nothing" is the default
+            # rather than a discrete choice competing with the other 7.
+            action = None    # no single discrete choice in this mode
+            if policy == 'random':
+                mag7 = None
+                probs = np.random.uniform(0., 1., N_ACT).astype(np.float32)
+            else:
+                mag7 = l7.bounded_gate(n=2.0)              # (7,) graph, [0,1) each
+                probs = mag7.data   # reused below only for the report line's
+                                     # per-dimension display, not a distribution
+        elif policy == 'random':
             probs = np.full(N_ACT, 1./N_ACT, np.float32)
+            action = int(np.random.choice(N_ACT, p=probs))
         else:
             lg = l7.data - l7.data.max()
             probs = np.exp(lg); probs /= probs.sum()
-        action = int(np.random.choice(N_ACT, p=probs))
-        act_counts_win[action] += 1; act_counts_all[action] += 1
+            action = int(np.random.choice(N_ACT, p=probs))
+        if action is not None:
+            act_counts_win[action] += 1; act_counts_all[action] += 1
+        elif action_mode == 'continuous':
+            mag_accum_win += probs; n_mag_win += 1
 
         # -- act --
         pan = 0.3 / zoom
-        if   action == 0: cx -= pan
-        elif action == 1: cx += pan
-        elif action == 2: cy -= pan
-        elif action == 3: cy += pan
-        elif action == 4: zoom = min(zoom*1.4, 1e8)
-        elif action == 5: zoom = max(zoom/1.4, 1.0)
-        elif action == 6: cx, cy, zoom = HOME
+        if action_mode == 'continuous':
+            # All seven action dimensions act simultaneously, each scaled by
+            # its own continuous magnitude (probs here is mag7.data for the
+            # curiosity policy, or a random uniform draw for the random
+            # policy baseline -- see action-selection above). A quiet/
+            # settled energy state (all magnitudes near 0) naturally means
+            # "do nothing," rather than needing a discrete choice for it.
+            cx -= probs[0] * pan
+            cx += probs[1] * pan
+            cy -= probs[2] * pan
+            cy += probs[3] * pan
+            zoom *= (1.0 + probs[4] * 0.4)     # continuous pull toward the 1.4x discrete step
+            zoom /= (1.0 + probs[5] * 0.4)     # continuous pull toward the /1.4 discrete step
+            # reset: continuous pull toward HOME rather than an all-or-
+            # nothing jump. zoom is log-scale, so blending it linearly (as
+            # done here for cx/cy) would pull disproportionately hard at
+            # high zoom; blend in log-zoom space instead so the pull feels
+            # comparable regardless of current zoom level.
+            cx   += probs[6] * (HOME[0] - cx)
+            cy   += probs[6] * (HOME[1] - cy)
+            log_zoom      = math.log(zoom, 1.4)
+            log_zoom_home = math.log(HOME[2], 1.4)
+            zoom = 1.4 ** (log_zoom + probs[6] * (log_zoom_home - log_zoom))
+            zoom = min(max(zoom, 1.0), 1e8)     # simultaneous forces could combine
+                                                  # to push past bounds; discrete
+                                                  # branch never needed this since
+                                                  # exactly one action fired at a time
+        else:
+            if   action == 0: cx -= pan
+            elif action == 1: cx += pan
+            elif action == 2: cy -= pan
+            elif action == 3: cy += pan
+            elif action == 4: zoom = min(zoom*1.4, 1e8)
+            elif action == 5: zoom = max(zoom/1.4, 1.0)
+            elif action == 6: cx, cy, zoom = HOME
         coverage.add((int(cx*50), int(cy*50), int(round(math.log(zoom, 1.4)))))
 
         # -- next view, reconstruction --
@@ -803,13 +860,40 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         aux_h_val = float(np.asarray(aux_h.data).ravel()[0]) if aux_h is not None else 0.0
         reward = rmse + 0.1 * aux_h_val
 
-        onehot = np.zeros(N_ACT, np.float32); onehot[action] = 1.
-        G_pol = np.zeros(N_ACT, np.float32)
+        if action_mode == 'continuous':
+            onehot = None; G_pol = None
+        else:
+            onehot = np.zeros(N_ACT, np.float32); onehot[action] = 1.
+            G_pol = np.zeros(N_ACT, np.float32)
         terms = [(h_out, g_h_recon)]
         if aux_h is not None: terms.append((aux_h, aux_weight))
         if aux_o is not None: terms.append((aux_o, aux_weight))
 
-        if policy == 'curiosity' and agent == 'reinforce':
+        if action_mode == 'continuous':
+            # Continuous analog of policy gradient: no discrete chosen-vs-
+            # unchosen split exists here (all seven dimensions act at once),
+            # so credit is assigned PROPORTIONALLY to how active each
+            # dimension currently is (mag7.data), rather than a binary
+            # onehot split. SGD does param -= lr*grad, so a NEGATIVE
+            # gradient increases the parameter -- injecting -advantage*mag7
+            # means: advantage>0 (good outcome) pushes currently-active
+            # dimensions to become MORE active; advantage<0 pushes them down.
+            # Dimensions that were barely active get barely any push either
+            # way, matching "reinforce proportionally to how much you did
+            # this," the natural analog of "reinforce what you chose" when
+            # there is no single choice. No entropy bonus here (entropy of
+            # a categorical distribution has no direct analog for N
+            # independent continuous magnitudes) -- omitted rather than
+            # guessed at.
+            if policy == 'curiosity' and mag7 is not None:
+                adv = reward - reward_baseline
+                reward_baseline = 0.99*reward_baseline + 0.01*reward
+                G_continuous = -pol_weight * adv * mag7.data
+                terms.append((mag7, G_continuous))
+            # policy == 'random': mag7 is None (magnitudes were drawn
+            # uniformly, not from the network), nothing to reinforce.
+
+        elif policy == 'curiosity' and agent == 'reinforce':
             adv = reward - reward_baseline
             reward_baseline = 0.99*reward_baseline + 0.01*reward
             G_pol = pol_weight * adv * (probs - onehot)
@@ -867,7 +951,8 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
             Wvh_t2 += target_update * (Wv_h2.data - Wvh_t2)
             Wva_t2 += target_update * (Wv_a2.data - Wva_t2)
 
-        terms.append((l7, G_pol))
+        if action_mode != 'continuous':
+            terms.append((l7, G_pol))
         combine_losses(*terms).backward()
 
         # Synaptogenesis: AFTER backward() (importance/grad accumulators are
@@ -899,12 +984,18 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
             if hasattr(Wp, 'layer') and hasattr(Wp.layer, 'nnz_total'):
                 nnz += Wp.layer.nnz_total()
             nnz_str = f"  nnz={nnz}" if nnz > 0 else ""
+            if action_mode == 'continuous':
+                mean_mag = mag_accum_win / max(1, n_mag_win)
+                act_str = f"mag={np.array2string(mean_mag, precision=2, suppress_small=True)}"
+            else:
+                act_str = f"H={entropy_nats(act_counts_win):.2f}"
             print(f"  step {step+1:6d}  pos=({cx:+.3f},{cy:+.3f}) z={zoom:.0f}  "
                   f"recon={recon_win/max(1,n_win):.4f} probe={pm:.4f}  "
-                  f"H={entropy_nats(act_counts_win):.2f}  cov={len(coverage)}  "
+                  f"{act_str}  cov={len(coverage)}  "
                   f"vcr={compression_ratio(view_buf):.3f}{nnz_str}  "
                   f"{(step+1)/el:.0f} st/s")
             recon_win = 0.; n_win = 0; act_counts_win[:] = 0
+            mag_accum_win[:] = 0.; n_mag_win = 0
 
     elapsed = time.perf_counter() - start
     steps_done = step + (1 if stop_reason == 'steps' else 0)
@@ -919,7 +1010,8 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
         recon_mse_all=recon_all/max(1, n_all),
         probe_mse_first=probe_history[0] if probe_history else float('nan'),
         probe_mse_final=final_probe,
-        action_entropy=entropy_nats(act_counts_all),
+        action_entropy=(entropy_nats(act_counts_all)
+                        if action_mode != 'continuous' else float('nan')),
         coverage=len(coverage),
         view_cr=compression_ratio(view_buf),
         hid_cr=compression_ratio(hid_buf),
@@ -932,8 +1024,12 @@ def run(core='sparse', policy='curiosity', agent='reinforce',
               f"{result['probe_mse_final']:.4f}  "
               f"({'LEARNING' if result['probe_mse_final'] < result['probe_mse_first'] else 'not improving'})")
         print(f"  online recon (whole run): {result['recon_mse_all']:.4f}")
-        print(f"  entropy={result['action_entropy']:.2f} (uniform={math.log(N_ACT):.2f})  "
-              f"coverage={result['coverage']}")
+        if action_mode == 'continuous':
+            print(f"  action_mode=continuous (no discrete entropy to report)  "
+                  f"coverage={result['coverage']}")
+        else:
+            print(f"  entropy={result['action_entropy']:.2f} (uniform={math.log(N_ACT):.2f})  "
+                  f"coverage={result['coverage']}")
 
     if d is not None:
         d.end()   # explicit cleanup rather than relying on __del__ timing
@@ -969,6 +1065,17 @@ def main():
                          'init. mistral: folded toy-Mistral weights, fixed '
                          'at hidden=32.')
     ap.add_argument('--agent',   default='reinforce', choices=['reinforce', 'rtac'])
+    ap.add_argument('--action-mode', default='discrete', choices=['discrete', 'continuous'],
+                    help='discrete (default): sample exactly one of 7 actions '
+                         'per step via softmax ("old actor" forced choice). '
+                         'continuous: no forced single choice -- every action '
+                         'dimension gets its own continuous, energy-earned '
+                         'magnitude via bounded_gate, and all can act at '
+                         'once. A settled/quiet energy state naturally means '
+                         '"do nothing," rather than needing a discrete choice '
+                         'for it. Falls back to --agent reinforce if combined '
+                         'with --agent rtac (RTAC assumes a discrete '
+                         'one-hot previous action).')
     ap.add_argument('--display', action='store_true',
                     help='displayarray window: current view | reconstruction')
     ap.add_argument('--policy',  default='curiosity', choices=['curiosity', 'random'])
@@ -1019,6 +1126,7 @@ def main():
     a = ap.parse_args()
     kw = dict(lr=a.lr, group=a.group, report_every=a.report_every,
               agent=a.agent, display=a.display, hidden=a.hidden,
+              action_mode=a.action_mode,
               base_connections=a.base_connections, num_cpus=a.num_cpus,
               k_factor=a.k_factor, importance_cutoff=a.importance_cutoff,
               synap_amplitude=a.synap_amplitude, synap_period=a.synap_period,
