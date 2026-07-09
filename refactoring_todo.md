@@ -500,3 +500,110 @@ not the ~500x informally recalled, which was almost certainly describing
 the since-reverted k_factor*n_in bug (build_probes(k) evaluates k_in*k_out
 candidates, so scaling k by row count caused a further n_in^2-fold blowup
 on top of whatever the true baseline ratio is).
+
+
+## MANDELBROT / EXPERIMENT PIPELINE -- QUEUED FROM THE BIG TESTING SESSION
+
+### conv2d in sili/tensor.py (OWED -- explicitly noticed as missing)
+Was interrupted mid-implementation two sessions running: reshape/transpose
+landed as prerequisites (verified ops, committed), conv2d itself never got
+written. Plan already agreed: NATIVE, not pytorch -- im2col as the
+primitive (its backward is a scatter-add, which IS transposed-conv's
+forward, so "conv and inv conv fwd/bwd are basically swapped" comes for
+free), reuse matmul's existing autograd for the actual multiply, SAME
+padding so sizes are preserved both directions. Then the agreed cascade
+reconstruction architecture: 3x3 conv -> ~24 channels with an
+EnergyDynamics ON THE CHANNELS (guarantees each channel trains/represents
+something) -> 3x3 inv conv back to input; ALSO feed the 24 channels into
+the pixel transformer whose output ADDS to those channels -- cascading
+learning for faster signal.
+
+### FoldedLayer.forward is forward_dense-only (verified, real speedup left
+on the table)
+sparse_rnn.py line ~380: FoldedLayer.forward calls forward_dense
+unconditionally. The CSR-input sparse path exists and is already used by
+SparseRNNAgent.forward (line ~706: converts state to CSR via
+CSR.from_dense(p=percent_active) then goes through the sparse kernels).
+With hard top-p energy gating, the recurrent state is mostly zeros every
+step -- forward_sparse on the active-only state is where the claimed 10x+
+lives. Fix: in the Mandelbrot cores (SparseCore.forward), sparsify the
+state before the recurrent layer call, mirroring SparseRNNAgent's pattern.
+backward_dense -> backward_sparse likewise where gradients are gated-sparse.
+
+### PixelAttentionHead: dense Python attention while C++ sparse attention
+exists (verified: bound but FORWARD-ONLY)
+cpu_backend.cpp binds sparse_attention, sparse_banded_attention,
+banded_attention (all *_forward). No backward bindings exist, which is why
+the trainable recon head couldn't just call them. Real fix: bind the
+attention backward kernels (or add them if only forward exists in C++),
+then swap PixelAttentionHead's numpy softmax-attention for the C++ path.
+Until then the Python version stands -- correct (finite-diff verified) but
+the slowest possible implementation, as noted.
+
+### TD cascade: multi-time-horizon critic (design provided verbatim below)
+Rationale: instant prediction saturates while future prediction keeps
+improving; preferring later horizons over instant reward needs multiple
+horizon levels. No BPTT required (deliberate -- "not worth the extra
+memory/compute pretty much ever" per direct experience); EMA cascade
+carries the temporal integration instead. Roughly Cox-PH-shaped; likely
+slow to train. Provided reference (pytorch-flavored; adapt to numpy/sili,
+value heads output n_heads values, keep ema_preds as loop state; open
+question: interaction with PopArt -- cascade may replace it or normalize
+per-head):
+
+```python
+def process_td_cascade_step(reward_t, current_preds, ema_preds,
+                            action_logits, actual_loss,
+                            gamma=0.99, alpha_base=0.5, beta_base=0.5):
+    n_heads = ema_preds.shape[-1]
+    for i in reversed(range(n_heads)):
+        alpha = alpha_base / (2 ** (i + 1))
+        beta = beta_base / (2 ** i)
+        if i < n_heads - 1:
+            ema_preds[:, i] = (ema_preds[:, i] * (1 - alpha) * (1 - beta)
+                               + ema_preds[:, i + 1] * alpha
+                               + current_preds[:, i].detach() * beta)
+        else:
+            ema_preds[:, i] = (ema_preds[:, i] * (1 - beta)
+                               + current_preds[:, i].detach() * beta)
+    critic_loss = F.mse_loss(current_preds[:, 0] + ema_preds[:, 0].detach(),
+                             actual_loss)
+    advantage = (reward_t.squeeze(-1) + gamma * ema_preds[:, 0].detach()) \
+                - current_preds[:, 0].detach()
+    actor_loss = -(action_logits * advantage.unsqueeze(-1)).mean()
+    return actor_loss, critic_loss
+```
+NOTE per the design: the network must CONSUME ema_preds and current_preds
+as part of its recurrent input for temporal consistency; heads 1..n train
+implicitly through the EMA feedback into head 0. Wire as --agent cascade
+alongside reinforce/rtac so the harness's action_mode grid can compare all
+three.
+
+### Energy-as-input and column energy (experiment features, not yet built)
+- energy-input: feed energy_h.energy into the core each step (either
+  concatenated into encode_observation -- changes raw_dim -- or a separate
+  small projection added into the core input; zero-init consistent with
+  mode). Flag: --energy-input.
+- column energy: partition hidden into columns of c neurons mapped to
+  inputs; loss ties mean(column_i at t) to input_i at t -- keeps internal
+  nets on the input manifold instead of doing private math to predict
+  their own energy. Gradient: broadcast (col_mean - input)*2/(n*c) to
+  column members, add as an (h_out, g) term. Flag: --column-energy-weight.
+  The ncd_view_hidden metric added this session is the direct measurement
+  for whether this works (it targets exactly the private-dynamics failure
+  mode).
+
+### run() decomposition follow-ups
+build_agent/select_action/apply_action_*/rtac_terms extracted and
+equivalence-verified this session. Remaining mess: probe_eval is still a
+closure over run() locals (fine but not importable); reward computation
+and the report block could extract similarly; the Cores + projections +
+recon head could move to their own module (models_mandelbrot.py) once
+conv/cascade lands so the experiment file imports models without the test.
+
+### Dense heads are the scaling bottleneck for the 50x-neurons plan
+Wa (hidden x 28), value heads (hidden x 1 x4), and the recon head's
+slot projections all scale with hidden and are DENSE -- at hidden ~50k
+they dominate step cost while the sparse core stays cheap. Sparsifying
+the heads (same grown-layer machinery) is the prerequisite for the
+"50x size at same compute" experiment beyond shape_vs_k's current 4096.
