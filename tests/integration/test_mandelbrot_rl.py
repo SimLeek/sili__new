@@ -576,12 +576,24 @@ def _run_params_dict(scope):
     return out
 
 
+def _json_default(o):
+    '''numpy scalars/arrays leak into records easily (e.g. cx/cy/zoom become
+    np.float32 after continuous-mode arithmetic with a float32 magnitude
+    array) -- convert them at the serialization boundary once rather than
+    chasing every producer.'''
+    if isinstance(o, (np.floating, np.integer)):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'not JSON serializable: {type(o).__name__}')
+
+
 def _write_json_atomic(path, obj):
     '''tmp-write + os.replace so a crash mid-write never leaves a truncated
     JSON for the experiment collector to choke on.'''
     tmp = str(path) + '.tmp'
     with open(tmp, 'w') as fh:
-        json.dump(obj, fh)
+        json.dump(obj, fh, default=_json_default)
     os.replace(tmp, path)
 
 
