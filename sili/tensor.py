@@ -244,6 +244,78 @@ def sparse_mm(weight, x: Tensor) -> Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Attention ops — Tensor-graph wrappers over the C++ forward/backward kernels
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The C++ side (sili/lib/headers/attention.hpp, bound in cpu_backend.cpp) has
+# always had real forward *and* backward kernels for all three variants below;
+# what was missing was any Tensor-graph wrapper connecting them, so nothing
+# using attention could be trained end-to-end -- only frozen-weight inference.
+# These wrappers are that missing piece: each stashes Q/K/V (the backward
+# kernels recompute the softmax internally rather than needing it cached) and
+# calls the matching `*_backward` binding from its `_backward` closure, the
+# same pattern `sparse_mm` above uses for the sparse-linear C++ object.
+#
+# Q/K/V are 2-D [T, d] / [K, d] float32 arrays, no batch axis -- matches every
+# other op in this library today (see EnergyDynamics's own single-vector
+# assumption); batching all of these together is a separate, larger project
+# tracked elsewhere, not attempted here.
+
+def _attn_f32(t: Tensor) -> np.ndarray:
+    return np.ascontiguousarray(t.data, dtype=np.float32)
+
+
+def sparse_attention(q: Tensor, k: Tensor, v: Tensor,
+                      top_k: int = 0, num_cpus: int = 4) -> Tensor:
+    """Global top-k sparse attention, differentiable w.r.t. q/k/v."""
+    from sili import _cpu
+    qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
+    out_np = _cpu.sparse_attention(qd, kd, vd, top_k, num_cpus)
+    out = Tensor(out_np, (q, k, v), "sparse_attention", q.backend)
+    def _bwd():
+        dQ, dK, dV = _cpu.sparse_attention_backward(
+            qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
+            top_k, num_cpus)
+        _acc(q, dQ); _acc(k, dK); _acc(v, dV)
+    out._backward = _bwd
+    return out
+
+
+def banded_attention(q: Tensor, k: Tensor, v: Tensor,
+                      half_bandwidth: int, num_cpus: int = 4) -> Tensor:
+    """Dense banded (geometric-diagonal) attention, differentiable w.r.t. q/k/v."""
+    from sili import _cpu
+    qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
+    out_np = _cpu.banded_attention(qd, kd, vd, half_bandwidth, num_cpus)
+    out = Tensor(out_np, (q, k, v), "banded_attention", q.backend)
+    def _bwd():
+        dQ, dK, dV = _cpu.banded_attention_backward(
+            qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
+            half_bandwidth, num_cpus)
+        _acc(q, dQ); _acc(k, dK); _acc(v, dV)
+    out._backward = _bwd
+    return out
+
+
+def sparse_banded_attention(q: Tensor, k: Tensor, v: Tensor,
+                            half_bandwidth: int, inner_k: int = 0,
+                            num_cpus: int = 4) -> Tensor:
+    """Banded attention with an inner top-k within each band, differentiable
+    w.r.t. q/k/v."""
+    from sili import _cpu
+    qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
+    out_np = _cpu.sparse_banded_attention(qd, kd, vd, half_bandwidth, inner_k, num_cpus)
+    out = Tensor(out_np, (q, k, v), "sparse_banded_attention", q.backend)
+    def _bwd():
+        dQ, dK, dV = _cpu.sparse_banded_attention_backward(
+            qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
+            half_bandwidth, inner_k, num_cpus)
+        _acc(q, dQ); _acc(k, dK); _acc(v, dV)
+    out._backward = _bwd
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Gradient helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
