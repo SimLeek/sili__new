@@ -25,7 +25,7 @@ done, not things blocking it.
 1. **This session's own SILi work** (built before the repo consolidation
    started) -- highest priority of all sources. Python-level tests
    (`test_sili.py`, `multimodal_sparse_rnn.py`, `sparse_tcnn_audio.py`,
-   preserved in `test/python/`) are highest priority within that.
+   preserved in `tests/unit/python/`) are highest priority within that.
 2. **optim_merge/master** (the actual GitHub repo, what `sili_new` was
    branched from) -- second priority.
 3. **cpu_sparse_io** -- explicitly the old direction (2026-03-10, predates
@@ -348,3 +348,262 @@ is shown to actually cost something. If/when this is picked up: reshape
 inference load time. Test first whether it sparsifies well at all before
 building the restore path -- if density stays high, it may not be worth
 doing regardless of whether the machinery exists.
+
+
+## RTAC ADVANCED FEATURES (later)
+
+Two items deferred from the RTAC curiosity agent (see
+docs/requirements_vlm_streaming_rtac.md section 4 for the base implementation
+-- PopArt and double critic are done; these two are not).
+
+**Critic-through-trunk.** rtac.py recomputes values from the SHARED hidden
+representation so the critic's gradient reaches the trunk weights, not just
+the value head. In the current online loop this needs the PREVIOUS step's
+forward pass to still be a LIVE Tensor with its autograd graph intact when
+the critic loss is computed one step later -- but the current loop applies
+SGD and clears every Tensor's graph at the end of each step (h_prev is
+stored as a detached numpy array specifically to avoid holding stale graphs
+across iterations). Two ways to fix this, both real refactors, not a small
+patch:
+  (a) Defer the SGD apply by one step: compute forward at t, hold the Tensor
+      graph, do the critic-through-trunk backward at t+1 using weights as
+      they were at t (values become slightly stale by one step, which
+      one-step TD already tolerates for the target net).
+  (b) Recompute h_prev's forward pass fresh at the critic step (rerun
+      core_net.forward on the stored raw inputs) so a live graph exists
+      again -- doubles the forward-pass cost per step and needs the raw
+      inputs (not just h_prev) retained.
+Not attempted when the base RTAC agent was built -- wanted correctness
+confidence before landing it, and (a) touches the main loop's control flow
+in a way that risks regressing the working zero-init learning signal.
+
+**Replay buffer / batched updates.** rtac.py samples batches from a large
+replay memory (Memory class, size 500k-1M in the paper's configs); the
+current loop is strictly online (one transition, one gradient step,
+immediately discarded). Adding replay means: a ring-buffer transition store,
+batched forward/backward (currently every op in the RL training loop is
+single-sample, e.g. EnergyDynamics.forward expects a single vector not a
+batch dimension -- needs a batch-axis audit before this is safe), and a
+decision on whether curiosity reward is recomputed at sample time (correct
+but requires storing enough to re-render the Mandelbrot view) or cached at
+collection time (cheaper, slightly off-policy). Substantially larger than
+anything else in the RTAC work; not attempted given the emphasis on the
+working pipeline over expanding scope.
+
+## VISION: PER-PATCH SEQUENCE + SPATIAL MERGE (later)
+
+UPDATE: the worst part of the old simplification is fixed -- test_mandelbrot_rl.py
+used to mean-pool ALL patches together into one vector before projection,
+destroying every bit of spatial layout (confirmed: with view=32, patch=8,
+that was averaging all 16 separate 8x8 patches into a single 64-dim vector --
+the network had no way to know WHERE any feature was in the frame, only
+"what does an average local patch look like"). Now flattens the full view
+directly (raw_dim = view*view + 3, the +3 being explicit position/zoom) so
+every pixel occupies a fixed position in the input vector and a linear
+projection can in principle learn to treat different spatial regions
+differently.
+
+That is still NOT the real Pixtral architecture's per-patch token sequence +
+attention + 2x2 spatial merge (multi_modal_projector.patch_merger,
+spatial_merge_size=2 per the real config.json) -- there is still no
+attention operating over spatially-distinct patch tokens, just one big flat
+vector through one linear layer. Implementing the real version still needs:
+patches kept as a genuine sequence (not flattened into one vector either),
+the vision tower's attention operating over that sequence, and the 2x2 merge
+implemented as a constant gather/matmul (group 2x2 neighboring patch tokens,
+concatenate their channels, project down) matching
+patch_merger.merging_layer.weight's real shape
+(VIS_HIDDEN, VIS_HIDDEN*MERGE*MERGE). Still a real architecture change from
+the current (much improved, but still single-vector) input, not a small
+patch -- deferred alongside the RTAC items above.
+
+
+## KNOWN ISSUE: tests/unit/python/test_sili.py is stale against the current SparseLinearLayer API
+
+Pre-existing, confirmed unrelated to any change made while fixing the
+`pip install -e .` build (dated via `git blame` to 2026-07-01, days before
+that fix). Surfaced because that fix was verified by running the FULL
+`tests/unit/run_tests.sh` end-to-end for the first time in a while, not because
+anything in `sili/cpu_backend.cpp`'s `SparseLinearLayer` binding changed
+today.
+
+Current constructor (sili/cpu_backend.cpp, `py::init<int,int,int,int>()`):
+    SparseLinearLayer(n_inputs, n_outputs, max_weights, num_cpus=4)
+
+test_sili.py's `make_layer()` helper and ~8 direct `_cpu.SparseLinearLayer(...)`
+call sites assume an OLDER, more elaborate signature with separate concepts
+that have since been consolidated or moved to other methods:
+    _cpu.SparseLinearLayer(n_in, n_out, bw, budget, cpus)        # 5 args
+    _cpu.SparseLinearLayer(8, 8, 1, BUDGET, 1, 5)                 # 6 args
+    _cpu.SparseLinearLayer(1000, 1000, 10, 1)                     # 4 args,
+        # but semantically wrong even though the COUNT happens to match:
+        # 3rd positional is `max_weights` now, not a byte `budget`
+
+61 failed + 23 errored (out of 103 collected) when run via
+`tests/unit/python/run_py_tests.sh` / `tests/unit/run_tests.sh` -- all TypeErrors at
+construction, all downstream of this one mismatch (TestConstruction,
+TestForward, TestBackward, TestSynaptogenesis, TestEqualizer, TestToAbsolute,
+TestPytorchLike, TestNumpyViews, TestSparseAttention, TestBandedAttention,
+TestParallelPointers, TestSerialisation, TestBufferAccess -- essentially the
+whole file). The C++ Catch2 suite (tests/unit/*.cpp, 612 assertions) and
+tests/integration/* are unaffected and reliable; this is isolated to this
+one legacy Python file.
+
+Needs real investigation before fixing, not a blind signature patch: where
+did the old `bw` (bandwidth) concept go -- folded into `max_weights`
+entirely, or moved to a separate method? Is byte-level `budget` gone in
+favor of an element-count `max_weights`, or available elsewhere (e.g.
+`equalize_to_capacity`, discussed earlier this session)? What does the
+trailing 6th arg in some call sites (parallel-pointer count?) map to now --
+`TestParallelPointers` existing as its own test class suggests a
+`.set_parallel_ptrs(...)`-style method may already exist and just isn'''t
+what these older call sites use. Whoever picks this up should read the
+CURRENT SparseLinearLayer binding's full method list in cpu_backend.cpp
+first, then decide per-test whether to update the call to the current API
+or whether the test itself is now redundant with something in
+tests/integration/.
+
+
+## C++-LEVEL PERFORMANCE TOOLING (later)
+
+Attempted to add a native Catch2 BENCHMARK for build_probes/synap_step
+(Catch2 v3 with benchmark support is genuinely installed and available).
+Blocked for now: SparseLinearLayer is defined directly inside
+sili/cpu_backend.cpp mixed with pybind11-dependent code (forward_dense/
+forward_sparse/backward_dense/backward_sparse all take py::array_t
+parameters), not in a separate pybind-free header the way the sparse
+math primitives it wraps (delta_csr_build_probes, delta_csr_synap_row_step
+in delta_csr_memory.hpp) already are. A pure C++ Catch2 test can't cleanly
+instantiate SparseLinearLayer without either including cpu_backend.cpp
+directly (risks a duplicate/conflicting pybind11 module registration
+against Catch2's own main) or linking pybind11 into the test binary just
+to construct py::array_t arguments it doesn't otherwise need.
+
+Real fix, not attempted here: extract SparseLinearLayer's definition into
+its own pybind-free header (sili/lib/headers/sparse_linear_layer.hpp or
+similar), with cpu_backend.cpp reduced to just the pybind11 bindings over
+it -- mirroring how delta_csr_build_probes/delta_csr_synap_row_step are
+already separated from their own binding layer. Once that split exists, a
+native Catch2 BENCHMARK block becomes straightforward and would also enable
+perf-based profiling directly on the class (this session's sandbox could
+not use perf at all -- kernel version mismatch with available
+linux-tools packages, and perf_event_paranoid=2 would likely block
+hardware counters anyway even with a matching version).
+
+Used instead, and committed as a real reusable tool rather than a
+one-off: tests/integration/benchmark_synaptogenesis.py, Python-level
+timing via the existing pybind11 bindings. Confirmed a full synaptogenesis
+call (build_probes once + synap_step once per row, matching
+FoldedLayer.synaptogenesis()'s actual structure) costs ~14x a regular
+backward_dense() call at a realistic size (n_in=1027, n_out=256, k=4) --
+not the ~500x informally recalled, which was almost certainly describing
+the since-reverted k_factor*n_in bug (build_probes(k) evaluates k_in*k_out
+candidates, so scaling k by row count caused a further n_in^2-fold blowup
+on top of whatever the true baseline ratio is).
+
+
+## MANDELBROT / EXPERIMENT PIPELINE -- QUEUED FROM THE BIG TESTING SESSION
+
+### conv2d in sili/tensor.py (OWED -- explicitly noticed as missing)
+Was interrupted mid-implementation two sessions running: reshape/transpose
+landed as prerequisites (verified ops, committed), conv2d itself never got
+written. Plan already agreed: NATIVE, not pytorch -- im2col as the
+primitive (its backward is a scatter-add, which IS transposed-conv's
+forward, so "conv and inv conv fwd/bwd are basically swapped" comes for
+free), reuse matmul's existing autograd for the actual multiply, SAME
+padding so sizes are preserved both directions. Then the agreed cascade
+reconstruction architecture: 3x3 conv -> ~24 channels with an
+EnergyDynamics ON THE CHANNELS (guarantees each channel trains/represents
+something) -> 3x3 inv conv back to input; ALSO feed the 24 channels into
+the pixel transformer whose output ADDS to those channels -- cascading
+learning for faster signal.
+
+### FoldedLayer.forward is forward_dense-only (verified, real speedup left
+on the table)
+sparse_rnn.py line ~380: FoldedLayer.forward calls forward_dense
+unconditionally. The CSR-input sparse path exists and is already used by
+SparseRNNAgent.forward (line ~706: converts state to CSR via
+CSR.from_dense(p=percent_active) then goes through the sparse kernels).
+With hard top-p energy gating, the recurrent state is mostly zeros every
+step -- forward_sparse on the active-only state is where the claimed 10x+
+lives. Fix: in the Mandelbrot cores (SparseCore.forward), sparsify the
+state before the recurrent layer call, mirroring SparseRNNAgent's pattern.
+backward_dense -> backward_sparse likewise where gradients are gated-sparse.
+
+### PixelAttentionHead: dense Python attention while C++ sparse attention
+exists (verified: bound but FORWARD-ONLY)
+cpu_backend.cpp binds sparse_attention, sparse_banded_attention,
+banded_attention (all *_forward). No backward bindings exist, which is why
+the trainable recon head couldn't just call them. Real fix: bind the
+attention backward kernels (or add them if only forward exists in C++),
+then swap PixelAttentionHead's numpy softmax-attention for the C++ path.
+Until then the Python version stands -- correct (finite-diff verified) but
+the slowest possible implementation, as noted.
+
+### TD cascade: multi-time-horizon critic (design provided verbatim below)
+Rationale: instant prediction saturates while future prediction keeps
+improving; preferring later horizons over instant reward needs multiple
+horizon levels. No BPTT required (deliberate -- "not worth the extra
+memory/compute pretty much ever" per direct experience); EMA cascade
+carries the temporal integration instead. Roughly Cox-PH-shaped; likely
+slow to train. Provided reference (pytorch-flavored; adapt to numpy/sili,
+value heads output n_heads values, keep ema_preds as loop state; open
+question: interaction with PopArt -- cascade may replace it or normalize
+per-head):
+
+```python
+def process_td_cascade_step(reward_t, current_preds, ema_preds,
+                            action_logits, actual_loss,
+                            gamma=0.99, alpha_base=0.5, beta_base=0.5):
+    n_heads = ema_preds.shape[-1]
+    for i in reversed(range(n_heads)):
+        alpha = alpha_base / (2 ** (i + 1))
+        beta = beta_base / (2 ** i)
+        if i < n_heads - 1:
+            ema_preds[:, i] = (ema_preds[:, i] * (1 - alpha) * (1 - beta)
+                               + ema_preds[:, i + 1] * alpha
+                               + current_preds[:, i].detach() * beta)
+        else:
+            ema_preds[:, i] = (ema_preds[:, i] * (1 - beta)
+                               + current_preds[:, i].detach() * beta)
+    critic_loss = F.mse_loss(current_preds[:, 0] + ema_preds[:, 0].detach(),
+                             actual_loss)
+    advantage = (reward_t.squeeze(-1) + gamma * ema_preds[:, 0].detach()) \
+                - current_preds[:, 0].detach()
+    actor_loss = -(action_logits * advantage.unsqueeze(-1)).mean()
+    return actor_loss, critic_loss
+```
+NOTE per the design: the network must CONSUME ema_preds and current_preds
+as part of its recurrent input for temporal consistency; heads 1..n train
+implicitly through the EMA feedback into head 0. Wire as --agent cascade
+alongside reinforce/rtac so the harness's action_mode grid can compare all
+three.
+
+### Energy-as-input and column energy (experiment features, not yet built)
+- energy-input: feed energy_h.energy into the core each step (either
+  concatenated into encode_observation -- changes raw_dim -- or a separate
+  small projection added into the core input; zero-init consistent with
+  mode). Flag: --energy-input.
+- column energy: partition hidden into columns of c neurons mapped to
+  inputs; loss ties mean(column_i at t) to input_i at t -- keeps internal
+  nets on the input manifold instead of doing private math to predict
+  their own energy. Gradient: broadcast (col_mean - input)*2/(n*c) to
+  column members, add as an (h_out, g) term. Flag: --column-energy-weight.
+  The ncd_view_hidden metric added this session is the direct measurement
+  for whether this works (it targets exactly the private-dynamics failure
+  mode).
+
+### run() decomposition follow-ups
+build_agent/select_action/apply_action_*/rtac_terms extracted and
+equivalence-verified this session. Remaining mess: probe_eval is still a
+closure over run() locals (fine but not importable); reward computation
+and the report block could extract similarly; the Cores + projections +
+recon head could move to their own module (models_mandelbrot.py) once
+conv/cascade lands so the experiment file imports models without the test.
+
+### Dense heads are the scaling bottleneck for the 50x-neurons plan
+Wa (hidden x 28), value heads (hidden x 1 x4), and the recon head's
+slot projections all scale with hidden and are DENSE -- at hidden ~50k
+they dominate step cost while the sparse core stays cheap. Sparsifying
+the heads (same grown-layer machinery) is the prerequisite for the
+"50x size at same compute" experiment beyond shape_vs_k's current 4096.

@@ -1,4 +1,4 @@
-#include "../sili/lib/headers/attention.hpp"
+#include "../../sili/lib/headers/attention.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 #include <cmath>

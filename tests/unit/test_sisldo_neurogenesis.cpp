@@ -1,4 +1,4 @@
-#include "../sili/lib/headers/linear_sisldo.hpp"
+#include "../../sili/lib/headers/linear_sisldo.hpp"
 #include "csr.hpp"
 #include "fiber.hpp"
 #include "sparse_struct.hpp"

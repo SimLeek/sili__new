@@ -1,4 +1,4 @@
-#include "../sili/lib/headers/coo.hpp"
+#include "../../sili/lib/headers/coo.hpp"
 #include "tests_main.h"
 #include <random>
 #include <vector>

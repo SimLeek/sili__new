@@ -1,4 +1,4 @@
-#include "../sili/lib/headers/hoyer_sparsify.hpp"
+#include "../../sili/lib/headers/hoyer_sparsify.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 #include <algorithm>

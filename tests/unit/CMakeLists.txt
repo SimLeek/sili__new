@@ -8,39 +8,39 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 set(CMAKE_INCLUDE_HEADERS_IN_COMPILE_COMMANDS ON)
 
-include_directories("../sili/")
-include_directories("../sili/lib/headers")
-include_directories("../sili/lib/src")
+include_directories("../../sili/")
+include_directories("../../sili/lib/headers")
+include_directories("../../sili/lib/src")
 
 set(SOURCE_FILES
-    #../sili/lib/src/cache_info.cpp
+    #../../sili/lib/src/cache_info.cpp
     # these are not included since we're testing private c++ functions
-    #../sili/lib/src/linear.cpp
-    #../sili/lib/src/outer_product.cpp
-    #../sili/lib/src/csf.cpp
-    #../sili/lib/src/conv2d.cpp
+    #../../sili/lib/src/linear.cpp
+    #../../sili/lib/src/outer_product.cpp
+    #../../sili/lib/src/csf.cpp
+    #../../sili/lib/src/conv2d.cpp
     )
 
 set(HEADER_FILES
     tests_main.hpp
 
-    ../sili/lib/headers/parallel.hpp
+    ../../sili/lib/headers/parallel.hpp
 
-    ../sili/lib/headers/linear_sisldo.hpp
-    ../sili/lib/headers/linear_disldo.hpp
+    ../../sili/lib/headers/linear_sisldo.hpp
+    ../../sili/lib/headers/linear_disldo.hpp
 
     #PASSED TESTS
-    ../sili/lib/headers/csr.hpp
-    ../sili/lib/headers/loss.hpp
+    ../../sili/lib/headers/csr.hpp
+    ../../sili/lib/headers/loss.hpp
 
-    #../sili/lib/headers/unique_vector.hpp
-    #../sili/lib/headers/coo.hpp
+    #../../sili/lib/headers/unique_vector.hpp
+    #../../sili/lib/headers/coo.hpp
 
     #OLD TESTS
-    #../sili/lib/headers/cache_info.h
-    #../sili/lib/headers/csr.h
-    #../sili/lib/headers/csf.h
-    #../sili/lib/headers/scan.h
+    #../../sili/lib/headers/cache_info.h
+    #../../sili/lib/headers/csr.h
+    #../../sili/lib/headers/csf.h
+    #../../sili/lib/headers/scan.h
     )
 
 find_package(Catch2 REQUIRED)
@@ -100,9 +100,9 @@ find_package(Python3 COMPONENTS Development REQUIRED)
 # currently, torch is broken in arch linux. Package is marked out of date. Should be fixed in a week or so.
 # pacman -S python-pytorch-opt-cuda
 # add: torch torch_cpu
-target_include_directories(sili_tests PRIVATE "../sili/" )
-target_include_directories(sili_tests PRIVATE "../sili/lib/headers" )
-target_include_directories(sili_tests PRIVATE "../sili/lib/src")
+target_include_directories(sili_tests PRIVATE "../../sili/" )
+target_include_directories(sili_tests PRIVATE "../../sili/lib/headers" )
+target_include_directories(sili_tests PRIVATE "../../sili/lib/src")
 target_link_libraries(sili_tests Catch2::Catch2WithMain OpenMP::OpenMP_CXX ${Python3_LIBRARIES} )
 
 option(ENABLE_AVX "Enable AVX support" ON)

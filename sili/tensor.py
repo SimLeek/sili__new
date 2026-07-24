@@ -55,6 +55,9 @@ class Tensor:
     def relu(self):                return relu(self)
     def tanh(self):                return tanh(self)
     def sum(self, axis=None):      return reduce_sum(self, axis)
+    def reshape(self, shape):      return reshape(self, shape)
+    def transpose(self, axes=None): return transpose(self, axes)
+    def bounded_gate(self, n=2.0): return bounded_gate(self, n)
     def __abs__(self):             return tensor_abs(self)
 
     def __radd__(self, o): return add(self._coerce(o), self)
@@ -162,6 +165,58 @@ def silu(a: Tensor) -> Tensor:
     def _bwd(): _acc(a, a.backend.silu_backward(a.data, out.grad))
     out._backward = _bwd
     return out
+
+
+def reshape(a: Tensor, shape: tuple) -> Tensor:
+    """Gradient is just reshaping the incoming grad back to a's original
+    shape -- reshape doesn't change values, only their logical arrangement."""
+    orig_shape = a.data.shape
+    out = Tensor(np.asarray(a.data).reshape(shape), (a,), "reshape", a.backend)
+    def _bwd(): _acc(a, np.asarray(out.grad).reshape(orig_shape))
+    out._backward = _bwd
+    return out
+
+
+def transpose(a: Tensor, axes=None) -> Tensor:
+    """Gradient is the incoming grad transposed by the INVERSE permutation.
+    np.argsort(axes) gives that inverse for any axes tuple; axes=None
+    (full reverse) is its own inverse."""
+    out = Tensor(np.transpose(a.data, axes), (a,), "transpose", a.backend)
+    inv_axes = None if axes is None else tuple(np.argsort(axes))
+    def _bwd(): _acc(a, np.transpose(np.asarray(out.grad), inv_axes))
+    out._backward = _bwd
+    return out
+
+
+def bounded_gate(a: Tensor, n: float = 2.0) -> Tensor:
+    """
+    Saturating output gate: 1 - 1/(x^n + 1), mapping [0, inf) -> [0, 1).
+
+    f(0) = 0: no activation -> no downstream effect.
+    f(x) -> 1 as x -> inf: bounded, never overshoots regardless of how large
+        the activation gets.
+    n controls suppression strength near zero (the "how much do small
+    activations get suppressed" knob, not a hard threshold): n=1 passes
+    small x through nearly linearly (f'(0)=1); n=2 (default) suppresses
+    small x quadratically -- f(x) ~= x^2 for small x, from the Taylor
+    expansion of 1/(1+x^2) -- so f'(0)=0, meaning a near-zero (settled,
+    quiet) activation produces near-zero effect, and effect only grows
+    meaningfully once activation moves clearly away from zero. Higher n
+    pushes that "clearly away from zero" threshold further out.
+
+    Intended for converting an energy-gated activation into a magnitude for
+    some downstream effect (e.g. how much to move, how much to act) where a
+    settled/quiet neuron should correspond to near-zero effect and only a
+    genuinely active one should produce a substantial one -- rather than
+    forcing a single discrete choice via argmax/softmax-sampling ("old
+    actor methods"), every input dimension gets its own continuous,
+    energy-earned magnitude, and multiple can act at once. Assumes a >= 0
+    (the non-negative, ReLU/energy-gated activation range this is meant
+    for); not defined for non-integer n at negative a.
+    """
+    xn = power(a, n)
+    denom = xn + 1.0
+    return neg(power(denom, -1.0)) + 1.0
 
 
 def broadcast_add(a: Tensor, bias: Tensor) -> Tensor:

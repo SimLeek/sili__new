@@ -1209,27 +1209,19 @@ PYBIND11_MODULE(_cpu, m)
         py::arg("rows"), py::arg("cols"),
         py::arg("ptrs"), py::arg("indices"), py::arg("values"));
 
-    m.def("make_weights",
-        [](int rows, int cols,
-           py::array_t<int>   ptrs,
-           py::array_t<int>   indices,
-           py::array_t<float> values,
-           py::array_t<float> grads,
-           py::array_t<float> importance) {
-            auto pb   = ptrs.request(),   ib  = indices.request();
-            auto vb   = values.request(), gb  = grads.request();
-            auto impb = importance.request();
-            return make_weights<int, float>(
-                rows, cols,
-                std::vector<int>  ((int*)  pb.ptr,   (int*)  pb.ptr   + pb.size),
-                std::vector<int>  ((int*)  ib.ptr,   (int*)  ib.ptr   + ib.size),
-                std::vector<float>((float*)vb.ptr,   (float*)vb.ptr   + vb.size),
-                std::vector<float>((float*)gb.ptr,   (float*)gb.ptr   + gb.size),
-                std::vector<float>((float*)impb.ptr, (float*)impb.ptr + impb.size));
-        },
-        py::arg("rows"), py::arg("cols"),
-        py::arg("ptrs"), py::arg("indices"),
-        py::arg("values"), py::arg("grads"), py::arg("importance"));
+    // NOTE: a standalone m.def("make_weights", ...) binding used to live here,
+    // calling make_weights<int,float> with a stale 7-arg signature (rows,
+    // cols, ptrs, indices, values, grads, importance -- a separate
+    // backprop-adjacent grads array that no longer exists as a concept)
+    // against the current 5-arg definition. It never compiled against the
+    // current headers (invalid use of incomplete type in pybind11's lambda
+    // signature deduction, since the 7-arg lambda's call to the 5-arg
+    // template was ill-formed). Confirmed unused from Python (no caller
+    // anywhere in the repo) and its purpose -- constructing a usable CSR
+    // weight layer from a few plain vectors for testing -- is already
+    // served by delta_csr_from_absolute, used throughout the C++ test suite
+    // and cpu_backend.cpp itself. Removed rather than patched; see TODO.md's
+    // former "Correctness, needs a real fix eventually" entry (now resolved).
 
     // ── Attention ops (ported from sparse_linear_ops.hpp) ────────────────────
     // All three take numpy [T, d] Q/K/V arrays (float32) and return a

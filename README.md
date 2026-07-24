@@ -1,0 +1,193 @@
+# sili -- Sparse Intelligence Library
+
+A research codebase for homeostatic, energy-driven sparse neural networks:
+FP4-quantized delta-CSR weight storage, synaptogenesis (runtime growth and
+pruning of connections), and integrate-and-fire-style energy dynamics that
+produce curiosity and predictive coding as emergent effects of homeostatic
+pressure rather than explicit objectives. A C++/pybind11 core handles the
+sparse compute; a thin Python layer provides autograd, RNN/transformer
+building blocks, and a model-conversion pipeline for folding real
+transformer checkpoints into sparse runtime layers.
+
+This is an active, private research repository, not a published package.
+
+## Repository layout
+
+```
+sili/                      Python package
+  tensor.py                 Minimal autograd Tensor (matmul, add, tanh, relu,
+                             power, reduce_sum, abs, combine_losses)
+  energy.py                 EnergyDynamics: homeostatic integrate-and-fire
+                             gating, KL sparsity, curiosity/aux-loss signal
+  sparse_rnn.py              FoldedLayer (sparse FP4 delta-CSR layer wired
+                             into the autograd graph), SparseRNNCell
+  module.py                 Module base class, dense Linear/RMSNorm
+  cpu.py / backend.py       Backend registration for the compiled extension
+  rl_utils.py               PopArt output normalization
+  cpu_backend.cpp           pybind11 bindings -> sili._cpu
+  lib/headers/*.hpp         C++ core: CSR/COO/delta-CSR sparse formats,
+                             FP4 quantization, SISLDO/DISLDO linear layers
+                             with synaptogenesis, attention, Hoyer sparsity,
+                             parallel utilities
+  conversion/               Model conversion pipeline:
+    sparse_prune.py           dense weights -> pruned CSR
+    rnn_fold.py                repeated transformer blocks -> one
+                                FoldedBlockDescriptor (block detection,
+                                vertical CSR stacking, attention-band masks)
+    streaming_prune.py        layer-by-layer conversion for models larger
+                                than available RAM (two-phase: per-tensor
+                                sparsify, then per-suffix fold with an
+                                over-budget --no-stack fallback)
+    model_reconstruct.py, sparse_runtime.py, trace_model.py
+
+tests/unit/                 C++ unit tests (Catch2) + legacy Python scripts.
+                             Fast; run on every commit.
+  run_tests.sh                Runs both run_cpp_tests.sh and run_py_tests.sh
+
+tests/integration/          Python integration tests: slower, validate that
+                             components work together end-to-end (energy +
+                             autograd RNNs, sparse FoldedLayer training,
+                             transformer attention vs. a PyTorch baseline,
+                             the toy-Mistral conversion pipeline, streaming
+                             conversion against a real on-disk safetensors
+                             checkpoint, curiosity RL). Should pass before
+                             merging a branch; not required on every commit.
+
+docs/                       Hand-written design and requirements docs.
+                             docs/doxygen/ and docs/pdoc/ are generated API
+                             documentation output (gitignored, not source).
+
+backburner/, examples/      Parked ideas and worked examples referenced from
+                             the docs below.
+```
+
+## Active planning documents
+
+- `refactoring_todo.md` -- the active priority queue: what's in progress,
+  what's blocked, and what's explicitly deferred to later (MoE expert-merge,
+  conv-kernel sparsification, RTAC's critic-through-trunk and replay buffer,
+  per-patch vision + spatial merge).
+- `refactoring_done.md` -- a log of completed refactoring milestones.
+- `docs/requirements_vlm_streaming_rtac.md` -- the current major workstream:
+  a vision-language model pipeline (verified against the real
+  Mistral-Small-3.1-24B-Base-2503 checkpoint schema), layer-by-layer
+  streaming conversion for RAM-limited machines, and an RTAC-based curiosity
+  agent. Includes a follow-up checklist tracking what's done vs. open.
+- `TODO.md` -- older backlog items not yet triaged into the above.
+- `energy-params.md`, `energy-personality.md`, `energy-proofs.md` --
+  design notes on the energy dynamics model, personality-trait parameter
+  mappings, and supporting derivations.
+
+## Building
+
+```bash
+pip install -e .
+```
+
+This compiles `sili/cpu_backend.cpp` into `sili._cpu` via pybind11
+(`setup.py` + `pyproject.toml`; requires a C++20 compiler and OpenMP).
+Verified on a completely clean virtualenv (no pybind11 or numpy
+pre-installed) -- `pyproject.toml` declares `pybind11` as a build-system
+requirement so pip's isolated build environment has it available before
+`setup.py` is even evaluated. Without that file, `pip install -e .` fails
+at "Getting requirements to build editable" with `ModuleNotFoundError: No
+module named 'pybind11'`, since `setup.py` needs pybind11 importable just
+to be evaluated, and pip's isolated build env starts empty.
+
+Python dependencies are pinned in `requirements.txt`.
+
+**Import note:** always import the compiled extension via `from sili import
+_cpu` (or transitively through `import sili`), never as a bare top-level
+`import _cpu`. The two resolve to different `sys.modules` keys for the same
+`.so` file, and pybind11 will raise `generic_type: ... already registered`
+if both paths ever get exercised in one process.
+
+## API documentation
+
+```bash
+apt-get install doxygen graphviz     # C++ doc generator + graph rendering
+pip install pdoc                     # Python doc generator
+bash docs/generate_docs.sh
+```
+
+Generates two browsable static sites (both gitignored -- build artifacts,
+not source):
+
+- `docs/doxygen/html/index.html` -- the C++ core (`sili/lib/headers/*.hpp`,
+  `sili/cpu_backend.cpp`). The project's documentation style is minimal
+  `///` one-liners rather than exhaustive `@param` blocks for every
+  argument, so Doxygen's undocumented-parameter warnings during generation
+  are expected, not a sign of misconfiguration.
+- `docs/pdoc/index.html` -- the Python package (`sili/*`), including the
+  compiled `sili._cpu` extension's pybind11-exposed classes and methods.
+
+## Testing
+
+```bash
+tests/unit/run_tests.sh        # C++ unit tests + legacy Python scripts
+python -m tests.integration.<name>   # any individual integration test
+```
+
+The C++ suite (`tests/unit/*.cpp`, Catch2, run via `run_cpp_tests.sh`) and every
+test in `tests/integration/` are reliable. **Known issue:** `tests/unit/run_tests.sh`
+currently exits nonzero because `tests/unit/python/test_sili.py` (legacy, run via
+`run_py_tests.sh`) is stale against `SparseLinearLayer`'s current constructor
+signature -- pre-existing, unrelated to the C++ core itself, tracked in
+`refactoring_todo.md`. A failing `tests/unit/run_tests.sh` run does not mean the
+build or the `_cpu` extension is broken; check the C++ portion's own
+"All tests passed" line, or run `tests/integration/` directly.
+
+Each integration test is runnable standalone and takes `--quiet` for
+pass/fail-only output, e.g.:
+
+```bash
+python -m tests.integration.test_energy_rnn --task rare --steps 2000
+python -m tests.integration.test_mandelbrot_rl --compare --core sparse --steps 150000 --timeout 3600 --display
+python -m tests.integration.test_toy_mistral
+```
+
+`--display` on `test_mandelbrot_rl` is optional and gated behind a graceful
+ImportError fallback (prints a message and continues headless if unusable).
+It uses `displayarray` rather than raw `cv2.imshow`, which is known to be
+slow/flaky to open a window on some systems:
+
+```bash
+pip install git+https://github.com/SimLeek/displayarray.git@moderngl
+```
+
+`test_mandelbrot_rl`'s key parameters (see `--help` for the full list):
+
+- `--core {sparse,dense,mistral}` -- sparse (default): large, genuinely
+  sparse, starts empty and grows via real synaptogenesis. dense: the
+  alternative/comparison, plain Tensor, exact-zero-init. mistral: folded
+  toy-Mistral weights, fixed at `--hidden 32`.
+- `--hidden N` (default 1024) -- recurrent state size; forced to 32 for
+  `--core mistral`.
+- `--base-connections N` (default 6) -- sparse core's per-row target,
+  reached via growth then held via continual grow/prune churn.
+- `--k-factor`, `--importance-cutoff`, `--synap-amplitude`, `--synap-period`,
+  `--synap-every` -- tune the synaptogenesis cadence and aggressiveness.
+  Real cost/quality tradeoff: `--synap-every` defaults to 10 (not 1) after
+  measuring that running full-layer probes every single step is genuinely
+  expensive at large `--hidden`.
+- `--agent {reinforce,rtac}`, `--policy {curiosity,random}`, `--compare`
+  -- policy learning options; `--compare` runs curiosity and random
+  side by side.
+
+As of writing, that branch is under active development (its own CI isn't
+wired up yet) and its `mglwindow` module references a `font.get_texture_atlas`
+submodule that doesn't exist in the tree yet -- `--display` will cleanly
+fall back to headless with an explanatory message until that's resolved,
+rather than crashing the run.
+
+## Contributing (internal)
+
+`main` is protected -- changes land via branches merged through pull
+requests, not direct commits. Current branch sequence:
+
+1. `docs/api-docs-and-readme` (this branch) -- Doxygen for the C++ headers,
+   a Python API doc generator, this README, and TODO/requirements cleanup.
+2. Continuous integration -- run the full test suite (including
+   `tests/integration/`) and generate documentation artifacts on every PR.
+3. Continue the original consolidation plan: merge remaining old `sili`
+   repositories in, remove superseded files, per `refactoring_todo.md`.

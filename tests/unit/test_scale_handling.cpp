@@ -1,5 +1,5 @@
-#include "../sili/lib/headers/sparse_struct.hpp"
-#include "../sili/lib/headers/linear_disldo.hpp"
+#include "../../sili/lib/headers/sparse_struct.hpp"
+#include "../../sili/lib/headers/linear_disldo.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 

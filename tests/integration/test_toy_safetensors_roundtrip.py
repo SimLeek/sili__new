@@ -17,7 +17,7 @@ Run: python -m tests.integration.test_toy_safetensors_roundtrip
 """
 import sys, os, tempfile, shutil, warnings
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'test', 'python'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'unit', 'python'))
 warnings.filterwarnings('ignore')
 
 from gen_toy_mistral_vlm import build_toy_mistral_vlm_state_dict, save_and_verify_safetensors
