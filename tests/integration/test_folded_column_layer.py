@@ -367,14 +367,9 @@ class TestRebuildLayerWithPreseed:
 
 
 class TestFoldedColumnLayerInputSkip:
-    """FoldedColumnLayer.from_descriptor now unions build_input_skip_preseed
-    onto every suffix's real in_proj weights -- previously only `recurrent`
-    got a pre-seeded skip structure; in_proj had none, so a dense LLM's own
-    fixed per-layer connectivity was the ONLY path input could ever reach a
-    given fold step through. Direct feedback: input should be able to reach
-    every fold step just like recurrent's skip connections do, and it
-    should speed up column-averaging convergence since 'no change' is a
-    common input."""
+    """FoldedColumnLayer.from_descriptor unions build_input_skip_preseed
+    onto every suffix's real in_proj weights, giving input a direct,
+    trainable path to every fold step (see sili_peridot/JOURNAL.md)."""
 
     def test_in_proj_has_more_connections_than_the_bare_descriptor(self):
         n_folds, hidden = 4, 6

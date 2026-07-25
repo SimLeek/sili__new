@@ -70,57 +70,19 @@ SISLDOLayerV architecture fix).
   has the tests already written and marked `xfail(strict=True)`, ready to
   flip green once this lands.
 
-  **Noted while building `FoldedColumnLayer` (Phase A4)**: it landed on
-  the exact same `h = input_proj(x) + recurrent(state)` shape
-  `SparseRNNCell` already has (structurally deliberate, not
-  coincidental -- see its docstring), but the two are NOT good
-  subclass/merge candidates right now: `SparseRNNCell` bundles
-  `EnergyDynamics`+`BranchingRatioTracker`+CSR-caching directly inside
-  `forward()`, while `FoldedColumnLayer` deliberately leaves energy
-  gating external (the caller composes it with `column_averaging_loss`,
-  which needs to see the gated state specifically); `SparseRNNCell`'s
-  `input_proj`/`recurrent` are the broken `DISLDOLayer`/`SISLDOLayer`
-  above, while `FoldedColumnLayer`'s are `SparseLinearLayer`-based on
-  purpose, specifically to avoid that bug. Once `DISLDOLayer`/
-  `SISLDOLayer` are rebuilt on `SparseLinearLayer` (the fix above), both
-  classes' `input_proj`/`recurrent` would share the same actual
-  underlying primitive rather than just resembling each other --
-  *that's* the point where extracting a shared minimal
-  `h = a(x) + b(state)` base becomes genuinely motivated instead of
-  premature (two real working examples instead of one).
+  `FoldedColumnLayer` (Phase A4) landed on the same `h = input_proj(x) +
+  recurrent(state)` shape as `SparseRNNCell` but is not a subclass/merge
+  candidate yet -- revisit once `DISLDOLayer`/`SISLDOLayer` are rebuilt on
+  `SparseLinearLayer` (see sili_peridot/JOURNAL.md for the full reasoning).
 
-- **A fired-but-not-selected neuron's energy grows without bound under a
-  chronically repeated identical input -- this looks like curiosity/
-  novelty-seeking pressure working as intended, not a bug.** Found while
-  validating the column-averaging mechanism (Phase A3/A4) end-to-end with
-  `FoldedColumnLayer` + `EnergyDynamics` on a FIXED input repeated every
-  step: `_apply_energy_dynamics`'s aux_loss (specifically `energy_loss`,
-  the per-neuron quadratic term) grew from ~0.08 to 177+ over 270 steps
-  with no sign of stopping. Mechanism: step 3's fire-threshold handling
-  applies a small refractory drain (`2 * activation_cost`) to every
-  neuron whose `new_energy >= 2.0`, regardless of whether the LATER
-  top-p gate (step 4) actually selects it into `kept_fire` -- a neuron
-  that fires but consistently loses the top-p competition nets
-  `drive - 2*activation_cost` per step (positive whenever
-  `drive > 2*activation_cost`, true of the config used here:
-  `drive=0.15, activation_cost=0.05`), so its energy keeps climbing with
-  no ceiling as long as nothing about its input changes. Confirmed NOT a
-  bug in the column-averaging code itself (isolated: `FoldedColumnLayer`/
-  `column_averaging_loss` both converge correctly on their own, see
-  `tests/integration/test_folded_column_layer.py`) -- this is
-  `_apply_energy_dynamics`'s own behavior under a genuinely static input,
-  and per direct feedback that's exactly the signature the curiosity/
-  compression-progress citations (`CITATIONS.md`) describe: "nothing new
-  is happening, pressure should build" is the correct response to a truly
-  unchanging input, not a defect to route around. Every other existing
-  usage in this codebase (Mandelbrot, RL agents, real token streams) never
-  exercises this regime because their inputs vary step to step -- adding
-  small per-step input variation made the aux_loss settle (~1-1.5) in the
-  same test, consistent with that reading. Not changed here; worth
-  deliberately harnessing later (e.g. as an input to Phase E's eventual
-  action pathway -- "this region has been quiet too long" as a literal,
-  already-present signal) rather than treating it as something to clamp
-  away.
+- **A neuron that fires but keeps losing the top-p competition never has
+  its energy reset**, so `aux_loss` grows unboundedly under a genuinely
+  static repeated input. This is curiosity/novelty-seeking pressure
+  working as intended, not a bug -- real inputs (Mandelbrot, RL agents,
+  MiniCPM5 token streams) always vary step to step, so it isn't hit in
+  practice. Worth deliberately harnessing later (e.g. a Phase E
+  action-pathway signal) rather than clamping away. See
+  sili_peridot/JOURNAL.md for the full trace.
 
 - **Synaptogenesis after `compact()` needs automatic handling, not just a
   loud failure.** FIXED: `synap_row_step` now throws a catchable

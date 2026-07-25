@@ -610,23 +610,18 @@ def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int,
                           weight: float = 1.0, indices=None) -> Tensor:
     """
     weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where column_i
-    is the set of n_folds neurons tracking input index i -- the mechanism
-    that turns a folded transformer stack into a next-input predictor
-    (sili_peridot/todolist.md Phase A3/A4).
+    is the set of n_folds neurons tracking input index i.
 
-    Takes h_out (energy-gated), not the pre-gating h: a column member
-    EnergyDynamics suppresses/flattens should actually hurt this loss, not
-    be invisible to it -- forcing the network to jointly satisfy energy
-    management and prediction is the point. Own function rather than part
-    of EnergyDynamics.forward since it needs the original input and a
-    column layout EnergyDynamics has no concept of; combine with
-    EnergyDynamics's aux_loss via sili.tensor.combine_losses.
+    Takes h_out (energy-gated), not the pre-gating h -- a column member
+    EnergyDynamics suppresses should hurt this loss, not be invisible to
+    it, so the network has to satisfy energy management and prediction
+    jointly. Combine with EnergyDynamics's aux_loss via
+    sili.tensor.combine_losses.
 
-    indices : optional int array, len n_folds*input_size, selecting which
-    flat positions of a LARGER h_out form the column block (position
+    indices: optional int array, len n_folds*input_size, selecting which
+    flat positions of a larger h_out form the column block (position
     indices[t*input_size+i] = column i's neuron at fold-step t). None
-    (default) requires h_out itself to be exactly that size -- pass
-    indices to track a subset of a bigger state instead.
+    (default) requires h_out to be exactly that size.
     """
     input_size = target.shape[0]
     expected = n_folds * input_size
