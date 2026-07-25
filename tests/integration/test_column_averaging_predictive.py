@@ -9,7 +9,8 @@ the loss against a free `h` parameter (no layer at all), and this
 package's TestColumnAveragingEndToEnd trains against a target unrelated
 to the actual input sequence. Both are silent on whether `recurrent` is
 doing anything predictive. See sili_peridot/JOURNAL.md for the tuning
-process and the (fragile) interaction with EnergyDynamics found here.
+process; see TestEnergyInteraction below for what does/doesn't survive
+adding EnergyDynamics to the loop.
 
 Method: train on sequences of increasing "does the next input depend on
 more than the current one" complexity and compare `recurrent`'s true-unit
@@ -26,7 +27,6 @@ warnings.filterwarnings('ignore')
 
 import torch
 import numpy as np
-import pytest
 
 from sili.tensor import Tensor, combine_losses
 from sili.energy import column_averaging_loss, EnergyDynamics
@@ -190,28 +190,78 @@ class TestRecurrentRelianceGrowsWithPatternComplexity:
 
 
 class TestEnergyInteraction:
-    """With/without energy, and low/high energy density, to see whether the
-    complexity-ordering above survives real energy competition.
+    """With energy, does the "recurrent tracks temporal-memory need" finding
+    above still hold? Two findings from sweeping drive in [0.01, 0.04] with
+    activation_cost=drive and exploration < drive/2 (both required by
+    EnergyDynamics's own documented constraints -- an under-constrained
+    first attempt at this, e.g. drive=activation_cost=0.08 with
+    exploration=0.002, produced one-off destabilizing gradient kicks that
+    looked like learning but were really a value_scale runaway, not a
+    reliable signal either way):
 
-    Finding (see sili_peridot/JOURNAL.md): it does NOT reliably survive at
-    this toy scale within a practical epoch budget -- energy's stochastic
-    top-p gating dominates which pathway gets gradient far more than the
-    underlying task structure does. So these tests only assert the weaker,
-    robust property (training stays finite/stable under energy gating,
-    matching TestColumnAveragingEndToEnd's own established scope), not the
-    same strict ordering as the no-energy case above.
+    - COARSE property survives under aggressive/low-density gating: a
+      constant (no-memory) sequence still ends up with less trained
+      `recurrent` weight than either sequence that actually varies over
+      time, regardless of whether that variation is itself deterministic
+      or needs genuine position memory. Verified below.
+    - FINE property (deterministic vs ambiguous -- the actual claim
+      TestRecurrentRelianceGrowsWithPatternComplexity makes without
+      energy) is NOT reliably reproduced under energy at this toy scale --
+      it flips depending on the exact drive/weight combination, with no
+      trend found favoring any particular drive in the range tried. Left
+      unresolved rather than forced; see sili_peridot/JOURNAL.md for the
+      full sweep. Under weak/high-density gating (p, density both close to
+      1 -- energy barely restricting anything) even the COARSE property
+      stops holding and magnitudes grow much larger (~15-25 vs ~0.01-0.04
+      elsewhere) -- that config is only checked for basic stability here.
     """
 
     def _energy(self, density: float, p: float) -> EnergyDynamics:
-        return EnergyDynamics(drive=0.08, activation_cost=0.08, precision=0.02,
-                              density=density, p=p, exploration=0.002, reactivity=0.02)
+        # drive=activation_cost and exploration < drive/2: both required by
+        # EnergyDynamics's own asserts/docstring, not independently tuned here.
+        return EnergyDynamics(drive=0.02, activation_cost=0.02, precision=0.02,
+                              density=density, p=p, exploration=0.004, reactivity=0.02)
 
-    @pytest.mark.parametrize("density,p", [(0.15, 0.3), (0.6, 0.9)])
-    def test_stays_finite_under_energy_gating(self, density, p):
+    def test_low_density_gating_still_favors_constant_over_varying(self):
+        # EnergyDynamics draws its exploration noise from the GLOBAL,
+        # unseeded np.random (see _apply_energy_dynamics) -- without
+        # pinning it here this test is flaky (verified: failed on a bare
+        # rerun). Fixed across all three training runs below since a
+        # margin check, not an exact-value one, is what's being asserted.
+        np.random.seed(0)
+        n_folds, hidden, T, epochs, weight = 4, 6, 60, 150, 20.0
+        const_seq   = _make_constant_sequence(T, hidden, seed=1)
+        simple_seq  = _make_sequence(np.arange(hidden), T, hidden)
+        complex_seq = _make_sequence(_make_ambiguous_cycle(7, hidden, seed=3), T, hidden)
+
+        # Fresh EnergyDynamics per run -- each needs its own unstepped energy state.
+        mag_const = _recurrent_true_weight_magnitude(
+            _train(const_seq, n_folds, hidden, seed_desc=5, epochs=epochs, weight=weight,
+                  energy=self._energy(density=0.15, p=0.3)))
+        mag_simple = _recurrent_true_weight_magnitude(
+            _train(simple_seq, n_folds, hidden, seed_desc=5, epochs=epochs, weight=weight,
+                  energy=self._energy(density=0.15, p=0.3)))
+        mag_complex = _recurrent_true_weight_magnitude(
+            _train(complex_seq, n_folds, hidden, seed_desc=5, epochs=epochs, weight=weight,
+                  energy=self._energy(density=0.15, p=0.3)))
+
+        assert mag_const < mag_simple and mag_const < mag_complex, (
+            f"expected constant to use recurrent least even under energy gating, got "
+            f"constant={mag_const:.4f} simple={mag_simple:.4f} complex={mag_complex:.4f}"
+        )
+
+    def test_high_density_weak_gating_stays_finite(self):
+        # Weak gating (p, density both close to 1): does NOT preserve even
+        # the coarse ordering above (see class docstring) -- only checked
+        # for basic stability here, matching TestColumnAveragingEndToEnd's
+        # own established scope (stability, not a convergence/ordering claim).
+        # Seeded for the same reason as the test above -- EnergyDynamics's
+        # exploration noise comes from the unseeded global np.random.
+        np.random.seed(0)
         n_folds, hidden, T, epochs = 4, 6, 60, 40
         complex_seq = _make_sequence(_make_ambiguous_cycle(7, hidden, seed=3), T, hidden)
         layer = _train(complex_seq, n_folds, hidden, seed_desc=5, epochs=epochs,
-                       energy=self._energy(density, p))
+                       energy=self._energy(density=0.6, p=0.9))
         assert np.all(np.isfinite(layer.recurrent.weights_vals))
         sub = next(iter(layer._sili_layers.values()))
         assert np.all(np.isfinite(sub.weights_vals))
