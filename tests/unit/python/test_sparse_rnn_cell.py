@@ -303,16 +303,30 @@ class TestSparseRNNCellConstruction:
 
     def test_has_branching_tracker(self):
         cell = _small_cell()
-        assert isinstance(cell.branching_recurrent, BranchingRatioTracker)
+        # Duck-typed on purpose -- don't assume which tracker class backs
+        # this by default (that's exactly what changed under us once
+        # already: default flipped window -> ema post-review).
+        assert hasattr(cell.branching_recurrent, "update")
+        assert hasattr(cell.branching_recurrent, "branching_ratio")
+        assert hasattr(cell.branching_recurrent, "reset")
 
     def test_dynamic_density_default_off(self):
         cell = _small_cell()
         assert cell.dynamic_density_from_branching_ratio is False
 
-    def test_branching_tracker_defaults_to_window(self):
+    def test_branching_tracker_default_is_ema(self):
+        # Default flipped from 'window' to 'ema' post-review (866ad5f) --
+        # pin the CURRENT default explicitly so a silent future flip is
+        # caught here, not discovered downstream.
         cell = _small_cell()
+        assert cell.branching_tracker_mode == "ema"
+        assert isinstance(cell.branching_recurrent, EMABranchingRatioTracker)
+
+    def test_branching_tracker_window_mode_selects_window_tracker(self):
+        cell = _small_cell(branching_tracker="window", branching_window=50)
         assert cell.branching_tracker_mode == "window"
         assert isinstance(cell.branching_recurrent, BranchingRatioTracker)
+        assert cell.branching_recurrent.window == 50
 
     def test_branching_tracker_ema_mode_selects_ema_tracker(self):
         cell = _small_cell(branching_tracker="ema", branching_ema_alpha=0.1)
