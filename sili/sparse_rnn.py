@@ -839,7 +839,7 @@ def state_dict_to_true_csr(d: dict):
 
 
 def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
-              n_rows: int, prefer: str = "a"):
+              n_rows: int, prefer: str = "a", num_cpus: int = 4):
     """
     Merge two CSRs of the SAME shape into one holding the union of their
     nonzero positions. `vals_a`/`vals_b` must already be in true units
@@ -852,34 +852,19 @@ def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
 
     Construction/loading time only -- never used in the forward/backward
     path. See build_fold_skip_layer's `existing` for the concrete case.
+
+    OpenMP-parallel (_cpu.csr_union, see csr.hpp) -- each row is an
+    independent two-pointer merge, so this scales to real model-sized
+    weight matrices instead of a per-row Python loop.
     """
     assert prefer in ("a", "b", "sum")
-    row_idx = [None] * n_rows
-    row_val = [None] * n_rows
-    for r in range(n_rows):
-        a_start, a_end = int(ptrs_a[r]), int(ptrs_a[r + 1])
-        b_start, b_end = int(ptrs_b[r]), int(ptrs_b[r + 1])
-        merged = dict(zip(idx_a[a_start:a_end].tolist(), vals_a[a_start:a_end].tolist()))
-        for c, v in zip(idx_b[b_start:b_end].tolist(), vals_b[b_start:b_end].tolist()):
-            if c in merged:
-                if prefer == "sum":
-                    merged[c] += v
-                elif prefer == "b":
-                    merged[c] = v
-                # prefer == "a": keep A's existing value, ignore B's
-            else:
-                merged[c] = v
-        cols_sorted = sorted(merged.keys())
-        row_idx[r] = np.asarray(cols_sorted, dtype=np.int32)
-        row_val[r] = np.asarray([merged[c] for c in cols_sorted], dtype=np.float32)
-
-    new_idx  = np.concatenate(row_idx) if n_rows > 0 else np.zeros(0, dtype=np.int32)
-    new_vals = np.concatenate(row_val) if n_rows > 0 else np.zeros(0, dtype=np.float32)
-    new_ptrs = np.zeros(n_rows + 1, dtype=np.int32)
-    for r in range(n_rows):
-        new_ptrs[r + 1] = new_ptrs[r] + len(row_idx[r])
-
-    return new_ptrs, new_idx, new_vals
+    return _cpu.csr_union(
+        np.asarray(ptrs_a, dtype=np.int32), np.asarray(idx_a, dtype=np.int32),
+        np.asarray(vals_a, dtype=np.float32),
+        np.asarray(ptrs_b, dtype=np.int32), np.asarray(idx_b, dtype=np.int32),
+        np.asarray(vals_b, dtype=np.float32),
+        int(n_rows), prefer, num_cpus,
+    )
 
 
 def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
@@ -922,7 +907,7 @@ def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
     if existing is not None:
         ex_ptrs, ex_idx, ex_vals = existing
         ptrs, idx, vals = csr_union(ptrs, idx, vals, ex_ptrs, ex_idx, ex_vals,
-                                    total, prefer=existing_prefer)
+                                    total, prefer=existing_prefer, num_cpus=num_cpus)
 
     nnz = len(idx)
     row_lengths = ptrs[1:] - ptrs[:-1]
@@ -988,7 +973,7 @@ def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
     preseed_vals = np.zeros(len(preseed_idx), dtype=np.float32)
     ptrs, idx, vals = csr_union(real_ptrs, real_idx, real_vals,
                                 preseed_ptrs, preseed_idx, preseed_vals,
-                                n_in, prefer="a")
+                                n_in, prefer="a", num_cpus=num_cpus)
 
     nnz = len(idx)
     row_lengths = ptrs[1:] - ptrs[:-1]

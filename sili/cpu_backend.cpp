@@ -1084,6 +1084,49 @@ PYBIND11_MODULE(_cpu, m)
         "Exact top-k sparsity conversion for forward and backward passes."
     );
 
+    // ── csr_union ─────────────────────────────────────────────────────────────
+    // OpenMP-parallel replacement for sili.sparse_rnn.csr_union's Python loop
+    // (see csr.hpp's csr_union<>) -- construction/loading-time CSR merge only.
+    m.def("csr_union",
+        [](py::array_t<int> ptrs_a, py::array_t<int> idx_a, py::array_t<float> vals_a,
+           py::array_t<int> ptrs_b, py::array_t<int> idx_b, py::array_t<float> vals_b,
+           int n_rows, std::string prefer, int num_cpus) -> py::tuple {
+            auto to_vec_i = [](py::array_t<int>& a) {
+                auto buf = a.request();
+                return std::vector<int>((int*)buf.ptr, (int*)buf.ptr + buf.size);
+            };
+            auto to_vec_f = [](py::array_t<float>& a) {
+                auto buf = a.request();
+                return std::vector<float>((float*)buf.ptr, (float*)buf.ptr + buf.size);
+            };
+            int prefer_code = (prefer == "a") ? 0 : (prefer == "b") ? 1
+                            : (prefer == "sum") ? 2 : throw std::invalid_argument(
+                                "prefer must be 'a', 'b', or 'sum'");
+
+            std::vector<int>   out_ptrs, out_idx;
+            std::vector<float> out_vals;
+            csr_union<int, float>(
+                to_vec_i(ptrs_a), to_vec_i(idx_a), to_vec_f(vals_a),
+                to_vec_i(ptrs_b), to_vec_i(idx_b), to_vec_f(vals_b),
+                n_rows, prefer_code, num_cpus,
+                out_ptrs, out_idx, out_vals);
+
+            py::array_t<int>   ret_ptrs ({(py::ssize_t)out_ptrs.size()});
+            py::array_t<int>   ret_idx  ({(py::ssize_t)out_idx.size()});
+            py::array_t<float> ret_vals ({(py::ssize_t)out_vals.size()});
+            std::copy(out_ptrs.begin(), out_ptrs.end(), (int*)  ret_ptrs.request().ptr);
+            std::copy(out_idx.begin(),  out_idx.end(),  (int*)  ret_idx .request().ptr);
+            std::copy(out_vals.begin(), out_vals.end(), (float*)ret_vals.request().ptr);
+            return py::make_tuple(ret_ptrs, ret_idx, ret_vals);
+        },
+        py::arg("ptrs_a"), py::arg("idx_a"), py::arg("vals_a"),
+        py::arg("ptrs_b"), py::arg("idx_b"), py::arg("vals_b"),
+        py::arg("n_rows"), py::arg("prefer") = "a", py::arg("num_cpus") = 4,
+        "Merge two same-shape CSRs into the union of their nonzero positions.\n"
+        "prefer: 'a' keeps A's value on overlap, 'b' keeps B's, 'sum' adds them.\n"
+        "Construction/loading time only -- not used in forward/backward."
+    );
+
     // ── hoyer_sparsify ────────────────────────────────────────────────────────
     // NOT wired into an automatic dense/sparse dispatch (see TODO.md) -- this
     // is the standalone Hoyer's-Sparsity-Measure operation, exposed so its
