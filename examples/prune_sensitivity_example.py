@@ -31,7 +31,7 @@ import torch
 
 from sili.conversion.prune_sensitivity import (
     group_tensor_names_by_role, sweep_group_sensitivity,
-    apply_group_thresholds, stepwise_cumulative_eval,
+    apply_group_thresholds, stepwise_cumulative_eval, iterative_threshold_search,
 )
 
 
@@ -107,6 +107,29 @@ def main():
 
     final = apply_group_thresholds(sd, groups, thresholds)
     print("\nFinal pruned state dict tensor names:", list(final.keys()))
+
+    # Step 4: the hand-picked thresholds above still cost more than we'd
+    # like once combined (see the last stepwise line printed above). Set
+    # a stricter target and let iterative_threshold_search walk the
+    # worst-offending group's threshold back automatically, instead of
+    # hand-tuning it again -- this is the "the manual search compounded
+    # worse than isolated sweeps suggested, so I had to walk thresholds
+    # back one at a time" loop from sili_peridot's own MiniCPM5
+    # calibration, made repeatable.
+    baseline_score = eval_fn(sd)
+    target_score = -300.0   # stricter than step 3's combined result above
+    found, history = iterative_threshold_search(
+        sd, groups, initial_thresholds=thresholds,
+        step_order=[[mlp_group], [crit_group]],
+        eval_fn=eval_fn, baseline_score=baseline_score, target_score=target_score,
+        shrink_factor=0.5, min_threshold=0.0, max_iterations=10,
+    )
+    print(f"\nIterative search toward target_score={target_score} "
+         f"({len(history)} round(s)):")
+    for i, round_ in enumerate(history):
+        print(f"  round {i}: thresholds={round_['thresholds']} "
+             f"final_score={round_['final_score']:.2f}")
+    print("Converged thresholds:", found)
 
 
 if __name__ == "__main__":
