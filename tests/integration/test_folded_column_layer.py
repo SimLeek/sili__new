@@ -18,11 +18,14 @@ import numpy as np
 import pytest
 
 import sili.cpu
+import sili._cpu as _cpu
 from sili.tensor import Tensor
 from sili.sparse_rnn import (
     FoldedColumnLayer, FoldedLayer, build_fold_skip_layer,
     csr_union, _build_banded_csr, state_dict_to_true_csr,
     _sparse_linear_layer_state_dict,
+    _build_rectangular_banded_csr, build_input_skip_preseed,
+    _rebuild_layer_with_preseed,
 )
 from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
 
@@ -242,6 +245,207 @@ class TestBuildFoldSkipLayer:
         row0_cols = set(np.asarray(merged.indices)[
             np.asarray(merged.ptrs)[0]:np.asarray(merged.ptrs)[1]].tolist())
         assert (total - 1) in row0_cols
+
+
+class TestBuildRectangularBandedCsr:
+    """_build_rectangular_banded_csr: in_proj's skip pre-seed needs a
+    geometric (proportional) diagonal, not an exact linear-algebra one,
+    since rows (in_dim) and cols (n_folds*out_dim) are different sizes."""
+
+    def test_shape_and_all_zero_valued(self):
+        ptrs, idx, vals = _build_rectangular_banded_csr(4, 12, 2)
+        assert len(ptrs) == 5
+        assert np.allclose(vals, 0.0)
+        assert np.all(idx >= 0) and np.all(idx < 12)
+
+    def test_row_zero_centers_near_column_zero(self):
+        ptrs, idx, vals = _build_rectangular_banded_csr(4, 12, 2)
+        row0 = idx[ptrs[0]:ptrs[1]]
+        assert 0 in row0
+
+    def test_last_row_centers_near_last_column(self):
+        rows, cols, bw = 4, 12, 2
+        ptrs, idx, vals = _build_rectangular_banded_csr(rows, cols, bw)
+        last_row = idx[ptrs[rows - 1]:ptrs[rows]]
+        expected_center = int((rows - 1) * cols / rows)
+        assert expected_center in last_row
+
+    def test_wider_bandwidth_gives_more_columns_per_row(self):
+        narrow = _build_rectangular_banded_csr(4, 40, 2)
+        wide   = _build_rectangular_banded_csr(4, 40, 8)
+        assert len(wide[1]) > len(narrow[1])
+
+    def test_columns_stay_in_range_even_at_edges(self):
+        ptrs, idx, vals = _build_rectangular_banded_csr(3, 5, 4)
+        assert np.all(idx >= 0) and np.all(idx < 5)
+
+
+class TestBuildInputSkipPreseed:
+    """build_input_skip_preseed: the in_proj analogue of
+    build_fold_skip_layer, giving training a direct input->column path to
+    every fold-depth step, not just whatever the original dense LLM's own
+    per-layer weights happened to connect."""
+
+    def test_shape_matches_n_in_by_n_folds_times_out_dim(self):
+        n_in, n_folds, out_dim = 6, 4, 6
+        ptrs, idx, vals = build_input_skip_preseed(n_in, n_folds, out_dim)
+        assert len(ptrs) == n_in + 1
+        assert np.all(idx < n_folds * out_dim)
+        assert np.allclose(vals, 0.0)
+
+    def test_reaches_columns_belonging_to_later_fold_steps(self):
+        # A "no skip" world would only ever let input dim r touch columns
+        # within fold step r's own out_dim-sized slot at most. With the
+        # pre-seed, at least some row should reach a column belonging to a
+        # LATER fold step's slot too -- proving input can structurally
+        # reach layer 2, 3, ... not just layer 1.
+        n_in, n_folds, out_dim = 4, 5, 4
+        ptrs, idx, vals = build_input_skip_preseed(n_in, n_folds, out_dim, bandwidth=out_dim + 2)
+        row0 = idx[ptrs[0]:ptrs[1]]
+        assert np.any(row0 >= out_dim), \
+            "input row 0 never reaches any column past fold step 0's own slot"
+
+    def test_default_bandwidth_is_out_dim(self):
+        n_in, n_folds, out_dim = 6, 4, 6
+        default = build_input_skip_preseed(n_in, n_folds, out_dim)
+        explicit = build_input_skip_preseed(n_in, n_folds, out_dim, bandwidth=out_dim)
+        assert np.array_equal(default[0], explicit[0])
+        assert np.array_equal(default[1], explicit[1])
+
+
+class TestRebuildLayerWithPreseed:
+    """_rebuild_layer_with_preseed: unions a zero-valued pre-seed onto an
+    already-built layer's REAL weights, real values always winning."""
+
+    def _real_layer(self, n_in=4, n_out=8, seed=0):
+        rng = np.random.default_rng(seed)
+        layer = _cpu.SparseLinearLayer(n_in, n_out, n_in * n_out, 1)
+        ptrs = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+        idx  = np.array([0, 2, 4, 6], dtype=np.int32)
+        vals = rng.standard_normal(4).astype(np.float32) * 2.0
+        for r in range(n_in):
+            layer.set_value_scale_raw(r, 1.0)
+        raw = vals.copy() / 1.0
+        layer.load_weights(ptrs, idx, raw)
+        return layer
+
+    def test_real_values_survive_the_union(self):
+        layer = self._real_layer()
+        before_ptrs, before_idx, before_vals = state_dict_to_true_csr(
+            _sparse_linear_layer_state_dict(layer))
+
+        preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(4, 2, 4, bandwidth=4)
+        merged = _rebuild_layer_with_preseed(
+            layer, preseed_ptrs, preseed_idx, num_cpus=1, expected_lr=0.02)
+
+        after_ptrs, after_idx, after_vals = state_dict_to_true_csr(
+            _sparse_linear_layer_state_dict(merged))
+        for r in range(4):
+            a_start, a_end = int(before_ptrs[r]), int(before_ptrs[r + 1])
+            for c, v in zip(before_idx[a_start:a_end], before_vals[a_start:a_end]):
+                m_start, m_end = int(after_ptrs[r]), int(after_ptrs[r + 1])
+                cols = list(after_idx[m_start:m_end])
+                assert c in cols, f"real position (row={r}, col={c}) dropped by union"
+                pos = m_start + cols.index(c)
+                assert np.isclose(after_vals[pos], v, atol=1e-3), \
+                    f"real value at (row={r}, col={c}) changed by union"
+
+    def test_new_zero_positions_are_added(self):
+        layer = self._real_layer()
+        preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(4, 2, 4, bandwidth=4)
+        merged = _rebuild_layer_with_preseed(
+            layer, preseed_ptrs, preseed_idx, num_cpus=1, expected_lr=0.02)
+        assert merged.nnz > layer.nnz
+
+    def test_shape_preserved(self):
+        layer = self._real_layer(n_in=4, n_out=8)
+        preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(4, 2, 4, bandwidth=4)
+        merged = _rebuild_layer_with_preseed(
+            layer, preseed_ptrs, preseed_idx, num_cpus=1, expected_lr=0.02)
+        assert merged.n_inputs == 4
+        assert merged.n_outputs == 8
+
+
+class TestFoldedColumnLayerInputSkip:
+    """FoldedColumnLayer.from_descriptor now unions build_input_skip_preseed
+    onto every suffix's real in_proj weights -- previously only `recurrent`
+    got a pre-seeded skip structure; in_proj had none, so a dense LLM's own
+    fixed per-layer connectivity was the ONLY path input could ever reach a
+    given fold step through. Direct feedback: input should be able to reach
+    every fold step just like recurrent's skip connections do, and it
+    should speed up column-averaging convergence since 'no change' is a
+    common input."""
+
+    def test_in_proj_has_more_connections_than_the_bare_descriptor(self):
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.3, seed=5)
+        bare = FoldedLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+        skipped = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+
+        bare_layer    = next(iter(bare._sili_layers.values()))
+        skipped_layer = next(iter(skipped._sili_layers.values()))
+        assert skipped_layer.nnz > bare_layer.nnz, \
+            "in_proj gained no structural connections from the skip pre-seed"
+
+    def test_real_pretrained_values_preserved_after_preseed_union(self):
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.6, seed=6)
+        bare    = FoldedLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+        skipped = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+
+        bare_layer    = next(iter(bare._sili_layers.values()))
+        skipped_layer = next(iter(skipped._sili_layers.values()))
+        bare_ptrs, bare_idx, bare_vals = state_dict_to_true_csr(
+            _sparse_linear_layer_state_dict(bare_layer))
+        sk_ptrs, sk_idx, sk_vals = state_dict_to_true_csr(
+            _sparse_linear_layer_state_dict(skipped_layer))
+
+        for r in range(hidden):
+            b_start, b_end = int(bare_ptrs[r]), int(bare_ptrs[r + 1])
+            for c, v in zip(bare_idx[b_start:b_end], bare_vals[b_start:b_end]):
+                s_start, s_end = int(sk_ptrs[r]), int(sk_ptrs[r + 1])
+                cols = list(sk_idx[s_start:s_end])
+                assert c in cols
+                pos = s_start + cols.index(c)
+                assert np.isclose(sk_vals[pos], v, atol=1e-2), \
+                    f"real pretrained value at (row={r}, col={c}) changed by skip union"
+
+    def test_forward_backward_still_finite_with_skip_preseed(self):
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=7)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+
+        x     = Tensor(np.random.randn(hidden).astype(np.float32))
+        state = Tensor(np.random.randn(n_folds * hidden).astype(np.float32))
+        out   = layer(x, state)
+        loss  = (out ** 2).sum()
+        loss.backward()
+        assert np.all(np.isfinite(out.data))
+        assert x.grad is not None and np.all(np.isfinite(x.grad))
+
+    def test_gradient_can_move_a_skip_seeded_position_off_zero(self):
+        # Multi-step training against a target that specifically needs a
+        # skip-seeded (not originally-real) connection to be useful: feed
+        # the SAME x every step (a static "no change" input) and check
+        # in_proj's weights end up nonzero at MORE positions than the
+        # bare descriptor's real pattern alone would ever allow.
+        n_folds, hidden = 3, 5
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.2, seed=8)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.05, num_cpus=1)
+        suffix_layer = next(iter(layer._sili_layers.values()))
+
+        rng = np.random.default_rng(3)
+        x = Tensor(rng.standard_normal(hidden).astype(np.float32))
+        target = Tensor((rng.standard_normal(n_folds * hidden) * 0.3).astype(np.float32))
+
+        for _ in range(15):
+            raw = layer.in_proj(x)
+            loss = ((raw - target) ** 2).sum()
+            loss.backward()
+            assert np.all(np.isfinite(suffix_layer.weights_vals)), "diverged mid-training"
+
+        assert suffix_layer.nnz > 0
+        assert not np.allclose(suffix_layer.weights_vals, 0.0)
 
 
 class TestFoldedColumnLayerForward:

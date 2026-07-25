@@ -636,7 +636,14 @@ class FoldedColumnLayer(FoldedLayer):
     represents "external input -> fold step 1" faithfully; every other
     fold step's band is computed from the same raw x too (FoldedLayer's
     approximation, see build_fold_skip_layer's docstring), not from what
-    the prior fold step actually produced.
+    the prior fold step actually produced. Also carries a
+    build_input_skip_preseed()-unioned band of zero-valued, trainable
+    skip connections from input directly to every fold-depth column, not
+    just whatever the original dense LLM's own weights connected -- the
+    in_proj analogue of `recurrent`'s pre-seeded band, giving training a
+    direct input->column shortcut (useful since column-averaging's target
+    often doesn't change step to step) instead of only an indirect path
+    through `recurrent`'s hop-by-hop propagation.
 
     recurrent(state) -- build_fold_skip_layer's from-scratch banded
     matrix (see below), mapping THIS layer's own [n_folds*out_dim] output
@@ -664,11 +671,15 @@ class FoldedColumnLayer(FoldedLayer):
                         bytes_per_row: int = 0,
                         recurrent_bandwidth: int = None,
                         existing_recurrent=None,
-                        existing_recurrent_prefer: str = "b") -> "FoldedColumnLayer":
+                        existing_recurrent_prefer: str = "b",
+                        input_skip_bandwidth: int = None) -> "FoldedColumnLayer":
         """
         Like FoldedLayer.from_descriptor, plus builds `recurrent` (see
         class docstring and build_fold_skip_layer) sized to this layer's
-        own [n_folds*out_dim] output space.
+        own [n_folds*out_dim] output space, and unions a zero-valued
+        input->column skip pre-seed onto EVERY suffix's in_proj weights
+        (see build_input_skip_preseed / class docstring) -- unconditional,
+        same as `recurrent`, not an opt-in.
 
         recurrent_bandwidth: forwarded to build_fold_skip_layer as
         `bandwidth` -- None (default) uses that function's own default
@@ -683,6 +694,14 @@ class FoldedColumnLayer(FoldedLayer):
         starting recurrent from scratch every time.
         None (default) is the plain "converting a dense LLM, which has no
         skip connections at all" case.
+
+        input_skip_bandwidth: forwarded to build_input_skip_preseed as
+        `bandwidth` per suffix -- None (default) uses that function's own
+        default (out_dim). Unlike `recurrent`, there's no `existing`
+        parameter here: the real weights on each suffix ARE the "existing"
+        data (loaded from `descriptor` by the super() call above) that the
+        fresh pre-seed unions onto, always with the real values winning
+        (see _rebuild_layer_with_preseed).
         """
         obj = super().from_descriptor(
             descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
@@ -693,6 +712,16 @@ class FoldedColumnLayer(FoldedLayer):
             bandwidth=recurrent_bandwidth, expected_lr=learning_rate,
             existing=existing_recurrent, existing_prefer=existing_recurrent_prefer,
         )
+
+        out_dim = obj.column_width
+        for suffix, layer in list(obj._sili_layers.items()):
+            preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(
+                layer.n_inputs, obj._n_folds, out_dim, bandwidth=input_skip_bandwidth)
+            obj._sili_layers[suffix] = _rebuild_layer_with_preseed(
+                layer, preseed_ptrs, preseed_idx,
+                num_cpus=num_cpus, expected_lr=learning_rate,
+            )
+
         return obj
 
     @property
@@ -799,6 +828,35 @@ def _build_banded_csr(total: int, bandwidth: int):
     idx = np.empty(nnz, dtype=np.int32)
     pos = 0
     for r in range(total):
+        n = int(row_lengths[r])
+        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        pos += n
+
+    return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
+
+
+def _build_rectangular_banded_csr(rows: int, cols: int, bandwidth: int):
+    """Zero-valued banded CSR from `rows` positions to `cols` positions --
+    generalizes _build_banded_csr to a RECTANGULAR shape, for cases (like
+    in_proj's input->column skip pre-seed below) where the two spaces are
+    different sizes and there's no exact diagonal to speak of. Row r
+    connects to columns near round(r * cols / rows) (a geometric diagonal
+    tracing proportional position, not a linear-algebra-exact one), within
+    `bandwidth` either side, clipped to [0, cols)."""
+    assert rows >= 1 and cols >= 1 and bandwidth >= 1
+    positions = np.arange(rows)
+    centers = (positions.astype(np.float64) * cols / rows).astype(np.int64)
+    lo = np.clip(centers - bandwidth + 1, 0, None)
+    hi = np.clip(centers + bandwidth - 1, None, cols - 1)
+    row_lengths = (hi - lo + 1).astype(np.int64)
+
+    ptrs = np.zeros(rows + 1, dtype=np.int64)
+    ptrs[1:] = np.cumsum(row_lengths)
+    nnz = int(ptrs[-1])
+
+    idx = np.empty(nnz, dtype=np.int32)
+    pos = 0
+    for r in range(rows):
         n = int(row_lengths[r])
         idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
         pos += n
@@ -987,6 +1045,92 @@ def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
         layer.set_importance_scale_raw(r, expected_lr / _FP4_MAX)
 
     return layer
+
+
+def build_input_skip_preseed(n_in: int, n_folds: int, out_dim: int, bandwidth: int = None):
+    """
+    Zero-valued, trainable skip connections from EXTERNAL INPUT directly to
+    every fold-depth column -- the in_proj analogue of build_fold_skip_layer
+    (which does this for `recurrent`). Without this, in_proj's only
+    connections are whatever the original dense LLM's own per-layer weight
+    matrices happened to have: real, but a FIXED pattern from conversion --
+    there's no zero-valued structural room for training to grow a NEW direct
+    path from input to a fold step the original model never connected it to.
+
+    Why this matters for column-averaging specifically: the target is
+    "track the (recent) input," and the input often doesn't change much
+    step to step ("no change" is a common input). A direct, short input
+    -> column path lets training find that shortcut immediately; without
+    it, the only way for input to influence a distant fold step's column
+    is indirectly, via `recurrent` propagating hop-by-hop through
+    intermediate fold steps first.
+
+    Returns a (ptrs, idx, vals) CSR shaped [n_in, n_folds*out_dim], all
+    vals 0.0 -- meant to be unioned onto a suffix's real stacked weights
+    (see FoldedColumnLayer.from_descriptor's `input_skip_bandwidth`), not
+    used standalone.
+
+    bandwidth: geometric banding (see _build_rectangular_banded_csr) --
+    input dim i connects to columns near round(i * n_folds*out_dim / n_in),
+    within `bandwidth` either side. Default (None) uses out_dim, matching
+    build_fold_skip_layer's own default reasoning (one hop's worth of
+    columns around the proportional center).
+    """
+    total_out = n_folds * out_dim
+    bw = out_dim if bandwidth is None else bandwidth
+    return _build_rectangular_banded_csr(n_in, total_out, bw)
+
+
+def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
+                                num_cpus: int, expected_lr: float,
+                                headroom_fraction: float = 0.5):
+    """
+    Rebuild a SparseLinearLayer, unioning a zero-valued pre-seed CSR's
+    structural positions onto the layer's REAL (already-trained/pretrained)
+    weights. The real values always win at any overlapping position
+    (prefer="a") -- the pre-seed only ADDS new zero-valued positions the
+    layer didn't already have; it must never clobber real data. This is
+    build_fold_skip_layer's `existing` union, with the roles reversed: there
+    the trained data is the optional extra brought in over a fresh band;
+    here the real data is the base layer and the fresh band is what's being
+    added on top.
+
+    Budget/scale handling mirrors build_fold_skip_layer exactly: nnz-based
+    headroom (not from_descriptor's dense n_in*n_out ceiling -- deliberately
+    smaller since this is a targeted addition, not the original conversion),
+    and per-row FP4 rescaling recomputed on the MERGED row so real trained
+    magnitudes keep full resolution.
+    """
+    n_in, n_out = layer.n_inputs, layer.n_outputs
+    real_ptrs, real_idx, real_vals = state_dict_to_true_csr(
+        _sparse_linear_layer_state_dict(layer))
+    preseed_vals = np.zeros(len(preseed_idx), dtype=np.float32)
+    ptrs, idx, vals = csr_union(real_ptrs, real_idx, real_vals,
+                                preseed_ptrs, preseed_idx, preseed_vals,
+                                n_in, prefer="a")
+
+    nnz = len(idx)
+    row_lengths = ptrs[1:] - ptrs[:-1]
+    max_row_weights = int(row_lengths.max()) if nnz > 0 else 1
+    budget = nnz + int(headroom_fraction * nnz) + n_in
+
+    _FP4_MAX = 6.0
+    row_scales = np.full(n_in, expected_lr / _FP4_MAX, dtype=np.float32)
+    for r in range(n_in):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            max_abs = float(np.abs(vals[start:end]).max())
+            if max_abs > 0.0:
+                row_scales[r] = max_abs / _FP4_MAX
+                vals[start:end] = vals[start:end] / row_scales[r]
+
+    new_layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
+    new_layer.load_weights(ptrs, idx, vals)
+    new_layer.equalize_to_capacity(max_row_weights)
+    for r in range(n_in):
+        new_layer.set_value_scale_raw(r, float(row_scales[r]))
+        new_layer.set_importance_scale_raw(r, expected_lr / _FP4_MAX)
+    return new_layer
 
 
 def apply_fold_skip(skip_layer, x: "Tensor", lr: float = 0.01) -> "Tensor":
