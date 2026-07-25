@@ -39,10 +39,10 @@ def _apply_energy_dynamics(
         density: float,              # beta   — target activation density
         exploration: float = 0.001,  # sigma  — per-neuron energy noise std
         setpoint: float = 1.0,       # tau    — homeostatic comfort zone target
-        kl_eps: float = 1e-4,        # dead zone threshold (architectural)
+        activation_threshold: float = 1e-4,  # dead zone threshold (architectural)
         reactivity: float = 0.01,    # alpha  — homeostatic correction gain
-        p: float = 0.02,             # HARD CEILING on active neuron fraction
-) -> Tuple[Tensor, np.ndarray, Tensor, float]:
+        p: float = 0.05,             # HARD CEILING on active neuron fraction
+) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
     autograd graph.
@@ -53,24 +53,64 @@ def _apply_energy_dynamics(
     energy        : per-neuron energy, plain numpy, same shape as h
     drive         : baseline energy drift — sets metabolic tempo
     activation_cost: energy drain per unit |h| — neural efficiency
-    precision     : KL sparsity enforcement strength
-    density       : target activation density / sparsity setpoint
+    precision     : KL sparsity enforcement strength (lambda_kl). Population
+                    -level control loop: pushes the ACHIEVED active fraction
+                    (rho, a population statistic) toward density (beta) via
+                    a KL term with no gradient to h (discrete mask) — this is
+                    a "how many are active" loop, blind to which neurons.
+                    Distinct from reactivity below; the two are not
+                    interchangeable knobs on the same thing.
+    density       : target activation density / sparsity setpoint (beta) —
+                    the actual LEARNED sparsity should usually land below p
+                    on its own, driven down by this term (plus shutoff/forced
+                    -firing) competing against whatever task objective is
+                    training the network — see p's docstring for why this
+                    must stay clearly below p, not close to or above it.
     exploration   : per-neuron energy noise std.
                     Must stay < drive/2 during waking — crossing this boundary
                     enters the hallucination / REM regime (intentional in DREAM,
-                    forbidden during waking operation).
+                    forbidden during waking operation). Also, independent of
+                    that regime boundary: exploration is what breaks symmetry
+                    between otherwise-identical neurons (same drive, same
+                    activation_cost, same initial energy) — without it,
+                    ties in the top-p competition are resolved by array order
+                    rather than by any signal, so every "identical" neuron
+                    would fire in lockstep instead of the population
+                    differentiating over time.
     setpoint      : homeostatic comfort zone target
-    kl_eps        : activation dead zone — values at or below this are zeroed
-    reactivity    : homeostatic correction gain
-    p             : HARD CEILING on active neuron fraction. Never exceeded under
-                    any condition — including fire events and pain signals.
-                    Exceeding p risks GPU thermal runaway, battery overdraw, and
-                    update-rate collapse (30-60hz -> 2-5hz) that causes physical
-                    instability in motor-control regions.
-                    Set jointly by:
+    activation_threshold : activation dead zone — values at or below this are
+                    zeroed for energy-accounting purposes (named for what it
+                    protects — the boundary between "active" and "not" — not
+                    for the KL mechanism, which is a separate, population
+                    -level pressure that happens to also consume this value).
+    reactivity    : homeostatic correction gain (alpha). Per-neuron control
+                    loop: pushes each neuron's own new_energy_t toward
+                    setpoint (tau) via a quadratic loss WITH a gradient to h
+                    (the linear surrogate) — a "how comfortable is this
+                    specific neuron" loop. See precision above for the
+                    contrasting population-level loop; both land in the same
+                    aux_loss scalar but are not the same mechanism and don't
+                    substitute for each other.
+    p             : HARD CEILING on active neuron fraction — a hardware/
+                    telemetry-driven compute-limit ceiling (thermal, battery,
+                    update-rate), NOT a tuning knob for learning quality and
+                    NOT the thing that should shape learned sparsity. Never
+                    exceeded under any condition — including fire events and
+                    pain signals. Exceeding p risks GPU thermal runaway,
+                    battery overdraw, and update-rate collapse (30-60hz ->
+                    2-5hz) that causes physical instability in motor-control
+                    regions. Set jointly by:
                       - PFC (cognitive load target)
                       - GPU/CPU temperature monitors (thermal throttle)
                       - Battery level + distance to charger (power reserve)
+                    MUST sit clearly above density (roughly 5-10x, e.g.
+                    p=0.05 with density=0.01) so KL/shutoff/forced-firing —
+                    not this hard ceiling — are what the network actually
+                    has to satisfy while also chasing its task objective.
+                    Set p this low (or lower) only when genuinely resource
+                    -constrained; see EnergyDynamics.__init__'s
+                    `density <= p * 0.8` assertion, which exists because this
+                    relationship was previously (silently) inverted.
 
     Returns
     -------
@@ -83,6 +123,15 @@ def _apply_energy_dynamics(
     actual_p   : fraction of neurons active after all gating. May differ
                  slightly from p at small region sizes due to integer rounding.
                  Return to PFC / thermal / battery for closed-loop feedback.
+    kept_indices : int32 array, flat (raveled) indices into h's original
+                 shape of every position gating kept alive (normal + fired +
+                 shutoff-but-kept), sorted ascending. This IS the gate
+                 decision energy already made — the intended source for
+                 building a sparse (CSR) representation of h for the next
+                 consumer, using h's PRE-gating values at these indices
+                 (not h_out's post-gating fire/shutoff constants), rather
+                 than re-deriving sparsity via an independent top-k pass
+                 that could disagree with what energy actually decided.
     """
 
     b              = h.backend
@@ -96,7 +145,7 @@ def _apply_energy_dynamics(
     energy_flat = np.asarray(energy, dtype=dtype).ravel().copy()
 
     # ── 1. Dead zone ─────────────────────────────────────────────────────────
-    alive = np.abs(h_np) > kl_eps
+    alive = np.abs(h_np) > activation_threshold
     h_dz  = h_np * alive           # zeroed copy for energy computation
 
     # ── 2. Energy update ─────────────────────────────────────────────────────
@@ -209,7 +258,7 @@ def _apply_energy_dynamics(
     # plain float, _coerce promotes it when summed with energy_loss.
 
     n_active = len(normal_kept) + len(kept_fire) + (
-        int(np.sum(np.abs(const_np.ravel()[shutoff_in_kept]) > kl_eps))
+        int(np.sum(np.abs(const_np.ravel()[shutoff_in_kept]) > activation_threshold))
         if len(shutoff_in_kept) > 0 else 0
     )
     actual_p = float(n_active / n)
@@ -248,7 +297,17 @@ def _apply_energy_dynamics(
     energy_loss  = (reactivity / 2.0) * ((new_energy_t - setpoint)**2).sum()
     aux_loss     = kl_val + energy_loss     # float + Tensor -> Tensor via _coerce
 
-    return h_out, new_energy.reshape(energy.shape), aux_loss, actual_p
+    # kept_indices: the gate decision energy already made, exposed so a
+    # caller can build a CSR straight from it (indices here, values from
+    # PRE-gating h_np at these same positions) instead of re-deriving
+    # sparsity via an independent top-k pass that could disagree with what
+    # energy actually decided. Sorted ascending -- CSR requires sorted
+    # per-row indices.
+    kept_indices = np.sort(np.concatenate([
+        normal_kept, kept_fire, shutoff_in_kept,
+    ])).astype(np.int32)
+
+    return h_out, new_energy.reshape(energy.shape), aux_loss, actual_p, kept_indices
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,25 +341,37 @@ class EnergyDynamics(Module):
             density: float,              # beta   — target activation density
             exploration: float = 0.001,  # sigma  — per-neuron noise
             setpoint: float   = 1.0,     # tau    — comfort zone target
-            kl_eps: float     = 1e-4,    # dead zone threshold
+            activation_threshold: float = 1e-4,  # dead zone threshold
             reactivity: float = 0.01,    # alpha  — homeostatic gain
-            p: float          = 0.02,    # hard ceiling on active fraction
+            p: float          = 0.05,    # hard ceiling on active fraction
     ):
         assert 0.01 <= activation_cost <= 0.5, "activation_cost (gamma) must be in [0.01, 0.5]"
         assert 0.0  <  density         < 1.0,  "density (beta) must be in (0, 1)"
         assert 0.0  <  p               <= 1.0, "p must be in (0, 1]"
+        # p is a hardware/telemetry compute-limit ceiling, not a sparsity
+        # target -- it must sit clearly above density so KL/shutoff/forced
+        # -firing (not this hard ceiling) are what actually shapes learned
+        # sparsity. This relationship was previously (silently) invertible;
+        # this assert exists specifically to catch that, not just document it.
+        assert density <= p * 0.8, (
+            f"density ({density}) must stay comfortably below p ({p}) -- "
+            f"p is a hardware/telemetry compute-limit ceiling that should "
+            f"rarely bind, not the thing that shapes learned sparsity. Got "
+            f"density > p*0.8 ({p * 0.8}); e.g. p=0.05 with density=0.01 is "
+            f"the intended relationship, not p=density or p<density."
+        )
 
         self._energy_start = max(0.0,2.0-drive*10)  # allow 10 steps for noise, but don't wait forever for more noise
 
-        self.drive           = float(drive)
-        self.activation_cost = float(activation_cost)
-        self.precision       = float(precision)
-        self.density         = float(density)
-        self.exploration     = float(exploration)
-        self.setpoint        = float(setpoint)
-        self.kl_eps          = float(kl_eps)
-        self.reactivity      = float(reactivity)
-        self.p               = float(p)
+        self.drive                = float(drive)
+        self.activation_cost      = float(activation_cost)
+        self.precision            = float(precision)
+        self.density              = float(density)
+        self.exploration          = float(exploration)
+        self.setpoint             = float(setpoint)
+        self.activation_threshold = float(activation_threshold)
+        self.reactivity           = float(reactivity)
+        self.p                    = float(p)
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
@@ -308,6 +379,13 @@ class EnergyDynamics(Module):
         # Cached for inspection / logging
         self.aux_loss: Optional[Tensor] = None
         self.actual_p: float = 0.0
+        # The gate decision from the most recent forward() -- flat indices
+        # into h's shape, sorted ascending. See _apply_energy_dynamics's
+        # kept_indices docstring: the intended source for building a CSR of
+        # h for a downstream consumer (indices here, values from that
+        # forward's PRE-gating h), rather than a separate independent top-k
+        # pass that could disagree with this decision.
+        self.kept_indices: Optional[np.ndarray] = None
 
     def parameters(self) -> list:
         return []
@@ -323,11 +401,20 @@ class EnergyDynamics(Module):
         e = d["energy"]
         self.energy = e.copy() if e.size > 0 else None
 
-    def forward(self, h: Tensor) -> Tuple[Tensor, Tensor, float]:
+    def forward(self, h: Tensor, density_override: Optional[float] = None) -> Tuple[Tensor, Tensor, float]:
         """
         Parameters
         ----------
         h : Tensor, any shape — no batch dimension, caller iterates batches
+        density_override : if given, used in place of self.density for this
+                    call only (self.density is left unchanged). Intended for
+                    a caller-computed dynamic KL target -- e.g. derived from
+                    a measured recurrent-only branching ratio (see
+                    sili.energy.BranchingRatioTracker) rather than a fixed
+                    config value. EnergyDynamics itself has no opinion on how
+                    this value is computed; passing None (the default)
+                    reproduces the exact fixed-density behavior of every
+                    existing caller.
 
         Returns
         -------
@@ -339,9 +426,98 @@ class EnergyDynamics(Module):
             # Reset energy on shape change (e.g. body switch, region resize)
             self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
 
-        h_out, self.energy, self.aux_loss, self.actual_p = _apply_energy_dynamics(
+        density = self.density if density_override is None else float(density_override)
+
+        h_out, self.energy, self.aux_loss, self.actual_p, self.kept_indices = _apply_energy_dynamics(
             h, self.energy,
-            self.drive, self.activation_cost, self.precision, self.density,
-            self.exploration, self.setpoint, self.kl_eps, self.reactivity, self.p,
+            self.drive, self.activation_cost, self.precision, density,
+            self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
         )
         return h_out, self.aux_loss, self.actual_p
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BranchingRatioTracker
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BranchingRatioTracker:
+    """
+    Estimate the branching ratio m of a self-propagating activity process
+    from a scalar activity count fed in once per step.
+
+    Background: a[t+1] = m*a[t] + h models activity as a branching process
+    with immigration -- m is the self-propagation (recurrent) factor, h an
+    external drive. m in [0.97, 0.99] ("near-critical") is the intended
+    healthy operating band for a genuinely self-sustaining recurrent
+    pathway; m near 0 means activity is being carried entirely by fresh
+    external drive each step, with no real recurrent memory.
+
+    Identifiability note (why this exists as its own tracker, not a stat
+    computed on SparseRNNCell's combined h): if fed the COMBINED activity
+    of input_proj(obs) + recurrent(state), this estimate cannot distinguish
+    "the recurrent pathway genuinely self-propagates" from "fresh input
+    alone keeps activity in-band while the recurrent branching factor is
+    silently 0" -- both produce statistically identical activity sequences
+    once mixed. Feed this tracker recurrent(state)'s OWN activity, measured
+    BEFORE it's summed with input_proj(obs)'s contribution, to get a
+    meaningful answer. See SparseRNNCell.forward for the split measurement
+    this is meant to be used with.
+
+    Estimator: single-lag OLS slope of a[t+1] on a[t] over a sliding window
+    -- a simplified, single-lag version of the multistep-regression (MR)
+    estimator (Wilting & Priesemann) that method is otherwise named after;
+    this implementation does not do the multi-lag extrapolation MR uses to
+    correct for subsampling bias, which matters more at large scale than it
+    does for the per-region window sizes this is intended for. Treat
+    branching_ratio() as a useful trend/regime indicator, not a
+    publication-grade MR estimate.
+    """
+
+    def __init__(self, window: int = 200):
+        assert window >= 3, "window must be >= 3 -- OLS needs at least a few points"
+        self.window = int(window)
+        self._history: list = []
+
+    def update(self, activity: float) -> None:
+        """Record one step's activity count (e.g. count of |h| above the
+        region's activation_threshold)."""
+        self._history.append(float(activity))
+        if len(self._history) > self.window:
+            self._history.pop(0)
+
+    def branching_ratio(self) -> Optional[float]:
+        """OLS slope of a[t+1] on a[t] over the current window, or None if
+        there isn't enough history yet or activity has had zero variance
+        (a flat sequence carries no information about self-propagation)."""
+        if len(self._history) < 3:
+            return None
+        a = np.asarray(self._history[:-1], dtype=np.float64)
+        b = np.asarray(self._history[1:],  dtype=np.float64)
+        a_mean = a.mean()
+        denom  = float(np.sum((a - a_mean) ** 2))
+        if denom <= 1e-12:
+            return None
+        b_mean = b.mean()
+        m = float(np.sum((a - a_mean) * (b - b_mean)) / denom)
+        return m
+
+    def avalanche_sizes(self) -> list:
+        """Consecutive-nonzero-activity run lengths from the current
+        history window -- a power-law-tail in this distribution is the
+        actual falsifiable signature of self-organized criticality (Bak,
+        Tang & Wiesenfeld 1987; Beggs & Plenz 2003), independent of whether
+        branching_ratio() alone looks healthy. Log/plot externally; this
+        just extracts the runs."""
+        sizes, current = [], 0
+        for a in self._history:
+            if a > 0:
+                current += 1
+            elif current > 0:
+                sizes.append(current)
+                current = 0
+        if current > 0:
+            sizes.append(current)
+        return sizes
+
+    def reset(self) -> None:
+        self._history.clear()

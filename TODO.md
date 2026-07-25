@@ -35,6 +35,41 @@ SISLDOLayerV architecture fix).
   won't be called from there at all. Tracked as part of the SISLDOLayerV
   fix, not as a standalone bug to chase.
 
+- **`sili.sparse_rnn.DISLDOLayer`/`SISLDOLayer` (Python) call C++ methods
+  that don't exist on any currently-bound class -- `SparseRNNCell`/
+  `SparseRNNAgent` cannot be constructed at all.** Found while adding
+  dedicated `SparseRNNCell` tests (`tests/unit/python/test_sparse_rnn_cell.py`,
+  see its module docstring for the full detail). `DISLDOLayer.__init__`
+  calls `_cpu.DISLDOLayer(...)` and `SISLDOLayer.__init__` calls
+  `_cpu.SISLDOLayer(...)` -- neither name is bound in `cpu_backend.cpp`,
+  only `DISLDOLayerV` is. `_SparseLayerBase.step()`/`.decay()`/
+  `.synaptogenesis()` additionally call `self._c.optim_weights(lr)`/
+  `.decay_importance(rate)`/`.optim_synaptogenesis(...)` -- none of which
+  exist on `DISLDOLayerV` OR `SparseLinearLayer` either. Three genuinely
+  different C++-layer API generations exist in this codebase today:
+  (1) whatever `DISLDOLayer`/`SISLDOLayer` assume (single-arg `forward`/
+  `backward`, separate `optim_weights`/`decay_importance`/
+  `optim_synaptogenesis` calls) -- never actually implemented/bound;
+  (2) `DISLDOLayerV` (`forward(x, learning_rate)`/`backward(dy,
+  learning_rate)`, `synap_row_step` instead of a probes+optim pair, no
+  weight-decay/separate-optim methods at all);
+  (3) `SparseLinearLayer` (`forward_dense`/`backward_dense` take
+  `learning_rate` directly and apply the update inline, `build_probes`+
+  `synap_step`, no separate optim/decay step) -- this is the one that
+  actually works today, proven by `FoldedLayer` (used by
+  `tests.integration.test_toy_mistral`) and `make_grown_sparse_layer` in
+  `tests/integration/test_mandelbrot_rl.py` (used by `SparseCore`/
+  `MistralCore`, i.e. the actual Mandelbrot experiment's sparse core).
+  **Not on the MiniCPM5 conversion critical path** -- that work goes
+  through `FoldedLayer`/`SparseLinearLayer` directly, never through
+  `SparseRNNCell`. Real fix: rebuild `DISLDOLayer`/`SISLDOLayer` on
+  `SparseLinearLayer`'s actual (working) API, which also means reworking
+  `SparseRNNCell.step()`'s separate-call convention into
+  `SparseLinearLayer`'s inline-learning-rate convention. Sized as its own
+  task, not a quick patch -- `tests/unit/python/test_sparse_rnn_cell.py`
+  has the tests already written and marked `xfail(strict=True)`, ready to
+  flip green once this lands.
+
 - **Synaptogenesis after `compact()` needs automatic handling, not just a
   loud failure.** FIXED: `synap_row_step` now throws a catchable
   `std::runtime_error` (with the row index and exact bytes/elements needed
