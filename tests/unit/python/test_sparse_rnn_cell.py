@@ -41,7 +41,7 @@ import pytest
 
 from sili.tensor import Tensor
 from sili.sparse_rnn import CSR, SparseRNNCell, SparseRNNAgent
-from sili.energy import EnergyDynamics, BranchingRatioTracker
+from sili.energy import EnergyDynamics, BranchingRatioTracker, EMABranchingRatioTracker
 
 _DISLDO_BROKEN_REASON = (
     "Pre-existing, unrelated bug: _cpu.DISLDOLayer/_cpu.SISLDOLayer were "
@@ -185,6 +185,75 @@ class TestBranchingRatioTracker:
             BranchingRatioTracker(window=2)
 
 
+class TestEMABranchingRatioTracker:
+    def test_none_before_enough_pairs(self):
+        t = EMABranchingRatioTracker(alpha=0.1)
+        assert t.branching_ratio() is None
+        t.update(1.0)
+        assert t.branching_ratio() is None  # only one value seen, no pair yet
+        t.update(2.0)
+        assert t.branching_ratio() is None  # one pair -- need >= 2
+
+    def test_recovers_known_branching_ratio_slow_alpha(self):
+        m, h, a = 0.9, 1.0, 5.0
+        t = EMABranchingRatioTracker(alpha=0.05)
+        for _ in range(400):
+            t.update(a)
+            a = m * a + h
+        est = t.branching_ratio()
+        assert est is not None
+        assert est == pytest.approx(m, abs=0.02)
+
+    def test_recovers_known_branching_ratio_fast_alpha(self):
+        # Fast alpha should converge in far fewer steps than slow alpha,
+        # trading long-term smoothness for quick response -- the whole
+        # point of offering alpha as a tunable knob.
+        m, h, a = 0.9, 1.0, 5.0
+        t = EMABranchingRatioTracker(alpha=0.3)
+        for _ in range(60):
+            t.update(a)
+            a = m * a + h
+        est = t.branching_ratio()
+        assert est is not None
+        assert est == pytest.approx(m, abs=0.02)
+
+    def test_flat_history_returns_none(self):
+        t = EMABranchingRatioTracker(alpha=0.1)
+        for _ in range(10):
+            t.update(3.0)  # zero variance
+        assert t.branching_ratio() is None
+
+    def test_reset_clears_state(self):
+        t = EMABranchingRatioTracker(alpha=0.1)
+        for i in range(10):
+            t.update(float(i))
+        assert t.branching_ratio() is not None
+        t.reset()
+        assert t.branching_ratio() is None
+
+    def test_no_avalanche_sizes_method(self):
+        # Deliberate -- an O(1) EMA state cannot reconstruct historical
+        # runs; use BranchingRatioTracker (run one alongside) for that.
+        t = EMABranchingRatioTracker(alpha=0.1)
+        assert not hasattr(t, "avalanche_sizes")
+
+    def test_alpha_out_of_range_rejected(self):
+        with pytest.raises(AssertionError):
+            EMABranchingRatioTracker(alpha=0.0)
+        with pytest.raises(AssertionError):
+            EMABranchingRatioTracker(alpha=1.5)
+
+    def test_o1_memory_no_growing_history(self):
+        # Unlike BranchingRatioTracker, nothing here should grow with
+        # the number of update() calls.
+        t = EMABranchingRatioTracker(alpha=0.1)
+        for i in range(500):
+            t.update(float(i % 7))
+        attr_count_before = len(t.__dict__)
+        t.update(1.0)
+        assert len(t.__dict__) == attr_count_before  # no hidden buffer growth
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EnergyDynamics kept_indices
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +308,28 @@ class TestSparseRNNCellConstruction:
     def test_dynamic_density_default_off(self):
         cell = _small_cell()
         assert cell.dynamic_density_from_branching_ratio is False
+
+    def test_branching_tracker_defaults_to_window(self):
+        cell = _small_cell()
+        assert cell.branching_tracker_mode == "window"
+        assert isinstance(cell.branching_recurrent, BranchingRatioTracker)
+
+    def test_branching_tracker_ema_mode_selects_ema_tracker(self):
+        cell = _small_cell(branching_tracker="ema", branching_ema_alpha=0.1)
+        assert cell.branching_tracker_mode == "ema"
+        assert isinstance(cell.branching_recurrent, EMABranchingRatioTracker)
+        assert cell.branching_recurrent.alpha == 0.1
+
+
+class TestSparseRNNCellInvalidBranchingTrackerMode:
+    # Deliberately NOT xfail -- the branching_tracker validation assert
+    # runs before any DISLDOLayer construction, so it fails the same way
+    # regardless of the pre-existing DISLDOLayer bug (verified: this
+    # raises AssertionError, not the DISLDOLayer AttributeError).
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(AssertionError):
+            SparseRNNCell(n_inputs=4, state_size=8, max_weights=64,
+                          branching_tracker="bogus")
 
 
 @pytest.mark.xfail(reason=_DISLDO_BROKEN_REASON, strict=True)

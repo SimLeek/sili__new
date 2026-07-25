@@ -522,3 +522,81 @@ class BranchingRatioTracker:
 
     def reset(self) -> None:
         self._history.clear()
+
+
+class EMABranchingRatioTracker:
+    """
+    EMA-based streaming variant of BranchingRatioTracker -- same OLS-slope
+    estimator (see that class's docstring for the branching-with-
+    immigration model and the identifiability reason this needs
+    recurrent-only activity, not combined activity), but its regression
+    statistics (mean(a), mean(a_next), mean(a*a_next), mean(a^2)) are
+    exponentially-weighted running estimates instead of a hard sliding
+    window. O(1) memory (no history buffer) instead of O(window).
+
+    The `alpha` decay rate is the direct tradeoff BranchingRatioTracker's
+    `window` only offers indirectly: large alpha = fast response to a
+    changing regime but noisy/short effective memory; small alpha = smooth
+    long-term trend but slow to notice a real regime shift. Unlike a hard
+    window, older observations are smoothly discounted rather than
+    dropped outright at a fixed cutoff. Want BOTH a fast and a long-term
+    read at once? Run two instances side by side at different alphas
+    (e.g. alpha=0.2 "fast" + alpha=0.02 "slow") rather than looking for a
+    single-instance dual-timescale mode -- composition over a wider
+    single-class API, and it keeps each instance's semantics simple.
+
+    Does NOT implement avalanche_sizes() -- that check inherently needs a
+    retained sequence of raw activity values (consecutive-nonzero run
+    lengths), which an O(1) EMA state cannot reconstruct by construction.
+    Use BranchingRatioTracker (run one alongside, if wanted) for that
+    check -- this is exactly the "have both EMA and windowed" case, not a
+    reason to avoid EMA for the branching-ratio estimate itself.
+    """
+
+    def __init__(self, alpha: float = 0.05):
+        assert 0.0 < alpha <= 1.0, "alpha must be in (0, 1]"
+        self.alpha = float(alpha)
+        self._prev:    Optional[float] = None
+        self._mean_a:  Optional[float] = None
+        self._mean_b:  Optional[float] = None
+        self._mean_aa: Optional[float] = None
+        self._mean_ab: Optional[float] = None
+        self._n_pairs = 0
+
+    def update(self, activity: float) -> None:
+        """Record one step's activity count (e.g. count of |h| above the
+        region's activation_threshold)."""
+        activity = float(activity)
+        if self._prev is not None:
+            a, b = self._prev, activity
+            a2, ab = a * a, a * b
+            if self._mean_a is None:
+                # First pair -- seed the running means directly rather
+                # than blending against an undefined prior.
+                self._mean_a, self._mean_b   = a, b
+                self._mean_aa, self._mean_ab = a2, ab
+            else:
+                al = self.alpha
+                self._mean_a  = (1.0 - al) * self._mean_a  + al * a
+                self._mean_b  = (1.0 - al) * self._mean_b  + al * b
+                self._mean_aa = (1.0 - al) * self._mean_aa + al * a2
+                self._mean_ab = (1.0 - al) * self._mean_ab + al * ab
+            self._n_pairs += 1
+        self._prev = activity
+
+    def branching_ratio(self) -> Optional[float]:
+        """OLS slope implied by the current EMA statistics, or None if
+        there aren't at least two pairs yet or activity has had zero
+        variance under the EMA (mirrors BranchingRatioTracker's guards)."""
+        if self._n_pairs < 2 or self._mean_a is None:
+            return None
+        var = self._mean_aa - self._mean_a ** 2
+        if var <= 1e-12:
+            return None
+        cov = self._mean_ab - self._mean_a * self._mean_b
+        return float(cov / var)
+
+    def reset(self) -> None:
+        self._prev = None
+        self._mean_a = self._mean_b = self._mean_aa = self._mean_ab = None
+        self._n_pairs = 0

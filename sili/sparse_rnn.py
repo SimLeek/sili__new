@@ -41,7 +41,7 @@ import sili._cpu as _cpu
 
 from sili.module import Module
 from sili.tensor import Tensor, _acc
-from sili.energy import EnergyDynamics, BranchingRatioTracker
+from sili.energy import EnergyDynamics, BranchingRatioTracker, EMABranchingRatioTracker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -733,17 +733,35 @@ class SparseRNNCell(Module):
     after SparseRNNAgent.load()), falling back to CSR.from_dense (the true
     step-0 path) exactly once until the cell has run again.
 
-    Branching-ratio measurement (see energy.BranchingRatioTracker): recurrent
-    -only activity is measured on recurrent_out BEFORE it's summed with
-    input_proj(obs) -- measuring on the combined h cannot distinguish a
-    genuinely self-propagating recurrent pathway from fresh input alone
-    carrying activity while the recurrent branching factor is silently 0.
+    Branching-ratio measurement (see energy.BranchingRatioTracker /
+    energy.EMABranchingRatioTracker): recurrent-only activity is measured
+    on recurrent_out BEFORE it's summed with input_proj(obs) -- measuring
+    on the combined h cannot distinguish a genuinely self-propagating
+    recurrent pathway from fresh input alone carrying activity while the
+    recurrent branching factor is silently 0. `branching_tracker` selects
+    which estimator backs `self.branching_recurrent`: "window" (default,
+    a hard sliding window, also the only one that supports
+    avalanche_sizes() for a SOC power-law-tail check) or "ema" (O(1)
+    memory, exponentially-discounted -- prefer this when you want a
+    continuously-updated read with a tunable fast/long-term tradeoff via
+    `branching_ema_alpha`, e.g. for `dynamic_density_from_branching_ratio`
+    reacting promptly to a regime change). Want both a fast EMA read and
+    the avalanche-size check at once? Construct a second tracker yourself
+    (`EMABranchingRatioTracker`/`BranchingRatioTracker` from `sili.energy`)
+    and feed it the same recurrent_out activity this cell already
+    computes each step -- not built into this class, since which
+    additional trackers (if any) matter is a caller decision, not
+    something this cell should hardcode a combination of.
     """
 
     def __init__(self, n_inputs: int, state_size: int, max_weights: int,
                  num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
                  dynamic_density_from_branching_ratio: bool = False,
-                 branching_window: int = 200):
+                 branching_tracker: str = "window",
+                 branching_window: int = 200,
+                 branching_ema_alpha: float = 0.05):
+        assert branching_tracker in ("window", "ema"), \
+            f"branching_tracker must be 'window' or 'ema', got {branching_tracker!r}"
         r = percent_active / 0.02
         self.input_proj = DISLDOLayer(n_inputs,   state_size, max_weights, num_cpus, solidify)
         self.recurrent  = SISLDOLayer(state_size, state_size, max_weights, num_cpus, solidify,
@@ -774,8 +792,16 @@ class SparseRNNCell(Module):
         # Recurrent-only branching-ratio measurement (A6 item 5) and its
         # optional (default-off) use to nudge the KL density target (A6's
         # "biggest structural change" -- a first-cut proportional adjustment,
-        # not a first-principles derivation; see energy-params.md).
-        self.branching_recurrent = BranchingRatioTracker(window=branching_window)
+        # not a first-principles derivation; see energy-params.md). "window"
+        # is the default so existing behavior/callers are unaffected;
+        # "ema" trades the avalanche_sizes() check away for O(1) memory and
+        # a tunable fast/long-term response via branching_ema_alpha -- see
+        # class docstring.
+        if branching_tracker == "window":
+            self.branching_recurrent = BranchingRatioTracker(window=branching_window)
+        else:
+            self.branching_recurrent = EMABranchingRatioTracker(alpha=branching_ema_alpha)
+        self.branching_tracker_mode = branching_tracker
         self.dynamic_density_from_branching_ratio = bool(dynamic_density_from_branching_ratio)
 
         # Cache for unifying the sparsification passes -- see class docstring.
