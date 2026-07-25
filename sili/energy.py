@@ -14,7 +14,8 @@ h is kept in the autograd graph throughout via straight-through gating:
 energy is plain numpy — running state, not a learned parameter.
 The caller owns batch iteration; do not pass batched tensors here.
 
-See PROOFS.md for the full mathematical treatment.
+See PROOFS.md for the full mathematical treatment, and CITATIONS.md (repo
+root) for the external work referenced by name in this file's docstrings.
 """
 
 from __future__ import annotations
