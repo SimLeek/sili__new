@@ -291,6 +291,94 @@ class TestFoldedColumnLayerRecurrent:
         assert not np.allclose(layer.recurrent.weights_vals, 0.0)
 
 
+class TestFoldedColumnLayerStatePersistence:
+    """FoldedLayer.state_dict() previously only saved in_proj (silently
+    dropping trained recurrent weights on save/reload), and had NO
+    load_state_dict() at all -- state_dict()'s own output could never be
+    loaded back through the public API. Found while comparing
+    FoldedColumnLayer against SparseRNNCell's persistence."""
+
+    def _trained_layer(self, n_folds=4, hidden=6, seed=2):
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=seed)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.02, num_cpus=1)
+        # Give recurrent non-trivial weights + a non-default value_scale
+        # directly (bypassing training) so the round-trip has something
+        # real to lose if the fix is wrong.
+        layer.recurrent.load_weights(
+            np.asarray(layer.recurrent.ptrs), np.asarray(layer.recurrent.indices),
+            ((np.arange(layer.recurrent.nnz, dtype=np.float32) % 6) - 3),
+        )
+        for r in range(layer.recurrent.n_inputs):
+            layer.recurrent.set_value_scale_raw(r, 0.7)
+        return layer
+
+    def test_state_dict_includes_recurrent(self):
+        layer = self._trained_layer()
+        d = layer.state_dict()
+        assert "recurrent" in d
+        assert not np.allclose(d["recurrent"]["weights"], 0.0)
+
+    def test_load_state_dict_restores_in_proj_weights_and_scale(self):
+        n_folds, hidden = 4, 6
+        layer  = self._trained_layer(n_folds, hidden)
+        target = FoldedColumnLayer.from_descriptor(
+            _toy_square_descriptor(n_folds, hidden, density=0.5, seed=99),
+            learning_rate=0.02, num_cpus=1)
+
+        target.load_state_dict(layer.state_dict())
+
+        src = layer._sili_layers[".down_proj.weight"]
+        dst = target._sili_layers[".down_proj.weight"]
+        np.testing.assert_array_equal(dst.weights_vals, src.weights_vals)
+        for r in range(src.n_inputs):
+            assert dst.get_value_scale(r) == pytest.approx(src.get_value_scale(r))
+
+    def test_load_state_dict_restores_recurrent_weights_and_scale(self):
+        n_folds, hidden = 4, 6
+        layer  = self._trained_layer(n_folds, hidden)
+        target = FoldedColumnLayer.from_descriptor(
+            _toy_square_descriptor(n_folds, hidden, density=0.5, seed=99),
+            learning_rate=0.02, num_cpus=1)
+
+        target.load_state_dict(layer.state_dict())
+
+        np.testing.assert_array_equal(target.recurrent.weights_vals, layer.recurrent.weights_vals)
+        for r in range(layer.recurrent.n_inputs):
+            assert target.recurrent.get_value_scale(r) == pytest.approx(
+                layer.recurrent.get_value_scale(r))
+
+    def test_round_trip_produces_identical_forward_output(self):
+        # The actual functional guarantee: same input -> same output
+        # after a save/reload cycle, not just matching internal arrays.
+        n_folds, hidden = 4, 6
+        layer  = self._trained_layer(n_folds, hidden)
+        target = FoldedColumnLayer.from_descriptor(
+            _toy_square_descriptor(n_folds, hidden, density=0.5, seed=99),
+            learning_rate=0.02, num_cpus=1)
+        target.load_state_dict(layer.state_dict())
+
+        x_np     = np.random.randn(hidden).astype(np.float32)
+        state_np = np.random.randn(n_folds * hidden).astype(np.float32)
+        out_src = layer(Tensor(x_np.copy()), Tensor(state_np.copy()))
+        out_dst = target(Tensor(x_np.copy()), Tensor(state_np.copy()))
+        np.testing.assert_allclose(out_src.data, out_dst.data, atol=1e-5)
+
+    def test_plain_folded_layer_load_state_dict_also_works(self):
+        # FoldedLayer itself (not just the FoldedColumnLayer subclass) --
+        # this method didn't exist at all before this fix.
+        n_folds, hidden = 3, 5
+        desc_a = _toy_square_descriptor(n_folds, hidden, density=0.6, seed=1)
+        desc_b = _toy_square_descriptor(n_folds, hidden, density=0.6, seed=42)
+        src = FoldedLayer.from_descriptor(desc_a, learning_rate=0.01, num_cpus=1)
+        dst = FoldedLayer.from_descriptor(desc_b, learning_rate=0.01, num_cpus=1)
+
+        dst.load_state_dict(src.state_dict())
+
+        src_sub = src._sili_layers[".down_proj.weight"]
+        dst_sub = dst._sili_layers[".down_proj.weight"]
+        np.testing.assert_array_equal(dst_sub.weights_vals, src_sub.weights_vals)
+
+
 class TestColumnAveragingEndToEnd:
     """
     FoldedColumnLayer -> EnergyDynamics -> column_averaging_loss, wired

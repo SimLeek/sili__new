@@ -70,6 +70,25 @@ SISLDOLayerV architecture fix).
   has the tests already written and marked `xfail(strict=True)`, ready to
   flip green once this lands.
 
+  **Noted while building `FoldedColumnLayer` (Phase A4)**: it landed on
+  the exact same `h = input_proj(x) + recurrent(state)` shape
+  `SparseRNNCell` already has (structurally deliberate, not
+  coincidental -- see its docstring), but the two are NOT good
+  subclass/merge candidates right now: `SparseRNNCell` bundles
+  `EnergyDynamics`+`BranchingRatioTracker`+CSR-caching directly inside
+  `forward()`, while `FoldedColumnLayer` deliberately leaves energy
+  gating external (the caller composes it with `column_averaging_loss`,
+  which needs to see the gated state specifically); `SparseRNNCell`'s
+  `input_proj`/`recurrent` are the broken `DISLDOLayer`/`SISLDOLayer`
+  above, while `FoldedColumnLayer`'s are `SparseLinearLayer`-based on
+  purpose, specifically to avoid that bug. Once `DISLDOLayer`/
+  `SISLDOLayer` are rebuilt on `SparseLinearLayer` (the fix above), both
+  classes' `input_proj`/`recurrent` would share the same actual
+  underlying primitive rather than just resembling each other --
+  *that's* the point where extracting a shared minimal
+  `h = a(x) + b(state)` base becomes genuinely motivated instead of
+  premature (two real working examples instead of one).
+
 - **A fired-but-not-selected neuron's energy grows without bound under a
   chronically repeated identical input -- this looks like curiosity/
   novelty-seeking pressure working as intended, not a bug.** Found while

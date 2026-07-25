@@ -253,6 +253,52 @@ class SISLDOLayer(_SparseLayerBase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Save/restore helpers for a raw _cpu.SparseLinearLayer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sparse_linear_layer_state_dict(layer) -> dict:
+    """
+    Full round-trippable state for a raw _cpu.SparseLinearLayer: weights
+    AND per-row value_scale/importance_scale. weights_vals are RAW
+    quantized units, not true values -- true value =
+    weights_vals[i] * value_scale[row_of_i] (see set_value_scale_raw's own
+    docstring) -- so scale must be saved alongside weights, or a reload
+    silently uses scale=1.0 (SparseLinearLayer's default for an untouched
+    row) instead of whatever was actually calibrated, corrupting every
+    true weight value on that row without erroring.
+
+    importance is saved (for inspection) but CANNOT currently be restored
+    by _sparse_linear_layer_load_state_dict below: SparseLinearLayer.
+    load_weights has no path to set per-connection importance (unlike
+    DISLDOLayerV.load_weights, which takes an importance array) -- see
+    TODO.md. A reloaded layer's importance starts fresh, not from here.
+    """
+    n = layer.n_inputs
+    return {
+        "ptrs":             np.array(layer.ptrs),
+        "indices":          np.array(layer.indices),
+        "weights":          np.array(layer.weights_vals),
+        "importance":       np.array(layer.importance),  # NOT restorable -- see docstring
+        "value_scale":      np.array([layer.get_value_scale(r) for r in range(n)], dtype=np.float32),
+        "importance_scale": np.array([layer.get_importance_scale(r) for r in range(n)], dtype=np.float32),
+    }
+
+
+def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
+    """Restore weights and per-row value_scale/importance_scale onto an
+    already-constructed layer of the matching shape. Does NOT restore
+    importance -- see _sparse_linear_layer_state_dict's docstring."""
+    layer.load_weights(
+        np.asarray(d["ptrs"],    dtype=np.int32),
+        np.asarray(d["indices"], dtype=np.int32),
+        np.asarray(d["weights"], dtype=np.float32),
+    )
+    for r in range(layer.n_inputs):
+        layer.set_value_scale_raw(r, float(d["value_scale"][r]))
+        layer.set_importance_scale_raw(r, float(d["importance_scale"][r]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FoldedLayer — runtime sili Module for a converted folded transformer block
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -550,16 +596,24 @@ class FoldedLayer(Module):
     def state_dict(self) -> dict:
         out = {}
         for suffix, layer in self._sili_layers.items():
-            out[suffix] = {
-                "ptrs":       np.array(layer.ptrs),
-                "indices":    np.array(layer.indices),
-                "weights":    np.array(layer.weights_vals),
-                "importance": np.array(layer.importance),
-                "n_folds":    np.array([self._n_folds]),
-                "out_dim":    np.array([self._out_dims[suffix]]),
-                "lr":         np.array([self.lr], dtype=np.float32),
-            }
+            d = _sparse_linear_layer_state_dict(layer)
+            d["n_folds"] = np.array([self._n_folds])
+            d["out_dim"] = np.array([self._out_dims[suffix]])
+            d["lr"]      = np.array([self.lr], dtype=np.float32)
+            out[suffix]  = d
         return out
+
+    def load_state_dict(self, d: dict) -> None:
+        """
+        Restore weights + per-row value_scale/importance_scale for every
+        suffix layer (previously: no load_state_dict existed on this
+        class at all -- state_dict()'s output could be saved but never
+        loaded back). Does NOT restore importance itself -- see
+        _sparse_linear_layer_state_dict's docstring; a reloaded
+        connection's importance starts fresh, not from what was saved.
+        """
+        for suffix, sub in d.items():
+            _sparse_linear_layer_load_state_dict(self._sili_layers[suffix], sub)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -695,6 +749,22 @@ class FoldedColumnLayer(FoldedLayer):
                            backend=x.backend)
         rec = apply_fold_skip(self.recurrent, state, lr=self.lr)
         return raw + rec
+
+    def state_dict(self) -> dict:
+        """FoldedLayer.state_dict() (in_proj) plus recurrent -- the
+        original version of this method (inherited, unoverridden) saved
+        only in_proj, silently dropping any trained recurrent weights on
+        save/reload."""
+        out = super().state_dict()
+        out["recurrent"] = _sparse_linear_layer_state_dict(self.recurrent)
+        return out
+
+    def load_state_dict(self, d: dict) -> None:
+        """Restore in_proj (via FoldedLayer.load_state_dict) and
+        recurrent. Does NOT restore importance for either -- see
+        _sparse_linear_layer_state_dict's docstring."""
+        super().load_state_dict({k: v for k, v in d.items() if k != "recurrent"})
+        _sparse_linear_layer_load_state_dict(self.recurrent, d["recurrent"])
 
 
 def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
