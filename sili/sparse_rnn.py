@@ -41,7 +41,7 @@ import sili._cpu as _cpu
 
 from sili.module import Module
 from sili.tensor import Tensor, _acc
-from sili.energy import EnergyDynamics
+from sili.energy import EnergyDynamics, BranchingRatioTracker, EMABranchingRatioTracker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -56,17 +56,56 @@ class CSR(NamedTuple):
     rows:    int
     cols:    int
 
+    @property
+    def nnz(self) -> int:
+        return len(self.indices)
+
     @staticmethod
     def from_dense(x: np.ndarray, p: float = 0.03, num_cpus: int = 4) -> "CSR":
         """
         Build CSR keeping the top-k entries by magnitude, k = max(1, round(cols * p)).
         x : float32 [cols] or [batch, cols]
+
+        Independent top-k -- use ONLY when no prior sparsification decision
+        already exists for this activation (i.e. true step-0, before any
+        EnergyDynamics gate has run). Once a gate decision exists, prefer
+        from_kept_indices below: re-deriving sparsity independently here can
+        disagree with what the gate already decided.
         """
         x2d = x[np.newaxis, :] if x.ndim == 1 else x
         x2d = np.asarray(x2d, dtype=np.float32)
         k   = max(1, int(x2d.shape[1] * p))
         ptrs, indices, values = _cpu.dense_to_top_k_csr(x2d, k, num_cpus)
         return CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
+
+    @staticmethod
+    def from_kept_indices(kept_indices: np.ndarray, values_source: np.ndarray,
+                          cols: int) -> "CSR":
+        """
+        Build a single-row CSR directly from an already-decided set of kept
+        column indices (e.g. EnergyDynamics.kept_indices) and a dense array
+        to pull values from at those indices.
+
+        This is the "unify the two sparsification passes" path (see
+        sili.energy._apply_energy_dynamics's kept_indices docstring): when a
+        prior energy-gating decision already exists for this activation,
+        build the CSR from THAT decision instead of from_dense's independent
+        top-k, which could disagree with it.
+
+        kept_indices  : int array, sorted ascending, indices into values_source
+        values_source : float32 [cols] -- values are read from HERE at
+                        kept_indices. Pass the PRE-gating activation (e.g.
+                        the h fed INTO an EnergyDynamics call), not that
+                        call's h_out -- h_out's fired/shutoff positions hold
+                        energy-derived constants (2.0, e+2), not the real
+                        activation magnitude the gate decided to keep.
+        cols          : full (dense) width this row represents
+        """
+        kept_indices  = np.asarray(kept_indices, dtype=np.int32)
+        values_source = np.asarray(values_source, dtype=np.float32).ravel()
+        values        = values_source[kept_indices]
+        ptrs          = np.array([0, len(kept_indices)], dtype=np.int32)
+        return CSR(ptrs, kept_indices, values, rows=1, cols=cols)
 
     def to_dense(self) -> np.ndarray:
         """Reconstruct dense float32 [rows, cols]."""
@@ -671,61 +710,169 @@ class SparseRNNCell(Module):
     """
     One sparse RNN step:
 
-        h     = input_proj(obs) + recurrent(csr, state)
-        h_out = energy(h)
+        recurrent_out = recurrent(csr, state)     [measured alone, see below]
+        h             = input_proj(obs) + recurrent_out
+        h_out         = energy(h)
 
-    The CSR of h_out is cached internally and reused as the recurrent input
-    on the next call — no redundant sparsification outside the cell.
+    Returns (h_out: Tensor, aux_loss: Tensor, actual_p: float) — h_out (dense)
+    is returned unchanged as the new state, same contract as before, so
+    argmax/save/inspection on it keep working without modification.
 
-    Returns (h_out: Tensor, aux_loss: Tensor, actual_p: float).
+    Unifying the sparsification passes (see energy.kept_indices docstring):
+    the CSR fed into `recurrent()` at the top of the NEXT call is built from
+    THIS call's own energy-gating decision (kept_indices + the PRE-gating h
+    values at those indices) rather than an independent top-k re-derivation
+    that could disagree with it. That decision is cached on the cell
+    (`_prev_kept_indices` / `_prev_h_dense`) rather than smuggled through the
+    state Tensor itself, since state.data must stay dense for argmax/save to
+    keep working, and CSR must not be built from state.data's own values
+    anyway -- state.data (h_out) has fire/shutoff positions flattened to
+    energy-derived constants (2.0, e+2), not the real activation magnitude
+    the gate decided to keep. The cache is invalidated on reset()/whenever
+    the caller hands in a state the cell didn't itself just produce (e.g.
+    after SparseRNNAgent.load()), falling back to CSR.from_dense (the true
+    step-0 path) exactly once until the cell has run again.
+
+    Branching-ratio measurement (see energy.BranchingRatioTracker /
+    energy.EMABranchingRatioTracker): recurrent-only activity is measured
+    on recurrent_out BEFORE it's summed with input_proj(obs) -- measuring
+    on the combined h cannot distinguish a genuinely self-propagating
+    recurrent pathway from fresh input alone carrying activity while the
+    recurrent branching factor is silently 0. `branching_tracker` selects
+    which estimator backs `self.branching_recurrent`: "window" (
+    a hard sliding window, also the only one that supports
+    avalanche_sizes() for a SOC power-law-tail check) or "ema" (default, O(1)
+    memory, exponentially-discounted -- prefer this when you want a
+    continuously-updated read with a tunable fast/long-term tradeoff via
+    `branching_ema_alpha`, e.g. for `dynamic_density_from_branching_ratio`
+    reacting promptly to a regime change). Want both a fast EMA read and
+    the avalanche-size check at once? Construct a second tracker yourself
+    (`EMABranchingRatioTracker`/`BranchingRatioTracker` from `sili.energy`)
+    and feed it the same recurrent_out activity this cell already
+    computes each step -- not built into this class, since which
+    additional trackers (if any) matter is a caller decision, not
+    something this cell should hardcode a combination of.
     """
 
     def __init__(self, n_inputs: int, state_size: int, max_weights: int,
-                 num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03):
+                 num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
+                 dynamic_density_from_branching_ratio: bool = False,
+                 branching_tracker: str = "ema",
+                 branching_window: int = 200,
+                 branching_ema_alpha: float = 0.05):
+        assert branching_tracker in ("window", "ema"), \
+            f"branching_tracker must be 'window' or 'ema', got {branching_tracker!r}"
         r = percent_active / 0.02
         self.input_proj = DISLDOLayer(n_inputs,   state_size, max_weights, num_cpus, solidify)
         self.recurrent  = SISLDOLayer(state_size, state_size, max_weights, num_cpus, solidify,
                                       backprop_p=percent_active)
+        # density IS the target active fraction; p is a hard compute-limit
+        # ceiling that must sit clearly above it (~5x here), not the thing
+        # that shapes learned sparsity -- see EnergyDynamics's own
+        # `density <= p * 0.8` assertion and its docstring for why. This
+        # inverts what this constructor did before (density used to be
+        # derived FROM percent_active*0.9 while p was set TO percent_active
+        # directly, i.e. density could exceed p*0.8 -- the actual bug).
+        density = min(0.9, percent_active)
+        p       = min(1.0, percent_active * 5.0)
         self.energy     = EnergyDynamics(
             drive          = 0.08*percent_active * r,
             activation_cost= 0.08 * r,
-            density        = min(0.25, percent_active * 0.9),
+            density        = density,
             exploration    = 0.001 * r,
             reactivity     = 0.01  * r,
             precision      = 0.04  * r,
             setpoint       = 1.0,
-            kl_eps         = 1e-4,
-            p              = percent_active,
+            activation_threshold = 1e-4,
+            p              = p,
         )
         self.state_size      = state_size
         self._percent_active = percent_active
+
+        # Recurrent-only branching-ratio measurement (A6 item 5) and its
+        # optional (default-off) use to nudge the KL density target (A6's
+        # "biggest structural change" -- a first-cut proportional adjustment,
+        # not a first-principles derivation; see energy-params.md). "window"
+        # is the default so existing behavior/callers are unaffected;
+        # "ema" trades the avalanche_sizes() check away for O(1) memory and
+        # a tunable fast/long-term response via branching_ema_alpha -- see
+        # class docstring.
+        if branching_tracker == "window":
+            self.branching_recurrent = BranchingRatioTracker(window=branching_window)
+        else:
+            self.branching_recurrent = EMABranchingRatioTracker(alpha=branching_ema_alpha)
+        self.branching_tracker_mode = branching_tracker
+        self.dynamic_density_from_branching_ratio = bool(dynamic_density_from_branching_ratio)
+
+        # Cache for unifying the sparsification passes -- see class docstring.
+        self._prev_kept_indices: Optional[np.ndarray] = None
+        self._prev_h_dense:      Optional[np.ndarray] = None
 
     def parameters(self) -> list:
         return []
 
     def forward(self, obs: Tensor, state: Tensor) -> Tuple[Tensor, Tensor, float]:
-        # state.data is a CSR after the first step; dense Tensor on step 0.
-        # Normalise: if state.data is not already a CSR, sparsify it once.
+        # state.data is a CSR only if the caller explicitly handed us one
+        # (e.g. warm-starting from a saved CSR); the cell's own output is
+        # always dense (see class docstring). Normal path: build the CSR
+        # from this cell's OWN cached gating decision when we have one and
+        # the caller hasn't reset/replaced the state since; otherwise fall
+        # back to the true step-0 independent top-k.
         if not isinstance(state.data, CSR):
-            state = CSR.from_dense(
-                np.asarray(state.data, dtype=np.float32),
-                p=self._percent_active,
-                num_cpus=self.input_proj.num_cpus,
-            ).as_tensor(state.backend)
+            if self._prev_kept_indices is not None:
+                state_csr = CSR.from_kept_indices(
+                    self._prev_kept_indices, self._prev_h_dense, cols=self.state_size)
+            else:
+                state_csr = CSR.from_dense(
+                    np.asarray(state.data, dtype=np.float32),
+                    p=self._percent_active,
+                    num_cpus=self.input_proj.num_cpus,
+                )
+            state = state_csr.as_tensor(state.backend)
 
-        h                   = self.input_proj(obs) + self.recurrent(state)
-        new_state, aux_loss, actual_p = self.energy(h)
+        # Measure the recurrent pathway's OWN activity before it's mixed
+        # with input_proj(obs) -- see class docstring / BranchingRatioTracker.
+        recurrent_out = self.recurrent(state)
+        recurrent_activity = float(np.sum(
+            np.abs(np.asarray(recurrent_out.data, dtype=np.float32))
+            > self.energy.activation_threshold
+        ))
+        self.branching_recurrent.update(recurrent_activity)
 
-        # new_state is a dense Tensor — return it directly as the new state.
-        # The next forward call converts it to CSR at the top when the
-        # recurrent layer needs it. Storing CSR here would force the recurrent
-        # input to be the energy-gated pattern (2.0 / 0) rather than the
-        # actual activation values.
-        print(self.input_proj.nnz, self.recurrent.nnz, end='\r')
+        h = self.input_proj(obs) + recurrent_out
+
+        density_override = None
+        if self.dynamic_density_from_branching_ratio:
+            m = self.branching_recurrent.branching_ratio()
+            if m is not None:
+                # First-cut proportional nudge around the configured base
+                # density, centered on the intended near-critical band
+                # [0.97, 0.99] -- NOT a first-principles derivation from m.
+                # Bounded to +/-2x the base density so a noisy early
+                # estimate can't send the target somewhere degenerate.
+                m_target = 0.98
+                density_override = float(np.clip(
+                    self.energy.density * (1.0 + 2.0 * (m - m_target)),
+                    self.energy.density * 0.5, self.energy.density * 2.0,
+                ))
+
+        new_state, aux_loss, actual_p = self.energy(h, density_override=density_override)
+
+        # Cache this call's gating decision for the NEXT call's CSR
+        # construction (pre-gating h, not h_out -- see class docstring).
+        self._prev_kept_indices = self.energy.kept_indices
+        self._prev_h_dense      = np.asarray(h.data, dtype=np.float32).ravel().copy()
+
         return new_state, aux_loss, actual_p
 
     def reset(self):
-        pass  # no cached state — CSR lives in the state Tensor itself
+        # Invalidate the sparsification-pass cache -- the next state the
+        # caller hands in did NOT come from this cell's own last forward
+        # call (e.g. after an external reset or a loaded checkpoint), so
+        # the cached kept_indices/h_dense no longer describe it.
+        self._prev_kept_indices = None
+        self._prev_h_dense      = None
+        self.branching_recurrent.reset()
 
     def step(self, lr: float):
         self.input_proj.step(lr)
@@ -750,6 +897,7 @@ class SparseRNNCell(Module):
         self.input_proj.load_state_dict(d["input_proj"])
         self.recurrent .load_state_dict(d["recurrent"])
         self.energy    .load_state_dict(d["energy"])
+        self.reset()  # loaded weights, not a state this cell itself produced
 
 
 

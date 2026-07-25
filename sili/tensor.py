@@ -32,6 +32,38 @@ class Tensor:
     def detach(self) -> "Tensor":
         return Tensor(self.data, backend=self.backend)
 
+    # ── sparse (CSR) data delegation ─────────────────────────────────────────
+    #
+    # Deliberately a separate concept from any flag marking the WEIGHT-side
+    # novel delta-CSR format (that lives in the C++-backed sparse layers,
+    # e.g. FoldedLayer/SparseLinearLayer) -- this is purely about whether
+    # this Tensor's ACTIVATION data happens to be a sili.sparse_rnn.CSR
+    # namedtuple instead of a dense ndarray.
+
+    @property
+    def is_csr(self) -> bool:
+        from sili.sparse_rnn import CSR
+        return isinstance(self.data, CSR)
+
+    @property
+    def is_dense(self) -> bool:
+        return not self.is_csr
+
+    def __getattr__(self, name):
+        # Only invoked when normal attribute lookup fails (self.data itself
+        # is always found normally -- set in __init__ -- so this never
+        # recurses on that). Delegates to self.data when it's a CSR, so
+        # tensor.nnz / tensor.rows / tensor.cols work directly without
+        # unwrapping .data by hand.
+        from sili.sparse_rnn import CSR
+        data = self.data
+        if isinstance(data, CSR) and hasattr(data, name):
+            return getattr(data, name)
+        raise AttributeError(
+            f"'Tensor' object has no attribute {name!r} "
+            f"(data is {type(data).__name__}, not a CSR)"
+        )
+
     # ── coerce scalar to same-device Tensor ───────────────────────────────────
 
     def _coerce(self, other) -> "Tensor":
