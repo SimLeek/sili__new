@@ -70,6 +70,33 @@ SISLDOLayerV architecture fix).
   has the tests already written and marked `xfail(strict=True)`, ready to
   flip green once this lands.
 
+  `FoldedColumnLayer` (Phase A4) landed on the same `h = input_proj(x) +
+  recurrent(state)` shape as `SparseRNNCell` but is not a subclass/merge
+  candidate yet -- revisit once `DISLDOLayer`/`SISLDOLayer` are rebuilt on
+  `SparseLinearLayer` (see sili_peridot/JOURNAL.md for the full reasoning).
+
+- **A neuron that fires but keeps losing the top-p competition never has
+  its energy reset**, so `aux_loss` grows unboundedly under a genuinely
+  static repeated input. This is curiosity/novelty-seeking pressure
+  working as intended, not a bug -- real inputs (Mandelbrot, RL agents,
+  MiniCPM5 token streams) always vary step to step, so it isn't hit in
+  practice. Worth deliberately harnessing later (e.g. a Phase E
+  action-pathway signal) rather than clamping away. See
+  sili_peridot/JOURNAL.md for the full trace.
+
+- **`EnergyDynamics`'s exploration noise (`_apply_energy_dynamics`) draws
+  from the global, unseeded `np.random`, not a seeded generator.** Any
+  test that trains through `EnergyDynamics` and asserts something more
+  specific than "stays finite" needs to call `np.random.seed(...)` itself
+  first, or it's flaky across runs -- hit this directly in
+  `tests/integration/test_column_averaging_predictive.py`
+  (`TestEnergyInteraction`, fixed there). `TestColumnAveragingEndToEnd`
+  in `test_folded_column_layer.py` has the same exposure but only asserts
+  finiteness, so it hasn't surfaced there. Not fixed at the source
+  (`EnergyDynamics` would need an injectable RNG) -- noted here so the
+  next test relying on specific energy-driven numbers doesn't rediscover
+  the flakiness from scratch.
+
 - **Synaptogenesis after `compact()` needs automatic handling, not just a
   loud failure.** FIXED: `synap_row_step` now throws a catchable
   `std::runtime_error` (with the row index and exact bytes/elements needed

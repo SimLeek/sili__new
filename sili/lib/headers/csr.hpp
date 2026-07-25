@@ -493,4 +493,81 @@ top_k_csr(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
     return to_csr(coo_result, num_threads);
 }
 
+// ── csr_union ─────────────────────────────────────────────────────────────
+//
+// Merge two same-shape absolute CSRs into the union of their nonzero
+// positions. Construction/loading-time operation (e.g. combining a dense
+// LLM's folded weights with a freshly pre-seeded skip-connection band --
+// see sili_peridot/JOURNAL.md); not used in the forward/backward path.
+//
+// Each row is an independent two-pointer merge of two sorted column lists,
+// so this parallelizes directly over rows -- no cross-row coordination
+// needed (unlike linear_sisldo.hpp's synap_parallel_fill, which also
+// enforces a global importance budget).
+//
+// prefer: 0 = keep A's value on overlap, 1 = keep B's, 2 = sum them.
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+void csr_union(
+    const std::vector<SIZE_TYPE>&  ptrs_a,
+    const std::vector<SIZE_TYPE>&  idx_a,
+    const std::vector<VALUE_TYPE>& vals_a,
+    const std::vector<SIZE_TYPE>&  ptrs_b,
+    const std::vector<SIZE_TYPE>&  idx_b,
+    const std::vector<VALUE_TYPE>& vals_b,
+    const SIZE_TYPE n_rows,
+    const int prefer,
+    const int num_cpus,
+    std::vector<SIZE_TYPE>&  out_ptrs,
+    std::vector<SIZE_TYPE>&  out_idx,
+    std::vector<VALUE_TYPE>& out_vals)
+{
+    std::vector<SIZE_TYPE> row_len(n_rows);
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (SIZE_TYPE r = 0; r < n_rows; ++r) {
+        SIZE_TYPE a = ptrs_a[r], a_end = ptrs_a[r + 1];
+        SIZE_TYPE b = ptrs_b[r], b_end = ptrs_b[r + 1];
+        SIZE_TYPE count = 0;
+        while (a < a_end && b < b_end) {
+            if (idx_a[a] < idx_b[b])      { ++a; ++count; }
+            else if (idx_b[b] < idx_a[a]) { ++b; ++count; }
+            else                          { ++a; ++b; ++count; }
+        }
+        count += (a_end - a) + (b_end - b);
+        row_len[r] = count;
+    }
+
+    out_ptrs.assign(n_rows + 1, SIZE_TYPE(0));
+    for (SIZE_TYPE r = 0; r < n_rows; ++r)
+        out_ptrs[r + 1] = out_ptrs[r] + row_len[r];
+
+    const SIZE_TYPE total = out_ptrs[n_rows];
+    out_idx.resize(total);
+    out_vals.resize(total);
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (SIZE_TYPE r = 0; r < n_rows; ++r) {
+        SIZE_TYPE a = ptrs_a[r], a_end = ptrs_a[r + 1];
+        SIZE_TYPE b = ptrs_b[r], b_end = ptrs_b[r + 1];
+        SIZE_TYPE w = out_ptrs[r];
+        while (a < a_end && b < b_end) {
+            if (idx_a[a] < idx_b[b]) {
+                out_idx[w] = idx_a[a]; out_vals[w] = vals_a[a];
+                ++a; ++w;
+            } else if (idx_b[b] < idx_a[a]) {
+                out_idx[w] = idx_b[b]; out_vals[w] = vals_b[b];
+                ++b; ++w;
+            } else {
+                out_idx[w] = idx_a[a];
+                out_vals[w] = (prefer == 0) ? vals_a[a]
+                             : (prefer == 1) ? vals_b[b]
+                                             : vals_a[a] + vals_b[b];
+                ++a; ++b; ++w;
+            }
+        }
+        while (a < a_end) { out_idx[w] = idx_a[a]; out_vals[w] = vals_a[a]; ++a; ++w; }
+        while (b < b_end) { out_idx[w] = idx_b[b]; out_vals[w] = vals_b[b]; ++b; ++w; }
+    }
+}
+
 #endif

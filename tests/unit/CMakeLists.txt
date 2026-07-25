@@ -67,6 +67,7 @@ add_executable(
     test_stats_thread_safety.cpp
     test_scale_handling.cpp
     test_attention.cpp
+    test_csr_union.cpp
 
     #test_parallel.cpp
     #test_fiber.cpp

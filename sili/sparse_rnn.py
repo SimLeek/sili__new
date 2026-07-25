@@ -253,6 +253,47 @@ class SISLDOLayer(_SparseLayerBase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Save/restore helpers for a raw _cpu.SparseLinearLayer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sparse_linear_layer_state_dict(layer) -> dict:
+    """
+    Full round-trippable state for a raw _cpu.SparseLinearLayer: weights
+    plus per-row value_scale/importance_scale. weights_vals are RAW
+    quantized units (true value = weights_vals[i] * value_scale[row_of_i],
+    see set_value_scale_raw) -- scale must travel with the weights or a
+    reload silently corrupts every true value via the default scale=1.0.
+
+    importance is saved for inspection only -- load_weights has no path to
+    restore per-connection importance (see TODO.md), so a reload starts
+    it fresh.
+    """
+    n = layer.n_inputs
+    return {
+        "ptrs":             np.array(layer.ptrs),
+        "indices":          np.array(layer.indices),
+        "weights":          np.array(layer.weights_vals),
+        "importance":       np.array(layer.importance),  # NOT restorable -- see docstring
+        "value_scale":      np.array([layer.get_value_scale(r) for r in range(n)], dtype=np.float32),
+        "importance_scale": np.array([layer.get_importance_scale(r) for r in range(n)], dtype=np.float32),
+    }
+
+
+def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
+    """Restore weights and per-row value_scale/importance_scale onto an
+    already-constructed layer of the matching shape. Does not restore
+    importance (see _sparse_linear_layer_state_dict)."""
+    layer.load_weights(
+        np.asarray(d["ptrs"],    dtype=np.int32),
+        np.asarray(d["indices"], dtype=np.int32),
+        np.asarray(d["weights"], dtype=np.float32),
+    )
+    for r in range(layer.n_inputs):
+        layer.set_value_scale_raw(r, float(d["value_scale"][r]))
+        layer.set_importance_scale_raw(r, float(d["importance_scale"][r]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FoldedLayer — runtime sili Module for a converted folded transformer block
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -550,17 +591,447 @@ class FoldedLayer(Module):
     def state_dict(self) -> dict:
         out = {}
         for suffix, layer in self._sili_layers.items():
-            out[suffix] = {
-                "ptrs":       np.array(layer.ptrs),
-                "indices":    np.array(layer.indices),
-                "weights":    np.array(layer.weights_vals),
-                "importance": np.array(layer.importance),
-                "n_folds":    np.array([self._n_folds]),
-                "out_dim":    np.array([self._out_dims[suffix]]),
-                "lr":         np.array([self.lr], dtype=np.float32),
-            }
+            d = _sparse_linear_layer_state_dict(layer)
+            d["n_folds"] = np.array([self._n_folds])
+            d["out_dim"] = np.array([self._out_dims[suffix]])
+            d["lr"]      = np.array([self.lr], dtype=np.float32)
+            out[suffix]  = d
         return out
 
+    def load_state_dict(self, d: dict) -> None:
+        """Restore weights + per-row value_scale/importance_scale for
+        every suffix layer. Does not restore importance (see
+        _sparse_linear_layer_state_dict)."""
+        for suffix, sub in d.items():
+            _sparse_linear_layer_load_state_dict(self._sili_layers[suffix], sub)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FoldedColumnLayer — FoldedLayer variant for the column-averaging mechanism
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FoldedColumnLayer(FoldedLayer):
+    """
+    FoldedLayer variant for the column-averaging mechanism: retains the
+    pre-sum [n_folds*out_dim] tensor instead of collapsing the fold axis,
+    and pairs it with a `recurrent` layer -- the same input_proj+recurrent
+    split SparseRNNCell uses, built on SparseLinearLayer instead of the
+    currently-broken DISLDOLayer/SISLDOLayer (see TODO.md).
+
+    in_proj(x) -- the real pretrained per-fold-step matrices (stacked),
+    plus a build_input_skip_preseed()-unioned band of zero-valued
+    trainable skip connections from input to every fold-depth column.
+
+    recurrent(state) -- build_fold_skip_layer's from-scratch banded
+    matrix mapping this layer's own [n_folds*out_dim] output space back to
+    itself (fold step i -> i+1 and nearby columns), carrying one step's
+    output into the next's input. No pretrained content.
+
+    forward(x, state) = in_proj(x) + recurrent(state), returned as the new
+    state to feed back in next call (mirrors SparseRNNCell's convention).
+    state defaults to zero when not given.
+
+    Feed forward()'s output to sili.energy.column_averaging_loss, after
+    whatever EnergyDynamics gating the model applies (that function must
+    run on the energy-gated state, not this layer's raw output).
+    """
+
+    @classmethod
+    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
+                        num_cpus: int = 4, max_row_weights: int = 0,
+                        bytes_per_row: int = 0,
+                        recurrent_bandwidth: int = None,
+                        existing_recurrent=None,
+                        existing_recurrent_prefer: str = "b",
+                        input_skip_bandwidth: int = None) -> "FoldedColumnLayer":
+        """
+        Like FoldedLayer.from_descriptor, plus builds `recurrent` sized to
+        this layer's [n_folds*out_dim] output space, and unconditionally
+        unions a zero-valued input->column skip pre-seed onto every
+        suffix's in_proj weights (see build_input_skip_preseed).
+
+        recurrent_bandwidth: forwarded to build_fold_skip_layer as
+        `bandwidth` (None -> that function's own default).
+
+        existing_recurrent / existing_recurrent_prefer: forwarded to
+        build_fold_skip_layer as `existing`/`existing_prefer` -- pass a
+        previously-saved recurrent CSR (e.g.
+        state_dict_to_true_csr(prior_layer.state_dict()["recurrent"])) to
+        preserve trained skip-connection weights across re-runs. None
+        (default) is the "converting a dense LLM" case.
+
+        input_skip_bandwidth: forwarded to build_input_skip_preseed as
+        `bandwidth` per suffix. No `existing` param here -- each suffix's
+        real weights ARE the base the fresh pre-seed unions onto, real
+        values always winning (see _rebuild_layer_with_preseed).
+        """
+        obj = super().from_descriptor(
+            descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
+            max_row_weights=max_row_weights, bytes_per_row=bytes_per_row,
+        )
+        obj.recurrent = build_fold_skip_layer(
+            obj._n_folds, obj.column_width, num_cpus=num_cpus,
+            bandwidth=recurrent_bandwidth, expected_lr=learning_rate,
+            existing=existing_recurrent, existing_prefer=existing_recurrent_prefer,
+        )
+
+        out_dim = obj.column_width
+        for suffix, layer in list(obj._sili_layers.items()):
+            preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(
+                layer.n_inputs, obj._n_folds, out_dim, bandwidth=input_skip_bandwidth)
+            obj._sili_layers[suffix] = _rebuild_layer_with_preseed(
+                layer, preseed_ptrs, preseed_idx,
+                num_cpus=num_cpus, expected_lr=learning_rate,
+            )
+
+        return obj
+
+    @property
+    def out_features(self) -> int:
+        # FoldedLayer's out_features is the PER-FOLD out_dim (post fold
+        # -sum); this layer doesn't sum, so its real output width is
+        # n_folds times that.
+        return self._n_folds * next(iter(self._out_dims.values()))
+
+    @property
+    def column_width(self) -> int:
+        """Per-fold-step output width -- also recurrent's own row/column
+        count divided by n_folds."""
+        return next(iter(self._out_dims.values()))
+
+    def in_proj(self, x: "Tensor") -> "Tensor":
+        """
+        The pretrained-weight half of forward(): does NOT sum over the
+        fold axis like FoldedLayer.forward does -- returns
+        [batch, n_folds*out_dim] (or [n_folds*out_dim] if x was 1-D),
+        every fold step's own out_dim-sized projection, concatenated
+        rather than collapsed.
+        """
+        x_np = np.asarray(x.data, dtype=np.float32)
+        squeezed = x_np.ndim == 1
+        if squeezed:
+            x_np = x_np[np.newaxis, :]
+        lr = self.lr
+
+        raw_parts = [layer.forward_dense(x_np, lr)
+                     for layer in self._sili_layers.values()]
+        raw_np = sum(raw_parts)   # [batch, n_folds*out_dim] -- kept as-is
+        if squeezed:
+            raw_np = raw_np.squeeze(0)
+
+        out = Tensor(raw_np, _children=(x,), _op="folded_column_in_proj", backend=x.backend)
+
+        _layers = list(self._sili_layers.values())
+        _sq     = squeezed
+
+        def _bwd():
+            if out.grad is None:
+                return
+            dy_np = np.asarray(out.grad, dtype=np.float32)
+            if dy_np.ndim == 1:
+                dy_np = dy_np[np.newaxis, :]
+            dx_parts = [layer.backward_dense(dy_np, lr, lr_per_row_nnz=True)
+                        for layer in _layers]
+            dx_np = sum(dx_parts).reshape(dy_np.shape[0], -1)
+            if _sq:
+                dx_np = dx_np.squeeze(0)
+            _acc(x, dx_np)
+
+        out._backward = _bwd
+        return out
+
+    def forward(self, x: "Tensor", state: "Tensor" = None) -> "Tensor":
+        """
+        h = in_proj(x) + recurrent(state) -- same pattern as
+        SparseRNNCell.forward. Returns the new state; feed it back in as
+        `state` on the next call. state=None (default) uses zeros -- true
+        step-0, matching RNNFoldedBlock.forward's state=0 start.
+        """
+        raw = self.in_proj(x)
+        if state is None:
+            state = Tensor(np.zeros(self.out_features, dtype=np.float32),
+                           backend=x.backend)
+        rec = apply_fold_skip(self.recurrent, state, lr=self.lr)
+        return raw + rec
+
+    def state_dict(self) -> dict:
+        """FoldedLayer.state_dict() (in_proj) plus recurrent."""
+        out = super().state_dict()
+        out["recurrent"] = _sparse_linear_layer_state_dict(self.recurrent)
+        return out
+
+    def load_state_dict(self, d: dict) -> None:
+        """Restore in_proj (via FoldedLayer.load_state_dict) and
+        recurrent."""
+        super().load_state_dict({k: v for k, v in d.items() if k != "recurrent"})
+        _sparse_linear_layer_load_state_dict(self.recurrent, d["recurrent"])
+
+
+def _build_banded_csr(total: int, bandwidth: int):
+    """Zero-valued [total, total] banded-diagonal CSR: row r connects to
+    columns c with abs(r-c) < bandwidth, clipped to [0, total). Split out
+    of build_fold_skip_layer so the pattern can be unioned with an
+    existing CSR (see csr_union) before any SparseLinearLayer is built."""
+    positions = np.arange(total)
+    lo = np.clip(positions - bandwidth + 1, 0, None)
+    hi = np.clip(positions + bandwidth - 1, None, total - 1)
+    row_lengths = (hi - lo + 1).astype(np.int64)
+
+    ptrs = np.zeros(total + 1, dtype=np.int64)
+    ptrs[1:] = np.cumsum(row_lengths)
+    nnz = int(ptrs[-1])
+
+    idx = np.empty(nnz, dtype=np.int32)
+    pos = 0
+    for r in range(total):
+        n = int(row_lengths[r])
+        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        pos += n
+
+    return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
+
+
+def _build_rectangular_banded_csr(rows: int, cols: int, bandwidth: int):
+    """Zero-valued banded CSR from `rows` positions to `cols` positions --
+    generalizes _build_banded_csr to a rectangular shape, where rows and
+    cols differ in size so there's no exact diagonal. Row r connects to
+    columns near round(r * cols / rows) (a geometric, proportional-position
+    diagonal), within `bandwidth` either side, clipped to [0, cols)."""
+    assert rows >= 1 and cols >= 1 and bandwidth >= 1
+    positions = np.arange(rows)
+    centers = (positions.astype(np.float64) * cols / rows).astype(np.int64)
+    lo = np.clip(centers - bandwidth + 1, 0, None)
+    hi = np.clip(centers + bandwidth - 1, None, cols - 1)
+    row_lengths = (hi - lo + 1).astype(np.int64)
+
+    ptrs = np.zeros(rows + 1, dtype=np.int64)
+    ptrs[1:] = np.cumsum(row_lengths)
+    nnz = int(ptrs[-1])
+
+    idx = np.empty(nnz, dtype=np.int32)
+    pos = 0
+    for r in range(rows):
+        n = int(row_lengths[r])
+        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        pos += n
+
+    return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
+
+
+def state_dict_to_true_csr(d: dict):
+    """
+    Convert one _sparse_linear_layer_state_dict()-shaped dict (e.g.
+    layer.state_dict()["recurrent"]) into a (ptrs, idx, vals) CSR with
+    vals in TRUE units -- the format csr_union/build_fold_skip_layer's
+    `existing` expects, since raw FP4 units from differently-scaled
+    sources aren't directly comparable.
+    """
+    ptrs   = np.asarray(d["ptrs"],  dtype=np.int32)
+    idx    = np.asarray(d["indices"], dtype=np.int32)
+    raw    = np.asarray(d["weights"], dtype=np.float32)
+    scale  = np.asarray(d["value_scale"], dtype=np.float32)
+    vals   = raw.copy()
+    for r in range(len(ptrs) - 1):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            vals[start:end] = raw[start:end] * scale[r]
+    return ptrs, idx, vals
+
+
+def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
+              n_rows: int, prefer: str = "a", num_cpus: int = 4):
+    """
+    Merge two CSRs of the SAME shape into one holding the union of their
+    nonzero positions. `vals_a`/`vals_b` must already be in true units
+    (not raw FP4 levels -- mixing raw units from differently-scaled
+    sources would be wrong); rescaling happens after the union, once a
+    single per-row scale for the merged row is chosen.
+
+    Where both inputs have an entry at (row, col), `prefer` decides the
+    result: 'a' (default) keeps A, 'b' keeps B, 'sum' adds them.
+
+    Construction/loading time only -- never used in the forward/backward
+    path. See build_fold_skip_layer's `existing` for the concrete case.
+
+    OpenMP-parallel (_cpu.csr_union, see csr.hpp) -- each row is an
+    independent two-pointer merge, so this scales to real model-sized
+    weight matrices instead of a per-row Python loop.
+    """
+    assert prefer in ("a", "b", "sum")
+    return _cpu.csr_union(
+        np.asarray(ptrs_a, dtype=np.int32), np.asarray(idx_a, dtype=np.int32),
+        np.asarray(vals_a, dtype=np.float32),
+        np.asarray(ptrs_b, dtype=np.int32), np.asarray(idx_b, dtype=np.int32),
+        np.asarray(vals_b, dtype=np.float32),
+        int(n_rows), prefer, num_cpus,
+    )
+
+
+def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
+                          bandwidth: int = None,
+                          headroom_fraction: float = 0.5,
+                          expected_lr: float = 0.01,
+                          existing=None,
+                          existing_prefer: str = "b") -> "_cpu.SparseLinearLayer":
+    """
+    Sparse layer mapping a FoldedColumnLayer's own [n_folds*out_dim]
+    output space back to itself: skip connections between virtual
+    (fold-depth) layers, pre-seeded as a zero-valued banded pattern (see
+    RNNFoldedBlock.forward in conversion/rnn_fold.py for the true fold
+    recurrence this approximates).
+
+    bandwidth: connect flat positions r, c whenever abs(r - c) < bandwidth.
+    Default (None) uses out_dim, so one hop reaches the adjacent fold
+    step at any nearby column.
+
+    expected_lr: sets the fallback per-row value_scale (expected_lr /
+    FP4_MAX) for rows whose final values are still all-zero, so gradient
+    updates of that magnitude don't round back to zero under FP4. Rows
+    with real nonzero values (from `existing`) get max_abs/FP4_MAX
+    instead.
+
+    existing: optional (ptrs, idx, vals) CSR, same shape, vals in TRUE
+    units (see csr_union) -- unioned with the fresh band before
+    construction. Pass a previously-trained recurrent CSR to preserve it
+    across re-runs; None (default) is the "converting a dense LLM" case.
+    existing_prefer: csr_union's prefer arg for overlapping positions --
+    default 'b' (existing's trained value wins over the fresh zero).
+    """
+    assert n_folds >= 1 and out_dim >= 1
+    bw = out_dim if bandwidth is None else bandwidth
+    assert bw >= 1
+    total = n_folds * out_dim
+
+    ptrs, idx, vals = _build_banded_csr(total, bw)
+
+    if existing is not None:
+        ex_ptrs, ex_idx, ex_vals = existing
+        ptrs, idx, vals = csr_union(ptrs, idx, vals, ex_ptrs, ex_idx, ex_vals,
+                                    total, prefer=existing_prefer, num_cpus=num_cpus)
+
+    nnz = len(idx)
+    row_lengths = ptrs[1:] - ptrs[:-1]
+    max_row_weights = int(row_lengths.max()) if nnz > 0 else 1
+    budget = nnz + int(headroom_fraction * nnz) + total
+
+    _FP4_MAX = 6.0
+    row_scales = np.full(total, expected_lr / _FP4_MAX, dtype=np.float32)
+    for r in range(total):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            max_abs = float(np.abs(vals[start:end]).max())
+            if max_abs > 0.0:
+                row_scales[r] = max_abs / _FP4_MAX
+                vals[start:end] = vals[start:end] / row_scales[r]
+
+    layer = _cpu.SparseLinearLayer(total, total, budget, num_cpus)
+    layer.load_weights(ptrs, idx, vals)
+    layer.equalize_to_capacity(max_row_weights)
+
+    for r in range(total):
+        layer.set_value_scale_raw(r, float(row_scales[r]))
+        layer.set_importance_scale_raw(r, expected_lr / _FP4_MAX)
+
+    return layer
+
+
+def build_input_skip_preseed(n_in: int, n_folds: int, out_dim: int, bandwidth: int = None):
+    """
+    Zero-valued, trainable skip connections from external input directly to
+    every fold-depth column -- the in_proj analogue of build_fold_skip_layer
+    (which does this for `recurrent`). Without this, in_proj's only
+    connections are the original dense LLM's fixed per-layer weights, with
+    no room for training to grow a new input->column path.
+
+    Returns a (ptrs, idx, vals) CSR shaped [n_in, n_folds*out_dim], all
+    vals 0.0 -- meant to be unioned onto a suffix's real stacked weights
+    (see FoldedColumnLayer.from_descriptor's `input_skip_bandwidth`).
+
+    bandwidth: geometric banding (see _build_rectangular_banded_csr) --
+    input dim i connects to columns near round(i * n_folds*out_dim / n_in),
+    within `bandwidth` either side. Default (None) uses out_dim.
+    """
+    total_out = n_folds * out_dim
+    bw = out_dim if bandwidth is None else bandwidth
+    return _build_rectangular_banded_csr(n_in, total_out, bw)
+
+
+def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
+                                num_cpus: int, expected_lr: float,
+                                headroom_fraction: float = 0.5):
+    """
+    Rebuild a SparseLinearLayer, unioning a zero-valued pre-seed CSR's
+    structural positions onto the layer's real (already-trained/pretrained)
+    weights. Real values always win at any overlap (prefer="a") -- the
+    pre-seed only adds new zero-valued positions, never clobbers real data.
+    Budget/scale handling mirrors build_fold_skip_layer (nnz-based
+    headroom, per-row FP4 rescaling recomputed on the merged row).
+    """
+    n_in, n_out = layer.n_inputs, layer.n_outputs
+    real_ptrs, real_idx, real_vals = state_dict_to_true_csr(
+        _sparse_linear_layer_state_dict(layer))
+    preseed_vals = np.zeros(len(preseed_idx), dtype=np.float32)
+    ptrs, idx, vals = csr_union(real_ptrs, real_idx, real_vals,
+                                preseed_ptrs, preseed_idx, preseed_vals,
+                                n_in, prefer="a", num_cpus=num_cpus)
+
+    nnz = len(idx)
+    row_lengths = ptrs[1:] - ptrs[:-1]
+    max_row_weights = int(row_lengths.max()) if nnz > 0 else 1
+    budget = nnz + int(headroom_fraction * nnz) + n_in
+
+    _FP4_MAX = 6.0
+    row_scales = np.full(n_in, expected_lr / _FP4_MAX, dtype=np.float32)
+    for r in range(n_in):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            max_abs = float(np.abs(vals[start:end]).max())
+            if max_abs > 0.0:
+                row_scales[r] = max_abs / _FP4_MAX
+                vals[start:end] = vals[start:end] / row_scales[r]
+
+    new_layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
+    new_layer.load_weights(ptrs, idx, vals)
+    new_layer.equalize_to_capacity(max_row_weights)
+    for r in range(n_in):
+        new_layer.set_value_scale_raw(r, float(row_scales[r]))
+        new_layer.set_importance_scale_raw(r, expected_lr / _FP4_MAX)
+    return new_layer
+
+
+def apply_fold_skip(skip_layer, x: "Tensor", lr: float = 0.01) -> "Tensor":
+    """
+    Apply a build_fold_skip_layer()-constructed layer to a
+    FoldedColumnLayer's raw output, wired into the Tensor autograd graph
+    (forward_dense + backward_dense, the same pattern FoldedLayer/
+    FoldedColumnLayer use for their own suffix layers). Typical use:
+    refined = raw + apply_fold_skip(skip, raw, lr) -- the skip
+    connections contribute a residual correction on top of the
+    independently-computed per-fold-step output.
+    """
+    x_np = np.asarray(x.data, dtype=np.float32)
+    squeezed = x_np.ndim == 1
+    if squeezed:
+        x_np = x_np[np.newaxis, :]
+
+    out_np = skip_layer.forward_dense(x_np, lr)
+    if squeezed:
+        out_np = out_np.squeeze(0)
+    out = Tensor(out_np, _children=(x,), _op="fold_skip", backend=x.backend)
+
+    def _bwd():
+        if out.grad is None:
+            return
+        dy = np.asarray(out.grad, dtype=np.float32)
+        if dy.ndim == 1:
+            dy = dy[np.newaxis, :]
+        dx = skip_layer.backward_dense(dy, lr, lr_per_row_nnz=True)
+        if squeezed:
+            dx = dx.squeeze(0)
+        _acc(x, dx)
+
+    out._backward = _bwd
+    return out
 
 
 class LayerMemoryState:

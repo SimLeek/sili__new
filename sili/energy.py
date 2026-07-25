@@ -24,7 +24,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from sili.module import Module
-from sili.tensor import Tensor
+from sili.tensor import Tensor, gather
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -600,3 +600,45 @@ class EMABranchingRatioTracker:
         self._prev = None
         self._mean_a = self._mean_b = self._mean_aa = self._mean_ab = None
         self._n_pairs = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Column-averaging loss
+# ══════════════════════════════════════════════════════════════════════════════
+
+def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int,
+                          weight: float = 1.0, indices=None) -> Tensor:
+    """
+    weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where column_i
+    is the set of n_folds neurons tracking input index i.
+
+    Takes h_out (energy-gated), not the pre-gating h -- a column member
+    EnergyDynamics suppresses should hurt this loss, not be invisible to
+    it, so the network has to satisfy energy management and prediction
+    jointly. Combine with EnergyDynamics's aux_loss via
+    sili.tensor.combine_losses.
+
+    indices: optional int array, len n_folds*input_size, selecting which
+    flat positions of a larger h_out form the column block (position
+    indices[t*input_size+i] = column i's neuron at fold-step t). None
+    (default) requires h_out to be exactly that size.
+    """
+    input_size = target.shape[0]
+    expected = n_folds * input_size
+    if indices is None:
+        assert h_out.shape[0] == expected, (
+            f"h_out has {h_out.shape[0]} elements, expected n_folds*input_size "
+            f"= {n_folds}*{input_size} = {expected} (or pass indices to "
+            f"select a subset of a larger state)"
+        )
+        column_block = h_out
+    else:
+        indices = np.asarray(indices)
+        assert indices.shape == (expected,), (
+            f"indices has shape {indices.shape}, expected ({expected},)"
+        )
+        column_block = gather(h_out, indices)
+
+    col_mean = column_block.reshape((n_folds, input_size)).sum(axis=0) * (1.0 / n_folds)
+    diff     = col_mean - target
+    return (diff ** 2).sum() * (weight / input_size)
