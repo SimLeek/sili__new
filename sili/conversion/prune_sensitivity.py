@@ -170,3 +170,80 @@ def stepwise_cumulative_eval(
                 trial_sd[n] = t * (t.abs() >= threshold)
         out.append((tuple(cumulative), eval_fn(trial_sd)))
     return out
+
+
+def iterative_threshold_search(
+    state_dict: Dict[str, torch.Tensor],
+    groups: Dict[str, List[str]],
+    initial_thresholds: Dict[str, float],
+    step_order: Sequence[Sequence[str]],
+    eval_fn: EvalFn,
+    baseline_score: float,
+    target_score: float,
+    shrink_factor: float = 0.5,
+    max_iterations: int = 10,
+    min_threshold: float = 0.0,
+    max_sample: int = 5_000_000,
+) -> Tuple[Dict[str, float], List[dict]]:
+    """
+    Greedy search: run stepwise_cumulative_eval with the CURRENT
+    thresholds, find whichever step caused the single worst marginal
+    score drop, shrink JUST the group(s) newly added in that step by
+    `shrink_factor` (floored at `min_threshold`), and repeat. Stops as
+    soon as the final (all-groups-combined) score reaches
+    `target_score`, or after `max_iterations` rounds, or once nothing is
+    left with room to shrink -- whichever comes first.
+
+    This encodes the "look at the stepwise trace, reduce whatever caused
+    the biggest single jump, re-check the combined result" procedure
+    used to calibrate MiniCPM5-1B-Base's own per-group thresholds (see
+    sili_peridot's conversion notes) -- greedy and NOT guaranteed
+    globally optimal (shrinking one group changes how much a group added
+    AFTER it costs, since costs compound along step_order; only the
+    single worst offender per round gets touched, never a joint
+    optimization across all groups at once), but it's exactly the manual
+    procedure that worked there, made repeatable instead of ad hoc.
+
+    baseline_score: eval_fn's score on the fully dense `state_dict` --
+    passed in rather than recomputed each round, since eval_fn is
+    typically a full model forward pass and this value never changes.
+
+    Returns (final_thresholds, history) -- history has one entry per
+    iteration actually run: {"thresholds": {...}, "final_score": float,
+    "steps": [(names_so_far, score), ...]}, in order, so callers can see
+    the whole search trace, not just the final answer.
+    """
+    thresholds = dict(initial_thresholds)
+    history: List[dict] = []
+
+    for _ in range(max_iterations):
+        steps = stepwise_cumulative_eval(state_dict, groups, thresholds,
+                                         step_order, eval_fn, max_sample=max_sample)
+        final_score = steps[-1][1]
+        history.append({"thresholds": dict(thresholds), "final_score": final_score,
+                        "steps": steps})
+        if final_score >= target_score:
+            break
+
+        drops = []
+        prev_score = baseline_score
+        for i, (_names, score) in enumerate(steps):
+            drops.append((prev_score - score, i))
+            prev_score = score
+        drops.sort(key=lambda d: -d[0])
+
+        shrunk_any = False
+        for _drop, step_idx in drops:
+            names = steps[step_idx][0]
+            prev_names = steps[step_idx - 1][0] if step_idx > 0 else ()
+            newly_added = [n for n in names if n not in prev_names]
+            shrinkable = [g for g in newly_added if thresholds[g] > min_threshold]
+            if shrinkable:
+                for gname in shrinkable:
+                    thresholds[gname] = max(min_threshold, thresholds[gname] * shrink_factor)
+                shrunk_any = True
+                break
+        if not shrunk_any:
+            break   # nothing left with room to shrink -- stop rather than loop forever
+
+    return thresholds, history

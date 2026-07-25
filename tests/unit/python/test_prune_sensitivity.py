@@ -15,7 +15,7 @@ import pytest
 
 from sili.conversion.prune_sensitivity import (
     group_tensor_names_by_role, sweep_group_sensitivity,
-    apply_group_thresholds, stepwise_cumulative_eval,
+    apply_group_thresholds, stepwise_cumulative_eval, iterative_threshold_search,
 )
 
 
@@ -172,3 +172,94 @@ class TestStepwiseCumulativeEval:
         )
         assert len(steps) == 1
         assert steps[0][0] == (q_group, v_group)
+
+
+def _asymmetric_state_dict(n_layers=2):
+    """Two roles with deliberately different pruning sensitivity, for
+    iterative_threshold_search: `critical` is ~10x the magnitude of
+    `mlp`, so under an L1-distance-to-original eval_fn the SAME pruned
+    *fraction* costs ~10x more there -- matches the real MiniCPM5 finding
+    (v_proj vs k_proj) this function's docstring references."""
+    torch.manual_seed(1)
+    sd = {}
+    for i in range(n_layers):
+        sd[f"model.layers.{i}.mlp.weight"]      = torch.randn(8, 8)
+        sd[f"model.layers.{i}.attn.critical.weight"] = torch.randn(8, 8) * 2.0 + 10.0
+    return sd
+
+
+class TestIterativeThresholdSearch:
+    def _setup(self):
+        sd = _asymmetric_state_dict()
+        groups = group_tensor_names_by_role(sd)
+        mlp_group  = next(g for g in groups if "mlp" in g)
+        crit_group = next(g for g in groups if "critical" in g)
+
+        def eval_fn(trial_sd):
+            return -sum(float((trial_sd[k] - sd[k]).abs().sum()) for k in sd)
+
+        baseline = eval_fn(sd)   # == 0.0: no pruning yet
+        return sd, groups, mlp_group, crit_group, eval_fn, baseline
+
+    def test_stops_immediately_once_target_already_met(self):
+        sd, groups, mlp_group, crit_group, eval_fn, baseline = self._setup()
+        initial = {mlp_group: 0.9, crit_group: 0.9}
+        thresholds, history = iterative_threshold_search(
+            sd, groups, initial, step_order=[[mlp_group], [crit_group]],
+            eval_fn=eval_fn, baseline_score=baseline,
+            target_score=baseline - 1e9,   # essentially unreachable-bad, i.e. always satisfied
+            max_iterations=10,
+        )
+        assert len(history) == 1
+        assert thresholds == initial   # never touched -- target met on the first check
+
+    def test_shrinks_the_worse_offender_first(self):
+        sd, groups, mlp_group, crit_group, eval_fn, baseline = self._setup()
+        initial = {mlp_group: 0.9, crit_group: 0.9}
+        # Strict enough that round 0 (aggressive 0.9/0.9) can't meet it.
+        thresholds, history = iterative_threshold_search(
+            sd, groups, initial, step_order=[[mlp_group], [crit_group]],
+            eval_fn=eval_fn, baseline_score=baseline, target_score=baseline - 1.0,
+            max_iterations=1,
+        )
+        assert history[0]["final_score"] < baseline - 1.0   # confirms target really wasn't met yet
+        assert thresholds[crit_group] < initial[crit_group]
+        assert thresholds[mlp_group] == initial[mlp_group]
+
+    def test_min_threshold_floor_is_never_exceeded(self):
+        sd, groups, mlp_group, crit_group, eval_fn, baseline = self._setup()
+        initial = {mlp_group: 0.9, crit_group: 0.9}
+        thresholds, history = iterative_threshold_search(
+            sd, groups, initial, step_order=[[mlp_group], [crit_group]],
+            eval_fn=eval_fn, baseline_score=baseline,
+            target_score=baseline + 1.0,   # unreachable-good -- forces every possible shrink
+            shrink_factor=0.5, min_threshold=0.1, max_iterations=20,
+        )
+        assert thresholds[mlp_group] >= 0.1
+        assert thresholds[crit_group] >= 0.1
+        assert len(history) <= 20
+
+    def test_gives_up_once_nothing_left_to_shrink(self):
+        sd, groups, mlp_group, crit_group, eval_fn, baseline = self._setup()
+        # Both already sitting exactly at the floor -- first shrink
+        # attempt finds nothing shrinkable and stops immediately.
+        initial = {mlp_group: 0.1, crit_group: 0.1}
+        thresholds, history = iterative_threshold_search(
+            sd, groups, initial, step_order=[[mlp_group], [crit_group]],
+            eval_fn=eval_fn, baseline_score=baseline,
+            target_score=baseline + 1.0, min_threshold=0.1, max_iterations=10,
+        )
+        assert len(history) == 1
+        assert thresholds == initial
+
+    def test_history_thresholds_are_a_snapshot_not_a_live_reference(self):
+        sd, groups, mlp_group, crit_group, eval_fn, baseline = self._setup()
+        initial = {mlp_group: 0.9, crit_group: 0.9}
+        _, history = iterative_threshold_search(
+            sd, groups, initial, step_order=[[mlp_group], [crit_group]],
+            eval_fn=eval_fn, baseline_score=baseline, target_score=baseline - 1.0,
+            max_iterations=3,
+        )
+        # Later iterations must not retroactively change an earlier
+        # iteration's recorded thresholds.
+        assert history[0]["thresholds"][crit_group] == 0.9
