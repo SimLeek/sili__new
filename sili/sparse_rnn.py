@@ -739,9 +739,9 @@ class SparseRNNCell(Module):
     on the combined h cannot distinguish a genuinely self-propagating
     recurrent pathway from fresh input alone carrying activity while the
     recurrent branching factor is silently 0. `branching_tracker` selects
-    which estimator backs `self.branching_recurrent`: "window" (default,
+    which estimator backs `self.branching_recurrent`: "window" (
     a hard sliding window, also the only one that supports
-    avalanche_sizes() for a SOC power-law-tail check) or "ema" (O(1)
+    avalanche_sizes() for a SOC power-law-tail check) or "ema" (default, O(1)
     memory, exponentially-discounted -- prefer this when you want a
     continuously-updated read with a tunable fast/long-term tradeoff via
     `branching_ema_alpha`, e.g. for `dynamic_density_from_branching_ratio`
@@ -757,7 +757,7 @@ class SparseRNNCell(Module):
     def __init__(self, n_inputs: int, state_size: int, max_weights: int,
                  num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
                  dynamic_density_from_branching_ratio: bool = False,
-                 branching_tracker: str = "window",
+                 branching_tracker: str = "ema",
                  branching_window: int = 200,
                  branching_ema_alpha: float = 0.05):
         assert branching_tracker in ("window", "ema"), \
