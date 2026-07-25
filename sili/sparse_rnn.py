@@ -662,7 +662,9 @@ class FoldedColumnLayer(FoldedLayer):
     def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
                         num_cpus: int = 4, max_row_weights: int = 0,
                         bytes_per_row: int = 0,
-                        recurrent_bandwidth: int = None) -> "FoldedColumnLayer":
+                        recurrent_bandwidth: int = None,
+                        existing_recurrent=None,
+                        existing_recurrent_prefer: str = "b") -> "FoldedColumnLayer":
         """
         Like FoldedLayer.from_descriptor, plus builds `recurrent` (see
         class docstring and build_fold_skip_layer) sized to this layer's
@@ -671,6 +673,16 @@ class FoldedColumnLayer(FoldedLayer):
         recurrent_bandwidth: forwarded to build_fold_skip_layer as
         `bandwidth` -- None (default) uses that function's own default
         (out_dim, i.e. one hop reaches the adjacent fold step).
+
+        existing_recurrent / existing_recurrent_prefer: forwarded to
+        build_fold_skip_layer as `existing`/`existing_prefer` -- pass a
+        previously-saved recurrent CSR (e.g.
+        state_dict_to_true_csr(some_prior_layer.state_dict()["recurrent"]))
+        to preserve real trained skip-connection weights when re-running
+        from_descriptor on (possibly updated) LLM weights, rather than
+        starting recurrent from scratch every time.
+        None (default) is the plain "converting a dense LLM, which has no
+        skip connections at all" case.
         """
         obj = super().from_descriptor(
             descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
@@ -679,6 +691,7 @@ class FoldedColumnLayer(FoldedLayer):
         obj.recurrent = build_fold_skip_layer(
             obj._n_folds, obj.column_width, num_cpus=num_cpus,
             bandwidth=recurrent_bandwidth, expected_lr=learning_rate,
+            existing=existing_recurrent, existing_prefer=existing_recurrent_prefer,
         )
         return obj
 
@@ -767,16 +780,125 @@ class FoldedColumnLayer(FoldedLayer):
         _sparse_linear_layer_load_state_dict(self.recurrent, d["recurrent"])
 
 
+def _build_banded_csr(total: int, bandwidth: int):
+    """Pure CSR array generation for a [total, total] banded-diagonal
+    pattern: row r connects to columns c with abs(r-c) < bandwidth,
+    clipped to [0, total). All values 0.0. Split out of
+    build_fold_skip_layer so its structural pattern can be unioned with
+    an existing CSR (see csr_union) before any SparseLinearLayer gets
+    constructed."""
+    positions = np.arange(total)
+    lo = np.clip(positions - bandwidth + 1, 0, None)
+    hi = np.clip(positions + bandwidth - 1, None, total - 1)
+    row_lengths = (hi - lo + 1).astype(np.int64)
+
+    ptrs = np.zeros(total + 1, dtype=np.int64)
+    ptrs[1:] = np.cumsum(row_lengths)
+    nnz = int(ptrs[-1])
+
+    idx = np.empty(nnz, dtype=np.int32)
+    pos = 0
+    for r in range(total):
+        n = int(row_lengths[r])
+        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        pos += n
+
+    return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
+
+
+def state_dict_to_true_csr(d: dict):
+    """
+    Convert one _sparse_linear_layer_state_dict()-shaped dict (e.g.
+    layer.state_dict()["recurrent"]) into a (ptrs, idx, vals) CSR with
+    vals in TRUE units -- the format csr_union/build_fold_skip_layer's
+    `existing` expects. Necessary because state_dict() saves RAW
+    quantized weights + a separate per-row value_scale (see
+    _sparse_linear_layer_state_dict's docstring for why they're kept
+    separate there); csr_union needs one merged "true value" per
+    position instead, since raw units from two differently-scaled
+    sources aren't comparable/summable directly.
+    """
+    ptrs   = np.asarray(d["ptrs"],  dtype=np.int32)
+    idx    = np.asarray(d["indices"], dtype=np.int32)
+    raw    = np.asarray(d["weights"], dtype=np.float32)
+    scale  = np.asarray(d["value_scale"], dtype=np.float32)
+    vals   = raw.copy()
+    for r in range(len(ptrs) - 1):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            vals[start:end] = raw[start:end] * scale[r]
+    return ptrs, idx, vals
+
+
+def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
+              n_rows: int, prefer: str = "a"):
+    """
+    Merge two CSRs of the SAME shape (n_rows rows, same implicit column
+    space) into one CSR holding the union of their nonzero positions.
+    `vals_a`/`vals_b` must already be in the SAME units (true values --
+    i.e. already multiplied by whatever per-row value_scale their source
+    used, not raw FP4 levels; mixing raw units from two differently
+    -scaled sources here would silently be wrong) -- rescaling to raw
+    FP4 units happens after the union, once a single per-row scale for
+    the MERGED row is chosen (see build_fold_skip_layer's `existing`).
+
+    Where both inputs have an entry at the same (row, col), `prefer`
+    decides the result: 'a' (default) keeps A's value, 'b' keeps B's,
+    'sum' adds them. Positions present in only one input use that value
+    directly.
+
+    Not used in the normal forward/backward/training path -- only at
+    construction/loading time, when a layer's structural pattern needs
+    to come from more than one source. See build_fold_skip_layer's
+    `existing` parameter for the concrete case this exists for: a dense
+    LLM has no skip connections at all, so converting one starts from an
+    empty set that gets unioned with the fresh banded pre-seed (trivial
+    union, degenerates to just the band); a previously-trained
+    recurrent, or manually-specified additional skip connections, are
+    the non-trivial cases.
+    """
+    assert prefer in ("a", "b", "sum")
+    row_idx = [None] * n_rows
+    row_val = [None] * n_rows
+    for r in range(n_rows):
+        a_start, a_end = int(ptrs_a[r]), int(ptrs_a[r + 1])
+        b_start, b_end = int(ptrs_b[r]), int(ptrs_b[r + 1])
+        merged = dict(zip(idx_a[a_start:a_end].tolist(), vals_a[a_start:a_end].tolist()))
+        for c, v in zip(idx_b[b_start:b_end].tolist(), vals_b[b_start:b_end].tolist()):
+            if c in merged:
+                if prefer == "sum":
+                    merged[c] += v
+                elif prefer == "b":
+                    merged[c] = v
+                # prefer == "a": keep A's existing value, ignore B's
+            else:
+                merged[c] = v
+        cols_sorted = sorted(merged.keys())
+        row_idx[r] = np.asarray(cols_sorted, dtype=np.int32)
+        row_val[r] = np.asarray([merged[c] for c in cols_sorted], dtype=np.float32)
+
+    new_idx  = np.concatenate(row_idx) if n_rows > 0 else np.zeros(0, dtype=np.int32)
+    new_vals = np.concatenate(row_val) if n_rows > 0 else np.zeros(0, dtype=np.float32)
+    new_ptrs = np.zeros(n_rows + 1, dtype=np.int32)
+    for r in range(n_rows):
+        new_ptrs[r + 1] = new_ptrs[r] + len(row_idx[r])
+
+    return new_ptrs, new_idx, new_vals
+
+
 def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
                           bandwidth: int = None,
                           headroom_fraction: float = 0.5,
-                          expected_lr: float = 0.01) -> "_cpu.SparseLinearLayer":
+                          expected_lr: float = 0.01,
+                          existing=None,
+                          existing_prefer: str = "b") -> "_cpu.SparseLinearLayer":
     """
-    Fresh, from-scratch sparse layer mapping a FoldedColumnLayer's own
-    [n_folds*out_dim] output space back to itself: literal skip
-    connections between virtual (fold-depth) layers, pre-seeded as a
-    banded pattern (all zero-valued -- nothing pretrained here, this
-    connectivity has no equivalent in the original unfolded model).
+    Sparse layer mapping a FoldedColumnLayer's own [n_folds*out_dim]
+    output space back to itself: literal skip connections between
+    virtual (fold-depth) layers, pre-seeded as a banded pattern. With no
+    `existing` (the default), this is entirely from-scratch and
+    zero-valued -- the case for converting a dense LLM, which has no
+    skip connections at all to bring forward.
 
     Why: FoldedLayer's single-matmul-then-sum trick computes every fold
     step's contribution from the SAME external input, independent of
@@ -803,46 +925,66 @@ def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
     value_scale is set relative to the learning rate that will actually
     be used to train it (FP4's minimum nonzero magnitude is
     0.5*value_scale; an update of order expected_lr rounds back to zero
-    under the default scale otherwise). Pass the SAME learning rate you
-    intend to call apply_fold_skip/backward_dense with, or these
-    connections will silently never move off zero no matter how much you
-    train.
+    under the default scale otherwise). Used as the fallback scale for
+    any row whose FINAL (post-union) values are still all zero; rows with
+    real nonzero values (from `existing`) instead get max_abs/FP4_MAX,
+    same as from_descriptor's own pretrained-weight scaling, so real
+    trained magnitudes aren't clipped by a scale sized for zero-escape.
+
+    existing: optional (ptrs, idx, vals) CSR, same [n_folds*out_dim,
+    n_folds*out_dim] shape, vals in TRUE units (see csr_union) -- unioned
+    with the fresh banded pre-seed before construction. NOT used in the
+    normal forward/backward/training path -- only when recurrent's
+    structural pattern needs to come from more than one source: loading
+    from a dense LLM (the default, existing=None -- union with an empty
+    set is a no-op, so this degenerates to plain banded pre-seeding) is
+    the immediate case; a previously-trained recurrent (pass its saved
+    CSR here to preserve real trained values while still guaranteeing the
+    band is present) or manually-specified additional skip connections
+    are the non-trivial ones.
+    existing_prefer: csr_union's prefer arg for positions in both the
+    fresh band and `existing` -- default 'b' (existing's value wins over
+    the fresh zero-valued pre-seed, since bringing forward real trained
+    weights is the point of passing `existing` at all).
     """
     assert n_folds >= 1 and out_dim >= 1
     bw = out_dim if bandwidth is None else bandwidth
     assert bw >= 1
     total = n_folds * out_dim
 
-    positions = np.arange(total)
-    lo = np.clip(positions - bw + 1, 0, None)
-    hi = np.clip(positions + bw - 1, None, total - 1)
-    row_lengths = (hi - lo + 1).astype(np.int64)
+    ptrs, idx, vals = _build_banded_csr(total, bw)
 
-    ptrs = np.zeros(total + 1, dtype=np.int64)
-    ptrs[1:] = np.cumsum(row_lengths)
-    nnz = int(ptrs[-1])
+    if existing is not None:
+        ex_ptrs, ex_idx, ex_vals = existing
+        ptrs, idx, vals = csr_union(ptrs, idx, vals, ex_ptrs, ex_idx, ex_vals,
+                                    total, prefer=existing_prefer)
 
-    idx = np.empty(nnz, dtype=np.int32)
-    pos = 0
-    for r in range(total):
-        n = int(row_lengths[r])
-        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
-        pos += n
-    ptrs = ptrs.astype(np.int32)
-    vals = np.zeros(nnz, dtype=np.float32)
-
-    max_row_weights = int(row_lengths.max())
+    nnz = len(idx)
+    row_lengths = ptrs[1:] - ptrs[:-1]
+    max_row_weights = int(row_lengths.max()) if nnz > 0 else 1
     budget = nnz + int(headroom_fraction * nnz) + total
+
+    # Per-row scale: real (post-union) magnitude gets full FP4 resolution
+    # (max_abs/FP4_MAX, same as from_descriptor's pretrained-weight
+    # scaling); a row that's still all-zero falls back to expected_lr's
+    # zero-escape scale, same reasoning as the no-`existing` case.
+    _FP4_MAX = 6.0
+    row_scales = np.full(total, expected_lr / _FP4_MAX, dtype=np.float32)
+    for r in range(total):
+        start, end = int(ptrs[r]), int(ptrs[r + 1])
+        if end > start:
+            max_abs = float(np.abs(vals[start:end]).max())
+            if max_abs > 0.0:
+                row_scales[r] = max_abs / _FP4_MAX
+                vals[start:end] = vals[start:end] / row_scales[r]
 
     layer = _cpu.SparseLinearLayer(total, total, budget, num_cpus)
     layer.load_weights(ptrs, idx, vals)
     layer.equalize_to_capacity(max_row_weights)
 
-    _FP4_MAX = 6.0
-    scale = expected_lr / _FP4_MAX
     for r in range(total):
-        layer.set_value_scale_raw(r, scale)
-        layer.set_importance_scale_raw(r, scale)
+        layer.set_value_scale_raw(r, float(row_scales[r]))
+        layer.set_importance_scale_raw(r, expected_lr / _FP4_MAX)
 
     return layer
 

@@ -19,7 +19,11 @@ import pytest
 
 import sili.cpu
 from sili.tensor import Tensor
-from sili.sparse_rnn import FoldedColumnLayer, FoldedLayer, build_fold_skip_layer
+from sili.sparse_rnn import (
+    FoldedColumnLayer, FoldedLayer, build_fold_skip_layer,
+    csr_union, _build_banded_csr, state_dict_to_true_csr,
+    _sparse_linear_layer_state_dict,
+)
 from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
 
 
@@ -50,6 +54,86 @@ def _toy_square_descriptor(n_folds: int, hidden: int, seed: int = 0,
         band_half_widths={".down_proj.weight": None},
         prefix="model.layers.",
     )
+
+
+class TestCsrUnion:
+    """csr_union: needed because a dense LLM has no skip connections at
+    all -- converting one starts recurrent's structural pattern from an
+    empty set that has to be unioned with the fresh banded pre-seed (see
+    build_fold_skip_layer's `existing`). NOT used in the forward/backward
+    path -- construction/loading time only."""
+
+    def test_disjoint_positions_all_kept(self):
+        ptrs_a = np.array([0, 1], dtype=np.int32)
+        idx_a  = np.array([0], dtype=np.int32)
+        vals_a = np.array([1.0], dtype=np.float32)
+        ptrs_b = np.array([0, 1], dtype=np.int32)
+        idx_b  = np.array([1], dtype=np.int32)
+        vals_b = np.array([2.0], dtype=np.float32)
+
+        p, i, v = csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b, n_rows=1)
+        assert list(zip(i.tolist(), v.tolist())) == [(0, 1.0), (1, 2.0)]
+
+    def test_overlap_prefer_a_keeps_a(self):
+        ptrs = np.array([0, 1], dtype=np.int32)
+        idx  = np.array([0], dtype=np.int32)
+        p, i, v = csr_union(ptrs, idx, np.array([1.0], dtype=np.float32),
+                            ptrs, idx, np.array([9.0], dtype=np.float32),
+                            n_rows=1, prefer="a")
+        assert v.tolist() == [1.0]
+
+    def test_overlap_prefer_b_keeps_b(self):
+        ptrs = np.array([0, 1], dtype=np.int32)
+        idx  = np.array([0], dtype=np.int32)
+        p, i, v = csr_union(ptrs, idx, np.array([1.0], dtype=np.float32),
+                            ptrs, idx, np.array([9.0], dtype=np.float32),
+                            n_rows=1, prefer="b")
+        assert v.tolist() == [9.0]
+
+    def test_overlap_prefer_sum_adds(self):
+        ptrs = np.array([0, 1], dtype=np.int32)
+        idx  = np.array([0], dtype=np.int32)
+        p, i, v = csr_union(ptrs, idx, np.array([1.0], dtype=np.float32),
+                            ptrs, idx, np.array([9.0], dtype=np.float32),
+                            n_rows=1, prefer="sum")
+        assert v.tolist() == [10.0]
+
+    def test_union_with_empty_b_returns_a_unchanged(self):
+        ptrs_a = np.array([0, 2], dtype=np.int32)
+        idx_a  = np.array([0, 1], dtype=np.int32)
+        vals_a = np.array([1.0, 2.0], dtype=np.float32)
+        ptrs_b = np.array([0, 0], dtype=np.int32)
+        idx_b  = np.zeros(0, dtype=np.int32)
+        vals_b = np.zeros(0, dtype=np.float32)
+
+        p, i, v = csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b, n_rows=1)
+        np.testing.assert_array_equal(i, idx_a)
+        np.testing.assert_array_equal(v, vals_a)
+
+    def test_invalid_prefer_raises(self):
+        ptrs = np.array([0, 0], dtype=np.int32)
+        idx  = np.zeros(0, dtype=np.int32)
+        vals = np.zeros(0, dtype=np.float32)
+        with pytest.raises(AssertionError):
+            csr_union(ptrs, idx, vals, ptrs, idx, vals, n_rows=1, prefer="bogus")
+
+
+class TestStateDictToTrueCsr:
+    def test_converts_raw_times_scale_to_true_value(self):
+        n_folds, out_dim = 3, 4
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, expected_lr=0.05)
+        layer.load_weights(
+            np.asarray(layer.ptrs), np.asarray(layer.indices),
+            np.full(layer.nnz, 2.0, dtype=np.float32),
+        )
+        for r in range(layer.n_inputs):
+            layer.set_value_scale_raw(r, 0.3)
+
+        d = _sparse_linear_layer_state_dict(layer)
+        ptrs, idx, vals = state_dict_to_true_csr(d)
+        np.testing.assert_allclose(vals, 2.0 * 0.3, atol=1e-6)
+        np.testing.assert_array_equal(ptrs, d["ptrs"])
+        np.testing.assert_array_equal(idx, d["indices"])
 
 
 class TestBuildFoldSkipLayer:
@@ -103,6 +187,61 @@ class TestBuildFoldSkipLayer:
         assert np.all(np.isfinite(out_np))
         # All-zero weights -> all-zero output pre-training, regardless of x.
         assert np.allclose(out_np, 0.0)
+
+    def test_no_existing_behaves_exactly_as_before(self):
+        # existing=None (the default) is the "converting a dense LLM,
+        # which has no skip connections at all" case -- union with an
+        # empty set, should be indistinguishable from the pre-`existing`
+        # behavior.
+        n_folds, out_dim = 3, 5
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, expected_lr=0.05)
+        assert np.allclose(layer.weights_vals, 0.0)
+        assert layer.get_value_scale(0) == pytest.approx(0.05 / 6.0)
+
+    def test_existing_brings_forward_real_trained_values(self):
+        n_folds, out_dim = 3, 4
+        total = n_folds * out_dim
+
+        trained = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, expected_lr=0.05)
+        trained.load_weights(
+            np.asarray(trained.ptrs), np.asarray(trained.indices),
+            (np.arange(trained.nnz, dtype=np.float32) % 6) - 3,
+        )
+        for r in range(total):
+            trained.set_value_scale_raw(r, 0.8)
+        existing_true = state_dict_to_true_csr(_sparse_linear_layer_state_dict(trained))
+
+        merged = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, expected_lr=0.05,
+                                       existing=existing_true, existing_prefer="b")
+        assert not np.allclose(merged.weights_vals, 0.0)
+        # A row with real (nonzero) merged values should get max_abs/FP4_MAX
+        # scaling, not the tiny zero-escape expected_lr/FP4_MAX scale --
+        # otherwise real trained magnitudes would be clipped.
+        assert merged.get_value_scale(0) != pytest.approx(0.05 / 6.0)
+
+    def test_existing_unions_new_structural_positions(self):
+        # existing containing a position OUTSIDE the fresh band (e.g. from
+        # synaptogenesis growth, or a manually-added skip connection) must
+        # actually grow the final structural pattern, not be dropped.
+        n_folds, out_dim = 3, 4
+        total = n_folds * out_dim
+        ptrs, idx, vals = _build_banded_csr(total, out_dim)
+        fresh_nnz = len(idx)
+
+        row0_end = int(ptrs[1])
+        existing_idx  = np.concatenate([idx[:row0_end], [total - 1], idx[row0_end:]])
+        existing_vals = np.concatenate([vals[:row0_end], [5.0], vals[row0_end:]])
+        existing_ptrs = ptrs.copy()
+        existing_ptrs[1:] += 1
+
+        merged = build_fold_skip_layer(
+            n_folds, out_dim, num_cpus=1, expected_lr=0.05,
+            existing=(existing_ptrs, existing_idx, existing_vals), existing_prefer="b")
+
+        assert merged.nnz == fresh_nnz + 1
+        row0_cols = set(np.asarray(merged.indices)[
+            np.asarray(merged.ptrs)[0]:np.asarray(merged.ptrs)[1]].tolist())
+        assert (total - 1) in row0_cols
 
 
 class TestFoldedColumnLayerForward:
@@ -289,6 +428,50 @@ class TestFoldedColumnLayerRecurrent:
             state = state.detach()
 
         assert not np.allclose(layer.recurrent.weights_vals, 0.0)
+
+    def test_from_descriptor_existing_recurrent_end_to_end(self):
+        # The actual MiniCPM5 conversion path: a dense LLM's folded
+        # weights come with NO skip connections at all, so the caller
+        # supplies a previously-trained `recurrent` CSR (e.g. saved from
+        # an earlier sili run via state_dict_to_true_csr) and expects
+        # from_descriptor to union it with the fresh banded pre-seed
+        # rather than discarding it.
+        n_folds, hidden = 4, 6
+        total = n_folds * hidden
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=3)
+
+        trained_ptrs = np.array([0, 1, 1, 1, 2, 2, 2, 2,
+                                  2, 2, 2, 2, 2, 2, 2, 2,
+                                  2, 2, 2, 2, 2, 2, 2, 2, 2], dtype=np.int32)
+        assert len(trained_ptrs) == total + 1
+        trained_idx = np.array([hidden * 3 + 1, hidden * 3 + 1], dtype=np.int32)  # row0->far, row3->far
+        trained_vals = np.array([0.9, -0.9], dtype=np.float32)
+
+        layer = FoldedColumnLayer.from_descriptor(
+            desc, learning_rate=0.02, num_cpus=1,
+            existing_recurrent=(trained_ptrs, trained_idx, trained_vals),
+            existing_recurrent_prefer="b",
+        )
+
+        # The trained long-range connection at row 0 survived the union.
+        row_start, row_end = int(layer.recurrent.ptrs[0]), int(layer.recurrent.ptrs[1])
+        cols = list(layer.recurrent.indices[row_start:row_end])
+        assert trained_idx[0] in cols
+        col_pos = row_start + cols.index(trained_idx[0])
+        true_val = layer.recurrent.weights_vals[col_pos] * layer.recurrent.get_value_scale(0)
+        assert np.isclose(true_val, 0.9, atol=1e-3)
+
+        # The fresh banded pre-seed's own diagonal is still present too.
+        assert 0 in cols
+
+        # And the merged layer is still usable end-to-end.
+        x = Tensor(np.random.randn(hidden).astype(np.float32))
+        state = Tensor(np.random.randn(total).astype(np.float32))
+        out = layer(x, state)
+        loss = (out ** 2).sum()
+        loss.backward()
+        assert np.all(np.isfinite(out.data))
+        assert x.grad is not None and np.all(np.isfinite(x.grad))
 
 
 class TestFoldedColumnLayerStatePersistence:
