@@ -39,6 +39,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
@@ -218,7 +219,8 @@ def _apply_rotary(q, k, cos, sin):
 
 class _LlamaAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: Optional[int],
-                 head_dim: Optional[int], max_seq: int):
+                 head_dim: Optional[int], max_seq: int,
+                 rope_theta: float = 10000.0):
         super().__init__()
         self.n_heads    = n_heads
         self.n_kv_heads = n_kv_heads or n_heads
@@ -230,7 +232,7 @@ class _LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, kv_dim, bias=False)
         self.v_proj = nn.Linear(d_model, kv_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-        self.rope   = _LlamaRotaryEmbedding(self.head_dim, max_seq=max_seq)
+        self.rope   = _LlamaRotaryEmbedding(self.head_dim, max_seq=max_seq, base=rope_theta)
 
     def forward(self, x: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -273,11 +275,11 @@ class _LlamaMLP(nn.Module):
 class _LlamaBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: Optional[int],
                  head_dim: Optional[int], intermediate: int, max_seq: int,
-                 rms_eps: float = 1e-5):
+                 rms_eps: float = 1e-5, rope_theta: float = 10000.0):
         super().__init__()
         self.input_layernorm       = _LlamaRMSNorm(d_model, rms_eps)
         self.self_attn             = _LlamaAttention(d_model, n_heads, n_kv_heads,
-                                                     head_dim, max_seq)
+                                                     head_dim, max_seq, rope_theta)
         self.post_attention_layernorm = _LlamaRMSNorm(d_model, rms_eps)
         self.mlp                   = _LlamaMLP(d_model, intermediate)
 
@@ -298,12 +300,12 @@ class LlamaModel(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, n_layers: int,
                  n_heads: int, n_kv_heads: Optional[int], head_dim: Optional[int],
                  intermediate: int, max_seq: int = 4096, rms_eps: float = 1e-5,
-                 tie_embeddings: bool = False):
+                 tie_embeddings: bool = False, rope_theta: float = 10000.0):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([
             _LlamaBlock(d_model, n_heads, n_kv_heads, head_dim,
-                        intermediate, max_seq, rms_eps)
+                        intermediate, max_seq, rms_eps, rope_theta)
             for _ in range(n_layers)
         ])
         self.norm   = _LlamaRMSNorm(d_model, rms_eps)
@@ -320,8 +322,23 @@ class LlamaModel(nn.Module):
         return self.lm_head(x)
 
 
-def _infer_llama_hparams(sd: Dict[str, torch.Tensor]) -> dict:
-    """Infer LLaMA hyperparameters from weight shapes."""
+def _infer_llama_hparams(
+    sd: Dict[str, torch.Tensor],
+    rms_eps: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+) -> dict:
+    """
+    Infer LLaMA hyperparameters from weight shapes.
+
+    ``rms_eps`` and ``rope_theta`` are NOT recoverable from weights alone
+    (RMSNorm folds its epsilon into the forward pass, never into a stored
+    tensor; RoPE's base/theta is never stored either) — pass them explicitly
+    (e.g. read from the checkpoint's real ``config.json`` via
+    :func:`load_hf_config`) whenever they're known. Falls back to the plain
+    LLaMA defaults (``1e-5``, ``10000.0``) only when not given, which is
+    silently wrong for models that deviate from those defaults (e.g.
+    MiniCPM5-1B-Base needs ``rms_eps=1e-6``, ``rope_theta=5000000``).
+    """
     embed = sd.get("model.embed_tokens.weight")
     if embed is None:
         embed = sd.get("embed_tokens.weight")
@@ -357,8 +374,10 @@ def _infer_llama_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     gate = next(v for k, v in sd.items() if "gate_proj.weight" in k)
     intermediate = gate.shape[0]
 
-    # rms_eps: not recoverable from weights alone, use LLaMA default
-    rms_eps = 1e-5
+    # rms_eps / rope_theta: not recoverable from weights alone -- use the
+    # caller-supplied config value if given, else the plain LLaMA default.
+    rms_eps    = 1e-5 if rms_eps is None else rms_eps
+    rope_theta = 10000.0 if rope_theta is None else rope_theta
 
     # tie_embeddings: check if lm_head.weight is absent (tied)
     tie = not any("lm_head.weight" in k for k in sd)
@@ -367,7 +386,23 @@ def _infer_llama_hparams(sd: Dict[str, torch.Tensor]) -> dict:
         vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
         n_heads=n_heads, n_kv_heads=n_kv_heads, head_dim=head_dim,
         intermediate=intermediate, rms_eps=rms_eps, tie_embeddings=tie,
+        rope_theta=rope_theta,
     )
+
+
+def load_hf_config(path: str) -> Optional[dict]:
+    """
+    Look for a HuggingFace ``config.json`` next to (or inside) a checkpoint
+    path and return it parsed, or ``None`` if not found. ``path`` may be a
+    single shard file (config.json is checked in its parent directory) or a
+    shard directory (config.json is checked inside it directly).
+    """
+    p = Path(path)
+    candidate = (p if p.is_dir() else p.parent) / "config.json"
+    if not candidate.is_file():
+        return None
+    with open(candidate) as f:
+        return json.load(f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1060,21 +1095,31 @@ def reconstruct_model(
     path: str,
     strict: bool = False,
     device: str = "cpu",
+    hf_config: Optional[dict] = None,
 ) -> nn.Module:
     """
     Load a .bin or .safetensors weight file and return a runnable nn.Module.
 
     Parameters
     ----------
-    path   : path to a single weight shard, or a directory of shards
-    strict : if True, raise on missing/unexpected keys during weight load
-    device : 'cpu', 'cuda', 'cuda:0', etc.
+    path      : path to a single weight shard, or a directory of shards
+    strict    : if True, raise on missing/unexpected keys during weight load
+    device    : 'cpu', 'cuda', 'cuda:0', etc.
+    hf_config : the checkpoint's real HuggingFace config.json, already
+                parsed. Supplies ``rms_norm_eps``/``rope_theta`` for the
+                ``llama`` family, since those aren't recoverable from weight
+                shapes alone. If not given, a sibling ``config.json`` is
+                looked up automatically via :func:`load_hf_config`; pass
+                ``hf_config`` explicitly to override or to supply one when
+                none sits next to the checkpoint.
 
     Returns
     -------
     An nn.Module in eval() mode with weights loaded.
     """
     p = Path(path)
+    if hf_config is None:
+        hf_config = load_hf_config(path)
 
     # Directory → sharded load
     if p.is_dir():
@@ -1096,7 +1141,9 @@ def reconstruct_model(
         _load_into(model, _remap_keys(sd, "qwen3vl"), strict)
 
     elif family == "llama":
-        hp = _infer_llama_hparams(sd)
+        rms_eps    = (hf_config or {}).get("rms_norm_eps")
+        rope_theta = (hf_config or {}).get("rope_theta")
+        hp = _infer_llama_hparams(sd, rms_eps=rms_eps, rope_theta=rope_theta)
         _print_hparams(hp, family)
         model = LlamaModel(**hp)
         _load_into(model, _remap_keys(sd, "llama"), strict)
@@ -1133,8 +1180,10 @@ def show_arch(path: str) -> None:
     p = Path(path)
     sd = load_weights_sharded(str(p)) if p.is_dir() else load_weights(str(p))
     family = detect_family(sd)
+    hf_config = load_hf_config(path)
     print(f"\nFamily   : {family}")
     print(f"Tensors  : {len(sd)}")
+    print(f"config.json : {'found, values below override shape-inferred guesses for rms_eps/rope_theta' if hf_config else 'not found -- rms_eps/rope_theta fall back to plain LLaMA defaults'}")
     print(f"\nParameter summary (name  →  shape):")
     for name, t in list(sd.items())[:40]:
         print(f"  {name:<60}  {tuple(t.shape)}")
@@ -1146,7 +1195,9 @@ def show_arch(path: str) -> None:
         print(f"\nInferred hparams:")
         for k, v in hp.items(): print(f"  {k:<24} = {v}")
     elif family == "llama":
-        hp = _infer_llama_hparams(sd)
+        rms_eps    = (hf_config or {}).get("rms_norm_eps")
+        rope_theta = (hf_config or {}).get("rope_theta")
+        hp = _infer_llama_hparams(sd, rms_eps=rms_eps, rope_theta=rope_theta)
         print(f"\nInferred hparams: {hp}")
     elif family == "gpt2":
         hp = _infer_gpt2_hparams(sd)
