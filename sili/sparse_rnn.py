@@ -300,8 +300,7 @@ class FoldedLayer(Module):
     def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
                         num_cpus: int = 4,
                         max_row_weights: int = 0,
-                        bytes_per_row: int = 0,
-                        preseed_fn=None) -> "FoldedLayer":
+                        bytes_per_row: int = 0) -> "FoldedLayer":
         """
         Build a FoldedLayer from a FoldedBlockDescriptor.
 
@@ -320,18 +319,6 @@ class FoldedLayer(Module):
                              The default adds a small margin for net growth per
                              synaptogenesis step. Pass an explicit value to
                              override (e.g. worst-case: max_row_weights * 5).
-          preseed_fn      -- extension point for subclasses (e.g.
-                             FoldedColumnLayer): optional
-                             (ptrs, idx, vals, n_in, n_out) -> (ptrs, idx, vals),
-                             called per suffix right after the base CSR is
-                             built from the pretrained weights but before
-                             FP4 row-scaling/load_weights. None (default) is
-                             a no-op -- FoldedLayer's own behavior is
-                             unchanged by this parameter's existence.
-                             Inserted entries should use value 0.0 so they
-                             don't perturb the pretrained forward pass and
-                             so per-row max-abs scaling (which only looks at
-                             nonzero magnitudes) ignores them.
         """
         import numpy as np
         import torch as _torch   # local import: conversion step only -- sili does
@@ -358,9 +345,6 @@ class FoldedLayer(Module):
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
             idx  = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
-
-            if preseed_fn is not None:
-                ptrs, idx, vals = preseed_fn(ptrs, idx, vals, n_in, n_out)
 
             # Per-row value scaling: map each row's max-abs to FP4_MAX so the
             # quantizer uses its full resolution.  See conversation for why
@@ -582,135 +566,25 @@ class FoldedLayer(Module):
 #  FoldedColumnLayer — FoldedLayer variant for the column-averaging mechanism
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _preseed_columns_fn(n_folds: int, redundancy: int = 1):
-    """
-    Returns a preseed_fn for FoldedLayer.from_descriptor's preseed_fn hook:
-    inserts zero-value structural synapses connecting input row i to output
-    column (fold_step, i), for every fold step and every valid column
-    position i < min(n_in, out_dim), into an already-built stacked CSR.
-
-    Why this exists (see sili_peridot/todolist.md Phase A4 for the full
-    argument): build_probes(k)'s per-row candidate window is k*k, sampled
-    from a search space of size n_in*n_out -- the specific cross-fold-depth
-    pairs a column needs are a tiny structured subset of that space, so
-    synaptogenesis has vanishingly small odds of discovering them from
-    scratch in any practical training budget. Seeding them directly at
-    conversion time means training only has to adjust weights (ordinary
-    backprop, fast), not discover topology (synaptogenesis-bound, slow).
-
-    redundancy: also seed `redundancy - 1` adjacent columns on each side of
-    the exact diagonal, within the same fold-step's column band (clipped so
-    it never crosses into a neighboring fold step's band). Substitutes for
-    per-connection importance protection, which isn't achievable with the
-    currently-bound C++ API (SparseLinearLayer.load_weights has no
-    importance parameter, and set_importance_scale_raw is a per-ROW scale,
-    not per-connection -- see FoldedColumnLayer's docstring). Several
-    independent near-diagonal routes are less likely to all be pruned away
-    by a synaptogenesis sweep than a single one, at the cost of extra
-    structural connections that must earn their keep or eventually get
-    pruned like any other low-importance synapse.
-    """
-    assert redundancy >= 1, "redundancy must be >= 1 (1 = just the exact diagonal)"
-
-    def preseed_fn(ptrs, idx, vals, n_in, n_out):
-        assert n_out % n_folds == 0, (
-            f"n_out ({n_out}) must be an exact multiple of n_folds "
-            f"({n_folds}) for column pre-seeding -- got n_out={n_out}, "
-            f"n_folds={n_folds}"
-        )
-        out_dim = n_out // n_folds
-        n_cols_tracked = min(n_in, out_dim)
-
-        row_idx = [None] * n_in
-        row_val = [None] * n_in
-        for r in range(n_in):
-            start, end = int(ptrs[r]), int(ptrs[r + 1])
-            cols = list(idx[start:end])
-            vs   = list(vals[start:end])
-            if r < n_cols_tracked:
-                col_set = set(cols)
-                for t in range(n_folds):
-                    band_start = t * out_dim
-                    band_end   = band_start + out_dim
-                    for off in range(-(redundancy - 1), redundancy):
-                        c = band_start + r + off
-                        if band_start <= c < band_end and c not in col_set:
-                            cols.append(c)
-                            vs.append(0.0)
-                            col_set.add(c)
-            order = np.argsort(cols)
-            row_idx[r] = np.asarray(cols, dtype=np.int32)[order]
-            row_val[r] = np.asarray(vs,   dtype=np.float32)[order]
-
-        new_idx  = (np.concatenate(row_idx) if n_in > 0
-                   else np.zeros(0, dtype=np.int32))
-        new_vals = (np.concatenate(row_val) if n_in > 0
-                   else np.zeros(0, dtype=np.float32))
-        new_ptrs = np.zeros(n_in + 1, dtype=np.int32)
-        for r in range(n_in):
-            new_ptrs[r + 1] = new_ptrs[r] + len(row_idx[r])
-
-        return new_ptrs, new_idx, new_vals
-
-    return preseed_fn
-
-
 class FoldedColumnLayer(FoldedLayer):
     """
     FoldedLayer variant for the column-averaging mechanism (see
     sili_peridot/todolist.md Phase A3/A4): retains the pre-sum
     [batch, n_folds*out_dim] tensor instead of collapsing the fold axis
-    (FoldedLayer.forward sums it away immediately), and pre-seeds
-    structural "column" synapses at construction time (see
-    _preseed_columns_fn above) so training doesn't have to rely on
-    synaptogenesis to discover the needed cross-fold-depth connectivity
-    from scratch.
+    (FoldedLayer.forward sums it away immediately). from_descriptor is
+    otherwise identical to FoldedLayer's -- no pre-seeding happens here;
+    see build_fold_skip_layer below for actual cross-fold-depth
+    connectivity, which is a separate, composable piece applied to this
+    layer's output, not baked into construction.
 
-    Feed forward()'s output directly to sili.energy.column_averaging_loss
-    (after whatever EnergyDynamics gating is in the actual model -- see
-    that function's docstring for why it must run on the energy-GATED
-    state, not this layer's raw output).
-
-    Column semantics require out_dim == the tracked input's width for
-    whichever suffix this wraps -- e.g. down_proj/o_proj in a real
-    transformer (layers that map the residual stream back to itself), not
-    q_proj/gate_proj/up_proj (project to a different width, so "column i
-    of the output" and "input index i" aren't the same thing). Using this
-    on a suffix where that doesn't hold will still run, but the column
-    -averaging loss built on top of it won't mean anything.
-
-    KNOWN LIMITATION (found while implementing, not silently worked
-    around): the design doc's original ask -- "give pre-seeded synapses
-    elevated PER-CONNECTION importance so they survive early
-    synaptogenesis pruning" -- isn't achievable with the currently-bound
-    C++ API. SparseLinearLayer.load_weights has no importance parameter at
-    all (only weights); the only importance control is
-    set_importance_scale_raw(row, scale), a per-ROW multiplier that would
-    scale every connection in that row equally, not just the pre-seeded
-    ones. The practical substitute implemented here is `column_redundancy`
-    (seed a small neighborhood of columns, not just the exact diagonal) --
-    real protection would need either a new C++ binding for per-connection
-    importance, or callers delaying their first synaptogenesis() sweep
-    long enough for forward/backward activity correlation to build real
-    importance on these connections before any pruning can remove them.
+    Feed forward()'s output to sili.energy.column_averaging_loss (after
+    whatever EnergyDynamics gating is in the actual model -- see that
+    function's docstring for why it must run on the energy-GATED state).
+    No shape requirement on the wrapped suffix beyond what out_features
+    already reports -- column_averaging_loss takes an explicit indices
+    argument rather than assuming this layer's whole output is the
+    tracked column block.
     """
-
-    @classmethod
-    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
-                        num_cpus: int = 4, max_row_weights: int = 0,
-                        bytes_per_row: int = 0,
-                        column_redundancy: int = 1) -> "FoldedColumnLayer":
-        """
-        Like FoldedLayer.from_descriptor, plus pre-seeds column synapses
-        (see _preseed_columns_fn and this class's docstring).
-
-        column_redundancy: forwarded to _preseed_columns_fn -- see there.
-        """
-        return super().from_descriptor(
-            descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
-            max_row_weights=max_row_weights, bytes_per_row=bytes_per_row,
-            preseed_fn=_preseed_columns_fn(descriptor.n_folds, column_redundancy),
-        )
 
     @property
     def out_features(self) -> int:
@@ -721,9 +595,7 @@ class FoldedColumnLayer(FoldedLayer):
 
     @property
     def column_width(self) -> int:
-        """Per-fold-step output width -- the input_size to pass to
-        column_averaging_loss (valid only when this equals in_features,
-        per the class docstring's column-semantics requirement)."""
+        """Per-fold-step output width."""
         return next(iter(self._out_dims.values()))
 
     def forward(self, x: "Tensor") -> "Tensor":
@@ -767,6 +639,121 @@ class FoldedColumnLayer(FoldedLayer):
 
         out._backward = _bwd
         return out
+
+
+def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
+                          bandwidth: int = None,
+                          headroom_fraction: float = 0.5,
+                          expected_lr: float = 0.01) -> "_cpu.SparseLinearLayer":
+    """
+    Fresh, from-scratch sparse layer mapping a FoldedColumnLayer's own
+    [n_folds*out_dim] output space back to itself: literal skip
+    connections between virtual (fold-depth) layers, pre-seeded as a
+    banded pattern (all zero-valued -- nothing pretrained here, this
+    connectivity has no equivalent in the original unfolded model).
+
+    Why: FoldedLayer's single-matmul-then-sum trick computes every fold
+    step's contribution from the SAME external input, independent of
+    every other step -- a first-order approximation of the true fold
+    recurrence (see RNNFoldedBlock.forward in conversion/rnn_fold.py:
+    state=0; for i: state += block_i(x+state), each step seeing
+    everything accumulated by every prior step). Apply this layer to a
+    FoldedColumnLayer's raw output (refined = raw + skip.forward_dense(raw))
+    to let nearby fold steps influence each other -- a cheap correction
+    toward the true recurrence's behavior without paying for n_folds real
+    sequential matmuls.
+
+    bandwidth: connect flat positions r, c whenever abs(r - c) < bandwidth.
+    Default (None) uses out_dim -- i.e. one hop reaches the adjacent fold
+    step at any nearby column, not just the exact same column index
+    (a wider band lets training find useful cross-column routes, not only
+    identity-like passthrough). At real model scale (out_dim in the
+    thousands) this is genuinely large (~2*out_dim connections per row);
+    tune bandwidth down if construction time/memory becomes a problem --
+    not solved here, just noted.
+
+    expected_lr: FP4 gotcha (see project notes) -- a freshly zero-valued
+    connection is structurally stuck at zero unless its per-row
+    value_scale is set relative to the learning rate that will actually
+    be used to train it (FP4's minimum nonzero magnitude is
+    0.5*value_scale; an update of order expected_lr rounds back to zero
+    under the default scale otherwise). Pass the SAME learning rate you
+    intend to call apply_fold_skip/backward_dense with, or these
+    connections will silently never move off zero no matter how much you
+    train.
+    """
+    assert n_folds >= 1 and out_dim >= 1
+    bw = out_dim if bandwidth is None else bandwidth
+    assert bw >= 1
+    total = n_folds * out_dim
+
+    positions = np.arange(total)
+    lo = np.clip(positions - bw + 1, 0, None)
+    hi = np.clip(positions + bw - 1, None, total - 1)
+    row_lengths = (hi - lo + 1).astype(np.int64)
+
+    ptrs = np.zeros(total + 1, dtype=np.int64)
+    ptrs[1:] = np.cumsum(row_lengths)
+    nnz = int(ptrs[-1])
+
+    idx = np.empty(nnz, dtype=np.int32)
+    pos = 0
+    for r in range(total):
+        n = int(row_lengths[r])
+        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        pos += n
+    ptrs = ptrs.astype(np.int32)
+    vals = np.zeros(nnz, dtype=np.float32)
+
+    max_row_weights = int(row_lengths.max())
+    budget = nnz + int(headroom_fraction * nnz) + total
+
+    layer = _cpu.SparseLinearLayer(total, total, budget, num_cpus)
+    layer.load_weights(ptrs, idx, vals)
+    layer.equalize_to_capacity(max_row_weights)
+
+    _FP4_MAX = 6.0
+    scale = expected_lr / _FP4_MAX
+    for r in range(total):
+        layer.set_value_scale_raw(r, scale)
+        layer.set_importance_scale_raw(r, scale)
+
+    return layer
+
+
+def apply_fold_skip(skip_layer, x: "Tensor", lr: float = 0.01) -> "Tensor":
+    """
+    Apply a build_fold_skip_layer()-constructed layer to a
+    FoldedColumnLayer's raw output, wired into the Tensor autograd graph
+    (forward_dense + backward_dense, the same pattern FoldedLayer/
+    FoldedColumnLayer use for their own suffix layers). Typical use:
+    refined = raw + apply_fold_skip(skip, raw, lr) -- the skip
+    connections contribute a residual correction on top of the
+    independently-computed per-fold-step output.
+    """
+    x_np = np.asarray(x.data, dtype=np.float32)
+    squeezed = x_np.ndim == 1
+    if squeezed:
+        x_np = x_np[np.newaxis, :]
+
+    out_np = skip_layer.forward_dense(x_np, lr)
+    if squeezed:
+        out_np = out_np.squeeze(0)
+    out = Tensor(out_np, _children=(x,), _op="fold_skip", backend=x.backend)
+
+    def _bwd():
+        if out.grad is None:
+            return
+        dy = np.asarray(out.grad, dtype=np.float32)
+        if dy.ndim == 1:
+            dy = dy[np.newaxis, :]
+        dx = skip_layer.backward_dense(dy, lr, lr_per_row_nnz=True)
+        if squeezed:
+            dx = dx.squeeze(0)
+        _acc(x, dx)
+
+    out._backward = _bwd
+    return out
 
 
 class LayerMemoryState:

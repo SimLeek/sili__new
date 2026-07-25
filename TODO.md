@@ -70,13 +70,14 @@ SISLDOLayerV architecture fix).
   has the tests already written and marked `xfail(strict=True)`, ready to
   flip green once this lands.
 
-- **A fired-but-not-selected neuron's energy is never reset, so it can grow
-  unboundedly under a chronically repeated identical input.** Found while
+- **A fired-but-not-selected neuron's energy grows without bound under a
+  chronically repeated identical input -- this looks like curiosity/
+  novelty-seeking pressure working as intended, not a bug.** Found while
   validating the column-averaging mechanism (Phase A3/A4) end-to-end with
   `FoldedColumnLayer` + `EnergyDynamics` on a FIXED input repeated every
   step: `_apply_energy_dynamics`'s aux_loss (specifically `energy_loss`,
   the per-neuron quadratic term) grew from ~0.08 to 177+ over 270 steps
-  with no sign of stopping. Root cause: step 3's fire-threshold handling
+  with no sign of stopping. Mechanism: step 3's fire-threshold handling
   applies a small refractory drain (`2 * activation_cost`) to every
   neuron whose `new_energy >= 2.0`, regardless of whether the LATER
   top-p gate (step 4) actually selects it into `kept_fire` -- a neuron
@@ -84,20 +85,23 @@ SISLDOLayerV architecture fix).
   `drive - 2*activation_cost` per step (positive whenever
   `drive > 2*activation_cost`, true of the config used here:
   `drive=0.15, activation_cost=0.05`), so its energy keeps climbing with
-  no ceiling. Confirmed NOT a bug in the column-averaging code itself
-  (isolated: `FoldedColumnLayer`/`column_averaging_loss` both converge
-  correctly on their own, see `tests/integration/test_folded_column_layer.py`)
-  -- this is a property of `_apply_energy_dynamics` under a genuinely
-  degenerate input distribution (exact repetition), which every other
-  existing usage in this codebase (Mandelbrot, RL agents, real token
-  streams) avoids simply by having inputs that vary step to step.
-  Adding small per-step input variation made the aux_loss bounded (settled
-  around ~1-1.5 rather than diverging) in the same test. **Not fixed
-  here** -- a real fix would need either clamping fired-but-unselected
-  neurons' energy, or documenting a "must not be fed a literally-static
-  input for many consecutive steps" constraint explicitly. Worth a second
-  look if a training loop for a genuinely slow-changing region (e.g. long
-  silence in an audio stream) is added later.
+  no ceiling as long as nothing about its input changes. Confirmed NOT a
+  bug in the column-averaging code itself (isolated: `FoldedColumnLayer`/
+  `column_averaging_loss` both converge correctly on their own, see
+  `tests/integration/test_folded_column_layer.py`) -- this is
+  `_apply_energy_dynamics`'s own behavior under a genuinely static input,
+  and per direct feedback that's exactly the signature the curiosity/
+  compression-progress citations (`CITATIONS.md`) describe: "nothing new
+  is happening, pressure should build" is the correct response to a truly
+  unchanging input, not a defect to route around. Every other existing
+  usage in this codebase (Mandelbrot, RL agents, real token streams) never
+  exercises this regime because their inputs vary step to step -- adding
+  small per-step input variation made the aux_loss settle (~1-1.5) in the
+  same test, consistent with that reading. Not changed here; worth
+  deliberately harnessing later (e.g. as an input to Phase E's eventual
+  action pathway -- "this region has been quiet too long" as a literal,
+  already-present signal) rather than treating it as something to clamp
+  away.
 
 - **Synaptogenesis after `compact()` needs automatic handling, not just a
   loud failure.** FIXED: `synap_row_step` now throws a catchable

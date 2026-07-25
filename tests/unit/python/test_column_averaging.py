@@ -77,6 +77,64 @@ class TestColumnAveragingLossGradient:
             column_averaging_loss(h, target, n_folds=3)
 
 
+class TestColumnAveragingLossIndices:
+    """indices lets column_averaging_loss track a subset of a LARGER
+    state, rather than requiring the whole tensor to be exactly
+    column-shaped -- state can be bigger than what's useful for tracking
+    without forcing every neuron into the column layout."""
+
+    def test_matches_no_indices_case_when_selecting_everything_in_order(self):
+        n_folds, input_size = 3, 4
+        h_np = np.random.randn(n_folds * input_size).astype(np.float32)
+        target_np = np.random.randn(input_size).astype(np.float32)
+        identity_indices = np.arange(n_folds * input_size)
+
+        h1 = Tensor(h_np.copy())
+        loss1 = column_averaging_loss(h1, Tensor(target_np.copy()), n_folds=n_folds)
+
+        h2 = Tensor(h_np.copy())
+        loss2 = column_averaging_loss(h2, Tensor(target_np.copy()), n_folds=n_folds,
+                                      indices=identity_indices)
+
+        assert float(loss1.data) == pytest.approx(float(loss2.data), rel=1e-5)
+
+    def test_gradient_only_touches_selected_subset_of_larger_state(self):
+        n_folds, input_size = 3, 4
+        big_size = 20
+        rng = np.random.default_rng(0)
+        h_np = rng.standard_normal(big_size).astype(np.float32)
+        target_np = rng.standard_normal(input_size).astype(np.float32)
+        col_indices = rng.choice(big_size, size=n_folds * input_size, replace=False)
+
+        h = Tensor(h_np.copy())
+        loss = column_averaging_loss(h, Tensor(target_np.copy()), n_folds=n_folds,
+                                     indices=col_indices)
+        loss.backward()
+
+        mask = np.zeros(big_size, dtype=bool)
+        mask[col_indices] = True
+        assert np.allclose(h.grad[~mask], 0.0), "gradient leaked outside selected indices"
+        assert not np.allclose(h.grad[mask], 0.0)
+
+    def test_wrong_length_indices_raises(self):
+        h = Tensor(np.zeros(20, dtype=np.float32))
+        target = Tensor(np.zeros(4, dtype=np.float32))
+        with pytest.raises(AssertionError):
+            column_averaging_loss(h, target, n_folds=3, indices=np.arange(5))
+
+    def test_repeated_indices_accumulate_gradient(self):
+        # A column position used twice should receive gradient contributions
+        # from both occurrences (gather's documented behavior).
+        input_size = 2
+        target = Tensor(np.array([0.0, 0.0], dtype=np.float32))
+        h = Tensor(np.array([1.0, 1.0], dtype=np.float32))
+        # n_folds=2, both "fold steps" point at the SAME two source indices.
+        indices = np.array([0, 1, 0, 1])
+        loss = column_averaging_loss(h, target, n_folds=2, indices=indices)
+        loss.backward()
+        assert np.all(h.grad != 0.0)
+
+
 class TestColumnAveragingLossTraining:
     def test_sgd_moves_column_mean_toward_target(self):
         # A minimal end-to-end check: treat h as a "parameter" and confirm

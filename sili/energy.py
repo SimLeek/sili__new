@@ -24,7 +24,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from sili.module import Module
-from sili.tensor import Tensor
+from sili.tensor import Tensor, gather
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -607,60 +607,43 @@ class EMABranchingRatioTracker:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int,
-                          weight: float = 1.0) -> Tensor:
+                          weight: float = 1.0, indices=None) -> Tensor:
     """
-    Ties each "column"'s average over a fold-depth recurrence to the
-    corresponding input value -- the mechanism that turns a folded
-    transformer stack into a next-input predictor (see
-    sili_peridot/todolist.md Phase A3/A4 for the full design rationale).
-    A "column" is the set of `n_folds` neurons at flat indices
-    `t*input_size + i` for `t in range(n_folds)`, one input index `i` at a
-    time; the loss pushes `mean_t(h_out[t, i])` toward `target[i]`.
+    weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where column_i
+    is the set of n_folds neurons tracking input index i -- the mechanism
+    that turns a folded transformer stack into a next-input predictor
+    (sili_peridot/todolist.md Phase A3/A4).
 
-    Deliberately takes `h_out` (the energy-gated state), NOT the
-    pre-gating `h`: a column member EnergyDynamics suppresses to zero (or
-    flattens to a fire/shutoff constant) should actually hurt this loss,
-    not be invisible to it. That tension is intentional, not a bug to
-    route around with a protected/reserved slot for column neurons --
-    forcing the network to jointly satisfy energy management AND next
-    -input prediction is the entire point of running this loss against
-    the post-gating state.
+    Takes h_out (energy-gated), not the pre-gating h: a column member
+    EnergyDynamics suppresses/flattens should actually hurt this loss, not
+    be invisible to it -- forcing the network to jointly satisfy energy
+    management and prediction is the point. Own function rather than part
+    of EnergyDynamics.forward since it needs the original input and a
+    column layout EnergyDynamics has no concept of; combine with
+    EnergyDynamics's aux_loss via sili.tensor.combine_losses.
 
-    This is a plain, ordinary differentiable Tensor expression (reshape +
-    mean + squared-error), not a hand-derived/manually-injected gradient
-    -- sili's autograd already composes reshape/sum/arithmetic correctly
-    (verified against finite differences), so there's no need to bypass
-    it the way _apply_energy_dynamics's straight-through gating has to.
-    Deliberately kept as its OWN function rather than folded into
-    _apply_energy_dynamics/EnergyDynamics.forward: it needs the original
-    input, which EnergyDynamics never sees, and a column layout
-    EnergyDynamics has no concept of. Combine the result with
-    EnergyDynamics's own aux_loss via sili.tensor.combine_losses before
-    calling .backward() once -- this is the established "energy aux +
-    task loss" pattern already documented on combine_losses itself.
-
-    Parameters
-    ----------
-    h_out   : Tensor, flat [n_folds * input_size] (e.g. a FoldedColumnLayer
-              cell's h_out for one recurrence step's full column state).
-    target  : Tensor, [input_size] -- the true next input each column
-              should average toward.
-    n_folds : number of fold-depth steps / rows in the column layout.
-    weight  : scalar multiplier. No universally-correct default --
-              tune relative to whatever else feeds combine_losses (task
-              loss, EnergyDynamics's own aux_loss) for the specific model.
-
-    Returns
-    -------
-    Scalar Tensor: weight * mean_i( (mean_t(h_out[t, i]) - target[i])^2 ).
+    indices : optional int array, len n_folds*input_size, selecting which
+    flat positions of a LARGER h_out form the column block (position
+    indices[t*input_size+i] = column i's neuron at fold-step t). None
+    (default) requires h_out itself to be exactly that size -- pass
+    indices to track a subset of a bigger state instead.
     """
     input_size = target.shape[0]
     expected = n_folds * input_size
-    assert h_out.shape[0] == expected, (
-        f"h_out has {h_out.shape[0]} elements, expected n_folds*input_size "
-        f"= {n_folds}*{input_size} = {expected}"
-    )
-    h2d      = h_out.reshape((n_folds, input_size))
-    col_mean = h2d.sum(axis=0) * (1.0 / n_folds)
+    if indices is None:
+        assert h_out.shape[0] == expected, (
+            f"h_out has {h_out.shape[0]} elements, expected n_folds*input_size "
+            f"= {n_folds}*{input_size} = {expected} (or pass indices to "
+            f"select a subset of a larger state)"
+        )
+        column_block = h_out
+    else:
+        indices = np.asarray(indices)
+        assert indices.shape == (expected,), (
+            f"indices has shape {indices.shape}, expected ({expected},)"
+        )
+        column_block = gather(h_out, indices)
+
+    col_mean = column_block.reshape((n_folds, input_size)).sum(axis=0) * (1.0 / n_folds)
     diff     = col_mean - target
     return (diff ** 2).sum() * (weight / input_size)

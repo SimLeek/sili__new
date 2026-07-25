@@ -220,6 +220,24 @@ def transpose(a: Tensor, axes=None) -> Tensor:
     return out
 
 
+def gather(a: Tensor, indices) -> Tensor:
+    """out[i] = a.flat[indices[i]], differentiably. Gradient scatters back
+    to a's original shape; repeated indices correctly accumulate
+    contributions from each occurrence (np.add.at, not plain assignment)."""
+    idx    = np.asarray(indices, dtype=np.int64)
+    a_flat = np.asarray(a.data, dtype=np.float32).ravel()
+    out    = Tensor(a_flat[idx], (a,), "gather", a.backend)
+    orig_shape = np.asarray(a.data).shape
+
+    def _bwd():
+        grad_flat = np.zeros(a_flat.shape, dtype=np.float32)
+        np.add.at(grad_flat, idx, np.asarray(out.grad, dtype=np.float32))
+        _acc(a, grad_flat.reshape(orig_shape))
+
+    out._backward = _bwd
+    return out
+
+
 def bounded_gate(a: Tensor, n: float = 2.0) -> Tensor:
     """
     Saturating output gate: 1 - 1/(x^n + 1), mapping [0, inf) -> [0, 1).

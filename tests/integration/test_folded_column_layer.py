@@ -1,7 +1,7 @@
 """
 tests/integration/test_folded_column_layer.py
 ────────────────────────────────────────────────
-Integration tests for FoldedColumnLayer and _preseed_columns_fn
+Integration tests for FoldedColumnLayer and build_fold_skip_layer
 (sili_peridot/todolist.md Phase A4). Lives in tests/integration/ (not
 tests/unit/python/) because, like test_toy_mistral.py, it exercises
 FoldedLayer.from_descriptor's torch-based conversion-time construction
@@ -19,7 +19,7 @@ import pytest
 
 import sili.cpu
 from sili.tensor import Tensor
-from sili.sparse_rnn import FoldedColumnLayer, FoldedLayer
+from sili.sparse_rnn import FoldedColumnLayer, FoldedLayer, build_fold_skip_layer
 from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
 
 
@@ -27,15 +27,11 @@ def _toy_square_descriptor(n_folds: int, hidden: int, seed: int = 0,
                            density: float = 1.0) -> FoldedBlockDescriptor:
     """
     A minimal toy descriptor with n_folds square [hidden, hidden] weight
-    matrices stacked -- i.e. out_dim == in_dim == hidden, the shape a real
-    down_proj/o_proj (residual-stream-preserving) suffix would have, which
-    is what column semantics require (see FoldedColumnLayer's docstring).
-
-    density < 1.0 zeroes out (1-density) of each matrix's entries before
-    converting to CSR, so pre-seeding has some non-trivial "was this
-    column entry already present or not" cases to exercise -- density=1.0
-    (default) means every entry is already present, so pre-seeding is a
-    pure no-op (still worth testing as its own case).
+    matrices stacked. Square shape isn't actually required by
+    FoldedColumnLayer itself (see its docstring -- no in_dim==out_dim
+    requirement anymore), just convenient for these tests since it lets
+    the SAME x/hidden size be reused as both input and (per-fold-step)
+    output width.
     """
     rng = torch.Generator().manual_seed(seed)
     per_block = []
@@ -56,78 +52,57 @@ def _toy_square_descriptor(n_folds: int, hidden: int, seed: int = 0,
     )
 
 
-class TestPreseedColumnsFn:
-    def test_diagonal_entries_present_after_preseeding(self):
-        n_folds, hidden = 4, 6
-        # density=0.0 -> every matrix starts fully empty, so EVERY column
-        # entry pre-seeding adds is genuinely new (not already present).
-        desc = _toy_square_descriptor(n_folds, hidden, density=0.0)
-        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.01, num_cpus=1)
-        sub = layer._sili_layers[".down_proj.weight"]
-        idx = np.asarray(sub.indices)
-        ptrs = np.asarray(sub.ptrs)
-        out_dim = hidden
-        for r in range(hidden):  # every row < min(n_in, out_dim) is column-tracked
+class TestBuildFoldSkipLayer:
+    def test_shape_and_all_zero_valued(self):
+        n_folds, out_dim = 4, 6
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1)
+        total = n_folds * out_dim
+        assert layer.n_inputs == total
+        assert layer.n_outputs == total
+        assert np.allclose(layer.weights_vals, 0.0)
+
+    def test_diagonal_always_connects_to_itself(self):
+        # abs(r-r)=0 < bandwidth always -- every row must at least connect
+        # to its own column.
+        n_folds, out_dim = 3, 5
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1)
+        idx = np.asarray(layer.indices)
+        ptrs = np.asarray(layer.ptrs)
+        for r in range(n_folds * out_dim):
             row_cols = set(idx[ptrs[r]:ptrs[r + 1]].tolist())
-            for t in range(n_folds):
-                assert (t * out_dim + r) in row_cols, \
-                    f"row {r} missing diagonal entry for fold step {t}"
+            assert r in row_cols
 
-    def test_preseeded_entries_are_zero_valued(self):
-        n_folds, hidden = 3, 5
-        desc = _toy_square_descriptor(n_folds, hidden, density=0.0)
-        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.01, num_cpus=1)
-        sub = layer._sili_layers[".down_proj.weight"]
-        # density=0.0 means ALL entries are pre-seeded (none pretrained),
-        # so every stored weight should be exactly zero pre-training.
-        vals = np.asarray(sub.weights_vals)
-        assert np.allclose(vals, 0.0, atol=1e-6)
-
-    def test_does_not_duplicate_already_present_diagonal(self):
-        # density=1.0 -> every entry already exists; pre-seeding must be a
-        # true no-op (nnz unchanged), not silently duplicate anything.
-        n_folds, hidden = 3, 4
-        desc_dense = _toy_square_descriptor(n_folds, hidden, density=1.0)
-        # nnz before pre-seeding, from an ordinary FoldedLayer (no preseed_fn):
-        plain = FoldedLayer.from_descriptor(desc_dense, learning_rate=0.01, num_cpus=1)
-        nnz_plain = plain._sili_layers[".down_proj.weight"].nnz
-
-        desc_dense2 = _toy_square_descriptor(n_folds, hidden, density=1.0)
-        columned = FoldedColumnLayer.from_descriptor(desc_dense2, learning_rate=0.01, num_cpus=1)
-        nnz_columned = columned._sili_layers[".down_proj.weight"].nnz
-
-        assert nnz_columned == nnz_plain
-
-    def test_redundancy_seeds_neighboring_columns(self):
-        n_folds, hidden = 3, 8
-        desc = _toy_square_descriptor(n_folds, hidden, density=0.0)
-        layer = FoldedColumnLayer.from_descriptor(
-            desc, learning_rate=0.01, num_cpus=1, column_redundancy=2)
-        sub = layer._sili_layers[".down_proj.weight"]
-        idx = np.asarray(sub.indices)
-        ptrs = np.asarray(sub.ptrs)
-        out_dim = hidden
-        r = 3  # an interior row, away from band edges
+    def test_default_bandwidth_reaches_adjacent_fold_step(self):
+        # Default bandwidth = out_dim -- row r in fold step t should reach
+        # AT LEAST into the immediately adjacent fold step's band (some
+        # column there), for interior fold steps.
+        n_folds, out_dim = 4, 10
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1)
+        idx = np.asarray(layer.indices)
+        ptrs = np.asarray(layer.ptrs)
+        t, i = 1, 3  # fold step 1 (interior), column 3
+        r = t * out_dim + i
         row_cols = set(idx[ptrs[r]:ptrs[r + 1]].tolist())
-        for t in range(n_folds):
-            band_start = t * out_dim
-            # redundancy=2 -> diagonal +/- 1 column, both should be present
-            assert (band_start + r - 1) in row_cols
-            assert (band_start + r)     in row_cols
-            assert (band_start + r + 1) in row_cols
+        prev_band = set(range((t - 1) * out_dim, t * out_dim))
+        next_band = set(range((t + 1) * out_dim, (t + 2) * out_dim))
+        assert row_cols & prev_band, "row doesn't reach the previous fold step's band"
+        assert row_cols & next_band, "row doesn't reach the next fold step's band"
 
-    def test_non_square_raises(self):
-        # out_dim not a multiple of n_folds should be impossible by
-        # construction here (out_dim IS hidden, n_folds independent), but
-        # the assert inside preseed_fn should still be reachable/correct
-        # for a genuinely mismatched n_out.
-        from sili.sparse_rnn import _preseed_columns_fn
-        fn = _preseed_columns_fn(n_folds=3)
-        ptrs = np.array([0, 0], dtype=np.int32)
-        idx = np.zeros(0, dtype=np.int32)
-        vals = np.zeros(0, dtype=np.float32)
-        with pytest.raises(AssertionError):
-            fn(ptrs, idx, vals, n_in=1, n_out=10)  # 10 not divisible by 3
+    def test_smaller_bandwidth_is_narrower(self):
+        n_folds, out_dim = 4, 10
+        wide   = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, bandwidth=out_dim)
+        narrow = build_fold_skip_layer(n_folds, out_dim, num_cpus=1, bandwidth=2)
+        assert narrow.nnz < wide.nnz
+
+    def test_forward_backward_finite(self):
+        n_folds, out_dim = 3, 6
+        layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1)
+        total = n_folds * out_dim
+        x = Tensor(np.random.randn(total).astype(np.float32))
+        out_np = layer.forward_dense(x.data[np.newaxis, :], 0.1)
+        assert np.all(np.isfinite(out_np))
+        # All-zero weights -> all-zero output pre-training, regardless of x.
+        assert np.allclose(out_np, 0.0)
 
 
 class TestFoldedColumnLayerForward:
@@ -215,6 +190,65 @@ class TestFoldedColumnLayerForward:
             f"layer weights didn't reduce column MSE via backward_dense: "
             f"early={err_early:.4f} late={err_late:.4f}"
         )
+
+
+class TestFoldedColumnLayerWithSkip:
+    """FoldedColumnLayer + build_fold_skip_layer, actually composed."""
+
+    def test_gradient_reaches_both_layers(self):
+        from sili.sparse_rnn import build_fold_skip_layer, apply_fold_skip
+
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.05, num_cpus=1)
+        skip  = build_fold_skip_layer(n_folds, hidden, num_cpus=1)
+
+        x = Tensor(np.random.randn(hidden).astype(np.float32))
+        raw     = layer(x)
+        skipped = apply_fold_skip(skip, raw, lr=0.05)
+        refined = raw + skipped
+
+        loss = (refined ** 2).sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert np.all(np.isfinite(x.grad))
+        assert np.all(np.isfinite(refined.data))
+
+    def test_skip_layer_weights_move_off_zero_after_training(self):
+        # The skip layer starts all-zero; a few steps of real backprop
+        # through it (via the composed refined = raw + skip(raw) loss)
+        # should move at least some of its weights away from zero.
+        #
+        # lr=0.3 here originally diverged (weight magnitude 14 -> 141 ->
+        # 890 -> ... over 5 steps against a random, structureless target
+        # with no real relationship to the input, eventually overflowing
+        # FP4 storage back to exactly 0 by step 18) -- not a library bug,
+        # just a badly-tuned test. A learning rate matched to the layer's
+        # own (0.02) converges to a stable nonzero state instead.
+        from sili.sparse_rnn import build_fold_skip_layer, apply_fold_skip
+
+        lr = 0.02
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=2)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=lr, num_cpus=1)
+        # expected_lr must match the lr apply_fold_skip is called with below --
+        # see build_fold_skip_layer's docstring for the FP4 gotcha this avoids.
+        skip  = build_fold_skip_layer(n_folds, hidden, num_cpus=1, expected_lr=lr)
+
+        rng = np.random.default_rng(1)
+        target = Tensor((rng.standard_normal(n_folds * hidden) * 0.3).astype(np.float32))
+
+        for _ in range(20):
+            x = Tensor(rng.standard_normal(hidden).astype(np.float32))
+            raw     = layer(x)
+            skipped = apply_fold_skip(skip, raw, lr=lr)
+            refined = raw + skipped
+            loss = ((refined - target) ** 2).sum()
+            loss.backward()
+            assert np.all(np.isfinite(skip.weights_vals)), "diverged mid-training"
+
+        assert not np.allclose(skip.weights_vals, 0.0)
 
 
 class TestColumnAveragingEndToEnd:
