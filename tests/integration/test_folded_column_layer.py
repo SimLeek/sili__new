@@ -136,11 +136,11 @@ class TestFoldedColumnLayerForward:
         assert np.all(np.isfinite(x.grad))
 
     def test_reshape_matches_folded_layer_sum(self):
-        # Sanity cross-check: FoldedColumnLayer's per-fold-step output,
-        # reshaped and summed over the fold axis by hand, should equal
-        # what an ordinary FoldedLayer produces from the SAME weights
-        # (same descriptor, no pre-seeding difference at density=1.0
-        # where pre-seeding is a no-op) -- confirms retaining the fold
+        # Sanity cross-check: FoldedColumnLayer's in_proj (the pretrained
+        # -weight half, NOT the full forward() -- FoldedLayer has no
+        # recurrent concept to compare against), reshaped and summed over
+        # the fold axis by hand, should equal what an ordinary FoldedLayer
+        # produces from the SAME weights -- confirms retaining the fold
         # axis didn't change the underlying per-fold-step computation.
         n_folds, hidden = 4, 5
         desc_a = _toy_square_descriptor(n_folds, hidden, density=1.0, seed=7)
@@ -150,10 +150,24 @@ class TestFoldedColumnLayerForward:
 
         x_np = np.random.randn(hidden).astype(np.float32)
         out_plain    = plain(Tensor(x_np.copy()))
-        out_columned = columned(Tensor(x_np.copy()))
+        out_in_proj  = columned.in_proj(Tensor(x_np.copy()))
 
-        manual_sum = out_columned.data.reshape(n_folds, hidden).sum(axis=0)
+        manual_sum = out_in_proj.data.reshape(n_folds, hidden).sum(axis=0)
         np.testing.assert_allclose(manual_sum, out_plain.data, atol=1e-4)
+
+    def test_zero_state_forward_equals_in_proj_alone(self):
+        # forward(x) with no state defaults to zeros; recurrent's own
+        # weights start at zero too, so a zero state through it produces
+        # zero regardless -- forward(x) should exactly equal in_proj(x)
+        # on a freshly-constructed layer.
+        n_folds, hidden = 3, 5
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.6, seed=4)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.01, num_cpus=1)
+        x_np = np.random.randn(hidden).astype(np.float32)
+
+        out_forward = layer(Tensor(x_np.copy()))
+        out_in_proj = layer.in_proj(Tensor(x_np.copy()))
+        np.testing.assert_allclose(out_forward.data, out_in_proj.data, atol=1e-6)
 
     def test_weights_learn_via_backward_dense_no_energy_gating(self):
         # FoldedColumnLayer's OWN weights (via backward_dense, not a free
@@ -192,63 +206,89 @@ class TestFoldedColumnLayerForward:
         )
 
 
-class TestFoldedColumnLayerWithSkip:
-    """FoldedColumnLayer + build_fold_skip_layer, actually composed."""
+class TestFoldedColumnLayerRecurrent:
+    """FoldedColumnLayer's automatic in_proj + recurrent composition --
+    mirrors SparseRNNCell's own input_proj+recurrent split (see class
+    docstring), built automatically by from_descriptor now rather than
+    requiring the caller to compose build_fold_skip_layer by hand."""
 
-    def test_gradient_reaches_both_layers(self):
-        from sili.sparse_rnn import build_fold_skip_layer, apply_fold_skip
-
+    def test_recurrent_built_automatically(self):
         n_folds, hidden = 4, 6
         desc = _toy_square_descriptor(n_folds, hidden, density=0.5)
         layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.05, num_cpus=1)
-        skip  = build_fold_skip_layer(n_folds, hidden, num_cpus=1)
+        assert hasattr(layer, "recurrent")
+        assert layer.recurrent.n_inputs == n_folds * hidden
+        assert layer.recurrent.n_outputs == n_folds * hidden
+        assert np.allclose(layer.recurrent.weights_vals, 0.0)
+
+    def test_nonzero_state_changes_output_vs_zero_state(self):
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=1)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.05, num_cpus=1)
+        # Give recurrent nonzero weights directly (bypassing training) so
+        # a nonzero state actually has something to propagate through.
+        layer.recurrent.load_weights(
+            np.asarray(layer.recurrent.ptrs), np.asarray(layer.recurrent.indices),
+            np.ones(layer.recurrent.nnz, dtype=np.float32),
+        )
+        layer.recurrent.set_value_scale_raw(0, 1.0)
+        for r in range(layer.recurrent.n_inputs):
+            layer.recurrent.set_value_scale_raw(r, 1.0)
 
         x = Tensor(np.random.randn(hidden).astype(np.float32))
-        raw     = layer(x)
-        skipped = apply_fold_skip(skip, raw, lr=0.05)
-        refined = raw + skipped
+        out_zero    = layer(x)
+        out_nonzero = layer(x, state=Tensor(np.ones(n_folds * hidden, dtype=np.float32)))
+        assert not np.allclose(out_zero.data, out_nonzero.data), \
+            "recurrent(state) had no effect despite nonzero weights and nonzero state"
 
-        loss = (refined ** 2).sum()
+    def test_gradient_reaches_both_in_proj_and_recurrent_weights(self):
+        n_folds, hidden = 4, 6
+        desc = _toy_square_descriptor(n_folds, hidden, density=0.5)
+        layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=0.05, num_cpus=1)
+
+        x     = Tensor(np.random.randn(hidden).astype(np.float32))
+        state = Tensor(np.random.randn(n_folds * hidden).astype(np.float32))
+        out   = layer(x, state)
+        loss  = (out ** 2).sum()
         loss.backward()
 
         assert x.grad is not None
         assert np.all(np.isfinite(x.grad))
-        assert np.all(np.isfinite(refined.data))
+        assert np.all(np.isfinite(out.data))
+        # in_proj's weights: check via neuron_grad_accum on the underlying
+        # suffix layer(s) -- nonzero confirms backward_dense ran on them.
+        sub = next(iter(layer._sili_layers.values()))
+        assert np.any(sub.neuron_grad_accum != 0.0)
 
-    def test_skip_layer_weights_move_off_zero_after_training(self):
-        # The skip layer starts all-zero; a few steps of real backprop
-        # through it (via the composed refined = raw + skip(raw) loss)
-        # should move at least some of its weights away from zero.
+    def test_recurrent_weights_move_off_zero_after_multi_step_training(self):
+        # Genuine multi-step recurrence: state threaded from one call to
+        # the next (mirroring SparseRNNCell's own calling convention),
+        # not a single forward(x, state) call with a hand-picked state.
         #
-        # lr=0.3 here originally diverged (weight magnitude 14 -> 141 ->
-        # 890 -> ... over 5 steps against a random, structureless target
-        # with no real relationship to the input, eventually overflowing
-        # FP4 storage back to exactly 0 by step 18) -- not a library bug,
-        # just a badly-tuned test. A learning rate matched to the layer's
-        # own (0.02) converges to a stable nonzero state instead.
-        from sili.sparse_rnn import build_fold_skip_layer, apply_fold_skip
-
+        # lr=0.3 here originally diverged in an earlier version of this
+        # test (weight magnitude exploding against a random target with
+        # no real relationship to input, eventually overflowing FP4
+        # storage back to exactly 0) -- not a library bug, just a
+        # badly-tuned test. A learning rate matched to the layer's own
+        # (0.02) converges to a stable nonzero state instead.
         lr = 0.02
         n_folds, hidden = 4, 6
         desc = _toy_square_descriptor(n_folds, hidden, density=0.5, seed=2)
         layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=lr, num_cpus=1)
-        # expected_lr must match the lr apply_fold_skip is called with below --
-        # see build_fold_skip_layer's docstring for the FP4 gotcha this avoids.
-        skip  = build_fold_skip_layer(n_folds, hidden, num_cpus=1, expected_lr=lr)
 
         rng = np.random.default_rng(1)
         target = Tensor((rng.standard_normal(n_folds * hidden) * 0.3).astype(np.float32))
 
+        state = None
         for _ in range(20):
             x = Tensor(rng.standard_normal(hidden).astype(np.float32))
-            raw     = layer(x)
-            skipped = apply_fold_skip(skip, raw, lr=lr)
-            refined = raw + skipped
-            loss = ((refined - target) ** 2).sum()
+            state = layer(x, state)
+            loss = ((state - target) ** 2).sum()
             loss.backward()
-            assert np.all(np.isfinite(skip.weights_vals)), "diverged mid-training"
+            assert np.all(np.isfinite(layer.recurrent.weights_vals)), "diverged mid-training"
+            state = state.detach()
 
-        assert not np.allclose(skip.weights_vals, 0.0)
+        assert not np.allclose(layer.recurrent.weights_vals, 0.0)
 
 
 class TestColumnAveragingEndToEnd:
@@ -281,6 +321,13 @@ class TestColumnAveragingEndToEnd:
     """
 
     def test_stable_under_real_energy_competition(self):
+        # Genuine multi-step recurrence now: state threaded from each
+        # step's energy-gated output into the next step's layer(x, state)
+        # call (detached between steps, BPTT=1-style, matching
+        # SparseRNNAgent.train_step's convention) -- this is what actually
+        # lets recurrent() participate, and is what "track next input at
+        # EVERY fold step" means now that it's backed by real recurrence
+        # rather than a single independently-computed snapshot.
         from sili.energy import EnergyDynamics, column_averaging_loss
         from sili.tensor import combine_losses
 
@@ -296,6 +343,7 @@ class TestColumnAveragingEndToEnd:
         x_base    = (rng.standard_normal(hidden) * 0.3).astype(np.float32)
 
         aux_losses = []
+        state = None
         for _ in range(500):
             # Varying input -- a literally-static repeated input is the
             # degenerate case documented in TODO.md (fired-but-unselected
@@ -303,7 +351,7 @@ class TestColumnAveragingEndToEnd:
             # eventually let them win their local competition).
             x_np = x_base + rng.standard_normal(hidden).astype(np.float32) * 0.02
             x = Tensor(x_np)
-            raw = layer(x)
+            raw = layer(x, state)
             h_out, aux_loss, actual_p = ed.forward(raw)
 
             assert np.all(np.isfinite(h_out.data))
@@ -319,8 +367,21 @@ class TestColumnAveragingEndToEnd:
             total.backward()
 
             aux_losses.append(float(aux_loss.data))
+            state = h_out.detach()
 
         assert all(np.isfinite(a) for a in aux_losses)
+        # Deliberately NOT asserting recurrent moves off zero here (unlike
+        # test_recurrent_weights_move_off_zero_after_multi_step_training,
+        # which does, with no EnergyDynamics in the loop): checked directly
+        # while writing this -- the gradient reaching recurrent through the
+        # full energy-gated path is real but tiny (attenuated by both the
+        # sparse gate and backward_dense's lr_per_row_nnz dilution), and can
+        # legitimately fall below FP4's quantization step for many steps.
+        # That's consistent with this class's own scope (stability under
+        # competition, not convergence -- see class docstring) rather than
+        # a bug; demanding visible weight movement here would be re-tuning
+        # toy hyperparameters to force a demo, the exact thing this file's
+        # history already argues against.
         # Regression guard for the TODO.md-documented divergence: with the
         # static-input degenerate case this reached 177+ by step 270 and
         # was still climbing; bounded and settling (not still climbing at

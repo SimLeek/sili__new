@@ -570,21 +570,63 @@ class FoldedColumnLayer(FoldedLayer):
     """
     FoldedLayer variant for the column-averaging mechanism (see
     sili_peridot/todolist.md Phase A3/A4): retains the pre-sum
-    [batch, n_folds*out_dim] tensor instead of collapsing the fold axis
-    (FoldedLayer.forward sums it away immediately). from_descriptor is
-    otherwise identical to FoldedLayer's -- no pre-seeding happens here;
-    see build_fold_skip_layer below for actual cross-fold-depth
-    connectivity, which is a separate, composable piece applied to this
-    layer's output, not baked into construction.
+    [n_folds*out_dim] tensor instead of collapsing the fold axis
+    (FoldedLayer.forward sums it away immediately), and pairs it with a
+    `recurrent` layer -- structurally the same input_proj+recurrent split
+    SparseRNNCell already uses (h = input_proj(obs) + recurrent(state)),
+    just built on FoldedLayer/SparseLinearLayer instead of the currently
+    -broken DISLDOLayer/SISLDOLayer (see TODO.md).
+
+    in_proj(x) -- this class's own inherited from_descriptor weights (the
+    REAL pretrained per-fold-step matrices, stacked) -- only genuinely
+    represents "external input -> fold step 1" faithfully; every other
+    fold step's band is computed from the same raw x too (FoldedLayer's
+    approximation, see build_fold_skip_layer's docstring), not from what
+    the prior fold step actually produced.
+
+    recurrent(state) -- build_fold_skip_layer's from-scratch banded
+    matrix (see below), mapping THIS layer's own [n_folds*out_dim] output
+    space back to itself: fold step i's slot -> fold step i+1's slot (and
+    nearby columns within bandwidth), genuinely carrying one step's
+    output into the next's input, which in_proj alone cannot do. No
+    pretrained content -- purely synaptogenesis/backprop-trained from the
+    zero-value banded pre-seed.
+
+    forward(x, state) = in_proj(x) + recurrent(state), returned as the
+    new state -- feed it back in for the next call, mirroring
+    SparseRNNCell's own calling convention exactly. state defaults to
+    zero (true step-0, matching RNNFoldedBlock.forward's state=0 start)
+    when not given.
 
     Feed forward()'s output to sili.energy.column_averaging_loss (after
     whatever EnergyDynamics gating is in the actual model -- see that
-    function's docstring for why it must run on the energy-GATED state).
-    No shape requirement on the wrapped suffix beyond what out_features
-    already reports -- column_averaging_loss takes an explicit indices
-    argument rather than assuming this layer's whole output is the
-    tracked column block.
+    function's docstring for why it must run on the energy-GATED state,
+    not this layer's raw output).
     """
+
+    @classmethod
+    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
+                        num_cpus: int = 4, max_row_weights: int = 0,
+                        bytes_per_row: int = 0,
+                        recurrent_bandwidth: int = None) -> "FoldedColumnLayer":
+        """
+        Like FoldedLayer.from_descriptor, plus builds `recurrent` (see
+        class docstring and build_fold_skip_layer) sized to this layer's
+        own [n_folds*out_dim] output space.
+
+        recurrent_bandwidth: forwarded to build_fold_skip_layer as
+        `bandwidth` -- None (default) uses that function's own default
+        (out_dim, i.e. one hop reaches the adjacent fold step).
+        """
+        obj = super().from_descriptor(
+            descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
+            max_row_weights=max_row_weights, bytes_per_row=bytes_per_row,
+        )
+        obj.recurrent = build_fold_skip_layer(
+            obj._n_folds, obj.column_width, num_cpus=num_cpus,
+            bandwidth=recurrent_bandwidth, expected_lr=learning_rate,
+        )
+        return obj
 
     @property
     def out_features(self) -> int:
@@ -595,17 +637,17 @@ class FoldedColumnLayer(FoldedLayer):
 
     @property
     def column_width(self) -> int:
-        """Per-fold-step output width."""
+        """Per-fold-step output width -- also recurrent's own row/column
+        count divided by n_folds."""
         return next(iter(self._out_dims.values()))
 
-    def forward(self, x: "Tensor") -> "Tensor":
+    def in_proj(self, x: "Tensor") -> "Tensor":
         """
-        Like FoldedLayer.forward, but does NOT sum over the fold axis --
-        returns [batch, n_folds*out_dim] (or [n_folds*out_dim] if x was
-        1-D): every fold step's own out_dim-sized projection, concatenated
-        rather than collapsed. Simpler backward than FoldedLayer's: no
-        fold-sum broadcast-tiling needed, since dy already arrives at the
-        full n_folds*out_dim width this layer actually produced.
+        The pretrained-weight half of forward(): does NOT sum over the
+        fold axis like FoldedLayer.forward does -- returns
+        [batch, n_folds*out_dim] (or [n_folds*out_dim] if x was 1-D),
+        every fold step's own out_dim-sized projection, concatenated
+        rather than collapsed.
         """
         x_np = np.asarray(x.data, dtype=np.float32)
         squeezed = x_np.ndim == 1
@@ -619,7 +661,7 @@ class FoldedColumnLayer(FoldedLayer):
         if squeezed:
             raw_np = raw_np.squeeze(0)
 
-        out = Tensor(raw_np, _children=(x,), _op="folded_column", backend=x.backend)
+        out = Tensor(raw_np, _children=(x,), _op="folded_column_in_proj", backend=x.backend)
 
         _layers = list(self._sili_layers.values())
         _sq     = squeezed
@@ -639,6 +681,20 @@ class FoldedColumnLayer(FoldedLayer):
 
         out._backward = _bwd
         return out
+
+    def forward(self, x: "Tensor", state: "Tensor" = None) -> "Tensor":
+        """
+        h = in_proj(x) + recurrent(state) -- same pattern as
+        SparseRNNCell.forward. Returns the new state; feed it back in as
+        `state` on the next call. state=None (default) uses zeros -- true
+        step-0, matching RNNFoldedBlock.forward's state=0 start.
+        """
+        raw = self.in_proj(x)
+        if state is None:
+            state = Tensor(np.zeros(self.out_features, dtype=np.float32),
+                           backend=x.backend)
+        rec = apply_fold_skip(self.recurrent, state, lr=self.lr)
+        return raw + rec
 
 
 def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
