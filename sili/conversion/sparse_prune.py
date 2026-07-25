@@ -152,6 +152,8 @@ def default_min_abs_param(
 def calibrate_min_abs_param(
     state_dict: Dict[str, torch.Tensor],
     target_sparsity: float = 0.5,
+    max_sample: Optional[int] = 5_000_000,
+    seed: int = 0,
 ) -> float:
     """
     Derive min_abs_param directly from the ACTUAL loaded weight-magnitude
@@ -202,29 +204,71 @@ def calibrate_min_abs_param(
                       calibrate_for_memory_budget() for a budget-first framing
                       of the same idea.
 
+    max_sample : cap on how many |weight| values get materialized for the
+                 percentile calculation. Above this, each eligible tensor
+                 contributes a random sample proportional to its share of
+                 the total eligible population, instead of every value.
+                 None disables sampling (exact kthvalue over the full
+                 population). Default 5,000,000 -- see "Memory" below;
+                 this function's own docstring already frames the result
+                 as a "robust, predictable... memory target," not an
+                 exact percentile, so approximating it via sampling is a
+                 memory/speed fix, not a design change.
+    seed        : RNG seed for the sampling above (irrelevant if
+                 max_sample is None or the population doesn't exceed it).
+
+    Memory
+    ------
+    The exact path (max_sample=None) materializes every eligible tensor's
+    |weight| as float32 simultaneously (one flattened copy per tensor,
+    all held in a list, THEN concatenated into one more full-size copy
+    for kthvalue) -- observed to peak at ~15GB RAM for a single call on a
+    ~1B-parameter checkpoint (MiniCPM5-1B), bringing a 15GB machine to
+    the edge of OOM/heavy swapping. Sampling keeps only ONE tensor's full
+    float copy alive at a time (freed before the next tensor's), plus a
+    capped-size running sample list, so peak memory tracks the single
+    LARGEST eligible tensor instead of their sum.
+
     Returns
     -------
     min_abs_param : float, the calibrated threshold.
     """
-    mags = []
-    for name, t in state_dict.items():
-        if not isinstance(t, torch.Tensor) or t.ndim != 2:
-            continue    # only 2-D matrices are threshold-eligible, matching
-                        # _keep_dense_reason's own ndim==2 requirement --
-                        # vectors and higher-rank tensors are always dense
-                        # regardless of threshold, so their magnitudes
-                        # shouldn't influence the percentile calculation.
-        mags.append(t.detach().float().abs().flatten())
-
-    if not mags:
+    eligible = [(name, t) for name, t in state_dict.items()
+               if isinstance(t, torch.Tensor) and t.ndim == 2]
+    # only 2-D matrices are threshold-eligible, matching
+    # _keep_dense_reason's own ndim==2 requirement -- vectors and
+    # higher-rank tensors are always dense regardless of threshold, so
+    # their magnitudes shouldn't influence the percentile calculation.
+    if not eligible:
         return 0.0    # nothing eligible -- threshold is moot either way
+
+    total_elems = sum(t.numel() for _, t in eligible)
+    do_sample = max_sample is not None and total_elems > max_sample
+    generator = torch.Generator().manual_seed(seed) if do_sample else None
+
+    mags = []
+    for _, t in eligible:
+        flat = t.detach().float().abs().flatten()
+        if do_sample:
+            n_take = min(flat.numel(), max(
+                1, int(round(flat.numel() / total_elems * max_sample))))
+            # randint (with replacement), not randperm: randperm would
+            # materialize a full-size permutation array just to then
+            # slice a small piece of it -- exactly the memory cost this
+            # sampling path exists to avoid for the largest tensors.
+            # Collision probability at n_take << flat.numel() is
+            # negligible and irrelevant for a percentile estimate anyway.
+            idx = torch.randint(0, flat.numel(), (n_take,), generator=generator)
+            flat = flat[idx]   # fancy indexing copies -- safe to drop the original
+        mags.append(flat)
 
     all_mags = torch.cat(mags)
     k = max(1, min(all_mags.numel(),
                    int(round(target_sparsity * all_mags.numel()))))
-    # kthvalue is exact and, unlike torch.quantile's interpolation path,
-    # doesn't require materializing a second full-precision sorted copy --
-    # matters for real multi-billion-parameter checkpoints.
+    # kthvalue is exact (over whatever population it's given -- the full
+    # set, or the sample above) and, unlike torch.quantile's interpolation
+    # path, doesn't require materializing a second full-precision sorted
+    # copy on top of it.
     threshold = torch.kthvalue(all_mags, k).values.item()
     return threshold
 
