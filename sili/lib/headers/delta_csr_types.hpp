@@ -464,6 +464,25 @@ struct SparseLinearWeightsDelta {
         importance_scale[row] = v;
     }
 
+    // Per-COLUMN counterpart to importance_scale, same relationship as
+    // output_scale is to value_scale: true_imp = stored_imp *
+    // importance_scale[row] * output_importance_scale[col]. A synapse's
+    // stored importance and stored weight live at the same (row, col)
+    // position, so if the weight's own representability scale needs a
+    // column term (it does -- see output_scale), the importance's does
+    // too, for the same reason (per-output activity magnitude can vary
+    // as much as per-output weight magnitude). Default 1.0, same
+    // lazy-sizing convention -- unused by from_descriptor today (no
+    // caller sets it, so this is a pure no-op for every existing path).
+    std::vector<value_type> output_importance_scale;
+    inline value_type get_output_importance_scale(std::size_t col) const {
+        return col < output_importance_scale.size() ? output_importance_scale[col] : value_type(1);
+    }
+    inline void set_output_importance_scale_raw(std::size_t col, value_type v) {
+        if (col >= output_importance_scale.size()) output_importance_scale.resize(col + 1, value_type(1));
+        output_importance_scale[col] = v;
+    }
+
     // Same per-row design, for STORED weight values instead of importance.
     // Same motivation, same lazy-sizing/default-1.0 pattern, same
     // read/write convention (true_w = stored_w * scale).

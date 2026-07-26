@@ -107,6 +107,12 @@ void disldo_forward(
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 const value_type  out_scale = weights.get_output_scale(col);
                 const value_type  w        = w_stored * val_scale * out_scale;   // -> true units
+                // Same row*col combination as the weight's own scale --
+                // a synapse's stored importance lives at the same (row,
+                // col) position as its stored weight, so its
+                // representability scale needs the same two factors.
+                const value_type  out_imp_scale   = weights.get_output_importance_scale(col);
+                const value_type  combined_imp_scale = imp_scale * out_imp_scale;
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -117,9 +123,9 @@ void disldo_forward(
 
                     if (learning_rate != value_type(0)) {
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        value_type imp = stored_imp * imp_scale;   // -> true units
+                        value_type imp = stored_imp * combined_imp_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / imp_scale);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / combined_imp_scale);
                         // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
                         // rounds to the nearest FP4_TABLE entry, so it can differ from what
                         // was just written. Stats must track what's really in the buffer.
@@ -337,7 +343,11 @@ void disldo_backward(
                 const value_type  out_scale     = weights.get_output_scale(col);
                 const value_type  combined_scale = val_scale * out_scale;
                 value_type cw  = cw_orig * combined_scale;   // -> true units
-                value_type ci  = ci_orig * imp_scale;   // -> true units
+                // Same row*col combination as the weight's own scale --
+                // see the matching comment in disldo_forward.
+                const value_type  out_imp_scale      = weights.get_output_importance_scale(col);
+                const value_type  combined_imp_scale = imp_scale * out_imp_scale;
+                value_type ci  = ci_orig * combined_imp_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -357,7 +367,7 @@ void disldo_backward(
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));

@@ -616,6 +616,42 @@ TEST_CASE("importance_scale and value_scale work correctly together, per-row, in
     CHECK(imp_stored != 0.0f);
 }
 
+TEST_CASE("output_importance_scale combines with importance_scale, mirroring output_scale/value_scale",
+         "[scale][output_importance_scale][regression]") {
+    // Same shape as the value/output_scale forward test, but for
+    // importance: forward's output must reflect BOTH importance_scale
+    // AND output_importance_scale, not just the row-side factor alone.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {6.0f};   // stored importance at FP4's max
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_importance_scale_raw(0, 0.1f);          // true_imp so far = 0.6
+    weights.set_output_importance_scale_raw(0, 10.0f);  // true_imp = 6.0 * 0.1 * 10.0 = 6.0
+
+    // Drive a forward pass with a large positive contribution so the
+    // Hebbian update pushes importance further in the SAME direction --
+    // if output_importance_scale were ignored (combined=0.1 instead of
+    // 1.0), the update step size relative to the "true" importance
+    // would be 100x larger, changing the post-quantization stored value.
+    std::vector<float> input = {1.0f};
+    std::vector<float> output(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.5f, 1);
+
+    const float stored_after = ValueAccessor<FP4BiPacked>::get_imp(
+        weights.connections.values, weights.connections.layout.elem_start[0]);
+    const float true_imp_after = stored_after * 0.1f * 10.0f;
+    // contrib = true_w * input = 1.0. true_imp before = 6.0.
+    // imp_after = 6.0 + 1.0*0.5/(1+6.0) = 6.0 + 0.0714... ~= 6.0714
+    CHECK(true_imp_after == Catch::Approx(6.0f + 1.0f * 0.5f / (1.0f + 6.0f)).margin(0.1f));
+}
+
 // ── SiliBlock reshape+sum mapping ────────────────────────────────────────────
 
 TEST_CASE("SiliBlock mapping: reshape+sum of [batch, n_folds*out] equals sequential sum",

@@ -543,6 +543,7 @@ public:
     V get_output_scale(S col)     const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
     V get_value_scale_importance(S row)  const { return weights.get_value_scale_importance(static_cast<std::size_t>(row)); }
     V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
+    V get_output_importance_scale(S col) const { return weights.get_output_importance_scale(static_cast<std::size_t>(col)); }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -932,6 +933,19 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_output_scale_importance", &SparseLinearLayer::get_output_scale_importance,
              py::arg("col"),
              "Per-column counterpart for output_scale. Default 0.")
+        .def("get_output_importance_scale", &SparseLinearLayer::get_output_importance_scale,
+             py::arg("col"),
+             "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
+             "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
+             "Default 1.0, same convention as get_output_scale().")
+        .def("set_output_importance_scale_raw",
+             [](SparseLinearLayer& self, int col, float scale) {
+                 self.weights.set_output_importance_scale_raw(
+                     static_cast<std::size_t>(col), scale);
+             },
+             py::arg("col"), py::arg("scale"),
+             "Same as set_importance_scale_raw() but per-output instead of\n"
+             "per-input -- see set_output_scale_raw() for the analogous pattern.")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
