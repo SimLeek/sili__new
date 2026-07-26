@@ -963,15 +963,44 @@ def fold_block_group(
                     f"Expected parameter '{param_name}' not found in state_dict"
                 )
 
-            # Accept either a raw CSR tensor or a dict entry from sparse_prune.py
+            # Accept either a raw CSR tensor or a dict entry from sparse_prune.py.
+            # sparse_prune.py's "raw" key is NOT only used for true scalars/
+            # vectors -- _keep_dense_reason falls back to "raw" for ANY 2-D
+            # matrix that stayed dense (low sparsity, or CSR overhead not
+            # worth it), which is the common case for a gently-pruned model.
+            # BUG (found converting a real checkpoint): this used to check
+            # `raw.get("csr") is None` and treat that as "scalar, skip" --
+            # silently skipping every dense-stored 2-D suffix instead of
+            # stacking it like the plain-dense-tensor branch below already
+            # does. Worse, fold_sparse_payload's removal step deletes a
+            # block's per-layer keys by (prefix, index) alone, not by
+            # whether the suffix was actually captured here -- a suffix
+            # skipped this way had its weights silently DELETED from the
+            # payload with no trace, not just left unfolded.
             if isinstance(raw, dict):
-                # sparse_prune.py format: {"csr": csr_tensor, "shape": ...}
-                csr_entry = raw.get("csr")
-                if csr_entry is None:
-                    # Scalar / empty tensor — skip stacking, keep as-is
-                    per_block_csr = None
-                    break
-                tensor = csr_entry
+                if "csr" in raw:
+                    tensor = raw["csr"]
+                elif "raw" in raw:
+                    # Identical treatment to the plain-dense-tensor branch
+                    # below -- a "raw" dict entry is just a dense tensor
+                    # that happens to be wrapped, not a distinct case
+                    # (that wrapping is exactly what the old buggy check
+                    # missed: it treated ANY dict without a "csr" key as
+                    # a non-stackable scalar, regardless of what the
+                    # wrapped tensor actually was).
+                    t = raw["raw"].detach().float()
+                    if t.ndim == 0:
+                        t = t.reshape(1, 1)
+                    elif t.ndim == 1:
+                        t = t.unsqueeze(0)
+                    elif t.ndim > 2:
+                        t = t.reshape(t.shape[0], -1)
+                    tensor = t.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+                else:
+                    raise ValueError(
+                        f"dict entry for '{param_name}' has neither 'csr' nor "
+                        f"'raw' key: {sorted(raw.keys())}"
+                    )
             elif isinstance(raw, torch.Tensor) and raw.layout == torch.sparse_csr:
                 tensor = raw
             elif isinstance(raw, torch.Tensor):
@@ -988,10 +1017,6 @@ def fold_block_group(
                 raise TypeError(f"Unexpected type for '{param_name}': {type(raw)}")
 
             per_block_csr.append(tensor)
-
-        if per_block_csr is None:
-            # Non-stackable entry (scalar) — skip
-            continue
 
         stacked = stack_csr_vertical(per_block_csr)
         out_dim = int(per_block_csr[0].shape[0])   # rows of a single block's matrix
@@ -1101,10 +1126,19 @@ def fold_sparse_payload(
         # Record which param names to remove from the flat state dict.
         # Must match prefix AND index -- index alone would also remove
         # same-indexed tensors belonging to an unrelated block family.
+        # Must ALSO match a suffix that's actually in desc.stacked_weights
+        # -- a suffix fold_block_group genuinely couldn't fold (true
+        # scalar/empty entries) must not be removed here, or its weights
+        # would be deleted from the payload with no trace anywhere in the
+        # output (see fold_block_group's docstring for the bug this
+        # guards against, found via a real checkpoint's dense-stored 2-D
+        # suffixes).
+        folded_suffixes = set(desc.stacked_weights.keys())
         for block_idx in group:
             for name in list(flat.keys()):
                 parsed = _parse_block_key(name)
-                if parsed and parsed[0] == prefix and parsed[1] == block_idx:
+                if (parsed and parsed[0] == prefix and parsed[1] == block_idx
+                        and parsed[2] in folded_suffixes):
                     removed_names.add(name)
 
         # Serialise descriptor for the payload
