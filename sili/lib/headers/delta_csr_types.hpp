@@ -464,6 +464,25 @@ struct SparseLinearWeightsDelta {
         importance_scale[row] = v;
     }
 
+    // Per-COLUMN counterpart to importance_scale, same relationship as
+    // output_scale is to value_scale: true_imp = stored_imp *
+    // importance_scale[row] * output_importance_scale[col]. A synapse's
+    // stored importance and stored weight live at the same (row, col)
+    // position, so if the weight's own representability scale needs a
+    // column term (it does -- see output_scale), the importance's does
+    // too, for the same reason (per-output activity magnitude can vary
+    // as much as per-output weight magnitude). Default 1.0, same
+    // lazy-sizing convention -- unused by from_descriptor today (no
+    // caller sets it, so this is a pure no-op for every existing path).
+    std::vector<value_type> output_importance_scale;
+    inline value_type get_output_importance_scale(std::size_t col) const {
+        return col < output_importance_scale.size() ? output_importance_scale[col] : value_type(1);
+    }
+    inline void set_output_importance_scale_raw(std::size_t col, value_type v) {
+        if (col >= output_importance_scale.size()) output_importance_scale.resize(col + 1, value_type(1));
+        output_importance_scale[col] = v;
+    }
+
     // Same per-row design, for STORED weight values instead of importance.
     // Same motivation, same lazy-sizing/default-1.0 pattern, same
     // read/write convention (true_w = stored_w * scale).
@@ -475,6 +494,39 @@ struct SparseLinearWeightsDelta {
     inline void set_value_scale_raw(std::size_t row, value_type v) {
         if (row >= value_scale.size()) value_scale.resize(row + 1, value_type(1));
         value_scale[row] = v;
+    }
+
+    // value_scale/output_scale are themselves gradient-updated parameters
+    // (disldo_backward), so -- like every per-synapse weight -- each gets
+    // its own importance value damping its update step
+    // (new = old - lr*grad / (1 + |importance|)). Default 0, same
+    // convention as per-synapse importance.
+    std::vector<value_type> value_scale_importance;
+    inline value_type get_value_scale_importance(std::size_t row) const {
+        return row < value_scale_importance.size() ? value_scale_importance[row] : value_type(0);
+    }
+
+    // Per-COLUMN counterpart to value_scale: true_w = stored_w *
+    // value_scale[row] * output_scale[col]. Same lazy-sizing/default-1.0
+    // convention. Gradient-updated by disldo_backward like value_scale is,
+    // but ONLY once a caller has explicitly called set_output_scale_raw at
+    // least once -- output_scale_is_trainable tracks that (not
+    // output_scale.empty(), which disldo_backward's own internal resize
+    // would otherwise flip after the first call regardless of intent).
+    std::vector<value_type> output_scale;
+    std::vector<value_type> output_scale_importance;
+    bool output_scale_is_trainable = false;
+
+    inline value_type get_output_scale(std::size_t col) const {
+        return col < output_scale.size() ? output_scale[col] : value_type(1);
+    }
+    inline value_type get_output_scale_importance(std::size_t col) const {
+        return col < output_scale_importance.size() ? output_scale_importance[col] : value_type(0);
+    }
+    inline void set_output_scale_raw(std::size_t col, value_type v) {
+        if (col >= output_scale.size()) output_scale.resize(col + 1, value_type(1));
+        output_scale[col] = v;
+        output_scale_is_trainable = true;
     }
 
     // Running L1 / L2^2 / max|.| for STORED (quantized) importance and

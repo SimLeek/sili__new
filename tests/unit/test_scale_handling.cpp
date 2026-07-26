@@ -169,6 +169,249 @@ TEST_CASE("rescale_value_row preserves the true weight value across a scale chan
     CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved
 }
 
+// ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
+//
+// Per-COLUMN counterpart to value_scale: true_w = stored_w * value_scale[row]
+// * output_scale[col]. Gradient-trainable like value_scale once a caller
+// calls set_output_scale_raw at least once (see delta_csr_types.hpp).
+
+TEST_CASE("output_scale defaults to 1.0, exact backward compat", "[scale][output_scale]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    CHECK(weights.get_output_scale(0) == Catch::Approx(1.0f));
+}
+
+TEST_CASE("output_scale never-touched column still defaults to 1.0, only the touched one changes",
+         "[scale][output_scale]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {1.0f, 1.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_output_scale_raw(0, 4.0f);
+    CHECK(weights.get_output_scale(0) == Catch::Approx(4.0f));
+    CHECK(weights.get_output_scale(1) == Catch::Approx(1.0f));   // untouched, still default
+}
+
+TEST_CASE("disldo_forward's output reflects value_scale * output_scale jointly (rank-1)",
+         "[scale][output_scale][regression]") {
+    // Two outputs sharing the same input row, DIFFERENT output_scale each --
+    // the real point of rank-1: one row-scale, but per-output resolution.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};          // 1 row, 2 nonzero entries
+    std::vector<S> idx  = {0, 1};          // -> columns 0 and 1
+    std::vector<float> w = {3.0f, 3.0f}, imp = {0.0f, 0.0f};   // same stored weight both
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(2, S(0));
+    weights.set_value_scale_raw(0, 0.1f);     // shared row scale
+    weights.set_output_scale_raw(0, 1.0f);    // col 0: true_w = 3.0*0.1*1.0 = 0.3
+    weights.set_output_scale_raw(1, 10.0f);   // col 1: true_w = 3.0*0.1*10.0 = 3.0
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> output(2, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.0f, 1);
+
+    CHECK(output[0] == Catch::Approx(0.6f).margin(1e-4f));    // 0.3 * 2.0
+    CHECK(output[1] == Catch::Approx(6.0f).margin(1e-4f));    // 3.0 * 2.0
+}
+
+TEST_CASE("disldo_backward's dx uses value_scale * output_scale jointly",
+         "[scale][output_scale][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {3.0f, 3.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree = {1, 1};
+    weights.set_value_scale_raw(0, 0.1f);
+    weights.set_output_scale_raw(0, 1.0f);
+    weights.set_output_scale_raw(1, 10.0f);
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> dy    = {1.0f, 1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(2, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.0f, 1);
+
+    // dx = true_w[col0]*dy[0] + true_w[col1]*dy[1] = 0.3*1.0 + 3.0*1.0 = 3.3
+    CHECK(dx[0] == Catch::Approx(3.3f).margin(1e-4f));
+}
+
+TEST_CASE("output_scale's own gradient moves it, symmetric to value_scale's",
+         "[scale][output_scale][gradient][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};   // stored weight = 2.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree = {1};   // one connection feeds column 0
+    weights.set_value_scale_raw(0, 4.0f);
+    weights.set_output_scale_raw(0, 0.5f);   // true_w = 2.0 * 4.0 * 0.5 = 4.0
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
+
+    // g = dy*input = 1.0. col_grad_sum = cw_orig * val_scale * g = 2.0*4.0*1.0 = 8.0
+    // col_eff_lr = learning_rate / out_degree[0] = 0.1 / 1 = 0.1
+    // raw_update = 0.1*8.0 = 0.8. importance = 0 - 0.8 = -0.8 (damps the
+    // scale's own step, same pattern as a per-synapse weight).
+    // new output_scale = 0.5 - 0.8/(1+0.8) = 0.5 - 0.44444... ~= 0.05556
+    const float raw_update = 0.1f * 8.0f;
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
+    CHECK(weights.get_output_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+    CHECK(weights.get_output_scale_importance(0) == Catch::Approx(-raw_update).margin(1e-4f));
+}
+
+TEST_CASE("a column with zero out_degree is skipped, not divided by zero",
+         "[scale][output_scale][gradient][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.clear();   // never populated (e.g. a hand-built fixture)
+    weights.set_output_scale_raw(0, 3.0f);
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/1.0f, 1);
+
+    CHECK(weights.get_output_scale(0) == Catch::Approx(3.0f));   // unchanged, no NaN/inf
+}
+
+TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scale factor",
+         "[scale][output_scale][value_scale][gradient][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};   // stored weight = 2.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree = {1};
+    weights.set_value_scale_raw(0, 0.5f);    // true_w = 2.0 * 0.5 * 4.0 = 4.0
+    weights.set_output_scale_raw(0, 4.0f);
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
+
+    // g = dy*input = 1.0. scale_grad_sum = cw_orig * out_scale * g = 2.0*4.0*1.0 = 8.0
+    // scale_eff_lr = learning_rate / nnz_this_row = 0.1 / 1 = 0.1
+    // raw_update = 0.8, importance = 0 - 0.8 = -0.8, damped step = 0.8/1.8
+    const float raw_update = 0.1f * 8.0f;
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+}
+
+// ── forward-side importance (activity correlation, mirrors per-synapse) ───────
+
+TEST_CASE("disldo_forward updates value_scale_importance via activity correlation",
+         "[scale][value_scale][importance][forward][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {3.0f}, imp = {0.0f};   // stored weight = 3.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_value_scale_raw(0, 1.0f);   // true_w = 3.0
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> output(1, 0.0f);
+    // learning_rate != 0 here also drives the per-synapse importance
+    // update -- irrelevant to what we're checking (value_scale_importance).
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.1f, 1);
+
+    // row_contrib_sum = true_w * input = 3.0 * 2.0 = 6.0
+    // vs_imp = 0 + 6.0 * 0.1 / (1 + 0) = 0.6
+    CHECK(weights.get_value_scale_importance(0) == Catch::Approx(0.6f).margin(1e-4f));
+}
+
+TEST_CASE("disldo_forward updates output_scale_importance only when output_scale is trainable",
+         "[scale][output_scale][importance][forward][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {3.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights_untrainable;
+    weights_untrainable.connections = dc;
+    std::vector<float> input = {2.0f};
+    std::vector<float> output1(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights_untrainable, output1.data(), 0.1f, 1);
+    CHECK(weights_untrainable.get_output_scale_importance(0) == 0.0f);   // never touched
+
+    auto dc2 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights_trainable;
+    weights_trainable.connections = dc2;
+    weights_trainable.out_degree = {1};   // one connection feeds column 0
+    weights_trainable.set_output_scale_raw(0, 1.0f);   // opts in
+    std::vector<float> output2(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights_trainable, output2.data(), 0.1f, 1);
+
+    // output[0,0] = true_w * input = 3.0 * 2.0 = 6.0 (same value as row_contrib_sum
+    // above, since there's only one connection here)
+    // os_imp = 0 + 6.0 * 0.1 / (1 + 0) = 0.6
+    CHECK(weights_trainable.get_output_scale_importance(0) == Catch::Approx(0.6f).margin(1e-4f));
+}
+
 TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer across rows of different nnz",
          "[scale][lr_normalization][regression]") {
     // Row 0: 1 synapse. Row 1: 4 synapses. Same weight, same input, same
@@ -246,8 +489,9 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
         in_acc.data(), gr_acc.data(), lr, 1);
 
     // scale_grad = stored_w * dy * input = 2.0 * 1.0 * 3.0 = 6.0
-    // new value_scale = 0.5 - 0.1 * 6.0 = 0.5 - 0.6 = -0.1
-    const float expected_scale = 0.5f - lr * (2.0f * 1.0f * 3.0f);
+    // raw_update = 0.1*6.0 = 0.6, importance = 0-0.6 = -0.6, damped by 1.6
+    const float raw_update = lr * (2.0f * 1.0f * 3.0f);
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-5f));
 }
 
@@ -282,7 +526,9 @@ TEST_CASE("value_scale gradient accumulates correctly across multiple synapses a
     // total scale_grad_sum = 6 + 9 = 15
     // scale_eff_lr = lr / nnz_this_row = 0.01 / 2 = 0.005 (always divides
     // by nnz_this_row for value_scale, independent of lr_per_row_nnz flag)
-    const float expected_scale = 1.0f - (lr / 2.0f) * 15.0f;
+    // raw_update = 0.005*15 = 0.075, importance = 0-0.075, damped by 1.075
+    const float raw_update = (lr / 2.0f) * 15.0f;
+    const float expected_scale = 1.0f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
 }
 
@@ -368,6 +614,42 @@ TEST_CASE("importance_scale and value_scale work correctly together, per-row, in
     const float imp_stored = ValueAccessor<FP4BiPacked>::get_imp(
         weights.connections.values, weights.connections.layout.elem_start[0]);
     CHECK(imp_stored != 0.0f);
+}
+
+TEST_CASE("output_importance_scale combines with importance_scale, mirroring output_scale/value_scale",
+         "[scale][output_importance_scale][regression]") {
+    // Same shape as the value/output_scale forward test, but for
+    // importance: forward's output must reflect BOTH importance_scale
+    // AND output_importance_scale, not just the row-side factor alone.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {6.0f};   // stored importance at FP4's max
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_importance_scale_raw(0, 0.1f);          // true_imp so far = 0.6
+    weights.set_output_importance_scale_raw(0, 10.0f);  // true_imp = 6.0 * 0.1 * 10.0 = 6.0
+
+    // Drive a forward pass with a large positive contribution so the
+    // Hebbian update pushes importance further in the SAME direction --
+    // if output_importance_scale were ignored (combined=0.1 instead of
+    // 1.0), the update step size relative to the "true" importance
+    // would be 100x larger, changing the post-quantization stored value.
+    std::vector<float> input = {1.0f};
+    std::vector<float> output(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.5f, 1);
+
+    const float stored_after = ValueAccessor<FP4BiPacked>::get_imp(
+        weights.connections.values, weights.connections.layout.elem_start[0]);
+    const float true_imp_after = stored_after * 0.1f * 10.0f;
+    // contrib = true_w * input = 1.0. true_imp before = 6.0.
+    // imp_after = 6.0 + 1.0*0.5/(1+6.0) = 6.0 + 0.0714... ~= 6.0714
+    CHECK(true_imp_after == Catch::Approx(6.0f + 1.0f * 0.5f / (1.0f + 6.0f)).margin(0.1f));
 }
 
 // ── SiliBlock reshape+sum mapping ────────────────────────────────────────────

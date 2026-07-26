@@ -715,7 +715,14 @@ class SiliBlock(RNNFoldedBlock):
         _FP4_MAX = 6.0
         self._layers: Dict[str, object] = {}
         for suffix, csr in descriptor.stacked_weights.items():
-            csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+            # csr.t() is metadata-only (CSC relabelling, no densify, no
+            # nnz-proportional copy); .to_sparse_csr() does the real (but
+            # nnz-proportional, never dense) reorganization into row-major
+            # order. NEVER call .to_dense() here -- csr is a whole folded/
+            # stacked layer's matrix, which can be too large to safely
+            # materialize (see sparse_rnn.py's FoldedLayer.from_descriptor,
+            # which had the identical bug).
+            csr_t = csr.t().to_sparse_csr()
             n_in  = int(csr_t.shape[0])   # in_dim
             n_out = int(csr_t.shape[1])   # n_folds * out_dim
             nnz   = int(csr_t.values().numel())

@@ -62,6 +62,15 @@ void disldo_forward(
 
     std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
+    // value_scale is gradient-trainable (disldo_backward), so -- same as
+    // every per-synapse weight -- it needs a forward-side importance
+    // update too (Hebbian activity correlation, not just the backward
+    // gradient step). Pre-size for safe indexed writes inside the
+    // per-row parallel loop below (each row is thread-exclusive, so no
+    // race once sized).
+    if (weights.value_scale_importance.size() < n_in)
+        weights.value_scale_importance.resize(n_in, value_type(0));
+
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
@@ -86,23 +95,37 @@ void disldo_forward(
             auto cursor = dc.row_cursor(r);
             const value_type imp_scale = weights.get_importance_scale(r);
             const value_type val_scale = weights.get_value_scale(r);
+            // value_scale's own forward importance signal: this row's
+            // total contribution to the output, same activity-correlation
+            // update as a per-synapse weight's, applied once per row
+            // (sum first) for the same reason value_scale's backward
+            // update sums first -- see disldo_backward.
+            double row_contrib_sum = 0.0;
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                const value_type  w        = w_stored * val_scale;   // -> true units
+                const value_type  out_scale = weights.get_output_scale(col);
+                const value_type  w        = w_stored * val_scale * out_scale;   // -> true units
+                // Same row*col combination as the weight's own scale --
+                // a synapse's stored importance lives at the same (row,
+                // col) position as its stored weight, so its
+                // representability scale needs the same two factors.
+                const value_type  out_imp_scale   = weights.get_output_importance_scale(col);
+                const value_type  combined_imp_scale = imp_scale * out_imp_scale;
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
                     if (iv == value_type(0)) continue;
                     const value_type contrib = w * iv;
                     mo[static_cast<std::size_t>(b) * n_out + col] += contrib;
+                    row_contrib_sum += static_cast<double>(contrib);
 
                     if (learning_rate != value_type(0)) {
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        value_type imp = stored_imp * imp_scale;   // -> true units
+                        value_type imp = stored_imp * combined_imp_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / imp_scale);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / combined_imp_scale);
                         // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
                         // rounds to the nearest FP4_TABLE entry, so it can differ from what
                         // was just written. Stats must track what's really in the buffer.
@@ -114,6 +137,18 @@ void disldo_forward(
                         local_max_new = std::max(local_max_new, std::abs(actual_stored));
                     }
                 }
+            }
+            if (learning_rate != value_type(0) && row_contrib_sum != 0.0) {
+                // Normalize by n_row -- same reasoning as backward's
+                // scale_eff_lr = lr/nnz_this_row: row_contrib_sum grows
+                // with fan-out (more synapses -> larger raw sum), and
+                // without this a wide row's importance would blow up
+                // and freeze value_scale's own backward step immediately.
+                const value_type avg_contrib = static_cast<value_type>(row_contrib_sum)
+                                              / static_cast<value_type>(n_row);
+                value_type vs_imp = weights.value_scale_importance[r];
+                vs_imp += avg_contrib * learning_rate / (value_type(1) + std::abs(vs_imp));
+                weights.value_scale_importance[r] = vs_imp;
             }
         }
 
@@ -133,6 +168,34 @@ void disldo_forward(
     for (int t = 0; t < num_cpus; ++t) {
         const value_type* s = t_out.data() + static_cast<std::size_t>(t) * ost;
         for (std::size_t i = 0; i < ost; ++i) output[i] += s[i];
+    }
+
+    // output_scale's forward importance: its own "contrib" is the final
+    // output value at that column (post fold reduction above), same
+    // activity-correlation formula as everything else. Only when
+    // output_scale is actually trainable (see output_scale_is_trainable);
+    // each column is independent, so this parallelizes trivially.
+    if (learning_rate != value_type(0) && weights.output_scale_is_trainable) {
+        if (weights.output_scale_importance.size() < n_out)
+            weights.output_scale_importance.resize(n_out, value_type(0));
+        #pragma omp parallel for num_threads(num_cpus) schedule(static)
+        for (std::size_t c = 0; c < n_out; ++c) {
+            const std::size_t deg = c < weights.out_degree.size()
+                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
+            if (deg == 0) continue;
+            double col_contrib_sum = 0.0;
+            for (SIZE_TYPE b = 0; b < batch; ++b)
+                col_contrib_sum += static_cast<double>(output[static_cast<std::size_t>(b) * n_out + c]);
+            if (col_contrib_sum == 0.0) continue;
+            // Normalize by out_degree[c] -- same reasoning as backward's
+            // col_eff_lr = lr/out_degree[c]: output[.,c] grows with
+            // fan-in (more rows feeding this column -> larger sum).
+            const value_type avg_contrib = static_cast<value_type>(col_contrib_sum)
+                                          / static_cast<value_type>(deg);
+            value_type os_imp = weights.output_scale_importance[c];
+            os_imp += avg_contrib * learning_rate / (value_type(1) + std::abs(os_imp));
+            weights.output_scale_importance[c] = os_imp;
+        }
     }
 }
 
@@ -190,15 +253,33 @@ void disldo_backward(
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
-    // Pre-size value_scale so that direct indexed writes from within the
-    // parallel region are safe (resize would race if called per-thread).
+    // output_scale's own gradient, symmetric to value_scale's: a column
+    // can be touched by many rows, spread across threads by the outer
+    // #pragma omp for (over rows) -- each thread accumulates into its own
+    // [n_out]-sized slice, reduced after the parallel region (same
+    // pattern as t_dx above). Only applied if output_scale_is_trainable
+    // (set by set_output_scale_raw) -- not a size check, since the resize
+    // below runs unconditionally for safe reads regardless of mode.
+    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out, value_type(0));
+    const bool output_scale_trainable = weights.output_scale_is_trainable;
+
+    // Pre-size value_scale/output_scale so that direct indexed writes
+    // from within the parallel region are safe (resize would race if
+    // called per-thread).
     if (weights.value_scale.size() < n_in)
         weights.value_scale.resize(n_in, value_type(1));
+    if (weights.output_scale.size() < n_out)
+        weights.output_scale.resize(n_out, value_type(1));
+    if (weights.value_scale_importance.size() < n_in)
+        weights.value_scale_importance.resize(n_in, value_type(0));
+    if (weights.output_scale_importance.size() < n_out)
+        weights.output_scale_importance.resize(n_out, value_type(0));
 
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
-        value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+        value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+        value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
 
         // Per-thread importance stats accumulators -- see disldo_forward's
         // comment and update_importance_stats()'s THREAD SAFETY note.
@@ -259,8 +340,14 @@ void disldo_backward(
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                 const value_type  ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                value_type cw  = cw_orig * val_scale;   // -> true units
-                value_type ci  = ci_orig * imp_scale;   // -> true units
+                const value_type  out_scale     = weights.get_output_scale(col);
+                const value_type  combined_scale = val_scale * out_scale;
+                value_type cw  = cw_orig * combined_scale;   // -> true units
+                // Same row*col combination as the weight's own scale --
+                // see the matching comment in disldo_forward.
+                const value_type  out_imp_scale      = weights.get_output_importance_scale(col);
+                const value_type  combined_imp_scale = imp_scale * out_imp_scale;
+                value_type ci  = ci_orig * combined_imp_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -270,13 +357,17 @@ void disldo_backward(
                     if (learning_rate != value_type(0)) {
                         ci -= g * effective_lr;
                         cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
-                        // dL/d(val_scale[r]) += stored_w * dy * input
-                        scale_grad_sum += static_cast<double>(cw_orig) * g;
+                        // dL/d(val_scale[r]) = stored_w * out_scale[col] * dy * input
+                        // dL/d(out_scale[col]) = stored_w * val_scale[r] * dy * input
+                        // (true_w = stored_w * val_scale * out_scale, so each
+                        // scale's gradient holds the OTHER factor fixed)
+                        scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
+                        mcol[col] += cw_orig * val_scale * g;
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / val_scale, ci / imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
@@ -286,7 +377,13 @@ void disldo_backward(
                 }
             }
             if (learning_rate != value_type(0)) {
-                weights.value_scale[r] -= static_cast<value_type>(scale_eff_lr * scale_grad_sum);
+                // Same damping pattern as a per-synapse weight: importance
+                // updates first (undamped), then the value_scale step
+                // itself is damped by the freshly-updated importance.
+                const value_type raw_update = static_cast<value_type>(scale_eff_lr * scale_grad_sum);
+                weights.value_scale_importance[r] -= raw_update;
+                const value_type vs_imp = weights.value_scale_importance[r];
+                weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
             }
         }
 
@@ -303,5 +400,27 @@ void disldo_backward(
     for (int t = 0; t < num_cpus; ++t) {
         const value_type* s = t_dx.data() + static_cast<std::size_t>(t) * dst;
         for (std::size_t i = 0; i < dst; ++i) input_grad[i] += s[i];
+    }
+
+    if (learning_rate != value_type(0) && output_scale_trainable) {
+        // output_scale[c]'s gradient, reduced across threads then applied
+        // once per column -- same "sum first, apply lr once" reasoning as
+        // value_scale's own update. Normalizes by out_degree[c] (how many
+        // rows feed this output), the column-axis equivalent of
+        // nnz_this_row; a column with zero connections is skipped.
+        for (std::size_t c = 0; c < n_out; ++c) {
+            const std::size_t deg = c < weights.out_degree.size()
+                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
+            if (deg == 0) continue;
+            double col_grad_sum = 0.0;
+            for (int t = 0; t < num_cpus; ++t)
+                col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
+            const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
+            // Same importance-damping pattern as value_scale's own update.
+            const value_type raw_update = static_cast<value_type>(col_eff_lr * col_grad_sum);
+            weights.output_scale_importance[c] -= raw_update;
+            const value_type os_imp = weights.output_scale_importance[c];
+            weights.output_scale[c] -= raw_update / (value_type(1) + std::abs(os_imp));
+        }
     }
 }

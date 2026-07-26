@@ -293,6 +293,37 @@ def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
         layer.set_importance_scale_raw(r, float(d["importance_scale"][r]))
 
 
+def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: int,
+                             n_iters: int = 6):
+    """
+    Alternating max-fit producing a rank-1 (outer-product) envelope:
+    row_scale[r] * col_scale[c] >= |M[r, c]| for every entry, using
+    O(rows+cols) parameters instead of O(rows*cols). Each update
+    recomputes the exact bound needed against the other side's current
+    estimate (Sinkhorn-style, but max- rather than sum-based).
+
+    Takes M's nonzero entries as COO-style triplets (row_idx, col_idx,
+    abs_vals), not a dense matrix -- a folded/stacked layer's matrix is
+    too large to densify safely (e.g. mlp.gate_proj folds to
+    [110592, 1536]; converting that to dense once already risked OOM on
+    a real conversion run). Entries not listed are implicitly 0 and
+    never bind the max, so this needs no dense intermediate at all.
+
+    Returns (row_scale, col_scale), float32 -- deliberately not float64
+    (a max/divide fit has no accumulating-sum precision need, and
+    float64 here would double the O(nnz) working set for no benefit).
+    """
+    import numpy as np
+    col_scale = np.ones(n_cols, dtype=np.float32)
+    row_scale = np.ones(n_rows, dtype=np.float32)
+    for _ in range(n_iters):
+        row_scale = np.full(n_rows, 1e-12, dtype=np.float32)
+        np.maximum.at(row_scale, row_idx, abs_vals / col_scale[col_idx])
+        col_scale = np.full(n_cols, 1e-12, dtype=np.float32)
+        np.maximum.at(col_scale, col_idx, abs_vals / row_scale[row_idx])
+    return row_scale, col_scale
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FoldedLayer — runtime sili Module for a converted folded transformer block
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,7 +372,9 @@ class FoldedLayer(Module):
     def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
                         num_cpus: int = 4,
                         max_row_weights: int = 0,
-                        bytes_per_row: int = 0) -> "FoldedLayer":
+                        bytes_per_row: int = 0,
+                        value_scale_mode: str = "per_row",
+                        rank1_iters: int = 6) -> "FoldedLayer":
         """
         Build a FoldedLayer from a FoldedBlockDescriptor.
 
@@ -360,20 +393,40 @@ class FoldedLayer(Module):
                              The default adds a small margin for net growth per
                              synaptogenesis step. Pass an explicit value to
                              override (e.g. worst-case: max_row_weights * 5).
+          value_scale_mode -- "per_row" (default, exact prior behavior): one
+                             value_scale per input row, output_scale left at
+                             its default 1.0. "rank1": also fits a
+                             per-output-column scale (fit_rank1_scale_envelope)
+                             via set_output_scale_raw, gradient-trainable
+                             like value_scale. Prefer "rank1" for real
+                             pretrained-weight conversion.
+          rank1_iters      -- alternating-fit iterations for "rank1" mode
+                             (ignored otherwise); see fit_rank1_scale_envelope.
         """
         import numpy as np
         import torch as _torch   # local import: conversion step only -- sili does
-        # the compute. torch is used once here to densify+transpose the stacked
-        # CSR weights, then discarded. Do not use torch in forward/backward paths.
+        # the compute. Do not use torch in forward/backward paths.
         import warnings; warnings.filterwarnings("ignore")
         _FP4_MAX = 6.0
+        if value_scale_mode not in ("per_row", "rank1"):
+            raise ValueError(
+                f"value_scale_mode must be 'per_row' or 'rank1', got {value_scale_mode!r}")
 
         layers = {}
         for suffix, csr in descriptor.stacked_weights.items():
-            csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+            # csr.t() is a metadata-only relabelling into CSC (no densify,
+            # no nnz-proportional copy) -- but CSC's own ccol_indices/
+            # row_indices are grouped by COLUMN, not the per-ROW grouping
+            # load_weights needs. .to_sparse_csr() does the real (but
+            # nnz-proportional, not densify-proportional) reorganization
+            # into row-major order. NEVER call .to_dense() on a
+            # stacked/folded layer's matrix here -- it can be too large to
+            # safely materialize (e.g. mlp.gate_proj folds to
+            # [110592, 1536]; densifying that alone risked OOM converting
+            # a real checkpoint).
+            csr_t = csr.t().to_sparse_csr()
             n_in  = int(csr_t.shape[0])
             n_out = int(csr_t.shape[1])
-            nnz   = int(csr_t.values().numel())
             # Budget for the delta-CSR pool: size for the fully-connected
             # maximum (n_in * n_out), not for current nnz. This is the fixed
             # total the staggered equalizer_step() will redistribute within --
@@ -387,23 +440,38 @@ class FoldedLayer(Module):
             idx  = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
 
-            # Per-row value scaling: map each row's max-abs to FP4_MAX so the
-            # quantizer uses its full resolution.  See conversation for why
-            # per-row (not per-layer) is critical for a stacked matrix that
-            # spans rows from N different original layers.
-            row_scales = np.ones(n_in, dtype=np.float32)
-            for r in range(n_in):
-                start, end = int(ptrs[r]), int(ptrs[r + 1])
-                if end > start:
-                    max_abs = float(np.abs(vals[start:end]).max())
-                    if max_abs > 0.0:
-                        row_scales[r] = max_abs / _FP4_MAX
-                        vals[start:end] /= row_scales[r]
+            if value_scale_mode == "rank1":
+                # One scale per input row AND one per output column,
+                # fit directly from the nonzero triplets -- no dense
+                # intermediate (see fit_rank1_scale_envelope).
+                row_of_nnz = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs))
+                row_env, col_env = fit_rank1_scale_envelope(
+                    row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters)
+                row_scales = (row_env / _FP4_MAX).astype(np.float32)
+                col_scales = col_env.astype(np.float32)
+                combined = row_scales[row_of_nnz] * col_scales[idx]
+                nonzero_combined = combined > 0
+                vals[nonzero_combined] /= combined[nonzero_combined]
+            else:
+                # Per-row: map each row's max-abs to FP4_MAX for full
+                # quantizer resolution.
+                row_scales = np.ones(n_in, dtype=np.float32)
+                col_scales = np.ones(n_out, dtype=np.float32)   # left at default (1.0) in this mode
+                for r in range(n_in):
+                    start, end = int(ptrs[r]), int(ptrs[r + 1])
+                    if end > start:
+                        max_abs = float(np.abs(vals[start:end]).max())
+                        if max_abs > 0.0:
+                            row_scales[r] = max_abs / _FP4_MAX
+                            vals[start:end] /= row_scales[r]
 
             layer.load_weights(ptrs, idx, vals)
             for r in range(n_in):
                 if row_scales[r] != 1.0:
                     layer.set_value_scale_raw(r, row_scales[r])
+            for c in range(n_out):
+                if col_scales[c] != 1.0:
+                    layer.set_output_scale_raw(c, col_scales[c])
 
             # Per-row importance_scale: same FP4 representability problem as
             # value_scale but for importance.

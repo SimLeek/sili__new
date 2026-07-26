@@ -540,6 +540,10 @@ public:
     // exact backward compat.
     V get_importance_scale(S row) const { return weights.get_importance_scale(static_cast<std::size_t>(row)); }
     V get_value_scale(S row)      const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
+    V get_output_scale(S col)     const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
+    V get_value_scale_importance(S row)  const { return weights.get_value_scale_importance(static_cast<std::size_t>(row)); }
+    V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
+    V get_output_importance_scale(S col) const { return weights.get_output_importance_scale(static_cast<std::size_t>(col)); }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -616,6 +620,12 @@ public:
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
             p, idx, w, imp, rows, cols, idx_budget, val_budget);
         weights.recompute_stats();
+        // load_weights replaces .connections wholesale, so out_degree
+        // (needed by output_scale's own gradient, disldo_backward) must be
+        // rebuilt from the new indices -- it isn't touched otherwise and
+        // would silently stay at the constructor's all-zero value.
+        weights.out_degree.assign(cols, S(0));
+        for (S c : idx) ++weights.out_degree[c];
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -900,6 +910,42 @@ PYBIND11_MODULE(_cpu, m)
              },
              py::arg("row"), py::arg("scale"),
              "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale",     &SparseLinearLayer::get_output_scale,
+             py::arg("col"),
+             "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
+             "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
+             "column not yet touched, exact backward compat with every caller that\n"
+             "never sets it.")
+        .def("set_output_scale_raw",
+             [](SparseLinearLayer& self, int col, float scale) {
+                 self.weights.set_output_scale_raw(
+                     static_cast<std::size_t>(col), scale);
+             },
+             py::arg("col"), py::arg("scale"),
+             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+             "same convention as set_value_scale_raw(), but per-output instead of\n"
+             "per-input. Calling this at least once makes output_scale\n"
+             "gradient-trainable in backward_dense(), like value_scale.")
+        .def("get_value_scale_importance",  &SparseLinearLayer::get_value_scale_importance,
+             py::arg("row"),
+             "Per-row importance backing value_scale's own gradient step, same\n"
+             "damping role as a synapse's importance value. Default 0.")
+        .def("get_output_scale_importance", &SparseLinearLayer::get_output_scale_importance,
+             py::arg("col"),
+             "Per-column counterpart for output_scale. Default 0.")
+        .def("get_output_importance_scale", &SparseLinearLayer::get_output_importance_scale,
+             py::arg("col"),
+             "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
+             "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
+             "Default 1.0, same convention as get_output_scale().")
+        .def("set_output_importance_scale_raw",
+             [](SparseLinearLayer& self, int col, float scale) {
+                 self.weights.set_output_importance_scale_raw(
+                     static_cast<std::size_t>(col), scale);
+             },
+             py::arg("col"), py::arg("scale"),
+             "Same as set_importance_scale_raw() but per-output instead of\n"
+             "per-input -- see set_output_scale_raw() for the analogous pattern.")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
