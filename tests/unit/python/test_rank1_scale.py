@@ -23,31 +23,57 @@ from sili.sparse_rnn import FoldedLayer, fit_rank1_scale_envelope
 from sili.conversion.rnn_fold import FoldedBlockDescriptor
 
 
+def _dense_to_triplets(abs_mat: np.ndarray):
+    """Every entry (including zeros) as an explicit triplet -- fine for
+    small test matrices, and lets the sparse-triplet function be tested
+    against the same fully-dense cases it replaces."""
+    n_rows, n_cols = abs_mat.shape
+    row_idx, col_idx = np.meshgrid(np.arange(n_rows), np.arange(n_cols), indexing='ij')
+    return row_idx.ravel(), col_idx.ravel(), abs_mat.ravel(), n_rows, n_cols
+
+
 class TestFitRank1ScaleEnvelope:
     def test_envelope_property_holds_for_every_entry(self):
         rng = np.random.RandomState(0)
         abs_mat = np.abs(rng.randn(20, 15)) * rng.choice([0.01, 1.0, 100.0], size=(20, 15))
-        row_scale, col_scale = fit_rank1_scale_envelope(abs_mat, n_iters=8)
+        row_idx, col_idx, abs_vals, n_rows, n_cols = _dense_to_triplets(abs_mat)
+        row_scale, col_scale = fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows, n_cols, n_iters=8)
         envelope = row_scale[:, None] * col_scale[None, :]
-        # allow tiny float slack -- the fit is exact by construction modulo fp error
-        assert np.all(envelope >= abs_mat - 1e-9)
+        # allow float32-relative slack -- the fit is exact by construction,
+        # modulo fp rounding (values here range up to ~O(100)).
+        assert np.all(envelope >= abs_mat - 1e-5 * np.abs(abs_mat))
 
     def test_recovers_a_true_rank1_matrix_exactly(self):
         rng = np.random.RandomState(1)
         true_row = np.abs(rng.randn(10)) + 0.1
         true_col = np.abs(rng.randn(8)) + 0.1
         abs_mat = np.outer(true_row, true_col)
-        row_scale, col_scale = fit_rank1_scale_envelope(abs_mat, n_iters=10)
+        row_idx, col_idx, abs_vals, n_rows, n_cols = _dense_to_triplets(abs_mat)
+        row_scale, col_scale = fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows, n_cols, n_iters=10)
         envelope = row_scale[:, None] * col_scale[None, :]
         assert np.allclose(envelope, abs_mat, rtol=1e-3)
 
-    def test_all_zero_matrix_does_not_crash(self):
-        abs_mat = np.zeros((4, 3))
-        row_scale, col_scale = fit_rank1_scale_envelope(abs_mat, n_iters=4)
+    def test_no_nonzero_entries_does_not_crash(self):
+        row_idx = np.array([], dtype=np.int64)
+        col_idx = np.array([], dtype=np.int64)
+        abs_vals = np.array([], dtype=np.float32)
+        row_scale, col_scale = fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, 4, 3, n_iters=4)
         assert row_scale.shape == (4,)
         assert col_scale.shape == (3,)
         assert np.all(row_scale > 0)   # floored at 1e-12, never exactly 0
         assert np.all(col_scale > 0)
+
+    def test_only_nonzero_entries_need_covering(self):
+        # A sparse matrix where most entries are structurally absent (not
+        # just numerically zero) -- the envelope only needs to bound the
+        # entries that actually exist.
+        row_idx = np.array([0, 1, 2], dtype=np.int64)
+        col_idx = np.array([0, 1, 2], dtype=np.int64)
+        abs_vals = np.array([3.0, 0.03, 30.0], dtype=np.float32)
+        row_scale, col_scale = fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, 3, 3, n_iters=8)
+        envelope = row_scale[:, None] * col_scale[None, :]
+        for r, c, v in zip(row_idx, col_idx, abs_vals):
+            assert envelope[r, c] >= v - 1e-6
 
 
 def _make_descriptor(w: torch.Tensor, suffix: str = ".w") -> FoldedBlockDescriptor:
@@ -192,3 +218,22 @@ class TestScaleImportance:
 
         assert raw.get_value_scale_importance(0) != 0.0    # value_scale always trainable
         assert raw.get_output_scale_importance(0) == 0.0   # output_scale untouched in this mode
+
+    def test_forward_alone_moves_importance_before_any_backward(self):
+        # Per-synapse importance updates in forward_dense (Hebbian
+        # activity correlation), not just backward -- value_scale/
+        # output_scale's own importance should too.
+        torch.manual_seed(5)
+        w = torch.randn(6, 4)
+        desc = _make_descriptor(w)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=0.05, num_cpus=1, value_scale_mode="rank1")
+        raw = layer._sili_layers[".w"]
+        assert raw.get_value_scale_importance(0) == 0.0
+        assert raw.get_output_scale_importance(0) == 0.0
+
+        x = Tensor(np.random.RandomState(1).randn(3, 4).astype(np.float32))
+        layer.forward(x)   # forward only -- no backward() at all
+
+        assert raw.get_value_scale_importance(0) != 0.0
+        assert raw.get_output_scale_importance(0) != 0.0

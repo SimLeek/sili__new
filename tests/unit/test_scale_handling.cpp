@@ -350,6 +350,68 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
 }
 
+// ── forward-side importance (activity correlation, mirrors per-synapse) ───────
+
+TEST_CASE("disldo_forward updates value_scale_importance via activity correlation",
+         "[scale][value_scale][importance][forward][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {3.0f}, imp = {0.0f};   // stored weight = 3.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_value_scale_raw(0, 1.0f);   // true_w = 3.0
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> output(1, 0.0f);
+    // learning_rate != 0 here also drives the per-synapse importance
+    // update -- irrelevant to what we're checking (value_scale_importance).
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.1f, 1);
+
+    // row_contrib_sum = true_w * input = 3.0 * 2.0 = 6.0
+    // vs_imp = 0 + 6.0 * 0.1 / (1 + 0) = 0.6
+    CHECK(weights.get_value_scale_importance(0) == Catch::Approx(0.6f).margin(1e-4f));
+}
+
+TEST_CASE("disldo_forward updates output_scale_importance only when output_scale is trainable",
+         "[scale][output_scale][importance][forward][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {3.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights_untrainable;
+    weights_untrainable.connections = dc;
+    std::vector<float> input = {2.0f};
+    std::vector<float> output1(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights_untrainable, output1.data(), 0.1f, 1);
+    CHECK(weights_untrainable.get_output_scale_importance(0) == 0.0f);   // never touched
+
+    auto dc2 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights_trainable;
+    weights_trainable.connections = dc2;
+    weights_trainable.out_degree = {1};   // one connection feeds column 0
+    weights_trainable.set_output_scale_raw(0, 1.0f);   // opts in
+    std::vector<float> output2(1, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights_trainable, output2.data(), 0.1f, 1);
+
+    // output[0,0] = true_w * input = 3.0 * 2.0 = 6.0 (same value as row_contrib_sum
+    // above, since there's only one connection here)
+    // os_imp = 0 + 6.0 * 0.1 / (1 + 0) = 0.6
+    CHECK(weights_trainable.get_output_scale_importance(0) == Catch::Approx(0.6f).margin(1e-4f));
+}
+
 TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer across rows of different nnz",
          "[scale][lr_normalization][regression]") {
     // Row 0: 1 synapse. Row 1: 4 synapses. Same weight, same input, same
