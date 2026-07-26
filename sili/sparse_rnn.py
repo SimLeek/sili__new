@@ -314,12 +314,18 @@ def fit_rank1_scale_envelope(abs_mat, n_iters: int = 6):
     genuine per-COLUMN scale can, at a fraction of a full per-element
     scale matrix's memory cost.
 
-    Returns (row_scale, col_scale), both float64 numpy arrays.
+    Returns (row_scale, col_scale), both float32 numpy arrays --
+    deliberately NOT float64: row_scale/col_scale's dtype determines
+    what dtype every `abs_mat / scale` broadcast upcasts to internally,
+    so float64 here would silently double the transient memory of every
+    iteration for the largest suffixes even if abs_mat itself is stored
+    as float32. A max/divide envelope fit has no numerical stability
+    need for float64 (unlike an accumulating sum).
     """
     import numpy as np
     n_rows, n_cols = abs_mat.shape
-    col_scale = np.ones(n_cols, dtype=np.float64)
-    row_scale = np.ones(n_rows, dtype=np.float64)
+    col_scale = np.ones(n_cols, dtype=np.float32)
+    row_scale = np.ones(n_rows, dtype=np.float32)
     for _ in range(n_iters):
         with np.errstate(divide='ignore', invalid='ignore'):
             row_scale = np.nanmax(np.where(col_scale > 0, abs_mat / col_scale[None, :], 0.0), axis=1)
@@ -451,7 +457,7 @@ class FoldedLayer(Module):
                 # fit_rank1_scale_envelope's docstring for why this was
                 # necessary (per-row-only quantization catastrophically
                 # degraded a real converted MiniCPM5 layer).
-                abs_mat = dense_t.abs().numpy().astype(np.float64)
+                abs_mat = dense_t.abs().numpy().astype(np.float32)
                 row_env, col_env = fit_rank1_scale_envelope(abs_mat, n_iters=rank1_iters)
                 del abs_mat
                 row_scales = (row_env / _FP4_MAX).astype(np.float32)
