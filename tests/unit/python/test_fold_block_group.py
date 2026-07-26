@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 import torch
 import pytest
 
-from sili.conversion.rnn_fold import fold_block_group, fold_sparse_payload
+from sili.conversion.rnn_fold import fold_block_group, fold_sparse_payload, FoldedBlockDescriptor, SiliBlock
 
 
 def _block_group_state_dict(n_layers=3, hidden=4, second_suffix="raw"):
@@ -128,3 +128,35 @@ class TestFoldSparsePayloadRemovalMatchesFoldedSuffixes:
         out = fold_sparse_payload(payload)
         remaining = [k for k in out["sparse_state_dict"] if "layers." in k]
         assert remaining == []   # both suffixes folded -- nothing left over
+
+
+class TestSiliBlockNoDensifyTranspose:
+    """SiliBlock.__init__ had the same to_dense().t() bug FoldedLayer.
+    from_descriptor did (see sparse_rnn.py) -- fixed the same way
+    (csr.t().to_sparse_csr(), never densifying the whole stacked
+    matrix). No prior test coverage existed for SiliBlock at all."""
+
+    def _descriptor(self, n_folds=3, out_dim=5, in_dim=4, seed=0):
+        torch.manual_seed(seed)
+        w = torch.randn(n_folds * out_dim, in_dim)
+        w = w * (torch.rand(n_folds * out_dim, in_dim) < 0.6)
+        csr = w.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+        desc = FoldedBlockDescriptor(
+            n_folds=n_folds, block_indices=list(range(n_folds)),
+            stacked_weights={".w": csr}, out_dims={".w": out_dim},
+            band_half_widths={".w": None}, prefix="model.",
+        )
+        return desc, w
+
+    def test_constructs_with_correct_shapes(self):
+        desc, w = self._descriptor()
+        block = SiliBlock(desc, learning_rate=0.01, num_cpus=1)
+        layer = block._layers[".w"]
+        assert layer.n_inputs == w.shape[1]
+        assert layer.n_outputs == w.shape[0]
+
+    def test_nnz_matches_source_matrix(self):
+        desc, w = self._descriptor()
+        block = SiliBlock(desc, learning_rate=0.01, num_cpus=1)
+        layer = block._layers[".w"]
+        assert layer.nnz == int((w != 0).sum())
