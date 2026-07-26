@@ -617,6 +617,12 @@ public:
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
             p, idx, w, imp, rows, cols, idx_budget, val_budget);
         weights.recompute_stats();
+        // load_weights replaces .connections wholesale, so out_degree
+        // (needed by output_scale's own gradient, disldo_backward) must be
+        // rebuilt from the new indices -- it isn't touched otherwise and
+        // would silently stay at the constructor's all-zero value.
+        weights.out_degree.assign(cols, S(0));
+        for (S c : idx) ++weights.out_degree[c];
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -915,16 +921,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("col"), py::arg("scale"),
              "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
              "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Unlike value_scale, output_scale is NOT gradient-updated by\n"
-             "backward_dense() -- it's meant as a fixed, write-once conversion-time\n"
-             "constant (e.g. from a rank-1/outer-product envelope fit over pretrained\n"
-             "weights), not a parameter actively re-learned during training.\n"
-             "Typical pattern (rank-1 quantization scale):\n"
-             "  in_scale, out_scale = fit_rank1_envelope(abs(W))   # two vectors\n"
-             "  effective = outer(out_scale, in_scale) / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / effective[row_of(idx)])\n"
-             "  for r in range(n_in): layer.set_value_scale_raw(r, in_scale[r] / FP4_MAX)\n"
-             "  for c in range(n_out): layer.set_output_scale_raw(c, out_scale[c])")
+             "per-input. Calling this at least once makes output_scale\n"
+             "gradient-trainable in backward_dense(), like value_scale.")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"

@@ -123,3 +123,35 @@ class TestFromDescriptorValueScaleMode:
         err_per_row = np.abs(out_per_row - ref).mean()
         err_rank1   = np.abs(out_rank1 - ref).mean()
         assert err_rank1 < err_per_row
+
+
+class TestOutputScaleGradientTraining:
+    def test_rank1_mode_output_scale_moves_under_backward(self):
+        torch.manual_seed(5)
+        w = torch.randn(6, 4)
+        desc = _make_descriptor(w)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=0.05, num_cpus=1, value_scale_mode="rank1")
+        raw = layer._sili_layers[".w"]
+        before = raw.get_output_scale(0)
+
+        x = Tensor(np.random.RandomState(1).randn(3, 4).astype(np.float32))
+        loss = (layer.forward(x) ** 2).sum()
+        loss.backward()
+
+        assert raw.get_output_scale(0) != pytest.approx(before, rel=1e-6)
+
+    def test_per_row_mode_output_scale_stays_fixed_under_backward(self):
+        torch.manual_seed(5)
+        w = torch.randn(6, 4)
+        desc = _make_descriptor(w)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=0.05, num_cpus=1, value_scale_mode="per_row")
+        raw = layer._sili_layers[".w"]
+        assert raw.get_output_scale(0) == 1.0
+
+        x = Tensor(np.random.RandomState(1).randn(3, 4).astype(np.float32))
+        loss = (layer.forward(x) ** 2).sum()
+        loss.backward()
+
+        assert raw.get_output_scale(0) == 1.0

@@ -191,15 +191,29 @@ void disldo_backward(
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
-    // Pre-size value_scale so that direct indexed writes from within the
-    // parallel region are safe (resize would race if called per-thread).
+    // output_scale's own gradient, symmetric to value_scale's: a column
+    // can be touched by many rows, spread across threads by the outer
+    // #pragma omp for (over rows) -- each thread accumulates into its own
+    // [n_out]-sized slice, reduced after the parallel region (same
+    // pattern as t_dx above). Only applied if output_scale_is_trainable
+    // (set by set_output_scale_raw) -- not a size check, since the resize
+    // below runs unconditionally for safe reads regardless of mode.
+    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out, value_type(0));
+    const bool output_scale_trainable = weights.output_scale_is_trainable;
+
+    // Pre-size value_scale/output_scale so that direct indexed writes
+    // from within the parallel region are safe (resize would race if
+    // called per-thread).
     if (weights.value_scale.size() < n_in)
         weights.value_scale.resize(n_in, value_type(1));
+    if (weights.output_scale.size() < n_out)
+        weights.output_scale.resize(n_out, value_type(1));
 
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
-        value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+        value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+        value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
 
         // Per-thread importance stats accumulators -- see disldo_forward's
         // comment and update_importance_stats()'s THREAD SAFETY note.
@@ -273,11 +287,12 @@ void disldo_backward(
                     if (learning_rate != value_type(0)) {
                         ci -= g * effective_lr;
                         cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
-                        // dL/d(val_scale[r]) += stored_w * out_scale[col] * dy * input
-                        // (out_scale is a FIXED factor, not itself gradient
-                        // -updated, but val_scale's own gradient must still
-                        // account for it: true_w = stored_w * val_scale * out_scale)
+                        // dL/d(val_scale[r]) = stored_w * out_scale[col] * dy * input
+                        // dL/d(out_scale[col]) = stored_w * val_scale[r] * dy * input
+                        // (true_w = stored_w * val_scale * out_scale, so each
+                        // scale's gradient holds the OTHER factor fixed)
                         scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
+                        mcol[col] += cw_orig * val_scale * g;
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
@@ -309,5 +324,23 @@ void disldo_backward(
     for (int t = 0; t < num_cpus; ++t) {
         const value_type* s = t_dx.data() + static_cast<std::size_t>(t) * dst;
         for (std::size_t i = 0; i < dst; ++i) input_grad[i] += s[i];
+    }
+
+    if (learning_rate != value_type(0) && output_scale_trainable) {
+        // output_scale[c]'s gradient, reduced across threads then applied
+        // once per column -- same "sum first, apply lr once" reasoning as
+        // value_scale's own update. Normalizes by out_degree[c] (how many
+        // rows feed this output), the column-axis equivalent of
+        // nnz_this_row; a column with zero connections is skipped.
+        for (std::size_t c = 0; c < n_out; ++c) {
+            const std::size_t deg = c < weights.out_degree.size()
+                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
+            if (deg == 0) continue;
+            double col_grad_sum = 0.0;
+            for (int t = 0; t < num_cpus; ++t)
+                col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
+            const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
+            weights.output_scale[c] -= static_cast<value_type>(col_eff_lr * col_grad_sum);
+        }
     }
 }

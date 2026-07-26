@@ -295,32 +295,16 @@ def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
 
 def fit_rank1_scale_envelope(abs_mat, n_iters: int = 6):
     """
-    Alternating max-fit producing a rank-1 (outer-product) envelope of a
-    matrix's magnitudes: row_scale[r] * col_scale[c] >= abs_mat[r, c] for
-    every entry, using O(rows+cols) parameters instead of O(rows*cols).
+    Alternating max-fit producing a rank-1 (outer-product) envelope:
+    row_scale[r] * col_scale[c] >= abs_mat[r, c] for every entry, using
+    O(rows+cols) parameters instead of O(rows*cols). Each update
+    recomputes the exact bound needed against the other side's current
+    estimate (Sinkhorn-style, but max- rather than sum-based).
 
-    row_scale[r] = max_c(abs_mat[r,c] / col_scale[c]), then
-    col_scale[c] = max_r(abs_mat[r,c] / row_scale[r]), repeated -- each
-    update recomputes the exact bound needed against the OTHER side's
-    current estimate, so alternating converges to a valid envelope (a
-    Sinkhorn-style scaling, but max-based rather than sum-based).
-
-    Why this exists (found converting a real MiniCPM5 layer -- see
-    conversation): a single per-row scale (from_descriptor's original
-    scheme) wastes most of FP4's resolution on any output whose true
-    magnitude is well below that row's max -- measured min/max ratio of
-    per-output magnitude within one folded layer as low as ~0.05-0.10.
-    Per-layer/per-row scale can't distinguish that structure at all; a
-    genuine per-COLUMN scale can, at a fraction of a full per-element
-    scale matrix's memory cost.
-
-    Returns (row_scale, col_scale), both float32 numpy arrays --
-    deliberately NOT float64: row_scale/col_scale's dtype determines
-    what dtype every `abs_mat / scale` broadcast upcasts to internally,
-    so float64 here would silently double the transient memory of every
-    iteration for the largest suffixes even if abs_mat itself is stored
-    as float32. A max/divide envelope fit has no numerical stability
-    need for float64 (unlike an accumulating sum).
+    Returns (row_scale, col_scale), float32 -- keep it float32: their
+    dtype determines what every `abs_mat / scale` broadcast upcasts to,
+    so float64 here doubles transient memory with no accuracy benefit
+    for a max/divide fit (no accumulating sum to lose precision in).
     """
     import numpy as np
     n_rows, n_cols = abs_mat.shape
@@ -407,19 +391,13 @@ class FoldedLayer(Module):
                              override (e.g. worst-case: max_row_weights * 5).
           value_scale_mode -- "per_row" (default, exact prior behavior): one
                              value_scale per input row, output_scale left at
-                             its default 1.0 everywhere. "rank1": ALSO fits a
-                             per-output-column scale via fit_rank1_scale_envelope
-                             and sets it via set_output_scale_raw -- found
-                             necessary converting a real folded MiniCPM5 layer
-                             (per-row-only quantization collapsed next-token
-                             accuracy catastrophically; rank1 recovered most of
-                             it, see conversation). Prefer "rank1" for any real
-                             pretrained-weight conversion; "per_row" stays the
-                             default only for exact backward compatibility with
-                             existing callers/tests.
+                             its default 1.0. "rank1": also fits a
+                             per-output-column scale (fit_rank1_scale_envelope)
+                             via set_output_scale_raw, gradient-trainable
+                             like value_scale. Prefer "rank1" for real
+                             pretrained-weight conversion.
           rank1_iters      -- alternating-fit iterations for "rank1" mode
-                             (ignored otherwise). 6 converges well in practice;
-                             see fit_rank1_scale_envelope.
+                             (ignored otherwise); see fit_rank1_scale_envelope.
         """
         import numpy as np
         import torch as _torch   # local import: conversion step only -- sili does
@@ -452,11 +430,7 @@ class FoldedLayer(Module):
             vals = csr_t.values().float().numpy().copy()
 
             if value_scale_mode == "rank1":
-                # Rank-1 (outer-product) scale: one value BOTH per input row
-                # AND per output column, instead of per-row only -- see
-                # fit_rank1_scale_envelope's docstring for why this was
-                # necessary (per-row-only quantization catastrophically
-                # degraded a real converted MiniCPM5 layer).
+                # One scale per input row AND one per output column.
                 abs_mat = dense_t.abs().numpy().astype(np.float32)
                 row_env, col_env = fit_rank1_scale_envelope(abs_mat, n_iters=rank1_iters)
                 del abs_mat
@@ -467,10 +441,8 @@ class FoldedLayer(Module):
                 nonzero_combined = combined > 0
                 vals[nonzero_combined] /= combined[nonzero_combined]
             else:
-                # Per-row value scaling: map each row's max-abs to FP4_MAX so
-                # the quantizer uses its full resolution.  See conversation
-                # for why per-row (not per-layer) is critical for a stacked
-                # matrix that spans rows from N different original layers.
+                # Per-row: map each row's max-abs to FP4_MAX for full
+                # quantizer resolution.
                 row_scales = np.ones(n_in, dtype=np.float32)
                 col_scales = np.ones(n_out, dtype=np.float32)   # left at default (1.0) in this mode
                 for r in range(n_in):
