@@ -477,6 +477,36 @@ struct SparseLinearWeightsDelta {
         value_scale[row] = v;
     }
 
+    // Per-COLUMN (per-output) counterpart to value_scale, for a rank-1
+    // (outer-product) quantization scale: true_w = stored_w * value_scale[row]
+    // * output_scale[col]. Motivation: a single per-row scale wastes most of
+    // FP4's resolution on any output whose true magnitude is well below that
+    // row's max -- found converting a real folded MiniCPM5 layer, where
+    // per-output max|.| within one (folded) layer varied by a
+    // min/max ratio as low as ~0.05-0.10 (i.e. the smallest output's true
+    // range was only 5-10% of the largest's). Same lazy-sizing/default-1.0
+    // convention as value_scale/importance_scale -- fully backward compatible
+    // with every caller that never touches it (defaults to 1.0, reducing to
+    // exactly the old per-row-only behavior).
+    //
+    // Deliberately NOT gradient-updated by disldo_backward the way
+    // value_scale can be (see linear_disldo.hpp) -- output_scale is meant as
+    // a FIXED, write-once conversion-time constant (set via
+    // set_output_scale_raw, e.g. from a rank-1 envelope fit over pretrained
+    // weights), not a parameter actively re-learned during training. The
+    // weight-VALUE gradient and value_scale's OWN gradient (both in
+    // disldo_backward) correctly account for output_scale as a fixed
+    // multiplicative factor either way.
+    std::vector<value_type> output_scale;
+
+    inline value_type get_output_scale(std::size_t col) const {
+        return col < output_scale.size() ? output_scale[col] : value_type(1);
+    }
+    inline void set_output_scale_raw(std::size_t col, value_type v) {
+        if (col >= output_scale.size()) output_scale.resize(col + 1, value_type(1));
+        output_scale[col] = v;
+    }
+
     // Running L1 / L2^2 / max|.| for STORED (quantized) importance and
     // weight values, maintained incrementally (O(1) per synapse touched,
     // not a full-layer rescan) by update_importance_stats()/

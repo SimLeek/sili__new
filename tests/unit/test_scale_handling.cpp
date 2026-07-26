@@ -169,6 +169,164 @@ TEST_CASE("rescale_value_row preserves the true weight value across a scale chan
     CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved
 }
 
+// ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
+//
+// Per-COLUMN counterpart to value_scale: true_w = stored_w * value_scale[row]
+// * output_scale[col]. Motivation: converting a real folded MiniCPM5 layer
+// found per-output max|.| within one (folded) layer varying by a min/max
+// ratio as low as ~0.05-0.10 -- a single per-row scale wastes most of FP4's
+// resolution on any output well below that row's max. Unlike value_scale,
+// output_scale is NOT gradient-updated -- fixed, write-once conversion-time
+// constant (see delta_csr_types.hpp's output_scale docstring).
+
+TEST_CASE("output_scale defaults to 1.0, exact backward compat", "[scale][output_scale]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    CHECK(weights.get_output_scale(0) == Catch::Approx(1.0f));
+}
+
+TEST_CASE("output_scale never-touched column still defaults to 1.0, only the touched one changes",
+         "[scale][output_scale]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {1.0f, 1.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.set_output_scale_raw(0, 4.0f);
+    CHECK(weights.get_output_scale(0) == Catch::Approx(4.0f));
+    CHECK(weights.get_output_scale(1) == Catch::Approx(1.0f));   // untouched, still default
+}
+
+TEST_CASE("disldo_forward's output reflects value_scale * output_scale jointly (rank-1)",
+         "[scale][output_scale][regression]") {
+    // Two outputs sharing the same input row, DIFFERENT output_scale each --
+    // the real point of rank-1: one row-scale, but per-output resolution.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};          // 1 row, 2 nonzero entries
+    std::vector<S> idx  = {0, 1};          // -> columns 0 and 1
+    std::vector<float> w = {3.0f, 3.0f}, imp = {0.0f, 0.0f};   // same stored weight both
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(2, S(0));
+    weights.set_value_scale_raw(0, 0.1f);     // shared row scale
+    weights.set_output_scale_raw(0, 1.0f);    // col 0: true_w = 3.0*0.1*1.0 = 0.3
+    weights.set_output_scale_raw(1, 10.0f);   // col 1: true_w = 3.0*0.1*10.0 = 3.0
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> output(2, 0.0f);
+    disldo_forward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), weights, output.data(), 0.0f, 1);
+
+    CHECK(output[0] == Catch::Approx(0.6f).margin(1e-4f));    // 0.3 * 2.0
+    CHECK(output[1] == Catch::Approx(6.0f).margin(1e-4f));    // 3.0 * 2.0
+}
+
+TEST_CASE("disldo_backward's dx uses value_scale * output_scale jointly",
+         "[scale][output_scale][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {3.0f, 3.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(2, S(0));
+    weights.set_value_scale_raw(0, 0.1f);
+    weights.set_output_scale_raw(0, 1.0f);
+    weights.set_output_scale_raw(1, 10.0f);
+
+    std::vector<float> input = {2.0f};
+    std::vector<float> dy    = {1.0f, 1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(2, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.0f, 1);
+
+    // dx = true_w[col0]*dy[0] + true_w[col1]*dy[1] = 0.3*1.0 + 3.0*1.0 = 3.3
+    CHECK(dx[0] == Catch::Approx(3.3f).margin(1e-4f));
+}
+
+TEST_CASE("output_scale is NOT gradient-updated by disldo_backward -- stays exactly fixed",
+         "[scale][output_scale][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(0));
+    weights.set_value_scale_raw(0, 0.5f);
+    weights.set_output_scale_raw(0, 3.0f);
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/1.0f, 1);
+
+    // value_scale is free to move (learning_rate != 0), but output_scale
+    // must stay EXACTLY 3.0 -- it has no gradient-update rule at all.
+    CHECK(weights.get_output_scale(0) == Catch::Approx(3.0f));
+}
+
+TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scale factor",
+         "[scale][output_scale][value_scale][gradient][regression]") {
+    // Same shape as the existing "disldo_backward updates value_scale via
+    // gradient" test, but with output_scale != 1.0 -- confirms
+    // scale_grad_sum correctly includes the output_scale factor
+    // (true_w = stored_w * value_scale * output_scale, so
+    // d(true_w)/d(value_scale) = stored_w * output_scale, not just stored_w).
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};   // stored weight = 2.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(0));
+    weights.set_value_scale_raw(0, 0.5f);    // true_w = 2.0 * 0.5 * 4.0 = 4.0
+    weights.set_output_scale_raw(0, 4.0f);
+
+    std::vector<float> input = {1.0f};
+    std::vector<float> dy    = {1.0f};
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    disldo_backward<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
+
+    // g = dy*input = 1.0. scale_grad_sum = cw_orig * out_scale * g = 2.0*4.0*1.0 = 8.0
+    // scale_eff_lr = learning_rate / nnz_this_row = 0.1 / 1 = 0.1
+    // new value_scale = 0.5 - 0.1 * 8.0 = 0.5 - 0.8 = -0.3
+    const float expected_scale = 0.5f - 0.1f * 8.0f;
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+}
+
 TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer across rows of different nnz",
          "[scale][lr_normalization][regression]") {
     // Row 0: 1 synapse. Row 1: 4 synapses. Same weight, same input, same

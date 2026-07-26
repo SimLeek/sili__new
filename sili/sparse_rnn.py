@@ -293,6 +293,43 @@ def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
         layer.set_importance_scale_raw(r, float(d["importance_scale"][r]))
 
 
+def fit_rank1_scale_envelope(abs_mat, n_iters: int = 6):
+    """
+    Alternating max-fit producing a rank-1 (outer-product) envelope of a
+    matrix's magnitudes: row_scale[r] * col_scale[c] >= abs_mat[r, c] for
+    every entry, using O(rows+cols) parameters instead of O(rows*cols).
+
+    row_scale[r] = max_c(abs_mat[r,c] / col_scale[c]), then
+    col_scale[c] = max_r(abs_mat[r,c] / row_scale[r]), repeated -- each
+    update recomputes the exact bound needed against the OTHER side's
+    current estimate, so alternating converges to a valid envelope (a
+    Sinkhorn-style scaling, but max-based rather than sum-based).
+
+    Why this exists (found converting a real MiniCPM5 layer -- see
+    conversation): a single per-row scale (from_descriptor's original
+    scheme) wastes most of FP4's resolution on any output whose true
+    magnitude is well below that row's max -- measured min/max ratio of
+    per-output magnitude within one folded layer as low as ~0.05-0.10.
+    Per-layer/per-row scale can't distinguish that structure at all; a
+    genuine per-COLUMN scale can, at a fraction of a full per-element
+    scale matrix's memory cost.
+
+    Returns (row_scale, col_scale), both float64 numpy arrays.
+    """
+    import numpy as np
+    n_rows, n_cols = abs_mat.shape
+    col_scale = np.ones(n_cols, dtype=np.float64)
+    row_scale = np.ones(n_rows, dtype=np.float64)
+    for _ in range(n_iters):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_scale = np.nanmax(np.where(col_scale > 0, abs_mat / col_scale[None, :], 0.0), axis=1)
+        row_scale = np.maximum(row_scale, 1e-12)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            col_scale = np.nanmax(np.where(row_scale[:, None] > 0, abs_mat / row_scale[:, None], 0.0), axis=0)
+        col_scale = np.maximum(col_scale, 1e-12)
+    return row_scale, col_scale
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FoldedLayer — runtime sili Module for a converted folded transformer block
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,7 +378,9 @@ class FoldedLayer(Module):
     def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
                         num_cpus: int = 4,
                         max_row_weights: int = 0,
-                        bytes_per_row: int = 0) -> "FoldedLayer":
+                        bytes_per_row: int = 0,
+                        value_scale_mode: str = "per_row",
+                        rank1_iters: int = 6) -> "FoldedLayer":
         """
         Build a FoldedLayer from a FoldedBlockDescriptor.
 
@@ -360,6 +399,21 @@ class FoldedLayer(Module):
                              The default adds a small margin for net growth per
                              synaptogenesis step. Pass an explicit value to
                              override (e.g. worst-case: max_row_weights * 5).
+          value_scale_mode -- "per_row" (default, exact prior behavior): one
+                             value_scale per input row, output_scale left at
+                             its default 1.0 everywhere. "rank1": ALSO fits a
+                             per-output-column scale via fit_rank1_scale_envelope
+                             and sets it via set_output_scale_raw -- found
+                             necessary converting a real folded MiniCPM5 layer
+                             (per-row-only quantization collapsed next-token
+                             accuracy catastrophically; rank1 recovered most of
+                             it, see conversation). Prefer "rank1" for any real
+                             pretrained-weight conversion; "per_row" stays the
+                             default only for exact backward compatibility with
+                             existing callers/tests.
+          rank1_iters      -- alternating-fit iterations for "rank1" mode
+                             (ignored otherwise). 6 converges well in practice;
+                             see fit_rank1_scale_envelope.
         """
         import numpy as np
         import torch as _torch   # local import: conversion step only -- sili does
@@ -367,10 +421,14 @@ class FoldedLayer(Module):
         # CSR weights, then discarded. Do not use torch in forward/backward paths.
         import warnings; warnings.filterwarnings("ignore")
         _FP4_MAX = 6.0
+        if value_scale_mode not in ("per_row", "rank1"):
+            raise ValueError(
+                f"value_scale_mode must be 'per_row' or 'rank1', got {value_scale_mode!r}")
 
         layers = {}
         for suffix, csr in descriptor.stacked_weights.items():
-            csr_t = csr.to_dense().t().to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
+            dense_t = csr.to_dense().t()
+            csr_t = dense_t.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
             n_in  = int(csr_t.shape[0])
             n_out = int(csr_t.shape[1])
             nnz   = int(csr_t.values().numel())
@@ -387,23 +445,44 @@ class FoldedLayer(Module):
             idx  = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
 
-            # Per-row value scaling: map each row's max-abs to FP4_MAX so the
-            # quantizer uses its full resolution.  See conversation for why
-            # per-row (not per-layer) is critical for a stacked matrix that
-            # spans rows from N different original layers.
-            row_scales = np.ones(n_in, dtype=np.float32)
-            for r in range(n_in):
-                start, end = int(ptrs[r]), int(ptrs[r + 1])
-                if end > start:
-                    max_abs = float(np.abs(vals[start:end]).max())
-                    if max_abs > 0.0:
-                        row_scales[r] = max_abs / _FP4_MAX
-                        vals[start:end] /= row_scales[r]
+            if value_scale_mode == "rank1":
+                # Rank-1 (outer-product) scale: one value BOTH per input row
+                # AND per output column, instead of per-row only -- see
+                # fit_rank1_scale_envelope's docstring for why this was
+                # necessary (per-row-only quantization catastrophically
+                # degraded a real converted MiniCPM5 layer).
+                abs_mat = dense_t.abs().numpy().astype(np.float64)
+                row_env, col_env = fit_rank1_scale_envelope(abs_mat, n_iters=rank1_iters)
+                del abs_mat
+                row_scales = (row_env / _FP4_MAX).astype(np.float32)
+                col_scales = col_env.astype(np.float32)
+                row_of_nnz = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs))
+                combined = row_scales[row_of_nnz] * col_scales[idx]
+                nonzero_combined = combined > 0
+                vals[nonzero_combined] /= combined[nonzero_combined]
+            else:
+                # Per-row value scaling: map each row's max-abs to FP4_MAX so
+                # the quantizer uses its full resolution.  See conversation
+                # for why per-row (not per-layer) is critical for a stacked
+                # matrix that spans rows from N different original layers.
+                row_scales = np.ones(n_in, dtype=np.float32)
+                col_scales = np.ones(n_out, dtype=np.float32)   # left at default (1.0) in this mode
+                for r in range(n_in):
+                    start, end = int(ptrs[r]), int(ptrs[r + 1])
+                    if end > start:
+                        max_abs = float(np.abs(vals[start:end]).max())
+                        if max_abs > 0.0:
+                            row_scales[r] = max_abs / _FP4_MAX
+                            vals[start:end] /= row_scales[r]
+            del dense_t
 
             layer.load_weights(ptrs, idx, vals)
             for r in range(n_in):
                 if row_scales[r] != 1.0:
                     layer.set_value_scale_raw(r, row_scales[r])
+            for c in range(n_out):
+                if col_scales[c] != 1.0:
+                    layer.set_output_scale_raw(c, col_scales[c])
 
             # Per-row importance_scale: same FP4 representability problem as
             # value_scale but for importance.

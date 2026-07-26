@@ -90,7 +90,8 @@ void disldo_forward(
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                const value_type  w        = w_stored * val_scale;   // -> true units
+                const value_type  out_scale = weights.get_output_scale(col);
+                const value_type  w        = w_stored * val_scale * out_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -259,7 +260,9 @@ void disldo_backward(
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
                 const value_type  ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                value_type cw  = cw_orig * val_scale;   // -> true units
+                const value_type  out_scale     = weights.get_output_scale(col);
+                const value_type  combined_scale = val_scale * out_scale;
+                value_type cw  = cw_orig * combined_scale;   // -> true units
                 value_type ci  = ci_orig * imp_scale;   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -270,13 +273,16 @@ void disldo_backward(
                     if (learning_rate != value_type(0)) {
                         ci -= g * effective_lr;
                         cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
-                        // dL/d(val_scale[r]) += stored_w * dy * input
-                        scale_grad_sum += static_cast<double>(cw_orig) * g;
+                        // dL/d(val_scale[r]) += stored_w * out_scale[col] * dy * input
+                        // (out_scale is a FIXED factor, not itself gradient
+                        // -updated, but val_scale's own gradient must still
+                        // account for it: true_w = stored_w * val_scale * out_scale)
+                        scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                     }
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / val_scale, ci / imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));

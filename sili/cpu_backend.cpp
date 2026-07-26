@@ -540,6 +540,7 @@ public:
     // exact backward compat.
     V get_importance_scale(S row) const { return weights.get_importance_scale(static_cast<std::size_t>(row)); }
     V get_value_scale(S row)      const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
+    V get_output_scale(S col)     const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -900,6 +901,30 @@ PYBIND11_MODULE(_cpu, m)
              },
              py::arg("row"), py::arg("scale"),
              "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale",     &SparseLinearLayer::get_output_scale,
+             py::arg("col"),
+             "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
+             "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
+             "column not yet touched, exact backward compat with every caller that\n"
+             "never sets it.")
+        .def("set_output_scale_raw",
+             [](SparseLinearLayer& self, int col, float scale) {
+                 self.weights.set_output_scale_raw(
+                     static_cast<std::size_t>(col), scale);
+             },
+             py::arg("col"), py::arg("scale"),
+             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+             "same convention as set_value_scale_raw(), but per-output instead of\n"
+             "per-input. Unlike value_scale, output_scale is NOT gradient-updated by\n"
+             "backward_dense() -- it's meant as a fixed, write-once conversion-time\n"
+             "constant (e.g. from a rank-1/outer-product envelope fit over pretrained\n"
+             "weights), not a parameter actively re-learned during training.\n"
+             "Typical pattern (rank-1 quantization scale):\n"
+             "  in_scale, out_scale = fit_rank1_envelope(abs(W))   # two vectors\n"
+             "  effective = outer(out_scale, in_scale) / FP4_MAX\n"
+             "  layer.load_weights(ptrs, idx, vals / effective[row_of(idx)])\n"
+             "  for r in range(n_in): layer.set_value_scale_raw(r, in_scale[r] / FP4_MAX)\n"
+             "  for c in range(n_out): layer.set_output_scale_raw(c, out_scale[c])")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
