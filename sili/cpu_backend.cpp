@@ -541,6 +541,8 @@ public:
     V get_importance_scale(S row) const { return weights.get_importance_scale(static_cast<std::size_t>(row)); }
     V get_value_scale(S row)      const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
     V get_output_scale(S col)     const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
+    V get_value_scale_importance(S row)  const { return weights.get_value_scale_importance(static_cast<std::size_t>(row)); }
+    V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -923,6 +925,13 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("get_value_scale_importance",  &SparseLinearLayer::get_value_scale_importance,
+             py::arg("row"),
+             "Per-row importance backing value_scale's own gradient step, same\n"
+             "damping role as a synapse's importance value. Default 0.")
+        .def("get_output_scale_importance", &SparseLinearLayer::get_output_scale_importance,
+             py::arg("col"),
+             "Per-column counterpart for output_scale. Default 0.")
         .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"

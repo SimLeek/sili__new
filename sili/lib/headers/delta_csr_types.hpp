@@ -477,6 +477,16 @@ struct SparseLinearWeightsDelta {
         value_scale[row] = v;
     }
 
+    // value_scale/output_scale are themselves gradient-updated parameters
+    // (disldo_backward), so -- like every per-synapse weight -- each gets
+    // its own importance value damping its update step
+    // (new = old - lr*grad / (1 + |importance|)). Default 0, same
+    // convention as per-synapse importance.
+    std::vector<value_type> value_scale_importance;
+    inline value_type get_value_scale_importance(std::size_t row) const {
+        return row < value_scale_importance.size() ? value_scale_importance[row] : value_type(0);
+    }
+
     // Per-COLUMN counterpart to value_scale: true_w = stored_w *
     // value_scale[row] * output_scale[col]. Same lazy-sizing/default-1.0
     // convention. Gradient-updated by disldo_backward like value_scale is,
@@ -485,10 +495,14 @@ struct SparseLinearWeightsDelta {
     // output_scale.empty(), which disldo_backward's own internal resize
     // would otherwise flip after the first call regardless of intent).
     std::vector<value_type> output_scale;
+    std::vector<value_type> output_scale_importance;
     bool output_scale_is_trainable = false;
 
     inline value_type get_output_scale(std::size_t col) const {
         return col < output_scale.size() ? output_scale[col] : value_type(1);
+    }
+    inline value_type get_output_scale_importance(std::size_t col) const {
+        return col < output_scale_importance.size() ? output_scale_importance[col] : value_type(0);
     }
     inline void set_output_scale_raw(std::size_t col, value_type v) {
         if (col >= output_scale.size()) output_scale.resize(col + 1, value_type(1));

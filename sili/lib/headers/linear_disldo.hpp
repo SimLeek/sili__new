@@ -208,6 +208,10 @@ void disldo_backward(
         weights.value_scale.resize(n_in, value_type(1));
     if (weights.output_scale.size() < n_out)
         weights.output_scale.resize(n_out, value_type(1));
+    if (weights.value_scale_importance.size() < n_in)
+        weights.value_scale_importance.resize(n_in, value_type(0));
+    if (weights.output_scale_importance.size() < n_out)
+        weights.output_scale_importance.resize(n_out, value_type(0));
 
     #pragma omp parallel num_threads(num_cpus)
     {
@@ -307,7 +311,13 @@ void disldo_backward(
                 }
             }
             if (learning_rate != value_type(0)) {
-                weights.value_scale[r] -= static_cast<value_type>(scale_eff_lr * scale_grad_sum);
+                // Same damping pattern as a per-synapse weight: importance
+                // updates first (undamped), then the value_scale step
+                // itself is damped by the freshly-updated importance.
+                const value_type raw_update = static_cast<value_type>(scale_eff_lr * scale_grad_sum);
+                weights.value_scale_importance[r] -= raw_update;
+                const value_type vs_imp = weights.value_scale_importance[r];
+                weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
             }
         }
 
@@ -340,7 +350,11 @@ void disldo_backward(
             for (int t = 0; t < num_cpus; ++t)
                 col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
             const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
-            weights.output_scale[c] -= static_cast<value_type>(col_eff_lr * col_grad_sum);
+            // Same importance-damping pattern as value_scale's own update.
+            const value_type raw_update = static_cast<value_type>(col_eff_lr * col_grad_sum);
+            weights.output_scale_importance[c] -= raw_update;
+            const value_type os_imp = weights.output_scale_importance[c];
+            weights.output_scale[c] -= raw_update / (value_type(1) + std::abs(os_imp));
         }
     }
 }

@@ -155,3 +155,40 @@ class TestOutputScaleGradientTraining:
         loss.backward()
 
         assert raw.get_output_scale(0) == 1.0
+
+
+class TestScaleImportance:
+    def test_rank1_mode_value_and_output_scale_importance_move_off_zero(self):
+        # importance is sili's per-parameter optimizer state -- anything
+        # gradient-updated (value_scale, now output_scale too) should have
+        # its own, same as a per-synapse weight does.
+        torch.manual_seed(5)
+        w = torch.randn(6, 4)
+        desc = _make_descriptor(w)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=0.05, num_cpus=1, value_scale_mode="rank1")
+        raw = layer._sili_layers[".w"]
+        assert raw.get_value_scale_importance(0) == 0.0
+        assert raw.get_output_scale_importance(0) == 0.0
+
+        x = Tensor(np.random.RandomState(1).randn(3, 4).astype(np.float32))
+        loss = (layer.forward(x) ** 2).sum()
+        loss.backward()
+
+        assert raw.get_value_scale_importance(0) != 0.0
+        assert raw.get_output_scale_importance(0) != 0.0
+
+    def test_per_row_mode_value_scale_importance_moves_output_scale_importance_does_not(self):
+        torch.manual_seed(5)
+        w = torch.randn(6, 4)
+        desc = _make_descriptor(w)
+        layer = FoldedLayer.from_descriptor(
+            desc, learning_rate=0.05, num_cpus=1, value_scale_mode="per_row")
+        raw = layer._sili_layers[".w"]
+
+        x = Tensor(np.random.RandomState(1).randn(3, 4).astype(np.float32))
+        loss = (layer.forward(x) ** 2).sum()
+        loss.backward()
+
+        assert raw.get_value_scale_importance(0) != 0.0    # value_scale always trainable
+        assert raw.get_output_scale_importance(0) == 0.0   # output_scale untouched in this mode

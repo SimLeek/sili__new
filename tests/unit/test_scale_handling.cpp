@@ -285,9 +285,13 @@ TEST_CASE("output_scale's own gradient moves it, symmetric to value_scale's",
 
     // g = dy*input = 1.0. col_grad_sum = cw_orig * val_scale * g = 2.0*4.0*1.0 = 8.0
     // col_eff_lr = learning_rate / out_degree[0] = 0.1 / 1 = 0.1
-    // new output_scale = 0.5 - 0.1 * 8.0 = -0.3
-    const float expected_scale = 0.5f - 0.1f * 8.0f;
+    // raw_update = 0.1*8.0 = 0.8. importance = 0 - 0.8 = -0.8 (damps the
+    // scale's own step, same pattern as a per-synapse weight).
+    // new output_scale = 0.5 - 0.8/(1+0.8) = 0.5 - 0.44444... ~= 0.05556
+    const float raw_update = 0.1f * 8.0f;
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_output_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+    CHECK(weights.get_output_scale_importance(0) == Catch::Approx(-raw_update).margin(1e-4f));
 }
 
 TEST_CASE("a column with zero out_degree is skipped, not divided by zero",
@@ -340,8 +344,9 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
 
     // g = dy*input = 1.0. scale_grad_sum = cw_orig * out_scale * g = 2.0*4.0*1.0 = 8.0
     // scale_eff_lr = learning_rate / nnz_this_row = 0.1 / 1 = 0.1
-    // new value_scale = 0.5 - 0.1 * 8.0 = 0.5 - 0.8 = -0.3
-    const float expected_scale = 0.5f - 0.1f * 8.0f;
+    // raw_update = 0.8, importance = 0 - 0.8 = -0.8, damped step = 0.8/1.8
+    const float raw_update = 0.1f * 8.0f;
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
 }
 
@@ -422,8 +427,9 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
         in_acc.data(), gr_acc.data(), lr, 1);
 
     // scale_grad = stored_w * dy * input = 2.0 * 1.0 * 3.0 = 6.0
-    // new value_scale = 0.5 - 0.1 * 6.0 = 0.5 - 0.6 = -0.1
-    const float expected_scale = 0.5f - lr * (2.0f * 1.0f * 3.0f);
+    // raw_update = 0.1*6.0 = 0.6, importance = 0-0.6 = -0.6, damped by 1.6
+    const float raw_update = lr * (2.0f * 1.0f * 3.0f);
+    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-5f));
 }
 
@@ -458,7 +464,9 @@ TEST_CASE("value_scale gradient accumulates correctly across multiple synapses a
     // total scale_grad_sum = 6 + 9 = 15
     // scale_eff_lr = lr / nnz_this_row = 0.01 / 2 = 0.005 (always divides
     // by nnz_this_row for value_scale, independent of lr_per_row_nnz flag)
-    const float expected_scale = 1.0f - (lr / 2.0f) * 15.0f;
+    // raw_update = 0.005*15 = 0.075, importance = 0-0.075, damped by 1.075
+    const float raw_update = (lr / 2.0f) * 15.0f;
+    const float expected_scale = 1.0f - raw_update / (1.0f + std::abs(-raw_update));
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
 }
 
