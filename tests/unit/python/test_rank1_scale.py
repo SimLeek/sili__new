@@ -3,12 +3,8 @@ tests/unit/python/test_rank1_scale.py
 ────────────────────────────────────────
 fit_rank1_scale_envelope + FoldedLayer.from_descriptor(value_scale_mode=
 "rank1") -- a per-output-column quantization scale alongside the existing
-per-row one. Found necessary converting a real folded MiniCPM5 layer: a
-single per-row scale (from_descriptor's original, still-default "per_row"
-mode) wastes most of FP4's resolution on any output well below that row's
-max -- measured min/max ratio of per-output magnitude within one folded
-layer as low as ~0.05-0.10 there. See sparse_rnn.py's fit_rank1_scale_envelope
-docstring and conversation for the full investigation.
+per-row one, for outputs whose magnitude varies a lot within one row's
+fan-out. See sparse_rnn.py's fit_rank1_scale_envelope docstring.
 """
 import sys, os, warnings
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
