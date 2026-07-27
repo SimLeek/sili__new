@@ -51,6 +51,14 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> compact(
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> out;
     out.layout.rows = L.rows;
     out.layout.cols = L.cols;
+    // group_size must travel with the bytes it describes -- compact() only
+    // memcpy's the row's existing bytes (no re-encoding), so a mismatched
+    // group_size here would leave DeltaCSRRowCursor decoding correctly-
+    // encoded bytes with the WRONG group width, silently corrupting every
+    // read (a real bug, found while doing the full ULEB128->FOR migration
+    // this replaces -- compact() previously had nothing analogous to get
+    // wrong, since ULEB128 had no per-layout encoding parameter at all).
+    out.layout.group_size = L.group_size;
     out.layout.byte_start.resize(L.rows + 1);
     out.layout.byte_end.resize(L.rows);
     out.layout.elem_start.resize(L.rows + 1);
@@ -135,11 +143,18 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom(
     delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, ptrs, idx, w, imp);
 
     const std::size_t n = idx.size();
+    // group_size must carry over from the input layer -- delta_csr_from_absolute
+    // defaults to G32, which would silently re-encode at the wrong group
+    // size (not just a metadata mismatch here, unlike compact(): this
+    // path actually re-encodes via delta_csr_to_absolute -> from_absolute,
+    // so getting this wrong would just pick a different, unintended real
+    // group size rather than corrupt anything -- still worth being
+    // explicit and intentional about, not accidental).
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, dc.layout.rows, dc.layout.cols,
-        n * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
+        n * (1.0 + blank_fraction) * (for_max_bytes_per_value()) + 4096,
         static_cast<std::size_t>(n * (1.0 + blank_fraction)) + 64,
-        blank_fraction);
+        blank_fraction, dc.layout.group_size);
 }
 
 // Like expand_headroom() but sizes the total budget for at least
@@ -163,9 +178,9 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
     const std::size_t budget = std::max(n, rows * min_nnz_per_row);
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, rows, dc.layout.cols,
-        budget * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
+        budget * (1.0 + blank_fraction) * (for_max_bytes_per_value()) + 4096,
         static_cast<std::size_t>(budget * (1.0 + blank_fraction)) + 64,
-        blank_fraction);
+        blank_fraction, dc.layout.group_size);
 }
 // ── Forward pass ─────────────────────────────────────────────────────────────
 

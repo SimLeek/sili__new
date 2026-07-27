@@ -272,6 +272,63 @@ TEST_CASE("compact() is lossless and shrinks reserved headroom", "[memory]") {
     CHECK(compacted2.layout.total_alloc_bytes() == compacted.layout.total_alloc_bytes());
 }
 
+// Regression: compact() only memcpy's a row's existing bytes (no
+// re-encoding), so it must copy group_size into its output layout too --
+// a mismatch would leave DeltaCSRRowCursor decoding correctly-encoded
+// bytes at the WRONG group width, silently corrupting every read. The
+// default-group_size case above wouldn't catch this (both sides default
+// to the same value coincidentally) -- this test explicitly uses a
+// non-default group size to actually exercise the bug.
+TEST_CASE("compact() preserves a non-default group_size", "[memory][regression]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+
+    std::vector<SIZE_TYPE> ptrs = {0, 3, 5, 6};
+    std::vector<SIZE_TYPE> idx  = {0, 5, 12, 2, 9, 20};
+    std::vector<float>     w    = {1.5f, -2.0f, 3.0f, 0.5f, -0.5f, 6.0f};
+    std::vector<float>     imp  = {0.1f, -0.2f, 0.3f, 0.0f, -0.4f, 0.5f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(25), std::size_t(4096), std::size_t(4096),
+        0.2f, ForGroupSize::G16);
+
+    REQUIRE(dc.layout.group_size == ForGroupSize::G16);
+    auto compacted = compact<SIZE_TYPE, FP4BiPacked, COL_TYPE>(dc);
+    CHECK(compacted.layout.group_size == ForGroupSize::G16);
+
+    for (std::size_t r = 0; r < 3; ++r) {
+        auto c1 = dc.row_cursor(r);
+        auto c2 = compacted.row_cursor(r);
+        while (!c1.at_end() && !c2.at_end()) REQUIRE(c1.advance() == c2.advance());
+        REQUIRE(c1.at_end() == c2.at_end());
+    }
+}
+
+// Same regression, for expand_headroom()'s path (delta_csr_to_absolute ->
+// delta_csr_from_absolute, which defaults to G32 if not told otherwise).
+TEST_CASE("expand_headroom() preserves a non-default group_size", "[memory][regression]") {
+    using SIZE_TYPE = int;
+    using COL_TYPE  = uint32_t;
+
+    std::vector<SIZE_TYPE> ptrs = {0, 3, 5, 6};
+    std::vector<SIZE_TYPE> idx  = {0, 5, 12, 2, 9, 20};
+    std::vector<float>     w    = {1.5f, -2.0f, 3.0f, 0.5f, -0.5f, 6.0f};
+    std::vector<float>     imp  = {0.1f, -0.2f, 0.3f, 0.0f, -0.4f, 0.5f};
+    auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(3), std::size_t(25), std::size_t(4096), std::size_t(4096),
+        0.2f, ForGroupSize::G8);
+
+    REQUIRE(dc.layout.group_size == ForGroupSize::G8);
+    auto expanded = expand_headroom<SIZE_TYPE, FP4BiPacked, COL_TYPE>(dc, 0.3f);
+    CHECK(expanded.layout.group_size == ForGroupSize::G8);
+
+    for (std::size_t r = 0; r < 3; ++r) {
+        auto c1 = dc.row_cursor(r);
+        auto c2 = expanded.row_cursor(r);
+        while (!c1.at_end() && !c2.at_end()) REQUIRE(c1.advance() == c2.advance());
+        REQUIRE(c1.at_end() == c2.at_end());
+    }
+}
+
 TEST_CASE("synap_row_step throws (not silently skips) when compact() removed all headroom",
          "[memory][synaptogenesis][regression]") {
     // After compact(), blank_bytes=0 per row. Synaptogenesis that tries to

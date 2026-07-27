@@ -23,6 +23,7 @@
 #include <omp.h>
 #include <stdexcept>
 #include <vector>
+#include "delta_csr_for.hpp"
 #include "fp4quant.hpp"
 
 /**
@@ -198,40 +199,13 @@ template <class SIZE_TYPE, class VALUE_TYPE>
 using SparseLinearWeightsV = sparse_weights<CSRSynapsesV<SIZE_TYPE, VALUE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
 
 // Delta CSR section
-
-/// Maximum bytes to encode an integer as ULEB128.
-// fake ULEB128, but in practice we're not going to have more than 2^28 zeroes between items in a single row
-template <typename T = uint32_t>
-constexpr std::size_t uleb128_max_bytes() {
-    return (sizeof(T) * 8 + 6) / 7;
-}
-
-/// Encode @p value into @p buf as ULEB128. Returns bytes written.
-template <typename T = uint32_t>
-inline std::size_t uleb128_encode(T value, uint8_t* buf) {
-    std::size_t n = 0;
-    do {
-        uint8_t byte = static_cast<uint8_t>(value & 0x7Fu);
-        value >>= 7;
-        if (value) byte |= 0x80u;
-        buf[n++] = byte;
-    } while (value);
-    return n;
-}
-
-/// Decode one ULEB128 value from @p buf at byte offset *pos. Advances *pos.
-template <typename T = uint32_t>
-inline T uleb128_decode(const uint8_t* buf, std::size_t& pos) {
-    T result = 0;
-    int shift = 0;
-    uint8_t byte;
-    do {
-        byte = buf[pos++];
-        result |= static_cast<T>(byte & 0x7Fu) << shift;
-        shift += 7;
-    } while (byte & 0x80u);
-    return result;
-}
+//
+// Column indices used to be sequential ULEB128 delta-from-previous
+// (uleb128_encode/uleb128_decode) -- fully replaced by frame-of-
+// reference (FOR) group encoding, see delta_csr_for.hpp's header
+// comment for why (removes a cumulative-sum dependency chain that
+// capped every SIMD strategy tried against the old format at ~2.5x;
+// real result here is 4-12x, mostly 5-7x, at real per-row nnz scale).
 
 template <typename V, typename = void>
 struct ValueAccessor;
@@ -313,6 +287,17 @@ struct DeltaCSRLayout {
 
     std::size_t total_nnz = 0;
 
+    // Frame-of-reference (FOR) group size for this tensor's column-index
+    // encoding (see delta_csr_for.hpp) -- ONE choice per DeltaCSRLayout,
+    // not per row: real sparsity/locality patterns for this library's
+    // actual workloads (e.g. whether synapses cluster near the diagonal)
+    // aren't established yet, so this is exposed for callers to tune per
+    // tensor at model-build time rather than hardcoded. G32 is a
+    // reasonable default (see prototypes/for_delta_encoding's benchmark:
+    // 4-5.3x speedup, ~3-32% size overhead depending on multi-byte-delta
+    // rate), not a claim that it's optimal for every layer shape.
+    ForGroupSize group_size = ForGroupSize::G32;
+
     std::size_t row_nnz        (std::size_t r) const { return elem_end[r] - elem_start[r]; }
     std::size_t row_byte_len   (std::size_t r) const { return byte_end[r] - byte_start[r]; }
     std::size_t row_alloc_bytes(std::size_t r) const { return byte_start[r+1] - byte_start[r]; }
@@ -338,29 +323,51 @@ struct DeltaCSRLayout {
 };
 
 // ── Forward-only row cursor ───────────────────────────────────────────────────
-
+//
+// Decodes FOR-encoded groups (see delta_csr_for.hpp) lazily, one group at
+// a time, caching the group's decoded values between individual
+// advance() calls -- external interface (advance()/col()/at_end()) is
+// byte-for-byte the same shape it always was, so every existing caller
+// (linear_disldo.hpp's disldo_forward, delta_csr_ops.hpp's SISLDO
+// forward, delta_csr_memory.hpp's row_last_col/row_remove/build_probes)
+// needs no changes at all -- only the decode happening INSIDE advance()
+// changed, from a per-element ULEB128 byte walk to a per-GROUP widen +
+// broadcast-add (see delta_csr_for.hpp's header comment for why that's
+// real speedup: 4-12x, mostly 5-7x, at real per-row scale). Most
+// advance() calls are now just "read the next cached slot" -- the actual
+// decode work happens once every G calls, not once per call.
 template <typename COL_TYPE = uint32_t>
 struct DeltaCSRRowCursor {
-    const uint8_t* buf      = nullptr;
-    std::size_t    byte_pos = 0;
-    std::size_t    byte_end = 0;
-    COL_TYPE       cur_col  = 0;
-    std::size_t    n_decoded = 0;
+    const uint8_t* buf        = nullptr;
+    std::size_t    byte_pos   = 0;   // next unread byte (start of the next not-yet-decoded group)
+    std::size_t    row_n      = 0;   // total elements in this row
+    ForGroupSize   group_size = ForGroupSize::G32;
+    uint32_t       carry      = 0;   // running absolute value, carried group to group
+
+    COL_TYPE       group_buf[kForMaxGroupSize];
+    std::size_t    group_buf_len = 0;   // valid entries currently cached
+    std::size_t    group_buf_pos = 0;   // next index within group_buf to serve
+    std::size_t    n_decoded     = 0;   // elements served so far, row-wide
+    COL_TYPE       cur_col       = 0;   // last value returned by advance()
 
     DeltaCSRRowCursor() = default;
 
     DeltaCSRRowCursor(const uint8_t* indices_buf, const DeltaCSRLayout& L, std::size_t row)
         : buf(indices_buf)
         , byte_pos(L.byte_start[row])
-        , byte_end(L.byte_end[row])
-        , cur_col(0)
-        , n_decoded(0)
+        , row_n(L.row_nnz(row))
+        , group_size(L.group_size)
     {}
 
-    bool at_end() const { return byte_pos >= byte_end; }
+    bool at_end() const { return n_decoded >= row_n; }
 
     COL_TYPE advance() {
-        cur_col += uleb128_decode<COL_TYPE>(buf, byte_pos);
+        if (group_buf_pos >= group_buf_len) {
+            byte_pos = for_decode_one_group_dispatch<COL_TYPE>(
+                buf, byte_pos, row_n - n_decoded, carry, group_buf, group_buf_len, group_size);
+            group_buf_pos = 0;
+        }
+        cur_col = group_buf[group_buf_pos++];
         ++n_decoded;
         return cur_col;
     }

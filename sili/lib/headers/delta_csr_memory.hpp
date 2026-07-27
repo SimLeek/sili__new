@@ -30,11 +30,11 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_importance,
     std::size_t rows, std::size_t cols,
     std::size_t index_bytes, std::size_t values_bytes,
-    float blank_fraction = 0.2f)
+    float blank_fraction = 0.2f,
+    ForGroupSize group_size = ForGroupSize::G32)
 {
     // Let the shifting and gradual modification handle blank space fragmenting
     // We don't know row sizes or byte lengths for each index, so if we try to evenly assign spaces, we could run out of memory
-    // Todo: We can guarantee we won't by assuming uleb128_max_bytes indices each time if needed, but this is a rarely used function.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> dc;
     dc.reserve_values(values_bytes);
@@ -43,23 +43,30 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     auto& L = dc.layout;
     L.rows = rows;
     L.cols = cols;
+    L.group_size = group_size;
     L.byte_start.resize(rows + 1);
     L.byte_end  .resize(rows);
     L.elem_start.resize(rows + 1);
     L.elem_end  .resize(rows);
 
-    uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
-
-    std::vector<std::size_t> row_bytes(rows, 0);
+    // FOR encoding needs a row's WHOLE delta list at once (group tiers
+    // depend on the group's own max offset, not any single value), unlike
+    // ULEB128's independent per-value bytes -- so this measures each row's
+    // encoded size by actually encoding it into a scratch buffer, then
+    // reuses those exact bytes for the real write pass below instead of
+    // re-encoding twice.
+    std::vector<std::vector<uint8_t>> row_encoded(rows);
     for (std::size_t r = 0; r < rows; ++r) {
+        const std::size_t n = static_cast<std::size_t>(csr_ptrs[r + 1] - csr_ptrs[r]);
+        std::vector<COL_TYPE> deltas(n);
         COL_TYPE prev = 0;
-        for (SIZE_TYPE i = csr_ptrs[r]; i < csr_ptrs[r + 1]; ++i) {
-            COL_TYPE col = static_cast<COL_TYPE>(csr_indices[i]);
-            row_bytes[r] += uleb128_encode<COL_TYPE>(col - prev, tmp);
+        for (std::size_t k = 0; k < n; ++k) {
+            const COL_TYPE col = static_cast<COL_TYPE>(csr_indices[csr_ptrs[r] + k]);
+            deltas[k] = col - prev;
             prev = col;
         }
+        for_encode_row_dispatch<COL_TYPE>(deltas.data(), n, row_encoded[r], group_size);
     }
-
 
     // BUG FIX (see conversation): this was `std::size_t blank_fraction = `
     // with nothing after the `=` before the next statement -- valid C++ that
@@ -67,26 +74,31 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     // zeroing the intended growth-headroom fraction. Confirmed via direct
     // testing: delta_csr_row_rebuild() failed silently on every row of a
     // freshly-imported layer (row_alloc_bytes/row_alloc_elems left almost no
-    // slack), so synaptogenesis could never actually grow a connection --
-    // exactly matching this function's own TODO comment above ("we could run
-    // out of memory... can guarantee we won't by assuming uleb128_max_bytes").
-    // 0.2 (20% headroom, elementwise and bytewise) mirrors this session's own
-    // delta_csr_from_absolute (1.2x multiplier) -- proven sufficient for
+    // slack), so synaptogenesis could never actually grow a connection.
+    // 0.2 (20% headroom, elementwise and bytewise) proven sufficient for
     // ordinary synaptogenesis rates in testing throughout this project.
     // blank_fraction is now a parameter (default 0.2, matching the original
-    // fixed value -- see conversation for the earlier bug where this was
-    // accidentally hardcoded via an incomplete assignment). Exposed so
-    // expand() can offer real caller control over how much headroom to
-    // restore, rather than reusing a fixed amount unconditionally.
+    // fixed value). Exposed so expand() can offer real caller control over
+    // how much headroom to restore, rather than reusing a fixed amount
+    // unconditionally.
+    //
+    // Fixed per-row adder changed from ULEB128's "+uleb128_max_bytes" (a
+    // few bytes, enough for one extra delta) to "+one whole worst-case
+    // group" (1 descriptor byte + G values at 4 bytes each) -- FOR's
+    // growth strategy (see delta_csr_row_rebuild below) re-encodes the
+    // WHOLE row on insert/remove, so the row needs enough slack to grow by
+    // a full group's worth in the worst case, not just one element.
+    const std::size_t group_worst_case_bytes = 1 + for_group_size_value(group_size) * 4;
     L.byte_start[0] = 0;
     L.elem_start[0] = 0;
     for (std::size_t r = 0; r < rows; ++r) {
         const std::size_t n = csr_ptrs[r + 1] - csr_ptrs[r];
-        L.byte_end[r]       = L.byte_start[r] + row_bytes[r];
-        const std::size_t byte_blank = static_cast<std::size_t>(row_bytes[r] * blank_fraction)
-                                       + uleb128_max_bytes<COL_TYPE>(); 
+        const std::size_t row_bytes = row_encoded[r].size();
+        L.byte_end[r]       = L.byte_start[r] + row_bytes;
+        const std::size_t byte_blank = static_cast<std::size_t>(row_bytes * blank_fraction)
+                                       + group_worst_case_bytes;
         L.byte_start[r + 1] = L.byte_end[r] + byte_blank;
-        
+
         L.elem_end[r]       = L.elem_start[r] + n;
         const std::size_t elem_blank = std::max(std::size_t(1),
                                                 static_cast<std::size_t>(n * blank_fraction) + 1);
@@ -103,14 +115,11 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     ValueAccessor<VALUES_TYPE>::reserve(dc.values, elem_headroom);
 
     for (std::size_t r = 0; r < rows; ++r) {
-        std::size_t bpos = L.byte_start[r];
-        COL_TYPE prev = 0;
+        if (!row_encoded[r].empty())
+            std::memcpy(dc.indices_buf.data() + L.byte_start[r], row_encoded[r].data(), row_encoded[r].size());
+
         std::size_t epos = L.elem_start[r];
         for (SIZE_TYPE i = csr_ptrs[r]; i < csr_ptrs[r + 1]; ++i) {
-            COL_TYPE col = static_cast<COL_TYPE>(csr_indices[i]);
-            bpos += uleb128_encode<COL_TYPE>(col - prev, dc.indices_buf.data() + bpos);
-            prev = col;
-            
             ValueAccessor<VALUES_TYPE>::set(dc.values, epos, csr_weights[i], csr_importance[i]);
             ++epos;
         }
@@ -260,6 +269,18 @@ COL_TYPE delta_csr_row_last_col(
     return cursor.col();
 }
 
+// Re-encode a row's WHOLE column list from scratch -- FOR's growth
+// strategy (see the "In-place insert/remove" section below) is
+// decode-whole-row -> modify -> rebuild, not ULEB128's old surgical
+// single-delta byte shift: a fixed-width GROUP means inserting/removing
+// one element can change every later group's byte length (unlike
+// ULEB128, where only the one delta straddling the edit point changes),
+// so there's no cheap partial-row edit for FOR the way there was for
+// ULEB128. Synaptogenesis is rare and touches few connections per step
+// (see conversation), so this O(row_nnz) cost per edit is an accepted
+// tradeoff for FOR's real decode-side speedup -- this function is what
+// the OLD ULEB128 delta_csr_row_insert_col/remove_col avoided needing,
+// and is now the primary growth path instead of a fallback.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 bool delta_csr_row_rebuild(
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
@@ -280,23 +301,21 @@ bool delta_csr_row_rebuild(
     // callers checking "did this actually grow") silently saw no change.
     const std::size_t old_row_nnz = L.row_nnz(row);
 
-    uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
-    std::size_t needed_bytes = 0;
+    std::vector<COL_TYPE> deltas(n);
     COL_TYPE prev = 0;
     for (std::size_t k = 0; k < n; ++k) {
-        needed_bytes += uleb128_encode<COL_TYPE>(cols[k] - prev, tmp);
+        deltas[k] = cols[k] - prev;
         prev = cols[k];
     }
-    if (needed_bytes > L.row_alloc_bytes(row)) return false;
-    if (n > L.row_alloc_elems(row))            return false;
+    std::vector<uint8_t> encoded;
+    for_encode_row_dispatch<COL_TYPE>(deltas.data(), n, encoded, L.group_size);
 
-    std::size_t bpos = L.byte_start[row];
-    prev = 0;
-    for (std::size_t k = 0; k < n; ++k) {
-        bpos += uleb128_encode<COL_TYPE>(cols[k] - prev, dc.indices_buf.data() + bpos);
-        prev = cols[k];
-    }
-    L.byte_end[row] = bpos;
+    if (encoded.size() > L.row_alloc_bytes(row)) return false;
+    if (n > L.row_alloc_elems(row))               return false;
+
+    if (!encoded.empty())
+        std::memcpy(dc.indices_buf.data() + L.byte_start[row], encoded.data(), encoded.size());
+    L.byte_end[row] = L.byte_start[row] + encoded.size();
 
     std::size_t epos = L.elem_start[row];
     for (std::size_t k = 0; k < n; ++k) {
@@ -310,34 +329,6 @@ bool delta_csr_row_rebuild(
     L.total_nnz = static_cast<std::size_t>(
         static_cast<std::ptrdiff_t>(L.total_nnz) + nnz_delta);
 
-    return true;
-}
-
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-bool delta_csr_row_append(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
-    COL_TYPE col, 
-    typename ValueAccessor<VALUES_TYPE>::value_type weight, 
-    typename ValueAccessor<VALUES_TYPE>::value_type imp)
-{
-    auto& L = dc.layout;
-    const COL_TYPE prev_col = delta_csr_row_last_col(dc, row);
-    assert(col >= prev_col && "delta_csr_row_append: column not in sorted order");
-
-    uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
-    const std::size_t nbytes = uleb128_encode<COL_TYPE>(col - prev_col, tmp);
-
-    if (nbytes > L.row_blank_bytes(row)) return false;
-    if (L.row_blank_elems(row) == 0)    return false;
-
-    std::memcpy(dc.indices_buf.data() + L.byte_end[row], tmp, nbytes);
-    L.byte_end[row] += nbytes;
-
-    const std::size_t epos = L.elem_end[row];
-    ValueAccessor<VALUES_TYPE>::set(dc.values, epos, weight, imp);
-    L.elem_end[row]++;
-
-    L.total_nnz++;
     return true;
 }
 
@@ -368,19 +359,19 @@ void delta_csr_row_remove(
 }
 
 
-// ── In-place insert/remove for delta-encoded rows ────────────────────────────
+// ── Insert/remove for delta-encoded rows ─────────────────────────────────────
 //
-// These replace the old "read all, rebuild from scratch" pattern in
-// delta_csr_synap_row_step. The key property: removing a connection shrinks
-// the row's byte count by (delta_A_bytes + delta_B_bytes - delta_AB_bytes),
-// which is at least 0 and usually positive. Inserting a connection expands by
-// delta_new_bytes + delta_updated_next_bytes - delta_old_next_bytes, which for
-// typical small-delta layers (column indices 0..n_out where n_out <= 16384) is
-// 1-2 bytes. Doing removals first then insertions means the freed bytes from
-// removals are immediately available for insertions -- synaptogenesis with
-// equal add/remove counts works with near-zero headroom.
+// ULEB128 used to support cheap in-place surgical edits here (shift only
+// the one delta straddling the edit point). That doesn't port to FOR's
+// fixed-width GROUPS: inserting/removing one element shifts every later
+// element's position within its group, which can change every later
+// group's byte length (tier included) -- there's no single-delta-sized
+// edit available. Both functions below go through delta_csr_row_rebuild
+// (decode whole row -> modify the column list -> re-encode whole row)
+// instead -- see that function's own comment for why this tradeoff is
+// accepted (synaptogenesis is rare and touches few connections per step).
 
-// Remove the connection at column `target_col` from row `row` in-place.
+// Remove the connection at column `target_col` from row `row`.
 // Returns false if target_col is not found (no-op).
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
@@ -389,67 +380,33 @@ bool delta_csr_row_remove_col(
     std::size_t row,
     COL_TYPE target_col)
 {
-    auto& L   = dc.layout;
-    auto& buf = dc.indices_buf;
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    auto& L = dc.layout;
     const std::size_t n = L.row_nnz(row);
     if (n == 0) return false;
 
-    std::size_t byte_pos  = L.byte_start[row];
-    std::size_t elem_pos  = L.elem_start[row];
-    COL_TYPE    prev_col  = 0;
-
-    for (std::size_t e = 0; e < n; ++e) {
-        std::size_t delta_len = 0;
-        const COL_TYPE delta  = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, delta_len);
-        const COL_TYPE col    = prev_col + delta;
-
-        if (col == target_col) {
-            const std::size_t next_byte_pos = byte_pos + delta_len;
-
-            if (e + 1 < n) {
-                // Merge this delta with the next one: next_col - prev_col
-                std::size_t next_delta_len = 0;
-                const COL_TYPE next_delta  =
-                    uleb128_decode<COL_TYPE>(buf.data() + next_byte_pos, next_delta_len);
-                const COL_TYPE merged_delta = delta + next_delta;
-
-                uint8_t merged_buf[uleb128_max_bytes<COL_TYPE>()];
-                const std::size_t merged_len = uleb128_encode<COL_TYPE>(merged_delta, merged_buf);
-
-                // Write merged delta at byte_pos
-                std::memcpy(buf.data() + byte_pos, merged_buf, merged_len);
-
-                // Shift the remainder of the row left to fill the freed gap
-                const std::size_t shift_from = next_byte_pos + next_delta_len;
-                const std::size_t shift_len  = L.byte_end[row] - shift_from;
-                const std::size_t freed      = delta_len + next_delta_len - merged_len;
-                if (shift_len > 0)
-                    std::memmove(buf.data() + byte_pos + merged_len,
-                                 buf.data() + shift_from, shift_len);
-                L.byte_end[row] -= freed;
-            } else {
-                // Last connection: just remove its delta bytes
-                L.byte_end[row] -= delta_len;
-            }
-
-            // Shift value elements left to fill the removed slot
-            const std::size_t row_end = L.elem_end[row];
-            if (elem_pos + 1 < row_end)
-                ValueAccessor<VALUES_TYPE>::move(dc.values,
-                    elem_pos, elem_pos + 1, row_end - elem_pos - 1);
-            L.elem_end[row]--;
-            L.total_nnz--;
-            return true;
+    std::vector<COL_TYPE>   cols(n);
+    std::vector<value_type> weights(n), importance(n);
+    {
+        auto cursor = dc.row_cursor(row);
+        for (std::size_t k = 0; k < n; ++k) {
+            cols[k]       = cursor.advance();
+            weights[k]    = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
+            importance[k] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[row] + k);
         }
-
-        prev_col  = col;
-        byte_pos += delta_len;
-        elem_pos++;
     }
-    return false; // not found
+
+    const auto it = std::find(cols.begin(), cols.end(), target_col);
+    if (it == cols.end()) return false; // not found
+    const std::size_t idx = static_cast<std::size_t>(it - cols.begin());
+    cols      .erase(cols.begin()       + static_cast<std::ptrdiff_t>(idx));
+    weights   .erase(weights.begin()    + static_cast<std::ptrdiff_t>(idx));
+    importance.erase(importance.begin() + static_cast<std::ptrdiff_t>(idx));
+
+    return delta_csr_row_rebuild(dc, row, cols, weights, importance);
 }
 
-// Insert a new connection at `new_col` in row `row` in sorted order, in-place.
+// Insert a new connection at `new_col` in row `row` in sorted order.
 // Returns true on success, false if the row has insufficient blank space.
 // On false: the row's blank space is exhausted. Call equalizer_step() to
 // redistribute space from adjacent rows, then retry. Callers must not
@@ -463,93 +420,42 @@ bool delta_csr_row_insert_col(
     typename ValueAccessor<VALUES_TYPE>::value_type weight,
     typename ValueAccessor<VALUES_TYPE>::value_type importance)
 {
-    auto& L   = dc.layout;
-    auto& buf = dc.indices_buf;
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    auto& L = dc.layout;
     const std::size_t n = L.row_nnz(row);
 
-    // Walk to find insertion point (first existing column > new_col)
-    std::size_t byte_pos      = L.byte_start[row];
-    std::size_t elem_pos      = L.elem_start[row];
-    COL_TYPE    prev_col      = 0;
-    std::size_t ins_byte_pos  = L.byte_end[row]; // default: append after last
-    std::size_t ins_elem_pos  = L.elem_end[row];
-    bool        has_next      = false;
-    COL_TYPE    next_col      = 0;
-    std::size_t next_dlen     = 0;
-
-    for (std::size_t e = 0; e < n; ++e) {
-        std::size_t dlen = 0;
-        const COL_TYPE delta = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, dlen);
-        const COL_TYPE col   = prev_col + delta;
-        if (col == new_col) return false; // duplicate, skip
-        if (col > new_col) {
-            ins_byte_pos = byte_pos;
-            ins_elem_pos = elem_pos;
-            has_next     = true;
-            next_col     = col;
-            next_dlen    = dlen;
-            break;
+    std::vector<COL_TYPE>   cols(n);
+    std::vector<value_type> weights(n), importances(n);
+    {
+        auto cursor = dc.row_cursor(row);
+        for (std::size_t k = 0; k < n; ++k) {
+            cols[k]        = cursor.advance();
+            weights[k]     = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
+            importances[k] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[row] + k);
         }
-        prev_col  = col;
-        byte_pos += dlen;
-        elem_pos++;
     }
 
-    // Bytes for the new delta and (if inserting before an existing) the updated
-    // next delta. Net byte change for the index buffer.
-    uint8_t new_d_buf[uleb128_max_bytes<COL_TYPE>()];
-    const std::size_t new_d_len = uleb128_encode<COL_TYPE>(new_col - prev_col, new_d_buf);
+    std::size_t ins = 0;
+    while (ins < n && cols[ins] < new_col) ++ins;
+    if (ins < n && cols[ins] == new_col) return false; // duplicate, skip
 
-    uint8_t upd_d_buf[uleb128_max_bytes<COL_TYPE>()];
-    std::size_t upd_d_len = 0;
-    if (has_next)
-        upd_d_len = uleb128_encode<COL_TYPE>(next_col - new_col, upd_d_buf);
+    cols       .insert(cols.begin()        + static_cast<std::ptrdiff_t>(ins), new_col);
+    weights    .insert(weights.begin()     + static_cast<std::ptrdiff_t>(ins), weight);
+    importances.insert(importances.begin() + static_cast<std::ptrdiff_t>(ins), importance);
 
-    const std::ptrdiff_t idx_delta =
-        static_cast<std::ptrdiff_t>(new_d_len + upd_d_len) -
-        static_cast<std::ptrdiff_t>(next_dlen);
-
-    // Check headroom (byte and element)
-    const std::size_t used_bytes = L.byte_end[row] - L.byte_start[row];
-    if (idx_delta > 0 &&
-        static_cast<std::size_t>(idx_delta) > L.row_alloc_bytes(row) - used_bytes)
-        return false; // not enough index byte headroom
-    if (L.row_nnz(row) >= L.row_alloc_elems(row))
-        return false; // not enough element headroom
-
-    // Shift index bytes to make room (or shrink if idx_delta < 0)
-    if (idx_delta != 0) {
-        const std::size_t shift_from = ins_byte_pos;
-        const std::size_t shift_len  = L.byte_end[row] - shift_from;
-        if (shift_len > 0)
-            std::memmove(buf.data() + shift_from + idx_delta,
-                         buf.data() + shift_from, shift_len);
-        L.byte_end[row] = static_cast<std::size_t>(
-            static_cast<std::ptrdiff_t>(L.byte_end[row]) + idx_delta);
-    }
-
-    // Write new delta and (if applicable) the updated next delta
-    std::memcpy(buf.data() + ins_byte_pos, new_d_buf, new_d_len);
-    if (has_next)
-        std::memcpy(buf.data() + ins_byte_pos + new_d_len, upd_d_buf, upd_d_len);
-
-    // Shift value elements right and write the new one
-    if (ins_elem_pos < L.elem_end[row])
-        ValueAccessor<VALUES_TYPE>::move(dc.values,
-            ins_elem_pos + 1, ins_elem_pos, L.elem_end[row] - ins_elem_pos);
-    ValueAccessor<VALUES_TYPE>::set(dc.values, ins_elem_pos, weight, importance);
-    L.elem_end[row]++;
-    L.total_nnz++;
-    return true;
+    return delta_csr_row_rebuild(dc, row, cols, weights, importances);
 }
 
 // ── Incremental synaptogenesis step ──────────────────────────────────────────
 //
-// Replaces the old "read all, merge, rebuild from scratch" approach with
-// in-place per-connection insert and remove. This eliminates the need to
-// pre-allocate uleb128_max (5) bytes per potential connection: for typical
-// layers (n_out <= 16384), deltas encode in 1-2 bytes, so the blank space per
-// row only needs to cover the NET GROWTH per step (additions - removals).
+// Each add/remove goes through delta_csr_row_insert_col/remove_col, which
+// (for FOR-encoded rows, see that function's own comment) decode-modify-
+// rebuild the whole row rather than a cheap in-place byte shift -- rare
+// per-step connection counts (see conversation) make this an accepted
+// tradeoff. Removes always shrink the row (freed bytes immediately
+// available for the adds that follow in the same step, same row); inserts
+// need the row's blank-space headroom to cover the row's real worst-case
+// re-encoded size (see delta_csr_from_absolute's group_worst_case_bytes).
 //
 // Algorithm per row:
 //   1. Walk row once: collect (col, weight, importance) for all connections.
