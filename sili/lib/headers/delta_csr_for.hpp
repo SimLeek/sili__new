@@ -2,14 +2,15 @@
 #define __DELTA_CSR_FOR_HPP_
 
 // Frame-of-reference (FOR) delta encoding for DeltaCSRWeights column
-// indices -- an alternative to delta_csr_types.hpp's sequential ULEB128
-// encoding (DeltaCSRRowCursor), decode-focused for now (see SCOPE below).
+// indices -- full replacement for the old sequential ULEB128 encoding
+// (uleb128_encode/uleb128_decode, removed from delta_csr_types.hpp;
+// DeltaCSRRowCursor now decodes FOR internally, see that file).
 //
-// ULEB128 encodes each column index as a delta from the PREVIOUS index,
-// so reconstructing absolute values requires a running cumulative sum --
-// a genuinely sequential dependency chain (confirmed via
-// `-fopt-info-vec-missed` that this specific loop cannot auto-vectorize).
-// Seven SIMD strategies were tried against that encoding; six converged
+// The old ULEB128 format encoded each column index as a delta from the
+// PREVIOUS index, so reconstructing absolute values required a running
+// cumulative sum -- a genuinely sequential dependency chain (confirmed
+// via `-fopt-info-vec-missed` that this specific loop could not
+// auto-vectorize). Seven SIMD strategies were tried against that encoding; six converged
 // on the same ~1.6-2.5x ceiling because every one of them was still
 // fighting that same dependency, just with progressively cleverer SIMD
 // around it (see sili_peridot's JOURNAL.md for the full trail). This
@@ -26,7 +27,7 @@
 // whole separate pass for costs nothing extra here.
 //
 // Real, correctness-verified benchmark: 4-12x (mostly 5-7x at G=32/64)
-// vs. the current ULEB128 decode, at real per-row nnz scale -- see
+// vs. the old ULEB128 decode, at real per-row nnz scale -- see
 // prototypes/for_delta_encoding/ for the standalone reference this was
 // validated with before landing here, including the size-overhead
 // tradeoff table across G (bigger groups amortize the per-group tier
@@ -43,16 +44,15 @@
 // choice over a curated set of pre-compiled instantiations, for callers
 // that pick G per-tensor at model-build time rather than per-compile.
 //
-// SCOPE (read before using): this covers ENCODE-once/DECODE-many,
-// matching a batched forward pass over an already-built row. It does
-// NOT YET address synaptogenesis-driven row GROWTH (inserting a new
-// synapse mid-row, which may force re-encoding a whole group at a wider
-// tier or shifting later groups) -- delta_csr_memory.hpp's row-rebuild/
-// insert/remove machinery is untouched, and DeltaCSRRowCursor/
-// uleb128_encode/uleb128_decode remain exactly as they were. Wiring
-// this into the live, growable weight storage
-// (disldo_forward/delta_csr_forward's hot paths) is a separate,
-// not-yet-done follow-up.
+// GROWTH: inserting/removing a synapse mid-row can force re-encoding a
+// whole group at a wider tier, or shifting later groups -- there's no
+// cheap single-value surgical edit the way ULEB128 had. Per project
+// decision (synaptogenesis is rare and touches few connections per
+// step), delta_csr_memory.hpp's row_insert_col/row_remove_col/
+// row_rebuild all go through decode-whole-row -> modify -> re-encode-
+// whole-row instead of a partial edit -- see those functions' own
+// comments. This file only provides the encode/decode primitives; the
+// growth-aware callers live in delta_csr_memory.hpp.
 
 #include <immintrin.h>
 #include <algorithm>
@@ -136,36 +136,58 @@ inline __m256i widen_tier(const uint8_t* p, ForWidthTier tier, std::size_t chunk
 
 } // namespace for_detail
 
-/// Decode an entire row (n values) from FOR-encoded bytes at buf into
-/// out_cols (caller-allocated, >= n entries). Bulk API -- fills the
-/// whole row in one call, not a per-element cursor like
-/// DeltaCSRRowCursor::advance() -- matches how callers actually consume
-/// a row (linear_disldo.hpp/delta_csr_ops.hpp loop over every element
-/// regardless), and is what makes the zero-prefix-sum decode possible:
-/// each 8-wide chunk is one widen + one broadcast-add, no per-element
-/// work at all, no dependency between chunks within a group.
+/// Decode exactly ONE group starting at buf+pos. `remaining_in_row` is
+/// how many elements are still left in the row (including this group) --
+/// used only to know how many of this group's G decoded slots are real
+/// vs. padding, never to skip bytes (the byte layout is always G-wide
+/// regardless). `carry` is the running absolute value -- read as this
+/// group's group_start on entry, written as the group's last real value
+/// (its own new group_start for whatever group comes next) on exit. This
+/// is the shared core both for_decode_row (bulk, all groups) and
+/// DeltaCSRRowCursor (lazy, one group at a time, cached between
+/// individual advance() calls) build on -- one source of truth for the
+/// actual widen+broadcast-add decode step.
+///
+/// Returns the byte position just past this group. `out_group` must have
+/// room for G entries; only the first returned `out_g` are real values
+/// (the rest are the row's own harmless encode-time padding).
 template <std::size_t G, typename COL_TYPE = uint32_t>
-inline void for_decode_row(const uint8_t* buf, std::size_t n, COL_TYPE* out_cols) {
+inline std::size_t for_decode_one_group(const uint8_t* buf, std::size_t pos,
+                                        std::size_t remaining_in_row, uint32_t& carry,
+                                        COL_TYPE* out_group, std::size_t& out_g) {
     static_assert(G % 8 == 0, "group size must be a multiple of 8 (AVX2 lane width)");
     constexpr std::size_t chunks_per_group = G / 8;
+    const ForWidthTier tier = static_cast<ForWidthTier>(buf[pos++]);
+    const int width = for_tier_width(tier);
+    const __m256i v_carry = _mm256_set1_epi32(static_cast<int>(carry));
+    alignas(32) uint32_t group_out[G];
+    for (std::size_t c = 0; c < chunks_per_group; ++c) {
+        const __m256i offsets = for_detail::widen_tier(buf + pos, tier, c);
+        const __m256i result  = _mm256_add_epi32(offsets, v_carry);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(group_out + c * 8), result);
+    }
+    pos += G * width;
+    carry = group_out[G - 1];
+
+    out_g = std::min(G, remaining_in_row);
+    for (std::size_t k = 0; k < out_g; ++k) out_group[k] = static_cast<COL_TYPE>(group_out[k]);
+    return pos;
+}
+
+/// Decode an entire row (n values) from FOR-encoded bytes at buf into
+/// out_cols (caller-allocated, >= n entries). Bulk API -- fills the
+/// whole row in one call; DeltaCSRRowCursor below is the per-element-
+/// interface equivalent (built on the same for_decode_one_group), for
+/// callers that need the old advance()/col() shape rather than a
+/// pre-filled buffer.
+template <std::size_t G, typename COL_TYPE = uint32_t>
+inline void for_decode_row(const uint8_t* buf, std::size_t n, COL_TYPE* out_cols) {
     std::size_t pos = 0;
     std::size_t written = 0;
     uint32_t carry = 0;
     while (written < n) {
-        const ForWidthTier tier = static_cast<ForWidthTier>(buf[pos++]);
-        const int width = for_tier_width(tier);
-        const __m256i v_carry = _mm256_set1_epi32(static_cast<int>(carry));
-        alignas(32) uint32_t group_out[G];
-        for (std::size_t c = 0; c < chunks_per_group; ++c) {
-            const __m256i offsets = for_detail::widen_tier(buf + pos, tier, c);
-            const __m256i result  = _mm256_add_epi32(offsets, v_carry);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(group_out + c * 8), result);
-        }
-        pos += G * width;
-        carry = group_out[G - 1];
-
-        const std::size_t g = std::min(G, n - written);
-        for (std::size_t k = 0; k < g; ++k) out_cols[written + k] = static_cast<COL_TYPE>(group_out[k]);
+        std::size_t g = 0;
+        pos = for_decode_one_group<G, COL_TYPE>(buf, pos, n - written, carry, out_cols + written, g);
         written += g;
     }
 }
@@ -199,5 +221,46 @@ inline void for_decode_row_dispatch(const uint8_t* buf, std::size_t n, COL_TYPE*
         case ForGroupSize::G64: for_decode_row<64, COL_TYPE>(buf, n, out_cols); return;
     }
 }
+
+/// Same runtime dispatch, one group at a time -- what DeltaCSRRowCursor
+/// uses for its lazy, cached-between-advance()-calls decode. Max group
+/// size is 64 (ForGroupSize's largest option), so out_group must have
+/// room for at least 64 entries regardless of which g is passed.
+template <typename COL_TYPE = uint32_t>
+inline std::size_t for_decode_one_group_dispatch(const uint8_t* buf, std::size_t pos,
+                                                  std::size_t remaining_in_row, uint32_t& carry,
+                                                  COL_TYPE* out_group, std::size_t& out_g,
+                                                  ForGroupSize g) {
+    switch (g) {
+        case ForGroupSize::G8:
+            return for_decode_one_group<8,  COL_TYPE>(buf, pos, remaining_in_row, carry, out_group, out_g);
+        case ForGroupSize::G16:
+            return for_decode_one_group<16, COL_TYPE>(buf, pos, remaining_in_row, carry, out_group, out_g);
+        case ForGroupSize::G32:
+            return for_decode_one_group<32, COL_TYPE>(buf, pos, remaining_in_row, carry, out_group, out_g);
+        default:
+            return for_decode_one_group<64, COL_TYPE>(buf, pos, remaining_in_row, carry, out_group, out_g);
+    }
+}
+
+inline constexpr std::size_t for_group_size_value(ForGroupSize g) {
+    return static_cast<std::size_t>(g);
+}
+
+/// Largest group size ForGroupSize can select -- callers sizing a fixed
+/// buffer to hold one decoded group (e.g. DeltaCSRRowCursor's cache)
+/// need this regardless of which specific g is chosen at runtime.
+constexpr std::size_t kForMaxGroupSize = 64;
+
+/// Rough worst-case bytes-per-value, for callers doing an initial
+/// pre-allocation size estimate before the real encoded size is known
+/// (e.g. delta_csr_ops.hpp's expand_headroom/expand_headroom_to) --
+/// analogous to uleb128_max_bytes<COL_TYPE>()'s role for the old
+/// encoding. Widest tier (4 bytes) plus one byte to conservatively cover
+/// the per-group descriptor's amortized cost even at the smallest group
+/// size (worst case for amortization). A real over-estimate is fine here
+/// -- delta_csr_from_absolute computes and uses the EXACT encoded size
+/// once it actually runs; this only sizes the initial reserve.
+constexpr std::size_t for_max_bytes_per_value() { return 5; }
 
 #endif

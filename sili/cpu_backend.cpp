@@ -441,11 +441,13 @@ public:
     // Grow each row until it has at least target_elems_per_row elements and
     // target_bytes_per_row index bytes of reserved space.
     //
-    // target_bytes_per_row = 0 (default): derive as target_elems * uleb128_max
-    // (worst-case encoding; safe for any column range but wastes memory for
-    // models where column deltas are typically small). Pass an explicit byte
-    // count when you know the typical encoding -- e.g. 100 connections at
-    // 2 bytes each = 204 bytes, vs the default 100*5+4 = 504 bytes.
+    // target_bytes_per_row = 0 (default): derive as target_elems *
+    // for_max_bytes_per_value (worst-case FOR tier; safe for any column
+    // range but wastes memory for models where column deltas are
+    // typically small, since real data mostly stays in FOR's cheapest
+    // 1-byte tier). Pass an explicit byte count when you know the typical
+    // encoding -- e.g. 100 connections at 1 byte each plus per-group
+    // descriptor overhead is well under the default 100*5+4 = 504 bytes.
     //
     // This is a ONE-TIME CONSTRUCTION CALL. Call it from from_descriptor with
     // the max_row_weights and bytes_per_row for this specific layer. After
@@ -459,7 +461,7 @@ public:
         const std::size_t tgt_e = static_cast<std::size_t>(target_elems_per_row);
         const std::size_t tgt_b = (target_bytes_per_row > 0)
             ? static_cast<std::size_t>(target_bytes_per_row)
-            : tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
+            : tgt_e * for_max_bytes_per_value() + 4;
         auto& dc  = weights.connections;
         const std::size_t rows = dc.layout.rows;
 
