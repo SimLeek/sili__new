@@ -195,6 +195,61 @@ class TestSparseBandedAttentionAutograd:
         np.testing.assert_allclose(v.grad, numeric, atol=2e-2, rtol=2e-2)
 
 
+class TestCausalAttentionAutograd:
+    """causal=True threads through both the forward call and the backward
+    closure in sili.tensor's wrappers -- gradient-check that path too, not
+    just the non-causal default already covered above."""
+
+    def test_banded_attention_causal_dQ_matches_finite_difference(self):
+        T, d = 7, 5   # T == K required for causal self-attention
+        q_np, k_np, v_np = _random_qkv(T, T, d, seed=30)
+        half_bw = 3
+
+        def loss_fn(q_np_, k_np_, v_np_):
+            def fn():
+                q = Tensor(q_np_.copy()); k = Tensor(k_np_.copy()); v = Tensor(v_np_.copy())
+                out = banded_attention(q, k, v, half_bandwidth=half_bw, causal=True)
+                return float(_scalar_loss(out).data)
+            return fn
+
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        out = banded_attention(q, k, v, half_bandwidth=half_bw, causal=True)
+        _scalar_loss(out).backward()
+
+        numeric = _numeric_grad(loss_fn(q.data, k_np, v_np), q.data)
+        np.testing.assert_allclose(q.grad, numeric, atol=2e-2, rtol=2e-2)
+
+    def test_sparse_attention_causal_dQ_matches_finite_difference(self):
+        T, d = 6, 5
+        q_np, k_np, v_np = _random_qkv(T, T, d, seed=31)
+        top_k = 4
+
+        def loss_fn(q_np_, k_np_, v_np_):
+            def fn():
+                q = Tensor(q_np_.copy()); k = Tensor(k_np_.copy()); v = Tensor(v_np_.copy())
+                out = sparse_attention(q, k, v, top_k=top_k, causal=True)
+                return float(_scalar_loss(out).data)
+            return fn
+
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        out = sparse_attention(q, k, v, top_k=top_k, causal=True)
+        _scalar_loss(out).backward()
+
+        numeric = _numeric_grad(loss_fn(q.data, k_np, v_np), q.data)
+        np.testing.assert_allclose(q.grad, numeric, atol=2e-2, rtol=2e-2)
+
+    def test_causal_output_differs_from_noncausal(self):
+        # Sanity check that causal=True actually changes behavior on data
+        # where it should (a query early in the sequence has fewer valid
+        # keys under causal masking than under full/banded attention).
+        T, d = 6, 5
+        q_np, k_np, v_np = _random_qkv(T, T, d, seed=32)
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        out_causal    = banded_attention(q, k, v, half_bandwidth=T, causal=True)
+        out_noncausal = banded_attention(q, k, v, half_bandwidth=T, causal=False)
+        assert not np.allclose(out_causal.data[0], out_noncausal.data[0])
+
+
 class TestAttentionAutogradGraphIntegration:
     """Confirm attention composes with the rest of the Tensor autograd graph
     (not just standalone) -- e.g. Q/K/V each coming from an upstream op."""

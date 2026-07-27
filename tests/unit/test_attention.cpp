@@ -306,3 +306,183 @@ TEST_CASE("sparse_banded_attention_backward: inner_k=0 backward matches banded_a
         CHECK(dV_b[i] == Catch::Approx(dV_s[i]).margin(1e-4f));
     }
 }
+
+// ── Causal masking ──────────────────────────────────────────────────────────
+//
+// None of the three variants mask the future by default -- band/top-k
+// selection is purely geometric/L2-norm-driven and can pick keys on either
+// side of a query. causal=true restricts each query to keys at or before
+// its own sequence position (self-attention only, T == K).
+
+static std::vector<float> naive_causal_attention(
+    const std::vector<float>& Q,
+    const std::vector<float>& K,
+    const std::vector<float>& V,
+    std::size_t T, std::size_t d)
+{
+    const float scale = 1.0f / std::sqrt(float(d));
+    std::vector<float> out(T * d, 0.0f);
+    for (std::size_t q = 0; q < T; ++q) {
+        std::vector<float> s(q + 1);
+        float max_s = -1e38f;
+        for (std::size_t k = 0; k <= q; ++k) {
+            float dot = 0.0f;
+            for (std::size_t i = 0; i < d; ++i) dot += Q[q*d+i] * K[k*d+i];
+            s[k] = dot * scale;
+            if (s[k] > max_s) max_s = s[k];
+        }
+        float sum_e = 0.0f;
+        for (float& v : s) { v = std::exp(v - max_s); sum_e += v; }
+        for (float& v : s) v /= sum_e;
+        for (std::size_t k = 0; k <= q; ++k)
+            for (std::size_t i = 0; i < d; ++i)
+                out[q*d+i] += s[k] * V[k*d+i];
+    }
+    return out;
+}
+
+TEST_CASE("banded_attention: causal with a full-width band matches naive causal attention",
+         "[attention][forward][causal]") {
+    const std::size_t T = 6, d = 8;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    std::vector<float> out(T*d, 0.0f);
+    banded_attention_forward(Q.data(), K.data(), V.data(), out.data(), T, T, d, T, 1, true);
+    auto ref = naive_causal_attention(Q, K, V, T, d);
+
+    for (std::size_t i = 0; i < T*d; ++i)
+        CHECK(out[i] == Catch::Approx(ref[i]).margin(1e-4f));
+}
+
+TEST_CASE("banded_attention: causal output at t does not depend on keys/values after t",
+         "[attention][forward][causal][regression]") {
+    // Direct leakage check, independent of the naive-reference comparison
+    // above: perturbing K/V at a future position must not change an
+    // earlier query's output at all.
+    const std::size_t T = 6, d = 8;
+    std::mt19937 rng(19);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    const std::size_t t = 2;   // query position under test
+    std::vector<float> out_before(T*d, 0.0f);
+    banded_attention_forward(Q.data(), K.data(), V.data(), out_before.data(), T, T, d, T, 1, true);
+
+    auto K2 = K, V2 = V;
+    for (std::size_t k = t + 1; k < T; ++k)
+        for (std::size_t i = 0; i < d; ++i) { K2[k*d+i] += 5.0f; V2[k*d+i] += 5.0f; }
+
+    std::vector<float> out_after(T*d, 0.0f);
+    banded_attention_forward(Q.data(), K2.data(), V2.data(), out_after.data(), T, T, d, T, 1, true);
+
+    for (std::size_t i = 0; i < d; ++i)
+        CHECK(out_before[t*d+i] == Catch::Approx(out_after[t*d+i]).margin(1e-5f));
+}
+
+TEST_CASE("sparse_banded_attention: causal inner_k=0 matches banded_attention causal",
+         "[attention][forward][causal]") {
+    const std::size_t T = 8, d = 12;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    std::vector<float> out_banded(T*d, 0.0f), out_sparse(T*d, 0.0f);
+    banded_attention_forward(Q.data(), K.data(), V.data(), out_banded.data(), T, T, d, 3, 1, true);
+    sparse_banded_attention_forward(Q.data(), K.data(), V.data(), out_sparse.data(), T, T, d, 3, 0, 1, true);
+
+    for (std::size_t i = 0; i < T*d; ++i)
+        CHECK(out_banded[i] == Catch::Approx(out_sparse[i]).margin(1e-5f));
+}
+
+TEST_CASE("sparse_attention: causal full top-k (k=T) matches naive causal attention",
+         "[attention][forward][causal]") {
+    const std::size_t T = 6, d = 8;
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    std::vector<float> out(T*d, 0.0f);
+    sparse_attention_forward(Q.data(), K.data(), V.data(), out.data(), T, d, T, 1, true);
+    auto ref = naive_causal_attention(Q, K, V, T, d);
+
+    for (std::size_t i = 0; i < T*d; ++i)
+        CHECK(out[i] == Catch::Approx(ref[i]).margin(1e-4f));
+}
+
+TEST_CASE("sparse_attention: causal output at t does not depend on keys/values after t",
+         "[attention][forward][causal][regression]") {
+    // sparse_attention selects queries/keys globally by L2 norm, so a
+    // "selected" key can land on either side of any given query -- this is
+    // the case most likely to leak the future if causal masking is wrong.
+    const std::size_t T = 6, d = 8;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    const std::size_t t = 1;
+    std::vector<float> out_before(T*d, 0.0f);
+    sparse_attention_forward(Q.data(), K.data(), V.data(), out_before.data(), T, d, T, 1, true);
+
+    auto K2 = K, V2 = V;
+    for (std::size_t k = t + 1; k < T; ++k)
+        for (std::size_t i = 0; i < d; ++i) { K2[k*d+i] += 5.0f; V2[k*d+i] += 5.0f; }
+
+    std::vector<float> out_after(T*d, 0.0f);
+    sparse_attention_forward(Q.data(), K2.data(), V2.data(), out_after.data(), T, d, T, 1, true);
+
+    for (std::size_t i = 0; i < d; ++i)
+        CHECK(out_before[t*d+i] == Catch::Approx(out_after[t*d+i]).margin(1e-5f));
+}
+
+TEST_CASE("banded_attention_backward: causal gradients match finite differences",
+         "[attention][backward][causal]") {
+    const std::size_t T = 6, d = 6;
+    std::mt19937 rng(31);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d), dO(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    for (auto& v : dO) v = dist(rng);
+
+    std::vector<float> dQ(T*d,0), dK(T*d,0), dV(T*d,0);
+    banded_attention_backward(Q.data(), K.data(), V.data(), dO.data(),
+                              dQ.data(), dK.data(), dV.data(), T, T, d, T, 1, true);
+
+    float max_err = 0.0f;
+    const float eps = 1e-3f;
+    auto fwd = [&](const std::vector<float>& Qp, const std::vector<float>& Kp,
+                  const std::vector<float>& Vp) {
+        std::vector<float> o(T*d, 0.0f);
+        banded_attention_forward(Qp.data(), Kp.data(), Vp.data(), o.data(), T, T, d, T, 1, true);
+        return o;
+    };
+    for (std::size_t r = 0; r < T; r += 2) {
+        for (std::size_t i = 0; i < d; i += 2) {
+            auto Qp = Q, Qm = Q; Qp[r*d+i] += eps; Qm[r*d+i] -= eps;
+            auto op = fwd(Qp, K, V), om = fwd(Qm, K, V);
+            float num = 0.0f;
+            for (std::size_t j = 0; j < T*d; ++j) num += (op[j]-om[j]) * dO[j];
+            num /= 2.0f*eps;
+            max_err = std::max(max_err, std::abs(num - dQ[r*d+i]));
+        }
+    }
+    CHECK(max_err < 1e-2f);
+}

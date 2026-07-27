@@ -1319,7 +1319,7 @@ PYBIND11_MODULE(_cpu, m)
 
     m.def("sparse_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           std::size_t top_k, int num_cpus) {
+           std::size_t top_k, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request();
             const std::size_t T = qb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
@@ -1327,17 +1327,19 @@ PYBIND11_MODULE(_cpu, m)
             std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
             sparse_attention_forward(
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, d, top_k, num_cpus);
+                (float*)ob.ptr, T, d, top_k, num_cpus, causal);
             return out;
         },
         py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("top_k") = 0, py::arg("num_cpus") = 4,
+        py::arg("top_k") = 0, py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Global top-k sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
-        "top_k=0 -> use sqrt(T). Returns [T, d] output.");
+        "top_k=0 -> use sqrt(T). causal=True masks any selected (query, key)\n"
+        "pair where the key's sequence position is after the query's.\n"
+        "Returns [T, d] output.");
 
     m.def("sparse_banded_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus) {
+           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
@@ -1345,17 +1347,20 @@ PYBIND11_MODULE(_cpu, m)
             std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
             sparse_banded_attention_forward(
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, K, d, half_bandwidth, inner_k, num_cpus);
+                (float*)ob.ptr, T, K, d, half_bandwidth, inner_k, num_cpus, causal);
             return out;
         },
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
+        py::arg("causal") = false,
         "Banded sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
-        "inner_k=0 -> use all keys in the band (dense banded). Returns [T, d] output.");
+        "inner_k=0 -> use all keys in the band (dense banded). causal=True\n"
+        "requires T == K and clamps each query's band so it never selects a\n"
+        "key past its own position. Returns [T, d] output.");
 
     m.def("banded_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           std::size_t half_bandwidth, int num_cpus) {
+           std::size_t half_bandwidth, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
@@ -1363,18 +1368,20 @@ PYBIND11_MODULE(_cpu, m)
             std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
             banded_attention_forward(
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, K, d, half_bandwidth, num_cpus);
+                (float*)ob.ptr, T, K, d, half_bandwidth, num_cpus, causal);
             return out;
         },
         py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("half_bandwidth"), py::arg("num_cpus") = 4,
+        py::arg("half_bandwidth"), py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Dense banded attention. Q/K/V are [T, d] float32 numpy arrays.\n"
+        "causal=True requires T == K and clamps each query's band so it\n"
+        "never sees a key past its own position (autoregressive self-attn).\n"
         "Returns [T, d] output.");
 
     m.def("banded_attention_backward",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            py::array_t<float> dO,
-           std::size_t half_bandwidth, int num_cpus) {
+           std::size_t half_bandwidth, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
@@ -1388,17 +1395,18 @@ PYBIND11_MODULE(_cpu, m)
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
                 (const float*)dob.ptr,
                 (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, K, d, half_bandwidth, num_cpus);
+                T, K, d, half_bandwidth, num_cpus, causal);
             return py::make_tuple(dQ, dK, dV);
         },
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("half_bandwidth"), py::arg("num_cpus") = 4,
-        "Backward pass for banded_attention. Returns (dQ, dK, dV) each [T or K, d].");
+        py::arg("half_bandwidth"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        "Backward pass for banded_attention. causal must match the forward\n"
+        "call. Returns (dQ, dK, dV) each [T or K, d].");
 
     m.def("sparse_banded_attention_backward",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            py::array_t<float> dO,
-           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus) {
+           std::size_t half_bandwidth, std::size_t inner_k, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
@@ -1412,17 +1420,19 @@ PYBIND11_MODULE(_cpu, m)
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
                 (const float*)dob.ptr,
                 (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, K, d, half_bandwidth, inner_k, num_cpus);
+                T, K, d, half_bandwidth, inner_k, num_cpus, causal);
             return py::make_tuple(dQ, dK, dV);
         },
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
         py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
-        "Backward pass for sparse_banded_attention. Returns (dQ, dK, dV).");
+        py::arg("causal") = false,
+        "Backward pass for sparse_banded_attention. causal must match the\n"
+        "forward call. Returns (dQ, dK, dV).");
 
     m.def("sparse_attention_backward",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            py::array_t<float> dO,
-           std::size_t top_k, int num_cpus) {
+           std::size_t top_k, int num_cpus, bool causal) {
             auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
             const std::size_t T = qb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
@@ -1436,12 +1446,13 @@ PYBIND11_MODULE(_cpu, m)
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
                 (const float*)dob.ptr,
                 (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, d, top_k, num_cpus);
+                T, d, top_k, num_cpus, causal);
             return py::make_tuple(dQ, dK, dV);
         },
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("top_k") = 0, py::arg("num_cpus") = 4,
-        "Backward pass for sparse_attention. Returns (dQ, dK, dV).");
+        py::arg("top_k") = 0, py::arg("num_cpus") = 4, py::arg("causal") = false,
+        "Backward pass for sparse_attention. causal must match the forward\n"
+        "call. Returns (dQ, dK, dV).");
 
     // ── Loss functions ────────────────────────────────────────────────────────
 

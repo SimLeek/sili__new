@@ -45,7 +45,9 @@ inline void banded_attention_forward(
     std::size_t  K,       ///< Number of key positions (may differ from T for cross-attn)
     std::size_t  d,
     std::size_t  half_bandwidth,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< requires T == K (self-attention); clamps
+                                    ///< the band so query t never sees key > t.
 {
     if (T == 0 || K == 0 || d == 0) return;
     const float scale = 1.0f / std::sqrt(float(d));
@@ -63,7 +65,8 @@ inline void banded_attention_forward(
 
         const std::size_t ck = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
-        const std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        if (causal) k_hi = std::min(k_hi, t);
 
         // Compute scores for the band.
         const std::size_t band_w = k_hi - k_lo + 1;
@@ -126,7 +129,9 @@ inline void sparse_banded_attention_forward(
     std::size_t  d,
     std::size_t  half_bandwidth,
     std::size_t  inner_k = 0,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< requires T == K; clamps the band so
+                                    ///< query t never selects a key > t.
 {
     if (T == 0 || K == 0 || d == 0) return;
     const float scale = 1.0f / std::sqrt(float(d));
@@ -143,7 +148,8 @@ inline void sparse_banded_attention_forward(
 
         const std::size_t ck   = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
-        const std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        if (causal) k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
 
         // inner_k=0 → use full band (dense banded).
@@ -232,7 +238,10 @@ inline void sparse_attention_forward(
     std::size_t  T,       ///< Sequence length
     std::size_t  d,       ///< Head dimension
     std::size_t  k,       ///< Top-k budget (0 = use √T, minimum 1)
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< mask out (qi,ki) pairs where the
+                                    ///< selected key position exceeds the
+                                    ///< selected query position.
 {
     if (T == 0 || d == 0) return;
 
@@ -284,15 +293,26 @@ inline void sparse_attention_forward(
 
     // ── Sparse softmax row by row ─────────────────────────────────────────────
     // Non-selected (i,j) pairs are -∞ → weight 0. Only the kk selected
-    // keys exist in each row of the sparse score matrix.
-    // We normalise only over the kk selected keys (denominator = their sum).
+    // keys exist in each row of the sparse score matrix. causal additionally
+    // masks any selected (qi,ki) pair whose key position is in the future of
+    // its query position -- global top-k selects by L2 norm alone, so a
+    // "selected" key can land on either side of a given query.
+    // We normalise only over the surviving keys (denominator = their sum).
     std::vector<float> weights(kk * kk);
     for (std::size_t qi = 0; qi < kk; ++qi) {
-        float row_max = *std::max_element(scores.data() + qi * kk,
-                                          scores.data() + qi * kk + kk);
+        std::vector<bool> valid(kk, true);
+        if (causal)
+            for (std::size_t ki = 0; ki < kk; ++ki)
+                valid[ki] = k_idx[ki] <= q_idx[qi];
+
+        float row_max = -1e38f;
+        for (std::size_t ki = 0; ki < kk; ++ki)
+            if (valid[ki]) row_max = std::max(row_max, scores[qi * kk + ki]);
+
         float row_sum = 0.0f;
         for (std::size_t ki = 0; ki < kk; ++ki) {
-            weights[qi * kk + ki] = std::exp(scores[qi * kk + ki] - row_max);
+            weights[qi * kk + ki] = valid[ki]
+                ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
             row_sum += weights[qi * kk + ki];
         }
         const float inv_sum = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
@@ -343,7 +363,8 @@ inline void banded_attention_backward(
     std::size_t  K,
     std::size_t  d,
     std::size_t  half_bandwidth,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< must match the forward call's causal flag.
 {
     if (T == 0 || K == 0 || d == 0) return;
     const float scale = 1.0f / std::sqrt(float(d));
@@ -366,7 +387,8 @@ inline void banded_attention_backward(
 
         const std::size_t ck   = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
-        const std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        if (causal) k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
 
         // Recompute softmax weights for this query's band.
@@ -437,7 +459,8 @@ inline void sparse_banded_attention_backward(
     std::size_t  d,
     std::size_t  half_bandwidth,
     std::size_t  inner_k = 0,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< must match the forward call's causal flag.
 {
     if (T == 0 || K == 0 || d == 0) return;
     const float scale = 1.0f / std::sqrt(float(d));
@@ -455,7 +478,8 @@ inline void sparse_banded_attention_backward(
 
         const std::size_t ck   = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
-        const std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
+        if (causal) k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
         const std::size_t kk = (inner_k == 0 || inner_k >= band_w) ? band_w : inner_k;
 
@@ -532,7 +556,8 @@ inline void sparse_attention_backward(
     std::size_t  T,
     std::size_t  d,
     std::size_t  k,
-    int          num_cpus = 4)
+    int          num_cpus = 4,
+    bool         causal = false)   ///< must match the forward call's causal flag.
 {
     if (T == 0 || d == 0) return;
 
@@ -573,10 +598,19 @@ inline void sparse_attention_backward(
             }
         }
         for (std::size_t qi = 0; qi < kk; ++qi) {
-            float row_max = *std::max_element(scores.data() + qi*kk, scores.data() + qi*kk + kk);
+            std::vector<bool> valid(kk, true);
+            if (causal)
+                for (std::size_t ki = 0; ki < kk; ++ki)
+                    valid[ki] = k_idx[ki] <= q_idx[qi];
+
+            float row_max = -1e38f;
+            for (std::size_t ki = 0; ki < kk; ++ki)
+                if (valid[ki]) row_max = std::max(row_max, scores[qi * kk + ki]);
+
             float row_sum = 0.0f;
             for (std::size_t ki = 0; ki < kk; ++ki) {
-                weights[qi * kk + ki] = std::exp(scores[qi * kk + ki] - row_max);
+                weights[qi * kk + ki] = valid[ki]
+                    ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
                 row_sum += weights[qi * kk + ki];
             }
             const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
