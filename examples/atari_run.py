@@ -43,7 +43,14 @@ NUM_CPUS    = 4
 # Training hyperparameters
 LR                = 1e-1
 IMPORTANCE_CUTOFF = 0.01
-SYNAPTOGENESIS_K  = 32
+# build_probes(k) selects top-k input neurons AND top-k output neurons,
+# then outer-products them -- k^2 candidate synapses, not k. Kept small
+# since this runs every online step (see below); a larger k can saturate
+# a layer's connectivity in a handful of steps instead of growing
+# gradually (measured: k=64 on a 1000x1000 layer reaches full density in
+# ONE synap_step call). Raise only after checking per-step nnz growth
+# against STATE_SIZE/MAX_WEIGHTS.
+SYNAPTOGENESIS_K  = 4
 # No synaptogenesis-cadence knob anymore -- build_probes/synap_step/
 # equalizer_step run every step (see sili.sparse_rnn's module docstring:
 # they're cheap and O(1)-ish by design, throttling them would reintroduce

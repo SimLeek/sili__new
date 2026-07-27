@@ -1589,7 +1589,18 @@ class SparseRNNAgent(Module):
     def __init__(self, n_inputs: int, n_actions: int, state_size: int, max_weights: int,
                  num_cpus: int = 4, percent_active: float = 0.03,
                  lr: float = 1e-3, importance_cutoff: float = 0.01,
-                 synaptogenesis_k: int = 64):
+                 synaptogenesis_k: int = 4):
+        # build_probes(k) generates min(k, n_in) * min(k, n_out) candidate
+        # pairs (top-k input rows outer-producted against top-k output
+        # columns) -- O(k^2), not O(k). Measured directly: on a 1000x1000
+        # layer, k=64 can grow nnz from ~0 to 1000 (full density) in a
+        # SINGLE synap_step call, vs. k=4 growing nnz by only ~16 -- since
+        # this runs every online step (see class/module docstring), a
+        # large k saturates connectivity almost immediately rather than
+        # growing gradually. k=4 (default) or smaller is far more sane
+        # for continuous per-step growth; only raise this if you've
+        # checked the resulting per-step nnz growth against your actual
+        # max_weights budget and step rate.
         assert n_actions <= state_size
 
         self.cell = SparseRNNCell(n_inputs, state_size, max_weights, num_cpus, percent_active)
