@@ -316,32 +316,39 @@ def _attn_f32(t: Tensor) -> np.ndarray:
 
 
 def sparse_attention(q: Tensor, k: Tensor, v: Tensor,
-                      top_k: int = 0, num_cpus: int = 4) -> Tensor:
-    """Global top-k sparse attention, differentiable w.r.t. q/k/v."""
+                      top_k: int = 0, num_cpus: int = 4,
+                      causal: bool = False) -> Tensor:
+    """Global top-k sparse attention, differentiable w.r.t. q/k/v.
+    causal=True masks any selected (query,key) pair where the key's
+    sequence position is after the query's -- see attention.hpp."""
     from sili import _cpu
     qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
-    out_np = _cpu.sparse_attention(qd, kd, vd, top_k, num_cpus)
+    out_np = _cpu.sparse_attention(qd, kd, vd, top_k, num_cpus, causal)
     out = Tensor(out_np, (q, k, v), "sparse_attention", q.backend)
     def _bwd():
         dQ, dK, dV = _cpu.sparse_attention_backward(
             qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
-            top_k, num_cpus)
+            top_k, num_cpus, causal)
         _acc(q, dQ); _acc(k, dK); _acc(v, dV)
     out._backward = _bwd
     return out
 
 
 def banded_attention(q: Tensor, k: Tensor, v: Tensor,
-                      half_bandwidth: int, num_cpus: int = 4) -> Tensor:
-    """Dense banded (geometric-diagonal) attention, differentiable w.r.t. q/k/v."""
+                      half_bandwidth: int, num_cpus: int = 4,
+                      causal: bool = False) -> Tensor:
+    """Dense banded (geometric-diagonal) attention, differentiable w.r.t.
+    q/k/v. causal=True requires q/k to have the same length (self-attention)
+    and clamps each query's band so it never sees a key past its own
+    position -- see attention.hpp."""
     from sili import _cpu
     qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
-    out_np = _cpu.banded_attention(qd, kd, vd, half_bandwidth, num_cpus)
+    out_np = _cpu.banded_attention(qd, kd, vd, half_bandwidth, num_cpus, causal)
     out = Tensor(out_np, (q, k, v), "banded_attention", q.backend)
     def _bwd():
         dQ, dK, dV = _cpu.banded_attention_backward(
             qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
-            half_bandwidth, num_cpus)
+            half_bandwidth, num_cpus, causal)
         _acc(q, dQ); _acc(k, dK); _acc(v, dV)
     out._backward = _bwd
     return out
@@ -349,17 +356,17 @@ def banded_attention(q: Tensor, k: Tensor, v: Tensor,
 
 def sparse_banded_attention(q: Tensor, k: Tensor, v: Tensor,
                             half_bandwidth: int, inner_k: int = 0,
-                            num_cpus: int = 4) -> Tensor:
+                            num_cpus: int = 4, causal: bool = False) -> Tensor:
     """Banded attention with an inner top-k within each band, differentiable
-    w.r.t. q/k/v."""
+    w.r.t. q/k/v. causal=True -- see banded_attention."""
     from sili import _cpu
     qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
-    out_np = _cpu.sparse_banded_attention(qd, kd, vd, half_bandwidth, inner_k, num_cpus)
+    out_np = _cpu.sparse_banded_attention(qd, kd, vd, half_bandwidth, inner_k, num_cpus, causal)
     out = Tensor(out_np, (q, k, v), "sparse_banded_attention", q.backend)
     def _bwd():
         dQ, dK, dV = _cpu.sparse_banded_attention_backward(
             qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
-            half_bandwidth, inner_k, num_cpus)
+            half_bandwidth, inner_k, num_cpus, causal)
         _acc(q, dQ); _acc(k, dK); _acc(v, dV)
     out._backward = _bwd
     return out
