@@ -41,11 +41,21 @@ MAX_WEIGHTS = 2_000_000
 NUM_CPUS    = 4
 
 # Training hyperparameters
-LR                   = 1e-1
-IMPORTANCE_BETA      = 0.01
-IMPORTANCE_DECAY     = 1e-3*0.03*.03  # needs to be related to sparsity
-SYNAPTOGENESIS_K     = 32
-SYNAPTOGENESIS_EVERY = 20
+LR                = 1e-1
+IMPORTANCE_CUTOFF = 0.01
+# build_probes(k) selects top-k input neurons AND top-k output neurons,
+# then outer-products them -- k^2 candidate synapses, not k. Kept small
+# since this runs every online step (see below); a larger k can saturate
+# a layer's connectivity in a handful of steps instead of growing
+# gradually (measured: k=64 on a 1000x1000 layer reaches full density in
+# ONE synap_step call). Raise only after checking per-step nnz growth
+# against STATE_SIZE/MAX_WEIGHTS.
+SYNAPTOGENESIS_K  = 4
+# No synaptogenesis-cadence knob anymore -- build_probes/synap_step/
+# equalizer_step run every step (see sili.sparse_rnn's module docstring:
+# they're cheap and O(1)-ish by design, throttling them would reintroduce
+# lag spikes). No importance-decay knob either -- doesn't exist in the
+# current SparseLinearLayer API generation (see same docstring).
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -55,17 +65,15 @@ def main():
     n_actions = env.action_space.n
 
     agent = SparseRNNAgent(
-        n_inputs             = OBS_SIZE,
-        n_actions            = n_actions,
-        state_size           = STATE_SIZE,
-        max_weights          = MAX_WEIGHTS,
-        num_cpus             = NUM_CPUS,
-        lr                   = LR,
-        importance_beta      = IMPORTANCE_BETA,
-        importance_decay     = IMPORTANCE_DECAY,
-        synaptogenesis_k     = SYNAPTOGENESIS_K,
-        synaptogenesis_every = SYNAPTOGENESIS_EVERY,
-        percent_active= 0.03
+        n_inputs          = OBS_SIZE,
+        n_actions         = n_actions,
+        state_size        = STATE_SIZE,
+        max_weights       = MAX_WEIGHTS,
+        num_cpus          = NUM_CPUS,
+        lr                = LR,
+        importance_cutoff = IMPORTANCE_CUTOFF,
+        synaptogenesis_k  = SYNAPTOGENESIS_K,
+        percent_active    = 0.03,
     )
 
     if os.path.exists(SAVE_FILE):
