@@ -8,6 +8,7 @@
 //#include "unique_vector.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <ctime>
@@ -404,11 +405,25 @@ top_k_csr_biased_v(VALUE_TYPE *values, CSRInput<SIZE_TYPE,  VALUE_TYPE>& bias, s
 }
 
 template <typename SIZE_TYPE, typename VALUE_TYPE>
-std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {    
+std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {
     if (k > size) k = size;
 
     size_t chunk_size = (size + num_threads - 1) / num_threads;
     std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> thread_pairs(num_threads);
+
+    // BUG FIX: this compared raw signed value (a.second > b.second), not
+    // magnitude -- for zero-mean data (e.g. any post-RMSNorm activation)
+    // that keeps only the largest POSITIVE entries and discards every
+    // negative one regardless of magnitude, no matter how large; even
+    // k close to `size` still drops exactly the most-negative (often
+    // highest-magnitude) entries first. dense_to_top_k_csr's own
+    // docstring ("top-k sparsity conversion") and CSR.from_dense's
+    // ("top-k entries by magnitude") both assume magnitude-based
+    // selection -- callers that don't already pre-abs their values
+    // (e.g. genesis_build_probes does) got silently wrong results.
+    auto by_magnitude = [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+        return std::abs(a.second) > std::abs(b.second);
+    };
 
     #pragma omp parallel num_threads(num_threads)
     {
@@ -424,10 +439,7 @@ std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
         }
 
         size_t local_k = std::min(k, local_pairs.size());
-        std::partial_sort(local_pairs.begin(), local_pairs.begin() + local_k, local_pairs.end(),
-                          [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
-                              return a.second > b.second;
-                          });
+        std::partial_sort(local_pairs.begin(), local_pairs.begin() + local_k, local_pairs.end(), by_magnitude);
 
         if (local_pairs.size() > k) local_pairs.resize(k);
         thread_pairs[thread_id] = std::move(local_pairs);
@@ -439,10 +451,7 @@ std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
     }
 
     size_t final_k = std::min(k, merged_pairs.size());
-    std::partial_sort(merged_pairs.begin(), merged_pairs.begin() + final_k, merged_pairs.end(),
-                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
-                          return a.second > b.second;
-                      });
+    std::partial_sort(merged_pairs.begin(), merged_pairs.begin() + final_k, merged_pairs.end(), by_magnitude);
 
     std::vector<SIZE_TYPE> indices;
     indices.reserve(final_k);
