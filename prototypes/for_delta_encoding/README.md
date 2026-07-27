@@ -75,3 +75,34 @@ g++ -O3 -march=haswell -mavx2 -mbmi2 -std=c++17 for_encoding_bench.cpp -o bench
 
 Requires AVX2 + BMI2 (matches this project's existing `-march=haswell`
 CMake flag). No dependency on the rest of sili__new -- fully standalone.
+
+## Full production migration: built, verified, NOT merged
+
+The full migration of `delta_csr_types.hpp`/`delta_csr_memory.hpp`/
+`delta_csr_ops.hpp`/`cpu_backend.cpp` from ULEB128-delta-from-previous to
+this FOR (offset-from-group-start) encoding was completed on branch
+`feature/delta-csr-for-encoding` (PR #17), including a rewritten
+`DeltaCSRRowCursor` with group-caching decode, a runtime-selectable
+`ForGroupSize` (G8/G16/G32/G64), and a real bug fix found along the way
+(`compact()`/`expand_headroom()` weren't propagating `group_size`,
+which would have silently corrupted decode for any non-default group
+size -- caught by adding explicit non-default-group-size regression
+tests). All 927 existing C++ assertions pass, and output was verified
+byte-identical against the real 1B-parameter MiniCPM5 checkpoint.
+
+**This branch is deliberately not merged into main.** Clean, isolated
+py-spy profiling against the real checkpoint (no other processes
+running -- see sili_peridot's JOURNAL.md) showed column-index decode is
+only ~1% of eval-phase time; the FOR encoding's measured 4-12x decode
+speedup therefore produced no measurable wall-clock improvement
+end-to-end (Amdahl's Law -- the dominant cost is the accumulation loop
+in `linear_disldo.hpp`, see `../disldo_accumulation_simd/README.md`).
+Since the improvement isn't significant on this hardware, it doesn't
+clear the bar to land in main and add permanent complexity/maintenance
+burden for no real benefit here.
+
+The branch is kept as a complete, tested reference in case decode ever
+becomes the actual bottleneck (different hardware, different sparsity
+pattern, different workload shape) -- at that point `feature/delta-csr-
+for-encoding` can be rebased and merged directly rather than redone
+from scratch.
