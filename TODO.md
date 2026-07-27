@@ -35,45 +35,44 @@ SISLDOLayerV architecture fix).
   won't be called from there at all. Tracked as part of the SISLDOLayerV
   fix, not as a standalone bug to chase.
 
-- **`sili.sparse_rnn.DISLDOLayer`/`SISLDOLayer` (Python) call C++ methods
-  that don't exist on any currently-bound class -- `SparseRNNCell`/
-  `SparseRNNAgent` cannot be constructed at all.** Found while adding
-  dedicated `SparseRNNCell` tests (`tests/unit/python/test_sparse_rnn_cell.py`,
-  see its module docstring for the full detail). `DISLDOLayer.__init__`
-  calls `_cpu.DISLDOLayer(...)` and `SISLDOLayer.__init__` calls
-  `_cpu.SISLDOLayer(...)` -- neither name is bound in `cpu_backend.cpp`,
-  only `DISLDOLayerV` is. `_SparseLayerBase.step()`/`.decay()`/
-  `.synaptogenesis()` additionally call `self._c.optim_weights(lr)`/
-  `.decay_importance(rate)`/`.optim_synaptogenesis(...)` -- none of which
-  exist on `DISLDOLayerV` OR `SparseLinearLayer` either. Three genuinely
-  different C++-layer API generations exist in this codebase today:
-  (1) whatever `DISLDOLayer`/`SISLDOLayer` assume (single-arg `forward`/
-  `backward`, separate `optim_weights`/`decay_importance`/
-  `optim_synaptogenesis` calls) -- never actually implemented/bound;
-  (2) `DISLDOLayerV` (`forward(x, learning_rate)`/`backward(dy,
-  learning_rate)`, `synap_row_step` instead of a probes+optim pair, no
-  weight-decay/separate-optim methods at all);
-  (3) `SparseLinearLayer` (`forward_dense`/`backward_dense` take
-  `learning_rate` directly and apply the update inline, `build_probes`+
-  `synap_step`, no separate optim/decay step) -- this is the one that
-  actually works today, proven by `FoldedLayer` (used by
-  `tests.integration.test_toy_mistral`) and `make_grown_sparse_layer` in
-  `tests/integration/test_mandelbrot_rl.py` (used by `SparseCore`/
-  `MistralCore`, i.e. the actual Mandelbrot experiment's sparse core).
-  **Not on the MiniCPM5 conversion critical path** -- that work goes
-  through `FoldedLayer`/`SparseLinearLayer` directly, never through
-  `SparseRNNCell`. Real fix: rebuild `DISLDOLayer`/`SISLDOLayer` on
-  `SparseLinearLayer`'s actual (working) API, which also means reworking
-  `SparseRNNCell.step()`'s separate-call convention into
-  `SparseLinearLayer`'s inline-learning-rate convention. Sized as its own
-  task, not a quick patch -- `tests/unit/python/test_sparse_rnn_cell.py`
-  has the tests already written and marked `xfail(strict=True)`, ready to
-  flip green once this lands.
+- ~~`sili.sparse_rnn.DISLDOLayer`/`SISLDOLayer` (Python) call C++ methods
+  that don't exist on any currently-bound class~~ **FIXED**: `DISLDOLayer`/
+  `SISLDOLayer` now wrap a real `_cpu.SparseLinearLayer` and use its
+  actual inline-learning-rate `forward_dense`/`backward_dense` (and
+  `forward_sparse`/`backward_sparse`) convention -- weight VALUE updates
+  happen inline during `backward()`, no separate `step()`/`decay()` call
+  (removed; no decay-equivalent exists in this API generation, see
+  `sili.sparse_rnn`'s module docstring). Structural growth is
+  `build_probes`+`synap_step`+`equalizer_step` via
+  `.synaptogenesis(k, importance_cutoff, max_row_weights)`, meant to be
+  called every online step, not throttled. Also fixed along the way
+  (surfaced only once the code could actually run):
+  `SparseRNNCell.__init__`'s `activation_cost=0.08*r` formula could
+  exceed `EnergyDynamics`'s own asserted `[0.01, 0.5]` range for a small
+  state needing a higher `percent_active` (now clamped); a fresh
+  `SparseLinearLayer` has zero connections and produces literal all-zero
+  output until grown (now pre-seeded with a small random sparse pattern
+  at construction -- an optimization for a faster bootstrap, not a
+  requirement, since `EnergyDynamics`'s forced-firing already gives a
+  slower path to the same place; see `_preseed_random_sparse`);
+  `synap_step` needs real per-row byte headroom that `load_weights`'
+  tight/exact-fit allocation doesn't provide (now restored via
+  `equalize_to_capacity`, called after `load_weights`/`load_state_dict`,
+  not `expand_headroom_to` -- that one's docstring promise didn't hold up
+  empirically); `SparseRNNCell.synaptogenesis`'s `max_weights` was being
+  passed straight through as a per-ROW cap to both sub-layers despite
+  their differing row counts (now converted per-layer via each one's own
+  `in_features`); and `forward_dense`/`backward_dense` always return
+  `[batch, cols]` even for a bare 1-D input (now squeezed back to 1-D in
+  `DISLDOLayer.forward` for online/no-batch use, matching what
+  `SISLDOLayer` already did). All tests in
+  `tests/unit/python/test_sparse_rnn_cell.py` un-xfailed and passing for
+  real, verified stable across repeated runs (unseeded randomness).
 
   `FoldedColumnLayer` (Phase A4) landed on the same `h = input_proj(x) +
   recurrent(state)` shape as `SparseRNNCell` but is not a subclass/merge
-  candidate yet -- revisit once `DISLDOLayer`/`SISLDOLayer` are rebuilt on
-  `SparseLinearLayer` (see sili_peridot/JOURNAL.md for the full reasoning).
+  candidate yet -- both now sit on `SparseLinearLayer`'s real API, so
+  this is worth revisiting.
 
 - **A neuron that fires but keeps losing the top-p competition never has
   its energy reset**, so `aux_loss` grows unboundedly under a genuinely

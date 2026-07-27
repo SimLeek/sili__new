@@ -2,8 +2,9 @@
 sili.sparse_rnn — sparse RNN layers.
 
 All layers are Module subclasses. C++-backed layers (DISLDOLayer, SISLDOLayer)
-carry no Tensor parameters — their weights live in C++ and are updated via their
-own optimizer. parameters() returns [] for these.
+carry no Tensor parameters — their weights live in a real _cpu.SparseLinearLayer
+and are updated INLINE during backward, not via a separate optimizer step.
+parameters() returns [] for these.
 
 Forward flow in SparseRNNCell
 ------------------------------
@@ -15,21 +16,38 @@ Forward flow in SparseRNNCell
 
 Backward / training
 --------------------
+Weight VALUE updates are inline, not a separate optimizer.step(): DISLDOLayer/
+SISLDOLayer.forward(x, learning_rate) store learning_rate and their _backward
+closure calls SparseLinearLayer.backward_dense/backward_sparse with it
+directly — gradient computation AND the weight update happen together, during
+aux_loss.backward()/loss.backward() itself. This is required to keep memory
+bounded (no separate accumulate-then-apply buffer held between calls) — the
+old two-phase "compute gradient, then separately .step(lr)" convention this
+module used to assume was actually wrong for this system, not merely
+unimplemented.
+
     BPTT=1 (default):
-        agent.train_step(obs)          # detaches state, forward, loss.backward(), step()
+        agent.train_step(obs)   # detaches state, forward(learning_rate=self.lr), aux_loss.backward()
 
     Multi-step BPTT:
         for obs in episode:
-            action = agent(obs)        # state stays in graph
+            action = agent(obs, learning_rate=0.0)   # state stays in graph, no update during rollout
             ...
-        loss.backward()
-        agent.step()
+        loss.backward()                              # inline weight updates fire here
         agent.state = agent.state.detach()
 
-    The C++ weight update (step()) is independent of the autograd graph.
-    aux_loss.backward() populates gradients on the Tensor path so that
-    DISLDOLayer / SISLDOLayer._backward can call _acc() and accumulate
-    into the C++ weight grad buffers.
+Only structural growth (synaptogenesis: build_probes + synap_step +
+equalizer_step) is a genuinely separate call, since it changes which synapses
+exist rather than updating a value. It's cheap and O(1)-ish by design —
+SparseRNNAgent.step() calls it every online step, not on an "every N steps"
+cadence (a periodic throttle would reintroduce the lag spikes this stepwise
+design exists to avoid). There is no importance-decay call in this API
+generation — importance already settles via the Hebbian/activity-correlation
+tracking inside forward/backward, and a separate periodic decay interacting
+correctly with FP4-quantized stored values would need more care than a simple
+multiply (values only resolve to FP4 granularity, and large-error entries
+already get squeezed out through ongoing training) — a deliberate difference
+from the old design, not an oversight.
 """
 
 from __future__ import annotations
@@ -130,8 +148,10 @@ class CSR(NamedTuple):
 
 class _SparseLayerBase(Module):
     """
-    Module base for layers whose weights live in C++.
-    parameters() returns [] — nothing participates in Tensor autograd.
+    Module base for layers whose weights live in a real _cpu.SparseLinearLayer.
+    parameters() returns [] — nothing participates in Tensor autograd; weight
+    VALUE updates happen inline inside backward_dense/backward_sparse instead
+    (see module docstring).
     """
 
     def parameters(self) -> list:
@@ -163,16 +183,16 @@ class _SparseLayerBase(Module):
     @property
     def neuron_grad_accum(self)  -> np.ndarray: return self._c.neuron_grad_accum
 
-    def step(self, lr: float):
-        self._c.optim_weights(lr)
-
-    def decay(self, rate: float):
-        self._c.decay_importance(rate)
-
-    def synaptogenesis(self, k: int, lr: float, importance_beta: float, max_weights: int):
+    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int):
+        """Structural growth + memory rebalancing -- the only call here
+        that ISN'T inline with forward/backward, since it changes which
+        synapses exist rather than updating a value. No learning_rate:
+        growth isn't a value update. Meant to be called every online
+        step (cheap, O(1)-ish by design) -- see module docstring for why
+        an "every N steps" cadence would be wrong here."""
         self._c.build_probes(k)
-        self._c.optim_synaptogenesis(lr, importance_beta, max_weights)
-        self._c.zero_accum()
+        self._c.synap_step(importance_cutoff, max_row_weights)
+        self._c.equalizer_step()
 
     def state_dict(self) -> dict:
         return {
@@ -183,12 +203,72 @@ class _SparseLayerBase(Module):
         }
 
     def load_state_dict(self, d: dict):
+        # SparseLinearLayer.load_weights takes (ptrs, indices, weights) --
+        # no importance array in this API generation. A loaded layer's
+        # importance starts fresh and rebuilds through subsequent
+        # training, rather than being restored from the saved value.
         self._c.load_weights(
-            d["ptrs"]      .astype(np.int32),
-            d["indices"]   .astype(np.int32),
-            d["weights"]   .astype(np.float32),
-            d["importance"].astype(np.float32),
+            d["ptrs"]   .astype(np.int32),
+            d["indices"].astype(np.int32),
+            d["weights"].astype(np.float32),
         )
+        # load_weights is a tight/exact-fit load, no spare per-row byte
+        # headroom -- a subsequent synap_step would immediately raise
+        # ("ran out of blank space") without this. Restore growth room
+        # to this layer's configured per-row cap, same as a fresh
+        # pre-seeded layer already has (see _preseed_random_sparse).
+        max_row_weights = getattr(self, "_max_row_weights", None)
+        if max_row_weights is not None:
+            self._c.equalize_to_capacity(max_row_weights)
+
+
+def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
+    """A freshly-constructed SparseLinearLayer has zero connections and
+    produces literal all-zero output until synaptogenesis grows some.
+    NOT strictly required when EnergyDynamics is in the loop (as it is
+    for SparseRNNCell): its forced-firing (energy accumulates via
+    `drive` alone, independent of input/weights, until a neuron crosses
+    the fire threshold and outputs a forced constant) already gives an
+    all-zero-weight layer a real, if slower, way to bootstrap activity
+    and a gradient signal to grow from -- closer to RL-style forced
+    exploration than a dead end. This is purely an optimization for a
+    faster/more immediate initial bootstrap (useful in tests, or
+    whenever waiting several steps for forced-firing to kick in isn't
+    wanted) via a standard random-sparse-init pattern -- not a
+    requirement.
+
+    Also calls equalize_to_capacity so later synap_step calls have
+    per-row headroom to grow into -- synap_step raises if a row's
+    pre-allocated space is already full, and load_weights' own
+    allocation is a tight/exact fit with no spare room. (Not
+    expand_headroom_to -- despite its docstring promising per-row
+    headroom after a full equalizer_step pass, that didn't hold up
+    empirically here; equalize_to_capacity, called AFTER load_weights,
+    is what actually works.)
+
+    CSR rows are INPUTS, columns are OUTPUTS (disldo_forward iterates
+    `for r in range(n_inputs)`, each row's nonzero entries its output
+    connections) -- see linear_disldo.hpp.
+    """
+    # load_weights is a tight/exact-fit encode regardless of any prior
+    # allocation -- equalize_to_capacity must be called AFTER it, not
+    # before, or the headroom gets compacted away immediately (verified
+    # empirically).
+    per_row = max(2, max_weights // max(1, n_inputs))
+    rng   = np.random.default_rng()
+    k     = max(1, min(n_outputs, per_row // 2))  # leave half the row's headroom free to grow into
+    scale = 1.0 / np.sqrt(k)
+    ptrs    = np.zeros(n_inputs + 1, dtype=np.int32)
+    indices = np.empty(n_inputs * k, dtype=np.int32)
+    values  = np.empty(n_inputs * k, dtype=np.float32)
+    for row in range(n_inputs):
+        cols = np.sort(rng.choice(n_outputs, size=k, replace=False))
+        indices[row * k:(row + 1) * k] = cols
+        values[row * k:(row + 1) * k]  = rng.standard_normal(k).astype(np.float32) * scale
+        ptrs[row + 1] = ptrs[row] + k
+    c.load_weights(ptrs, indices, values)
+    c.equalize_to_capacity(per_row)
+    return per_row
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,23 +276,39 @@ class _SparseLayerBase(Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DISLDOLayer(_SparseLayerBase):
-    """Dense observation → state contribution. No CSR on the input side."""
+    """Dense observation → state contribution. No CSR on either side --
+    dense in, dense out, via SparseLinearLayer.forward_dense/backward_dense
+    (both sides dense, weight update inline in backward_dense -- see module
+    docstring). No batch dimension required for online (single-sample) use."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, solidify: float = 0.01):
-        self._c = _cpu.DISLDOLayer(in_features, out_features, max_weights, num_cpus, solidify)
+                 num_cpus: int = 4):
+        self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights)
 
-    def forward(self, x) -> Tensor:
+    def forward(self, x, learning_rate: float = 0.0) -> Tensor:
+        # forward_dense/backward_dense always return [batch, cols] --
+        # even for a bare 1-D [cols] input, batch is implicitly 1, but
+        # the OUTPUT shape stays 2-D regardless. Squeeze that back out
+        # when the input was 1-D so a single online sample round-trips
+        # to 1-D, matching this class's own no-batch-dimension
+        # docstring; leave genuinely 2-D (batched) input alone.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)[np.newaxis, :]
-        out_np = self._c.forward(x_np).squeeze(0)
-        out    = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
+        x_np   = np.asarray(x.data, dtype=np.float32)
+        was_1d = x_np.ndim == 1
+        out_np = self._c.forward_dense(x_np, learning_rate)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        out = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
 
         def _bwd():
             if out.grad is not None:
-                dy = np.asarray(out.grad, dtype=np.float32)[np.newaxis, :]
-                _acc(x, self._c.backward(dy).squeeze(0))
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=True)
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
 
         out._backward = _bwd
         return out
@@ -223,17 +319,28 @@ class DISLDOLayer(_SparseLayerBase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SISLDOLayer(_SparseLayerBase):
-    """Sparse state → state contribution. Input must be a CSR."""
+    """Sparse state → state contribution. Input must be a CSR.
+
+    Forward exploits sparse ACTIVATIONS (forward_sparse, skips inactive
+    input rows). Backward exploits a top-k'd sparse GRADIENT
+    (backward_sparse) -- these are independent axes on SparseLinearLayer,
+    not a matched forward/backward pair (see its class comment in
+    cpu_backend.cpp): dx doesn't depend on the input's own sparsity, only
+    on weights and dy, so backward_sparse's required dense `x` argument is
+    exactly what the C++ side already cached as `last_input` during the
+    forward_sparse call above -- not an approximation, just reusing it."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, solidify: float = 0.01, backprop_p: float = 0.03):
-        self._c         = _cpu.SISLDOLayer(in_features, out_features, max_weights, num_cpus, solidify)
+                 num_cpus: int = 4, backprop_p: float = 0.03):
+        self._c         = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights)
         self.backprop_p = backprop_p
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
         """x.data must be a CSR. grad flows back as a dense ndarray."""
         csr    = x.data
-        out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
+        out_np = self._c.forward_sparse(
+            csr.ptrs, csr.indices, csr.values, csr.rows, learning_rate).squeeze(0)
         out    = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
 
         def _bwd():
@@ -241,10 +348,9 @@ class SISLDOLayer(_SparseLayerBase):
                 dy   = np.asarray(out.grad, dtype=np.float32)[np.newaxis, :]
                 k    = max(1, int(dy.shape[1] * self.backprop_p))
                 dp, di, dv = _cpu.dense_to_top_k_csr(dy, k, self._c.num_cpus)
-                dx = self._c.backward(
-                    csr.ptrs, csr.indices, csr.values,
-                    dy, dp, di, dv,
-                    csr.rows, csr.cols,
+                dx = self._c.backward_sparse(
+                    self._c.last_input, dp, di, dv,
+                    csr.rows, learning_rate, lr_per_row_nnz=True,
                 ).squeeze(0)
                 _acc(x, dx)
 
@@ -1304,7 +1410,7 @@ class SparseRNNCell(Module):
     """
 
     def __init__(self, n_inputs: int, state_size: int, max_weights: int,
-                 num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
+                 num_cpus: int = 4, percent_active: float = 0.03,
                  dynamic_density_from_branching_ratio: bool = False,
                  branching_tracker: str = "ema",
                  branching_window: int = 200,
@@ -1312,8 +1418,8 @@ class SparseRNNCell(Module):
         assert branching_tracker in ("window", "ema"), \
             f"branching_tracker must be 'window' or 'ema', got {branching_tracker!r}"
         r = percent_active / 0.02
-        self.input_proj = DISLDOLayer(n_inputs,   state_size, max_weights, num_cpus, solidify)
-        self.recurrent  = SISLDOLayer(state_size, state_size, max_weights, num_cpus, solidify,
+        self.input_proj = DISLDOLayer(n_inputs,   state_size, max_weights, num_cpus)
+        self.recurrent  = SISLDOLayer(state_size, state_size, max_weights, num_cpus,
                                       backprop_p=percent_active)
         # density IS the target active fraction; p is a hard compute-limit
         # ceiling that must sit clearly above it (~5x here), not the thing
@@ -1324,9 +1430,17 @@ class SparseRNNCell(Module):
         # directly, i.e. density could exceed p*0.8 -- the actual bug).
         density = min(0.9, percent_active)
         p       = min(1.0, percent_active * 5.0)
+        # activation_cost=0.08*r grows unbounded with percent_active (r
+        # scales linearly with it) -- fine for the small percent_active
+        # this formula was tuned around, but a small state legitimately
+        # wants a much higher percent_active to get more than 0-1 active
+        # neurons (e.g. state_size=12), which pushes activation_cost past
+        # EnergyDynamics's own asserted [0.01, 0.5] range. Clamp rather
+        # than let construction fail for that (valid) regime.
+        activation_cost = min(0.5, max(0.01, 0.08 * r))
         self.energy     = EnergyDynamics(
             drive          = 0.08*percent_active * r,
-            activation_cost= 0.08 * r,
+            activation_cost= activation_cost,
             density        = density,
             exploration    = 0.001 * r,
             reactivity     = 0.01  * r,
@@ -1360,7 +1474,7 @@ class SparseRNNCell(Module):
     def parameters(self) -> list:
         return []
 
-    def forward(self, obs: Tensor, state: Tensor) -> Tuple[Tensor, Tensor, float]:
+    def forward(self, obs: Tensor, state: Tensor, learning_rate: float = 0.0) -> Tuple[Tensor, Tensor, float]:
         # state.data is a CSR only if the caller explicitly handed us one
         # (e.g. warm-starting from a saved CSR); the cell's own output is
         # always dense (see class docstring). Normal path: build the CSR
@@ -1381,14 +1495,14 @@ class SparseRNNCell(Module):
 
         # Measure the recurrent pathway's OWN activity before it's mixed
         # with input_proj(obs) -- see class docstring / BranchingRatioTracker.
-        recurrent_out = self.recurrent(state)
+        recurrent_out = self.recurrent(state, learning_rate)
         recurrent_activity = float(np.sum(
             np.abs(np.asarray(recurrent_out.data, dtype=np.float32))
             > self.energy.activation_threshold
         ))
         self.branching_recurrent.update(recurrent_activity)
 
-        h = self.input_proj(obs) + recurrent_out
+        h = self.input_proj(obs, learning_rate) + recurrent_out
 
         density_override = None
         if self.dynamic_density_from_branching_ratio:
@@ -1423,17 +1537,23 @@ class SparseRNNCell(Module):
         self._prev_h_dense      = None
         self.branching_recurrent.reset()
 
-    def step(self, lr: float):
-        self.input_proj.step(lr)
-        self.recurrent .step(lr)
+    def synaptogenesis(self, k: int, importance_cutoff: float, max_weights: int):
+        """Structural growth + memory rebalancing for both sub-layers --
+        see _SparseLayerBase.synaptogenesis. No lr/step/decay here: weight
+        VALUE updates already happened inline during forward()'s
+        backward() closures (see module docstring), and there's no
+        importance-decay call in this API generation.
 
-    def decay(self, rate: float):
-        self.input_proj.decay(rate)
-        self.recurrent .decay(rate)
-
-    def synaptogenesis(self, k: int, lr: float, importance_beta: float, max_weights: int):
-        self.input_proj.synaptogenesis(k, lr, importance_beta, max_weights)
-        self.recurrent .synaptogenesis(k, lr, importance_beta, max_weights)
+        max_weights is the TOTAL per-layer budget (same units as what
+        was passed to this cell's own constructor) -- converted to a
+        PER-ROW cap for each sub-layer here (synap_step's actual unit),
+        using each sub-layer's own in_features, since input_proj and
+        recurrent generally have different row counts and a single
+        scalar can't be a correct per-row cap for both at once."""
+        input_proj_cap = max(1, max_weights // self.input_proj.in_features)
+        recurrent_cap  = max(1, max_weights // self.recurrent.in_features)
+        self.input_proj.synaptogenesis(k, importance_cutoff, input_proj_cap)
+        self.recurrent .synaptogenesis(k, importance_cutoff, recurrent_cap)
 
     def state_dict(self) -> dict:
         return {
@@ -1467,14 +1587,12 @@ class SparseRNNAgent(Module):
     """
 
     def __init__(self, n_inputs: int, n_actions: int, state_size: int, max_weights: int,
-                 num_cpus: int = 4, solidify: float = 0.01, percent_active: float = 0.03,
-                 lr: float = 1e-3, importance_beta: float = 0.01,
-                 importance_decay: float = 1e-3*0.03, synaptogenesis_k: int = 64,
-                 synaptogenesis_every: int = 20):
+                 num_cpus: int = 4, percent_active: float = 0.03,
+                 lr: float = 1e-3, importance_cutoff: float = 0.01,
+                 synaptogenesis_k: int = 64):
         assert n_actions <= state_size
 
-        self.cell = SparseRNNCell(n_inputs, state_size, max_weights, num_cpus,
-                                  solidify, percent_active)
+        self.cell = SparseRNNCell(n_inputs, state_size, max_weights, num_cpus, percent_active)
 
         self.state = Tensor(np.zeros(state_size, dtype=np.float32))
 
@@ -1483,11 +1601,9 @@ class SparseRNNAgent(Module):
         self.state_size  = state_size
         self.max_weights = max_weights
 
-        self.lr                   = lr
-        self.importance_beta      = importance_beta
-        self.importance_decay     = importance_decay
-        self.synaptogenesis_k     = synaptogenesis_k
-        self.synaptogenesis_every = synaptogenesis_every
+        self.lr                = lr
+        self.importance_cutoff = importance_cutoff
+        self.synaptogenesis_k  = synaptogenesis_k
 
         self._step_count = 0
         self.aux_loss:   Optional[Tensor] = None
@@ -1499,8 +1615,11 @@ class SparseRNNAgent(Module):
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, obs: Tensor) -> int:
-        """Run one step. State stays in the autograd graph (use for multi-step BPTT)."""
-        h_out, aux_loss, actual_p = self.cell(obs, self.state)
+        """Run one step. State stays in the autograd graph (use for multi-step
+        BPTT). Threads self.lr into the cell so weight VALUE updates fire
+        inline whenever backward() eventually runs (see module docstring) --
+        forward() itself never updates anything, only backward() does."""
+        h_out, aux_loss, actual_p = self.cell(obs, self.state, self.lr)
         self.state      = h_out
         self.aux_loss   = aux_loss
         self._actual_p  = actual_p
@@ -1509,7 +1628,10 @@ class SparseRNNAgent(Module):
     def train_step(self, obs: Tensor) -> int:
         """
         BPTT=1 convenience wrapper. Detaches state before forward so gradients
-        don't flow across steps, then runs aux_loss.backward() and step().
+        don't flow across steps, then runs aux_loss.backward() (fires the
+        inline weight-value updates) and step() (structural growth only --
+        weight values are already updated by that point, see module
+        docstring).
 
         Use aux_loss directly before calling this if you want to add a task loss:
             action   = agent.forward(obs)
@@ -1531,13 +1653,15 @@ class SparseRNNAgent(Module):
     # ── Optimization ─────────────────────────────────────────────────────────
 
     def step(self):
-        self.cell.step(self.lr)
-        self.cell.decay(self.importance_decay)
+        """Structural growth + memory rebalancing only -- weight VALUE
+        updates already happened inline during aux_loss.backward()/
+        loss.backward() (see module docstring). Called every step, not
+        throttled by an "every N steps" cadence: synaptogenesis/
+        equalizer_step are cheap and purpose-built for continuous
+        per-step operation -- throttling them would reintroduce the lag
+        spikes they exist to avoid."""
+        self.cell.synaptogenesis(self.synaptogenesis_k, self.importance_cutoff, self.max_weights)
         self._step_count += 1
-        if self._step_count % self.synaptogenesis_every == 0:
-            self.cell.synaptogenesis(
-                self.synaptogenesis_k, self.lr,
-                self.importance_beta, self.max_weights)
 
     def reset_state(self):
         self.state    = Tensor(np.zeros(self.state_size, dtype=np.float32))

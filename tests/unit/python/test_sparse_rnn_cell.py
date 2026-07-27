@@ -11,29 +11,21 @@ exercised by examples/atari_run.py, which needs gymnasium/ROMs and isn't a
 practical unit test. These tests exercise SparseRNNCell/SparseRNNAgent
 directly, standalone.
 
-KNOWN PRE-EXISTING BUG (found while writing these, unrelated to the A6
-changes themselves -- do not "fix" by weakening these tests):
-sili.sparse_rnn.DISLDOLayer/SISLDOLayer call _cpu.DISLDOLayer(...)/
-_cpu.SISLDOLayer(...), plus _SparseLayerBase.step()/.decay()/
-.synaptogenesis() call self._c.optim_weights(lr)/.decay_importance(rate)/
-.optim_synaptogenesis(...) -- NONE of these names exist on any C++ class
-currently bound in cpu_backend.cpp. Only DISLDOLayerV is bound (a
-different, incompatible API: forward(x, learning_rate)/backward(dy,
-learning_rate) instead of forward(x)/backward(dy), synap_row_step instead
-of a build_probes+optim_synaptogenesis pair, no optim_weights/
-decay_importance at all). SparseLinearLayer (what FoldedLayer actually
-uses, and what MiniCPM5 conversion + Mandelbrot's SparseCore/MistralCore
-both build on -- see make_grown_sparse_layer in test_mandelbrot_rl.py) is
-a THIRD, separate, currently-WORKING API: forward_dense(x, learning_rate)/
-backward_dense(dy, learning_rate) apply the weight update inline, no
-separate step()/decay() call at all. DISLDOLayer/SISLDOLayer/
-SparseRNNCell/SparseRNNAgent are therefore stale relics of an even older
-API generation that predates all three of these, not something the A6
-changes broke -- SparseRNNCell could not have been constructed successfully
-before this session either. Tests below that need actual C++ execution are
-marked xfail(strict=True) with this same reason, so they'll flag loudly
-(as an unexpected pass) once DISLDOLayer/SISLDOLayer are rebuilt on
-SparseLinearLayer's real API rather than needing to be remembered by hand.
+DISLDOLayer/SISLDOLayer/SparseRNNCell/SparseRNNAgent were previously
+unusable: they called _cpu.DISLDOLayer(...)/_cpu.SISLDOLayer(...) (never
+bound) and _SparseLayerBase.step()/.decay()/.synaptogenesis() called C++
+methods (optim_weights/decay_importance/optim_synaptogenesis) that didn't
+exist on any bound class -- a stale relic of an API generation that
+predates SparseLinearLayer (the one FoldedLayer/MiniCPM5-conversion/
+Mandelbrot's SparseCore actually use, and that works). Fixed: DISLDOLayer/
+SISLDOLayer now wrap a real _cpu.SparseLinearLayer and use its actual
+inline-learning-rate forward_dense/backward_dense (and forward_sparse/
+backward_sparse) convention -- weight VALUE updates happen inline during
+backward(), not via a separate step()/decay() call (removed; no
+decay-equivalent exists in this API generation, see sili.sparse_rnn's
+module docstring). Structural growth is build_probes+synap_step+
+equalizer_step via .synaptogenesis(k, importance_cutoff, max_row_weights),
+meant to be called every online step, not throttled.
 """
 from __future__ import annotations
 import numpy as np
@@ -42,14 +34,6 @@ import pytest
 from sili.tensor import Tensor
 from sili.sparse_rnn import CSR, SparseRNNCell, SparseRNNAgent
 from sili.energy import EnergyDynamics, BranchingRatioTracker, EMABranchingRatioTracker
-
-_DISLDO_BROKEN_REASON = (
-    "Pre-existing, unrelated bug: _cpu.DISLDOLayer/_cpu.SISLDOLayer were "
-    "never bound (only DISLDOLayerV exists, a different+incompatible API), "
-    "and _SparseLayerBase.step()/.decay()/.synaptogenesis() call C++ methods "
-    "(optim_weights/decay_importance/optim_synaptogenesis) that don't exist "
-    "on any currently-bound class. See this file's module docstring."
-)
 
 
 def _small_cell(**kwargs):
@@ -295,7 +279,6 @@ class TestEnergyDynamicsKeptIndices:
 # SparseRNNCell
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(reason=_DISLDO_BROKEN_REASON, strict=True)
 class TestSparseRNNCellConstruction:
     def test_density_below_p_by_design(self):
         cell = _small_cell()
@@ -346,7 +329,6 @@ class TestSparseRNNCellInvalidBranchingTrackerMode:
                           branching_tracker="bogus")
 
 
-@pytest.mark.xfail(reason=_DISLDO_BROKEN_REASON, strict=True)
 class TestSparseRNNCellForward:
     def test_step0_dense_fallback_produces_finite_output(self):
         cell = _small_cell()
@@ -415,7 +397,12 @@ class TestSparseRNNCellForward:
         assert calls["from_dense"] == 1
 
     def test_recurrent_activity_tracked_before_combining_with_input(self):
-        cell = _small_cell()
+        # "window" explicitly -- the default is "ema" (post-review flip,
+        # see test_branching_tracker_default_is_ema), whose tracker has
+        # no _history list. Only the window tracker exposes it directly;
+        # what this test actually checks (an update happened) doesn't
+        # depend on which tracker mode is used.
+        cell = _small_cell(branching_tracker="window")
         obs   = Tensor(np.random.randn(6).astype(np.float32))
         state = Tensor(np.zeros(12, dtype=np.float32))
         assert len(cell.branching_recurrent._history) == 0
@@ -457,7 +444,6 @@ class TestSparseRNNCellForward:
         assert cell.branching_recurrent.branching_ratio() is not None
 
 
-@pytest.mark.xfail(reason=_DISLDO_BROKEN_REASON, strict=True)
 class TestSparseRNNAgentSaveLoad:
     def test_state_stays_dense_across_steps(self, tmp_path):
         agent = SparseRNNAgent(n_inputs=6, n_actions=2, state_size=12,
