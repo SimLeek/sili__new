@@ -1,5 +1,6 @@
 #include "../../sili/lib/headers/sparse_struct.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
+#include "../../sili/lib/headers/delta_csr_ops.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 
@@ -831,4 +832,98 @@ TEST_CASE("disldo_backward with broadcast dy_raw: dx matches finite-difference g
         float num = ((op[0]+op[2]+op[1]+op[3]) - (om[0]+om[2]+om[1]+om[3])) / (2.0f*eps);
         CHECK(dx[i] == Catch::Approx(num).margin(0.05f));
     }
+}
+
+// ── delta_csr_forward / delta_csr_backward_sparse_grad: output_scale ──────────
+//
+// BUG FIX regression tests: these two (the SISLDO/sparse-input path, used by
+// SparseLinearLayer::forward_sparse/backward_sparse) never read output_scale
+// at all -- only val_scale -- unlike disldo_forward/disldo_backward's
+// identical row*col combination. A rank-1-quantized layer (real
+// value_scale AND output_scale both set, e.g. via
+// FoldedLayer.from_descriptor(value_scale_mode="rank1")) run through
+// forward_sparse/backward_sparse silently dropped output_scale entirely.
+
+TEST_CASE("delta_csr_forward's output reflects value_scale * output_scale jointly (rank-1)",
+         "[scale][output_scale][sisldo][regression]") {
+    // Same setup/expected values as disldo_forward's matching test above --
+    // sparse-input and dense-input forward must agree exactly given the
+    // same single input row.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 2};
+    std::vector<S> idx  = {0, 1};
+    std::vector<float> w = {3.0f, 3.0f}, imp = {0.0f, 0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(2, S(0));
+    weights.set_value_scale_raw(0, 0.1f);     // shared row scale
+    weights.set_output_scale_raw(0, 1.0f);    // col 0: true_w = 3.0*0.1*1.0 = 0.3
+    weights.set_output_scale_raw(1, 10.0f);   // col 1: true_w = 3.0*0.1*10.0 = 3.0
+
+    CSRInput<S, float> in;
+    in.rows = 1; in.cols = 1;
+    in.ptrs[0]    = std::make_shared<std::vector<S>>(std::vector<S>{0, 1});
+    in.indices[0] = std::make_shared<std::vector<S>>(std::vector<S>{0});
+    in.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{2.0f});
+
+    std::vector<float> output(2, 0.0f);
+    delta_csr_forward<S, FP4BiPacked, COL_TYPE>(in, weights, output.data(), 0.0f, 1);
+
+    CHECK(output[0] == Catch::Approx(0.6f).margin(1e-4f));    // 0.3 * 2.0
+    CHECK(output[1] == Catch::Approx(6.0f).margin(1e-4f));    // 3.0 * 2.0
+}
+
+TEST_CASE("delta_csr_backward_sparse_grad's dx and value_scale gradient account for output_scale",
+         "[scale][output_scale][sisldo][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {2.0f}, imp = {0.0f};   // stored weight = 2.0
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree = {1};
+    weights.set_value_scale_raw(0, 4.0f);
+    weights.set_output_scale_raw(0, 0.5f);   // true_w = 2.0 * 4.0 * 0.5 = 4.0
+
+    std::vector<float> input = {1.0f};
+    CSRInput<S, float> dy;
+    dy.rows = 1; dy.cols = 1;
+    dy.ptrs[0]    = std::make_shared<std::vector<S>>(std::vector<S>{0, 1});
+    dy.indices[0] = std::make_shared<std::vector<S>>(std::vector<S>{0});
+    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{1.0f});
+
+    std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+    delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(),
+        /*learning_rate=*/0.0f, 1);
+
+    // dx = true_w * dy = 4.0 * 1.0 = 4.0 -- would be 1.0 (2.0*0.5 stored*val_scale
+    // only, dropping output_scale) if the bug were still present.
+    CHECK(dx[0] == Catch::Approx(4.0f).margin(1e-4f));
+
+    // value_scale's own gradient must also account for the fixed output_scale
+    // factor: g = dy*in = 1.0, scale_grad_sum = w_stored * out_scale * g =
+    // 2.0*0.5*1.0 = 1.0, scale_eff_lr = lr/nnz_this_row = 0.1/1 = 0.1,
+    // raw_update = 0.1. NOTE: unlike disldo_backward, this path's own
+    // value_scale update is plain undamped SGD (value_scale[r] -=
+    // scale_grad_sums[r]), not importance-damped -- a real, separate
+    // inconsistency from disldo_backward's later damping fix, not
+    // addressed by this output_scale fix.
+    std::vector<float> dx2(1, 0.0f), in_acc2(1, 0.0f), gr_acc2(1, 0.0f);
+    delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+        input.data(), S(1), weights, dy, dx2.data(), in_acc2.data(), gr_acc2.data(),
+        /*learning_rate=*/0.1f, 1);
+    const float raw_update = 0.1f * (2.0f * 0.5f * 1.0f);
+    const float expected_scale = 4.0f - raw_update;
+    // value_scale stores the ROW factor only (4.0 -> expected_scale); output_scale
+    // (0.5) stays fixed, so true_w after update = expected_scale * 0.5.
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
 }

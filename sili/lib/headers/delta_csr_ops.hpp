@@ -265,16 +265,26 @@ void delta_csr_forward(
                     // within this loop (work-offset iteration, not a simple per-row
                     // loop) -- unlike disldo_forward/backward, can't fix it once per
                     // outer iteration.
+                    // BUG FIX: out_scale/output_importance_scale (per-column, e.g. from
+                    // FoldedLayer.from_descriptor's value_scale_mode="rank1") were never
+                    // read here, unlike disldo_forward's identical row*col combination --
+                    // a rank-1-quantized layer run through forward_sparse silently
+                    // dropped its column scale entirely, reconstructing only stored_w *
+                    // val_scale instead of the true value.
                     const value_type  val_scale = weights.get_value_scale(in_idx);
-                    const value_type  wval      = wval_stored * val_scale;   // -> true units
+                    const value_type  out_scale = weights.get_output_scale(out_idx);
+                    const value_type  combined_scale = val_scale * out_scale;
+                    const value_type  wval      = wval_stored * combined_scale;   // -> true units
                     const value_type  contrib   = wval * in_val;
 
                     if (learning_rate != 0) {
                         const value_type imp_scale  = weights.get_importance_scale(in_idx);
+                        const value_type out_imp_scale = weights.get_output_importance_scale(out_idx);
+                        const value_type combined_imp_scale = imp_scale * out_imp_scale;
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
-                        value_type cur_imp = stored_imp * imp_scale;   // -> true units
+                        value_type cur_imp = stored_imp * combined_imp_scale;   // -> true units
                         cur_imp += contrib * learning_rate / (value_type(1) + std::abs(cur_imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval_stored, cur_imp / imp_scale);
+                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval_stored, cur_imp / combined_imp_scale);
                         // Read back post-quantization actual -- see disldo_forward's comment.
                         const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
                         local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
@@ -450,7 +460,12 @@ void delta_csr_backward_sparse_grad(
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                const value_type  w        = w_stored * val_scale;   // -> true units
+                // BUG FIX: out_scale/output_importance_scale were never read
+                // here, unlike disldo_backward's identical row*col
+                // combination -- see delta_csr_forward's matching fix.
+                const value_type  out_scale = weights.get_output_scale(col);
+                const value_type  combined_scale = val_scale * out_scale;
+                const value_type  w        = w_stored * combined_scale;   // -> true units
 
                 // Merge-advance (both this row's columns and the gradient's
                 // columns are sorted ascending) -- O(nnz_this_row + grad_nnz)
@@ -466,21 +481,26 @@ void delta_csr_backward_sparse_grad(
                 dx_accum += w * dy_val;   // weight-only -- reaches this row regardless of in_val
 
                 if (learning_rate != value_type(0)) {
+                    const value_type out_imp_scale = weights.get_output_importance_scale(col);
+                    const value_type combined_imp_scale = imp_scale * out_imp_scale;
                     const value_type grad = dy_val * in_val;   // scales with true input value
                     const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    value_type imp = stored_imp * imp_scale;   // -> true units
+                    value_type imp = stored_imp * combined_imp_scale;   // -> true units
                     imp -= grad * effective_lr;
                     const value_type new_w = w + (-effective_lr * grad)
                                               / (value_type(1) + std::abs(imp));
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / val_scale, imp / imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
                     batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
                     batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
                     batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
-                    // value_scale gradient: w_stored * dy_val * in_val
-                    scale_grad_sums[r] += static_cast<double>(w_stored) * (scale_eff_lr * dy_val * in_val);
+                    // value_scale gradient: stored_w * out_scale[col] * dy_val * in_val
+                    // (true_w = stored_w * val_scale * out_scale, so val_scale's own
+                    // gradient holds out_scale fixed -- see disldo_backward's comment).
+                    scale_grad_sums[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
+                                          * (scale_eff_lr * dy_val * in_val);
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
