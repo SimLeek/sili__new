@@ -374,7 +374,8 @@ class FoldedLayer(Module):
                         max_row_weights: int = 0,
                         bytes_per_row: int = 0,
                         value_scale_mode: str = "per_row",
-                        rank1_iters: int = 6) -> "FoldedLayer":
+                        rank1_iters: int = 6,
+                        compact_after_build: bool = True) -> "FoldedLayer":
         """
         Build a FoldedLayer from a FoldedBlockDescriptor.
 
@@ -402,6 +403,13 @@ class FoldedLayer(Module):
                              pretrained-weight conversion.
           rank1_iters      -- alternating-fit iterations for "rank1" mode
                              (ignored otherwise); see fit_rank1_scale_envelope.
+          compact_after_build -- strip equalize_to_capacity's per-row growth
+                             headroom right after loading (default True).
+                             Measured on a real checkpoint: dropped 7 suffixes'
+                             combined RSS from ~1.9x to ~1.08x the 2-bytes/param
+                             theoretical minimum. Call expand_headroom_to() on
+                             the built layer before synaptogenesis needs room
+                             to grow again.
         """
         import numpy as np
         import torch as _torch   # local import: conversion step only -- sili does
@@ -503,6 +511,8 @@ class FoldedLayer(Module):
                 bpr  = mrw * typ + 4       # +4 bytes margin per step
 
             layer.equalize_to_capacity(mrw, bpr)
+            if compact_after_build:
+                layer.compact()
 
             layers[suffix] = layer
 
