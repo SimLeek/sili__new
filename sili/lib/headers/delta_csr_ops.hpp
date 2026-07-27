@@ -419,6 +419,8 @@ void delta_csr_backward_sparse_grad(
     std::vector<double> scale_grad_sums(n_inputs, 0.0);
     if (weights.value_scale.size() < n_inputs)
         weights.value_scale.resize(n_inputs, value_type(1));
+    if (weights.value_scale_importance.size() < n_inputs)
+        weights.value_scale_importance.resize(n_inputs, value_type(0));
 
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
@@ -519,10 +521,18 @@ void delta_csr_backward_sparse_grad(
         // Apply value_scale gradient once per row, after ALL batches.
         // scale_grad_sums[r] already has scale_eff_lr folded in
         // (multiplied per-synapse during accumulation above so the final
-        // subtraction is just a direct assignment-minus).
+        // subtraction is just a direct assignment-minus). Damped by
+        // value_scale_importance, same pattern as disldo_backward's
+        // matching update (importance updates first, undamped, then the
+        // value_scale step itself is damped by the freshly-updated
+        // importance) -- this path never got that fix when it was added
+        // to disldo_backward.
         for (std::size_t r = 0; r < n_inputs; ++r) {
             if (scale_grad_sums[r] == 0.0) continue;
-            weights.value_scale[r] -= static_cast<value_type>(scale_grad_sums[r]);
+            const value_type raw_update = static_cast<value_type>(scale_grad_sums[r]);
+            weights.value_scale_importance[r] -= raw_update;
+            const value_type vs_imp = weights.value_scale_importance[r];
+            weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
         }
     }
 }

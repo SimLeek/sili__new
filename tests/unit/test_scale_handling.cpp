@@ -912,18 +912,17 @@ TEST_CASE("delta_csr_backward_sparse_grad's dx and value_scale gradient account 
     // value_scale's own gradient must also account for the fixed output_scale
     // factor: g = dy*in = 1.0, scale_grad_sum = w_stored * out_scale * g =
     // 2.0*0.5*1.0 = 1.0, scale_eff_lr = lr/nnz_this_row = 0.1/1 = 0.1,
-    // raw_update = 0.1. NOTE: unlike disldo_backward, this path's own
-    // value_scale update is plain undamped SGD (value_scale[r] -=
-    // scale_grad_sums[r]), not importance-damped -- a real, separate
-    // inconsistency from disldo_backward's later damping fix, not
-    // addressed by this output_scale fix.
+    // raw_update = 0.1, importance = 0-0.1 = -0.1, damped step = 0.1/1.1
+    // (same importance-damping pattern as disldo_backward's own
+    // value_scale update).
     std::vector<float> dx2(1, 0.0f), in_acc2(1, 0.0f), gr_acc2(1, 0.0f);
     delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), weights, dy, dx2.data(), in_acc2.data(), gr_acc2.data(),
         /*learning_rate=*/0.1f, 1);
     const float raw_update = 0.1f * (2.0f * 0.5f * 1.0f);
-    const float expected_scale = 4.0f - raw_update;
+    const float expected_scale = 4.0f - raw_update / (1.0f + std::abs(-raw_update));
     // value_scale stores the ROW factor only (4.0 -> expected_scale); output_scale
     // (0.5) stays fixed, so true_w after update = expected_scale * 0.5.
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
+    CHECK(weights.get_value_scale_importance(0) == Catch::Approx(-raw_update).margin(1e-3f));
 }
