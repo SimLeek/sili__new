@@ -246,7 +246,12 @@ struct ValueAccessor<FP4BiPacked> {
         v[0][i] = w;
         v[1][i] = imp;
     }
-    static void reserve(FP4BiPacked& v, std::size_t n) { 
+    /// Gradient-driven update only -- see fp4_quantize_stochastic()'s
+    /// docstring (fp4quant.hpp) for why this is separate from set().
+    static void set_stochastic(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v.set_stochastic(i, w, imp);
+    }
+    static void reserve(FP4BiPacked& v, std::size_t n) {
         v.reserve(n); 
     }
     static void resize(FP4BiPacked& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) { 
@@ -279,6 +284,13 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     static void set(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
         v.weights[i] = w;
         v.importance[i] = imp;
+    }
+    /// No quantization happens for this (float32 fallback) storage, so
+    /// stochastic rounding is meaningless here -- passthrough to set()
+    /// so callers that always use set_stochastic() for gradient-driven
+    /// updates work identically against either VALUES_TYPE.
+    static void set_stochastic(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        set(v, i, w, imp);
     }
     static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0), value_type imp = value_type(0)) {
         v.weights.resize(n, val);

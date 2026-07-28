@@ -125,7 +125,7 @@ void disldo_forward(
                         const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         value_type imp = stored_imp * combined_imp_scale;   // -> true units
                         imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w_stored, imp / combined_imp_scale);
+                        ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, w_stored, imp / combined_imp_scale);
                         // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
                         // rounds to the nearest FP4_TABLE entry, so it can differ from what
                         // was just written. Stats must track what's really in the buffer.
@@ -367,7 +367,7 @@ void disldo_backward(
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));

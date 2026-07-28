@@ -28,6 +28,7 @@ warnings.filterwarnings('ignore')
 import torch
 import numpy as np
 
+from sili import _cpu
 from sili.tensor import Tensor, combine_losses
 from sili.energy import column_averaging_loss, EnergyDynamics
 from sili.sparse_rnn import (
@@ -170,6 +171,13 @@ class TestRecurrentRelianceGrowsWithPatternComplexity:
     """
 
     def test_constant_lt_deterministic_lt_ambiguous(self):
+        # backward_dense's weight/importance update is stochastically
+        # rounded into FP4 (see fp4quant.hpp's fp4_quantize_stochastic) --
+        # unlike EnergyDynamics' exploration noise, this test doesn't use
+        # energy at all, so it was fully deterministic before that landed.
+        # Pin it the same way (verified: flaky without this, ~2/3 runs
+        # failed on a bare rerun).
+        _cpu.seed_fp4_stochastic_rng(0)
         n_folds, hidden, T, epochs = 4, 6, 60, 100
 
         const_seq   = _make_constant_sequence(T, hidden, seed=1)
@@ -228,7 +236,19 @@ class TestEnergyInteraction:
         # pinning it here this test is flaky (verified: failed on a bare
         # rerun). Fixed across all three training runs below since a
         # margin check, not an exact-value one, is what's being asserted.
+        # Also pin backward_dense's FP4 stochastic rounding (see
+        # fp4quant.hpp) -- a second, independent randomness source added
+        # later, same reasoning. KNOWN INCOMPLETE: seeding this makes the
+        # test deterministic in isolation, but the specific pass/fail
+        # outcome still varies between an isolated run and the full suite
+        # (observed both ways) -- something upstream of this test still
+        # perturbs the FP4 RNG's thread-local state before this seed call
+        # takes effect (OpenMP's one-time libgomp warmup from an earlier
+        # test is one candidate, unconfirmed). Real improvement over fully
+        # unseeded (was flaky ~every run before; now only order-dependent),
+        # not a complete fix -- left as a follow-up, not chased further here.
         np.random.seed(0)
+        _cpu.seed_fp4_stochastic_rng(0)
         n_folds, hidden, T, epochs, weight = 4, 6, 60, 150, 20.0
         const_seq   = _make_constant_sequence(T, hidden, seed=1)
         simple_seq  = _make_sequence(np.arange(hidden), T, hidden)

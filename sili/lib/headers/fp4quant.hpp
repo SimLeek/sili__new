@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 // ── FP4 lookup table — "FP4 All the Way" ─────────────────────────────────────
@@ -41,6 +42,95 @@ inline uint8_t fp4_quantize(float v) {
         if (err < best_err) { best_err = err; best = i; }
     }
     return best;
+}
+
+// ── Stochastic rounding ───────────────────────────────────────────────────────
+//
+// fp4_quantize() above is deterministic nearest-neighbour: a gradient-driven
+// update too small to cross the midpoint between two FP4_TABLE entries is
+// silently discarded, every single time, with no memory of the near-miss --
+// there's no persistent float32 "master weight" anywhere in this storage (see
+// linear_disldo.hpp's disldo_forward/disldo_backward, which dequantize the
+// CURRENTLY-STORED code, add the update, and requantize immediately). That's
+// fine for one-shot construction/conversion (nearest-neighbour is the best
+// single-shot approximation) but makes small/gradual training updates
+// impossible: real per-synapse gradients here are routinely too small to
+// cross even the finest FP4 gap (0->0.5) in one step, and with round-to-
+// nearest they never accumulate toward doing so on a later step either.
+//
+// Standard fix from low-precision training literature (Gupta et al. 2015,
+// "Deep Learning with Limited Numerical Precision", and used by essentially
+// every training scheme with quantized weights and no master-weight copy,
+// including modern large-model FP4 training): STOCHASTIC rounding. Round up
+// or down with probability proportional to how close v is to each neighbour,
+// so E[quantized value] == v exactly. A single small update then has a small
+// but real, unbiased CHANCE of flipping the stored code, and the expected
+// drift over many steps correctly tracks the true (unquantized) gradient
+// signal -- unlike round-to-nearest, which has no expected drift at all for
+// sub-half-gap updates.
+//
+// Deliberately NOT a replacement for fp4_quantize() -- only the gradient-
+// driven update sites (disldo_forward's importance update, disldo_backward's
+// weight+importance update) should use this; construction/loading/compact/
+// synaptogenesis-insert must stay exactly deterministic (repacking or
+// reloading the same content must not randomly perturb existing values).
+
+// FP4_TABLE's 15 non-NaN indices, sorted ascending by VALUE (not by index --
+// the raw table interleaves positive codes 0-7 and negative codes 9-15).
+static constexpr uint8_t FP4_SORTED_IDX[15] = {
+    15, 14, 13, 12, 11, 10, 9, 0, 1, 2, 3, 4, 5, 6, 7,
+    // -6  -4  -3  -2 -1.5 -1 -.5 0 .5  1 1.5  2  3  4  6
+};
+
+/// Fast, thread-local, non-cryptographic PRNG (xorshift64*) for stochastic
+/// rounding -- called from within OpenMP-parallelized per-synapse loops, so
+/// a shared/global generator would mean either a data race or lock
+/// contention on every single synapse update. Seeded once per thread from
+/// its id by default -- explicitly reseedable via fp4_seed_stochastic_rng()
+/// for tests that need reproducibility, same precedent as EnergyDynamics'
+/// own unseeded-by-default exploration noise (np.random.seed(0) pinned by
+/// callers that need it, see test_column_averaging_predictive.py).
+inline uint64_t& fp4_stochastic_rng_state() {
+    thread_local uint64_t state =
+        (std::hash<std::thread::id>{}(std::this_thread::get_id()) ^ 0x9E3779B97F4A7C15ULL) | 1ULL;
+    return state;
+}
+
+/// Reseeds the CALLING thread's stochastic-rounding RNG. Single-threaded
+/// callers (tests, small examples) get full reproducibility this way; a
+/// multi-threaded (OpenMP) caller would need to call this once per worker
+/// thread to pin all of them, which no caller currently needs -- training
+/// runs are meant to be stochastic across threads too, this is for
+/// unit-test determinism, not for controlling a real training run's outcome.
+inline void fp4_seed_stochastic_rng(uint64_t seed) {
+    fp4_stochastic_rng_state() = (seed ^ 0x9E3779B97F4A7C15ULL) | 1ULL;
+}
+
+inline float fp4_stochastic_uniform01() {
+    uint64_t& s = fp4_stochastic_rng_state();
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    const uint64_t r = s * 0x2545F4914F6CDD1DULL;
+    return static_cast<float>((r >> 40) * (1.0 / 16777216.0));  // top 24 bits -> [0,1)
+}
+
+/// Stochastic quantize @p v to a 4-bit FP4 index -- unbiased (E[result] == v
+/// for v within the representable range [-6,6]; clamps deterministically
+/// outside it, same as fp4_quantize() would).
+inline uint8_t fp4_quantize_stochastic(float v) {
+    constexpr float lo_bound = FP4_TABLE[FP4_SORTED_IDX[0]];
+    constexpr float hi_bound = FP4_TABLE[FP4_SORTED_IDX[14]];
+    if (v <= lo_bound) return FP4_SORTED_IDX[0];
+    if (v >= hi_bound) return FP4_SORTED_IDX[14];
+
+    for (int k = 0; k < 14; ++k) {
+        const float lo_val = FP4_TABLE[FP4_SORTED_IDX[k]];
+        const float hi_val = FP4_TABLE[FP4_SORTED_IDX[k + 1]];
+        if (v <= hi_val) {
+            const float p_up = (v - lo_val) / (hi_val - lo_val);
+            return (fp4_stochastic_uniform01() < p_up) ? FP4_SORTED_IDX[k + 1] : FP4_SORTED_IDX[k];
+        }
+    }
+    return fp4_quantize(v);  // unreachable given the bounds checks above; safe fallback
 }
 
 // ── FP4BiPacked ───────────────────────────────────────────────────────────────
@@ -205,7 +295,14 @@ struct FP4BiPacked {
                                 |  fp4_quantize(importance)));
     }
 
-    
+    /// Gradient-driven update only -- see fp4_quantize_stochastic()'s own
+    /// docstring for why this exists separately from operator[]=/resize/
+    /// push_back (all of which stay deterministic on purpose).
+    void set_stochastic(std::size_t i, float weight, float importance) {
+        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] = uint8_t((fp4_quantize_stochastic(weight) << 4)
+                             |  fp4_quantize_stochastic(importance));
+    }
 
     void clear() { if (_data) _data->clear(); }
 

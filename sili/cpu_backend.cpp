@@ -1130,6 +1130,16 @@ PYBIND11_MODULE(_cpu, m)
         "Exact top-k sparsity conversion for forward and backward passes."
     );
 
+    m.def("seed_fp4_stochastic_rng", &fp4_seed_stochastic_rng, py::arg("seed"),
+        "Reseed the CALLING thread's FP4 stochastic-rounding RNG (see "
+        "fp4quant.hpp's fp4_quantize_stochastic -- used by disldo_forward's "
+        "importance update and disldo_backward's weight+importance update, "
+        "NOT by construction/loading/compact, which stay deterministic). "
+        "For single-threaded test reproducibility, same precedent as pinning "
+        "np.random.seed(0) for EnergyDynamics' own unseeded exploration "
+        "noise -- does not control a real (OpenMP-parallel) training run's "
+        "outcome, only this one thread's RNG state.");
+
     // ── csr_union ─────────────────────────────────────────────────────────────
     // OpenMP-parallel replacement for sili.sparse_rnn.csr_union's Python loop
     // (see csr.hpp's csr_union<>) -- construction/loading-time CSR merge only.
