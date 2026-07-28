@@ -216,6 +216,18 @@ void disldo_forward(
  * @param neuron_grad_accum  [out_cols] |output_grad| accumulator for synaptogenesis.
  * @param learning_rate     Update step.
  * @param num_cpus          Thread count.
+ * @param damp_by_importance When true (default): the weight update is
+ *        divided by (1+|ci|), so a synapse that's accumulated a lot of
+ *        same-direction gradient pressure gets progressively smaller
+ *        steps -- a per-synapse adaptive-learning-rate effect. When
+ *        false: the raw (-effective_lr * g) step is applied directly,
+ *        with no damping -- ci is still tracked/updated identically
+ *        either way (importance stays meaningful for pruning/
+ *        synaptogenesis decisions regardless), only its use as a
+ *        WEIGHT-UPDATE damping factor is toggled. Exists specifically
+ *        so a caller can A/B this mechanism against itself on the same
+ *        kernel -- see sili_peridot's/sili__new's importance-damping-
+ *        as-optimizer integration test.
  *
  * NOTE (test): with learning_rate=0, input_grad must equal W_dense^T @ output_grad
  * per batch sample, weights/importance unchanged. Same reference check as
@@ -233,7 +245,8 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
     int          num_cpus = 4,
-    bool         lr_per_row_nnz = false)
+    bool         lr_per_row_nnz = false,
+    bool         damp_by_importance = true)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
@@ -356,7 +369,9 @@ void disldo_backward(
 
                     if (learning_rate != value_type(0)) {
                         ci -= g * effective_lr;
-                        cw += (-effective_lr * g) / (value_type(1) + std::abs(ci));
+                        cw += damp_by_importance
+                            ? (-effective_lr * g) / (value_type(1) + std::abs(ci))
+                            : (-effective_lr * g);
                         // dL/d(val_scale[r]) = stored_w * out_scale[col] * dy * input
                         // dL/d(out_scale[col]) = stored_w * val_scale[r] * dy * input
                         // (true_w = stored_w * val_scale * out_scale, so each

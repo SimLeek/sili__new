@@ -304,7 +304,8 @@ public:
 
     // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
 
-    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false) {
+    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+                                  bool damp_by_importance = true) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE>(
@@ -313,7 +314,7 @@ public:
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz);
+            num_cpus, lr_per_row_nnz, damp_by_importance);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -832,7 +833,14 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"), py::arg("learning_rate") = 0.01f)
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false)
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true,
+             "damp_by_importance=True (default): weight update divided by\n"
+             "(1+|importance|), a per-synapse adaptive-learning-rate effect.\n"
+             "False: raw update, no damping -- importance is still tracked\n"
+             "identically either way, only its use to shape the weight step\n"
+             "is toggled. For A/B-testing whether the damping itself helps\n"
+             "optimization, not for production use.")
         .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
              py::arg("batch"), py::arg("learning_rate") = 0.0f)
