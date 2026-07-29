@@ -79,10 +79,83 @@ double bench_ntiles(F&& fn, int n_tiles, int reps = 200) {
     return best / n_tiles;  // seconds per tile
 }
 
+// ---- Hand-written SSE intrinsics, BS=4 (exactly one __m128 register --
+// what dense_block4.hpp actually uses in production) ----
+void block_matvec_sse_4x4(const float* W_colmajor, const float* x, float* y) {
+    __m128 acc = _mm_loadu_ps(y);
+    for (int j = 0; j < 4; ++j) {
+        __m128 wcol = _mm_loadu_ps(W_colmajor + j * 4);
+        __m128 xj   = _mm_set1_ps(x[j]);
+        acc = _mm_fmadd_ps(wcol, xj, acc);
+    }
+    _mm_storeu_ps(y, acc);
+}
+
 int main() {
     const int N_TILES = 100000;  // enough tiles to make timing loop overhead negligible
     std::mt19937 rng(1);
     std::uniform_real_distribution<float> wv(-1, 1);
+
+    // ---- BS=2 (does a SIMD-width-2 tile get any real benefit at all?) ----
+    {
+        std::vector<float> W(size_t(N_TILES) * 4), x(size_t(N_TILES) * 2), y(size_t(N_TILES) * 2, 0.f);
+        for (auto& v : W) v = wv(rng);
+        for (auto& v : x) v = wv(rng);
+
+        double t_auto = bench_ntiles<2>([&] {
+            for (int t = 0; t < N_TILES; ++t)
+                block_matvec_auto<2>(&W[size_t(t) * 4], &x[size_t(t) * 2], &y[size_t(t) * 2]);
+        }, N_TILES);
+        std::fill(y.begin(), y.end(), 0.f);
+        double t_scalar = bench_ntiles<2>([&] {
+            for (int t = 0; t < N_TILES; ++t) {
+                float* yt = &y[size_t(t) * 2];
+                const float* Wt = &W[size_t(t) * 4];
+                const float* xt = &x[size_t(t) * 2];
+                for (int j = 0; j < 2; ++j)
+                    for (int i = 0; i < 2; ++i) yt[i] += Wt[j * 2 + i] * xt[j];
+            }
+        }, N_TILES);
+        printf("=== BS=2 (4 slots/tile) ===\n");
+        printf("scalar          : %8.2f ns/tile  %8.1f Mtile/s  %8.1f Mslot/s\n",
+               t_scalar * 1e9, 1.0 / t_scalar * 1e-6, 4.0 / t_scalar * 1e-6);
+        printf("auto (omp simd) : %8.2f ns/tile  %8.1f Mtile/s  %8.1f Mslot/s  (%.2fx vs scalar)\n\n",
+               t_auto * 1e9, 1.0 / t_auto * 1e-6, 4.0 / t_auto * 1e-6, t_scalar / t_auto);
+    }
+
+    // ---- BS=4 (what dense_block4.hpp actually uses) ----
+    {
+        std::vector<float> W(size_t(N_TILES) * 16), x(size_t(N_TILES) * 4), y(size_t(N_TILES) * 4, 0.f);
+        for (auto& v : W) v = wv(rng);
+        for (auto& v : x) v = wv(rng);
+
+        double t_auto = bench_ntiles<4>([&] {
+            for (int t = 0; t < N_TILES; ++t)
+                block_matvec_auto<4>(&W[size_t(t) * 16], &x[size_t(t) * 4], &y[size_t(t) * 4]);
+        }, N_TILES);
+        std::fill(y.begin(), y.end(), 0.f);
+        double t_sse = bench_ntiles<4>([&] {
+            for (int t = 0; t < N_TILES; ++t)
+                block_matvec_sse_4x4(&W[size_t(t) * 16], &x[size_t(t) * 4], &y[size_t(t) * 4]);
+        }, N_TILES);
+        std::fill(y.begin(), y.end(), 0.f);
+        double t_scalar = bench_ntiles<4>([&] {
+            for (int t = 0; t < N_TILES; ++t) {
+                float* yt = &y[size_t(t) * 4];
+                const float* Wt = &W[size_t(t) * 16];
+                const float* xt = &x[size_t(t) * 4];
+                for (int j = 0; j < 4; ++j)
+                    for (int i = 0; i < 4; ++i) yt[i] += Wt[j * 4 + i] * xt[j];
+            }
+        }, N_TILES);
+        printf("=== BS=4 (16 slots/tile) ===\n");
+        printf("scalar          : %8.2f ns/tile  %8.1f Mtile/s  %8.1f Mslot/s\n",
+               t_scalar * 1e9, 1.0 / t_scalar * 1e-6, 16.0 / t_scalar * 1e-6);
+        printf("auto (omp simd) : %8.2f ns/tile  %8.1f Mtile/s  %8.1f Mslot/s  (%.2fx vs scalar)\n",
+               t_auto * 1e9, 1.0 / t_auto * 1e-6, 16.0 / t_auto * 1e-6, t_scalar / t_auto);
+        printf("hand SSE        : %8.2f ns/tile  %8.1f Mtile/s  %8.1f Mslot/s  (%.2fx vs scalar)\n\n",
+               t_sse * 1e9, 1.0 / t_sse * 1e-6, 16.0 / t_sse * 1e-6, t_scalar / t_sse);
+    }
 
     // ---- BS=8 ----
     {

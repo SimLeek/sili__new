@@ -32,6 +32,49 @@ would carry different structural decisions (which regions ended up in
 the block path vs. the scattered disldo path) than the same model
 targeting 8x8 or 16x16 on different hardware.
 
+**Checked directly (not assumed) whether going SMALLER helps: it
+doesn't, and 2x2 is a real regression, not just a non-improvement.**
+Extended `bench_block_kernel.cpp` with BS=2: `#pragma omp simd`
+vectorization attempted on a 2-lane accumulator came out **0.66x
+scalar (34% SLOWER)** -- the setup/teardown cost of vectorizing
+something that thin exceeds any benefit, and 2 lanes can't fill even a
+128-bit SSE register's 4-float width. BS=4 (this file's actual choice)
+gets a real but modest 1.23-1.29x; the benefit climbs with tile size
+on this hardware's 4-wide ceiling (BS=8: ~2.2-2.3x, BS=16: ~2.5-2.6x,
+diminishing returns past the point where a tile fills more than one
+native register's worth of work per fixed per-tile overhead). The
+general principle, likely true on other hardware too, not just this
+chip: **the tile needs to be at least as wide as the machine's native
+SIMD register (in float32 lanes) to see any real benefit at all** --
+below that, you pay vectorization overhead for zero (or negative)
+return, regardless of architecture. 4x4 is this CPU's floor as well as
+its ceiling (its native width IS effectively 4, given AVX2's
+double-pumped behavior here); a real AVX2 or AVX-512 machine's floor
+would likely sit at 8x8 or 16x16 respectively, not lower -- 2x2 or even
+4x4 tiles would likely under-fill their wider native registers the
+same way 2x2 under-fills this one.
+
+## Future idea: compile-time architecture detection, multiple tile sizes, runtime promotion/demotion between them
+
+Noted for later, not scoped or built: GCC can detect the target
+architecture at build time (`-march=native`, or explicit
+`__builtin_cpu_supports("avx512f")`-style runtime dispatch), so a real
+production version of this design could compile SEVERAL tile-size
+variants (4x4, 8x8, 16x16 -- whichever the detected hardware's native
+SIMD width actually supports well, per the finding above) into the
+same binary, with a **runtime promotion/demotion policy choosing
+between them per region**, not just choosing once between "block4 vs
+disldo" per tile the way this prototype does. This is a direct
+generalization of Fable's own `sparse_format_controller.hpp`
+`Controller` (measured bits/param + hysteresis + dwell count, deciding
+packed vs. banked per layer) -- the same idea, extended to a THIRD axis
+(tile size) rather than just two codecs. Not attempted here: the
+breakeven-fill-rate sweep would need to be re-run per candidate tile
+size on the SAME machine to know when promotion between sizes is
+actually worth it, and the memory/bookkeeping cost of maintaining
+multiple live tile-size regions in one layer is a real, unexplored
+design question of its own.
+
 ## Structure matters at least as much as tile size
 
 The real breakeven check on uniform-random synthetic data (fill rate
