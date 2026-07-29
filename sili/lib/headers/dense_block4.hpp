@@ -93,6 +93,164 @@ inline void block4_forward(const Block4Weights& bw, const float* x, float* y, in
     }
 }
 
+// ── Backward: transpose + dx, then a separate weight-update pass ──
+//
+// Forward walks row=output (y[r] += W[r,c]*x[c]); backward-dx needs
+// dx[c] += W[r,c]*dy[r], summing over ROWS for a FIXED column -- the
+// opposite direction. Same structural reason Fable's own banked/packed
+// codecs need dual CSR/CSC storage (see THEORY.md Lecture 1: "gather
+// form... needs no atomics... is why we insist on two views"). Rather
+// than scatter (which would throw away the whole reason block4 exists),
+// build a transposed copy once and reuse block4_forward's exact
+// validated kernel shape on it.
+
+// Byte-for-byte 4x4 transpose of one tile: tile_bytes[j*4+i] (original
+// convention, see split_for_block4) becomes tile_bytes[i*4+j] in the
+// transposed structure -- a literal matrix transpose of the 16-byte tile.
+inline Block4Weights transpose_block4(const Block4Weights& bw) {
+    Block4Weights t;
+    t.n_block_rows = bw.n_block_cols;
+    t.n_block_cols = bw.n_block_rows;
+    // row_scale here is keyed by ORIGINAL OUTPUT row (unchanged meaning),
+    // which is now the COLUMN dimension of the transposed tile -- consumed
+    // per-j (not per-i) in block4_backward_dx below.
+    t.row_scale = bw.row_scale;
+
+    struct Entry { uint32_t local_i, local_j; uint8_t byte; };
+    std::vector<std::vector<Entry>> tiles(std::size_t(t.n_block_rows) * t.n_block_cols);
+    for (uint32_t br = 0; br < bw.n_block_rows; ++br) {
+        const uint32_t nblocks = bw.block_ptrs[br + 1] - bw.block_ptrs[br];
+        std::size_t bytepos = bw.block_byte_ptrs[br];
+        uint32_t prev = 0;
+        const uint8_t* data = bw.block_data.data() + std::size_t(bw.block_ptrs[br]) * 16;
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            std::size_t dlen = 0;
+            uint32_t delta = uleb128_decode<uint32_t>(bw.block_col_bytes.data() + bytepos, dlen);
+            bytepos += dlen;
+            const uint32_t bc = prev + delta;
+            prev = bc;
+            const uint8_t* Wb = data + std::size_t(b) * 16;
+            for (int j = 0; j < 4; ++j) {
+                for (int i = 0; i < 4; ++i) {
+                    const uint8_t byte = Wb[j * 4 + i];
+                    if ((byte & 0xFu) == 0) continue;
+                    // new tile at (new_br=bc, new_bc=br); new_local_i=j, new_local_j=i
+                    tiles[std::size_t(bc) * t.n_block_cols + br].push_back({uint32_t(j), uint32_t(i), byte});
+                }
+            }
+        }
+    }
+
+    t.block_ptrs.assign(t.n_block_rows + 1, 0);
+    t.block_byte_ptrs.assign(t.n_block_rows + 1, 0);
+    for (uint32_t br = 0; br < t.n_block_rows; ++br) {
+        uint32_t prev_bc = 0;
+        for (uint32_t bc = 0; bc < t.n_block_cols; ++bc) {
+            auto& tl = tiles[std::size_t(br) * t.n_block_cols + bc];
+            if (tl.empty()) continue;
+            uint8_t tile_bytes[16] = {0};
+            for (auto& e : tl) tile_bytes[e.local_j * 4 + e.local_i] = e.byte;
+            uint8_t tmp[6];
+            std::size_t dlen = uleb128_encode<uint32_t>(bc - prev_bc, tmp);
+            t.block_col_bytes.insert(t.block_col_bytes.end(), tmp, tmp + dlen);
+            t.block_data.insert(t.block_data.end(), tile_bytes, tile_bytes + 16);
+            prev_bc = bc;
+            t.block_ptrs[br + 1]++;
+        }
+        t.block_ptrs[br + 1] += t.block_ptrs[br];
+        t.block_byte_ptrs[br + 1] = uint32_t(t.block_col_bytes.size());
+    }
+    return t;
+}
+
+// dx[4*r : 4*r+4] += sum over this (transposed) block-row's active blocks
+// of W_block^T @ dy[4*bcol : 4*bcol+4]. bw_t must be transpose_block4()'s
+// output. Same kernel shape as block4_forward, reused -- the only real
+// difference is row_scale is consumed per-j here (it's keyed by the
+// original OUTPUT row, which is this structure's column dimension), not
+// per-i like block4_forward's own row_scale usage.
+inline void block4_backward_dx(const Block4Weights& bw_t, const float* dy, float* dx, int num_cpus) {
+    #pragma omp parallel for schedule(static) num_threads(num_cpus)
+    for (int64_t rr = 0; rr < int64_t(bw_t.n_block_rows); ++rr) {
+        const uint32_t r = uint32_t(rr);
+        const uint32_t nblocks = bw_t.block_ptrs[r + 1] - bw_t.block_ptrs[r];
+        float xl[4] = {0.f, 0.f, 0.f, 0.f};
+        std::size_t bytepos = bw_t.block_byte_ptrs[r];
+        uint32_t prev = 0;
+        const uint8_t* data = bw_t.block_data.data() + std::size_t(bw_t.block_ptrs[r]) * 16;
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            std::size_t dlen = 0;
+            uint32_t delta = uleb128_decode<uint32_t>(bw_t.block_col_bytes.data() + bytepos, dlen);
+            bytepos += dlen;
+            const uint32_t bcol = prev + delta;
+            prev = bcol;
+            const uint8_t* Wb = data + std::size_t(b) * 16;
+            const float* dyb = dy + std::size_t(bcol) * 4;
+            const float rs0 = bw_t.row_scale[bcol * 4 + 0], rs1 = bw_t.row_scale[bcol * 4 + 1],
+                        rs2 = bw_t.row_scale[bcol * 4 + 2], rs3 = bw_t.row_scale[bcol * 4 + 3];
+            #pragma omp simd
+            for (int j = 0; j < 4; ++j) {
+                xl[j] += FP4_TABLE[Wb[0 * 4 + j] & 0xFu] * rs0 * dyb[0]
+                       + FP4_TABLE[Wb[1 * 4 + j] & 0xFu] * rs1 * dyb[1]
+                       + FP4_TABLE[Wb[2 * 4 + j] & 0xFu] * rs2 * dyb[2]
+                       + FP4_TABLE[Wb[3 * 4 + j] & 0xFu] * rs3 * dyb[3];
+            }
+        }
+        dx[r * 4 + 0] += xl[0]; dx[r * 4 + 1] += xl[1]; dx[r * 4 + 2] += xl[2]; dx[r * 4 + 3] += xl[3];
+    }
+}
+
+// In-place weight update: w -= effective_lr*g/(1+|ci|), ci -= g*effective_lr,
+// g = dy[r]*x[c] -- same damped-importance formula as disldo_backward
+// (linear_disldo.hpp), same fp4_quantize_stochastic write path (matching
+// the stochastic-rounding fix this project already made to disldo's own
+// gradient-driven writes -- deterministic round-to-nearest at these
+// small updates would silently no-op the same way disldo's did before
+// that fix). Walks the ORIGINAL (row=output) structure -- no transpose
+// needed for the update itself, only dx needed one.
+inline void block4_weight_update(Block4Weights& bw, const float* x, const float* dy,
+                                 float learning_rate, int num_cpus) {
+    if (learning_rate == 0.0f) return;
+    #pragma omp parallel for schedule(static) num_threads(num_cpus)
+    for (int64_t rr = 0; rr < int64_t(bw.n_block_rows); ++rr) {
+        const uint32_t r = uint32_t(rr);
+        const uint32_t nblocks = bw.block_ptrs[r + 1] - bw.block_ptrs[r];
+        const float rs[4] = {bw.row_scale[r * 4 + 0], bw.row_scale[r * 4 + 1],
+                              bw.row_scale[r * 4 + 2], bw.row_scale[r * 4 + 3]};
+        const float dyl[4] = {dy[r * 4 + 0], dy[r * 4 + 1], dy[r * 4 + 2], dy[r * 4 + 3]};
+        std::size_t bytepos = bw.block_byte_ptrs[r];
+        uint32_t prev = 0;
+        uint8_t* data = bw.block_data.data() + std::size_t(bw.block_ptrs[r]) * 16;
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            std::size_t dlen = 0;
+            uint32_t delta = uleb128_decode<uint32_t>(bw.block_col_bytes.data() + bytepos, dlen);
+            bytepos += dlen;
+            const uint32_t bcol = prev + delta;
+            prev = bcol;
+            uint8_t* Wb = data + std::size_t(b) * 16;
+            const float xc0 = x[bcol * 4 + 0], xc1 = x[bcol * 4 + 1],
+                        xc2 = x[bcol * 4 + 2], xc3 = x[bcol * 4 + 3];
+            for (int j = 0; j < 4; ++j) {
+                const float xj = (j == 0) ? xc0 : (j == 1) ? xc1 : (j == 2) ? xc2 : xc3;
+                for (int i = 0; i < 4; ++i) {
+                    uint8_t& byte = Wb[j * 4 + i];
+                    const uint8_t code = byte & 0xFu;
+                    if (code == 0 && (byte >> 4) == 0) continue;   // fully sleeping slot
+                    const float g = dyl[i] * xj;
+                    if (g == 0.0f) continue;
+                    float cw = FP4_TABLE[code] * rs[i];
+                    float ci = FP4_TABLE[byte >> 4];   // importance stored unscaled (0..6 range directly, matches disldo's imp4 reuse of fp4_quantize)
+                    ci -= g * learning_rate;
+                    cw -= learning_rate * g / (1.0f + std::abs(ci));
+                    const uint8_t new_w4 = fp4_quantize_stochastic(cw / rs[i]);
+                    const uint8_t new_imp4 = fp4_quantize_stochastic(ci) & 0xFu;
+                    byte = uint8_t((new_imp4 << 4) | new_w4);
+                }
+            }
+        }
+    }
+}
+
 // ── Construction: split a CSR (ptrs/indices/weights) into a locally-dense
 // remainder (B, this file) and a scattered leftover (A, unchanged CSR
 // arrays for the caller to build via delta_csr_from_absolute as usual) ──
