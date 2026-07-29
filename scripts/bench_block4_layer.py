@@ -26,6 +26,18 @@ import numpy as np
 import sili._cpu as _cpu
 
 
+def block4_counts(layer):
+    # layer.block4 only exists on branches that have block4 at all -- the
+    # pre-block4 baseline this script also runs against (unmodified, see
+    # module docstring) has neither `block4` nor the older flat
+    # `block4_tiles`/`block4_synapses` properties it replaced, so both
+    # counts are legitimately 0 there.
+    b4 = getattr(layer, 'block4', None)
+    if b4 is None:
+        return 0, 0
+    return int(b4.tiles), int(b4.synapses)
+
+
 def dense_reference(layer, n_in, n_out, ptrs, indices, weights):
     # true_w = stored_w * value_scale[row] * output_scale[col] -- see
     # linear_disldo.hpp's disldo_forward. weights_vals returns STORED
@@ -130,8 +142,7 @@ def main():
               "args": vars(args)}
 
     report["nnz_before_growth"] = int(layer.nnz)
-    report["block4_tiles_before_growth"] = int(getattr(layer, 'block4_tiles', 0))
-    report["block4_synapses_before_growth"] = int(getattr(layer, 'block4_synapses', 0))
+    report["block4_tiles_before_growth"], report["block4_synapses_before_growth"] = block4_counts(layer)
 
     # Quality check BEFORE growth.
     dense0 = dense_reference(layer, n_in, n_out, layer.ptrs, layer.indices, layer.weights_vals)
@@ -163,8 +174,7 @@ def main():
     report["growth_phase_throws"] = n_throws
 
     report["nnz_after_growth"] = int(layer.nnz)
-    report["block4_tiles_after_growth"] = int(getattr(layer, 'block4_tiles', 0))
-    report["block4_synapses_after_growth"] = int(getattr(layer, 'block4_synapses', 0))
+    report["block4_tiles_after_growth"], report["block4_synapses_after_growth"] = block4_counts(layer)
 
     # Quality check AFTER growth -- must still match a dense reference
     # reconstructed from the (block4-aware, see delta_csr_combined_to_absolute)

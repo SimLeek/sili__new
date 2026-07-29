@@ -208,8 +208,18 @@ void delta_csr_combined_to_absolute(
                     const Block4Tile* tile = weights.block4.find(br, bc);
                     if (!tile) continue;
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                        if (!tile->is_live(li, lj)) continue;
                         const uint8_t byte = tile->at(li, lj);
+                        // A tile is dense (every slot is a real synapse --
+                        // see block4.hpp), but this export path shouldn't
+                        // flood the caller with empty filler slots; "byte
+                        // nonzero" (both nibbles, not just weight -- a
+                        // freshly-grown synapse starts at weight=0.0 with
+                        // only a nonzero importance) is a cheap, good-enough
+                        // heuristic for "worth exporting", not a liveness
+                        // oracle -- a slot trained to exactly (0.0, 0.0) is
+                        // simply skipped this call, same as it would be in
+                        // the scattered CSR path if pruned.
+                        if (byte == 0) continue;
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         if (col >= L.cols) continue;
                         row_entries.push_back({
@@ -681,7 +691,6 @@ void block4_maybe_promote(
                     const std::size_t vb = L.elem_start[row] + k;
                     const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    if (!tile->is_live(li, lj)) { tile->live_count++; tile->set_live(li, lj, true); }
                     tile->at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                     delta_csr_row_remove_col(dc, row, col);
                     return;
@@ -715,7 +724,6 @@ void block4_maybe_promote(
             const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
             const uint32_t fli = uint32_t(f.row - row_lo);
             const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
-            if (!tile.is_live(fli, flj)) { tile.live_count++; tile.set_live(fli, flj, true); }
             tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
         }
         // Removal happens after ALL reads above -- each row's synapses are
@@ -730,8 +738,9 @@ void block4_maybe_promote(
 // Pruning-only hook: demotes the WHOLE tile at (br,bc) back to the scattered
 // CSR -- every remaining live synapse in it moves into `connections` via
 // delta_csr_row_insert_col, then the tile is erased. Called only after a
-// block4-resident synapse was just pruned and the tile's live_count dropped
-// below BLOCK4_PROMOTE_MIN_LIVE (never called for growth). Throws if a
+// block4-resident synapse was just pruned and the tile's count_live() (an
+// on-demand scan, see block4.hpp) dropped below BLOCK4_PROMOTE_MIN_LIVE
+// (never called for growth). Throws if a
 // target row has run out of blank space -- same contract as
 // delta_csr_synap_row_step's own Step 6.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
@@ -755,8 +764,11 @@ void block4_demote_tile(
             const std::size_t row = row_lo + li;
             if (row >= L.rows) continue;
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                if (!tile->is_live(li, lj)) continue;
                 const uint8_t byte  = tile->at(li, lj);
+                // Same "byte nonzero" heuristic as the export path above --
+                // re-inserting an exactly-(0.0,0.0) slot into the scattered
+                // CSR would just be storing a meaningless entry.
+                if (byte == 0) continue;
                 const uint8_t wcode = byte & 0xFu;
                 const std::size_t col = col_lo + lj;
                 if (col >= L.cols) continue;
@@ -839,7 +851,14 @@ bool delta_csr_synap_row_step(
                 const Block4Tile* tile = weights.block4.find(br, bc);
                 if (!tile) continue;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    if (!tile->is_live(li, lj)) continue;
+                    // "Byte nonzero" as the discovery heuristic -- same
+                    // reasoning as the export/demote paths: a tile slot
+                    // trained to exactly (0.0, 0.0) isn't a meaningful
+                    // synapse for capacity/pruning accounting purposes,
+                    // same as an absent scattered CSR entry. Weight nibble
+                    // alone would miss a freshly-grown synapse (weight=0.0
+                    // by Step 6's insert convention, importance nonzero).
+                    if (tile->at(li, lj) == 0) continue;
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= L.cols) continue;
                     b4_bc.push_back(bc);
@@ -963,11 +982,13 @@ bool delta_csr_synap_row_step(
                 const uint32_t bc = uint32_t(re.col) / BLOCK4_TILE;
                 const uint32_t lj = uint32_t(re.col) % BLOCK4_TILE;
                 Block4Tile* tile = weights.block4.find(br, bc);
-                if (tile && tile->is_live(li, lj)) {
+                if (tile && tile->at(li, lj) != 0) {
                     tile->at(li, lj) = 0;
-                    tile->set_live(li, lj, false);
-                    if (tile->live_count > 0) tile->live_count--;
-                    if (tile->live_count < BLOCK4_PROMOTE_MIN_LIVE)
+                    // count_live() is a cheap O(16) on-demand scan (cold
+                    // path -- one prune event, not every backward call);
+                    // see block4.hpp for why there's no incrementally
+                    // tracked live_count anymore.
+                    if (tile->count_live() < BLOCK4_PROMOTE_MIN_LIVE)
                         block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
                 }
             }

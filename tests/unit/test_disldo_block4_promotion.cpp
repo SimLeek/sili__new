@@ -66,7 +66,7 @@ int main() {
 
     const Block4Tile* tile = weights.block4.find(0, 0);
     CHECK(tile != nullptr, "tile (0,0) must exist after promotion");
-    CHECK(tile->live_count == 2, "tile live_count should be 2, got %u", tile ? tile->live_count : 999u);
+    CHECK(tile->count_live() == 2, "tile count_live() should be 2, got %u", tile ? tile->count_live() : 999u);
 
     // out_degree must still correctly reflect BOTH synapses (never touched
     // by promotion -- see block4_maybe_promote's design comment).
@@ -81,7 +81,7 @@ int main() {
     CHECK(ok3, "third growth step should succeed");
     CHECK(weights.connections.layout.row_nnz(2) == 0, "row2's new synapse should migrate straight into the existing tile");
     tile = weights.block4.find(0, 0);
-    CHECK(tile->live_count == 3, "tile live_count should be 3 after single-synapse migration, got %u", tile->live_count);
+    CHECK(tile->count_live() == 3, "tile count_live() should be 3 after single-synapse migration, got %u", tile->count_live());
     CHECK(weights.out_degree[2] == 1, "out_degree[2] should be 1, got %d", (int)weights.out_degree[2]);
 
     // ── Pruning: demote by cutting live count back below threshold ────────
@@ -98,7 +98,7 @@ int main() {
         weights, current_row, /*importance_cutoff=*/1e9f, /*max_row_weights=*/SIZE_TYPE(10));
     tile = weights.block4.find(0, 0);
     CHECK(tile != nullptr, "tile should still exist after pruning row2 (2 live left, still >= threshold)");
-    CHECK(tile && tile->live_count == 2, "tile live_count should be 2 after pruning row2's synapse");
+    CHECK(tile && tile->count_live() == 2, "tile count_live() should be 2 after pruning row2's synapse");
     CHECK(weights.out_degree[2] == 0, "out_degree[2] should drop to 0 after real prune, got %d", (int)weights.out_degree[2]);
 
     current_row = 1;

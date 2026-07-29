@@ -15,6 +15,23 @@
 
 namespace py = pybind11;
 
+// ── Block4View ───────────────────────────────────────────────────────────────
+// Thin, non-owning wrapper exposing a layer's Block4Store to Python as
+// `layer.block4.tiles` / `layer.block4.synapses` -- purely observational
+// (see block4.hpp: block4's whole point is to be invisible to callers
+// otherwise). Holds a raw pointer into the owning layer's `weights.block4`;
+// SparseLinearLayer::block4()/DISLDOLayerV::block4() bind this with
+// py::keep_alive<0, 1>() so the layer can't be freed while a Block4View
+// referencing it is still alive in Python.
+class Block4View {
+public:
+    explicit Block4View(Block4Store& s) : store(&s) {}
+    std::size_t tiles()    const { return store->n_tiles(); }
+    std::size_t synapses() const { return store->live_synapses(); }
+private:
+    Block4Store* store;
+};
+
 // ── SISLDOLayer ───────────────────────────────────────────────────────────────
 // Sparse Input, Sparse Linear, Dense Output layer.
 //
@@ -281,12 +298,9 @@ public:
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
-    // How many synapses currently live in block4 vs the scattered CSR --
-    // purely observational (block4's whole point is to be invisible to
-    // callers otherwise), exposed so benchmarks/diagnostics can report
-    // what fraction of a layer actually promoted rather than guessing.
-    S block4_tiles()    const { return static_cast<S>(weights.block4.n_tiles()); }
-    S block4_synapses() const { return static_cast<S>(weights.block4.live_synapses()); }
+    // Purely observational (block4's whole point is to be invisible to
+    // callers otherwise) -- see Block4View, bound as layer.block4.
+    Block4View block4() { return Block4View(weights.block4); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -726,8 +740,7 @@ public:
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
-    S block4_tiles()    const { return static_cast<S>(weights.block4.n_tiles()); }
-    S block4_synapses() const { return static_cast<S>(weights.block4.live_synapses()); }
+    Block4View block4() { return Block4View(weights.block4); }
 
     py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
@@ -831,6 +844,13 @@ public:
 
 PYBIND11_MODULE(_cpu, m)
 {
+    // ── Block4View ────────────────────────────────────────────────────────────
+    py::class_<Block4View>(m, "Block4View")
+        .def_property_readonly("tiles",    &Block4View::tiles,
+             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("synapses", &Block4View::synapses,
+             "Number of synapses currently living in block4 (subset of nnz) --"
+             " purely observational.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
@@ -1016,11 +1036,10 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
-        .def_property_readonly("block4_tiles",    &SparseLinearLayer::block4_tiles,
-             "Number of block4 tiles currently promoted -- purely observational.")
-        .def_property_readonly("block4_synapses", &SparseLinearLayer::block4_synapses,
-             "Number of synapses currently living in block4 (subset of nnz) --"
-             " purely observational.")
+        .def_property_readonly("block4",    &SparseLinearLayer::block4,
+             py::keep_alive<0, 1>(),
+             "Purely observational view onto this layer's block4 storage --"
+             " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
             [](const SparseLinearLayer& self) -> py::object {
                 if (self._last_input.empty()) return py::none();
@@ -1074,8 +1093,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
-        .def_property_readonly("block4_tiles",    &DISLDOLayerV::block4_tiles)
-        .def_property_readonly("block4_synapses", &DISLDOLayerV::block4_synapses);
+        .def_property_readonly("block4",    &DISLDOLayerV::block4, py::keep_alive<0, 1>());
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

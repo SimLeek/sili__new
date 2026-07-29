@@ -41,9 +41,6 @@ int main() {
     Block4Tile tile;
     tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
     tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.75f) << 4);
-    tile.set_live(0, 1, true);
-    tile.set_live(2, 3, true);
-    tile.live_count = 2;
     weights.block4.tiles[Block4Store::key(0, 0)] = tile;
     weights.block4.by_block_row[0].insert(0);
 

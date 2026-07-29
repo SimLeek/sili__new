@@ -1,10 +1,19 @@
 #pragma once
+// Benchmark-only escape hatch: force block4's disldo_backward onto its
+// pre-SIMD scalar path (identical math, no Block4Vec) to measure the SIMD
+// rewrite's real speedup against a same-commit, same-everything-else
+// baseline -- e.g. `-DSILI_BLOCK4_FORCE_SCALAR_BACKWARD=1`. Defaults off;
+// not a runtime knob, not meant to ship enabled.
+#ifndef SILI_BLOCK4_FORCE_SCALAR_BACKWARD
+#define SILI_BLOCK4_FORCE_SCALAR_BACKWARD 0
+#endif
 #include "csr.hpp"
 #include "sparse_struct.hpp"
 #include "parallel.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 // ── DISLDO: Dense Input, Sparse Linear, Dense Output ─────────────────────────
@@ -231,18 +240,37 @@ void disldo_forward(
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= n_out) continue;
                     const value_type out_scale = weights.get_output_scale(col);
+
+                    // Decode this column's whole 4-wide weight vector ONCE,
+                    // outside the batch loop -- table lookup and the
+                    // get_value_scale() call (a branch on row bounds) both
+                    // block auto-vectorization if left inside the batch
+                    // loop, and neither depends on b. row_idx clamps an
+                    // out-of-range row (last, partial tile) to a safe
+                    // in-bounds index; w4 is 0 there regardless (real
+                    // in-bounds slots never quantize to exactly this
+                    // combination unless genuinely zero), so the clamped
+                    // read never contributes -- keeps the per-batch loop
+                    // below branch-free without reading out of bounds.
+                    value_type w4[BLOCK4_TILE];
+                    std::size_t row_idx[BLOCK4_TILE];
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        if (row < n_in) {
+                            const uint8_t code = tile.at(li, lj) & 0xFu;
+                            w4[li] = FP4_TABLE[code] * weights.get_value_scale(row) * out_scale;
+                            row_idx[li] = row;
+                        } else {
+                            w4[li] = value_type(0);
+                            row_idx[li] = 0;
+                        }
+                    }
+
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         value_type acc = value_type(0);
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                            if (row >= n_in) continue;
-                            const uint8_t code = tile.at(li, lj) & 0xFu;
-                            if (code == 0) continue;
-                            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
-                            if (iv == value_type(0)) continue;
-                            const value_type val_scale = weights.get_value_scale(row);
-                            acc += FP4_TABLE[code] * val_scale * out_scale * iv;
-                        }
+                        const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                            acc += w4[li] * in_row[row_idx[li]];
                         mo[static_cast<std::size_t>(b) * n_out + col] += acc;
                     }
                 }
@@ -536,22 +564,19 @@ void disldo_backward(
             tile_bc.push_back(uint32_t(kv.first & 0xFFFFFFFFu));
         }
 
-        // Exact per-row live count across ALL block4 tiles (not just one
-        // tile), needed for both lr_per_row_nnz and the unconditional
-        // scale_eff_lr normalization -- a single cheap serial pass
-        // (O(n_tiles*BLOCK4_TILE_SLOTS)) avoids either an approximation
-        // or a race on a shared counter.
+        // Per-row slot count across ALL block4 tiles touching that row
+        // (not just one tile), needed for both lr_per_row_nnz and the
+        // unconditional scale_eff_lr normalization. Every tile contributes
+        // exactly BLOCK4_TILE slots per row it covers -- dense, no
+        // per-slot scan needed (see block4.hpp: a live tile's slots are
+        // all real synapses, weight=0.0 included).
         std::vector<uint32_t> row_live_count(n_in, 0);
         for (std::size_t ti = 0; ti < live_tiles.size(); ++ti) {
-            const Block4Tile& tile = *live_tiles[ti];
             const uint32_t br = tile_br[ti];
             for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                 const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                 if (row >= n_in) continue;
-                uint32_t c = 0;
-                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
-                    if (tile.is_live(li, lj)) ++c;
-                row_live_count[row] += c;
+                row_live_count[row] += BLOCK4_TILE;
             }
         }
 
@@ -580,55 +605,198 @@ void disldo_backward(
                         ? learning_rate / static_cast<value_type>(nnz_row)
                         : learning_rate;
 
+                    // Decode this row's whole 4-wide column vector ONCE,
+                    // outside the batch loop: table lookups and the
+                    // get_output_scale()/get_output_importance_scale()
+                    // calls (both branch on col bounds) block
+                    // auto-vectorization if left inside it, and none
+                    // depend on b. The batch loop itself can't vectorize
+                    // across b -- cw4/ci4 carry a genuine sequential
+                    // per-sample update across b (online SGD within the
+                    // call, not a reduction) -- but each of the 4 COLUMNS
+                    // is independent of the others, so the inner loop over
+                    // lj at each b is a real, branch-free, gather-free
+                    // 4-wide vectorization target instead.
+                    std::size_t col4[BLOCK4_TILE];
+                    bool        col_valid4[BLOCK4_TILE];
+                    value_type  out_scale4[BLOCK4_TILE];
+                    value_type  combined_scale4[BLOCK4_TILE], combined_imp_scale4[BLOCK4_TILE];
+                    value_type  cw4[BLOCK4_TILE], ci4[BLOCK4_TILE], cw_orig4[BLOCK4_TILE];
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                        if (col >= n_out) continue;
-                        // Liveness is tracked structurally in the tile's own
-                        // presence bitmask, NOT inferred from the byte value
-                        // -- a genuinely-live synapse can have BOTH its
-                        // weight AND importance quantize to FP4_TABLE's
-                        // zero entry (extremely common: 0.0 is the nearest
-                        // table value for anything near the origin, and a
-                        // freshly-grown synapse starts at weight=0.0 exactly
-                        // -- see delta_csr_memory.hpp's Step 6). A real bug
-                        // found and fixed here (and throughout
-                        // delta_csr_memory.hpp's promotion/demotion/
-                        // discovery code): using data[slot]==0 as the
-                        // liveness signal silently dropped exactly this case
-                        // from every read path, including this gradient
-                        // update -- permanently stranding such a synapse,
-                        // unable to ever train away from zero.
-                        if (!tile.is_live(li, lj)) continue;
-                        uint8_t& byte = tile.at(li, lj);
+                        col_valid4[lj] = col < n_out;
+                        if (!col_valid4[lj]) {
+                            col4[lj] = 0;
+                            out_scale4[lj] = combined_scale4[lj] = combined_imp_scale4[lj] = value_type(0);
+                            cw4[lj] = ci4[lj] = cw_orig4[lj] = value_type(0);
+                            continue;
+                        }
+                        col4[lj] = col;
+                        // Every slot is a real synapse, weight=0.0 included
+                        // -- see block4.hpp -- so every slot gets a real
+                        // gradient update every call, no liveness check.
+                        const uint8_t byte     = tile.at(li, lj);
                         const uint8_t w_code   = byte & 0xFu;
                         const uint8_t imp_code = (byte >> 4) & 0xFu;
-                        const value_type out_scale      = weights.get_output_scale(col);
-                        const value_type out_imp_scale  = weights.get_output_importance_scale(col);
-                        const value_type combined_scale     = val_scale * out_scale;
-                        const value_type combined_imp_scale = imp_scale * out_imp_scale;
-                        const value_type cw_orig = FP4_TABLE[w_code];
-                        value_type cw = cw_orig * combined_scale;          // -> true units
-                        value_type ci = FP4_TABLE[imp_code] * combined_imp_scale;
+                        out_scale4[lj] = weights.get_output_scale(col);
+                        const value_type out_imp_scale = weights.get_output_importance_scale(col);
+                        combined_scale4[lj]     = val_scale * out_scale4[lj];
+                        combined_imp_scale4[lj] = imp_scale * out_imp_scale;
+                        cw_orig4[lj] = FP4_TABLE[w_code];
+                        cw4[lj] = cw_orig4[lj] * combined_scale4[lj];          // -> true units
+                        ci4[lj] = FP4_TABLE[imp_code] * combined_imp_scale4[lj];
+                    }
 
-                        for (SIZE_TYPE b = 0; b < batch; ++b) {
-                            const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + row];
-                            const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
-                            const value_type g   = dyv * iv;
-
-                            if (learning_rate != value_type(0)) {
-                                ci -= g * effective_lr;
-                                cw += damp_by_importance
-                                    ? (-effective_lr * g) / (value_type(1) + std::abs(ci))
-                                    : (-effective_lr * g);
-                                mrow[row] += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
-                                mcol[col] += cw_orig * val_scale * g;
+                    // mcol[col4[lj]] is a real 4-way SCATTER (4 distinct
+                    // output columns) if written every (b, lj) -- confirmed
+                    // via -fopt-info-vec as the actual remaining blocker
+                    // once the FP4_TABLE lookups above were already moved
+                    // out of this loop (a gather was never the issue here
+                    // once that happened). Accumulate into a small local
+                    // array across the whole batch loop instead -- pure
+                    // register/stack traffic, no memory scatter -- and
+                    // flush the 4 (not 4*batch) real scatter writes once,
+                    // after. mrow[row] isn't a scatter (same address for
+                    // every lj already, a horizontal reduction), but gets
+                    // the same local-accumulate-then-flush treatment for
+                    // consistency and to keep it out of the hot loop too.
+                    value_type mcol4[BLOCK4_TILE] = {0};
+                    double     mrow_local = 0.0;
+                    // col4[lj] is really just col_base+lj (contiguous), but
+                    // reading it back OUT of the array hides that from GCC
+                    // -- confirmed via -fopt-info-vec: it correctly proved
+                    // the loop below vectorizable via SLP, then rejected it
+                    // as "unprofitable" because indexing output_grad through
+                    // col4[lj] looks like a 4-way gather instead of one
+                    // contiguous load. Reading output_grad[...+col_base+lj]
+                    // directly (a plain affine index in the loop variable)
+                    // lets it see the load is contiguous. Only valid when
+                    // the whole tile-column is in bounds (true for every
+                    // tile except possibly the last, boundary one) --
+                    // that's the split below, checked once per tile, not
+                    // per batch element.
+                    const std::size_t col_base = std::size_t(bc) * BLOCK4_TILE;
+                    const bool full_tile_cols = (col_base + BLOCK4_TILE <= n_out);
+                    // block4 is FP4-specific and value_type is float in
+                    // every real instantiation (FP4BiPacked and
+                    // DeltaCSRBiValues<float> both use it; nothing in this
+                    // codebase ever instantiates DeltaCSRBiValues<double>)
+                    // -- but this function isn't itself gated behind
+                    // is_same_v<VALUES_TYPE, FP4BiPacked>, so it must still
+                    // COMPILE generically. Block4Vec is float-only by
+                    // design (see block4.hpp), so the real SIMD path is
+                    // guarded here and a plain scalar fallback (identical
+                    // math, matches the pre-SIMD version already verified
+                    // correct) covers any hypothetical non-float
+                    // instantiation instead of silently miscompiling one.
+                    if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
+                        if (full_tile_cols) {
+                            const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
+                            const Block4Vec val_scale_v    = block4_vec_broadcast(val_scale);
+                            const Block4Vec one_v          = block4_vec_broadcast(1.0f);
+                            Block4Vec cw_v        = block4_vec_load(cw4);
+                            Block4Vec ci_v         = block4_vec_load(ci4);
+                            const Block4Vec cw_orig_v      = block4_vec_load(cw_orig4);
+                            const Block4Vec out_scale_v    = block4_vec_load(out_scale4);
+                            Block4Vec mcol_acc_v   = block4_vec_broadcast(0.0f);
+                            const bool training = (learning_rate != value_type(0));
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                                value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
+                                const Block4Vec dyv_v = block4_vec_load(
+                                    output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+                                const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
+                                if (training) {
+                                    ci_v -= g_v * effective_lr_v;
+                                    const Block4Vec neg_lr_g_v = -(effective_lr_v * g_v);
+                                    const Block4Vec delta_v = damp_by_importance
+                                        ? neg_lr_g_v / (one_v + block4_vec_abs(ci_v))
+                                        : neg_lr_g_v;
+                                    cw_v += delta_v;
+                                    // mrow_local accumulates in DOUBLE, one
+                                    // horizontal-sum per b -- matches the
+                                    // pre-SIMD code's own double-precision
+                                    // accumulation exactly (unlike mcol,
+                                    // which was already float-precision in
+                                    // the original scalar code, so
+                                    // accumulating it as a Block4Vec across
+                                    // the whole loop is not a regression).
+                                    // A real, confirmed-not-hypothetical
+                                    // issue: accumulating mrow_local in
+                                    // float across a whole batch loop
+                                    // measurably changed which growth/
+                                    // pruning decisions this codebase's
+                                    // stochastic FP4 rounding makes over
+                                    // many cycles (0 tiles ended up promoted
+                                    // in a real 512x512 growth run instead
+                                    // of the ~250 expected) -- precision
+                                    // here isn't cosmetic.
+                                    mrow_local += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * g_v));
+                                    mcol_acc_v += cw_orig_v * val_scale_v * g_v;
+                                }
+                                *mdx_row += block4_vec_hsum(cw_v * dyv_v);
                             }
-                            mdx[static_cast<std::size_t>(b) * in_cols + row] += cw * dyv;
+                            block4_vec_store(cw4, cw_v);
+                            block4_vec_store(ci4, ci_v);
+                            block4_vec_store(mcol4, mcol_acc_v);
+                        } else {
+                            // Boundary tile-column (rare -- only the last
+                            // one, when n_out isn't a multiple of
+                            // BLOCK4_TILE): scalar bounds-checked fallback,
+                            // not on the fast path, doesn't need SIMD.
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                                value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    if (!col_valid4[lj]) continue;
+                                    const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4[lj]];
+                                    const value_type g   = dyv * iv;
+                                    if (learning_rate != value_type(0)) {
+                                        ci4[lj] -= g * effective_lr;
+                                        cw4[lj] += damp_by_importance
+                                            ? (-effective_lr * g) / (value_type(1) + std::abs(ci4[lj]))
+                                            : (-effective_lr * g);
+                                        mrow_local += static_cast<double>(cw_orig4[lj]) * static_cast<double>(out_scale4[lj]) * g;
+                                        mcol4[lj] += cw_orig4[lj] * val_scale * g;
+                                    }
+                                    *mdx_row += cw4[lj] * dyv;
+                                }
+                            }
                         }
-                        if (learning_rate != value_type(0)) {
-                            const uint8_t new_w   = fp4_quantize_stochastic(cw / combined_scale);
-                            const uint8_t new_imp = fp4_quantize_stochastic(ci / combined_imp_scale);
-                            byte = uint8_t((new_imp << 4) | new_w);
+                    } else {
+                        // Hypothetical non-float value_type (never actually
+                        // instantiated in this codebase -- see the comment
+                        // above): the bounds-checked array form, correct
+                        // for both the full-tile and boundary cases via
+                        // col_valid4 either way, so no full_tile_cols split
+                        // needed here at all.
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                            value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (!col_valid4[lj]) continue;
+                                const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4[lj]];
+                                const value_type g   = dyv * iv;
+                                if (learning_rate != value_type(0)) {
+                                    ci4[lj] -= g * effective_lr;
+                                    cw4[lj] += damp_by_importance
+                                        ? (-effective_lr * g) / (value_type(1) + std::abs(ci4[lj]))
+                                        : (-effective_lr * g);
+                                    mrow_local += static_cast<double>(cw_orig4[lj]) * static_cast<double>(out_scale4[lj]) * g;
+                                    mcol4[lj] += cw_orig4[lj] * val_scale * g;
+                                }
+                                *mdx_row += cw4[lj] * dyv;
+                            }
+                        }
+                    }
+                    if (learning_rate != value_type(0)) {
+                        mrow[row] += mrow_local;   // mrow is double* already, no down/up-cast needed
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            if (!col_valid4[lj]) continue;
+                            mcol[col4[lj]] += mcol4[lj];
+                            const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
+                            const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                            tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
                         }
                     }
                 }

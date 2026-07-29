@@ -56,6 +56,17 @@ importance accessors) -- not a second, bolted-on object.
    - Checked at the specific growth/pruning EVENT that touched that
      specific tile, not a periodic sweep and not a blind check on every
      `synap_step` call regardless of what changed.
+   - **Demotion metric, settled**: not sum/average/L1/L2/weighted-sum of
+     the tile's importances -- `is_greater_than` count against the SAME
+     `importance_cutoff` pruning itself already uses. A synapse survives a
+     real prune iff its importance exceeds that cutoff, so a tile's
+     "effective live count" for demotion purposes is just how many of its
+     16 importances would currently survive that same check -- reusing
+     pruning's own threshold instead of inventing a second, separate
+     aggregate criterion. Computable as 4 SIMD compare+cumulative-sum ops
+     (one `Block4Vec` compare-and-hsum per tile row) rather than a 16-wide
+     scalar loop. Not yet implemented (`count_live()` still does the
+     simpler "byte != 0" scan) -- this replaces it once written.
 3. **Memory layout**: `SparseLinearWeightsDelta` gets a real block4
    member (not a separate prototype struct) alongside the existing
    `DeltaCSRWeights`. `compact()`/`expand_headroom*()` need to handle
@@ -153,6 +164,94 @@ importance accessors) -- not a second, bolted-on object.
       regardless of the BLAS confound, since it doesn't cluster the way
       real transformer weights do. Memory not yet measured (only speed +
       correctness so far).
+- [x] Remove `presence`/`live_count` bitmask bookkeeping entirely --
+      `Block4Tile` is now just `uint8_t data[16]` (128 bits/tile total, no
+      per-tile index, no extra liveness state), every slot in a promoted
+      tile treated as a real synapse unconditionally (weight=0.0 included),
+      `count_live()` demoted to an on-demand O(16) cold-path scan used only
+      by promotion/demotion/reporting. `layer.block4_tiles`/
+      `block4_synapses` flat methods replaced with a proper nested
+      `layer.block4.tiles`/`.synapses` view (`Block4View`, `cpu_backend.cpp`).
+- [x] Make backward's block4 hot path genuinely SIMD (it was online-learning
+      -- no reason backward should be scalar when forward is). Real
+      auto-vectorization blockers found and fixed in order: `FP4_TABLE[code]`
+      gather + per-element scale calls inside the batch loop (fixed by
+      precomputing once per tile-column outside it); a genuine 4-way
+      scatter into `mcol[]` (fixed via local-accumulate-then-flush); a
+      *hidden* gather where the target column was actually contiguous but
+      array-indexing obscured that from GCC's cost model (fixed via direct
+      `col_base+lj` arithmetic + a `full_tile_cols` fast path); and a
+      genuine cross-batch recurrence in the per-column weight/importance
+      state that auto-vectorization's SLP pass could prove vectorizable but
+      wouldn't commit to across plain scalar arrays -- required an explicit
+      `Block4Vec` (GCC/Clang `vector_size` extension, float x4) to actually
+      force it. Verified via real disassembly (not just `-fopt-info-vec`'s
+      diagnostic text): 103 packed `vmulps`/`vaddps`/`vsubps` instructions
+      in the compiled hot path.
+- [x] Diagnose and fix a false "0 tiles instead of 251" alarm surfaced by
+      `compare_block4_venvs.sh` after the SIMD rewrite. After extensive
+      bisection (native C++ repro with exact numpy-dumped data, exact
+      `equalize_to_capacity`/budget replication, matched RNG seed -- all
+      ruled out), the real cause turned out to be trivial: `bench_block4_layer.py`
+      still read the OLD flat `layer.block4_tiles`/`block4_synapses`
+      properties via `getattr(layer, 'block4_tiles', 0)`, which silently
+      fell back to 0 once those were replaced with `layer.block4.tiles`/
+      `.synapses` above -- never a real regression in growth/promotion
+      logic. Fixed via a `block4_counts()` helper that reads the new
+      `.block4` view when present (and still returns `(0, 0)` unmodified
+      against the pre-block4 baseline venv, which has neither API).
+- [x] The residual tiny nnz mismatch `diff_bench_reports.py` still flags
+      after that fix (35073 vs 35029 at 15% density, 4678 vs 4677 at 2% --
+      both ~0.1%) is real but benign: quality error stays at float32 noise
+      (~1e-6-1e-5) on both sides, growth throws are identical, and the
+      divergence is proportionally tiny at both densities. Consistent with
+      floating-point reordering (SIMD's backward now sums in a different
+      order than the scalar baseline) nudging a handful of values across
+      FP4's *stochastic*-rounding thresholds over 300 growth cycles --
+      the same kind of seed-sensitive cascading already documented above
+      for unseeded RNG state, just triggered by build-to-build math-order
+      differences instead of an unseeded RNG. `diff_bench_reports.py`'s own
+      "should match exactly" assumption is arguably too strict now that
+      block4 legitimately changes evaluation order; left as a documented
+      known-benign mismatch rather than "fixed" (there's nothing to fix).
+- [x] Isolated the SIMD rewrite's real speedup on backward, separate from
+      the venv-vs-venv comparison above (which is dominated by the
+      non-block4 scattered-CSR majority at realistic uniform-random
+      densities -- growth-driven promotion turns out to be fundamentally
+      collision-limited on uniform-random data: increasing density *or*
+      growth cycles 10x [0.1 density x 3000 cycles] still only produced
+      305/16384 possible tiles, ~1.7% of nnz, because promotion needs 2+
+      synapses landing in the *same* tile, which random insertion rarely
+      does regardless of overall density). Instead, built a same-commit
+      A/B (`SILI_BLOCK4_FORCE_SCALAR_BACKWARD` compile-time toggle in
+      `linear_disldo.hpp`, off by default, benchmark-only) and a native
+      harness that *directly* fills a chosen fraction of all possible 4x4
+      tile positions (bypassing growth entirely) so the block4 hot path's
+      share of total work is representative, not the <3%-of-nnz growth
+      alone can produce. Result (12 interleaved reps at 30% tile fraction,
+      5 each at 10/60/90%, `-O3 -march=native -ffast-math`, single
+      thread):
+
+      | tile fraction | scalar median | SIMD median | speedup |
+      |---|---|---|---|
+      | 10% (1638 tiles)   | 1.718ms  | 1.596ms  | 1.076x |
+      | 30% (4915 tiles)   | 5.776ms  | 4.902ms  | 1.178x |
+      | 60% (9830 tiles)   | 11.515ms | 9.845ms  | 1.170x |
+      | 90% (14745 tiles)  | 18.687ms | 15.857ms | 1.178x |
+      | 100% (16384 tiles, whole matrix is block4, no scattered CSR at all) | 9.393ms | 8.299ms | 1.132x (10 reps) |
+
+      Every tile at every fraction above is already fully dense (all 16
+      slots real, per the "no presence bitmask" design -- there's no
+      partial-fill mode to test separately; "tile fraction" is how much of
+      the matrix's tile-position grid got converted, not per-tile
+      occupancy). Consistent, real, reproducible ~1.05x-1.27x per-rep
+      speedup from the Block4Vec rewrite alone, flat across tile-fill
+      fraction including the 100%-coverage case -- confirms this is a
+      per-tile hot-path speedup, not something that scales with how much
+      of the matrix block4 covers. Modest, not the 2-13x PR #22 measured
+      on real checkpoint structure (that number is about block4 vs.
+      fully-scattered CSR, a different comparison than SIMD vs. scalar
+      *within* block4) -- but real and free money regardless.
 - [ ] Once verified clean (no regression, real win), sili_peridot should
       pin its `sili` dependency to this specific commit/tag rather than
       floating on whatever's installed -- exact mechanism (git submodule?

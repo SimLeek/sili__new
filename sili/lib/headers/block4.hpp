@@ -1,11 +1,12 @@
 #pragma once
 #include "fp4quant.hpp"
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-// ── block4: dense NxN tiles, integrated into SparseLinearWeightsDelta ──────
+// ── block4: dense 4x4 tiles, integrated into SparseLinearWeightsDelta ──────
 //
 // Production version of the prototype validated on feature/sili-ell-benchmark
 // (PR #22, kept as reference, not merged): a real speedup (2-13x on the real
@@ -30,16 +31,11 @@
 //     a time (see delta_csr_memory.hpp's synap_row_step hook), not a
 //     whole-matrix batch split the way the prototype's split_for_block4 was.
 //
-// Compile-time constants, overridable at build time (both setup.py's
-// extra_compile_args and CMakeLists.txt need `-DSILI_BLOCK4_TILE_SIZE=N`/
-// `-DSILI_BLOCK4_PROMOTE_MIN_LIVE=N` wired through for this to actually be
-// build-configurable, not just in-principle). Real ceiling for TILE_SIZE is
-// hardware-specific -- see prototypes/sili_ell/BLOCK4_NOTES.md: this
-// machine's real SIMD width is ~4 (AVX2 runs double-pumped on this CPU
-// generation), 2x2 is a measured REGRESSION not just a non-improvement.
-// PROMOTE_MIN_LIVE=2 for TILE_SIZE=4 matches ceil(0.10 * 16) = 2, the
-// measured real breakeven on this machine (also hardware/data-distribution
-// specific -- re-verify before trusting a different default elsewhere).
+// This is a 4x4 dense tile, not a generic NxN one -- BLOCK4_TILE_SIZE exists
+// only as a compile-time override for re-tuning that one fixed number (see
+// TODO_DUAL_BLOCK4.md's settled design decisions), not as a hook for runtime
+// or templated generality nothing here actually needs. Don't widen anything
+// in this file "to be safe" for a size this isn't and was never asked to be.
 #ifndef SILI_BLOCK4_TILE_SIZE
 #define SILI_BLOCK4_TILE_SIZE 4
 #endif
@@ -51,9 +47,59 @@ constexpr uint32_t BLOCK4_TILE = SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_TILE_SLOTS = SILI_BLOCK4_TILE_SIZE * SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 
-static_assert(BLOCK4_TILE_SLOTS <= 64,
-    "Block4Tile::presence is a 64-bit mask -- BLOCK4_TILE_SIZE too large "
-    "for a single uint64_t bit per slot (8x8=64 is the ceiling).");
+// ── block4 4-wide SIMD helpers ───────────────────────────────────────────────
+//
+// float only -- this codebase's only real VALUES_TYPE::value_type, and
+// deliberately not templated: block4 is a concrete 4x4 tile, not a generic
+// abstraction (see the header comment above), so this doesn't pretend to
+// support a hypothetical double path nothing here actually uses.
+//
+// GCC/Clang's vector_size extension, not raw target intrinsics: portable
+// across whatever SIMD width the build target actually has (SSE/AVX/NEON),
+// and it's what actually gets the compiler to emit real SIMD for block4's
+// per-column state in disldo_backward -- confirmed via -fopt-info-vec that
+// the auto-vectorizer's own SLP pass, working from plain scalar arrays,
+// could PROVE the loop vectorizable but rejected it as unprofitable (cost
+// model didn't like an array-indexed load it couldn't prove was contiguous).
+// An explicit vector type doesn't leave that judgment call to the
+// auto-vectorizer's cost heuristics.
+using Block4Vec  = float    __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(float))));
+using Block4VecU = uint32_t __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(uint32_t))));
+static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float), "Block4Vec width must match BLOCK4_TILE");
+
+inline Block4Vec block4_vec_load(const float* p) {
+    Block4Vec v;
+    std::memcpy(&v, p, sizeof(v));   // unaligned-safe load, no UB regardless of p's alignment
+    return v;
+}
+inline void block4_vec_store(float* p, Block4Vec v) {
+    std::memcpy(p, &v, sizeof(v));
+}
+inline Block4Vec block4_vec_broadcast(float x) {
+    Block4Vec v;
+    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) v[i] = x;
+    return v;
+}
+inline Block4VecU block4_vecu_broadcast(uint32_t x) {
+    Block4VecU v;
+    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) v[i] = x;
+    return v;
+}
+// Elementwise |x| via an IEEE-754 sign-bit clear -- std::abs isn't defined
+// for GCC vector-extension types, and this avoids a per-lane branch.
+inline Block4Vec block4_vec_abs(Block4Vec x) {
+    Block4VecU bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    bits &= block4_vecu_broadcast(0x7FFFFFFFu);
+    Block4Vec result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+inline float block4_vec_hsum(Block4Vec x) {
+    float s = 0.0f;
+    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) s += x[i];
+    return s;
+}
 
 // One dense tile: BLOCK4_TILE_SLOTS bytes, (imp4<<4|w4) per slot, stored
 // [local_j * BLOCK4_TILE + local_i] (row=local_i, col=local_j within the
@@ -64,41 +110,49 @@ static_assert(BLOCK4_TILE_SLOTS <= 64,
 // explicit orientation fix -- done differently and more simply here from
 // the start).
 //
-// `presence` is a real, necessary field, not redundant with `data`: a
-// genuinely-live synapse's weight AND importance can BOTH legitimately
-// quantize to FP4_TABLE's zero entry (0.0 is the single most common value
-// near the origin, especially for a freshly-grown synapse whose weight
-// starts at exactly 0.0 -- see delta_csr_memory.hpp's Step 6). Using
-// `data[slot] == 0` as the liveness signal is indistinguishable from an
-// empty slot in exactly that case -- a real bug found here (via a 64x64
-// growth+promotion repro that silently dropped such a synapse from every
-// read path -- forward, backward's gradient update, and the combined-view
-// getters) and fixed by tracking structural liveness in this separate
-// bitmask, the same way the scattered CSR already does implicitly (a
-// synapse's presence there is structural -- whether it has a CSR entry at
-// all -- never inferred from its stored value).
+// No liveness bit, no live_count. Every slot in a promoted tile is a real
+// synapse, weight=0.0 included -- that's what "dense" means; a value-based
+// liveness signal (data[slot] == 0) is a sparse-domain idea that doesn't
+// belong here, and turned into a real bug the first time it was tried: a
+// genuinely-live synapse whose weight AND importance both round to
+// FP4_TABLE's zero entry (common -- 0.0 is nearest for anything near the
+// origin, and a freshly-grown synapse starts at weight=0.0 exactly) was
+// indistinguishable from an empty slot, silently dropping it from forward,
+// from backward's gradient update (permanently -- it could never train away
+// from zero), and from every read path. Forward/backward now process all
+// BLOCK4_TILE_SLOTS slots of a live tile unconditionally -- see
+// linear_disldo.hpp. (This didn't cost any SIMD either way: confirmed via
+// -fopt-info-vec that these loops don't auto-vectorize regardless, blocked
+// by the FP4_TABLE gather and the get_value_scale/get_output_scale calls,
+// not by any liveness branch.)
+//
+// count_live() is a cold-path, on-demand O(16) byte scan (weight nibble
+// nonzero), used only by promotion/demotion/reporting to decide whether a
+// tile still holds enough real data to justify staying block4 -- not a
+// structural oracle, just a cheap heuristic. A slot whose value happens to
+// be exactly (0.0 weight, 0.0 importance) at the moment of that scan reads
+// as "not live" here, same as before -- but the consequence is now minor
+// (it just doesn't count toward this cycle's demotion/reporting tally,
+// nothing more) instead of being permanently unreachable, since forward and
+// backward no longer consult this at all.
 struct Block4Tile {
     uint8_t data[BLOCK4_TILE_SLOTS] = {0};
-    uint64_t presence = 0;   // bit i set = slot i structurally live, independent of data[i]'s value
-    uint32_t live_count = 0;
 
     static uint32_t slot_index(uint32_t local_i, uint32_t local_j) { return local_j * BLOCK4_TILE + local_i; }
 
     uint8_t& at(uint32_t local_i, uint32_t local_j) { return data[slot_index(local_i, local_j)]; }
     uint8_t  at(uint32_t local_i, uint32_t local_j) const { return data[slot_index(local_i, local_j)]; }
 
-    bool is_live(uint32_t local_i, uint32_t local_j) const {
-        return (presence >> slot_index(local_i, local_j)) & 1ull;
-    }
-    // Sets/clears the presence bit only -- caller is responsible for
-    // data[slot] and live_count (their update rules differ by call site:
-    // e.g. promotion increments live_count only on a true silent->live
-    // transition, demotion's silencing decrements it and zeroes the byte
-    // for cleanliness even though presence alone is now authoritative).
-    void set_live(uint32_t local_i, uint32_t local_j, bool live) {
-        const uint32_t idx = slot_index(local_i, local_j);
-        if (live) presence |= (1ull << idx);
-        else      presence &= ~(1ull << idx);
+    uint32_t count_live() const {
+        // Whole byte, not just the weight nibble: a freshly-grown synapse
+        // starts at weight=0.0 by convention (see delta_csr_memory.hpp's
+        // Step 6) with only a nonzero importance -- checking the weight
+        // nibble alone would miss it here the same way it did before this
+        // was ever tracked as a separate liveness bit.
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
+            if (data[i] != 0) ++n;
+        return n;
     }
 };
 
@@ -148,9 +202,11 @@ struct Block4Store {
         }
     }
     std::size_t n_tiles() const { return tiles.size(); }
+    // Cold-path reporting only (nnz(), diagnostics) -- O(n_tiles * 16), not
+    // called from forward/backward.
     std::size_t live_synapses() const {
         std::size_t n = 0;
-        for (auto& kv : tiles) n += kv.second.live_count;
+        for (auto& kv : tiles) n += kv.second.count_live();
         return n;
     }
 };
