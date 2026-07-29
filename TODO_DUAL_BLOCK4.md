@@ -95,7 +95,18 @@ importance accessors) -- not a second, bolted-on object.
       empty for a freshly-grown (weight=0.0) synapse -- silently broke
       backward's gradient update and demotion's rediscovery for anything
       not yet trained. Fixed to check the whole byte throughout.
-- [ ] Update `compact()`/`expand_headroom*()` for the combined structure.
+- [x] Update `compact()`/`expand_headroom*()` for the combined structure.
+      Turned out to need no changes -- both only touch
+      `weights.connections`, and `block4` is a separate struct member
+      untouched by that reassignment. Auditing the rest of this surface
+      found two real bugs instead: `nnz()` (both block4-capable classes)
+      and the `get_weights_vals`/`get_indices`/`get_ptrs`/`get_importance`
+      save/export path only ever read `weights.connections`, so any
+      block4-promoted synapse was silently invisible to both the reported
+      count and any save taken after a promotion. Fixed via a new
+      `delta_csr_combined_to_absolute()` (delta_csr_memory.hpp) that
+      merges block4 entries back into column order per row; verified
+      under ASan/UBSan plus a real pybind rebuild + Python round trip.
 - [ ] Real per-row (or finer) FP4 value_scale calibration for block4,
       matching disldo's own (already proven necessary on real weights,
       not optional -- see PR #22's bug #4).
