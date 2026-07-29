@@ -550,7 +550,7 @@ void disldo_backward(
                 if (row >= n_in) continue;
                 uint32_t c = 0;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
-                    if ((tile.at(li, lj) & 0xFu) != 0) ++c;
+                    if (tile.at(li, lj) != 0) ++c;
                 row_live_count[row] += c;
             }
         }
@@ -584,8 +584,18 @@ void disldo_backward(
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         if (col >= n_out) continue;
                         uint8_t& byte = tile.at(li, lj);
-                        const uint8_t w_code = byte & 0xFu;
-                        if (w_code == 0) continue;
+                        // Liveness is the WHOLE byte, not just the weight
+                        // nibble -- a freshly-grown synapse starts with
+                        // weight=0.0 (Step 6's insert convention, see
+                        // delta_csr_memory.hpp) and only a nonzero
+                        // importance, which would be indistinguishable from
+                        // an empty slot if only the weight nibble were
+                        // checked (a real bug found and fixed here: it
+                        // silently skipped gradient updates for any
+                        // not-yet-trained block4 synapse, permanently
+                        // stranding it at weight=0).
+                        if (byte == 0) continue;
+                        const uint8_t w_code   = byte & 0xFu;
                         const uint8_t imp_code = (byte >> 4) & 0xFu;
                         const value_type out_scale      = weights.get_output_scale(col);
                         const value_type out_imp_scale  = weights.get_output_importance_scale(col);

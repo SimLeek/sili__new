@@ -2,6 +2,7 @@
 #include "fp4quant.hpp"
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ── block4: dense NxN tiles, integrated into SparseLinearWeightsDelta ──────
@@ -76,6 +77,15 @@ struct Block4Tile {
 struct Block4Store {
     std::unordered_map<uint64_t, Block4Tile> tiles;
 
+    // Reverse index: block-row -> set of block-columns with a live tile
+    // there. delta_csr_synap_row_step's pruning path is triggered per CSR
+    // ROW, and needs to know "does this row's block-row participate in any
+    // block4 tile" -- without this, that check would be an O(n_tiles) scan
+    // of the whole store on EVERY row-step call (the function is meant to
+    // be cheap and called very frequently, one row per call). Kept in sync
+    // by get_or_create/erase below -- never mutate `tiles` directly.
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> by_block_row;
+
     static uint64_t key(uint32_t br, uint32_t bc) {
         return (uint64_t(br) << 32) | uint64_t(bc);
     }
@@ -88,10 +98,19 @@ struct Block4Store {
         return it != tiles.end() ? &it->second : nullptr;
     }
     Block4Tile& get_or_create(uint32_t br, uint32_t bc) {
-        return tiles[key(br, bc)];
+        const uint64_t k = key(br, bc);
+        auto it = tiles.find(k);
+        if (it != tiles.end()) return it->second;
+        by_block_row[br].insert(bc);
+        return tiles[k];
     }
     void erase(uint32_t br, uint32_t bc) {
         tiles.erase(key(br, bc));
+        auto it = by_block_row.find(br);
+        if (it != by_block_row.end()) {
+            it->second.erase(bc);
+            if (it->second.empty()) by_block_row.erase(it);
+        }
     }
     std::size_t n_tiles() const { return tiles.size(); }
     std::size_t live_synapses() const {

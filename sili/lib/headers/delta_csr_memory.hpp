@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <numeric>
 #include <algorithm>
+#include <type_traits>
 
 // ── Build from / convert to absolute CSR ─────────────────────────────────────
 
@@ -543,6 +544,161 @@ bool delta_csr_row_insert_col(
     return true;
 }
 
+// ── block4 promotion / demotion ──────────────────────────────────────────────
+//
+// Directional by design (see TODO_DUAL_BLOCK4.md's "Design decisions"):
+// growth (synaptogenesis) can only PROMOTE scattered -> block4; pruning can
+// only DEMOTE block4 -> scattered. Never the reverse. Checked at the
+// specific event touching the specific tile, not a periodic sweep.
+//
+// Both directions move a synapse's weight+importance losslessly: block4
+// shares the OWNING SparseLinearWeightsDelta's own value_scale/output_scale
+// with the scattered path (see block4.hpp), so re-quantizing an
+// already-exact FP4_TABLE value via fp4_quantize() round-trips exactly --
+// going through ValueAccessor::get_w/get_imp (float, exact table lookup)
+// and fp4_quantize() (exact round-trip) on the way, rather than poking
+// FP4BiPacked's internal byte layout directly.
+//
+// out_degree is intentionally left untouched by both: it already counts a
+// synapse once, at its ORIGINAL scattered insertion (this file's own
+// delta_csr_synap_row_step Step 6), and means "total live synapses feeding
+// this column regardless of current representation" -- both disldo_backward's
+// scattered path and block4's own backward write into the SAME output_scale
+// gradient buffer, normalized once by out_degree (see linear_disldo.hpp).
+// Only an actual prune (a real removal, not a representation move) changes
+// it -- see delta_csr_synap_row_step's Step 5 below.
+
+// Growth-only hook: call after a NEW synapse was just inserted into the
+// scattered CSR at (row, col). If the tile covering (row, col) is already
+// block4, migrates just this one synapse in. Otherwise scans the tile's
+// <=BLOCK4_TILE rows of scattered CSR data within its column span; if the
+// live count (including this new synapse) meets BLOCK4_PROMOTE_MIN_LIVE,
+// promotes the WHOLE tile (every synapse found in its coverage moves out of
+// `connections` into a new Block4Tile). Never demotes.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+void block4_maybe_promote(
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    std::size_t row, COL_TYPE col)
+{
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        (void)weights; (void)row; (void)col; // block4 is FP4-specific.
+    } else {
+        using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+        auto& dc = weights.connections;
+        auto& L  = dc.layout;
+        const uint32_t br = uint32_t(row / BLOCK4_TILE);
+        const uint32_t bc = uint32_t(col / BLOCK4_TILE);
+        const uint32_t li = uint32_t(row % BLOCK4_TILE);
+        const uint32_t lj = uint32_t(col % BLOCK4_TILE);
+
+        if (Block4Tile* tile = weights.block4.find(br, bc)) {
+            const std::size_t n = L.row_nnz(row);
+            auto cursor = dc.row_cursor(row);
+            for (std::size_t k = 0; k < n; ++k) {
+                const COL_TYPE c = cursor.advance();
+                if (c == col) {
+                    const std::size_t vb = L.elem_start[row] + k;
+                    const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                    const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    if (tile->at(li, lj) == 0) tile->live_count++;
+                    tile->at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                    delta_csr_row_remove_col(dc, row, col);
+                    return;
+                }
+            }
+            return; // not found -- shouldn't happen, caller just inserted it
+        }
+
+        const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+        const std::size_t row_hi = std::min(row_lo + BLOCK4_TILE, L.rows);
+        const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+        const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, L.cols);
+
+        struct Found { std::size_t row; COL_TYPE col; std::size_t elem_idx; };
+        std::vector<Found> found;
+        for (std::size_t r = row_lo; r < row_hi; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            if (n == 0) continue;
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t k = 0; k < n; ++k) {
+                const COL_TYPE c = cursor.advance();
+                if (std::size_t(c) >= col_lo && std::size_t(c) < col_hi)
+                    found.push_back({r, c, L.elem_start[r] + k});
+            }
+        }
+        if (found.size() < BLOCK4_PROMOTE_MIN_LIVE) return;
+
+        Block4Tile& tile = weights.block4.get_or_create(br, bc);
+        for (const auto& f : found) {
+            const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, f.elem_idx);
+            const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
+            const uint32_t fli = uint32_t(f.row - row_lo);
+            const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
+            if (tile.at(fli, flj) == 0) tile.live_count++;
+            tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+        }
+        // Removal happens after ALL reads above -- each row's synapses are
+        // fully read before any of them are removed, so a removal's shift of
+        // later byte offsets in that row can never invalidate an elem_idx
+        // this loop still needs.
+        for (const auto& f : found)
+            delta_csr_row_remove_col(dc, f.row, f.col);
+    }
+}
+
+// Pruning-only hook: demotes the WHOLE tile at (br,bc) back to the scattered
+// CSR -- every remaining live synapse in it moves into `connections` via
+// delta_csr_row_insert_col, then the tile is erased. Called only after a
+// block4-resident synapse was just pruned and the tile's live_count dropped
+// below BLOCK4_PROMOTE_MIN_LIVE (never called for growth). Throws if a
+// target row has run out of blank space -- same contract as
+// delta_csr_synap_row_step's own Step 6.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+void block4_demote_tile(
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    uint32_t br, uint32_t bc)
+{
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        (void)weights; (void)br; (void)bc;
+    } else {
+        using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+        auto& dc = weights.connections;
+        auto& L  = dc.layout;
+        Block4Tile* tile = weights.block4.find(br, bc);
+        if (!tile) return;
+
+        const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+        const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            const std::size_t row = row_lo + li;
+            if (row >= L.rows) continue;
+            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                const uint8_t byte  = tile->at(li, lj);
+                // Liveness is the whole byte -- see the matching comment in
+                // linear_disldo.hpp's backward block4 loop.
+                if (byte == 0) continue;
+                const uint8_t wcode = byte & 0xFu;
+                const std::size_t col = col_lo + lj;
+                if (col >= L.cols) continue;
+                const uint8_t impcode = (byte >> 4) & 0xFu;
+                const value_type w   = FP4_TABLE[wcode];
+                const value_type imp = FP4_TABLE[impcode];
+                if (!delta_csr_row_insert_col(dc, row, COL_TYPE(col), w, imp)) {
+                    throw std::runtime_error(
+                        "block4_demote_tile: row " + std::to_string(row) +
+                        " ran out of blank space while demoting tile (" +
+                        std::to_string(br) + "," + std::to_string(bc) + ")."
+                        " Call equalizer_step() to redistribute space from"
+                        " adjacent rows before retrying.");
+                }
+            }
+        }
+        weights.block4.erase(br, bc);
+    }
+}
+
 // ── Incremental synaptogenesis step ──────────────────────────────────────────
 //
 // Replaces the old "read all, merge, rebuild from scratch" approach with
@@ -585,22 +741,62 @@ bool delta_csr_synap_row_step(
     const std::size_t row = current_row % L.rows;
     current_row = (current_row + 1) % L.rows;
 
-    const std::size_t n_exist = L.row_nnz(row);
+    const std::size_t n_scattered = L.row_nnz(row);
     const bool has_probes = weights.probes.indices[0] &&
                             !weights.probes.indices[0]->empty();
+    // block4-resident entries for this row's block-row, across every
+    // block-column that currently has a live tile there -- looked up via
+    // Block4Store::by_block_row so this stays cheap even when the store
+    // holds many tiles elsewhere in the layer (see block4.hpp). Merged into
+    // the SAME cutoff/max_row_weights ranking as the scattered entries
+    // below: capacity and importance-cutoff decisions treat both
+    // representations as one pool for this row, per design.
+    const uint32_t br = uint32_t(row / BLOCK4_TILE);
+    const uint32_t li = uint32_t(row % BLOCK4_TILE);
+    std::vector<uint32_t> b4_bc, b4_lj;
+    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        auto brit = weights.block4.by_block_row.find(br);
+        if (brit != weights.block4.by_block_row.end()) {
+            for (uint32_t bc : brit->second) {
+                const Block4Tile* tile = weights.block4.find(br, bc);
+                if (!tile) continue;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    if (tile->at(li, lj) == 0) continue;
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= L.cols) continue;
+                    b4_bc.push_back(bc);
+                    b4_lj.push_back(lj);
+                }
+            }
+        }
+    }
+    const std::size_t n_exist = n_scattered + b4_bc.size();
     if (n_exist == 0 && !has_probes) return false;
 
-    // ── Step 1: Read existing connections ──────────────────────────────────
+    // ── Step 1: Read existing connections (scattered, then block4) ────────
     std::vector<COL_TYPE>   exist_cols(n_exist);
     std::vector<value_type> exist_w(n_exist), exist_imp(n_exist);
+    std::vector<bool>       exist_is_b4(n_exist, false);
     {
         auto cursor = dc.row_cursor(row);
-        for (std::size_t k = 0; k < n_exist; ++k) {
+        for (std::size_t k = 0; k < n_scattered; ++k) {
             exist_cols[k] = cursor.advance();
             exist_w[k]    = ValueAccessor<VALUES_TYPE>::get_w(
                 dc.values, L.elem_start[row] + k);
             exist_imp[k]  = ValueAccessor<VALUES_TYPE>::get_imp(
                 dc.values, L.elem_start[row] + k);
+        }
+    }
+    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        for (std::size_t j = 0; j < b4_bc.size(); ++j) {
+            const std::size_t k = n_scattered + j;
+            const uint32_t bc = b4_bc[j], lj = b4_lj[j];
+            const Block4Tile* tile = weights.block4.find(br, bc);
+            const uint8_t byte = tile->at(li, lj);
+            exist_cols[k]  = COL_TYPE(std::size_t(bc) * BLOCK4_TILE + lj);
+            exist_w[k]     = FP4_TABLE[byte & 0xFu];
+            exist_imp[k]   = FP4_TABLE[(byte >> 4) & 0xFu];
+            exist_is_b4[k] = true;
         }
     }
 
@@ -629,17 +825,20 @@ bool delta_csr_synap_row_step(
                   return exist_imp[a] < exist_imp[b];
               });
 
-    std::vector<COL_TYPE> to_remove;
+    struct RemoveEntry { COL_TYPE col; bool is_b4; };
+    std::vector<RemoveEntry> to_remove;
     const std::size_t max_rw = static_cast<std::size_t>(max_row_weights);
     for (std::size_t rank = 0; rank < n_exist; ++rank) {
         const std::size_t k    = by_imp[rank];
         const std::size_t keep = n_exist - to_remove.size();
         if (exist_imp[k] < importance_cutoff || keep > max_rw)
-            to_remove.push_back(exist_cols[k]);
+            to_remove.push_back({exist_cols[k], exist_is_b4[k]});
     }
-    // Sort descending so we remove from high col first -- keeps byte positions
-    // of lower-col elements stable while we walk and remove.
-    std::sort(to_remove.rbegin(), to_remove.rend());
+    // Sort descending so scattered removes happen high col first -- keeps
+    // byte positions of lower-col elements stable while we walk and remove
+    // (block4 removes don't shift anything, order doesn't matter for them).
+    std::sort(to_remove.begin(), to_remove.end(),
+              [](const RemoveEntry& a, const RemoveEntry& b) { return a.col > b.col; });
 
     // ── Step 4: Determine which probes to add ─────────────────────────────
     // Filter out probes that already have a connection.
@@ -647,7 +846,9 @@ bool delta_csr_synap_row_step(
         std::unordered_set<COL_TYPE> exist_set(exist_cols.begin(), exist_cols.end());
         // (Will also filter against to_remove to avoid immediately re-adding
         // a just-removed connection. Not strictly necessary but clean.)
-        std::unordered_set<COL_TYPE> remove_set(to_remove.begin(), to_remove.end());
+        std::unordered_set<COL_TYPE> remove_set;
+        remove_set.reserve(to_remove.size());
+        for (const auto& re : to_remove) remove_set.insert(re.col);
 
         std::vector<std::size_t> pidx(probe_cols.size());
         std::iota(pidx.begin(), pidx.end(), 0);
@@ -674,10 +875,28 @@ bool delta_csr_synap_row_step(
     }
 
     // ── Step 5: Apply removes (in-place, high-col first) ──────────────────
-    for (COL_TYPE col : to_remove) {
-        delta_csr_row_remove_col(dc, row, col);
-        if (!weights.out_degree.empty() && weights.out_degree[col] > 0)
-            --weights.out_degree[col];
+    // A real prune either way (scattered delete, or block4 byte-silence) --
+    // out_degree is decremented in both cases, unlike promotion/demotion's
+    // pure representation moves (see the block4_maybe_promote/
+    // block4_demote_tile comment above).
+    for (const auto& re : to_remove) {
+        if (re.is_b4) {
+            if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+                const uint32_t bc = uint32_t(re.col) / BLOCK4_TILE;
+                const uint32_t lj = uint32_t(re.col) % BLOCK4_TILE;
+                Block4Tile* tile = weights.block4.find(br, bc);
+                if (tile && tile->at(li, lj) != 0) {
+                    tile->at(li, lj) = 0;
+                    if (tile->live_count > 0) tile->live_count--;
+                    if (tile->live_count < BLOCK4_PROMOTE_MIN_LIVE)
+                        block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
+                }
+            }
+        } else {
+            delta_csr_row_remove_col(dc, row, re.col);
+        }
+        if (!weights.out_degree.empty() && weights.out_degree[re.col] > 0)
+            --weights.out_degree[re.col];
     }
 
     // ── Step 6: Apply adds in-place ──────────────────────────────────────
@@ -703,6 +922,11 @@ bool delta_csr_synap_row_step(
         }
         if (!weights.out_degree.empty())
             ++weights.out_degree[col];
+        // Growth-only hook: may immediately move this synapse (and possibly
+        // its whole tile) into block4 -- never demotes. See the comment
+        // block above block4_maybe_promote's definition.
+        if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>)
+            block4_maybe_promote(weights, row, col);
     }
 
     return true;
