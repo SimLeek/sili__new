@@ -54,13 +54,10 @@ void disldo_forward(
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
     const auto& L  = dc.layout;
-    if (dc.empty()) return;
 
     const std::size_t n_in  = L.rows;
     const std::size_t n_out = L.cols;
     const std::size_t ost   = static_cast<std::size_t>(batch) * n_out;
-
-    std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
     // value_scale is gradient-trainable (disldo_backward), so -- same as
     // every per-synapse weight -- it needs a forward-side importance
@@ -70,6 +67,14 @@ void disldo_forward(
     // race once sized).
     if (weights.value_scale_importance.size() < n_in)
         weights.value_scale_importance.resize(n_in, value_type(0));
+
+    // dc.empty() no longer means "nothing to do": block4 (below) may hold
+    // live synapses even when the scattered CSR is empty (e.g. everything
+    // in a small/dense layer promoted). L.rows/L.cols stay valid either
+    // way (set at construction, independent of nnz), so skipping just this
+    // block is safe.
+    if (!dc.empty()) {
+    std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
     #pragma omp parallel num_threads(num_cpus)
     {
@@ -168,6 +173,85 @@ void disldo_forward(
     for (int t = 0; t < num_cpus; ++t) {
         const value_type* s = t_out.data() + static_cast<std::size_t>(t) * ost;
         for (std::size_t i = 0; i < ost; ++i) output[i] += s[i];
+    }
+    }  // !dc.empty()
+
+    // block4 contribution -- same shared per-row value_scale/output_scale
+    // as the scattered path above (see block4.hpp: this is the whole point
+    // of NOT giving block4 its own separate scale, unlike the prototype).
+    // No gather here: within an active tile, position IS the column, a
+    // fixed compile-time-known offset -- see block4.hpp / BLOCK4_NOTES.md
+    // for the real, measured SIMD benefit this gets on this machine that
+    // the scattered loop above never can (GCC: "complicated access
+    // pattern", confirmed via -fopt-info-vec, never auto-vectorizes).
+    //
+    // KNOWN GAP, not yet addressed: unlike the scattered path above, this
+    // does not yet update value_scale_importance/output_scale_importance's
+    // forward-side Hebbian signal for block4-owned synapses specifically
+    // -- those importance scales are updated only by whatever fraction of
+    // a row/column still has scattered synapses. Fine for a first working,
+    // speed-focused version; a real quality comparison against the
+    // scattered-only baseline should check whether this matters before
+    // being trusted for training quality claims, not just forward value
+    // correctness (which does not depend on this).
+    if (!weights.block4.tiles.empty()) {
+        // Hash-map iteration isn't parallel-for-friendly directly; collect
+        // pointers once per call. Real cost: O(n_tiles), not O(nnz) --
+        // cheap relative to the per-tile compute unless tiles are
+        // pathologically small, but a real, measurable per-call overhead
+        // the prototype's contiguous block_data array didn't pay. Worth
+        // checking in the comparison script (not assumed either way).
+        std::vector<const Block4Tile*> live_tiles;
+        std::vector<uint32_t> tile_br, tile_bc;
+        live_tiles.reserve(weights.block4.tiles.size());
+        tile_br.reserve(weights.block4.tiles.size());
+        tile_bc.reserve(weights.block4.tiles.size());
+        for (auto& kv : weights.block4.tiles) {
+            live_tiles.push_back(&kv.second);
+            tile_br.push_back(uint32_t(kv.first >> 32));
+            tile_bc.push_back(uint32_t(kv.first & 0xFFFFFFFFu));
+        }
+        // Per-thread private output buffers, same pattern as the scattered
+        // path's t_out above -- necessary, not optional: two tiles that
+        // share a block-COLUMN (different block-rows, i.e. different input
+        // rows feeding the same output columns) write to the same output
+        // positions, so parallelizing freely over tiles without this would
+        // race exactly the way the scattered path's own scatter-write
+        // would without t_out.
+        std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
+        #pragma omp parallel num_threads(num_cpus)
+        {
+            const int tid = omp_get_thread_num();
+            value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
+            #pragma omp for schedule(static)
+            for (int64_t ti = 0; ti < int64_t(live_tiles.size()); ++ti) {
+                const Block4Tile& tile = *live_tiles[std::size_t(ti)];
+                const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= n_out) continue;
+                    const value_type out_scale = weights.get_output_scale(col);
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        value_type acc = value_type(0);
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                            if (row >= n_in) continue;
+                            const uint8_t code = tile.at(li, lj) & 0xFu;
+                            if (code == 0) continue;
+                            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                            if (iv == value_type(0)) continue;
+                            const value_type val_scale = weights.get_value_scale(row);
+                            acc += FP4_TABLE[code] * val_scale * out_scale * iv;
+                        }
+                        mo[static_cast<std::size_t>(b) * n_out + col] += acc;
+                    }
+                }
+            }
+        }
+        for (int t = 0; t < num_cpus; ++t) {
+            const value_type* s = b4_out.data() + static_cast<std::size_t>(t) * ost;
+            for (std::size_t i = 0; i < ost; ++i) output[i] += s[i];
+        }
     }
 
     // output_scale's forward importance: its own "contrib" is the final

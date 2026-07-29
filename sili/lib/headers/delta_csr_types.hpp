@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
+#include "block4.hpp"
 
 /**
  * @brief Type trait to check if a type is a std::array.
@@ -439,6 +440,14 @@ struct SparseLinearWeightsDelta {
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
     std::vector<SIZE_TYPE>                            out_degree;
+
+    // Locally-dense companion to `connections` -- see block4.hpp. Shares
+    // THIS struct's own value_scale/importance_scale below (not a separate
+    // scale), so moving a synapse between `connections` and `block4` is a
+    // lossless byte copy, not a requantization. Promotion/demotion logic
+    // lives in delta_csr_memory.hpp (needs delta_csr_row_insert_col/
+    // _remove_col, which would be a circular include from here).
+    Block4Store block4;
 
     // Per-ROW scale applied to STORED importance to get TRUE units before
     // any importance arithmetic (the activity-correlation `1+|imp|` denominator, the
