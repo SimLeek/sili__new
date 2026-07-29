@@ -126,10 +126,35 @@ std::unique_ptr<DualLayer> build_dual_layer(
             }
             a_ptrs[in_row + 1] = int(a_idx.size());
         }
+        // Per-row value_scale calibration, matching disldo's own default
+        // (model/sili_block.py's _build_step_layer_from_arrays in
+        // sili_peridot) -- a REAL gap found by A/B-testing quantization
+        // error against a standalone, properly-calibrated disldo layer on
+        // real weights: embed_tokens (the tensor with the largest leftover
+        // fraction, 3.5%) showed 2.07x WORSE relative error than plain
+        // disldo on identical weights before this fix, because leftover
+        // entries were quantized raw/unscaled while disldo's own
+        // comparison layer got calibrated. Without this, the dual-matrix
+        // design's A path is a strictly worse disldo than disldo itself,
+        // which isn't a fair test of the design.
+        std::vector<float> a_row_scale(n_in_pad, 1.0f);
+        for (uint32_t in_row = 0; in_row < n_in_pad; ++in_row) {
+            float max_abs = 0.0f;
+            for (int e = a_ptrs[in_row]; e < a_ptrs[in_row + 1]; ++e)
+                max_abs = std::max(max_abs, std::abs(a_w[std::size_t(e)]));
+            if (max_abs > 0.0f) {
+                a_row_scale[in_row] = max_abs / 6.0f;
+                for (int e = a_ptrs[in_row]; e < a_ptrs[in_row + 1]; ++e)
+                    a_w[std::size_t(e)] /= a_row_scale[in_row];
+            }
+        }
         layer.a_weights.connections = delta_csr_from_absolute<int, FP4BiPacked, uint32_t>(
             a_ptrs, a_idx, a_w, a_imp, n_in_pad, n_out_pad,
             a_idx.size() * 8 + 4096, a_idx.size() + 64, 0.2f);
         layer.a_weights.recompute_stats();
+        for (uint32_t in_row = 0; in_row < n_in_pad; ++in_row)
+            if (a_row_scale[in_row] != 1.0f)
+                layer.a_weights.set_value_scale_raw(in_row, a_row_scale[in_row]);
         layer.has_a = true;
     }
     return layer_ptr;
