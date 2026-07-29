@@ -33,12 +33,17 @@
 //     4 | weight nibble, same FP4 pair disldo stores) -- no per-synapse
 //     index cost at all once a tile is active.
 //
-// Values are UNSCALED FP4 codes (no per-row value_scale/output_scale the
-// way disldo has -- see the conversation's open question on this: Fable's
-// codec has the same limitation, single scalar w_scale, no per-row
-// calibration). Fine for weights already in FP4's native magnitude range;
-// a real deployment on small-magnitude trained weights would need this
-// added before quality claims can be trusted.
+// Values are FP4 codes scaled by a PER-ORIGINAL-ROW value_scale (matching
+// disldo's own default "per_row" calibration -- see sili_peridot's
+// model/sili_block.py, _build_step_layer_from_arrays). A single global
+// scale was tried first and found (not assumed) insufficient on real
+// weights: one real MiniCPM5 layer's weight magnitudes spanned 0.0095 to
+// 0.629 (66x) -- a global scale calibrated to the max still left the
+// smallest weights far below FP4's floor (0.5), losing 43% of real
+// nonzeros. Per-row narrows the range each scale has to cover to
+// whatever ONE row's own weights actually span, recovering much more of
+// the real distribution -- same reasoning disldo's own per-row scale is
+// built on, applied here to block4's dense tiles the same way.
 
 struct Block4Weights {
     uint32_t n_block_rows = 0, n_block_cols = 0;   // M/4, N/4 (M, N must be multiples of 4)
@@ -46,20 +51,23 @@ struct Block4Weights {
     std::vector<uint32_t> block_byte_ptrs;           // size n_block_rows+1, byte offset into block_col_bytes
     std::vector<uint8_t>  block_col_bytes;           // ULEB128-delta block-column indices
     std::vector<uint8_t>  block_data;                // 16 bytes/block: (imp<<4|w4), row-major within tile (col-major in j for the forward loop below)
-    float w_scale = 1.0f;
+    std::vector<float>    row_scale;                 // size n_block_rows*4 (one per ORIGINAL row, matching disldo's own granularity)
 
     uint32_t n_blocks() const { return block_ptrs.empty() ? 0 : block_ptrs.back(); }
 };
 
 // y[4*r : 4*r+4] += sum over this block-row's active blocks of W_block @ x[4*bcol : 4*bcol+4].
 // Caller zeroes y first (matches disldo_forward's own "accumulated into" convention).
-inline void block4_forward(const Block4Weights& bw, const float* x, float* y,
-                           int num_cpus, float w_scale_override = -1.0f) {
-    const float ws = (w_scale_override >= 0.0f) ? w_scale_override : bw.w_scale;
+inline void block4_forward(const Block4Weights& bw, const float* x, float* y, int num_cpus) {
     #pragma omp parallel for schedule(static) num_threads(num_cpus)
     for (int64_t rr = 0; rr < int64_t(bw.n_block_rows); ++rr) {
         const uint32_t r = uint32_t(rr);
         const uint32_t nblocks = bw.block_ptrs[r + 1] - bw.block_ptrs[r];
+        // Loaded once per block-row (4 consecutive original rows), reused
+        // across every active block in this row -- one small extra load,
+        // not a per-synapse cost.
+        const float rs0 = bw.row_scale[r * 4 + 0], rs1 = bw.row_scale[r * 4 + 1],
+                    rs2 = bw.row_scale[r * 4 + 2], rs3 = bw.row_scale[r * 4 + 3];
         float yl[4] = {0.f, 0.f, 0.f, 0.f};
         std::size_t bytepos = bw.block_byte_ptrs[r];
         uint32_t prev = 0;
@@ -75,8 +83,10 @@ inline void block4_forward(const Block4Weights& bw, const float* x, float* y,
             #pragma omp simd
             for (int j = 0; j < 4; ++j) {
                 const float xj = xb[j];
-                for (int i = 0; i < 4; ++i)
-                    yl[i] += FP4_TABLE[Wb[j * 4 + i] & 0xFu] * ws * xj;
+                yl[0] += FP4_TABLE[Wb[j * 4 + 0] & 0xFu] * rs0 * xj;
+                yl[1] += FP4_TABLE[Wb[j * 4 + 1] & 0xFu] * rs1 * xj;
+                yl[2] += FP4_TABLE[Wb[j * 4 + 2] & 0xFu] * rs2 * xj;
+                yl[3] += FP4_TABLE[Wb[j * 4 + 3] & 0xFu] * rs3 * xj;
             }
         }
         y[r * 4 + 0] += yl[0]; y[r * 4 + 1] += yl[1]; y[r * 4 + 2] += yl[2]; y[r * 4 + 3] += yl[3];
@@ -114,6 +124,25 @@ inline Block4SplitResult split_for_block4(
     res.block4.n_block_rows = Mb;
     res.block4.n_block_cols = Nb;
 
+    // Real trained-model weights are typically far smaller in magnitude
+    // than FP4's smallest representable nonzero (0.5) -- the exact same
+    // gap disldo's own per-row value_scale exists to close (see
+    // model/sili_block.py's _build_step_layer_from_arrays in sili_peridot).
+    // A first version used one GLOBAL scale and found it insufficient on
+    // real weights (found the hard way, not assumed): one real MiniCPM5
+    // layer's weight magnitudes spanned 0.0095-0.629 (66x), and a global
+    // scale still left 43% of real nonzeros below FP4's floor even after
+    // scaling. Per-row narrows this to whatever each individual row's own
+    // weights span -- computed here exactly like disldo's own per-row
+    // pass (max_abs per row / 6.0, applied before quantizing).
+    res.block4.row_scale.assign(M, 1.0f);
+    for (uint32_t row = 0; row < M; ++row) {
+        float max_abs = 0.0f;
+        for (uint32_t e = csr_ptrs[row]; e < csr_ptrs[row + 1]; ++e)
+            max_abs = std::max(max_abs, std::abs(csr_w[e]));
+        if (max_abs > 0.0f) res.block4.row_scale[row] = max_abs / 6.0f;
+    }
+
     // Bucket every (row, col, w, imp) into its 4x4 tile.
     struct Entry { uint32_t local_i, local_j; float w, imp; uint32_t orig_row, orig_col; };
     std::vector<std::vector<Entry>> tiles(std::size_t(Mb) * Nb);
@@ -138,7 +167,8 @@ inline Block4SplitResult split_for_block4(
             if (fill >= min_fill_frac) {
                 uint8_t tile_bytes[16] = {0};
                 for (auto& e : t) {
-                    const uint8_t w4 = fp4_quantize(e.w);
+                    const float inv_row_scale = 1.0f / res.block4.row_scale[e.orig_row];
+                    const uint8_t w4 = fp4_quantize(e.w * inv_row_scale);
                     const uint8_t imp4 = fp4_quantize(e.imp) & 0xFu;   // reuse fp4_quantize for a 4-bit importance code too
                     tile_bytes[e.local_j * 4 + e.local_i] = uint8_t((imp4 << 4) | w4);
                 }
