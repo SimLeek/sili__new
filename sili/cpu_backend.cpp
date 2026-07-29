@@ -281,6 +281,12 @@ public:
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    // How many synapses currently live in block4 vs the scattered CSR --
+    // purely observational (block4's whole point is to be invisible to
+    // callers otherwise), exposed so benchmarks/diagnostics can report
+    // what fraction of a layer actually promoted rather than guessing.
+    S block4_tiles()    const { return static_cast<S>(weights.block4.n_tiles()); }
+    S block4_synapses() const { return static_cast<S>(weights.block4.live_synapses()); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -720,6 +726,8 @@ public:
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    S block4_tiles()    const { return static_cast<S>(weights.block4.n_tiles()); }
+    S block4_synapses() const { return static_cast<S>(weights.block4.live_synapses()); }
 
     py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
@@ -1008,6 +1016,11 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
+        .def_property_readonly("block4_tiles",    &SparseLinearLayer::block4_tiles,
+             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("block4_synapses", &SparseLinearLayer::block4_synapses,
+             "Number of synapses currently living in block4 (subset of nnz) --"
+             " purely observational.")
         .def_property_readonly("last_input",
             [](const SparseLinearLayer& self) -> py::object {
                 if (self._last_input.empty()) return py::none();
@@ -1060,7 +1073,9 @@ PYBIND11_MODULE(_cpu, m)
         .def_readonly ("num_cpus",  &DISLDOLayerV::num_cpus)
         .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
-        .def_property_readonly("nnz",       &DISLDOLayerV::nnz);
+        .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
+        .def_property_readonly("block4_tiles",    &DISLDOLayerV::block4_tiles)
+        .def_property_readonly("block4_synapses", &DISLDOLayerV::block4_synapses);
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

@@ -44,7 +44,11 @@ def dense_reference(layer, n_in, n_out, ptrs, indices, weights):
     return dense
 
 
-def time_calls(fn, n_calls):
+def time_calls(fn, n_calls, warmup):
+    # Warmup discarded before timing: first calls can carry one-time costs
+    # (allocator growth, cache cold-start) unrelated to steady-state speed.
+    for _ in range(warmup):
+        fn()
     times = []
     for _ in range(n_calls):
         t0 = time.perf_counter()
@@ -54,6 +58,7 @@ def time_calls(fn, n_calls):
         "mean_s": statistics.mean(times),
         "median_s": statistics.median(times),
         "min_s": min(times),
+        "max_s": max(times),
     }
 
 
@@ -75,6 +80,7 @@ def main():
                      "multi-threaded timing instead; expect nnz_after_growth "
                      "to then legitimately differ run-to-run.")
     ap.add_argument("--n-calls", type=int, default=50)
+    ap.add_argument("--warmup-calls", type=int, default=5)
     ap.add_argument("--growth-cycles", type=int, default=200,
                      help="number of synap_step calls in the growth phase")
     ap.add_argument("--probe-k", type=int, default=64)
@@ -124,6 +130,8 @@ def main():
               "args": vars(args)}
 
     report["nnz_before_growth"] = int(layer.nnz)
+    report["block4_tiles_before_growth"] = int(getattr(layer, 'block4_tiles', 0))
+    report["block4_synapses_before_growth"] = int(getattr(layer, 'block4_synapses', 0))
 
     # Quality check BEFORE growth.
     dense0 = dense_reference(layer, n_in, n_out, layer.ptrs, layer.indices, layer.weights_vals)
@@ -132,11 +140,11 @@ def main():
     report["quality_before_growth_max_abs_err"] = float(np.max(np.abs(y0 - ref0)))
 
     report["forward_before_growth"] = time_calls(
-        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls)
+        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls, args.warmup_calls)
 
     y_for_bwd = layer.forward_dense(x, learning_rate=0.0)
     report["backward_before_growth"] = time_calls(
-        lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls)
+        lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls, args.warmup_calls)
 
     # Growth phase: build probes once, then repeatedly synap_step to insert
     # them row by row (this is what triggers block4 promotion on branches
@@ -155,6 +163,8 @@ def main():
     report["growth_phase_throws"] = n_throws
 
     report["nnz_after_growth"] = int(layer.nnz)
+    report["block4_tiles_after_growth"] = int(getattr(layer, 'block4_tiles', 0))
+    report["block4_synapses_after_growth"] = int(getattr(layer, 'block4_synapses', 0))
 
     # Quality check AFTER growth -- must still match a dense reference
     # reconstructed from the (block4-aware, see delta_csr_combined_to_absolute)
@@ -165,9 +175,9 @@ def main():
     report["quality_after_growth_max_abs_err"] = float(np.max(np.abs(y1 - ref1)))
 
     report["forward_after_growth"] = time_calls(
-        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls)
+        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls, args.warmup_calls)
     report["backward_after_growth"] = time_calls(
-        lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls)
+        lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls, args.warmup_calls)
 
     print(json.dumps(report, indent=2))
 
