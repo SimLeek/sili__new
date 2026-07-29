@@ -345,7 +345,7 @@ void disldo_backward(
             neuron_grad_accum[c]  += std::abs(output_grad[static_cast<std::size_t>(b) * n_out + c]);
     }
 
-    if (dc.empty()) return;
+    if (dc.empty() && weights.block4.tiles.empty()) return;
 
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
@@ -357,6 +357,9 @@ void disldo_backward(
     // pattern as t_dx above). Only applied if output_scale_is_trainable
     // (set by set_output_scale_raw) -- not a size check, since the resize
     // below runs unconditionally for safe reads regardless of mode.
+    // Shared between the scattered loop below AND block4's own loop
+    // further down -- both write into the same buffer (per-thread-private
+    // slices, indexed by their own tid), summed once at the very end.
     std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out, value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
@@ -372,6 +375,7 @@ void disldo_backward(
     if (weights.output_scale_importance.size() < n_out)
         weights.output_scale_importance.resize(n_out, value_type(0));
 
+    if (!dc.empty()) {
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
@@ -492,6 +496,143 @@ void disldo_backward(
                 weights.update_importance_stats_aggregate(
                     local_sum_abs_new_i, local_sum_abs_old_i,
                     local_sum_sq_new_i,  local_sum_sq_old_i, local_max_new_i);
+            }
+        }
+    }
+    }  // !dc.empty()
+
+    // block4 backward: dx + inline weight/importance update, mirroring the
+    // scattered loop above but keyed by tile instead of CSR row. Same
+    // shared value_scale/output_scale as forward and the scattered path
+    // (see block4.hpp) -- moving a synapse between representations stays
+    // a lossless byte copy, so its gradient math must stay consistent too.
+    //
+    // Race note: the scattered loop above parallelizes over ROWS, so each
+    // row (and thus each row's value_scale/value_scale_importance update)
+    // is owned by exactly one thread. Here we parallelize over TILES, and
+    // two different tiles can share the same block-ROW (different block-
+    // columns) -- so a row's value_scale gradient can now be touched by
+    // more than one thread concurrently. Fixed the same way output_scale's
+    // gradient already is in this function: per-thread-private accumulator
+    // buffers (t_row_grad, indexed like t_col_grad), reduced serially once
+    // after the parallel region, instead of applying the update inline.
+    //
+    // KNOWN SIMPLIFICATION (documented, not a bug): if a row has BOTH
+    // scattered and block4 synapses, its value_scale gets two sequential
+    // gradient steps (the scattered loop's own step above, then block4's
+    // step below) rather than one combined step over the true total nnz.
+    // Mathematically this is just two successive descent steps, not an
+    // incorrect one -- acceptable for a first working version; revisit if
+    // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
+    if (!weights.block4.tiles.empty()) {
+        std::vector<Block4Tile*> live_tiles;
+        std::vector<uint32_t> tile_br, tile_bc;
+        live_tiles.reserve(weights.block4.tiles.size());
+        tile_br.reserve(weights.block4.tiles.size());
+        tile_bc.reserve(weights.block4.tiles.size());
+        for (auto& kv : weights.block4.tiles) {
+            live_tiles.push_back(&kv.second);
+            tile_br.push_back(uint32_t(kv.first >> 32));
+            tile_bc.push_back(uint32_t(kv.first & 0xFFFFFFFFu));
+        }
+
+        // Exact per-row live count across ALL block4 tiles (not just one
+        // tile), needed for both lr_per_row_nnz and the unconditional
+        // scale_eff_lr normalization -- a single cheap serial pass
+        // (O(n_tiles*BLOCK4_TILE_SLOTS)) avoids either an approximation
+        // or a race on a shared counter.
+        std::vector<uint32_t> row_live_count(n_in, 0);
+        for (std::size_t ti = 0; ti < live_tiles.size(); ++ti) {
+            const Block4Tile& tile = *live_tiles[ti];
+            const uint32_t br = tile_br[ti];
+            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                if (row >= n_in) continue;
+                uint32_t c = 0;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
+                    if ((tile.at(li, lj) & 0xFu) != 0) ++c;
+                row_live_count[row] += c;
+            }
+        }
+
+        std::vector<double> t_row_grad(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
+
+        #pragma omp parallel num_threads(num_cpus)
+        {
+            const int tid = omp_get_thread_num();
+            value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+            value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
+            double* mrow = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in;
+
+            #pragma omp for schedule(static)
+            for (int64_t ti = 0; ti < int64_t(live_tiles.size()); ++ti) {
+                Block4Tile& tile = *live_tiles[std::size_t(ti)];
+                const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+
+                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                    const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                    if (row >= n_in) continue;
+                    const uint32_t nnz_row = row_live_count[row];
+                    if (nnz_row == 0) continue;
+                    const value_type val_scale = weights.get_value_scale(row);
+                    const value_type imp_scale = weights.get_importance_scale(row);
+                    const value_type effective_lr = lr_per_row_nnz
+                        ? learning_rate / static_cast<value_type>(nnz_row)
+                        : learning_rate;
+
+                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                        const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                        if (col >= n_out) continue;
+                        uint8_t& byte = tile.at(li, lj);
+                        const uint8_t w_code = byte & 0xFu;
+                        if (w_code == 0) continue;
+                        const uint8_t imp_code = (byte >> 4) & 0xFu;
+                        const value_type out_scale      = weights.get_output_scale(col);
+                        const value_type out_imp_scale  = weights.get_output_importance_scale(col);
+                        const value_type combined_scale     = val_scale * out_scale;
+                        const value_type combined_imp_scale = imp_scale * out_imp_scale;
+                        const value_type cw_orig = FP4_TABLE[w_code];
+                        value_type cw = cw_orig * combined_scale;          // -> true units
+                        value_type ci = FP4_TABLE[imp_code] * combined_imp_scale;
+
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + row];
+                            const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
+                            const value_type g   = dyv * iv;
+
+                            if (learning_rate != value_type(0)) {
+                                ci -= g * effective_lr;
+                                cw += damp_by_importance
+                                    ? (-effective_lr * g) / (value_type(1) + std::abs(ci))
+                                    : (-effective_lr * g);
+                                mrow[row] += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
+                                mcol[col] += cw_orig * val_scale * g;
+                            }
+                            mdx[static_cast<std::size_t>(b) * in_cols + row] += cw * dyv;
+                        }
+                        if (learning_rate != value_type(0)) {
+                            const uint8_t new_w   = fp4_quantize_stochastic(cw / combined_scale);
+                            const uint8_t new_imp = fp4_quantize_stochastic(ci / combined_imp_scale);
+                            byte = uint8_t((new_imp << 4) | new_w);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (learning_rate != value_type(0)) {
+            for (std::size_t row = 0; row < n_in; ++row) {
+                const uint32_t nnz_row = row_live_count[row];
+                if (nnz_row == 0) continue;
+                double sum = 0.0;
+                for (int t = 0; t < num_cpus; ++t)
+                    sum += t_row_grad[static_cast<std::size_t>(t) * n_in + row];
+                if (sum == 0.0) continue;
+                const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
+                const value_type raw_update = static_cast<value_type>(scale_eff_lr * sum);
+                weights.value_scale_importance[row] -= raw_update;
+                const value_type vs_imp = weights.value_scale_importance[row];
+                weights.value_scale[row] -= raw_update / (value_type(1) + std::abs(vs_imp));
             }
         }
     }
