@@ -75,15 +75,21 @@ inline Block4Vec block4_vec_load(const float* p) {
 inline void block4_vec_store(float* p, Block4Vec v) {
     std::memcpy(p, &v, sizeof(v));
 }
+// Hardcoded to 4 elements, not a BLOCK4_TILE-driven loop -- a real,
+// measured bug found via callgrind: a runtime-indexed loop over a
+// vector-extension type's lanes (`for (i...) v[i]=x`) forces GCC to treat
+// the whole vector as memory instead of a register, compiling to a real
+// scalar loop, NOT a single broadcast instruction -- 7.6% of all
+// instructions in a profiled disldo_backward run were this "vectorized"
+// broadcast helper alone. A 4-element brace-init list is a genuine single
+// broadcast op; this file already commits to exactly 4 (see the header
+// comment -- BLOCK4_TILE_SIZE is a compile-time override knob for
+// re-tuning, not a hook for a generic-width loop nothing here needs).
 inline Block4Vec block4_vec_broadcast(float x) {
-    Block4Vec v;
-    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) v[i] = x;
-    return v;
+    return Block4Vec{x, x, x, x};
 }
 inline Block4VecU block4_vecu_broadcast(uint32_t x) {
-    Block4VecU v;
-    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) v[i] = x;
-    return v;
+    return Block4VecU{x, x, x, x};
 }
 // Elementwise |x| via an IEEE-754 sign-bit clear -- std::abs isn't defined
 // for GCC vector-extension types, and this avoids a per-lane branch.
@@ -95,10 +101,49 @@ inline Block4Vec block4_vec_abs(Block4Vec x) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
+// Hardcoded 4-term sum, not a BLOCK4_TILE-driven loop -- same real,
+// measured bug as block4_vec_broadcast above (runtime-indexed access
+// forces scalar memory traffic instead of a real horizontal-add): this
+// one function alone was 12.16% of all instructions in a profiled
+// disldo_backward run. Constant-index element extraction (x[0] etc, index
+// known at compile time) is what actually lets GCC treat x as a register
+// and emit a real extract+add sequence instead of a loop.
 inline float block4_vec_hsum(Block4Vec x) {
-    float s = 0.0f;
-    for (uint32_t i = 0; i < BLOCK4_TILE; ++i) s += x[i];
-    return s;
+    return x[0] + x[1] + x[2] + x[3];
+}
+// 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes BLOCK4_TILE codes in one
+// shot instead of BLOCK4_TILE separate FP4_TABLE[code] lookups. Same
+// branchless bit formula as the scalar version (see fp4quant.hpp's header
+// comment on why it's exact, not an approximation), with the two branches
+// combined via a compare-mask blend instead of an if/else -- GCC/Clang
+// vector-extension comparison operators already return an all-ones/all-
+// zero mask per lane, so `(a & mask) | (b & ~mask)` is the whole blend,
+// no scalar branching anywhere. Verified bit-exact against
+// fp4_decode_bits() (equivalently FP4_TABLE) for all 65536 4-tuples of
+// codes -- see test_fp4_bitshift.cpp.
+inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
+    const Block4VecU one_u  = block4_vecu_broadcast(1u);
+    const Block4VecU zero_u = block4_vecu_broadcast(0u);
+    const Block4VecU s = (codes >> 3) & one_u;
+    const Block4VecU e = (codes >> 1) & block4_vecu_broadcast(3u);
+    const Block4VecU m = codes & one_u;
+
+    const Block4VecU bits_normal =
+        (s << 31) | ((e + block4_vecu_broadcast(126u)) << 23) | (m << 22);
+
+    const Block4VecU half_bits = block4_vecu_broadcast(0x3F000000u) | (s << 31);
+    const Block4VecU nan_bits  = block4_vecu_broadcast(0x7FC00000u);
+    const Block4VecU s_mask    = (s != zero_u);
+    const Block4VecU bits_m0   = (nan_bits & s_mask) | (zero_u & ~s_mask);
+    const Block4VecU m_mask    = (m != zero_u);
+    const Block4VecU bits_special = (half_bits & m_mask) | (bits_m0 & ~m_mask);
+
+    const Block4VecU e_mask = (e != zero_u);
+    const Block4VecU bits = (bits_normal & e_mask) | (bits_special & ~e_mask);
+
+    Block4Vec result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
 // One dense tile: BLOCK4_TILE_SLOTS bytes, (imp4<<4|w4) per slot, stored

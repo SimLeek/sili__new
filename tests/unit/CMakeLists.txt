@@ -137,3 +137,24 @@ include_directories(${Python3_INCLUDE_DIRS})
 include(CTest)
 include(Catch)
 catch_discover_tests(sili_tests)
+
+# Standalone (own int main(), not Catch2 TEST_CASE) block4/fp4 tests --
+# never wired into sili_tests itself (would collide on multiple main()
+# definitions), and until now never wired into CTest either -- only ever
+# run via ad-hoc manual g++ invocations during the block4 integration work
+# (see conversation). Real coverage gap, not intentional; fixed here rather
+# than left as-is.
+set(SILI_STANDALONE_TESTS
+    test_disldo_block4_forward
+    test_disldo_block4_backward
+    test_disldo_block4_promotion
+    test_disldo_block4_combined_absolute
+    test_fp4_bitshift
+)
+foreach(t ${SILI_STANDALONE_TESTS})
+    add_executable(${t} ${t}.cpp)
+    target_include_directories(${t} PRIVATE "../../sili/" "../../sili/lib/headers" "../../sili/lib/src")
+    target_link_libraries(${t} OpenMP::OpenMP_CXX)
+    set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME ${t} COMMAND ${t})
+endforeach()

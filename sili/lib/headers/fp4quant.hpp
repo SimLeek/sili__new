@@ -32,16 +32,97 @@ static constexpr float FP4_TABLE[16] = {
     -6.0f,   // 1111
 };
 
+// ── Bit-shift codec (no table, no branch-per-candidate) ─────────────────────
+//
+// FP4_TABLE's 16 entries are exactly OCP MXFP4 E2M1 (2 exponent bits, 1
+// mantissa bit, bias 1) with one repurposing: slot 8 (sign=1,exp=00,mant=0,
+// which E2M1 itself would read as -0.0) stores NaN instead. That's a real,
+// deliberate difference from raw E2M1 -- not a bug to route around here.
+//
+// decode: E2M1's exponent/mantissa fields slot directly into an IEEE-754
+// float32's fields with a re-bias (E2M1 bias 1 -> float32 bias 127, so
+// exp_field = e2m1_exp + 126) and the single mantissa bit placed at
+// float32's top mantissa bit -- exact, no rounding, verified bit-for-bit
+// against FP4_TABLE for all 16 codes (see conversation). Only exp==0 (the
+// subnormal slot, values 0/NaN/-0.5 depending on sign+mantissa) needs
+// separate handling; every other code is one shift+mask+bitcast.
+//
+// encode: nearest-value quantization via the standard low-precision-ML
+// technique (also how real E2M1 hardware casts work) -- add a rounding
+// bias at the mantissa truncation point and let integer addition's carry
+// propagate the rounding through the exponent (1.75 -> 2.0 falls out of
+// the carry automatically, no separate case needed), then saturate at the
+// max representable magnitude (6.0). The one further special case is the
+// [0.25, 1.0) magnitude range, which straddles the subnormal/normal
+// boundary the generic carry trick doesn't span on its own.
+//
+// Tie-breaking here (nearest with exact float ties resolved by whichever
+// way the bit arithmetic naturally falls, e.g. midpoints round up in
+// magnitude) is NOT required to match fp4_quantize()'s old linear-scan
+// tie convention (which favoured lower table index on a tie) -- the table
+// isn't a frozen external format, just this codebase's own choice, and
+// exact-tie floats essentially never occur in real gradient-driven data.
+// fp4_quantize() below is now defined IN TERMS OF this encoder, not the
+// other way around.
+
+inline float fp4_decode_bits(uint8_t code) {
+    const uint32_t s = (uint32_t(code) >> 3) & 1u;
+    const uint32_t e = (uint32_t(code) >> 1) & 3u;
+    const uint32_t m = uint32_t(code) & 1u;
+    uint32_t bits;
+    if (e == 0) {
+        // Subnormal slot: code 0/1 -> 0.0/0.5, code 8/9 -> NaN/-0.5 (see
+        // header comment -- 8 is the repurposed slot, not IEEE -0.0).
+        bits = m ? (0x3F000000u | (s << 31)) : (s ? 0x7FC00000u : 0u);
+    } else {
+        const uint32_t exp_field = e + 126u;
+        bits = (s << 31) | (exp_field << 23) | (m << 22);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+inline uint8_t fp4_encode_bits(float v) {
+    static constexpr uint32_t TH_025 = 0x3E800000u;  // bits_of(0.25f)
+    static constexpr uint32_t TH_075 = 0x3F400000u;  // bits_of(0.75f)
+    static constexpr uint32_t TH_1   = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX    = 0x40C00000u;  // bits_of(6.0f)
+
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+
+    uint32_t mag_code;
+    if (abits > 0x7F800000u) {
+        // NaN input: matches the old linear-scan's fp4_quantize(NaN) == 0
+        // (every |NaN - table[i]| comparison is false, so `best` never
+        // moves off its 0 initial value).
+        return 0;
+    } else if (abits < TH_025) {
+        mag_code = 0;
+    } else if (abits < TH_075) {
+        mag_code = 1;
+    } else if (abits < TH_1) {
+        mag_code = 2;
+    } else {
+        uint32_t rounded = abits + (1u << 21);
+        if (rounded > SIX) rounded = SIX;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
+    }
+    // A near-zero input must land on code 0 regardless of sign -- never
+    // the repurposed NaN slot (8 = sign 1, magnitude 0).
+    if (mag_code == 0) return 0;
+    const uint32_t s = sign ? 1u : 0u;
+    return uint8_t((s << 3) | mag_code);
+}
+
 ///Nearest-neighbour quantize @p v to a 4-bit FP4 index. NaN slot (8) is skipped.
 inline uint8_t fp4_quantize(float v) {
-    uint8_t best     = 0;
-    float   best_err = std::abs(v - FP4_TABLE[0]);
-    for (uint8_t i = 1; i < 16; ++i) {
-        if (i == 8) continue;
-        const float err = std::abs(v - FP4_TABLE[i]);
-        if (err < best_err) { best_err = err; best = i; }
-    }
-    return best;
+    return fp4_encode_bits(v);
 }
 
 // ── Stochastic rounding ───────────────────────────────────────────────────────

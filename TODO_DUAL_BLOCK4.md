@@ -252,6 +252,82 @@ importance accessors) -- not a second, bolted-on object.
       on real checkpoint structure (that number is about block4 vs.
       fully-scattered CSR, a different comparison than SIMD vs. scalar
       *within* block4) -- but real and free money regardless.
+- [x] Bit-shift FP4 encode/decode (`fp4quant.hpp`'s `fp4_decode_bits`/
+      `fp4_encode_bits`), replacing `FP4_TABLE[code]`/the old 15-entry
+      linear scan for CPU. Not an approximation: FP4_TABLE turns out to be
+      exactly OCP MXFP4 E2M1 (2 exponent bits, 1 mantissa bit, bias 1)
+      with one repurposed slot (code 8, sign=1/exp=00/mant=0, stores NaN
+      instead of IEEE E2M1's -0.0) -- decode is a straight field re-bias
+      into a float32's own exponent/mantissa (exact, verified bit-for-bit
+      against FP4_TABLE for all 16 codes), encode is the standard
+      low-precision-ML round-via-carry technique (add a rounding bias at
+      the mantissa truncation point, let integer addition's carry
+      propagate the rounding through the exponent) with one explicit
+      3-way threshold split for the awkward subnormal/normal transition
+      region ([0, 0.25)/[0.25,0.75)/[0.75,1.0) magnitudes). Per-direction
+      (table isn't a frozen external format, this codebase's own choice):
+      encode's exact tie-break no longer needs to match the old linear
+      scan's arbitrary "lower table index wins" convention -- only that
+      it lands on a nearest-or-tied value, verified over 516k swept +
+      random values (`test_fp4_bitshift.cpp`, now wired into ctest, see
+      below). `fp4_quantize()` is now defined in terms of `fp4_encode_bits`
+      (same name/signature, faster body) -- FP4_TABLE itself, and
+      `fp4_quantize_stochastic`'s own interpolation logic, are UNCHANGED
+      and still lookup-table-based, per direction: keep the table
+      available for GPU/other-device use and the non-block4 scattered
+      path, this only replaces the CPU-side deterministic encode/decode.
+      `block4_vec_decode_fp4` (block4.hpp) is the 4-wide SIMD version
+      (same bit formula, GCC vector-extension compare+blend instead of
+      if/else -- verified bit-exact against the scalar version for all
+      65536 4-tuples of codes), wired into both forward's and backward's
+      block4 precompute (replacing `FP4_TABLE[code]` there).
+- [x] Real gap found and fixed: `test_disldo_block4_*.cpp` (4 files) were
+      never actually wired into the test suite at all -- own `int main()`,
+      never added to `CMakeLists.txt`'s `sili_tests` (would collide with
+      Catch2's own `main`) or any other build target, only ever run via
+      ad-hoc manual `g++` invocations during this integration's own
+      development. Fixed via a separate `SILI_STANDALONE_TESTS` CMake
+      loop (own executables + `add_test`), `run_cpp_tests.sh` now runs
+      `ctest` (covers both `sili_tests`'s Catch2 cases and these) instead
+      of just `./sili_tests` directly. Added `test_fp4_bitshift.cpp` to
+      the same list.
+- [x] Real, measured bug found via `valgrind --tool=callgrind` line-level
+      profiling (prompted by "we should still be getting ~4x, what isn't
+      SIMD" -- the direct answer): `block4_vec_hsum`/`block4_vec_broadcast`
+      (block4.hpp) used a `for (i=0..BLOCK4_TILE)` loop indexing a
+      GCC vector-extension type with a RUNTIME variable -- this compiles
+      to genuine scalar memory traffic (GCC can't treat a
+      runtime-indexed vector-extension lane as a register), not the
+      single broadcast/horizontal-add instruction the code looked like it
+      should be. Confirmed via profiling: these two functions alone were
+      ~20% of ALL instructions in a profiled `disldo_backward` call.
+      Fixed by hardcoding the 4-lane case directly (brace-init literal /
+      constant-index sum) instead of looping -- justified since this file
+      already explicitly commits to exactly 4 lanes (see the file's own
+      "don't widen this to be safe for a size this isn't" comment). Found
+      and fixed the same bug in a smaller form in both precompute sites'
+      code-gather/decode-extract steps too. Combined effect (30%
+      tile-fill fraction, 12+ interleaved reps): total instruction count
+      down ~13% (560M -> 485M `valgrind --tool=callgrind` Ir count), SIMD-
+      vs-scalar backward speedup improved from ~1.05x-1.27x to
+      ~1.2x-1.9x. Remaining top costs, per the same profiling pass: the
+      batch loop's own control overhead and genuine multiply-accumulate
+      work (~40% of instructions, `linear_disldo.hpp`), and the writeback
+      (`fp4_quantize_stochastic`, still table/interpolation-based, NOT
+      yet SIMD -- ~31%, unchanged by this pass) -- the next real target
+      if pursuing this further, per direction ("fp4 encode/decode can be
+      made simd, though this one specifically isn't 4x... uleb128 can be
+      made simd... all of backward/forward/optim ops should be able to be
+      fully simd for block4").
+- [ ] Not yet done, explicitly scoped out of this pass: SIMD stochastic
+      FP4 encode (`fp4_quantize_stochastic`'s writeback calls, still
+      table/`FP4_SORTED_IDX`-interpolation-based -- now the single
+      largest unoptimized chunk per the profiling above); uleb128 SIMD
+      decode for the non-block4 scattered CSR path (a wholly separate,
+      already-referenced-elsewhere branch/idea, out of block4's scope);
+      OMP scheduling tuned so different threads decode/process
+      far-apart regions (reduces redundant cache-line contention on
+      uleb128 decode specifically). None of these started yet.
 - [ ] Once verified clean (no regression, real win), sili_peridot should
       pin its `sili` dependency to this specific commit/tag rather than
       floating on whatever's installed -- exact mechanism (git submodule?

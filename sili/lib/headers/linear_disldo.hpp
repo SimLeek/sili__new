@@ -252,13 +252,30 @@ void disldo_forward(
                     // combination unless genuinely zero), so the clamped
                     // read never contributes -- keeps the per-batch loop
                     // below branch-free without reading out of bounds.
+                    // Decode all BLOCK4_TILE weight codes in one SIMD op
+                    // (block4_vec_decode_fp4, fp4quant.hpp's bit-shift
+                    // formula, not FP4_TABLE[code]'s 4 separate gathers --
+                    // see fp4quant.hpp's header comment) -- the remaining
+                    // per-row scale multiply/clamp still has to stay
+                    // scalar (get_value_scale(row) itself isn't a SIMD
+                    // operation), but the decode step no longer is either.
+                    // Hardcoded 4-way unroll (constant lane indices), not a
+                    // BLOCK4_TILE-driven loop -- see backward's identical
+                    // fix and its comment for why: a runtime-indexed
+                    // vector-extension read/write compiles to real scalar
+                    // memory traffic instead of a register op.
+                    const Block4VecU w_codes = {uint32_t(tile.at(0, lj) & 0xFu), uint32_t(tile.at(1, lj) & 0xFu),
+                                                 uint32_t(tile.at(2, lj) & 0xFu), uint32_t(tile.at(3, lj) & 0xFu)};
+                    const Block4Vec w_decoded = block4_vec_decode_fp4(w_codes);
+                    const value_type w_decoded_arr[BLOCK4_TILE] = {value_type(w_decoded[0]), value_type(w_decoded[1]),
+                                                                     value_type(w_decoded[2]), value_type(w_decoded[3])};
+
                     value_type w4[BLOCK4_TILE];
                     std::size_t row_idx[BLOCK4_TILE];
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                         if (row < n_in) {
-                            const uint8_t code = tile.at(li, lj) & 0xFu;
-                            w4[li] = FP4_TABLE[code] * weights.get_value_scale(row) * out_scale;
+                            w4[li] = w_decoded_arr[li] * weights.get_value_scale(row) * out_scale;
                             row_idx[li] = row;
                         } else {
                             w4[li] = value_type(0);
@@ -617,6 +634,41 @@ void disldo_backward(
                     // is independent of the others, so the inner loop over
                     // lj at each b is a real, branch-free, gather-free
                     // 4-wide vectorization target instead.
+                    // Decode both the weight and importance codes for all
+                    // BLOCK4_TILE columns in two SIMD ops (same
+                    // block4_vec_decode_fp4 as forward's precompute above)
+                    // instead of 2*BLOCK4_TILE separate FP4_TABLE[code]
+                    // lookups -- unconditional, before the per-lj bounds
+                    // check below, since decoding an out-of-bounds column's
+                    // byte is harmless (the branch below discards it).
+                    // Hardcoded 4-way unroll (constant lane indices), not a
+                    // BLOCK4_TILE-driven loop -- writing/reading a
+                    // vector-extension lane through a RUNTIME index (the
+                    // loop variable this replaced) is the same real,
+                    // measured bug as block4_vec_hsum/broadcast above:
+                    // GCC can't treat that as a register op, so it
+                    // compiles to genuine scalar memory traffic. The 4
+                    // tile.at() reads stay scalar regardless (a real
+                    // strided gather, 4 bytes 4 apart in the tile), but
+                    // building/reading the vectors themselves shouldn't
+                    // pay that cost too.
+                    const uint8_t byte0 = tile.at(li, 0), byte1 = tile.at(li, 1),
+                                  byte2 = tile.at(li, 2), byte3 = tile.at(li, 3);
+                    const Block4VecU w_codes   = {uint32_t(byte0 & 0xFu), uint32_t(byte1 & 0xFu),
+                                                   uint32_t(byte2 & 0xFu), uint32_t(byte3 & 0xFu)};
+                    const Block4VecU imp_codes = {uint32_t((byte0 >> 4) & 0xFu), uint32_t((byte1 >> 4) & 0xFu),
+                                                   uint32_t((byte2 >> 4) & 0xFu), uint32_t((byte3 >> 4) & 0xFu)};
+                    const Block4Vec w_decoded   = block4_vec_decode_fp4(w_codes);
+                    const Block4Vec imp_decoded = block4_vec_decode_fp4(imp_codes);
+                    // Extract to plain arrays ONCE (below, still per-lane
+                    // but only 4 total extractions instead of one per
+                    // read-site) -- a normal array read afterwards is a
+                    // regular load, not the vector-lane penalty above.
+                    const value_type w_decoded_arr[BLOCK4_TILE]   = {value_type(w_decoded[0]), value_type(w_decoded[1]),
+                                                                       value_type(w_decoded[2]), value_type(w_decoded[3])};
+                    const value_type imp_decoded_arr[BLOCK4_TILE] = {value_type(imp_decoded[0]), value_type(imp_decoded[1]),
+                                                                       value_type(imp_decoded[2]), value_type(imp_decoded[3])};
+
                     std::size_t col4[BLOCK4_TILE];
                     bool        col_valid4[BLOCK4_TILE];
                     value_type  out_scale4[BLOCK4_TILE];
@@ -635,16 +687,13 @@ void disldo_backward(
                         // Every slot is a real synapse, weight=0.0 included
                         // -- see block4.hpp -- so every slot gets a real
                         // gradient update every call, no liveness check.
-                        const uint8_t byte     = tile.at(li, lj);
-                        const uint8_t w_code   = byte & 0xFu;
-                        const uint8_t imp_code = (byte >> 4) & 0xFu;
                         out_scale4[lj] = weights.get_output_scale(col);
                         const value_type out_imp_scale = weights.get_output_importance_scale(col);
                         combined_scale4[lj]     = val_scale * out_scale4[lj];
                         combined_imp_scale4[lj] = imp_scale * out_imp_scale;
-                        cw_orig4[lj] = FP4_TABLE[w_code];
+                        cw_orig4[lj] = w_decoded_arr[lj];
                         cw4[lj] = cw_orig4[lj] * combined_scale4[lj];          // -> true units
-                        ci4[lj] = FP4_TABLE[imp_code] * combined_imp_scale4[lj];
+                        ci4[lj] = imp_decoded_arr[lj] * combined_imp_scale4[lj];
                     }
 
                     // mcol[col4[lj]] is a real 4-way SCATTER (4 distinct
