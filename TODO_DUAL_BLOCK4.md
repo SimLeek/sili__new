@@ -73,12 +73,28 @@ importance accessors) -- not a second, bolted-on object.
 
 ## Once the design is settled
 
-- [ ] Extend `SparseLinearWeightsDelta`/`SparseLinearLayer` (delta_csr_types.hpp,
+- [x] Extend `SparseLinearWeightsDelta`/`SparseLinearLayer` (delta_csr_types.hpp,
       cpu_backend.cpp) with the block4 member + promotion/demotion logic.
-- [ ] Update `forward_dense`/`backward_dense` to combine both paths
-      internally (callers shouldn't need to know about the split).
-- [ ] Update `build_probes`/`synap_step`/`synap_row_step` to handle
-      promotion (and pruning paths for demotion).
+- [x] Update `forward_dense`/`backward_dense` to combine both paths
+      internally (callers shouldn't need to know about the split). Done at
+      the `disldo_forward`/`disldo_backward` level (linear_disldo.hpp),
+      which `SparseLinearLayer::forward_dense`/`backward_dense`
+      (cpu_backend.cpp) already call through -- verified via ASan/UBSan
+      correctness tests (test_disldo_block4_forward.cpp,
+      test_disldo_block4_backward.cpp).
+- [x] Update `build_probes`/`synap_step`/`synap_row_step` to handle
+      promotion (and pruning paths for demotion). Done in
+      `delta_csr_synap_row_step` (delta_csr_memory.hpp) via
+      `block4_maybe_promote`/`block4_demote_tile`; `build_probes` itself
+      unchanged (it only proposes candidates, doesn't need to know about
+      block4). Verified end-to-end (test_disldo_block4_promotion.cpp):
+      growth promotes at threshold, pruning demotes below it, out_degree
+      only moves on real prunes not representation transfers. Found and
+      fixed a real bug along the way: block4 was using the weight nibble
+      alone as a slot's liveness bit, which is indistinguishable from
+      empty for a freshly-grown (weight=0.0) synapse -- silently broke
+      backward's gradient update and demotion's rediscovery for anything
+      not yet trained. Fixed to check the whole byte throughout.
 - [ ] Update `compact()`/`expand_headroom*()` for the combined structure.
 - [ ] Real per-row (or finer) FP4 value_scale calibration for block4,
       matching disldo's own (already proven necessary on real weights,
