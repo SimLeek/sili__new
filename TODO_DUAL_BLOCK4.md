@@ -90,11 +90,18 @@ importance accessors) -- not a second, bolted-on object.
       block4). Verified end-to-end (test_disldo_block4_promotion.cpp):
       growth promotes at threshold, pruning demotes below it, out_degree
       only moves on real prunes not representation transfers. Found and
-      fixed a real bug along the way: block4 was using the weight nibble
-      alone as a slot's liveness bit, which is indistinguishable from
-      empty for a freshly-grown (weight=0.0) synapse -- silently broke
-      backward's gradient update and demotion's rediscovery for anything
-      not yet trained. Fixed to check the whole byte throughout.
+      fixed a real bug along the way, in two passes: first, using the
+      weight nibble alone as a slot's liveness bit (indistinguishable
+      from empty for a freshly-grown weight=0.0 synapse); then, after
+      switching to "whole byte == 0", a DEEPER version of the same bug
+      surfaced via the comparison script (see below) -- a genuinely-live
+      synapse can have BOTH weight and importance quantize to
+      FP4_TABLE's zero entry (common, not rare: 0.0 is nearest for
+      anything near the origin). Block4Tile now has a real `presence`
+      bitmask, independent of the stored byte, as the sole source of
+      truth for liveness everywhere (forward's own value-based skip is
+      the one exception, and is fine as-is -- 0 contributes 0 regardless
+      of the liveness label).
 - [x] Update `compact()`/`expand_headroom*()` for the combined structure.
       Turned out to need no changes -- both only touch
       `weights.connections`, and `block4` is a separate struct member
@@ -110,9 +117,26 @@ importance accessors) -- not a second, bolted-on object.
 - [ ] Real per-row (or finer) FP4 value_scale calibration for block4,
       matching disldo's own (already proven necessary on real weights,
       not optional -- see PR #22's bug #4).
-- [ ] Bash comparison script: old venv vs. new venv, same suite, speed +
-      memory + quality, on both synthetic and (if available) real
-      checkpoint data.
+- [x] Bash comparison script: old venv vs. new venv, same suite, speed +
+      quality. `scripts/compare_block4_venvs.sh` (+ `bench_block4_layer.py`,
+      `diff_bench_reports.py`) runs the SAME script unmodified under both
+      `.venv_baseline` and this repo's own venv -- block4 has no new
+      Python API surface, so no separate baseline/new variants were
+      needed. This is what surfaced the presence-bitmask bug above: nnz
+      silently diverged between venvs before that fix, matches exactly
+      after it (both at 2% and 15% synthetic density).
+      HONEST FINDING, not yet a win: at both densities tested, this
+      branch is measurably SLOWER than baseline (0.57x-0.88x across
+      forward/backward/growth). Expected, not a regression to chase --
+      uniform-random synthetic sparsity rarely clusters 2+ synapses into
+      one 4x4 tile, so BLOCK4_PROMOTE_MIN_LIVE is rarely met and the
+      extra branching/allocation overhead (checking `block4.tiles.empty()`,
+      the live_tiles vector, etc.) never gets paid back. PR #22's real
+      2-13x win was measured on the ACTUAL MiniCPM5 checkpoint's
+      structured sparsity, not reproduced here. Memory not yet measured
+      (only speed + correctness so far). Real-checkpoint validation via
+      sili_peridot (not yet done) is the real test of whether this is a
+      production win before merging.
 - [ ] Once verified clean (no regression, real win), sili_peridot should
       pin its `sili` dependency to this specific commit/tag rather than
       floating on whatever's installed -- exact mechanism (git submodule?
