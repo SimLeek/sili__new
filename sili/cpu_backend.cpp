@@ -280,7 +280,7 @@ public:
 
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -642,28 +642,28 @@ public:
     // delta_csr_to_absolute on each call. O(nnz), not O(1) like before.
     py::array_t<V> get_weights_vals() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
         return result;
@@ -719,7 +719,7 @@ public:
 
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
 
     py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
@@ -793,28 +793,28 @@ public:
                               neuron_grad_accum.data(), py::cast(this)); }
     py::array_t<V> get_weights_vals() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
         return result;

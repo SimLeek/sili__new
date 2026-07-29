@@ -150,6 +150,86 @@ void delta_csr_to_absolute(
     }
 }
 
+// Like delta_csr_to_absolute() above, but also merges in any block4-resident
+// synapses (sorted back into column order per row) -- needed because a
+// caller reading only weights.connections would otherwise silently lose
+// every synapse currently promoted into block4. See cpu_backend.cpp's
+// get_weights_vals()/get_indices()/get_ptrs()/get_importance(), whose
+// whole purpose is exposing "every live synapse" to Python regardless of
+// which representation currently holds it -- returns STORED (not
+// scale-multiplied) weight/importance, same convention as
+// delta_csr_to_absolute() and ValueAccessor::get_w/get_imp.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void delta_csr_combined_to_absolute(
+    const SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    std::vector<SIZE_TYPE>&  out_ptrs,
+    std::vector<SIZE_TYPE>&  out_indices,
+    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_weights,
+    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_importance)
+{
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    const auto& dc = weights.connections;
+    const auto& L  = dc.layout;
+
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        // block4 is FP4-specific (see block4.hpp) -- always empty otherwise.
+        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
+            dc, out_ptrs, out_indices, out_weights, out_importance);
+        return;
+    } else if (weights.block4.tiles.empty()) {
+        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
+            dc, out_ptrs, out_indices, out_weights, out_importance);
+        return;
+    } else {
+        out_ptrs.assign(L.rows + 1, SIZE_TYPE(0));
+        out_indices.clear();
+        out_weights.clear();
+        out_importance.clear();
+
+        struct Entry { COL_TYPE col; value_type w, imp; };
+        std::vector<Entry> row_entries;
+
+        for (std::size_t r = 0; r < L.rows; ++r) {
+            row_entries.clear();
+            auto cursor = dc.row_cursor(r);
+            const std::size_t n = L.row_nnz(r);
+            for (std::size_t k = 0; k < n; ++k) {
+                row_entries.push_back({
+                    cursor.advance(),
+                    ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[r] + k),
+                    ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k)});
+            }
+
+            const uint32_t br = uint32_t(r / BLOCK4_TILE);
+            const uint32_t li = uint32_t(r % BLOCK4_TILE);
+            auto brit = weights.block4.by_block_row.find(br);
+            if (brit != weights.block4.by_block_row.end()) {
+                for (uint32_t bc : brit->second) {
+                    const Block4Tile* tile = weights.block4.find(br, bc);
+                    if (!tile) continue;
+                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                        const uint8_t byte = tile->at(li, lj);
+                        if (byte == 0) continue;
+                        const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                        if (col >= L.cols) continue;
+                        row_entries.push_back({
+                            COL_TYPE(col), FP4_TABLE[byte & 0xFu], FP4_TABLE[(byte >> 4) & 0xFu]});
+                    }
+                }
+            }
+
+            std::sort(row_entries.begin(), row_entries.end(),
+                      [](const Entry& a, const Entry& b) { return a.col < b.col; });
+            for (const auto& e : row_entries) {
+                out_indices.push_back(e.col);
+                out_weights.push_back(e.w);
+                out_importance.push_back(e.imp);
+            }
+            out_ptrs[r + 1] = static_cast<SIZE_TYPE>(out_indices.size());
+        }
+    }
+}
+
 // ── Blank-space management ────────────────────────────────────────────────────
 
 inline std::size_t delta_csr_target_alloc_bytes(const DeltaCSRLayout& L) {
