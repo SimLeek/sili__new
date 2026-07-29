@@ -51,6 +51,10 @@ constexpr uint32_t BLOCK4_TILE = SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_TILE_SLOTS = SILI_BLOCK4_TILE_SIZE * SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 
+static_assert(BLOCK4_TILE_SLOTS <= 64,
+    "Block4Tile::presence is a 64-bit mask -- BLOCK4_TILE_SIZE too large "
+    "for a single uint64_t bit per slot (8x8=64 is the ceiling).");
+
 // One dense tile: BLOCK4_TILE_SLOTS bytes, (imp4<<4|w4) per slot, stored
 // [local_j * BLOCK4_TILE + local_i] (row=local_i, col=local_j within the
 // tile -- matches disldo's own row=input/col=output CSR orientation, see
@@ -59,12 +63,43 @@ constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 // prototype which used the opposite (row=output) convention and needed an
 // explicit orientation fix -- done differently and more simply here from
 // the start).
+//
+// `presence` is a real, necessary field, not redundant with `data`: a
+// genuinely-live synapse's weight AND importance can BOTH legitimately
+// quantize to FP4_TABLE's zero entry (0.0 is the single most common value
+// near the origin, especially for a freshly-grown synapse whose weight
+// starts at exactly 0.0 -- see delta_csr_memory.hpp's Step 6). Using
+// `data[slot] == 0` as the liveness signal is indistinguishable from an
+// empty slot in exactly that case -- a real bug found here (via a 64x64
+// growth+promotion repro that silently dropped such a synapse from every
+// read path -- forward, backward's gradient update, and the combined-view
+// getters) and fixed by tracking structural liveness in this separate
+// bitmask, the same way the scattered CSR already does implicitly (a
+// synapse's presence there is structural -- whether it has a CSR entry at
+// all -- never inferred from its stored value).
 struct Block4Tile {
     uint8_t data[BLOCK4_TILE_SLOTS] = {0};
+    uint64_t presence = 0;   // bit i set = slot i structurally live, independent of data[i]'s value
     uint32_t live_count = 0;
 
-    uint8_t& at(uint32_t local_i, uint32_t local_j) { return data[local_j * BLOCK4_TILE + local_i]; }
-    uint8_t  at(uint32_t local_i, uint32_t local_j) const { return data[local_j * BLOCK4_TILE + local_i]; }
+    static uint32_t slot_index(uint32_t local_i, uint32_t local_j) { return local_j * BLOCK4_TILE + local_i; }
+
+    uint8_t& at(uint32_t local_i, uint32_t local_j) { return data[slot_index(local_i, local_j)]; }
+    uint8_t  at(uint32_t local_i, uint32_t local_j) const { return data[slot_index(local_i, local_j)]; }
+
+    bool is_live(uint32_t local_i, uint32_t local_j) const {
+        return (presence >> slot_index(local_i, local_j)) & 1ull;
+    }
+    // Sets/clears the presence bit only -- caller is responsible for
+    // data[slot] and live_count (their update rules differ by call site:
+    // e.g. promotion increments live_count only on a true silent->live
+    // transition, demotion's silencing decrements it and zeroes the byte
+    // for cleanliness even though presence alone is now authoritative).
+    void set_live(uint32_t local_i, uint32_t local_j, bool live) {
+        const uint32_t idx = slot_index(local_i, local_j);
+        if (live) presence |= (1ull << idx);
+        else      presence &= ~(1ull << idx);
+    }
 };
 
 // Tiles are keyed by (block_row, block_col) = (row/BLOCK4_TILE, col/BLOCK4_TILE)

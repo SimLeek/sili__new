@@ -550,7 +550,7 @@ void disldo_backward(
                 if (row >= n_in) continue;
                 uint32_t c = 0;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
-                    if (tile.at(li, lj) != 0) ++c;
+                    if (tile.is_live(li, lj)) ++c;
                 row_live_count[row] += c;
             }
         }
@@ -583,18 +583,23 @@ void disldo_backward(
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         if (col >= n_out) continue;
+                        // Liveness is tracked structurally in the tile's own
+                        // presence bitmask, NOT inferred from the byte value
+                        // -- a genuinely-live synapse can have BOTH its
+                        // weight AND importance quantize to FP4_TABLE's
+                        // zero entry (extremely common: 0.0 is the nearest
+                        // table value for anything near the origin, and a
+                        // freshly-grown synapse starts at weight=0.0 exactly
+                        // -- see delta_csr_memory.hpp's Step 6). A real bug
+                        // found and fixed here (and throughout
+                        // delta_csr_memory.hpp's promotion/demotion/
+                        // discovery code): using data[slot]==0 as the
+                        // liveness signal silently dropped exactly this case
+                        // from every read path, including this gradient
+                        // update -- permanently stranding such a synapse,
+                        // unable to ever train away from zero.
+                        if (!tile.is_live(li, lj)) continue;
                         uint8_t& byte = tile.at(li, lj);
-                        // Liveness is the WHOLE byte, not just the weight
-                        // nibble -- a freshly-grown synapse starts with
-                        // weight=0.0 (Step 6's insert convention, see
-                        // delta_csr_memory.hpp) and only a nonzero
-                        // importance, which would be indistinguishable from
-                        // an empty slot if only the weight nibble were
-                        // checked (a real bug found and fixed here: it
-                        // silently skipped gradient updates for any
-                        // not-yet-trained block4 synapse, permanently
-                        // stranding it at weight=0).
-                        if (byte == 0) continue;
                         const uint8_t w_code   = byte & 0xFu;
                         const uint8_t imp_code = (byte >> 4) & 0xFu;
                         const value_type out_scale      = weights.get_output_scale(col);

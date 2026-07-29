@@ -208,8 +208,8 @@ void delta_csr_combined_to_absolute(
                     const Block4Tile* tile = weights.block4.find(br, bc);
                     if (!tile) continue;
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                        if (!tile->is_live(li, lj)) continue;
                         const uint8_t byte = tile->at(li, lj);
-                        if (byte == 0) continue;
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         if (col >= L.cols) continue;
                         row_entries.push_back({
@@ -681,7 +681,7 @@ void block4_maybe_promote(
                     const std::size_t vb = L.elem_start[row] + k;
                     const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    if (tile->at(li, lj) == 0) tile->live_count++;
+                    if (!tile->is_live(li, lj)) { tile->live_count++; tile->set_live(li, lj, true); }
                     tile->at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                     delta_csr_row_remove_col(dc, row, col);
                     return;
@@ -715,7 +715,7 @@ void block4_maybe_promote(
             const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
             const uint32_t fli = uint32_t(f.row - row_lo);
             const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
-            if (tile.at(fli, flj) == 0) tile.live_count++;
+            if (!tile.is_live(fli, flj)) { tile.live_count++; tile.set_live(fli, flj, true); }
             tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
         }
         // Removal happens after ALL reads above -- each row's synapses are
@@ -755,10 +755,8 @@ void block4_demote_tile(
             const std::size_t row = row_lo + li;
             if (row >= L.rows) continue;
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                if (!tile->is_live(li, lj)) continue;
                 const uint8_t byte  = tile->at(li, lj);
-                // Liveness is the whole byte -- see the matching comment in
-                // linear_disldo.hpp's backward block4 loop.
-                if (byte == 0) continue;
                 const uint8_t wcode = byte & 0xFu;
                 const std::size_t col = col_lo + lj;
                 if (col >= L.cols) continue;
@@ -841,7 +839,7 @@ bool delta_csr_synap_row_step(
                 const Block4Tile* tile = weights.block4.find(br, bc);
                 if (!tile) continue;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    if (tile->at(li, lj) == 0) continue;
+                    if (!tile->is_live(li, lj)) continue;
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= L.cols) continue;
                     b4_bc.push_back(bc);
@@ -965,8 +963,9 @@ bool delta_csr_synap_row_step(
                 const uint32_t bc = uint32_t(re.col) / BLOCK4_TILE;
                 const uint32_t lj = uint32_t(re.col) % BLOCK4_TILE;
                 Block4Tile* tile = weights.block4.find(br, bc);
-                if (tile && tile->at(li, lj) != 0) {
+                if (tile && tile->is_live(li, lj)) {
                     tile->at(li, lj) = 0;
+                    tile->set_live(li, lj, false);
                     if (tile->live_count > 0) tile->live_count--;
                     if (tile->live_count < BLOCK4_PROMOTE_MIN_LIVE)
                         block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
