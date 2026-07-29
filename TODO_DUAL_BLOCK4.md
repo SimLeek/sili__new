@@ -125,18 +125,34 @@ importance accessors) -- not a second, bolted-on object.
       needed. This is what surfaced the presence-bitmask bug above: nnz
       silently diverged between venvs before that fix, matches exactly
       after it (both at 2% and 15% synthetic density).
-      HONEST FINDING, not yet a win: at both densities tested, this
-      branch is measurably SLOWER than baseline (0.57x-0.88x across
-      forward/backward/growth). Expected, not a regression to chase --
-      uniform-random synthetic sparsity rarely clusters 2+ synapses into
-      one 4x4 tile, so BLOCK4_PROMOTE_MIN_LIVE is rarely met and the
-      extra branching/allocation overhead (checking `block4.tiles.empty()`,
-      the live_tiles vector, etc.) never gets paid back. PR #22's real
-      2-13x win was measured on the ACTUAL MiniCPM5 checkpoint's
-      structured sparsity, not reproduced here. Memory not yet measured
-      (only speed + correctness so far). Real-checkpoint validation via
-      sili_peridot (not yet done) is the real test of whether this is a
-      production win before merging.
+      RETRACTED FINDING: an earlier pass of this script (single
+      sequential baseline-then-new run, no warmup) reported this branch
+      as measurably SLOWER (0.57x-0.88x). That was a benchmark artifact,
+      not real: `.venv` resolves numpy to scipy-openblas64
+      (MAX_THREADS=64) while `.venv_baseline` resolves to plain system
+      BLAS -- sili's own forward_dense/backward_dense never call BLAS at
+      all, but an unbounded 64-thread pool contending for this machine's
+      8 hardware threads slowed down ANY CPU-bound work sharing that
+      process, block4-unrelated pure-C++ loops included. Confirmed via a
+      native (no Python/pybind) A/B comparison -- same process, both
+      repos' headers, identical production flags, 40 interleaved runs --
+      landing at ~parity (0.95x-0.99x median), which is what sent the
+      investigation to the Python layer instead. Pinning
+      OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS=1 for the
+      benchmark subprocess (now done in compare_block4_venvs.sh) restores
+      parity at the Python level too.
+      CURRENT FINDING (interleaved, BLAS-pinned, 7 repeats each): at 2%
+      density (37 tiles / 93 synapses, 1.99% of nnz) medians are
+      0.89x-1.12x; at 15% density (251 tiles / 806 synapses, 2.30% of
+      nnz) medians are 0.91x-1.09x -- both within measurement noise of
+      parity, no real win or loss on this synthetic uniform-random
+      benchmark either way. Real-checkpoint validation via sili_peridot
+      (not yet done) is still the actual test of whether structured
+      (not uniform-random) sparsity produces PR #22's measured 2-13x --
+      this synthetic benchmark was never going to reproduce that pattern
+      regardless of the BLAS confound, since it doesn't cluster the way
+      real transformer weights do. Memory not yet measured (only speed +
+      correctness so far).
 - [ ] Once verified clean (no regression, real win), sili_peridot should
       pin its `sili` dependency to this specific commit/tag rather than
       floating on whatever's installed -- exact mechanism (git submodule?
