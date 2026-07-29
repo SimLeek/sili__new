@@ -319,15 +319,60 @@ importance accessors) -- not a second, bolted-on object.
       made simd, though this one specifically isn't 4x... uleb128 can be
       made simd... all of backward/forward/optim ops should be able to be
       fully simd for block4").
-- [ ] Not yet done, explicitly scoped out of this pass: SIMD stochastic
-      FP4 encode (`fp4_quantize_stochastic`'s writeback calls, still
-      table/`FP4_SORTED_IDX`-interpolation-based -- now the single
-      largest unoptimized chunk per the profiling above); uleb128 SIMD
-      decode for the non-block4 scattered CSR path (a wholly separate,
-      already-referenced-elsewhere branch/idea, out of block4's scope);
-      OMP scheduling tuned so different threads decode/process
-      far-apart regions (reduces redundant cache-line contention on
-      uleb128 decode specifically). None of these started yet.
+- [x] SIMD stochastic FP4 encode (`block4_vec_quantize_stochastic_fp4`,
+      block4.hpp), replacing block4's writeback `fp4_quantize_stochastic`
+      calls (8 scalar calls/tile -> 2 SIMD calls/tile). The old
+      `FP4_SORTED_IDX`-linear-bracket-scan algorithm doesn't translate
+      directly to bit tricks (nonuniform table spacing), but its
+      underlying MATH does, in two pieces: for |v| >= 1.0 (E2M1's
+      "normal" region), the classic interpolation-fraction-equals-
+      discarded-mantissa-bits property (provable algebraically -- both
+      neighbouring representable values share one IEEE exponent bracket)
+      makes the standard ML dithered-rounding trick exact: add a UNIFORM
+      RANDOM integer spanning the discarded bits' range (not the
+      deterministic encoder's fixed bias) and let integer-add carry
+      propagate the rounding, same structure as `fp4_encode_bits` just
+      probabilistic instead of round-to-nearest. For |v| < 1.0
+      (subnormal/normal-transition magnitudes 0/0.5/1.0), the
+      interpolation fraction is just linear in v (`2v` or `2v-1`), no
+      bit tricks needed there. Per direction (table isn't a frozen
+      external format): only required to stay UNBIASED
+      (E[decode(stochastic_encode(v))] == v, verified via 200k-sample
+      mean-convergence + saturation + exact-value + NaN-slot checks,
+      both scalar `test_fp4_stochastic.cpp` and the 4-wide SIMD version)
+      -- NOT to reproduce the old scan's exact per-draw sequence for a
+      given seed (checked first: no test anywhere pins exact stochastic
+      codes for a seed, only uses seeding for general run-to-run
+      reproducibility of aggregate/statistical outcomes). `FP4_SORTED_IDX`
+      and the scalar scan-based algorithm are gone from
+      `fp4_quantize_stochastic`'s own CPU implementation (replaced with
+      the same dithering formula, scalar form) -- `FP4_SORTED_IDX` itself
+      stays defined, for GPU/other-device use per direction (documents
+      the sort order, generically useful even if unused by this file's
+      own scan anymore).
+
+      RNG draws stay genuinely scalar (4 independent
+      `fp4_stochastic_next_u64()` calls per SIMD call, one per lane) --
+      the SIMD win is in the branch/arithmetic, not the RNG itself,
+      which is a handful of xorshift ops regardless of lane count.
+      Callgrind confirms this was the right target: `fp4quant.hpp`'s
+      absolute instruction contribution to a profiled `disldo_backward`
+      run dropped from 150M to 32M (~78%) after wiring this in --
+      combined with the earlier hsum/broadcast fix, total instruction
+      count is down ~23% from where this window started (560M -> 432M),
+      and the isolated SIMD-vs-scalar backward speedup (direct-fill
+      harness, 30% tile fraction) improved from ~1.05x-1.27x to
+      ~1.8x-3.0x. Remaining top costs per the same profiling pass are now
+      genuine work, not more of the same bug class: `block4_vec_hsum`
+      (called every batch step, not a bug anymore -- just called a lot),
+      real per-batch multiply-accumulate, and the (now unavoidably
+      scalar, by design) 4 RNG draws per tile.
+- [ ] Not yet done: uleb128 SIMD decode for the non-block4 scattered CSR
+      path (a wholly separate, already-referenced-elsewhere branch/idea,
+      out of block4's own scope); OMP scheduling tuned so different
+      threads decode/process far-apart regions (reduces redundant
+      cache-line contention on uleb128 decode specifically). Neither
+      started yet.
 - [ ] Once verified clean (no regression, real win), sili_peridot should
       pin its `sili` dependency to this specific commit/tag rather than
       floating on whatever's installed -- exact mechanism (git submodule?

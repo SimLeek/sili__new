@@ -146,6 +146,79 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
     return result;
 }
 
+// 4-wide fp4_quantize_stochastic (fp4quant.hpp) -- stochastically quantizes
+// BLOCK4_TILE values in one shot instead of BLOCK4_TILE separate scalar
+// calls. Same dithered-rounding formula as the scalar version (see
+// fp4quant.hpp's header comment for why the |v|>=1.0 branch's bit-add
+// dithering is exact, not approximate), branches combined via
+// compare-mask blends like block4_vec_decode_fp4 above. The 4 per-lane
+// RNG draws stay genuinely scalar (fp4_stochastic_next_u64() x4) -- the
+// SIMD win here is in the branch/arithmetic, not the RNG itself, which is
+// a handful of xorshift ops regardless of lane count. Verified against
+// fp4_quantize_stochastic() via matched-seed statistical (mean-converges-
+// to-v) and saturation/exact-value checks -- see test_fp4_stochastic.cpp.
+inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
+    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+
+    Block4VecU bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const Block4VecU sign  = bits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU abits = bits & block4_vecu_broadcast(0x7FFFFFFFu);
+
+    const uint64_t r0 = fp4_stochastic_next_u64();
+    const uint64_t r1 = fp4_stochastic_next_u64();
+    const uint64_t r2 = fp4_stochastic_next_u64();
+    const uint64_t r3 = fp4_stochastic_next_u64();
+    const Block4Vec uniform01 = {
+        float((r0 >> 40) * (1.0 / 16777216.0)), float((r1 >> 40) * (1.0 / 16777216.0)),
+        float((r2 >> 40) * (1.0 / 16777216.0)), float((r3 >> 40) * (1.0 / 16777216.0))};
+    const Block4VecU dither22 = {uint32_t(r0 & 0x3FFFFFu), uint32_t(r1 & 0x3FFFFFu),
+                                  uint32_t(r2 & 0x3FFFFFu), uint32_t(r3 & 0x3FFFFFu)};
+
+    Block4Vec av;  // abits reinterpreted as float -- always >= 0, a valid magnitude
+    std::memcpy(&av, &abits, sizeof(av));
+    const Block4Vec two_v = block4_vec_broadcast(2.0f);
+    const Block4Vec p_low = av * two_v;                              // (v-0.0)/(0.5-0.0)
+    const Block4Vec p_mid = av * two_v - block4_vec_broadcast(1.0f);  // (v-0.5)/(1.0-0.5)
+
+    Block4VecU up_low_mask, up_mid_mask;
+    {
+        const auto cmp_low = (uniform01 < p_low);
+        const auto cmp_mid = (uniform01 < p_mid);
+        std::memcpy(&up_low_mask, &cmp_low, sizeof(up_low_mask));
+        std::memcpy(&up_mid_mask, &cmp_mid, sizeof(up_mid_mask));
+    }
+
+    const Block4VecU sat_mask = (abits >= block4_vecu_broadcast(SIX_BITS));
+    const Block4VecU low_mask = (abits < block4_vecu_broadcast(HALF_BITS));
+    const Block4VecU mid_mask = ~sat_mask & ~low_mask & (abits < block4_vecu_broadcast(ONE_BITS));
+    const Block4VecU norm_mask = ~sat_mask & ~low_mask & ~mid_mask;
+
+    const Block4VecU mag_sat = block4_vecu_broadcast(7u);
+    const Block4VecU mag_low = up_low_mask & block4_vecu_broadcast(1u);  // 1 if round up else 0
+    const Block4VecU mag_mid = (up_mid_mask & block4_vecu_broadcast(2u)) | (~up_mid_mask & block4_vecu_broadcast(1u));
+
+    Block4VecU rounded = abits + dither22;
+    const Block4VecU six_mask = (rounded > block4_vecu_broadcast(SIX_BITS));
+    rounded = (rounded & ~six_mask) | (block4_vecu_broadcast(SIX_BITS) & six_mask);
+    const Block4VecU exp_field = (rounded >> 23) & block4_vecu_broadcast(0xFFu);
+    const Block4VecU m_bit     = (rounded >> 22) & block4_vecu_broadcast(1u);
+    const Block4VecU mag_norm  = ((exp_field - block4_vecu_broadcast(126u)) << 1) | m_bit;
+
+    Block4VecU mag_code =
+        (mag_sat & sat_mask) | (mag_low & low_mask) | (mag_mid & mid_mask) | (mag_norm & norm_mask);
+
+    // Never the repurposed NaN slot (8) for a genuinely near-zero lane --
+    // same rule as fp4_encode_bits/fp4_quantize_stochastic.
+    const Block4VecU zero_mag_mask = (mag_code == block4_vecu_broadcast(0u));
+    // sign is bit 31 (0x80000000) or 0; >>28 moves it to bit 3 (0x8 or 0),
+    // exactly the code's sign-bit position -- no separate mask needed.
+    const Block4VecU sign_bit = sign >> 28;
+    return (sign_bit | mag_code) & ~zero_mag_mask;
+}
+
 // One dense tile: BLOCK4_TILE_SLOTS bytes, (imp4<<4|w4) per slot, stored
 // [local_j * BLOCK4_TILE + local_i] (row=local_i, col=local_j within the
 // tile -- matches disldo's own row=input/col=output CSR orientation, see

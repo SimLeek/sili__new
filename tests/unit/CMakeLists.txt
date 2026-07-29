@@ -150,6 +150,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_promotion
     test_disldo_block4_combined_absolute
     test_fp4_bitshift
+    test_fp4_stochastic
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

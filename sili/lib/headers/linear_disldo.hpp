@@ -840,12 +840,46 @@ void disldo_backward(
                     }
                     if (learning_rate != value_type(0)) {
                         mrow[row] += mrow_local;   // mrow is double* already, no down/up-cast needed
-                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                            if (!col_valid4[lj]) continue;
-                            mcol[col4[lj]] += mcol4[lj];
-                            const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
-                            const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
-                            tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
+                        if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
+                            if (full_tile_cols) {
+                                // 2 SIMD stochastic-quantize calls (4 lanes
+                                // each) instead of 8 scalar
+                                // fp4_quantize_stochastic() calls. Safe to
+                                // divide unconditionally here (unlike the
+                                // scalar fallback's per-lj guard) --
+                                // full_tile_cols means every lane is valid,
+                                // so combined_scale4/combined_imp_scale4
+                                // are never the invalid-lane 0 that would
+                                // make this a 0/0 division.
+                                const Block4Vec w_to_encode = {
+                                    cw4[0] / combined_scale4[0], cw4[1] / combined_scale4[1],
+                                    cw4[2] / combined_scale4[2], cw4[3] / combined_scale4[3]};
+                                const Block4Vec imp_to_encode = {
+                                    ci4[0] / combined_imp_scale4[0], ci4[1] / combined_imp_scale4[1],
+                                    ci4[2] / combined_imp_scale4[2], ci4[3] / combined_imp_scale4[3]};
+                                const Block4VecU new_w_codes   = block4_vec_quantize_stochastic_fp4(w_to_encode);
+                                const Block4VecU new_imp_codes = block4_vec_quantize_stochastic_fp4(imp_to_encode);
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    mcol[col4[lj]] += mcol4[lj];
+                                    tile.at(li, lj) = uint8_t((new_imp_codes[lj] << 4) | new_w_codes[lj]);
+                                }
+                            } else {
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    if (!col_valid4[lj]) continue;
+                                    mcol[col4[lj]] += mcol4[lj];
+                                    const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
+                                    const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                    tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
+                                }
+                            }
+                        } else {
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (!col_valid4[lj]) continue;
+                                mcol[col4[lj]] += mcol4[lj];
+                                const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
+                                const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
+                            }
                         }
                     }
                 }
