@@ -2,11 +2,9 @@
 // ===========================================================================
 // Minimal, prototype-stage pybind11 binding for the dual-matrix design
 // (y = disldo_forward(A) + block4_forward(B)) so sili_peridot can benchmark
-// it against real converted-model weights. Deliberately separate from
-// sili._cpu (the production extension) -- this is still a speed prototype
-// on a feature branch, not yet merged/stabilized. Forward-only: no
-// backward/training here yet (see conversation -- that's the next step,
-// this unblocks the requested per-layer speedup benchmark first).
+// and train with it against real converted-model weights. Deliberately
+// separate from sili._cpu (the production extension) -- this is still a
+// speed prototype on a feature branch, not yet merged/stabilized.
 // ===========================================================================
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -23,10 +21,12 @@ struct DualLayer {
     uint32_t n_in, n_out;
     int num_cpus;
     bool has_a = false;
+    std::vector<float> last_input;   // cached for backward, matching SparseLinearLayer's own convention
 
     py::array_t<float> forward(py::array_t<float> x) {
         auto xbuf = x.request();
         const float* xp = static_cast<const float*>(xbuf.ptr);
+        last_input.assign(xp, xp + n_in);
         std::vector<float> y(n_out, 0.0f);
 
         if (has_a) {
@@ -37,6 +37,39 @@ struct DualLayer {
 
         py::array_t<float> result(n_out);
         std::memcpy(result.request().ptr, y.data(), n_out * sizeof(float));
+        return result;
+    }
+
+    // dx = disldo_backward(A) + block4's own dx (via a fresh transpose of
+    // B), THEN both A's and B's weights are updated in place (inline,
+    // matching disldo's own convention -- no separate optimizer-apply
+    // step). Requires forward() to have been called first (uses the
+    // cached input).
+    //
+    // Known real cost, not yet addressed: transpose_block4() rebuilds B's
+    // whole transposed copy EVERY call, O(nnz). Fine for batch/occasional
+    // training; a genuinely online (single-token-at-a-time) loop -- this
+    // project's own stated convention elsewhere -- would pay this every
+    // step, likely dominating cost at real model scale. An incremental
+    // transpose update (matching Fable's own "trade" idea for keeping two
+    // views in sync cheaply) is the real fix, not built here.
+    py::array_t<float> backward(py::array_t<float> dy, float learning_rate) {
+        auto dybuf = dy.request();
+        const float* dyp = static_cast<const float*>(dybuf.ptr);
+        std::vector<float> dx(n_in, 0.0f);
+
+        if (has_a) {
+            std::vector<float> neuron_in_accum(n_in, 0.f), neuron_grad_accum(n_out, 0.f);
+            disldo_backward<int, FP4BiPacked, uint32_t>(
+                last_input.data(), 1, n_in, dyp, a_weights, dx.data(),
+                neuron_in_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, false);
+        }
+        auto bwt = transpose_block4(b_weights);
+        block4_backward_dx(bwt, dyp, dx.data(), num_cpus);
+        block4_weight_update(b_weights, last_input.data(), dyp, learning_rate, num_cpus);
+
+        py::array_t<float> result(n_in);
+        std::memcpy(result.request().ptr, dx.data(), n_in * sizeof(float));
         return result;
     }
 
@@ -163,6 +196,7 @@ std::unique_ptr<DualLayer> build_dual_layer(
 PYBIND11_MODULE(dual_layer_proto, m) {
     py::class_<DualLayer, std::unique_ptr<DualLayer>>(m, "DualLayer")
         .def("forward", &DualLayer::forward)
+        .def("backward", &DualLayer::backward)
         .def("a_nnz", &DualLayer::a_nnz)
         .def("b_nnz", &DualLayer::b_nnz)
         .def("b_capacity_slots", &DualLayer::b_capacity_slots)
