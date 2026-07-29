@@ -32,53 +32,44 @@ importance accessors) -- not a second, bolted-on object.
   vs. a dense reference, same methodology as `dual_matrix_vs_disldo.md`)
   side by side. Not written yet.
 
-## Open design questions (need answers before writing C++)
+## Design decisions (settled)
 
-1. **Promotion/demotion threshold, precisely.** User's own framing: "10%
-   of 16 is 1.6 so if there are 2 synapses in a 4x4 block then promotion
-   starts to make sense, but it depends on which exact local group does
-   better." Concretely:
-   - The threshold should be an INTEGER synapse count per tile (>=2 for a
-     4x4 tile, not a bare fraction), since fractional synapses aren't
-     real -- what's the right rounding rule in general (ceil(0.10*16)=2,
-     but is 10% still the right fill fraction now that this is a real,
-     re-verifiable-per-machine number, not the prototype's one-off
-     measurement)?
-   - "Depends on which exact local group does better" -- does this mean
-     the decision should be based on a per-tile MEASURED or ESTIMATED
-     comparison (e.g., track actual disldo vs. block4 cost for that
-     region over time) rather than a single fixed global threshold? Or
-     does it mean different SUFFIXES/roles (q_proj vs. gate_proj, etc.)
-     may have different real breakevens worth separately calibrating?
-     Needs to be settled with the user before implementing.
-2. **Memory layout.** Today `SparseLinearWeightsDelta` holds one
-   `DeltaCSRWeights` (ULEB128-delta CSR + FP4BiPacked values). The dual
-   version needs to hold BOTH that (for the scattered remainder) AND a
-   block4 structure (`Block4Weights`-equivalent, now as a real member,
-   not a separate prototype struct) -- plus keep `compact()`/
-   `expand_headroom*()` working correctly across both.
-3. **Synaptogenesis hook.** `build_probes`/`synap_step` grow new
-   synapses today via the scattered CSR only. New connections need a
-   real decision: land in the scattered part by default (current
-   behavior) and get PROMOTED to block4 once their tile crosses the
-   threshold (checked when? every synap_step call? a separate,
-   explicitly-invoked maintenance pass, matching Fable's own controller
-   cadence idea?) -- and DEMOTION needs the same kind of hook when
-   pruning drops a tile below threshold.
-4. **Backward's transpose cost.** The prototype rebuilds block4's
-   transpose from scratch every `backward()` call (O(nnz)) -- fine for
-   batch training, likely a real bottleneck for genuine online (single-
-   token) training at real model scale. Needs either an incremental
-   transpose-update (paired with promotion/demotion, since those are the
-   only things that change which tiles exist) or a deliberate decision
-   that online training doesn't get block4's speed benefit for backward
-   yet (forward could still use it).
-5. **Tile size**: fixed at 4x4 for this machine (verified: this CPU's
-   real SIMD ceiling is ~4x, not the assumed 8x; 2x2 is a measured
-   regression, not just a non-improvement -- see PR #22 / BLOCK4_NOTES.md
-   for the numbers). Should the production version hardcode 4, or be
-   templated/configurable now so a later architecture-detection pass
-   (noted as a future idea, not scoped) doesn't require another rewrite?
+1. **Promotion/demotion threshold**: a **compile-time fixed integer**
+   (default 2 for a 4x4 tile, matching the 10%-of-16=1.6 reasoning),
+   overridable at build time (CMake `-D` for the unit-test build,
+   `extra_compile_args`/env-driven for the real `setup.py` pybind
+   extension build -- both need the override wired through, not just
+   CMake, since production installs via `setup.py`/pip, not CMake).
+   Not runtime-configurable, not adaptive/per-region -- deliberately
+   simple.
+2. **Directional hook, not a symmetric check everywhere**: "synaptogenesis
+   maybe promotes and pruning maybe demotes but synaptogenesis never
+   demotes and pruning never promotes." Concretely:
+   - On a NEW synapse added by growth: if that synapse landed in a tile
+     currently in the SCATTERED representation, check just that tile's
+     local live count (scan its <=4 rows' worth of CSR entries within
+     the tile's column range -- bounded, cheap, not a full-structure
+     scan) and promote if it now meets the threshold. Never demotes.
+   - On a synapse REMOVED by pruning: if it was in a tile currently in
+     BLOCK4, check that tile's live count (O(1), already a 16-slot byte
+     scan) and demote if it now falls below threshold. Never promotes.
+   - Checked at the specific growth/pruning EVENT that touched that
+     specific tile, not a periodic sweep and not a blind check on every
+     `synap_step` call regardless of what changed.
+3. **Memory layout**: `SparseLinearWeightsDelta` gets a real block4
+   member (not a separate prototype struct) alongside the existing
+   `DeltaCSRWeights`. `compact()`/`expand_headroom*()` need to handle
+   both.
+4. **Backward's transpose cost**: not resolved yet, proceeding with the
+   prototype's rebuild-every-call approach for a first working version;
+   revisit once the rest is in and benchmarked -- may be acceptable for
+   now (real profiling needed before optimizing further), matching this
+   session's own "measure before assuming" pattern throughout.
+5. **Tile size**: hardcoded to 4 as a compile-time constant (same
+   override mechanism as the promotion threshold), matching the
+   promotion threshold's own settled mechanism -- not templated/
+   multi-size yet (that's the noted-not-scoped future idea in
+   `prototypes/sili_ell/BLOCK4_NOTES.md`).
 
 ## Once the design is settled
 
