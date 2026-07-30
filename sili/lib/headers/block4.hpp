@@ -716,6 +716,19 @@ class Block4TileHandle {
 public:
     Block4TileHandle() = default;
     Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc);
+    // Fast-path constructor for a caller that already knows this tile's
+    // exact position in tile_values (e.g. it just walked row_cursor(br)
+    // itself and can track block_layout.elem_start[br]+k as it advances --
+    // see Block4Store::at_index()). Skips raw_find()'s O(row_nnz) re-scan
+    // entirely -- that redundant re-scan (once during the caller's own
+    // collection walk to discover which tiles exist, then AGAIN via
+    // find()'s own internal raw_find() to fetch each one) measured as the
+    // dominant real cost of block4's forward/backward hot loop at batch=1
+    // (see conversation): batch=1 has too little per-tile compute (16
+    // FLOPs) to amortize even one O(row_nnz) scan, let alone two. No
+    // bounds/coordinate check -- passing a stale or wrong elem_pos is UB,
+    // unlike find()'s self-verifying coordinate lookup.
+    Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos);
     ~Block4TileHandle();
 
     Block4TileHandle(Block4TileHandle&& other) noexcept { *this = std::move(other); }
@@ -821,6 +834,20 @@ struct Block4Store {
         return const_cast<Block4Store*>(this)->find(br, bc);
     }
 
+    // Fast path for a caller that already walked row_cursor(br) itself
+    // (e.g. disldo_forward/backward's block4 collection loop) and can
+    // supply the tile's exact element index directly -- see
+    // Block4TileHandle's matching constructor for why this exists. The
+    // caller is responsible for elem_pos being correct (block_layout's
+    // own elem_start[br]+k for the k-th tile encountered while walking
+    // row_cursor(br)); no verification is performed here.
+    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos) {
+        return Block4TileHandle(*this, br, bc, elem_pos);
+    }
+    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos) const {
+        return const_cast<Block4Store*>(this)->at_index(br, bc, elem_pos);
+    }
+
     Block4TileHandle get_or_create(uint32_t br, uint32_t bc) {
         if (raw_find(br, bc) == nullptr) {
             // A real, easy-to-hit mistake, not hypothetical (caught via
@@ -901,6 +928,15 @@ inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint3
 {
     stored_ = store_->raw_find(br_, bc_);
     if (!stored_) { valid_ = false; return; }
+    valid_ = true;
+    was_sparse_ = stored_->is_sparse;
+    if (was_sparse_) block4_sparse_unpack(stored_->data, scratch_);
+}
+
+inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos)
+    : store_(&store), br_(br), bc_(bc)
+{
+    stored_ = &store_->tile_values[elem_pos];
     valid_ = true;
     was_sparse_ = stored_->is_sparse;
     if (was_sparse_) block4_sparse_unpack(stored_->data, scratch_);

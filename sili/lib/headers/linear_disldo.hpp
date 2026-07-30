@@ -205,30 +205,38 @@ void disldo_forward(
     // correctness (which does not depend on this).
     if (weights.block4.n_tiles() > 0) {
         // Row-major cursor walk isn't parallel-for-friendly directly (same
-        // reason the old hash-map iteration wasn't); collect (br,bc)
-        // COORDINATES once per call (not Block4Tile pointers/handles --
-        // a handle can't be pre-collected across the parallel region
-        // since it's move-only, RAII, and per-tile compress/decompress
-        // decisions must happen within ONE thread's ownership of ONE
-        // tile at a time; each thread constructs its own handle fresh,
-        // inside the loop body below, from these coordinates). Real
-        // cost: O(n_tiles), not O(nnz) -- cheap relative to the per-tile
-        // compute unless tiles are pathologically small, but a real,
-        // measurable per-call overhead the prototype's contiguous
-        // block_data array didn't pay. Worth checking in the comparison
-        // script (not assumed either way).
+        // reason the old hash-map iteration wasn't); collect (br,bc,elem_pos)
+        // TRIPLES once per call (not Block4Tile pointers/handles -- a
+        // handle can't be pre-collected across the parallel region since
+        // it's move-only, RAII, and per-tile compress/decompress decisions
+        // must happen within ONE thread's ownership of ONE tile at a time;
+        // each thread constructs its own handle fresh, inside the loop
+        // body below, from these coordinates). elem_pos is the tile's
+        // actual index into block4's tile_values (this walk already knows
+        // it -- block_layout.elem_start[br]+bk -- for free), passed to
+        // Block4Store::at_index() so the hot loop below doesn't redo an
+        // O(row_nnz) coordinate re-scan per tile via find(). That redundant
+        // second scan (discover a tile here, then re-discover it again via
+        // find()'s own raw_find()) measured as the dominant real cost of
+        // this loop at batch=1 -- see conversation: batch=1 has too little
+        // per-tile compute (16 FLOPs) to amortize even one such scan, let
+        // alone two.
         std::vector<uint32_t> tile_br, tile_bc;
+        std::vector<std::size_t> tile_elem;
         const std::size_t n_b4 = weights.block4.n_tiles();
         tile_br.reserve(n_b4);
         tile_bc.reserve(n_b4);
+        tile_elem.reserve(n_b4);
         const auto& BL4 = weights.block4.block_layout;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
-            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+            std::size_t elem_pos = BL4.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos) {
                 tile_br.push_back(uint32_t(br));
                 tile_bc.push_back(bc_cursor.advance());
+                tile_elem.push_back(elem_pos);
             }
         }
         // Per-thread private output buffers, same pattern as the scattered
@@ -249,8 +257,11 @@ void disldo_forward(
                 // const: routes .at() through the const overload, which
                 // does NOT mark the handle dirty -- forward is read-only,
                 // so a sparse tile's destructor should do nothing here
-                // (no wasted re-pack of unchanged content).
-                const auto tile = weights.block4.find(br, bc);
+                // (no wasted re-pack of unchanged content). at_index(): the
+                // collection loop above already knows this tile's exact
+                // storage position, so skip find()'s redundant O(row_nnz)
+                // re-scan (see collection loop's comment).
+                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= n_out) continue;
@@ -585,21 +596,27 @@ void disldo_backward(
     // incorrect one -- acceptable for a first working version; revisit if
     // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
     if (weights.block4.n_tiles() > 0) {
-        // Coordinates only, not pointers/handles -- see forward's
-        // identical comment above for why (handles are move-only RAII,
-        // constructed fresh per-tile inside the parallel loop body below).
+        // Coordinates + storage index -- see forward's identical comment
+        // above for why (handles are move-only RAII, constructed fresh
+        // per-tile inside the parallel loop body below; elem_pos lets that
+        // construction skip find()'s redundant O(row_nnz) re-scan via
+        // at_index() instead).
         std::vector<uint32_t> tile_br, tile_bc;
+        std::vector<std::size_t> tile_elem;
         const std::size_t n_b4 = weights.block4.n_tiles();
         tile_br.reserve(n_b4);
         tile_bc.reserve(n_b4);
+        tile_elem.reserve(n_b4);
         const auto& BL4 = weights.block4.block_layout;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
-            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+            std::size_t elem_pos = BL4.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos) {
                 tile_br.push_back(uint32_t(br));
                 tile_bc.push_back(bc_cursor.advance());
+                tile_elem.push_back(elem_pos);
             }
         }
 
@@ -635,8 +652,14 @@ void disldo_backward(
                 // written (writeback) below, spanning this whole
                 // iteration -- one handle, unpacks once if sparse,
                 // re-packs once (if touched) when it goes out of scope
-                // at the end of this iteration.
-                auto tile = weights.block4.find(br, bc);
+                // at the end of this iteration. at_index(): skip find()'s
+                // redundant re-scan, see collection loop's comment above.
+                // Safe across a sparse->dense re-pack mid-loop (this
+                // iteration's own tile, in its own destructor) because
+                // Block4StoredTile is fixed-size -- repacking never moves
+                // ANY tile's slot, so every OTHER iteration's elem_pos
+                // stays valid regardless of what this one does.
+                auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
 
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
