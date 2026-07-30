@@ -277,6 +277,11 @@ void disldo_forward(
                 // storage position, so skip find()'s redundant O(row_nnz)
                 // re-scan (see collection loop's comment).
                 const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
+                // Resolved ONCE per tile instead of once per .at() call
+                // (16 calls/tile below otherwise, each re-branching on
+                // whether this tile is sparse-packed -- a property that
+                // can't change mid-tile). See Block4TileHandle::raw_data().
+                const uint8_t* tdata = tile.raw_data();
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= n_out) continue;
@@ -320,8 +325,8 @@ void disldo_forward(
                     // that the isolated test's result didn't transfer --
                     // trust the real benchmark over the isolated one. See
                     // TODO_DUAL_BLOCK4.md's Part C.
-                    const Block4VecU w_codes = {uint32_t(tile.at(0, lj) & 0xFu), uint32_t(tile.at(1, lj) & 0xFu),
-                                                 uint32_t(tile.at(2, lj) & 0xFu), uint32_t(tile.at(3, lj) & 0xFu)};
+                    const Block4VecU w_codes = {uint32_t(tdata[Block4Tile::slot_index(0, lj)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(1, lj)] & 0xFu),
+                                                 uint32_t(tdata[Block4Tile::slot_index(2, lj)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(3, lj)] & 0xFu)};
                     const Block4Vec w_decoded = block4_vec_decode_fp4(w_codes);
                     const value_type w_decoded_arr[BLOCK4_TILE] = {value_type(w_decoded[0]), value_type(w_decoded[1]),
                                                                      value_type(w_decoded[2]), value_type(w_decoded[3])};
@@ -703,6 +708,13 @@ void disldo_backward(
                 // ANY tile's slot, so every OTHER iteration's elem_pos
                 // stays valid regardless of what this one does.
                 auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
+                // Resolved ONCE per tile for the read-only decode below
+                // instead of once per .at() call (16 calls/tile
+                // otherwise) -- see forward's identical hoist and
+                // Block4TileHandle::raw_data()'s comment. Only valid for
+                // READS; the write-back further down still goes through
+                // tile.at(...) = ..., which marks the handle dirty.
+                const uint8_t* tdata = tile.raw_data();
 
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
@@ -758,8 +770,8 @@ void disldo_backward(
                     // Unconditional, before the per-lj bounds check below,
                     // since decoding an out-of-bounds column's byte is
                     // harmless (the branch below discards it).
-                    const uint8_t byte0 = tile.at(li, 0), byte1 = tile.at(li, 1),
-                                  byte2 = tile.at(li, 2), byte3 = tile.at(li, 3);
+                    const uint8_t byte0 = tdata[Block4Tile::slot_index(li, 0)], byte1 = tdata[Block4Tile::slot_index(li, 1)],
+                                  byte2 = tdata[Block4Tile::slot_index(li, 2)], byte3 = tdata[Block4Tile::slot_index(li, 3)];
                     const value_type w_decoded_arr[BLOCK4_TILE]   = {FP4_TABLE[byte0 & 0xFu], FP4_TABLE[byte1 & 0xFu],
                                                                        FP4_TABLE[byte2 & 0xFu], FP4_TABLE[byte3 & 0xFu]};
                     const value_type imp_decoded_arr[BLOCK4_TILE] = {FP4_TABLE[(byte0 >> 4) & 0xFu], FP4_TABLE[(byte1 >> 4) & 0xFu],

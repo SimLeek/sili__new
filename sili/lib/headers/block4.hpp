@@ -760,6 +760,16 @@ public:
     uint32_t count_live() const {
         return was_sparse_ ? block4_count_live(scratch_) : block4_count_live(stored_->data);
     }
+
+    // Raw read-only pointer to this tile's 16 bytes (scratch_ if sparse,
+    // stored_->data if dense), resolved ONCE instead of per-.at()-call.
+    // For a hot loop that reads many slots of the SAME tile (forward's
+    // decode step reads all 16 via 4 separate 4-wide passes, one per lj),
+    // going through .at() every time re-branches on was_sparse_ 16 times
+    // for a value that can't change mid-tile -- this lets a caller hoist
+    // that branch to once. Does NOT mark dirty (read-only by design); a
+    // caller that also writes must still use at() for those writes.
+    const uint8_t* raw_data() const { return was_sparse_ ? scratch_ : stored_->data; }
 };
 
 struct Block4Store {

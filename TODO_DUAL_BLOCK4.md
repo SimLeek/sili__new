@@ -891,12 +891,32 @@ own benchmark run) don't answer that question at all.
       the specific "load the whole network into block4 first" plan) --
       once pruning brings density down toward the actual crossover,
       block4 should already be winning, not losing.
+- [x] **Found and fixed one more real, removable indirection:
+      `Block4TileHandle::at()` re-branches on `was_sparse_` every single
+      call.** Forward's decode reads all 16 bytes of a tile via 16
+      separate `.at()` calls (4 lj iterations x 4 li each); backward's
+      decode does the same. `was_sparse_` can't change mid-tile, so
+      re-checking it 16 times per tile is pure waste. Added
+      `Block4TileHandle::raw_data()` -- resolves the `was_sparse_ ?
+      scratch_ : stored_->data` branch ONCE, returns a `const uint8_t*`
+      valid for the tile's whole read-only decode phase; writes still go
+      through `.at()` (marks dirty, needed for the sparse-repack
+      destructor logic). Verified correctness: `Block4Tile::slot_index`
+      maps different `li` values to DISJOINT byte positions, so hoisting
+      the pointer across the `li` loop can't read stale data even when
+      an earlier `li` iteration wrote via `.at()` in the same tile.
+      Measured via the NOW-TRUSTED isolated-process methodology (see
+      above): forward improved ~9-11% (100% density: 0.713ms ->
+      0.634ms; 50%: 0.358ms -> 0.326ms; 10%: 0.071ms -> 0.065ms) --
+      real, modest, consistent across the density range, not
+      density-dependent. `compare_block4_venvs.sh` re-run afterward,
+      consistent with prior runs, no regression.
 - [ ] Continue investigating the remaining gap ABOVE the crossover
       density (still open, not yet root-caused the way `at_index()`/the
-      decode-algorithm swap were): is it removable indirection or
-      genuine per-element arithmetic. Must be verified via isolated-
-      process (or properly interleaved) measurement per the lesson
-      above, not a bare sequential sweep.
+      decode-algorithm swap/`raw_data()` hoist were): is it removable
+      indirection or genuine per-element arithmetic. Must be verified
+      via isolated-process (or properly interleaved) measurement per the
+      lesson above, not a bare sequential sweep.
 
 ## Explicitly NOT changing
 
