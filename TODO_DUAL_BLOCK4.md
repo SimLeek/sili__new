@@ -496,64 +496,103 @@ be a worse fit than writing a parallel set of functions. Plan:
       this problem size, n_out/BLOCK4_TILE=128, all fit in one ULEB128
       byte). Real, measured 29.2% reduction from the old 192 bits/tile.
 
-### Part B -- sparse/dense hybrid tile encoding + fixed-latency SIMD unpack (novel, higher-risk, do after Part A)
+### Part B -- sparse/dense hybrid tile encoding (scalar, threshold-configurable, do after Part A)
 
-Per direction: the tile's own 128-bit storage slot becomes two possible
-encodings, chosen by active-synapse count (no per-tile presence bit
-needed -- count discriminates the mode itself):
-- **Sparse mode** (<=10 active synapses): an ORDERED list of 12-bit
-  entries (4-bit sub-index = 2-bit local row + 2-bit local col, since
-  it's a fixed 4x4 tile; 8-bit weight+importance nibble pair, same byte
-  format as today), plus ~8 bits of header (count/section info) -- fits
-  in 128 bits since 10*12+8=128.
-- **Dense mode** (>=11 active): today's flat 16x8-bit array, since
-  11*12=132 would overflow the 128-bit budget. Hardcode this threshold
-  with the math as a one-line comment, not a derived/configurable
-  constant -- it's exact, not a tuning knob.
+**Prototyped and measured in `/tmp` first, per direction, before touching
+the repo.** Layout (16 bytes, matching the tile's 128-bit budget):
+byte[0]=count (0-10), bytes[1..5]=10 position nibbles (2-bit local row +
+2-bit local col, 2/byte), bytes[6..15]=10 value bytes (byte-identical
+format to today's dense `data[]`). 10\*12+8=128 bits exactly (the
+original math holds); 11 active synapses would need 132 bits, over
+budget, so 11+ stays dense -- this arithmetic is exact, not a tuning
+knob, even though the SWITCH POINT itself (see below) now is.
 
-Unpack (sparse -> dense scratch, for the existing forward/backward SIMD
-math to operate on unchanged): always exactly 4 SIMD-4 passes (one per
-tile row li=0..3), constant-time regardless of actual count -- each pass
-grabs the next 4 entries from the front of the ordered list, uses each
-entry's local-row sub-index bits to determine via shift/mask whether it
-belongs to THIS row (landing it at the right local-col slot if so, zeroed
-if its row is further ahead), and remembers where the ordered list left
-off for the next pass. Sub-indices get dropped once unpacked into the
-dense scratch buffer.
+**SIMD unpack: tried, measured, real negative result -- scalar wins.**
+Three variants prototyped and correctness-verified (55k randomized
+round-trips, 0 failures, all three bit-exact against a scalar reference):
+1. The originally-planned binary-decomposition idea (turn the runtime
+   count into up to 4 compile-time-fixed-size unrolled blocks of 1/2/4/8
+   one-element SIMD scatter ops -- broadcast position, broadcast value,
+   compare-against-lane-index, and, or -- cursor advanced via OR, which
+   is provably identical to addition here since it only ever combines
+   distinct powers of two in increasing order).
+2. A one-shot `__builtin_shuffle`-based gather (build a 16-byte index
+   vector from the position nibbles, one shuffle instruction places
+   every value).
+3. A variant of (2) avoiding a runtime-indexed vector-extension write
+   when building the index vector (the same anti-pattern class already
+   fixed once this session, `block4_vec_hsum`/`broadcast`) -- built the
+   index as a plain scalar array first, loaded as a vector once.
 
-**Open question, not yet confirmed with the user:** re-packing after
-backward's writeback (dense scratch -> compact ordered form again,
-including possibly crossing the 10/11-entry threshold either direction)
-wasn't spelled out in the original description (only unpack was) -- my
-assumption is it's needed (backward changes byte values in place today,
-`tile.at(li,lj) = ...`, and the whole point of the compact encoding is
-that storage stays compact after training updates, not just at
-promotion time) but this needs explicit confirmation before Part B
-implementation starts, since it's the more novel/failure-prone half of
-this redesign and shapes the API a lot (in-place update vs.
-decode-modify-reencode-every-call).
+Confirmed via disassembly this was real SIMD codegen (`vpbroadcastb`/
+`vpcmpeqb`/`vpand`/`vpor`), not another hidden version of that same bug.
+Benchmarked per EXACT count (not a mixed average, which would hide
+whether scalar only wins at the high end) across the full 0-10 range,
+1M tiles/count, 5 interleaved repeats: **plain scalar unpack (a trivial
+`for i in 0..count: dense[pos[i]] = val[i]` loop) wins outright at EVERY
+count from 0 to 10** -- the gap actually WIDENS with count rather than
+favoring SIMD at scale (binary-decomposition variant: 1.16x slower at
+n=1, 2.15x slower at n=8; one-shot shuffle: up to 5.9x slower). Each SIMD
+scatter costs ~5 real vector instructions per element; the scalar loop's
+per-element cost is one indexed byte store -- for N this small (<=10
+elements, 16 bytes total), the compiler's own scalar codegen already
+beats any hand-rolled SIMD attempted here. Conclusion: **trust the
+compiler, use scalar unpack/repack.** (Scratch harness:
+`sparse_tile_unpack.cpp`, not part of the repo -- kept as a reference of
+what was tried in case someone else has a sharper idea later.)
 
-- [ ] Confirm the re-pack requirement/design with the user before writing
-      code for this part.
-- [ ] Design + implement the sparse-mode 128-bit layout (entry
-      packing/unpacking bit layout, header format).
-- [ ] Implement the fixed-latency 4-pass SIMD unpack (block4.hpp,
-      alongside `block4_vec_decode_fp4`/`block4_vec_quantize_stochastic_fp4`).
-- [ ] Implement re-pack (pending the confirmation above).
-- [ ] Wire into forward/backward: decode-to-scratch before the existing
-      SIMD math, re-encode-to-storage after (if the re-pack requirement
-      is confirmed).
-- [ ] Update `count_live()`/promotion/demotion: sparse mode's count is
-      now free (the ordered list's own length), no more O(16) byte scan
-      needed at all, in either mode.
-- [ ] Correctness tests: round-trip decode/encode for all counts 0..16,
-      the exact 10/11 threshold boundary, ASan/UBSan.
-- [ ] Timing verification: confirm the "always 4 SIMD-4 calls, constant
-      time" claim actually holds (profile, don't assume) and measure
-      real per-synapse bit cost across a realistic count distribution
-      (not just the worst-case/best-case endpoints).
-- [ ] Update TODO_DUAL_BLOCK4.md with final measured bit budget and any
-      speed delta vs. Part A's dense-only 136-144-bit design.
+**Design pivot, per direction:** given scalar wins, the whole
+sparse-mode encoding is no longer mandatory/automatic at a hardcoded
+threshold -- it becomes an OPTIONAL, per-layer (or per-network)
+**compression parameter**: a configurable switch point (default 10,
+matching the exact 10\*12+8=128 arithmetic above, but user-adjustable)
+that decides, per tile, whether to store compactly (sparse mode, scalar
+pack/unpack, saves memory, costs a small scalar unpack/repack on every
+access) or always store dense (128 bits flat, no pack/unpack cost at
+all, matching today's behavior exactly). Setting the switch point to 0
+disables compression entirely (always dense, byte-for-byte today's
+behavior) -- a real, meaningful lever between "slower, more memory-
+efficient" and "faster, uncompressed," not a fixed design decision baked
+into the format.
+
+- [ ] Design the switch-point parameter's home: per-`SparseLinearLayer`
+      (simplest, matches how e.g. `num_cpus` is already a per-layer
+      constructor arg) vs. some network-wide default with a per-layer
+      override -- decide before implementing, since it affects the
+      constructor/pybind signature.
+- [ ] Implement the scalar pack (dense -> sparse, i.e. repack) and unpack
+      (sparse -> dense) functions in block4.hpp, using the winning
+      scalar approach from the prototype above -- straightforward,
+      already proven correct and fast, no SIMD needed.
+- [ ] `Block4Tile` (or a new type wrapping it) needs a mode discriminator
+      -- likely just "count <= switch_point" checked against the stored
+      byte layout's own count field when in sparse mode, vs. today's
+      always-16-bytes-dense assumption everywhere forward/backward reads
+      `tile.at(li,lj)` directly. Decide how forward/backward access this
+      without a full decode-to-scratch on every hot-path call when a
+      tile is ALREADY dense (should stay a zero-cost direct read in that
+      case, same as today) -- only sparse-mode tiles pay the unpack cost.
+- [ ] Wire pack/unpack into wherever a tile crosses the switch point
+      (promotion time already scans/builds a tile from scratch; backward's
+      writeback changes byte values in place today via
+      `tile.at(li,lj) = ...`, which needs to become "unpack once at the
+      start of this tile's processing if sparse, work on a dense
+      scratch buffer, re-pack once at the end if now `<=` switch point,
+      stay dense otherwise" -- avoid unpack/repack more than once per
+      call).
+- [ ] `count_live()`/promotion/demotion: sparse mode's count is free (the
+      stored count byte), no O(16) scan needed there; dense mode keeps
+      today's scan.
+- [ ] Correctness tests: round-trip pack/unpack for all counts 0-16,
+      the switch-point boundary in both directions, ASan/UBSan, plus a
+      test with switch_point=0 (compression fully disabled) verifying
+      byte-identical behavior to Part A's dense-only tiles.
+- [ ] Real, measured bit budget across a realistic count distribution
+      (not just endpoints) at a few different switch-point settings, and
+      the real speed cost of the scalar pack/unpack call overhead itself
+      (small per the prototype above, but should be measured in the real
+      forward/backward hot path, not assumed from the isolated
+      microbenchmark).
 
 ## Explicitly NOT changing
 
