@@ -840,9 +840,63 @@ own benchmark run) don't answer that question at all.
       since the forward-regression episode above is direct, reproduced
       proof that isolated microbenchmarks can point the wrong way for
       this codebase's actual hot paths.
-- [ ] Re-run the full batch=1 density sweep (10%-100%, both single- and
-      multi-threaded) after any further backward-specific work lands, to
-      track real progress against the dense-FP4-matmul bar.
+- [x] **Re-ran the batch=1 density sweep -- and caught a second real
+      methodology error, corrected before it misled anything further.**
+      The FIRST density sweep (`bench_full_block4.cpp`, all six
+      densities looped sequentially inside one process/one `main()`)
+      showed forward staying nearly FLAT (~0.69ms-0.76ms) across the
+      entire 10%-100% density range, despite a 10x tile-count spread --
+      seemingly proving block4 wasn't taking advantage of sparsity at
+      all, dominated by some large fixed per-call cost. Investigated via
+      callgrind: instruction count DID scale ~10x proportionally with
+      tile count (matches expectations for genuine per-tile work);
+      cachegrind (`--cache-sim=yes`) showed miss rates similarly tiny at
+      both 10% and 100% density (0.4%/0.1% D1, ~0% LL) -- neither
+      explained the wall-clock flatness. Re-ran each density point as a
+      fully separate, isolated process (`isolated_density_point.cpp`,
+      one process per data point, no within-process sequential loop)
+      instead: **forward scales cleanly and proportionally with tile
+      count after all** (0.072ms at 10% -> 0.717ms at 100%, ~10x for a
+      ~10x tile-count change) -- the flatness in the first sweep was a
+      real measurement artifact, same class of issue as the
+      thermal/frequency-scaling confound `compare_block4_venvs.sh`
+      already had to correct for once before in this file (running
+      multiple conditions sequentially in one process/run lets earlier
+      conditions run at a different effective clock state than later
+      ones). **Lesson: any single-process sweep over multiple
+      conditions in this codebase needs either isolated processes per
+      condition or genuine interleaving across repeats, never a bare
+      sequential loop -- a lesson now hit twice (venv comparison,
+      density sweep), worth remembering for any FUTURE density/config
+      sweep too.**
+      Corrected, trustworthy density sweep (isolated process per point,
+      batch=1, single thread, vs the dense-FP4 floor: fwd 0.195ms/bwd
+      0.556ms):
+
+      | density | fwd (block4) | fwd vs dense | bwd (block4) | bwd vs dense |
+      |---|---|---|---|---|
+      | 10% (1617 tiles)  | 0.072ms | 0.37x (2.7x FASTER) | 0.164ms | 0.29x (3.4x FASTER) |
+      | 25% (4100 tiles)  | 0.179ms | 0.92x (~tied)        | 0.410ms | 0.74x (faster) |
+      | 50% (8261 tiles)  | 0.363ms | 1.86x slower         | 0.824ms | 1.48x slower |
+      | 75% (12338 tiles) | 0.538ms | 2.76x slower         | 1.237ms | 2.23x slower |
+      | 90% (14754 tiles) | 0.639ms | 3.28x slower         | 1.470ms | 2.65x slower |
+      | 100% (16384 tiles)| 0.717ms | 3.68x slower         | 1.640ms | 2.95x slower |
+
+      **Real, actionable finding for the planned prune/grow workflow:**
+      there's a clear crossover around **~20-25% tile-fill density**.
+      Below it, block4 genuinely beats a naive dense-FP4 matmul (up to
+      ~3x faster at 10%); above it, block4 loses, worse as density
+      climbs toward 100%. The earlier ~3x/~3.7x "gap at 100% density"
+      framing above is the WORST case (fully-loaded network, matching
+      the specific "load the whole network into block4 first" plan) --
+      once pruning brings density down toward the actual crossover,
+      block4 should already be winning, not losing.
+- [ ] Continue investigating the remaining gap ABOVE the crossover
+      density (still open, not yet root-caused the way `at_index()`/the
+      decode-algorithm swap were): is it removable indirection or
+      genuine per-element arithmetic. Must be verified via isolated-
+      process (or properly interleaved) measurement per the lesson
+      above, not a bare sequential sweep.
 
 ## Explicitly NOT changing
 
