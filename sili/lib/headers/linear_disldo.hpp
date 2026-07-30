@@ -212,22 +212,28 @@ void disldo_forward(
         // must happen within ONE thread's ownership of ONE tile at a time;
         // each thread constructs its own handle fresh, inside the loop
         // body below, from these coordinates). elem_pos is the tile's
-        // actual index into block4's tile_values (this walk already knows
-        // it -- block_layout.elem_start[br]+bk -- for free), passed to
-        // Block4Store::at_index() so the hot loop below doesn't redo an
-        // O(row_nnz) coordinate re-scan per tile via find(). That redundant
-        // second scan (discover a tile here, then re-discover it again via
-        // find()'s own raw_find()) measured as the dominant real cost of
-        // this loop at batch=1 -- see conversation: batch=1 has too little
-        // per-tile compute (16 FLOPs) to amortize even one such scan, let
-        // alone two.
-        // Persistent scratch (Block4Store::scratch_tile_br/bc/elem), not a
-        // fresh vector every call -- see block4.hpp: batch=1 real-time
-        // calls can't amortize repeated heap allocation of these the way
-        // a large training batch could.
+        // index into block4's own address space (this walk already knows
+        // it -- block_layout.elem_start[br]+bk -- for free); byte_pos is
+        // its position in block4's flat variable-length tile_data buffer
+        // (see block4.hpp -- a tile's byte length varies with its live
+        // count when sparse, so unlike elem_pos this can't be derived by
+        // simple arithmetic, only by walking the row and summing each
+        // preceding tile's real length, which this collection loop is
+        // already doing). Both are passed to Block4Store::at_index() so
+        // the hot loop below doesn't redo an O(row_nnz) coordinate
+        // re-scan per tile via find(). That redundant second scan
+        // (discover a tile here, then re-discover it again via find()'s
+        // own raw_find()) measured as the dominant real cost of this loop
+        // at batch=1 -- see conversation: batch=1 has too little per-tile
+        // compute (16 FLOPs) to amortize even one such scan, let alone two.
+        // Persistent scratch (Block4Store::scratch_tile_br/bc/elem/byte),
+        // not a fresh vector every call -- see block4.hpp: batch=1
+        // real-time calls can't amortize repeated heap allocation of
+        // these the way a large training batch could.
         std::vector<uint32_t>&    tile_br   = weights.block4.scratch_tile_br;
         std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
+        std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back(): push_back's
         // per-call capacity check (branch + increment) is real, measured
@@ -241,6 +247,7 @@ void disldo_forward(
         tile_br.resize(n_b4);
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
+        tile_byte.resize(n_b4);
         const auto& BL4 = weights.block4.block_layout;
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
@@ -248,10 +255,13 @@ void disldo_forward(
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
             std::size_t elem_pos = BL4.elem_start[br];
+            std::size_t byte_pos = weights.block4.tile_byte_start[br];
             for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
                 tile_br[ti] = uint32_t(br);
                 tile_bc[ti] = bc_cursor.advance();
                 tile_elem[ti] = elem_pos;
+                tile_byte[ti] = byte_pos;
+                byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
         // Per-thread private output buffers, same pattern as the scattered
@@ -294,7 +304,7 @@ void disldo_forward(
                 // collection loop above already knows this tile's exact
                 // storage position, so skip find()'s redundant O(row_nnz)
                 // re-scan (see collection loop's comment).
-                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
+                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)], tile_byte[std::size_t(ti)]);
                 // Resolved ONCE per tile instead of once per .at() call
                 // (16 calls/tile below otherwise, each re-branching on
                 // whether this tile is sparse-packed -- a property that
@@ -652,9 +662,9 @@ void disldo_backward(
     if (weights.block4.n_tiles() > 0) {
         // Coordinates + storage index -- see forward's identical comment
         // above for why (handles are move-only RAII, constructed fresh
-        // per-tile inside the parallel loop body below; elem_pos lets that
-        // construction skip find()'s redundant O(row_nnz) re-scan via
-        // at_index() instead).
+        // per-tile inside the parallel loop body below; elem_pos/byte_pos
+        // let that construction skip find()'s redundant O(row_nnz)
+        // re-scan via at_index() instead).
         // Persistent scratch (Block4Store::scratch_*), not fresh vectors
         // every call -- see forward's identical comment above and
         // block4.hpp: batch=1 real-time calls can't amortize repeated
@@ -662,6 +672,7 @@ void disldo_backward(
         std::vector<uint32_t>&    tile_br   = weights.block4.scratch_tile_br;
         std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
+        std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back() -- see
         // forward's identical comment above (real, measured cost:
@@ -671,6 +682,7 @@ void disldo_backward(
         tile_br.resize(n_b4);
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
+        tile_byte.resize(n_b4);
 
         // Per-row slot count across ALL block4 tiles touching that row
         // (not just one tile), needed for both lr_per_row_nnz and the
@@ -695,10 +707,33 @@ void disldo_backward(
             }
             auto bc_cursor = weights.block4.row_cursor(br);
             std::size_t elem_pos = BL4.elem_start[br];
+            std::size_t byte_pos = weights.block4.tile_byte_start[br];
             for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
                 tile_br[ti] = uint32_t(br);
-                tile_bc[ti] = bc_cursor.advance();
+                const uint32_t bc = bc_cursor.advance();
+                tile_bc[ti] = bc;
+                // Backward writes every one of a tile's 16 slots on every
+                // touch (see the write-back below) -- promote any still-
+                // sparse tile to dense HERE, serially, before the
+                // parallel region below even starts. See
+                // Block4Store::force_dense_at's comment for why this
+                // can't safely happen inside the parallel loop: resizing
+                // a sparse tile shifts every LATER tile in its row, which
+                // would race against another thread reading/writing that
+                // same row if done concurrently -- a real hazard the old
+                // fixed-16-byte-per-tile storage never had.
+                // force_dense_at (not force_dense(br,bc)): this loop
+                // already knows elem_pos/byte_pos from its own walk, so
+                // use the O(1) core directly -- calling force_dense(br,bc)
+                // here would make it re-derive them via its own raw_find()
+                // row scan on every tile, turning this collection loop
+                // into an O(row_nnz^2) scan (a real, measured regression
+                // caught via scripts/bench_block4_vs_dense_fp4.cpp before
+                // this call was fixed).
+                weights.block4.force_dense_at(uint32_t(br), elem_pos, byte_pos);
                 tile_elem[ti] = elem_pos;
+                tile_byte[ti] = byte_pos;
+                byte_pos += BLOCK4_TILE_SLOTS; // guaranteed dense now
             }
         }
 
@@ -728,12 +763,17 @@ void disldo_backward(
                 // re-packs once (if touched) when it goes out of scope
                 // at the end of this iteration. at_index(): skip find()'s
                 // redundant re-scan, see collection loop's comment above.
-                // Safe across a sparse->dense re-pack mid-loop (this
-                // iteration's own tile, in its own destructor) because
-                // Block4StoredTile is fixed-size -- repacking never moves
-                // ANY tile's slot, so every OTHER iteration's elem_pos
-                // stays valid regardless of what this one does.
-                auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)]);
+                // Every tile reaching this parallel loop was already
+                // force_dense()'d in the SERIAL collection loop above, so
+                // this handle is always the dense fast path here -- its
+                // destructor is a guaranteed no-op (see
+                // ~Block4TileHandle()'s comment), which is what makes this
+                // loop safe to parallelize at all: a variable-length
+                // sparse tile's own destructor can resize and shift every
+                // LATER tile in its row (see block4_resize_tile_in_row),
+                // which would race against another thread touching that
+                // same row if it could happen here.
+                auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)], tile_byte[std::size_t(ti)]);
                 // Resolved ONCE per tile for the read-only decode below
                 // instead of once per .at() call (16 calls/tile
                 // otherwise) -- see forward's identical hoist and

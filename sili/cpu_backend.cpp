@@ -345,7 +345,7 @@ public:
         // test_disldo_block4_promotion.cpp's single-tile usage).
         weights.block4.set_limits(
             static_cast<std::size_t>(max_weights) * 8 + 4096,
-            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * sizeof(Block4StoredTile));
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;

@@ -33,8 +33,14 @@ static void test_pack_unpack_roundtrip() {
         for (int trial = 0; trial < 2000; ++trial) {
             Block4Tile dense = make_random_dense(rng, n);
             uint8_t packed[16] = {0};
-            block4_sparse_pack(dense.data, packed);
+            const uint8_t written_count = block4_sparse_pack(dense.data, packed);
             CHECK(packed[0] == n, "pack: count byte should be %d, got %d", n, packed[0]);
+            CHECK(written_count == n, "pack: returned count should be %d, got %d", n, written_count);
+            const std::size_t expect_len = block4_sparse_packed_len(uint8_t(n));
+            CHECK(expect_len == std::size_t(1 + (n + 1) / 2 + n),
+                  "block4_sparse_packed_len(%d) should be 1+ceil(n/2)+n = %zu, got %zu",
+                  n, std::size_t(1 + (n + 1) / 2 + n), expect_len);
+            CHECK(expect_len <= 16, "packed length must never exceed the dense size at n=%d", n);
             uint8_t roundtrip[16];
             block4_sparse_unpack(packed, roundtrip);
             CHECK(std::memcmp(dense.data, roundtrip, 16) == 0,
@@ -73,7 +79,7 @@ static void test_switch_point_zero_disables_compression() {
         h.at(0, 0) = 0x11;
     }
     store.maybe_compress(0, 0);
-    CHECK(store.tile_values[0].is_sparse == false, "switch_point=0 should never compress, even at count=1");
+    CHECK(store.is_sparse(0, 0) == false, "switch_point=0 should never compress, even at count=1");
 }
 
 static void test_maybe_compress_explicit_check() {
@@ -85,9 +91,9 @@ static void test_maybe_compress_explicit_check() {
         h.at(0, 0) = 0x11;
         h.at(0, 1) = 0x22;
     }
-    CHECK(store.tile_values[0].is_sparse == false, "fresh tile stays dense until maybe_compress -- not automatic");
+    CHECK(store.is_sparse(0, 0) == false, "fresh tile stays dense until maybe_compress -- not automatic");
     store.maybe_compress(0, 0);
-    CHECK(store.tile_values[0].is_sparse == true, "2 active <= switch_point=2, maybe_compress should compress");
+    CHECK(store.is_sparse(0, 0) == true, "2 active <= switch_point=2, maybe_compress should compress");
     {
         auto h = store.find(0, 0);
         CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22, "values survive compression");
@@ -102,7 +108,7 @@ static void test_maybe_compress_explicit_check() {
         h.at(0, 1) = 0x22; // 2 active > switch_point=1
     }
     store2.maybe_compress(0, 0);
-    CHECK(store2.tile_values[0].is_sparse == false, "2 active > switch_point=1, maybe_compress should NOT compress");
+    CHECK(store2.is_sparse(0, 0) == false, "2 active > switch_point=1, maybe_compress should NOT compress");
     store2.maybe_compress(5, 5); // nonexistent tile: no-op, no crash
 }
 
@@ -116,12 +122,12 @@ static void test_sparse_to_dense_promotion_on_write() {
         h.at(0, 1) = 0x22;
     }
     store.maybe_compress(0, 0);
-    CHECK(store.tile_values[0].is_sparse == true, "setup: should be sparse before the test");
+    CHECK(store.is_sparse(0, 0) == true, "setup: should be sparse before the test");
     {
         auto h = store.find(0, 0);
         h.at(0, 2) = 0x33; // now 3 active, > switch_point=2
     } // destructor should promote back to dense
-    CHECK(store.tile_values[0].is_sparse == false, "3 active > switch_point=2 should decompress to dense");
+    CHECK(store.is_sparse(0, 0) == false, "3 active > switch_point=2 should decompress to dense");
     {
         auto h = store.find(0, 0);
         CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22 && h.at(0, 2) == 0x33,
@@ -143,7 +149,7 @@ static void test_erase_while_handle_alive() {
             h.at(0, 0) = 0x11;
         }
         store.maybe_compress(0, 0); // now sparse
-        CHECK(store.tile_values[0].is_sparse == true, "setup: should be sparse");
+        CHECK(store.is_sparse(0, 0) == true, "setup: should be sparse");
         {
             auto h = store.find(0, 0); // sparse handle, unpacks
             h.at(0, 1) = 0x22;         // dirty write into scratch
@@ -170,6 +176,44 @@ static void test_erase_while_handle_alive() {
     }
 }
 
+static void test_real_compression_shrinks_footprint() {
+    // The actual point of this redesign: a low-occupancy tile must use
+    // FEWER real bytes in tile_data after compression, not just get a
+    // repacked-in-place is_sparse flag inside an already-dense-sized slot
+    // (see block4.hpp's old todo comments -- that was the bug).
+    Block4Store store;
+    store.init(16, 16);
+    {
+        auto h = store.get_or_create(0, 0);
+        h.at(0, 0) = 0x11;
+        h.at(0, 1) = 0x22; // 2 live synapses
+    }
+    const std::size_t dense_bytes = store.total_tile_used_bytes();
+    CHECK(dense_bytes == 16, "one freshly-created tile should use exactly 16 bytes dense, got %zu", dense_bytes);
+    store.maybe_compress(0, 0);
+    CHECK(store.is_sparse(0, 0), "2 <= default switch_point (10) should compress");
+    const std::size_t compressed_bytes = store.total_tile_used_bytes();
+    const std::size_t expect_bytes = block4_sparse_packed_len(2); // 1 + 1 + 2 = 4
+    CHECK(compressed_bytes == expect_bytes,
+          "2-live tile should use exactly %zu bytes after real compression, got %zu",
+          expect_bytes, compressed_bytes);
+    CHECK(compressed_bytes < dense_bytes,
+          "compression must genuinely shrink used bytes (%zu -> %zu), not just flip a flag in a fixed slot",
+          dense_bytes, compressed_bytes);
+    {
+        auto h = store.find(0, 0);
+        CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22, "values survive real compression");
+    }
+    // Note: total_tile_alloc_bytes() (row headroom) doesn't necessarily
+    // shrink on its own here -- like the scattered CSR side's own blank
+    // space, freed bytes stay as reusable slack in the row rather than
+    // being reclaimed immediately; total_tile_used_bytes() above (already
+    // checked) is the figure that reflects real compression. A shared-
+    // budget, many-tile scenario (where that slack matters for how many
+    // MORE tiles fit) belongs in the dedicated memory-cap benchmark, not
+    // this single-tile unit test.
+}
+
 static void test_move_semantics() {
     Block4Store store;
     store.init(16, 16);
@@ -188,6 +232,7 @@ int main() {
     test_maybe_compress_explicit_check();
     test_sparse_to_dense_promotion_on_write();
     test_erase_while_handle_alive();
+    test_real_compression_shrinks_footprint();
     test_move_semantics();
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);

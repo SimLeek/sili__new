@@ -744,7 +744,7 @@ void block4_maybe_promote(
             // comment (cpu_backend.cpp) for why.
             weights.block4.set_limits(
                 dc.max_indices_bytes,
-                std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * sizeof(Block4StoredTile));
+                std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
         }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
         const uint32_t bc = uint32_t(col / BLOCK4_TILE);
