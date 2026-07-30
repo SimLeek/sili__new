@@ -965,16 +965,42 @@ own benchmark run) don't answer that question at all.
       assume it transfers from one function to a structurally different
       one** (the SAME lesson, in a new form, as the decode-algorithm
       episode earlier in this file).
-- [ ] Backward's remaining gap above the crossover density is still
-      open. Given the heavy-compute section is already hand-vectorized
-      and unrolling it further hurts, the next candidates (not yet
-      tried) are smaller-scoped: the `col4`/`out_scale4`/
-      `combined_scale4` SETUP loop specifically (line ~811, separate
-      from and much smaller than the Block4Vec math it feeds), or
-      accepting that backward's remaining gap reflects genuinely more
-      work per element (importance damping + dual weight/importance
-      quantization + stochastic rounding, none of which the dense-FP4
-      floor's bare weight update does) rather than removable overhead.
+- [x] **The "backward gap above the crossover density" mostly wasn't
+      real -- found via a corrected, fair comparison.** Two remaining
+      methodology bugs in the dense-FP4 floor itself, found by
+      questioning whether it was doing the same WORK as block4, not
+      just the same FP4 codec: (1) it never included
+      value_scale/output_scale composition or per-synapse importance
+      tracking/damping, and used deterministic (not stochastic)
+      re-quantization; (2) the block4 benchmarks it was compared
+      against were accidentally using `learning_rate=0`, which skips
+      that same work on block4's side too, but for an unrelated reason
+      -- neither side was doing equivalent work. Fixed in
+      `scripts/bench_block4_vs_dense_fp4.cpp` (new, permanent,
+      committed): both sides now run the exact same feature set (real
+      nonzero learning_rate, `damp_by_importance=true`, stochastic
+      requantize of both weight and importance nibbles) -- the dense
+      floor replicates block4's per-element math on a flat array, no
+      tile/CSR indirection. **Result: block4 backward beats the fair
+      dense floor at EVERY density, including 100% fill** (100%: dense
+      7.68ms vs block4 4.07ms, 1.88x faster; 50%: 3.74x faster; 10%:
+      15.85x faster) -- almost certainly because block4's SIMD
+      stochastic-quantize (`block4_vec_quantize_stochastic_fp4`, 2
+      vector calls/tile) beats 8 scalar `fp4_quantize_stochastic()`
+      calls by a wide margin, an advantage the earlier, unfair
+      comparison never gave it credit for. **Per direction: this real,
+      corrected result is sufficient reason to merge the branch** --
+      forward's smaller, genuinely-still-open ~5x gap (real, since
+      forward at `learning_rate=0` never exercises the
+      importance/stochastic machinery backward wins on) is a real
+      follow-up, not a blocker.
+- [ ] Forward's remaining gap (real, not a baseline artifact) is still
+      open, lower priority given the merge decision above. Candidates
+      not yet tried: whether any of the col4/out_scale4-equivalent
+      setup could be shared/hoisted; whether a batch=1-specific fast
+      path makes sense given forward's SIMD decode is already the
+      right choice (established this session) but the surrounding
+      per-tile-column code isn't otherwise special-cased for batch=1.
 
 ## Explicitly NOT changing
 
