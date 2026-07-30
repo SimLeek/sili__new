@@ -262,12 +262,30 @@ void disldo_forward(
         // race exactly the way the scattered path's own scatter-write
         // would without t_out.
         std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
+        // Hoisted out of the loop condition below -- measured, not
+        // assumed: tile_br.size() was being re-evaluated on every single
+        // loop iteration instead of once (confirmed via callgrind: 8.78%
+        // of this function's total instruction count was spent purely
+        // inside std::vector::size(), on a fully block4-resident
+        // 512x512 layer -- the compiler apparently couldn't prove
+        // tile_br's size is loop-invariant across the omp-outlined
+        // function boundary, so it re-read _M_finish - _M_start on
+        // every iteration instead of hoisting it). A plain local
+        // variable is trivially provably invariant. NOTE: correct and a
+        // real instruction-count win, but measured (isolated-process
+        // methodology) as NOT moving wall-clock time noticeably --
+        // apparently absorbed by the CPU's own execution resources
+        // (same pattern already seen once for the vector-allocation-
+        // churn fix). Kept anyway: real, harmless, zero-risk, and
+        // instruction count reductions are not guaranteed irrelevant on
+        // every CPU/compiler this code will ever run on.
+        const int64_t n_tiles_local = int64_t(n_b4);
         #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
             #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < int64_t(tile_br.size()); ++ti) {
+            for (int64_t ti = 0; ti < n_tiles_local; ++ti) {
                 const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
                 // const: routes .at() through the const overload, which
                 // does NOT mark the handle dirty -- forward is read-only,
@@ -686,6 +704,13 @@ void disldo_backward(
         std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
         t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
 
+        // Hoisted out of the loop condition below -- see forward's
+        // identical fix/comment (block4.hpp): re-evaluating
+        // tile_br.size() every iteration instead of once measured as a
+        // real, large cost (8.78% of forward's total instruction count
+        // at 100% density). n_b4 (already computed above) is exactly
+        // this same value, so no extra call needed either way.
+        const int64_t n_tiles_local = int64_t(n_b4);
         #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
@@ -694,7 +719,7 @@ void disldo_backward(
             double* mrow = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in;
 
             #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < int64_t(tile_br.size()); ++ti) {
+            for (int64_t ti = 0; ti < n_tiles_local; ++ti) {
                 const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
                 // Non-const: this tile is both read (precompute) and
                 // written (writeback) below, spanning this whole
