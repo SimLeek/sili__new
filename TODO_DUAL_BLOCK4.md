@@ -911,12 +911,70 @@ own benchmark run) don't answer that question at all.
       real, modest, consistent across the density range, not
       density-dependent. `compare_block4_venvs.sh` re-run afterward,
       consistent with prior runs, no regression.
-- [ ] Continue investigating the remaining gap ABOVE the crossover
-      density (still open, not yet root-caused the way `at_index()`/the
-      decode-algorithm swap/`raw_data()` hoist were): is it removable
-      indirection or genuine per-element arithmetic. Must be verified
-      via isolated-process (or properly interleaved) measurement per the
-      lesson above, not a bare sequential sweep.
+- [x] **Root cause found via `-fopt-info-vec`: block4's per-tile loop
+      structurally cannot auto-vectorize, unlike the dense-FP4 floor's
+      simple flat loop.** GCC's own diagnostic for forward's `lj` loop
+      (4 output columns per tile): *"loop nest containing two or more
+      consecutive inner loops cannot be vectorized"* -- the `li`-decode
+      loop and the `b`-batch loop, both nested sequentially inside it,
+      block the vectorizer from treating the 4-column dimension as SIMD
+      lanes at all. The dense-FP4 baseline's single flat loop vectorizes
+      cleanly by contrast. This, not any remaining lookup/allocation/
+      branch cost, is the structural explanation for most of the
+      residual gap above the crossover density.
+- [x] **Fixed for forward**: replaced the runtime `lj` loop with a
+      templated lambda (`process_col<LJ>`, C++20 template-lambda syntax)
+      called 4 times with compile-time-constant `LJ`, matching the
+      hand-unroll pattern already used for the decode step. Confirmed
+      via `-fopt-info-vec`: the inner `li` loop now vectorizes in each
+      of the 4 instantiations, where it couldn't before at all. Real,
+      consistent ~9-10% wall-clock improvement across the WHOLE density
+      range (100%: 0.643ms -> 0.585ms; 50%: 0.327ms -> 0.297ms; 10%:
+      0.066ms -> 0.059ms) -- unlike the earlier allocation-churn/
+      `size()`-hoist fixes, this one actually moved wall-clock time,
+      consistent with genuinely unlocking vectorization rather than
+      just reducing instruction count the CPU was already absorbing.
+      Committed.
+- [x] **Attempted the SAME fix for backward -- real, measured
+      regression, reverted.** Backward's analogous outer loop (`li`,
+      over 4 ROWS) reports the identical `-fopt-info-vec` diagnostic,
+      but its structure is fundamentally different from forward's: the
+      actual heavy compute (gradient accumulation, importance damping,
+      stochastic re-quantization) is ALREADY hand-vectorized via
+      `Block4Vec` (the `SILI_BLOCK4_FORCE_SCALAR_BACKWARD`-guarded
+      section, independently re-verified still winning at batch=1 this
+      session, see above) -- it was never relying on GCC's
+      auto-vectorizer for the expensive part the way forward's `lj` loop
+      was. Wrapping the WHOLE `li`-loop body (the entire SIMD gradient
+      section, importance damping, stochastic encode -- hundreds of
+      lines) into a templated `process_row<LI>` lambda and calling it 4x
+      quadruples that body's code size with no new vectorization to show
+      for it. Measured via the isolated-process methodology: a real,
+      clear, consistent REGRESSION (100% density: 1.660ms -> 2.178ms,
+      ~31% SLOWER; 50%: 0.830ms -> 1.091ms, ~31% slower) -- reverted
+      immediately (`git checkout`, working tree confirmed clean, matches
+      the last good commit). Verified correct under both the default and
+      `SILI_BLOCK4_FORCE_SCALAR_BACKWARD=1` builds before reverting
+      (both passed test_disldo_block4_backward.cpp), so this was a real
+      PERFORMANCE regression caught before commit, not a correctness
+      bug -- but a regression regardless, and a useful negative result:
+      **the "unroll a small loop into a templated lambda" fix is not a
+      universal win -- it only helps when the loop body ISN'T already
+      hand-vectorized and is small enough that 4x code duplication
+      doesn't matter. Apply it selectively, re-measure every time, never
+      assume it transfers from one function to a structurally different
+      one** (the SAME lesson, in a new form, as the decode-algorithm
+      episode earlier in this file).
+- [ ] Backward's remaining gap above the crossover density is still
+      open. Given the heavy-compute section is already hand-vectorized
+      and unrolling it further hurts, the next candidates (not yet
+      tried) are smaller-scoped: the `col4`/`out_scale4`/
+      `combined_scale4` SETUP loop specifically (line ~811, separate
+      from and much smaller than the Block4Vec math it feeds), or
+      accepting that backward's remaining gap reflects genuinely more
+      work per element (importance damping + dual weight/importance
+      quantization + stochastic rounding, none of which the dense-FP4
+      floor's bare weight update does) rather than removable overhead.
 
 ## Explicitly NOT changing
 
