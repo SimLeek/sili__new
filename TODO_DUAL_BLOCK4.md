@@ -759,22 +759,90 @@ own benchmark run) don't answer that question at all.
       (`combined_scale4`/`combined_imp_scale4`/`col_valid4` etc.) block4
       does for every tile-column, structurally more work per synapse
       than scattered CSR's simpler single-value update.
-- [ ] **Not yet done**: reduce block4 backward's genuine per-element
-      arithmetic cost itself (as opposed to the lookup/allocation
-      overhead already fixed above). Candidates to investigate: whether
-      any of the per-lane scale composition can be hoisted or shared
-      across tiles in the same block-row/block-column (value_scale is
-      already per-ROW, so it's currently recomputed identically for
-      every tile-column sharing that row -- worth checking if that's
-      real, avoidable redundancy or already amortized); whether the
-      SIMD `Block4Vec` batch-loop design (built to vectorize across
-      BATCH, per its own comments) has any batch=1-specific fast path
-      worth adding, since there's no batch dimension to vectorize over
-      in the real-time case.
+- [x] **Fair recalibration: "dense matmul" must include FP4 codec cost.**
+      A plain float32 dense matmul (no quantization at all) isn't the
+      right comparison point -- FP4 encode/decode is a required cost
+      regardless of representation (block4 or scattered), not something
+      to blame on block4. Measured a dense matmul over FP4-packed
+      weights (decode via `FP4_TABLE`, encode via `fp4_quantize`, same
+      round-trip real online learning pays) at 512x512/batch=1: forward
+      0.222ms, backward 0.639ms. Against THIS fair floor, block4 (0.74ms
+      fwd / 1.79ms bwd at the time) was ~3x off, not ~20x -- a real,
+      closeable gap, not an unreasonable target.
+- [x] **Isolated the gap's real source: removable indirection, confirmed
+      by a direct A/B.** A hand-written scalar loop operating directly
+      on `Block4StoredTile::data[16]` bytes (bypassing
+      `Block4TileHandle`, SIMD `Block4Vec`, and per-lane bookkeeping
+      arrays entirely) reached forward=0.218ms on the SAME weight data
+      -- essentially identical to the dense-FP4 floor (0.222ms). This
+      confirmed the gap was genuinely closeable indirection, not
+      something fundamental to block4's design.
+- [x] **Precisely isolated WHICH indirection, via a proper controlled
+      comparison -- and corrected a real methodological error along the
+      way.** First attempt crossed {`Block4TileHandle` vs direct byte
+      access} x {SIMD `block4_vec_decode_fp4` vs `FP4_TABLE[code]`
+      scalar} and concluded "SIMD loses" -- WRONG framing, caught after
+      swapping the fix into the real code and finding forward regressed
+      in the full benchmark despite winning the isolated test (1.71x ->
+      ~1.55x at 100% density, reproduced consistently). Root cause of
+      the wrong conclusion: `FP4_TABLE[code]` (array lookup) and
+      `block4_vec_decode_fp4` (bit-shift formula, vectorized) are TWO
+      DIFFERENT ALGORITHMS, not a scalar/SIMD pair -- comparing them
+      conflated "which algorithm" with "vectorized or not" into one
+      axis. Redone properly with `fp4_decode_bits()` (the actual scalar
+      equivalent of `block4_vec_decode_fp4`'s formula) as the true
+      scalar baseline: an isolated microbenchmark showed SIMD winning by
+      5.3x over true scalar bit-shift decode -- confirming SIMD
+      genuinely beats scalar bit-shift, consistent with this file's
+      earlier documented finding (the `SILI_BLOCK4_FORCE_SCALAR_BACKWARD`
+      toggle, which covers a DIFFERENT section -- the batch-loop
+      gradient math + stochastic re-encode, not this decode step --
+      re-verified still winning at batch=1 too, ~7-8% here, in the
+      2-repeat range of the originally-documented 1.05x-1.27x). Then
+      tested all three decode options in the REAL, full
+      `disldo_backward` benchmark (not an isolated microbenchmark, which
+      the forward regression already proved can mislead): scalar
+      `fp4_decode_bits` was clearly WORST (bwd 2.71ms at 100% density);
+      SIMD `block4_vec_decode_fp4` (original) and `FP4_TABLE[code]` were
+      close, with `FP4_TABLE` a real, reproducible ~6% faster (bwd
+      1.649ms vs 1.755ms, 3 repeats each, clean non-overlapping ranges).
+      **Net, corrected conclusion: kept `FP4_TABLE[code]` for backward's
+      decode specifically (real ~6% win, a different-algorithm effect,
+      not a SIMD-vs-scalar one) and reverted forward back to
+      `block4_vec_decode_fp4` (SIMD genuinely wins there, matching the
+      established pattern) -- the two functions' surrounding code
+      apparently interacts with this choice differently enough that the
+      same swap doesn't transfer between them.** This does NOT
+      contradict the earlier "SIMD beats scalar" finding anywhere in
+      this file or the sparse-tile pack/unpack investigation -- both
+      remain true; what's corrected is that `FP4_TABLE` was never a
+      valid stand-in for "scalar" in the first comparison.
+- [x] Result after all Part C fixes, batch=1, 100% density, single
+      thread: forward 1.71x (unchanged from the `at_index()` fix alone),
+      backward 0.72x -> ~0.79x-0.80x (the `FP4_TABLE` decode swap's real,
+      if modest, contribution on top of `at_index()`/scratch-buffer
+      reuse). Real progress, not yet at the dense-FP4 floor for
+      backward -- see below.
+- [ ] **Not yet done**: reduce block4 backward's remaining per-element
+      arithmetic cost further (block4 is still measurably slower than
+      the dense-FP4 floor, ~0.639ms, though much closer than the
+      original ~20x-off float32-only comparison suggested). Candidates:
+      whether any of the per-lane scale composition can be hoisted or
+      shared across tiles in the same block-row (value_scale is already
+      per-ROW, so it's currently recomputed identically for every
+      tile-column sharing that row -- worth checking if that's real,
+      avoidable redundancy or already amortized); whether the
+      gradient-math/encode SIMD section (the
+      `SILI_BLOCK4_FORCE_SCALAR_BACKWARD`-guarded code) has any further
+      batch=1-specific headroom despite already winning there. Any
+      further change here MUST be verified the same way this section
+      was -- full-benchmark A/B, not an isolated microbenchmark alone,
+      since the forward-regression episode above is direct, reproduced
+      proof that isolated microbenchmarks can point the wrong way for
+      this codebase's actual hot paths.
 - [ ] Re-run the full batch=1 density sweep (10%-100%, both single- and
       multi-threaded) after any further backward-specific work lands, to
-      track real progress against the "nearly as fast as a normal dense
-      matmul" bar.
+      track real progress against the dense-FP4-matmul bar.
 
 ## Explicitly NOT changing
 

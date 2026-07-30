@@ -305,6 +305,21 @@ void disldo_forward(
                     // fix and its comment for why: a runtime-indexed
                     // vector-extension read/write compiles to real scalar
                     // memory traffic instead of a register op.
+                    //
+                    // NOTE (measured, not assumed): an isolated microbenchmark
+                    // suggested scalar FP4_TABLE decode should win here too
+                    // (same as backward's decode, below) -- but swapping it
+                    // in for THIS specific loop measurably regressed the
+                    // real disldo_forward benchmark at batch=1 (~1.71x ->
+                    // ~1.55x speedup vs scattered CSR at 100% density,
+                    // reproduced consistently across repeats), unlike
+                    // backward where the same swap was a real, consistent
+                    // win. Reverted here; kept for backward. Compiler
+                    // codegen interactions with the surrounding code
+                    // apparently differ enough between the two functions
+                    // that the isolated test's result didn't transfer --
+                    // trust the real benchmark over the isolated one. See
+                    // TODO_DUAL_BLOCK4.md's Part C.
                     const Block4VecU w_codes = {uint32_t(tile.at(0, lj) & 0xFu), uint32_t(tile.at(1, lj) & 0xFu),
                                                  uint32_t(tile.at(2, lj) & 0xFu), uint32_t(tile.at(3, lj) & 0xFu)};
                     const Block4Vec w_decoded = block4_vec_decode_fp4(w_codes);
@@ -713,39 +728,42 @@ void disldo_backward(
                     // lj at each b is a real, branch-free, gather-free
                     // 4-wide vectorization target instead.
                     // Decode both the weight and importance codes for all
-                    // BLOCK4_TILE columns in two SIMD ops (same
-                    // block4_vec_decode_fp4 as forward's precompute above)
-                    // instead of 2*BLOCK4_TILE separate FP4_TABLE[code]
-                    // lookups -- unconditional, before the per-lj bounds
-                    // check below, since decoding an out-of-bounds column's
-                    // byte is harmless (the branch below discards it).
-                    // Hardcoded 4-way unroll (constant lane indices), not a
-                    // BLOCK4_TILE-driven loop -- writing/reading a
-                    // vector-extension lane through a RUNTIME index (the
-                    // loop variable this replaced) is the same real,
-                    // measured bug as block4_vec_hsum/broadcast above:
-                    // GCC can't treat that as a register op, so it
-                    // compiles to genuine scalar memory traffic. The 4
-                    // tile.at() reads stay scalar regardless (a real
-                    // strided gather, 4 bytes 4 apart in the tile), but
-                    // building/reading the vectors themselves shouldn't
-                    // pay that cost too.
+                    // BLOCK4_TILE columns via plain FP4_TABLE[code] lookups,
+                    // NOT block4_vec_decode_fp4's SIMD bit-shift formula.
+                    // NOT a "SIMD loses to scalar" finding -- that was
+                    // checked properly and is FALSE: fp4_decode_bits()
+                    // (the true scalar equivalent of the SIMD formula,
+                    // same bit-shift algorithm, just unvectorized) is
+                    // measurably the WORST of the three options here
+                    // (~1.6x slower than either alternative in the full
+                    // backward benchmark), confirming SIMD genuinely beats
+                    // scalar bit-shift decode, consistent with this
+                    // codebase's earlier documented finding
+                    // (TODO_DUAL_BLOCK4.md) and not contradicted by
+                    // anything here. What DOES win, measured in the real
+                    // disldo_backward benchmark (not just an isolated
+                    // microbenchmark, which misleadingly suggested a
+                    // bigger and differently-shaped effect than the real
+                    // one -- see TODO_DUAL_BLOCK4.md's Part C) is
+                    // FP4_TABLE[code] specifically -- a different decode
+                    // ALGORITHM (branchless array lookup vs bit-field
+                    // reconstruction), not a SIMD-vs-scalar swap. Real,
+                    // reproducible ~6% win over the SIMD bit-shift version
+                    // for backward specifically (3 repeats each, clean
+                    // non-overlapping ranges); forward showed the OPPOSITE
+                    // (SIMD bit-shift wins there, kept as-is above) --
+                    // the two functions' surrounding code apparently
+                    // interacts with this choice differently enough that
+                    // the same swap doesn't transfer between them.
+                    // Unconditional, before the per-lj bounds check below,
+                    // since decoding an out-of-bounds column's byte is
+                    // harmless (the branch below discards it).
                     const uint8_t byte0 = tile.at(li, 0), byte1 = tile.at(li, 1),
                                   byte2 = tile.at(li, 2), byte3 = tile.at(li, 3);
-                    const Block4VecU w_codes   = {uint32_t(byte0 & 0xFu), uint32_t(byte1 & 0xFu),
-                                                   uint32_t(byte2 & 0xFu), uint32_t(byte3 & 0xFu)};
-                    const Block4VecU imp_codes = {uint32_t((byte0 >> 4) & 0xFu), uint32_t((byte1 >> 4) & 0xFu),
-                                                   uint32_t((byte2 >> 4) & 0xFu), uint32_t((byte3 >> 4) & 0xFu)};
-                    const Block4Vec w_decoded   = block4_vec_decode_fp4(w_codes);
-                    const Block4Vec imp_decoded = block4_vec_decode_fp4(imp_codes);
-                    // Extract to plain arrays ONCE (below, still per-lane
-                    // but only 4 total extractions instead of one per
-                    // read-site) -- a normal array read afterwards is a
-                    // regular load, not the vector-lane penalty above.
-                    const value_type w_decoded_arr[BLOCK4_TILE]   = {value_type(w_decoded[0]), value_type(w_decoded[1]),
-                                                                       value_type(w_decoded[2]), value_type(w_decoded[3])};
-                    const value_type imp_decoded_arr[BLOCK4_TILE] = {value_type(imp_decoded[0]), value_type(imp_decoded[1]),
-                                                                       value_type(imp_decoded[2]), value_type(imp_decoded[3])};
+                    const value_type w_decoded_arr[BLOCK4_TILE]   = {FP4_TABLE[byte0 & 0xFu], FP4_TABLE[byte1 & 0xFu],
+                                                                       FP4_TABLE[byte2 & 0xFu], FP4_TABLE[byte3 & 0xFu]};
+                    const value_type imp_decoded_arr[BLOCK4_TILE] = {FP4_TABLE[(byte0 >> 4) & 0xFu], FP4_TABLE[(byte1 >> 4) & 0xFu],
+                                                                       FP4_TABLE[(byte2 >> 4) & 0xFu], FP4_TABLE[(byte3 >> 4) & 0xFu]};
 
                     std::size_t col4[BLOCK4_TILE];
                     bool        col_valid4[BLOCK4_TILE];
