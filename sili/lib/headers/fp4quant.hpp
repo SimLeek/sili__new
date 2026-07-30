@@ -32,16 +32,97 @@ static constexpr float FP4_TABLE[16] = {
     -6.0f,   // 1111
 };
 
+// ── Bit-shift codec (no table, no branch-per-candidate) ─────────────────────
+//
+// FP4_TABLE's 16 entries are exactly OCP MXFP4 E2M1 (2 exponent bits, 1
+// mantissa bit, bias 1) with one repurposing: slot 8 (sign=1,exp=00,mant=0,
+// which E2M1 itself would read as -0.0) stores NaN instead. That's a real,
+// deliberate difference from raw E2M1 -- not a bug to route around here.
+//
+// decode: E2M1's exponent/mantissa fields slot directly into an IEEE-754
+// float32's fields with a re-bias (E2M1 bias 1 -> float32 bias 127, so
+// exp_field = e2m1_exp + 126) and the single mantissa bit placed at
+// float32's top mantissa bit -- exact, no rounding, verified bit-for-bit
+// against FP4_TABLE for all 16 codes (see conversation). Only exp==0 (the
+// subnormal slot, values 0/NaN/-0.5 depending on sign+mantissa) needs
+// separate handling; every other code is one shift+mask+bitcast.
+//
+// encode: nearest-value quantization via the standard low-precision-ML
+// technique (also how real E2M1 hardware casts work) -- add a rounding
+// bias at the mantissa truncation point and let integer addition's carry
+// propagate the rounding through the exponent (1.75 -> 2.0 falls out of
+// the carry automatically, no separate case needed), then saturate at the
+// max representable magnitude (6.0). The one further special case is the
+// [0.25, 1.0) magnitude range, which straddles the subnormal/normal
+// boundary the generic carry trick doesn't span on its own.
+//
+// Tie-breaking here (nearest with exact float ties resolved by whichever
+// way the bit arithmetic naturally falls, e.g. midpoints round up in
+// magnitude) is NOT required to match fp4_quantize()'s old linear-scan
+// tie convention (which favoured lower table index on a tie) -- the table
+// isn't a frozen external format, just this codebase's own choice, and
+// exact-tie floats essentially never occur in real gradient-driven data.
+// fp4_quantize() below is now defined IN TERMS OF this encoder, not the
+// other way around.
+
+inline float fp4_decode_bits(uint8_t code) {
+    const uint32_t s = (uint32_t(code) >> 3) & 1u;
+    const uint32_t e = (uint32_t(code) >> 1) & 3u;
+    const uint32_t m = uint32_t(code) & 1u;
+    uint32_t bits;
+    if (e == 0) {
+        // Subnormal slot: code 0/1 -> 0.0/0.5, code 8/9 -> NaN/-0.5 (see
+        // header comment -- 8 is the repurposed slot, not IEEE -0.0).
+        bits = m ? (0x3F000000u | (s << 31)) : (s ? 0x7FC00000u : 0u);
+    } else {
+        const uint32_t exp_field = e + 126u;
+        bits = (s << 31) | (exp_field << 23) | (m << 22);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+inline uint8_t fp4_encode_bits(float v) {
+    static constexpr uint32_t TH_025 = 0x3E800000u;  // bits_of(0.25f)
+    static constexpr uint32_t TH_075 = 0x3F400000u;  // bits_of(0.75f)
+    static constexpr uint32_t TH_1   = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX    = 0x40C00000u;  // bits_of(6.0f)
+
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+
+    uint32_t mag_code;
+    if (abits > 0x7F800000u) {
+        // NaN input: matches the old linear-scan's fp4_quantize(NaN) == 0
+        // (every |NaN - table[i]| comparison is false, so `best` never
+        // moves off its 0 initial value).
+        return 0;
+    } else if (abits < TH_025) {
+        mag_code = 0;
+    } else if (abits < TH_075) {
+        mag_code = 1;
+    } else if (abits < TH_1) {
+        mag_code = 2;
+    } else {
+        uint32_t rounded = abits + (1u << 21);
+        if (rounded > SIX) rounded = SIX;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
+    }
+    // A near-zero input must land on code 0 regardless of sign -- never
+    // the repurposed NaN slot (8 = sign 1, magnitude 0).
+    if (mag_code == 0) return 0;
+    const uint32_t s = sign ? 1u : 0u;
+    return uint8_t((s << 3) | mag_code);
+}
+
 ///Nearest-neighbour quantize @p v to a 4-bit FP4 index. NaN slot (8) is skipped.
 inline uint8_t fp4_quantize(float v) {
-    uint8_t best     = 0;
-    float   best_err = std::abs(v - FP4_TABLE[0]);
-    for (uint8_t i = 1; i < 16; ++i) {
-        if (i == 8) continue;
-        const float err = std::abs(v - FP4_TABLE[i]);
-        if (err < best_err) { best_err = err; best = i; }
-    }
-    return best;
+    return fp4_encode_bits(v);
 }
 
 // ── Stochastic rounding ───────────────────────────────────────────────────────
@@ -106,31 +187,89 @@ inline void fp4_seed_stochastic_rng(uint64_t seed) {
     fp4_stochastic_rng_state() = (seed ^ 0x9E3779B97F4A7C15ULL) | 1ULL;
 }
 
-inline float fp4_stochastic_uniform01() {
+/// One xorshift64* step, raw 64-bit output -- shared by fp4_stochastic_uniform01()
+/// (top 24 bits) and fp4_quantize_stochastic()'s dithered rounding (different
+/// bit slices of the SAME draw, not a second RNG step -- xorshift64*'s bits
+/// are well-mixed enough that slicing different ranges for different
+/// purposes within one draw is fine, and matters here: it keeps stochastic
+/// quantize at exactly one RNG step per call, same as before this split).
+inline uint64_t fp4_stochastic_next_u64() {
     uint64_t& s = fp4_stochastic_rng_state();
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
-    const uint64_t r = s * 0x2545F4914F6CDD1DULL;
+    return s * 0x2545F4914F6CDD1DULL;
+}
+
+inline float fp4_stochastic_uniform01() {
+    const uint64_t r = fp4_stochastic_next_u64();
     return static_cast<float>((r >> 40) * (1.0 / 16777216.0));  // top 24 bits -> [0,1)
 }
 
 /// Stochastic quantize @p v to a 4-bit FP4 index -- unbiased (E[result] == v
 /// for v within the representable range [-6,6]; clamps deterministically
 /// outside it, same as fp4_quantize() would).
+///
+/// Bit-shift/dithered-rounding implementation, not FP4_SORTED_IDX's linear
+/// bracket scan (kept, for GPU/other-device use per direction, but no
+/// longer this function's own CPU path -- same relationship as
+/// fp4_quantize()/FP4_TABLE above). Two regimes, matching fp4_encode_bits'
+/// own split:
+///   - |v| >= 1.0 ("normal" E2M1 region): the interpolation fraction
+///     between the two neighbouring representable values is EXACTLY the
+///     value's own discarded IEEE mantissa bits (below the one bit E2M1
+///     keeps), normalized to [0,1) -- provably, algebraically, not an
+///     approximation (both endpoints of any such bracket share the same
+///     IEEE exponent, so the bracket's linear interpolation fraction and
+///     the mantissa's fractional position within that exponent coincide
+///     exactly). That makes the classic dithered-rounding trick exact
+///     here: add a UNIFORM RANDOM integer spanning the discarded bits'
+///     full range (not the deterministic encoder's fixed 1<<21 bias),
+///     then truncate -- integer addition's carry propagates a rounding
+///     UP through the exponent as needed, precisely like the
+///     deterministic version, just probabilistically instead of via a
+///     fixed round-to-nearest bias.
+///   - |v| < 1.0 (the subnormal/normal-transition region, magnitudes
+///     0/0.5/1.0 only): straddles E2M1's own subnormal boundary the same
+///     way fp4_encode_bits' 3-way split does, and doesn't have the
+///     "discarded mantissa bits = interpolation fraction" property (no
+///     shared exponent bracket to exploit) -- but the two sub-brackets
+///     here ([0,0.5) and [0.5,1.0)) are each linear in v directly, so
+///     the interpolation fraction is just a plain multiply (2v, or
+///     2v-1), no bit tricks needed.
 inline uint8_t fp4_quantize_stochastic(float v) {
-    constexpr float lo_bound = FP4_TABLE[FP4_SORTED_IDX[0]];
-    constexpr float hi_bound = FP4_TABLE[FP4_SORTED_IDX[14]];
-    if (v <= lo_bound) return FP4_SORTED_IDX[0];
-    if (v >= hi_bound) return FP4_SORTED_IDX[14];
+    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
 
-    for (int k = 0; k < 14; ++k) {
-        const float lo_val = FP4_TABLE[FP4_SORTED_IDX[k]];
-        const float hi_val = FP4_TABLE[FP4_SORTED_IDX[k + 1]];
-        if (v <= hi_val) {
-            const float p_up = (v - lo_val) / (hi_val - lo_val);
-            return (fp4_stochastic_uniform01() < p_up) ? FP4_SORTED_IDX[k + 1] : FP4_SORTED_IDX[k];
-        }
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+
+    if (abits > 0x7F800000u) return 0;  // NaN input -- matches fp4_quantize(NaN) == 0
+
+    uint32_t mag_code;
+    if (abits >= SIX_BITS) {
+        mag_code = 7;  // deterministic saturate, matches the old scan's v >= hi_bound clamp
+    } else if (abits < HALF_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float p_up = av * 2.0f;   // (v - 0.0) / (0.5 - 0.0)
+        mag_code = (fp4_stochastic_uniform01() < p_up) ? 1u : 0u;
+    } else if (abits < ONE_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float p_up = av * 2.0f - 1.0f;   // (v - 0.5) / (1.0 - 0.5)
+        mag_code = (fp4_stochastic_uniform01() < p_up) ? 2u : 1u;
+    } else {
+        const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);  // uniform in [0, 2^22)
+        uint32_t rounded = abits + dither;
+        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
     }
-    return fp4_quantize(v);  // unreachable given the bounds checks above; safe fallback
+    if (mag_code == 0) return 0;  // never the repurposed NaN slot, see fp4_encode_bits
+    return uint8_t(((sign ? 1u : 0u) << 3) | mag_code);
 }
 
 // ── FP4BiPacked ───────────────────────────────────────────────────────────────

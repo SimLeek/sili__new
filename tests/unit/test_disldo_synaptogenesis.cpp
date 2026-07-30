@@ -338,11 +338,17 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
 
-    const std::size_t nnz_before = weights.connections.nnz();
+    // Combined (scattered + block4) nnz, not connections.nnz() alone: this
+    // 3x4 layer fits entirely inside one block4 tile, so a growth step here
+    // can legitimately promote the WHOLE tile (pre-existing connections
+    // included) into block4, which would otherwise look like nnz going to
+    // zero instead of growing -- see delta_csr_memory.hpp's
+    // block4_maybe_promote.
+    const std::size_t nnz_before = weights.connections.nnz() + weights.block4.live_synapses();
     std::size_t current_row = 0;
     CHECK_NOTHROW(
         (delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, current_row, 0.0f, SIZE_TYPE(10))));
-    CHECK(weights.connections.nnz() > nnz_before);
+    CHECK(weights.connections.nnz() + weights.block4.live_synapses() > nnz_before);
 }
 
 // ── delta_csr_backward_sparse_grad ────────────────────────────────────────────
@@ -731,7 +737,9 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
     weights.connections = dc;
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
-    const std::size_t nnz_before = weights.connections.nnz();
+    // Combined (scattered + block4), not connections.nnz() alone -- see the
+    // matching comment in the expand_headroom() regression test above.
+    const std::size_t nnz_before = weights.connections.nnz() + weights.block4.live_synapses();
 
     std::vector<float> input_accum = {5.0f, 0.1f, 3.0f};
     std::vector<float> grad_accum  = {0.1f, 4.0f, 0.1f, 0.1f};
@@ -759,7 +767,7 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
 
     // Strict > , not >= : this must be a real, verified size increase (see
     // conversation for why a >= here would have masked the nnz_delta bug).
-    CHECK(weights.connections.nnz() > nnz_before);
+    CHECK(weights.connections.nnz() + weights.block4.live_synapses() > nnz_before);
 }
 
 TEST_CASE("load_weights on two separate SparseLinearWeightsDelta layers does not corrupt either",

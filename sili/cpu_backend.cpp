@@ -15,6 +15,30 @@
 
 namespace py = pybind11;
 
+// ── Block4View ───────────────────────────────────────────────────────────────
+// Thin, non-owning wrapper exposing a layer's Block4Store to Python as
+// `layer.block4.tiles` / `layer.block4.synapses` -- purely observational
+// (see block4.hpp: block4's whole point is to be invisible to callers
+// otherwise). Holds a raw pointer into the owning layer's `weights.block4`;
+// SparseLinearLayer::block4()/DISLDOLayerV::block4() bind this with
+// py::keep_alive<0, 1>() so the layer can't be freed while a Block4View
+// referencing it is still alive in Python.
+class Block4View {
+public:
+    explicit Block4View(Block4Store& s) : store(&s) {}
+    std::size_t tiles()    const { return store->n_tiles(); }
+    std::size_t synapses() const { return store->live_synapses(); }
+    // Per-store compression parameter (see block4.hpp: Block4Store::switch_point) --
+    // the only knob in Block4View that isn't purely observational. A tile with
+    // <= switch_point live synapses is eligible to be packed into the
+    // sparse-encoded 16-byte layout instead of staying fully dense; 0 disables
+    // compression entirely.
+    uint32_t get_switch_point() const { return store->switch_point; }
+    void set_switch_point(uint32_t v) { store->switch_point = v; }
+private:
+    Block4Store* store;
+};
+
 // ── SISLDOLayer ───────────────────────────────────────────────────────────────
 // Sparse Input, Sparse Linear, Dense Output layer.
 //
@@ -270,6 +294,7 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
@@ -280,7 +305,10 @@ public:
 
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    // Purely observational (block4's whole point is to be invisible to
+    // callers otherwise) -- see Block4View, bound as layer.block4.
+    Block4View block4() { return Block4View(weights.block4); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -642,28 +670,28 @@ public:
     // delta_csr_to_absolute on each call. O(nnz), not O(1) like before.
     py::array_t<V> get_weights_vals() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, FP4BiPacked, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
         return result;
@@ -719,7 +747,8 @@ public:
 
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz()); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    Block4View block4() { return Block4View(weights.block4); }
 
     py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
         auto xbuf     = x.request();
@@ -793,28 +822,28 @@ public:
                               neuron_grad_accum.data(), py::cast(this)); }
     py::array_t<V> get_weights_vals() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
         std::vector<S> op, oi; std::vector<V> ow, oimp;
-        delta_csr_to_absolute<S, VT, COL_TYPE>(weights.connections, op, oi, ow, oimp);
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
         return result;
@@ -823,6 +852,18 @@ public:
 
 PYBIND11_MODULE(_cpu, m)
 {
+    // ── Block4View ────────────────────────────────────────────────────────────
+    py::class_<Block4View>(m, "Block4View")
+        .def_property_readonly("tiles",    &Block4View::tiles,
+             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("synapses", &Block4View::synapses,
+             "Number of synapses currently living in block4 (subset of nnz) --"
+             " purely observational.")
+        .def_property("switch_point", &Block4View::get_switch_point, &Block4View::set_switch_point,
+             "Tiles with <= switch_point live synapses may be packed into the"
+             " sparse-encoded tile layout instead of staying fully dense (see"
+             " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
+             " 0 disables compression entirely. Default 10.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
@@ -1008,6 +1049,10 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
+        .def_property_readonly("block4",    &SparseLinearLayer::block4,
+             py::keep_alive<0, 1>(),
+             "Purely observational view onto this layer's block4 storage --"
+             " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
             [](const SparseLinearLayer& self) -> py::object {
                 if (self._last_input.empty()) return py::none();
@@ -1060,7 +1105,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_readonly ("num_cpus",  &DISLDOLayerV::num_cpus)
         .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
-        .def_property_readonly("nnz",       &DISLDOLayerV::nnz);
+        .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
+        .def_property_readonly("block4",    &DISLDOLayerV::block4, py::keep_alive<0, 1>());
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

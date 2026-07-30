@@ -24,6 +24,11 @@
 #include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
+// block4.hpp is included further down (right before SparseLinearWeightsDelta,
+// the only thing here that needs Block4Store's full definition) -- Block4Store
+// itself now reuses DeltaCSRLayout/DeltaCSRRowCursor (defined below), so
+// block4.hpp can't be included this early any more. See conversation
+// (ULEB128 block4 tile indexing).
 
 /**
  * @brief Type trait to check if a type is a std::array.
@@ -384,6 +389,11 @@ struct DeltaCSRRowCursor {
     COL_TYPE col() const { return cur_col; }
 };
 
+// Needs DeltaCSRLayout/DeltaCSRRowCursor just defined above -- Block4Store
+// reuses both directly (both are already value-type-agnostic, no changes
+// needed to either). See conversation (ULEB128 block4 tile indexing).
+#include "block4.hpp"
+
 // ── DeltaCSRWeights ──────────────────────────────────────────────────────────
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
@@ -439,6 +449,14 @@ struct SparseLinearWeightsDelta {
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
     std::vector<SIZE_TYPE>                            out_degree;
+
+    // Locally-dense companion to `connections` -- see block4.hpp. Shares
+    // THIS struct's own value_scale/importance_scale below (not a separate
+    // scale), so moving a synapse between `connections` and `block4` is a
+    // lossless byte copy, not a requantization. Promotion/demotion logic
+    // lives in delta_csr_memory.hpp (needs delta_csr_row_insert_col/
+    // _remove_col, which would be a circular include from here).
+    Block4Store block4;
 
     // Per-ROW scale applied to STORED importance to get TRUE units before
     // any importance arithmetic (the activity-correlation `1+|imp|` denominator, the

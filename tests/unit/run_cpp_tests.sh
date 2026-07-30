@@ -21,7 +21,11 @@ cmake -DCMAKE_BUILD_TYPE=Debug ..
 # Build the tests (specify the number of CPU cores for parallel build with -j)
 # Replace 4 with the desired number of CPU cores
 # valgrind --leak-check=full ./sparse_tests
-if cmake --build . -j4 && ./sili_tests; then
+# ctest (not just ./sili_tests) so the standalone (own int main()) block4/
+# fp4 tests run too (SILI_STANDALONE_TESTS in CMakeLists.txt) -- running
+# ./sili_tests alone silently skips them; ctest covers both (it
+# catch_discover_tests's sili_tests AND the standalone add_test entries).
+if cmake --build . -j4 && ctest --output-on-failure; then
     echo "Tests passed."
 else
     echo "Tests failed."
