@@ -555,16 +555,29 @@ behavior) -- a real, meaningful lever between "slower, more memory-
 efficient" and "faster, uncompressed," not a fixed design decision baked
 into the format.
 
-- [ ] Design the switch-point parameter's home: per-`SparseLinearLayer`
+- [x] Design the switch-point parameter's home: per-`SparseLinearLayer`
       (simplest, matches how e.g. `num_cpus` is already a per-layer
       constructor arg) vs. some network-wide default with a per-layer
       override -- decide before implementing, since it affects the
       constructor/pybind signature.
-- [ ] Implement the scalar pack (dense -> sparse, i.e. repack) and unpack
+      **Decided (per direction): lives on `Block4Store` itself**
+      (`Block4Store::switch_point`, default `BLOCK4_SPARSE_MAX_COUNT`=10),
+      exposed read/write on the layer via `layer.block4.switch_point`
+      (`Block4View`, `cpu_backend.cpp`) -- accessible/modifiable from
+      `SparseLinearLayer`/`DISLDOLayerV` without adding a constructor arg.
+- [x] Implement the scalar pack (dense -> sparse, i.e. repack) and unpack
       (sparse -> dense) functions in block4.hpp, using the winning
       scalar approach from the prototype above -- straightforward,
       already proven correct and fast, no SIMD needed.
-- [ ] `Block4Tile` (or a new type wrapping it) needs a mode discriminator
+      `block4_sparse_pack`/`block4_sparse_unpack` (block4.hpp): 16-byte
+      sparse layout is byte[0]=count(0-10), bytes[1-5]=10 packed 4-bit
+      position nibbles (2-bit local row + 2-bit local col, 2/byte),
+      bytes[6-15]=10 value bytes (byte-identical to the dense format's
+      per-slot byte). `SILI_BLOCK4_SPARSE_MAX_COUNT`=10 is a
+      `static_assert`-enforced exact constant (10*12+8=128 bits exactly;
+      11 would need 132, over budget) -- NOT the same knob as the
+      runtime-configurable `switch_point`.
+- [x] `Block4Tile` (or a new type wrapping it) needs a mode discriminator
       -- likely just "count <= switch_point" checked against the stored
       byte layout's own count field when in sparse mode, vs. today's
       always-16-bytes-dense assumption everywhere forward/backward reads
@@ -572,7 +585,18 @@ into the format.
       without a full decode-to-scratch on every hot-path call when a
       tile is ALREADY dense (should stay a zero-cost direct read in that
       case, same as today) -- only sparse-mode tiles pay the unpack cost.
-- [ ] Wire pack/unpack into wherever a tile crosses the switch point
+      **`Block4StoredTile`** bundles `uint8_t data[16]` + `bool is_sparse`
+      in one struct (not a parallel array) so a single memmove during row
+      insert/remove/shift keeps both fields in sync atomically -- the
+      cost is per-tile, not per-byte, amortized over the >=2 synapses
+      every promoted tile holds. Access goes through a new RAII
+      **`Block4TileHandle`** (returned by `find()`/`get_or_create()`
+      instead of a raw `Block4Tile*`): caches `Block4StoredTile*` at
+      construction for the dense fast path (`.at()` is a direct pointer
+      read/write, zero-cost, matches pre-redesign behavior exactly); for
+      sparse tiles, unpacks ONCE into an internal `uint8_t scratch_[16]`
+      at construction, and `.at()` reads/writes scratch. Move-only.
+- [x] Wire pack/unpack into wherever a tile crosses the switch point
       (promotion time already scans/builds a tile from scratch; backward's
       writeback changes byte values in place today via
       `tile.at(li,lj) = ...`, which needs to become "unpack once at the
@@ -580,19 +604,83 @@ into the format.
       scratch buffer, re-pack once at the end if now `<=` switch point,
       stay dense otherwise" -- avoid unpack/repack more than once per
       call).
-- [ ] `count_live()`/promotion/demotion: sparse mode's count is free (the
+      Handled by the handle's destructor, not automatically on every
+      write: for DENSE tiles the destructor does nothing (no per-call
+      O(16) scan -- compression is a deliberate, explicit decision, never
+      an automatic side effect of a forward/backward call); for SPARSE
+      tiles that were touched (`dirty_`), the destructor re-packs once,
+      promoting to dense if the live count now exceeds `switch_point`.
+      A new **`Block4Store::maybe_compress(br, bc)`** is the only place
+      that packs dense -> sparse, called explicitly at the same
+      promotion-event checkpoints that already decide block4<->scattered
+      demotion (`block4_maybe_promote`'s two branches), so compression
+      never adds cost to every forward/backward call, only to actual
+      structural growth events.
+      **Real lifetime hazard, found via auditing every `find()`/
+      `get_or_create()` call site in `delta_csr_memory.hpp`:** two sites
+      (`block4_demote_tile`, and Step 5's pruning check in
+      `delta_csr_synap_row_step`) have a handle for (br,bc) still in
+      scope when a later call in the same scope erases that SAME
+      (br,bc) via `Block4Store::erase()` (directly, or transitively
+      through `block4_demote_tile`). A naively-cached-pointer handle's
+      destructor would write through a dangling pointer after that
+      erase()'s internal memmove. Fixed by having the destructor
+      re-fetch the sparse case's storage slot **by coordinate**
+      (`raw_find(br,bc)`), not a cached pointer -- gracefully no-ops if
+      the entry is gone -- plus explicit nested-block scoping at both
+      call sites as defense-in-depth/readability.
+- [x] `count_live()`/promotion/demotion: sparse mode's count is free (the
       stored count byte), no O(16) scan needed there; dense mode keeps
       today's scan.
-- [ ] Correctness tests: round-trip pack/unpack for all counts 0-16,
+- [x] Correctness tests: round-trip pack/unpack for all counts 0-16,
       the switch-point boundary in both directions, ASan/UBSan, plus a
       test with switch_point=0 (compression fully disabled) verifying
       byte-identical behavior to Part A's dense-only tiles.
-- [ ] Real, measured bit budget across a realistic count distribution
+      `tests/unit/test_block4_sparse_tile.cpp` (wired into
+      `SILI_STANDALONE_TESTS` in `tests/unit/CMakeLists.txt`, runs under
+      ctest): 22000-case pack/unpack round trip (counts 0-10, 2000
+      trials each), dense passthrough, `switch_point=0` disables
+      compression, explicit `maybe_compress` in both directions
+      (compresses/doesn't), sparse->dense promotion mid-lifetime on
+      write, the erase-while-handle-alive lifetime hazard (both sparse
+      and dense cases), move semantics. All pass under both `-O0`/ASan/
+      UBSan and `-O3 -march=native`/ASan/UBSan. Full `ctest` suite (87
+      tests) also run clean apart from 4 known pre-existing flaky
+      failures unrelated to block4 (stats/num_cpus/importance_scale --
+      see `run_cpp_tests.sh`'s own history).
+- [x] Real, measured bit budget across a realistic count distribution
       (not just endpoints) at a few different switch-point settings, and
       the real speed cost of the scalar pack/unpack call overhead itself
       (small per the prototype above, but should be measured in the real
       forward/backward hot path, not assumed from the isolated
       microbenchmark).
+      Realistic mixed layer (512x512, 15% density, 500 growth cycles +
+      50 backward calls, default `switch_point=10`): `n_tiles=90`,
+      `sparse=18 dense=72` (20% of live tiles genuinely compressed),
+      `live_synapses=1068`. Clean under ASan/UBSan.
+      **A real, worth-documenting finding about `switch_point` itself:**
+      once a tile is promoted into block4 it is treated as a dense 4x4
+      micro-block for forward/backward purposes -- `disldo_backward`'s
+      Hebbian update touches all 16 local `(li,lj)` slots on every call
+      it processes that tile, not just the synapses that originally
+      triggered promotion. So a promoted tile's live count climbs toward
+      capacity as ordinary training proceeds, independent of the growth
+      event that created it. Verified with a periodically-instrumented
+      stress run at `switch_point=3` (barely above
+      `BLOCK4_PROMOTE_MIN_LIVE`=2): tiles were genuinely sparse right
+      after growth (`sparse=15` of 22 live tiles), but 30 subsequent
+      `disldo_backward` calls with real learning (`lr=0.01`) monotonically
+      drove `sparse` to 0 within ~15 calls as each tile's live count grew
+      past 3. This is NOT a bug -- `maybe_compress` is deliberately
+      never re-checked on every write (see above), so a tile that grows
+      past `switch_point` after being compressed correctly stays
+      compressed only until its next dirty-write flush, at which point
+      the handle destructor decompresses it, and it isn't re-evaluated
+      for compression again until another promotion-event checkpoint.
+      Practical implication: pick `switch_point` well above
+      `BLOCK4_PROMOTE_MIN_LIVE`, and expect the sparse fraction to
+      reflect each tile's *steady-state* trained density, not its
+      density at the moment of promotion.
 
 ## Explicitly NOT changing
 

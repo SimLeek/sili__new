@@ -65,9 +65,9 @@ int main() {
     CHECK(weights.connections.layout.row_nnz(0) == 0, "row0's synapse should have moved OUT of connections");
     CHECK(weights.connections.layout.row_nnz(1) == 0, "row1's synapse should have moved OUT of connections");
 
-    const Block4Tile* tile = weights.block4.find(0, 0);
-    CHECK(tile != nullptr, "tile (0,0) must exist after promotion");
-    CHECK(tile->count_live() == 2, "tile count_live() should be 2, got %u", tile ? tile->count_live() : 999u);
+    auto tile = weights.block4.find(0, 0);
+    CHECK(bool(tile), "tile (0,0) must exist after promotion");
+    CHECK(tile.count_live() == 2, "tile count_live() should be 2, got %u", bool(tile) ? tile.count_live() : 999u);
 
     // out_degree must still correctly reflect BOTH synapses (never touched
     // by promotion -- see block4_maybe_promote's design comment).
@@ -82,7 +82,7 @@ int main() {
     CHECK(ok3, "third growth step should succeed");
     CHECK(weights.connections.layout.row_nnz(2) == 0, "row2's new synapse should migrate straight into the existing tile");
     tile = weights.block4.find(0, 0);
-    CHECK(tile->count_live() == 3, "tile count_live() should be 3 after single-synapse migration, got %u", tile->count_live());
+    CHECK(tile.count_live() == 3, "tile count_live() should be 3 after single-synapse migration, got %u", tile.count_live());
     CHECK(weights.out_degree[2] == 1, "out_degree[2] should be 1, got %d", (int)weights.out_degree[2]);
 
     // ── Pruning: demote by cutting live count back below threshold ────────
@@ -98,8 +98,8 @@ int main() {
     delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         weights, current_row, /*importance_cutoff=*/1e9f, /*max_row_weights=*/SIZE_TYPE(10));
     tile = weights.block4.find(0, 0);
-    CHECK(tile != nullptr, "tile should still exist after pruning row2 (2 live left, still >= threshold)");
-    CHECK(tile && tile->count_live() == 2, "tile count_live() should be 2 after pruning row2's synapse");
+    CHECK(bool(tile), "tile should still exist after pruning row2 (2 live left, still >= threshold)");
+    CHECK(tile && tile.count_live() == 2, "tile count_live() should be 2 after pruning row2's synapse");
     CHECK(weights.out_degree[2] == 0, "out_degree[2] should drop to 0 after real prune, got %d", (int)weights.out_degree[2]);
 
     current_row = 1;

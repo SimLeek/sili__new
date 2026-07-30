@@ -149,6 +149,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_backward
     test_disldo_block4_promotion
     test_disldo_block4_combined_absolute
+    test_block4_sparse_tile
     test_fp4_bitshift
     test_fp4_stochastic
 )

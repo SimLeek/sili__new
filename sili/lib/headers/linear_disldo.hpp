@@ -205,16 +205,20 @@ void disldo_forward(
     // correctness (which does not depend on this).
     if (weights.block4.n_tiles() > 0) {
         // Row-major cursor walk isn't parallel-for-friendly directly (same
-        // reason the old hash-map iteration wasn't); collect pointers once
-        // per call. Real cost: O(n_tiles), not O(nnz) -- cheap relative to
-        // the per-tile compute unless tiles are pathologically small, but a
-        // real, measurable per-call overhead the prototype's contiguous
+        // reason the old hash-map iteration wasn't); collect (br,bc)
+        // COORDINATES once per call (not Block4Tile pointers/handles --
+        // a handle can't be pre-collected across the parallel region
+        // since it's move-only, RAII, and per-tile compress/decompress
+        // decisions must happen within ONE thread's ownership of ONE
+        // tile at a time; each thread constructs its own handle fresh,
+        // inside the loop body below, from these coordinates). Real
+        // cost: O(n_tiles), not O(nnz) -- cheap relative to the per-tile
+        // compute unless tiles are pathologically small, but a real,
+        // measurable per-call overhead the prototype's contiguous
         // block_data array didn't pay. Worth checking in the comparison
         // script (not assumed either way).
-        std::vector<const Block4Tile*> live_tiles;
         std::vector<uint32_t> tile_br, tile_bc;
         const std::size_t n_b4 = weights.block4.n_tiles();
-        live_tiles.reserve(n_b4);
         tile_br.reserve(n_b4);
         tile_bc.reserve(n_b4);
         const auto& BL4 = weights.block4.block_layout;
@@ -222,12 +226,9 @@ void disldo_forward(
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
-            std::size_t bc_elem = BL4.elem_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
-                const uint32_t bc = bc_cursor.advance();
-                live_tiles.push_back(&weights.block4.tile_values[bc_elem]);
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 tile_br.push_back(uint32_t(br));
-                tile_bc.push_back(bc);
+                tile_bc.push_back(bc_cursor.advance());
             }
         }
         // Per-thread private output buffers, same pattern as the scattered
@@ -243,9 +244,13 @@ void disldo_forward(
             const int tid = omp_get_thread_num();
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
             #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < int64_t(live_tiles.size()); ++ti) {
-                const Block4Tile& tile = *live_tiles[std::size_t(ti)];
+            for (int64_t ti = 0; ti < int64_t(tile_br.size()); ++ti) {
                 const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+                // const: routes .at() through the const overload, which
+                // does NOT mark the handle dirty -- forward is read-only,
+                // so a sparse tile's destructor should do nothing here
+                // (no wasted re-pack of unchanged content).
+                const auto tile = weights.block4.find(br, bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= n_out) continue;
@@ -580,10 +585,11 @@ void disldo_backward(
     // incorrect one -- acceptable for a first working version; revisit if
     // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
     if (weights.block4.n_tiles() > 0) {
-        std::vector<Block4Tile*> live_tiles;
+        // Coordinates only, not pointers/handles -- see forward's
+        // identical comment above for why (handles are move-only RAII,
+        // constructed fresh per-tile inside the parallel loop body below).
         std::vector<uint32_t> tile_br, tile_bc;
         const std::size_t n_b4 = weights.block4.n_tiles();
-        live_tiles.reserve(n_b4);
         tile_br.reserve(n_b4);
         tile_bc.reserve(n_b4);
         const auto& BL4 = weights.block4.block_layout;
@@ -591,12 +597,9 @@ void disldo_backward(
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
-            std::size_t bc_elem = BL4.elem_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
-                const uint32_t bc = bc_cursor.advance();
-                live_tiles.push_back(&weights.block4.tile_values[bc_elem]);
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 tile_br.push_back(uint32_t(br));
-                tile_bc.push_back(bc);
+                tile_bc.push_back(bc_cursor.advance());
             }
         }
 
@@ -607,7 +610,7 @@ void disldo_backward(
         // per-slot scan needed (see block4.hpp: a live tile's slots are
         // all real synapses, weight=0.0 included).
         std::vector<uint32_t> row_live_count(n_in, 0);
-        for (std::size_t ti = 0; ti < live_tiles.size(); ++ti) {
+        for (std::size_t ti = 0; ti < tile_br.size(); ++ti) {
             const uint32_t br = tile_br[ti];
             for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                 const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
@@ -626,9 +629,14 @@ void disldo_backward(
             double* mrow = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in;
 
             #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < int64_t(live_tiles.size()); ++ti) {
-                Block4Tile& tile = *live_tiles[std::size_t(ti)];
+            for (int64_t ti = 0; ti < int64_t(tile_br.size()); ++ti) {
                 const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+                // Non-const: this tile is both read (precompute) and
+                // written (writeback) below, spanning this whole
+                // iteration -- one handle, unpacks once if sparse,
+                // re-packs once (if touched) when it goes out of scope
+                // at the end of this iteration.
+                auto tile = weights.block4.find(br, bc);
 
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;

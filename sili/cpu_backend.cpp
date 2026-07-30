@@ -28,6 +28,13 @@ public:
     explicit Block4View(Block4Store& s) : store(&s) {}
     std::size_t tiles()    const { return store->n_tiles(); }
     std::size_t synapses() const { return store->live_synapses(); }
+    // Per-store compression parameter (see block4.hpp: Block4Store::switch_point) --
+    // the only knob in Block4View that isn't purely observational. A tile with
+    // <= switch_point live synapses is eligible to be packed into the
+    // sparse-encoded 16-byte layout instead of staying fully dense; 0 disables
+    // compression entirely.
+    uint32_t get_switch_point() const { return store->switch_point; }
+    void set_switch_point(uint32_t v) { store->switch_point = v; }
 private:
     Block4Store* store;
 };
@@ -851,7 +858,12 @@ PYBIND11_MODULE(_cpu, m)
              "Number of block4 tiles currently promoted -- purely observational.")
         .def_property_readonly("synapses", &Block4View::synapses,
              "Number of synapses currently living in block4 (subset of nnz) --"
-             " purely observational.");
+             " purely observational.")
+        .def_property("switch_point", &Block4View::get_switch_point, &Block4View::set_switch_point,
+             "Tiles with <= switch_point live synapses may be packed into the"
+             " sparse-encoded tile layout instead of staying fully dense (see"
+             " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
+             " 0 disables compression entirely. Default 10.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 

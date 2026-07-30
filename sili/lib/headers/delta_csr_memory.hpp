@@ -206,12 +206,14 @@ void delta_csr_combined_to_absolute(
                 const auto& BL = weights.block4.block_layout;
                 const std::size_t n_bc = BL.row_nnz(br);
                 auto bc_cursor = weights.block4.row_cursor(br);
-                std::size_t bc_elem = BL.elem_start[br];
-                for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+                for (std::size_t bk = 0; bk < n_bc; ++bk) {
                     const uint32_t bc = bc_cursor.advance();
-                    const Block4Tile* tile = &weights.block4.tile_values[bc_elem];
+                    // const: read-only export path, should not mark a
+                    // sparse tile's handle dirty (no wasted re-pack of
+                    // unchanged content).
+                    const auto tile = weights.block4.find(br, bc);
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                        const uint8_t byte = tile->at(li, lj);
+                        const uint8_t byte = tile.at(li, lj);
                         // A tile is dense (every slot is a real synapse --
                         // see block4.hpp), but this export path shouldn't
                         // flood the caller with empty filler slots; "byte
@@ -697,7 +699,7 @@ void block4_maybe_promote(
         const uint32_t li = uint32_t(row % BLOCK4_TILE);
         const uint32_t lj = uint32_t(col % BLOCK4_TILE);
 
-        if (Block4Tile* tile = weights.block4.find(br, bc)) {
+        if (weights.block4.find(br, bc)) {
             const std::size_t n = L.row_nnz(row);
             auto cursor = dc.row_cursor(row);
             for (std::size_t k = 0; k < n; ++k) {
@@ -706,7 +708,19 @@ void block4_maybe_promote(
                     const std::size_t vb = L.elem_start[row] + k;
                     const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    tile->at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                    {
+                        auto tile = weights.block4.find(br, bc);
+                        tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                    } // tile's scope ends here -- a sparse tile's own
+                      // destructor already re-evaluates compression on
+                      // any dirty write (re-packs or promotes to dense as
+                      // needed); a dense tile's destructor is a no-op, so
+                      // maybe_compress below closes the one remaining gap
+                      // (a dense tile that's STILL under switch_point
+                      // after this single-synapse add would otherwise
+                      // never become compressed until some other
+                      // pruning-driven event touches it).
+                    weights.block4.maybe_compress(br, bc);
                     delta_csr_row_remove_col(dc, row, col);
                     return;
                 }
@@ -733,14 +747,24 @@ void block4_maybe_promote(
         }
         if (found.size() < BLOCK4_PROMOTE_MIN_LIVE) return;
 
-        Block4Tile& tile = weights.block4.get_or_create(br, bc);
-        for (const auto& f : found) {
-            const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, f.elem_idx);
-            const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
-            const uint32_t fli = uint32_t(f.row - row_lo);
-            const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
-            tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
-        }
+        {
+            auto tile = weights.block4.get_or_create(br, bc);
+            for (const auto& f : found) {
+                const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, f.elem_idx);
+                const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
+                const uint32_t fli = uint32_t(f.row - row_lo);
+                const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
+                tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+            }
+        } // tile's scope ends here -- get_or_create's tile always starts
+          // dense, so this destructor is a no-op regardless, but ending
+          // its lifetime before maybe_compress below keeps the ordering
+          // unambiguous.
+        // A newly-promoted tile is typically small (found.size() can be
+        // as low as BLOCK4_PROMOTE_MIN_LIVE=2) -- give it a chance to
+        // start compressed right away, same explicit-check pattern as
+        // everywhere else (never automatic on every write).
+        weights.block4.maybe_compress(br, bc);
         // Removal happens after ALL reads above -- each row's synapses are
         // fully read before any of them are removed, so a removal's shift of
         // later byte offsets in that row can never invalidate an elem_idx
@@ -770,36 +794,43 @@ void block4_demote_tile(
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
         auto& L  = dc.layout;
-        Block4Tile* tile = weights.block4.find(br, bc);
-        if (!tile) return;
-
         const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
         const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
-        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-            const std::size_t row = row_lo + li;
-            if (row >= L.rows) continue;
-            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                const uint8_t byte  = tile->at(li, lj);
-                // Same "byte nonzero" heuristic as the export path above --
-                // re-inserting an exactly-(0.0,0.0) slot into the scattered
-                // CSR would just be storing a meaningless entry.
-                if (byte == 0) continue;
-                const uint8_t wcode = byte & 0xFu;
-                const std::size_t col = col_lo + lj;
-                if (col >= L.cols) continue;
-                const uint8_t impcode = (byte >> 4) & 0xFu;
-                const value_type w   = FP4_TABLE[wcode];
-                const value_type imp = FP4_TABLE[impcode];
-                if (!delta_csr_row_insert_col(dc, row, COL_TYPE(col), w, imp)) {
-                    throw std::runtime_error(
-                        "block4_demote_tile: row " + std::to_string(row) +
-                        " ran out of blank space while demoting tile (" +
-                        std::to_string(br) + "," + std::to_string(bc) + ")."
-                        " Call equalizer_step() to redistribute space from"
-                        " adjacent rows before retrying.");
+        {
+            auto tile = weights.block4.find(br, bc);
+            if (!tile) return;
+            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                const std::size_t row = row_lo + li;
+                if (row >= L.rows) continue;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const uint8_t byte  = tile.at(li, lj);
+                    // Same "byte nonzero" heuristic as the export path above --
+                    // re-inserting an exactly-(0.0,0.0) slot into the scattered
+                    // CSR would just be storing a meaningless entry.
+                    if (byte == 0) continue;
+                    const uint8_t wcode = byte & 0xFu;
+                    const std::size_t col = col_lo + lj;
+                    if (col >= L.cols) continue;
+                    const uint8_t impcode = (byte >> 4) & 0xFu;
+                    const value_type w   = FP4_TABLE[wcode];
+                    const value_type imp = FP4_TABLE[impcode];
+                    if (!delta_csr_row_insert_col(dc, row, COL_TYPE(col), w, imp)) {
+                        throw std::runtime_error(
+                            "block4_demote_tile: row " + std::to_string(row) +
+                            " ran out of blank space while demoting tile (" +
+                            std::to_string(br) + "," + std::to_string(bc) + ")."
+                            " Call equalizer_step() to redistribute space from"
+                            " adjacent rows before retrying.");
+                    }
                 }
             }
-        }
+        } // tile's scope ends here, BEFORE erase() -- this read-only handle's
+          // destructor would try to re-pack a now-invalidated pointer if it
+          // outlived the erase() below (see Block4TileHandle's class comment
+          // for why the destructor re-fetches by coordinate rather than
+          // trusting a cached pointer -- this scoping is still the right
+          // fix here regardless, since there's nothing meaningful to write
+          // back to a tile about to be erased anyway).
         weights.block4.erase(br, bc);
     }
 }
@@ -864,10 +895,11 @@ bool delta_csr_synap_row_step(
             const auto& BL = weights.block4.block_layout;
             const std::size_t n_bc = BL.row_nnz(br);
             auto bc_cursor = weights.block4.row_cursor(br);
-            std::size_t bc_elem = BL.elem_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 const uint32_t bc = bc_cursor.advance();
-                const Block4Tile& tile = weights.block4.tile_values[bc_elem];
+                // const: read-only discovery scan, should not mark a
+                // sparse tile's handle dirty.
+                const auto tile = weights.block4.find(br, bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     // "Byte nonzero" as the discovery heuristic -- same
                     // reasoning as the export/demote paths: a tile slot
@@ -906,8 +938,8 @@ bool delta_csr_synap_row_step(
         for (std::size_t j = 0; j < b4_bc.size(); ++j) {
             const std::size_t k = n_scattered + j;
             const uint32_t bc = b4_bc[j], lj = b4_lj[j];
-            const Block4Tile* tile = weights.block4.find(br, bc);
-            const uint8_t byte = tile->at(li, lj);
+            auto tile = weights.block4.find(br, bc);
+            const uint8_t byte = tile.at(li, lj);
             exist_cols[k]  = COL_TYPE(std::size_t(bc) * BLOCK4_TILE + lj);
             exist_w[k]     = FP4_TABLE[byte & 0xFu];
             exist_imp[k]   = FP4_TABLE[(byte >> 4) & 0xFu];
@@ -999,16 +1031,23 @@ bool delta_csr_synap_row_step(
             if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
                 const uint32_t bc = uint32_t(re.col) / BLOCK4_TILE;
                 const uint32_t lj = uint32_t(re.col) % BLOCK4_TILE;
-                Block4Tile* tile = weights.block4.find(br, bc);
-                if (tile && tile->at(li, lj) != 0) {
-                    tile->at(li, lj) = 0;
-                    // count_live() is a cheap O(16) on-demand scan (cold
-                    // path -- one prune event, not every backward call);
-                    // see block4.hpp for why there's no incrementally
-                    // tracked live_count anymore.
-                    if (tile->count_live() < BLOCK4_PROMOTE_MIN_LIVE)
-                        block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
-                }
+                bool should_demote = false;
+                {
+                    auto tile = weights.block4.find(br, bc);
+                    if (tile && tile.at(li, lj) != 0) {
+                        tile.at(li, lj) = 0;
+                        // count_live() is a cheap O(16) on-demand scan (cold
+                        // path -- one prune event, not every backward call);
+                        // see block4.hpp for why there's no incrementally
+                        // tracked live_count anymore.
+                        should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
+                    }
+                } // tile's scope ends here, BEFORE block4_demote_tile below --
+                  // that function calls weights.block4.erase() on this SAME
+                  // (br,bc), which would invalidate an outstanding handle's
+                  // cached pointer (see Block4TileHandle's class comment).
+                if (should_demote)
+                    block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
             }
         } else {
             delta_csr_row_remove_col(dc, row, re.col);
