@@ -41,6 +41,7 @@ int main() {
     Weights weights;
     weights.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, n_in, n_out, 4096, 4096, 0.5f);
+    weights.block4.init(n_in, n_out);
     weights.out_degree.assign(n_out, SIZE_TYPE(0));
 
     // ── Growth: insert (0,0) then (1,1) into tile (0,0), one per call ──────

@@ -404,62 +404,97 @@ importance)`), and `Block4Tile` is one opaque 128-bit blob, not a
 (weight, importance) pair -- forcing it through that exact signature would
 be a worse fit than writing a parallel set of functions. Plan:
 
-- [ ] New `block4_row_insert_col`/`block4_row_remove_col` (delta_csr_memory.hpp
-      or block4.hpp) mirroring `delta_csr_row_insert_col`/`remove_col`'s
-      *algorithm* exactly (uleb128 delta re-encoding, byte-shift via
-      memmove, headroom checks) but operating on `std::vector<Block4Tile>`
-      directly instead of through `ValueAccessor`. `delta_csr_shift_row`
-      itself (byte/elem capacity growth) IS value-agnostic already --
-      check whether it's directly reusable as-is once the layout/buf
-      shape matches, before writing a parallel version of that one too.
-- [ ] Rework `Block4Store`: drop `unordered_map<uint64_t, Block4Tile> tiles`
-      and `unordered_map<uint32_t, unordered_set<uint32_t>> by_block_row`,
-      replace with `DeltaCSRLayout block_layout` + `std::vector<uint8_t>
-      indices_buf` + `std::vector<Block4Tile> tile_values`. Keep the
-      PUBLIC API shape (`get_or_create(br,bc)`, `find(br,bc)`,
-      `erase(br,bc)`, `n_tiles()`, `live_synapses()`) so call sites don't
-      all need to change -- `find`/`get_or_create` become an O(row_nnz)
-      cursor walk instead of O(1) hash lookup (row_nnz here = tiles in
-      that one block-row, expected small given block4's own
-      collision-limited population -- verify this assumption holds, don't
-      just assert it).
-- [ ] Update the ~8 point-lookup call sites in `delta_csr_memory.hpp`
-      (`block4_maybe_promote`, `block4_demote_tile`, the Step 1b/5 hooks
-      in `delta_csr_synap_row_step`) -- these use `find`/`get_or_create`/
-      `erase` directly, should mostly Just Work against the new API if the
-      signatures are preserved, but verify each one (some also touch
-      `by_block_row` directly for the "does this block-row have any
-      tiles" check, which needs to become "does this block-row have
-      row_nnz > 0" via the new layout instead).
-- [ ] Update the 2 flat-tile-collection loops in `linear_disldo.hpp`
-      (forward's and backward's `for (auto& kv : weights.block4.tiles)`
-      preambles, which flatten into `live_tiles`/`tile_br`/`tile_bc`
-      vectors for `#pragma omp for` parallelization) to walk every
-      block-row's cursor instead -- order doesn't matter to the existing
-      per-tile math (already fully parallel, no cross-tile dependency),
-      only that all live tiles get collected once.
-- [ ] Multiply/divide-by-4 audit: every (br,bc) at the Block4Store boundary
-      is a BLOCK coordinate (real row/col already divided by 4 by the
-      caller, per the existing convention) -- the new layout's `rows`/
-      `cols` should be `ceil(n_in/4)`/`ceil(n_out/4)`, not `n_in`/`n_out`.
-      Verify at construction (wherever `Block4Store` gets sized/
-      constructed today) and audit for any place still assuming raw
-      row/col scale.
-- [ ] Update the 4 `test_disldo_block4_*.cpp` files (now real ctest
-      entries, not just ad-hoc runs -- see the SIMD-writeback commit) for
-      whatever internal-field references break, plus a new correctness
-      test for `block4_row_insert_col`/`remove_col` themselves
-      (insert/remove/reinsert at various block-row positions, boundary
-      rows, capacity-exhaustion-returns-false, matching the existing
-      `test_disldo_synaptogenesis.cpp`-style coverage for the scattered
-      path's own insert/remove).
-- [ ] Verify: full ctest suite, ASan/UBSan on the new insert/remove
-      functions specifically, a real pybind rebuild +
-      `bench_block4_layer.py` correctness check (quality err, nnz/tile
-      counts), and update TODO_DUAL_BLOCK4.md with the real measured bit
-      budget (not just the 136-144 estimate) and any speed delta (O(1)
-      hash lookup -> O(row_nnz) cursor walk could go either way on real
-      timing, measure don't assume).
+- [x] `block4_row_insert_tile`/`block4_row_remove_tile` (block4.hpp) mirror
+      `delta_csr_row_insert_col`/`remove_col`'s *algorithm* exactly (uleb128
+      delta re-encoding, byte-shift via memmove, headroom checks) but
+      operate on `std::vector<Block4Tile>` directly -- not a call to the
+      existing functions (confirmed: those are shaped around
+      `ValueAccessor<VALUES_TYPE>`'s weight+importance FLOAT PAIR, wrong
+      fit for one opaque 128-bit blob). `DeltaCSRLayout`/`DeltaCSRRowCursor`
+      (delta_csr_types.hpp) ARE reused directly, unchanged -- confirmed
+      value-agnostic, needed only a header-include reorder (block4.hpp now
+      included after both, not before -- see delta_csr_types.hpp). Also
+      needed `block4_row_shift`/`block4_grow_last_row`/
+      `block4_ensure_row_headroom` (new -- Block4Store's own growth-on-
+      demand, exactly-enough-for-one-more-tile increment, no
+      equalize_to_capacity-style API needed given block4's inherently
+      small population) -- not originally called out as separate line
+      items but a necessary part of "give it its own capacity management,"
+      mirroring `SparseLinearLayer::equalize_to_capacity`'s own real
+      last-row special case (delta_csr_shift_row's algorithm intentionally
+      no-ops on the last row; growing it needs a different, simpler path).
+- [x] `Block4Store` reworked: `DeltaCSRLayout block_layout` +
+      `std::vector<uint8_t> indices_buf` + `std::vector<Block4Tile>
+      tile_values`, hash map and `by_block_row` both gone. Public API
+      shape preserved (`get_or_create`/`find`/`erase`/`n_tiles`/
+      `live_synapses`) plus a new `init(n_in, n_out)` (sizes the block-
+      granularity layout, zero initial per-row headroom -- growth is lazy
+      on first insert, matching the whole point of this redesign: don't
+      reserve space most block-rows will never use). `find`/`get_or_create`
+      are now O(row_nnz) cursor walks, not O(1) hash lookup -- measured,
+      not assumed: total instruction count in a profiled disldo_backward
+      run was UNCHANGED (716.2M vs. 715.8M pre-change, <0.1% difference) --
+      block-row populations are small enough (block4's own collision-
+      limited growth, established earlier this session) that the
+      complexity change is free in practice.
+- [x] Real bug found via ASan while stress-testing (not hypothetical):
+      `get_or_create()` called directly on a never-`init()`'d Block4Store
+      (`block_layout.rows == 0`) indexed `byte_start`/`elem_start` out of
+      bounds -- a real SEGV, caught in my own `bench_block4_direct.cpp`
+      scratch harness (which called `get_or_create` directly, bypassing
+      promotion's safety net). Fixed two ways: (1) `block4_maybe_promote`
+      (the ONLY place a tile is ever first created through the real growth
+      path) now lazily self-inits from `weights.connections.layout`'s own
+      rows/cols if not yet sized, so no caller going through promotion
+      needs to remember an explicit `init()` call; (2) `get_or_create()`
+      itself now throws `std::out_of_range` with a clear message for an
+      out-of-bounds/uninitialized block-row, instead of silently
+      corrupting memory, for any caller (tests, future code) that invokes
+      it directly. `SparseLinearLayer`'s own constructor (cpu_backend.cpp)
+      calls `init()` explicitly too, belt-and-suspenders.
+- [x] All ~8 point-lookup call sites in `delta_csr_memory.hpp`
+      (`block4_maybe_promote`, `block4_demote_tile`, the discovery/step
+      hooks in `delta_csr_synap_row_step`, `delta_csr_combined_to_absolute`)
+      and the 2 flat-tile-collection preambles in `linear_disldo.hpp`
+      (forward's and backward's) updated -- `by_block_row.find(br)`-style
+      checks became `br < block_layout.rows` + a `row_cursor(br)` walk;
+      the flat-collection loops now walk every block-row's cursor instead
+      of iterating a hash map, order doesn't matter to the (already fully
+      parallel, no cross-tile dependency) per-tile math that follows.
+- [x] Multiply/divide-by-4: `Block4Store::init` sizes `block_layout.rows/cols`
+      as `ceil(n_in/BLOCK4_TILE)`/`ceil(n_out/BLOCK4_TILE)`. Verified
+      against non-4-divisible dimensions (511x509) under ASan/UBSan with
+      3000 growth cycles -- exercises the boundary/partial last block-row
+      and block-col cleanly, no errors -- plus the direct-fill stress test
+      below (100% tile-fill fraction touches every block-row including
+      the last one).
+- [x] All 4 `test_disldo_block4_*.cpp` files updated (manual
+      `tiles[Block4Store::key(br,bc)]` construction -> `get_or_create(br,bc)`
+      + `init(n_in,n_out)`) -- all still pass, including
+      `test_disldo_block4_promotion.cpp`, which drives real promotion/
+      demotion through `delta_csr_synap_row_step` (the actual growth path),
+      not hand-built fixtures, so it's real coverage of the new insert/
+      remove machinery, not just the manually-constructed cases.
+- [x] Verify: full ctest suite (86 tests, same pre-existing 2-4 flaky
+      thread-scheduling-order failures as before this change, confirmed
+      flaky not regressed by re-running individually); ASan/UBSan on all
+      4 block4 test files individually AND three purpose-built stress
+      harnesses -- `bench_realistic_mixed` (natural growth, up to 8000
+      cycles, multiple densities including 0.3/0.05, both 512x512 and
+      511x509), `bench_block4_direct` (artificial 10%/50%/100% tile-fill
+      via direct `get_or_create` calls -- the 100% case inserts all
+      16384 possible tiles in one pass, exercising every block-row
+      including the last/boundary one) -- all clean, zero ASan/UBSan
+      findings; a real pybind rebuild + `bench_block4_layer.py`
+      correctness check (quality err unchanged at ~5.7e-6, nnz/tile
+      counts sane). REAL measured bit budget (not just the 136-144
+      estimate): 88 tiles at 512x512/15%-density/300-growth-cycles used
+      exactly 88 bytes of index buffer -- **136 bits/tile measured**
+      (128 tile + 8-bit/1-byte index), the low end of the estimate,
+      confirming the scattered path's own "100% single-byte at realistic
+      density" finding applies here too (block-column values 0-127 at
+      this problem size, n_out/BLOCK4_TILE=128, all fit in one ULEB128
+      byte). Real, measured 29.2% reduction from the old 192 bits/tile.
 
 ### Part B -- sparse/dense hybrid tile encoding + fixed-latency SIMD unpack (novel, higher-risk, do after Part A)
 

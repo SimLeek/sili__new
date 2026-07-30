@@ -24,7 +24,11 @@
 #include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
-#include "block4.hpp"
+// block4.hpp is included further down (right before SparseLinearWeightsDelta,
+// the only thing here that needs Block4Store's full definition) -- Block4Store
+// itself now reuses DeltaCSRLayout/DeltaCSRRowCursor (defined below), so
+// block4.hpp can't be included this early any more. See conversation
+// (ULEB128 block4 tile indexing).
 
 /**
  * @brief Type trait to check if a type is a std::array.
@@ -384,6 +388,11 @@ struct DeltaCSRRowCursor {
 
     COL_TYPE col() const { return cur_col; }
 };
+
+// Needs DeltaCSRLayout/DeltaCSRRowCursor just defined above -- Block4Store
+// reuses both directly (both are already value-type-agnostic, no changes
+// needed to either). See conversation (ULEB128 block4 tile indexing).
+#include "block4.hpp"
 
 // ── DeltaCSRWeights ──────────────────────────────────────────────────────────
 

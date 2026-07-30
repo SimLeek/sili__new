@@ -2,8 +2,7 @@
 #include "fp4quant.hpp"
 #include <cstdint>
 #include <cstring>
-#include <unordered_map>
-#include <unordered_set>
+#include <stdexcept>
 #include <vector>
 
 // ── block4: dense 4x4 tiles, integrated into SparseLinearWeightsDelta ──────
@@ -274,57 +273,386 @@ struct Block4Tile {
     }
 };
 
-// Tiles are keyed by (block_row, block_col) = (row/BLOCK4_TILE, col/BLOCK4_TILE)
-// in the SAME row/col space as the owning DeltaCSRWeights (row=input,
-// col=output, disldo's convention). A hash map, not a dense array: real
-// layers are still globally sparse even after locally-dense tiles are
-// promoted (e.g. embed_tokens' real 20% density leaves most possible tile
-// coordinates empty) -- a dense presence array would waste memory
-// proportional to n_block_rows*n_block_cols, not to actual tile count.
-struct Block4Store {
-    std::unordered_map<uint64_t, Block4Tile> tiles;
+// ── Tile index: ULEB128 delta-CSR over BLOCK coordinates ────────────────────
+//
+// Previously an unordered_map<uint64_t, Block4Tile> (64-bit key -- 128 tile
+// + 64 key = 192 bits/tile) + a separate unordered_map<uint32_t,
+// unordered_set<uint32_t>> reverse index for the per-block-row liveness
+// check. Per direction: reuse the SAME ULEB128 delta-encoding the scattered
+// path already uses for its own column indices (confirmed this session:
+// 100% single-byte at realistic density), just at BLOCK granularity
+// (block_row = row/BLOCK4_TILE, block_col = col/BLOCK4_TILE) -- 128 tile +
+// 8-16 uleb128 index = 136-144 bits/tile, and the per-block-row liveness
+// check becomes "row_nnz(br) > 0" on this same layout instead of a second
+// data structure to keep in sync.
+//
+// DeltaCSRLayout and DeltaCSRRowCursor (delta_csr_types.hpp, just above --
+// this file is now included AFTER both) are reused directly, unchanged --
+// neither ever referenced VALUES_TYPE/ValueAccessor, so nothing about them
+// needed to change for a Block4Tile "value" instead of a float pair.
+//
+// block4_row_insert_tile/remove_tile below are NOT calls to the existing
+// delta_csr_row_insert_col/remove_col (delta_csr_memory.hpp) -- those are
+// shaped around ValueAccessor<VALUES_TYPE>'s weight+importance FLOAT PAIR
+// interface (`insert_col(..., value_type weight, value_type importance)`),
+// and a Block4Tile is one opaque 128-bit blob, not a (weight, importance)
+// pair -- forcing it through that signature would be a worse fit than a
+// parallel set of functions with the same shifting algorithm.
 
-    // Reverse index: block-row -> set of block-columns with a live tile
-    // there. delta_csr_synap_row_step's pruning path is triggered per CSR
-    // ROW, and needs to know "does this row's block-row participate in any
-    // block4 tile" -- without this, that check would be an O(n_tiles) scan
-    // of the whole store on EVERY row-step call (the function is meant to
-    // be cheap and called very frequently, one row per call). Kept in sync
-    // by get_or_create/erase below -- never mutate `tiles` directly.
-    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> by_block_row;
+// Grows row `row`'s byte/elem allocation to at least the given targets,
+// for any row EXCEPT the last -- mirrors delta_csr_shift_row's exact
+// algorithm (byte_start/byte_end/elem_start/elem_end bookkeeping,
+// memmove-based shift of every row after this one) but operates on
+// `values` (std::vector<Block4Tile>) directly, not through ValueAccessor.
+// Deliberately does nothing for the LAST row (row+1 == L.rows) -- same
+// real subtlety as delta_csr_shift_row: there's no "next row" to shift out
+// of the way, so growing the last row needs a different, simpler path
+// (see block4_grow_last_row below) -- this isn't a bug carried over
+// blindly, it's the same shape as the scattered path's own
+// equalize_to_capacity, which special-cases the last row for exactly this
+// reason.
+inline void block4_row_shift(
+    DeltaCSRLayout& L,
+    std::vector<uint8_t>& ibuf,
+    std::vector<Block4Tile>& values,
+    std::size_t row,
+    std::size_t target_byte_alloc,
+    std::size_t target_elem_alloc)
+{
+    const std::size_t cur_byte_alloc = L.row_alloc_bytes(row);
+    if (cur_byte_alloc != target_byte_alloc && row + 1 < L.rows) {
+        const std::size_t move_src  = L.byte_start[row + 1];
+        const std::size_t move_len  = L.byte_start[L.rows] - move_src;
+        const std::size_t new_start = L.byte_start[row] + target_byte_alloc;
 
-    static uint64_t key(uint32_t br, uint32_t bc) {
-        return (uint64_t(br) << 32) | uint64_t(bc);
+        if (target_byte_alloc > cur_byte_alloc)
+            ibuf.resize(ibuf.size() + (target_byte_alloc - cur_byte_alloc));
+        if (move_len > 0)
+            std::memmove(ibuf.data() + new_start, ibuf.data() + move_src, move_len);
+        if (target_byte_alloc < cur_byte_alloc)
+            ibuf.resize(ibuf.size() - (cur_byte_alloc - target_byte_alloc));
+
+        const std::ptrdiff_t byte_delta =
+            std::ptrdiff_t(target_byte_alloc) - std::ptrdiff_t(cur_byte_alloc);
+        for (std::size_t r = row + 1; r <= L.rows; ++r)
+            L.byte_start[r] = std::size_t(std::ptrdiff_t(L.byte_start[r]) + byte_delta);
+        for (std::size_t r = row + 1; r < L.rows; ++r)
+            L.byte_end[r] = std::size_t(std::ptrdiff_t(L.byte_end[r]) + byte_delta);
     }
+
+    const std::size_t cur_elem_alloc = L.row_alloc_elems(row);
+    if (cur_elem_alloc != target_elem_alloc && row + 1 < L.rows) {
+        const std::size_t move_src  = L.elem_start[row + 1];
+        const std::size_t move_len  = L.elem_start[L.rows] - move_src;
+        const std::size_t new_start = L.elem_start[row] + target_elem_alloc;
+        const std::size_t current_total = L.total_alloc_elems();
+
+        if (target_elem_alloc > cur_elem_alloc)
+            values.resize(current_total + (target_elem_alloc - cur_elem_alloc));
+        if (move_len > 0)
+            // Block4Tile is trivially copyable (a plain uint8_t[16]), so a
+            // raw memmove here is exactly as safe as std::vector's own
+            // internal moves would be -- same reasoning delta_csr_shift_row
+            // relies on via ValueAccessor::move for FP4BiPacked.
+            std::memmove(values.data() + new_start, values.data() + move_src,
+                         move_len * sizeof(Block4Tile));
+        if (target_elem_alloc < cur_elem_alloc)
+            values.resize(current_total - (cur_elem_alloc - target_elem_alloc));
+
+        const std::ptrdiff_t elem_delta =
+            std::ptrdiff_t(target_elem_alloc) - std::ptrdiff_t(cur_elem_alloc);
+        for (std::size_t r = row + 1; r <= L.rows; ++r)
+            L.elem_start[r] = std::size_t(std::ptrdiff_t(L.elem_start[r]) + elem_delta);
+        for (std::size_t r = row + 1; r < L.rows; ++r)
+            L.elem_end[r] = std::size_t(std::ptrdiff_t(L.elem_end[r]) + elem_delta);
+    }
+}
+
+// Last-row growth: no row follows it, so no memmove is needed -- just
+// extend the flat buffers and the row's own end marker (L.byte_start[rows]/
+// L.elem_start[rows] double as "end of the last row's allocation" since
+// there's no row `rows` to have its own start). Mirrors
+// SparseLinearLayer::equalize_to_capacity's identical last-row special
+// case (cpu_backend.cpp).
+inline void block4_grow_last_row(
+    DeltaCSRLayout& L,
+    std::vector<uint8_t>& ibuf,
+    std::vector<Block4Tile>& values,
+    std::size_t target_byte_alloc,
+    std::size_t target_elem_alloc)
+{
+    if (L.rows == 0) return;
+    const std::size_t r = L.rows - 1;
+    const std::size_t cur_b = L.row_alloc_bytes(r);
+    const std::size_t cur_e = L.row_alloc_elems(r);
+    if (target_byte_alloc > cur_b) {
+        ibuf.resize(ibuf.size() + (target_byte_alloc - cur_b), uint8_t(0));
+        L.byte_start[L.rows] = L.byte_start[r] + target_byte_alloc;
+    }
+    if (target_elem_alloc > cur_e) {
+        const std::size_t new_total = L.elem_start[r] + target_elem_alloc;
+        values.resize(new_total);
+        L.elem_start[L.rows] = new_total;
+    }
+}
+
+// Grows row `row` by exactly enough for ONE more tile (uleb128_max_bytes
+// worst case on the byte side, +1 element) -- not amortized/doubling
+// growth: block4's own population is inherently small (collision-limited
+// via growth, confirmed empirically this session), so a fixed
+// exactly-enough-for-one-more increment avoids overreserving without a
+// meaningful cost in practice. Dispatches to block4_row_shift or
+// block4_grow_last_row depending on whether `row` is the last one.
+inline void block4_ensure_row_headroom(
+    DeltaCSRLayout& L,
+    std::vector<uint8_t>& ibuf,
+    std::vector<Block4Tile>& values,
+    std::size_t row)
+{
+    const std::size_t target_b = L.row_alloc_bytes(row) + uleb128_max_bytes<uint32_t>();
+    const std::size_t target_e = L.row_alloc_elems(row) + 1;
+    if (row + 1 < L.rows)
+        block4_row_shift(L, ibuf, values, row, target_b, target_e);
+    else
+        block4_grow_last_row(L, ibuf, values, target_b, target_e);
+}
+
+// Insert `tile` at block-column `new_col` in block-row `row`, sorted order,
+// in place. Returns true on success, false if the row has insufficient
+// blank space (caller should grow via block4_ensure_row_headroom and
+// retry -- Block4Store::get_or_create below does this automatically).
+// Mirrors delta_csr_row_insert_col's exact algorithm (delta_csr_memory.hpp)
+// -- same uleb128 re-encoding/byte-shift/headroom-check shape -- but writes
+// a whole Block4Tile directly instead of going through
+// ValueAccessor<VALUES_TYPE>::set(weight, importance).
+inline bool block4_row_insert_tile(
+    DeltaCSRLayout& L,
+    std::vector<uint8_t>& ibuf,
+    std::vector<Block4Tile>& values,
+    std::size_t row,
+    uint32_t new_col,
+    const Block4Tile& tile)
+{
+    const std::size_t n = L.row_nnz(row);
+
+    std::size_t byte_pos      = L.byte_start[row];
+    std::size_t elem_pos      = L.elem_start[row];
+    uint32_t    prev_col      = 0;
+    std::size_t ins_byte_pos  = L.byte_end[row];
+    std::size_t ins_elem_pos  = L.elem_end[row];
+    bool        has_next      = false;
+    uint32_t    next_col      = 0;
+    std::size_t next_dlen     = 0;
+
+    for (std::size_t e = 0; e < n; ++e) {
+        std::size_t dlen = 0;
+        const uint32_t delta = uleb128_decode<uint32_t>(ibuf.data() + byte_pos, dlen);
+        const uint32_t col   = prev_col + delta;
+        if (col == new_col) return false; // duplicate, skip (tile already exists)
+        if (col > new_col) {
+            ins_byte_pos = byte_pos;
+            ins_elem_pos = elem_pos;
+            has_next     = true;
+            next_col     = col;
+            next_dlen    = dlen;
+            break;
+        }
+        prev_col  = col;
+        byte_pos += dlen;
+        elem_pos++;
+    }
+
+    uint8_t new_d_buf[uleb128_max_bytes<uint32_t>()];
+    const std::size_t new_d_len = uleb128_encode<uint32_t>(new_col - prev_col, new_d_buf);
+
+    uint8_t upd_d_buf[uleb128_max_bytes<uint32_t>()];
+    std::size_t upd_d_len = 0;
+    if (has_next)
+        upd_d_len = uleb128_encode<uint32_t>(next_col - new_col, upd_d_buf);
+
+    const std::ptrdiff_t idx_delta =
+        std::ptrdiff_t(new_d_len + upd_d_len) - std::ptrdiff_t(next_dlen);
+
+    const std::size_t used_bytes = L.byte_end[row] - L.byte_start[row];
+    if (idx_delta > 0 && std::size_t(idx_delta) > L.row_alloc_bytes(row) - used_bytes)
+        return false;
+    if (L.row_nnz(row) >= L.row_alloc_elems(row))
+        return false;
+
+    if (idx_delta != 0) {
+        const std::size_t shift_from = ins_byte_pos;
+        const std::size_t shift_len  = L.byte_end[row] - shift_from;
+        if (shift_len > 0)
+            std::memmove(ibuf.data() + shift_from + idx_delta, ibuf.data() + shift_from, shift_len);
+        L.byte_end[row] = std::size_t(std::ptrdiff_t(L.byte_end[row]) + idx_delta);
+    }
+
+    std::memcpy(ibuf.data() + ins_byte_pos, new_d_buf, new_d_len);
+    if (has_next)
+        std::memcpy(ibuf.data() + ins_byte_pos + new_d_len, upd_d_buf, upd_d_len);
+
+    if (ins_elem_pos < L.elem_end[row])
+        std::memmove(values.data() + ins_elem_pos + 1, values.data() + ins_elem_pos,
+                     (L.elem_end[row] - ins_elem_pos) * sizeof(Block4Tile));
+    values[ins_elem_pos] = tile;
+    L.elem_end[row]++;
+    L.total_nnz++;
+    return true;
+}
+
+// Remove the tile at block-column `target_col` in block-row `row`, if
+// present. Mirrors delta_csr_row_remove_col's exact algorithm
+// (delta_csr_memory.hpp) -- same delta-merge/byte-shift-left shape -- for
+// `std::vector<Block4Tile>` directly.
+inline bool block4_row_remove_tile(
+    DeltaCSRLayout& L,
+    std::vector<uint8_t>& ibuf,
+    std::vector<Block4Tile>& values,
+    std::size_t row,
+    uint32_t target_col)
+{
+    const std::size_t n = L.row_nnz(row);
+    if (n == 0) return false;
+
+    std::size_t byte_pos = L.byte_start[row];
+    std::size_t elem_pos = L.elem_start[row];
+    uint32_t    prev_col = 0;
+
+    for (std::size_t e = 0; e < n; ++e) {
+        std::size_t delta_len = 0;
+        const uint32_t delta = uleb128_decode<uint32_t>(ibuf.data() + byte_pos, delta_len);
+        const uint32_t col   = prev_col + delta;
+
+        if (col == target_col) {
+            const std::size_t next_byte_pos = byte_pos + delta_len;
+
+            if (e + 1 < n) {
+                std::size_t next_delta_len = 0;
+                const uint32_t next_delta =
+                    uleb128_decode<uint32_t>(ibuf.data() + next_byte_pos, next_delta_len);
+                const uint32_t merged_delta = delta + next_delta;
+
+                uint8_t merged_buf[uleb128_max_bytes<uint32_t>()];
+                const std::size_t merged_len = uleb128_encode<uint32_t>(merged_delta, merged_buf);
+
+                std::memcpy(ibuf.data() + byte_pos, merged_buf, merged_len);
+
+                const std::size_t shift_from = next_byte_pos + next_delta_len;
+                const std::size_t shift_len  = L.byte_end[row] - shift_from;
+                const std::size_t freed      = delta_len + next_delta_len - merged_len;
+                if (shift_len > 0)
+                    std::memmove(ibuf.data() + byte_pos + merged_len, ibuf.data() + shift_from, shift_len);
+                L.byte_end[row] -= freed;
+            } else {
+                L.byte_end[row] -= delta_len;
+            }
+
+            const std::size_t row_end = L.elem_end[row];
+            if (elem_pos + 1 < row_end)
+                std::memmove(values.data() + elem_pos, values.data() + elem_pos + 1,
+                             (row_end - elem_pos - 1) * sizeof(Block4Tile));
+            L.elem_end[row]--;
+            L.total_nnz--;
+            return true;
+        }
+
+        prev_col  = col;
+        byte_pos += delta_len;
+        elem_pos++;
+    }
+    return false;
+}
+
+struct Block4Store {
+    DeltaCSRLayout           block_layout;   // rows/cols are BLOCK-granularity (ceil(n_in/4), ceil(n_out/4))
+    std::vector<uint8_t>     indices_buf;    // uleb128-encoded block-col deltas
+    std::vector<Block4Tile>  tile_values;    // parallel to block_layout's elem_start/elem_end
+
+    // Sizes an EMPTY store for a layer of n_in x n_out real (not block)
+    // dimensions. Zero initial per-row headroom -- growth is lazy, on
+    // first insert into a given block-row (see get_or_create), matching
+    // the whole point of this redesign (don't waste memory reserving
+    // space most block-rows will never use, since block4 population is
+    // inherently sparse even after promotion).
+    void init(std::size_t n_in, std::size_t n_out) {
+        block_layout = DeltaCSRLayout{};
+        block_layout.rows = (n_in + BLOCK4_TILE - 1) / BLOCK4_TILE;
+        block_layout.cols = (n_out + BLOCK4_TILE - 1) / BLOCK4_TILE;
+        block_layout.byte_start.assign(block_layout.rows + 1, 0);
+        block_layout.byte_end.assign(block_layout.rows, 0);
+        block_layout.elem_start.assign(block_layout.rows + 1, 0);
+        block_layout.elem_end.assign(block_layout.rows, 0);
+        block_layout.total_nnz = 0;
+        indices_buf.clear();
+        tile_values.clear();
+    }
+
+    DeltaCSRRowCursor<uint32_t> row_cursor(std::size_t br) const {
+        return DeltaCSRRowCursor<uint32_t>(indices_buf.data(), block_layout, br);
+    }
+
     Block4Tile* find(uint32_t br, uint32_t bc) {
-        auto it = tiles.find(key(br, bc));
-        return it != tiles.end() ? &it->second : nullptr;
+        if (br >= block_layout.rows) return nullptr;
+        auto cur = row_cursor(br);
+        const std::size_t n = block_layout.row_nnz(br);
+        std::size_t elem_pos = block_layout.elem_start[br];
+        for (std::size_t e = 0; e < n; ++e, ++elem_pos) {
+            const uint32_t col = cur.advance();
+            if (col == bc) return &tile_values[elem_pos];
+            if (col > bc) break; // sorted ascending -- can't appear later
+        }
+        return nullptr;
     }
     const Block4Tile* find(uint32_t br, uint32_t bc) const {
-        auto it = tiles.find(key(br, bc));
-        return it != tiles.end() ? &it->second : nullptr;
+        return const_cast<Block4Store*>(this)->find(br, bc);
     }
+
     Block4Tile& get_or_create(uint32_t br, uint32_t bc) {
-        const uint64_t k = key(br, bc);
-        auto it = tiles.find(k);
-        if (it != tiles.end()) return it->second;
-        by_block_row[br].insert(bc);
-        return tiles[k];
-    }
-    void erase(uint32_t br, uint32_t bc) {
-        tiles.erase(key(br, bc));
-        auto it = by_block_row.find(br);
-        if (it != by_block_row.end()) {
-            it->second.erase(bc);
-            if (it->second.empty()) by_block_row.erase(it);
+        if (Block4Tile* existing = find(br, bc)) return *existing;
+        // A real, easy-to-hit mistake, not hypothetical (caught via ASan
+        // testing this session's own ULEB128 tile-indexing redesign): a
+        // Block4Store that was never sized via init(n_in, n_out) has
+        // block_layout.rows == 0, so block_layout.byte_start/elem_start
+        // are both empty -- silently proceeding to
+        // block4_row_insert_tile below would index them out of bounds
+        // (a real SEGV, not just UB in theory). block4_maybe_promote
+        // (delta_csr_memory.hpp) lazily self-inits before ever reaching
+        // here; a caller invoking get_or_create() directly (bypassing
+        // promotion, e.g. a hand-built test fixture) doesn't have that
+        // safety net, since this function has no n_in/n_out to lazily
+        // size to on its own -- fail loud instead of corrupting memory.
+        if (br >= block_layout.rows)
+            throw std::out_of_range(
+                "Block4Store::get_or_create: block_row out of range -- "
+                "was Block4Store::init(n_in, n_out) called?");
+        if (!block4_row_insert_tile(block_layout, indices_buf, tile_values, br, bc, Block4Tile{})) {
+            block4_ensure_row_headroom(block_layout, indices_buf, tile_values, br);
+            const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_values, br, bc, Block4Tile{});
+            (void)ok; // block4_ensure_row_headroom grows by exactly enough for one more tile -- this must succeed
         }
+        Block4Tile* inserted = find(br, bc);
+        return *inserted;
     }
-    std::size_t n_tiles() const { return tiles.size(); }
+
+    void erase(uint32_t br, uint32_t bc) {
+        if (br >= block_layout.rows) return;
+        block4_row_remove_tile(block_layout, indices_buf, tile_values, br, bc);
+    }
+
+    std::size_t n_tiles() const { return block_layout.total_nnz; }
+
     // Cold-path reporting only (nnz(), diagnostics) -- O(n_tiles * 16), not
-    // called from forward/backward.
+    // called from forward/backward. Must walk per-row (elem_start[r]..
+    // elem_end[r]), not tile_values[0..total_nnz) -- rows have blank
+    // (unused) element slots between them, same as the scattered path's
+    // own values array.
     std::size_t live_synapses() const {
         std::size_t n = 0;
-        for (auto& kv : tiles) n += kv.second.count_live();
+        for (std::size_t r = 0; r < block_layout.rows; ++r) {
+            const std::size_t start = block_layout.elem_start[r];
+            const std::size_t end   = block_layout.elem_end[r];
+            for (std::size_t i = start; i < end; ++i) n += tile_values[i].count_live();
+        }
         return n;
     }
 };

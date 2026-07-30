@@ -203,22 +203,32 @@ void disldo_forward(
     // scattered-only baseline should check whether this matters before
     // being trusted for training quality claims, not just forward value
     // correctness (which does not depend on this).
-    if (!weights.block4.tiles.empty()) {
-        // Hash-map iteration isn't parallel-for-friendly directly; collect
-        // pointers once per call. Real cost: O(n_tiles), not O(nnz) --
-        // cheap relative to the per-tile compute unless tiles are
-        // pathologically small, but a real, measurable per-call overhead
-        // the prototype's contiguous block_data array didn't pay. Worth
-        // checking in the comparison script (not assumed either way).
+    if (weights.block4.n_tiles() > 0) {
+        // Row-major cursor walk isn't parallel-for-friendly directly (same
+        // reason the old hash-map iteration wasn't); collect pointers once
+        // per call. Real cost: O(n_tiles), not O(nnz) -- cheap relative to
+        // the per-tile compute unless tiles are pathologically small, but a
+        // real, measurable per-call overhead the prototype's contiguous
+        // block_data array didn't pay. Worth checking in the comparison
+        // script (not assumed either way).
         std::vector<const Block4Tile*> live_tiles;
         std::vector<uint32_t> tile_br, tile_bc;
-        live_tiles.reserve(weights.block4.tiles.size());
-        tile_br.reserve(weights.block4.tiles.size());
-        tile_bc.reserve(weights.block4.tiles.size());
-        for (auto& kv : weights.block4.tiles) {
-            live_tiles.push_back(&kv.second);
-            tile_br.push_back(uint32_t(kv.first >> 32));
-            tile_bc.push_back(uint32_t(kv.first & 0xFFFFFFFFu));
+        const std::size_t n_b4 = weights.block4.n_tiles();
+        live_tiles.reserve(n_b4);
+        tile_br.reserve(n_b4);
+        tile_bc.reserve(n_b4);
+        const auto& BL4 = weights.block4.block_layout;
+        for (std::size_t br = 0; br < BL4.rows; ++br) {
+            const std::size_t n_bc = BL4.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = weights.block4.row_cursor(br);
+            std::size_t bc_elem = BL4.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+                const uint32_t bc = bc_cursor.advance();
+                live_tiles.push_back(&weights.block4.tile_values[bc_elem]);
+                tile_br.push_back(uint32_t(br));
+                tile_bc.push_back(bc);
+            }
         }
         // Per-thread private output buffers, same pattern as the scattered
         // path's t_out above -- necessary, not optional: two tiles that
@@ -390,7 +400,7 @@ void disldo_backward(
             neuron_grad_accum[c]  += std::abs(output_grad[static_cast<std::size_t>(b) * n_out + c]);
     }
 
-    if (dc.empty() && weights.block4.tiles.empty()) return;
+    if (dc.empty() && weights.block4.n_tiles() == 0) return;
 
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
@@ -569,16 +579,25 @@ void disldo_backward(
     // Mathematically this is just two successive descent steps, not an
     // incorrect one -- acceptable for a first working version; revisit if
     // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
-    if (!weights.block4.tiles.empty()) {
+    if (weights.block4.n_tiles() > 0) {
         std::vector<Block4Tile*> live_tiles;
         std::vector<uint32_t> tile_br, tile_bc;
-        live_tiles.reserve(weights.block4.tiles.size());
-        tile_br.reserve(weights.block4.tiles.size());
-        tile_bc.reserve(weights.block4.tiles.size());
-        for (auto& kv : weights.block4.tiles) {
-            live_tiles.push_back(&kv.second);
-            tile_br.push_back(uint32_t(kv.first >> 32));
-            tile_bc.push_back(uint32_t(kv.first & 0xFFFFFFFFu));
+        const std::size_t n_b4 = weights.block4.n_tiles();
+        live_tiles.reserve(n_b4);
+        tile_br.reserve(n_b4);
+        tile_bc.reserve(n_b4);
+        const auto& BL4 = weights.block4.block_layout;
+        for (std::size_t br = 0; br < BL4.rows; ++br) {
+            const std::size_t n_bc = BL4.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = weights.block4.row_cursor(br);
+            std::size_t bc_elem = BL4.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+                const uint32_t bc = bc_cursor.advance();
+                live_tiles.push_back(&weights.block4.tile_values[bc_elem]);
+                tile_br.push_back(uint32_t(br));
+                tile_bc.push_back(bc);
+            }
         }
 
         // Per-row slot count across ALL block4 tiles touching that row

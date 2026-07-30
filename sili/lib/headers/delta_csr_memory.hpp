@@ -176,7 +176,7 @@ void delta_csr_combined_to_absolute(
         delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
             dc, out_ptrs, out_indices, out_weights, out_importance);
         return;
-    } else if (weights.block4.tiles.empty()) {
+    } else if (weights.block4.n_tiles() == 0) {
         delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
             dc, out_ptrs, out_indices, out_weights, out_importance);
         return;
@@ -202,11 +202,14 @@ void delta_csr_combined_to_absolute(
 
             const uint32_t br = uint32_t(r / BLOCK4_TILE);
             const uint32_t li = uint32_t(r % BLOCK4_TILE);
-            auto brit = weights.block4.by_block_row.find(br);
-            if (brit != weights.block4.by_block_row.end()) {
-                for (uint32_t bc : brit->second) {
-                    const Block4Tile* tile = weights.block4.find(br, bc);
-                    if (!tile) continue;
+            if (br < weights.block4.block_layout.rows) {
+                const auto& BL = weights.block4.block_layout;
+                const std::size_t n_bc = BL.row_nnz(br);
+                auto bc_cursor = weights.block4.row_cursor(br);
+                std::size_t bc_elem = BL.elem_start[br];
+                for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+                    const uint32_t bc = bc_cursor.advance();
+                    const Block4Tile* tile = &weights.block4.tile_values[bc_elem];
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const uint8_t byte = tile->at(li, lj);
                         // A tile is dense (every slot is a real synapse --
@@ -677,6 +680,18 @@ void block4_maybe_promote(
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
         auto& L  = dc.layout;
+        // Lazy self-init, not a requirement every construction site has to
+        // remember: this is the ONLY place a block4 tile is ever first
+        // created (block4_demote_tile only ever runs on an already-promoted
+        // tile, so it can't be reached with an uninitialized store either).
+        // Without this, weights.block4.get_or_create() below would index
+        // block_layout's byte_start/elem_start (both empty, rows=0) out of
+        // bounds the first time ANY caller forgot to call
+        // weights.block4.init(n_in, n_out) explicitly -- a real, easy-to-
+        // hit latent crash, not hypothetical (caught while updating this
+        // session's own test suite for the ULEB128 tile-indexing redesign).
+        if (weights.block4.block_layout.rows == 0 && L.rows > 0)
+            weights.block4.init(L.rows, L.cols);
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
         const uint32_t bc = uint32_t(col / BLOCK4_TILE);
         const uint32_t li = uint32_t(row % BLOCK4_TILE);
@@ -845,11 +860,14 @@ bool delta_csr_synap_row_step(
     const uint32_t li = uint32_t(row % BLOCK4_TILE);
     std::vector<uint32_t> b4_bc, b4_lj;
     if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-        auto brit = weights.block4.by_block_row.find(br);
-        if (brit != weights.block4.by_block_row.end()) {
-            for (uint32_t bc : brit->second) {
-                const Block4Tile* tile = weights.block4.find(br, bc);
-                if (!tile) continue;
+        if (br < weights.block4.block_layout.rows) {
+            const auto& BL = weights.block4.block_layout;
+            const std::size_t n_bc = BL.row_nnz(br);
+            auto bc_cursor = weights.block4.row_cursor(br);
+            std::size_t bc_elem = BL.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++bc_elem) {
+                const uint32_t bc = bc_cursor.advance();
+                const Block4Tile& tile = weights.block4.tile_values[bc_elem];
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     // "Byte nonzero" as the discovery heuristic -- same
                     // reasoning as the export/demote paths: a tile slot
@@ -858,7 +876,7 @@ bool delta_csr_synap_row_step(
                     // same as an absent scattered CSR entry. Weight nibble
                     // alone would miss a freshly-grown synapse (weight=0.0
                     // by Step 6's insert convention, importance nonzero).
-                    if (tile->at(li, lj) == 0) continue;
+                    if (tile.at(li, lj) == 0) continue;
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= L.cols) continue;
                     b4_bc.push_back(bc);

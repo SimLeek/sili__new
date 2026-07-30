@@ -287,6 +287,7 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;

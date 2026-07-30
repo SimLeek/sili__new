@@ -29,12 +29,12 @@ int main() {
     SparseLinearWeightsDelta<int, FP4BiPacked, uint32_t> weights;
     weights.connections = delta_csr_from_absolute<int, FP4BiPacked, uint32_t>(
         ptrs, idx, w, imp, n_in, n_out, 256, 64, 0.2f);
+    weights.block4.init(n_in, n_out);
     weights.recompute_stats();
 
-    Block4Tile tile;
+    Block4Tile& tile = weights.block4.get_or_create(0, 0);
     tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
     tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4);
-    weights.block4.tiles[Block4Store::key(0, 0)] = tile;
 
     std::vector<float> x(n_in, 0.f);
     x[0] = 3.0f; x[1] = 1.0f; x[2] = 2.0f;
@@ -66,7 +66,7 @@ int main() {
         CHECK(std::abs(dx[r] - dx_ref[r]) < 1e-4f, "dx[%d]: got %.4f expected %.4f", r, dx[r], dx_ref[r]);
 
     // Weight bytes must be UNCHANGED with learning_rate=0.
-    const Block4Tile& t_after0 = weights.block4.tiles[Block4Store::key(0, 0)];
+    const Block4Tile& t_after0 = *weights.block4.find(0, 0);
     CHECK((t_after0.at(0, 1) & 0xFu) == fp4_quantize(1.0f), "block4 (0,1) weight changed at lr=0");
     CHECK((t_after0.at(2, 3) & 0xFu) == fp4_quantize(0.5f), "block4 (2,3) weight changed at lr=0");
 
@@ -81,7 +81,7 @@ int main() {
         /*learning_rate=*/0.5f, /*num_cpus=*/2, /*lr_per_row_nnz=*/false,
         /*damp_by_importance=*/false);
 
-    const Block4Tile& t_after1 = weights.block4.tiles[Block4Store::key(0, 0)];
+    const Block4Tile& t_after1 = *weights.block4.find(0, 0);
     const float w01_after = FP4_TABLE[t_after1.at(0, 1) & 0xFu];
     CHECK(w01_after < 1.0f - 1e-6f, "block4 (0,1) weight should decrease under lr=0.5, g>0: got %.3f", w01_after);
 

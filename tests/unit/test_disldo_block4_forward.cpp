@@ -28,15 +28,15 @@ int main() {
     SparseLinearWeightsDelta<int, FP4BiPacked, uint32_t> weights;
     weights.connections = delta_csr_from_absolute<int, FP4BiPacked, uint32_t>(
         ptrs, idx, w, imp, n_in, n_out, 256, 64, 0.2f);
+    weights.block4.init(n_in, n_out);
     weights.recompute_stats();
 
     // Block4 tile (block_row=0, block_col=0): covers rows/cols 0-3.
     // Place two live entries: (row=0,col=1)=1.0, (row=2,col=3)=0.5,
     // matching FP4_TABLE exact values (no quantization ambiguity).
-    Block4Tile tile;
+    Block4Tile& tile = weights.block4.get_or_create(0, 0);
     tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);   // row=0(local_i),col=1(local_j)
     tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4);   // row=2,col=3
-    weights.block4.tiles[Block4Store::key(0, 0)] = tile;
 
     std::vector<float> x(n_in, 0.f);
     x[0] = 3.0f;   // feeds block4's (row=0,col=1)
