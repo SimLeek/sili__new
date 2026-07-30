@@ -776,6 +776,32 @@ struct Block4Store {
     // always dense, byte-for-byte today's pre-compression behavior).
     uint32_t switch_point = BLOCK4_SPARSE_MAX_COUNT;
 
+    // Persistent scratch buffers for disldo_forward/disldo_backward's
+    // per-call tile collection (linear_disldo.hpp) -- reused (cleared in
+    // place, capacity kept) across calls instead of freshly heap-allocated
+    // every single call. Real, measured cost, not a hypothetical
+    // micro-optimization: this library's target workload is real-time
+    // online learning (batch=1, one forward+backward per step, not
+    // amortized over a training batch), and a callgrind profile of
+    // disldo_backward on a fully block4-resident 512x512 layer (16384
+    // tiles) showed ~12% of total instruction count inside
+    // std::vector's allocate/deallocate alone, from tile_br/tile_bc/
+    // tile_elem/row_live_count/t_row_grad being reconstructed from
+    // scratch every call (see TODO_DUAL_BLOCK4.md). Only types that
+    // don't depend on the calling function's VALUES_TYPE live here
+    // (coordinate/index bookkeeping, not the value_type-typed per-thread
+    // accumulator buffers, which stay local to disldo_forward/backward).
+    // Plain (non-mutable) members are fine: both disldo_forward and
+    // disldo_backward take a non-const SparseLinearWeightsDelta&, and a
+    // single Block4Store is never called into concurrently from multiple
+    // top-level forward/backward invocations (num_cpus parallelizes
+    // WITHIN one call, not across calls) -- the same assumption every
+    // other per-call scratch state in this codebase already makes.
+    std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
+    std::vector<std::size_t> scratch_tile_elem;
+    std::vector<uint32_t>    scratch_row_live_count; // backward only
+    std::vector<double>      scratch_row_grad;        // backward only
+
     // Sizes an EMPTY store for a layer of n_in x n_out real (not block)
     // dimensions. Zero initial per-row headroom -- growth is lazy, on
     // first insert into a given block-row (see get_or_create), matching

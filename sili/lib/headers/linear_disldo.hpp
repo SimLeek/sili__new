@@ -221,22 +221,37 @@ void disldo_forward(
         // this loop at batch=1 -- see conversation: batch=1 has too little
         // per-tile compute (16 FLOPs) to amortize even one such scan, let
         // alone two.
-        std::vector<uint32_t> tile_br, tile_bc;
-        std::vector<std::size_t> tile_elem;
+        // Persistent scratch (Block4Store::scratch_tile_br/bc/elem), not a
+        // fresh vector every call -- see block4.hpp: batch=1 real-time
+        // calls can't amortize repeated heap allocation of these the way
+        // a large training batch could.
+        std::vector<uint32_t>&    tile_br   = weights.block4.scratch_tile_br;
+        std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
+        std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         const std::size_t n_b4 = weights.block4.n_tiles();
-        tile_br.reserve(n_b4);
-        tile_bc.reserve(n_b4);
-        tile_elem.reserve(n_b4);
+        // resize()+direct indexing, not reserve()+push_back(): push_back's
+        // per-call capacity check (branch + increment) is real, measured
+        // exclusive cost at this scale (~49k push_back calls across the 3
+        // vectors on a fully block4-resident 512x512 layer -- confirmed
+        // via callgrind: switching to scratch buffers alone barely moved
+        // this cost, since reused capacity still pays the per-push_back
+        // check every call regardless of allocation). resize() is a single
+        // capacity check for the whole vector; the fill loop below then
+        // writes through plain indexed stores.
+        tile_br.resize(n_b4);
+        tile_bc.resize(n_b4);
+        tile_elem.resize(n_b4);
         const auto& BL4 = weights.block4.block_layout;
+        std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             auto bc_cursor = weights.block4.row_cursor(br);
             std::size_t elem_pos = BL4.elem_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos) {
-                tile_br.push_back(uint32_t(br));
-                tile_bc.push_back(bc_cursor.advance());
-                tile_elem.push_back(elem_pos);
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
+                tile_br[ti] = uint32_t(br);
+                tile_bc[ti] = bc_cursor.advance();
+                tile_elem[ti] = elem_pos;
             }
         }
         // Per-thread private output buffers, same pattern as the scattered
@@ -601,42 +616,55 @@ void disldo_backward(
         // per-tile inside the parallel loop body below; elem_pos lets that
         // construction skip find()'s redundant O(row_nnz) re-scan via
         // at_index() instead).
-        std::vector<uint32_t> tile_br, tile_bc;
-        std::vector<std::size_t> tile_elem;
+        // Persistent scratch (Block4Store::scratch_*), not fresh vectors
+        // every call -- see forward's identical comment above and
+        // block4.hpp: batch=1 real-time calls can't amortize repeated
+        // heap allocation of these the way a large training batch could.
+        std::vector<uint32_t>&    tile_br   = weights.block4.scratch_tile_br;
+        std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
+        std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         const std::size_t n_b4 = weights.block4.n_tiles();
-        tile_br.reserve(n_b4);
-        tile_bc.reserve(n_b4);
-        tile_elem.reserve(n_b4);
-        const auto& BL4 = weights.block4.block_layout;
-        for (std::size_t br = 0; br < BL4.rows; ++br) {
-            const std::size_t n_bc = BL4.row_nnz(br);
-            if (n_bc == 0) continue;
-            auto bc_cursor = weights.block4.row_cursor(br);
-            std::size_t elem_pos = BL4.elem_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos) {
-                tile_br.push_back(uint32_t(br));
-                tile_bc.push_back(bc_cursor.advance());
-                tile_elem.push_back(elem_pos);
-            }
-        }
+        // resize()+direct indexing, not reserve()+push_back() -- see
+        // forward's identical comment above (real, measured cost:
+        // push_back's per-call capacity check across ~3*n_tiles calls,
+        // independent of whether the backing allocation is fresh or
+        // reused).
+        tile_br.resize(n_b4);
+        tile_bc.resize(n_b4);
+        tile_elem.resize(n_b4);
 
         // Per-row slot count across ALL block4 tiles touching that row
         // (not just one tile), needed for both lr_per_row_nnz and the
         // unconditional scale_eff_lr normalization. Every tile contributes
         // exactly BLOCK4_TILE slots per row it covers -- dense, no
         // per-slot scan needed (see block4.hpp: a live tile's slots are
-        // all real synapses, weight=0.0 included).
-        std::vector<uint32_t> row_live_count(n_in, 0);
-        for (std::size_t ti = 0; ti < tile_br.size(); ++ti) {
-            const uint32_t br = tile_br[ti];
+        // all real synapses, weight=0.0 included). Computed directly per
+        // block-row here (n_bc * BLOCK4_TILE, known before the tile loop
+        // even starts) instead of a separate second pass re-walking
+        // tile_br after the fact -- same result, one fewer O(n_tiles) pass.
+        std::vector<uint32_t>& row_live_count = weights.block4.scratch_row_live_count;
+        row_live_count.assign(n_in, 0);
+        const auto& BL4 = weights.block4.block_layout;
+        std::size_t ti = 0;
+        for (std::size_t br = 0; br < BL4.rows; ++br) {
+            const std::size_t n_bc = BL4.row_nnz(br);
+            if (n_bc == 0) continue;
+            const uint32_t row_count = uint32_t(n_bc) * BLOCK4_TILE;
             for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                if (row >= n_in) continue;
-                row_live_count[row] += BLOCK4_TILE;
+                const std::size_t row = br * BLOCK4_TILE + li;
+                if (row < n_in) row_live_count[row] = row_count;
+            }
+            auto bc_cursor = weights.block4.row_cursor(br);
+            std::size_t elem_pos = BL4.elem_start[br];
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
+                tile_br[ti] = uint32_t(br);
+                tile_bc[ti] = bc_cursor.advance();
+                tile_elem[ti] = elem_pos;
             }
         }
 
-        std::vector<double> t_row_grad(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
+        std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
+        t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
 
         #pragma omp parallel num_threads(num_cpus)
         {
