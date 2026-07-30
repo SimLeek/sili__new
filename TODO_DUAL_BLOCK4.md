@@ -1082,11 +1082,38 @@ smaller allocation.
   previously-documented density point (100% fill: 1.93x vs documented
   1.88x; 50%: 3.83x vs 3.74x; 10%: 16.11x vs 15.85x; forward's ~5x
   gap, `learning_rate=0`'s real cost, unchanged).
-- **Not yet done**: the dedicated memory-cap + compression benchmark
-  (permanent, committed, verifying max memory is never exceeded during
-  a real synaptogenesis stress run AND that compression genuinely
-  reduces `total_tile_alloc_bytes()`/`total_tile_used_bytes()`) --
-  planned as a follow-up, not blocking this redesign.
+- **Memory-cap + compression benchmark, done.**
+  `tests/unit/test_block4_memory_cap_and_compression.cpp` (ctest,
+  hard-CHECK, permanent): drives 1500 iterations of real online
+  training + aggressive synaptogenesis under a tight shared budget,
+  asserting the REAL allocated-byte totals (both scattered CSR and
+  block4, both the indices and tile-data sides) never exceed
+  `set_limits()`'s configured caps -- the actual guarantee the original
+  ask was about ("guarantee memory doesn't go outside of max capacity
+  during synaptogenesis... so that synaptogenesis doesn't crash the
+  AI"). A second test builds 40 tiles at 2 live synapses each,
+  compresses them, and asserts the measured footprint is EXACTLY
+  `n_tiles * block4_sparse_packed_len(2)` bytes (a real 4.00x
+  reduction vs the dense-equivalent), not just that an `is_sparse`
+  flag flipped.
+- **Speed cost of compression, measured (`scripts/bench_block4_memory_and_compression.cpp`,
+  informational, not ctest).** A full online-training loop turned out
+  NOT to exercise compression at all -- `disldo_backward` writes every
+  slot of a touched tile on every call, so an actively-trained tile is
+  forced back to full occupancy before compression has any lasting
+  effect (measured 1.00x under that workload, confirming the
+  established "tiles trend toward full occupancy" finding applies to
+  compression persistence too, not just the memory-cap budget
+  formula). Real compression's value is for tiles NOT under active
+  per-step training. Rewritten to directly drive the pack/unpack/resize
+  machinery instead: repeatedly nudge 2000 tiles' live count up across
+  `switch_point` (forcing a real sparse->dense resize) then back down
+  (forcing a real dense->sparse resize via `maybe_compress`), a
+  worst-case constant-churn scenario. Result: real, sustained 4.00x
+  compression, at ~441ns/cycle vs ~319ns/cycle uncompressed (~1.4x
+  slower per touch when a tile is oscillating across the threshold on
+  EVERY single access -- realistic steady-state usage, where most
+  tiles don't flip every touch, pays this far less often).
 - **Not yet done**: routing sparse CSR input through sisldo ops (dense
   input already goes through disldo) and finding/documenting the
   density crossover point where sparse input becomes faster.
