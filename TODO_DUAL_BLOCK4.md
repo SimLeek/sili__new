@@ -682,6 +682,100 @@ into the format.
       reflect each tile's *steady-state* trained density, not its
       density at the moment of promotion.
 
+## Part C: batch=1 real-time speed (sili's actual target workload)
+
+Motivating question, per direction: sili's purpose is real-time online
+learning, where batch is almost always 1, not a training-sized batch.
+"Load an entire network into block4, then prune/grow while gathering
+importance data" only makes sense if block4 ops are close to a normal
+dense matmul's speed at batch=1 -- the earlier batch=64 numbers (Part B's
+own benchmark run) don't answer that question at all.
+
+- [x] **Direct block4-vs-scattered-CSR comparison at batch=1**, bypassing
+      growth-driven promotion entirely (which only touches a small,
+      probe-budget-limited fraction of an already-populated matrix per
+      run -- 50% uniform density only reached 8.33% block4 fill after
+      200 growth cycles, nothing like "load the whole network"). Built a
+      native harness that bulk-loads an entire dense weight matrix
+      directly into block4 tiles (mirroring the planned workflow) vs the
+      identical weights as pure scattered CSR, at densities 10%-100%.
+      **Finding: at batch=1, block4 was slower than scattered CSR at
+      EVERY density including 100% fill**, with or without threading
+      (0.66x forward / 0.43x backward at 100% density, single-threaded).
+      Batch=64 numbers (0.9x-3.9x depending on density) are irrelevant
+      to this workload -- block4's fixed per-tile overhead needs batch
+      size to amortize against, and real-time inference doesn't have
+      that.
+- [x] **Root cause #1, found and fixed: redundant per-tile lookup.**
+      `disldo_forward`/`disldo_backward`'s block4 loop already walks
+      each row's block4 cursor once (single-threaded, sequential) to
+      discover which tiles exist, building a flat coordinate list for
+      the parallel compute loop -- then threw that position away and
+      called `find(br, bc)` per tile in the parallel loop, which
+      re-derives the same tile's position from scratch via a SECOND
+      O(row_nnz) cursor scan. At batch=1 a 4x4 tile is only 16 FLOPs,
+      nowhere near enough to amortize even one such scan, let alone two.
+      Fixed via `Block4Store::at_index()` / a `Block4TileHandle`
+      fast-path constructor that takes the already-known storage index
+      directly (the collection loop already has it for free --
+      `block_layout.elem_start[row]+k`), skipping `find()`'s internal
+      `raw_find()` re-scan entirely. Safe even when a tile's own
+      destructor re-packs it sparse<->dense mid-loop, since
+      `Block4StoredTile` is fixed-size -- repacking never moves any
+      tile's slot, so other iterations' captured indices stay valid.
+      **Result at batch=1, 100% density: forward 0.66x -> 1.71x** (a
+      real win, was a loss at every density before) **, backward 0.43x
+      -> 0.72x** (roughly halves the absolute per-tile overhead, second
+      cost identified below).
+- [x] **Investigated and ruled out via profiling, not assumed:** two
+      further hypotheses for backward's remaining gap, both directly
+      measured with callgrind/cachegrind on a native repeated-call
+      harness (not part of the repo) rather than guessed:
+      - *Vector allocation churn*: `tile_br`/`tile_bc`/`tile_elem`/
+        `row_live_count`/`t_row_grad` were freshly heap-allocated every
+        call. Added persistent scratch buffers on `Block4Store`
+        (`scratch_tile_br`/`_bc`/`_elem`/`_row_live_count`/`_row_grad`),
+        reused (resized in place) across calls; also folded
+        `row_live_count`'s precompute into the SAME collection loop
+        instead of a separate second pass over the just-collected list.
+        Re-profiling showed this barely moved the exclusive cost
+        (11.75% -> 11.95%) -- the real cost wasn't allocation, it was
+        `push_back`'s per-call capacity check across ~49k calls (3
+        vectors x 16384 tiles at 100% density), independent of whether
+        the backing store was fresh or reused. Switched to
+        `resize()`+direct indexing (pays that check once per vector, not
+        once per element) -- correct and real, but wall-clock impact was
+        small.
+      - *Cache/memory latency*: cachegrind with `--cache-sim=yes` on the
+        same harness showed D1 miss rate 0.1%, LL miss rate ~0% --
+        ruled out.
+      **Conclusion: backward's remaining gap is genuine per-tile
+      arithmetic, not a lookup/allocation/cache bug.** At 100% density
+      both paths update the identical total element count (262144 on a
+      512x512 layer), and block4 is still ~37% slower PER ELEMENT than
+      scattered CSR in that exact case (no wasted work on empty slots to
+      blame either). The extra cost is the per-lane FP4 decode
+      (`Block4Vec`) and per-column scale composition
+      (`combined_scale4`/`combined_imp_scale4`/`col_valid4` etc.) block4
+      does for every tile-column, structurally more work per synapse
+      than scattered CSR's simpler single-value update.
+- [ ] **Not yet done**: reduce block4 backward's genuine per-element
+      arithmetic cost itself (as opposed to the lookup/allocation
+      overhead already fixed above). Candidates to investigate: whether
+      any of the per-lane scale composition can be hoisted or shared
+      across tiles in the same block-row/block-column (value_scale is
+      already per-ROW, so it's currently recomputed identically for
+      every tile-column sharing that row -- worth checking if that's
+      real, avoidable redundancy or already amortized); whether the
+      SIMD `Block4Vec` batch-loop design (built to vectorize across
+      BATCH, per its own comments) has any batch=1-specific fast path
+      worth adding, since there's no batch dimension to vectorize over
+      in the real-time case.
+- [ ] Re-run the full batch=1 density sweep (10%-100%, both single- and
+      multi-threaded) after any further backward-specific work lands, to
+      track real progress against the "nearly as fast as a normal dense
+      matmul" bar.
+
 ## Explicitly NOT changing
 
 - The prototype branch (`feature/sili-ell-benchmark`, PR #22) and its
