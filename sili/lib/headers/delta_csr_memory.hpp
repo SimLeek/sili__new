@@ -31,13 +31,29 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_importance,
     std::size_t rows, std::size_t cols,
     std::size_t index_bytes, std::size_t values_bytes,
-    float blank_fraction = 0.2f)
+    float blank_fraction = 0.2f,
+    // Hard ceiling this call must never allocate past, independent of
+    // index_bytes/values_bytes above -- those are just this ONE call's
+    // requested reservation, which a caller like expand_headroom() can
+    // compute from CURRENT content size with no awareness of the
+    // layer's original max_weights budget. Defaults to SIZE_MAX
+    // (unbounded, today's pre-existing behavior) for callers that don't
+    // care. Real bug this fixes: DeltaCSRWeights::set_limits() applied
+    // AFTER this function returns is too late -- reserve_values/
+    // reserve_indices below already ran against a freshly-constructed
+    // dc's own default (unbounded) limits by then. See
+    // TODO_DUAL_BLOCK4.md / conversation for the real, measured
+    // overshoot this closes (nnz reached 127x max_weights in a stress
+    // test before this fix).
+    std::size_t hard_index_limit_bytes = std::numeric_limits<std::size_t>::max(),
+    std::size_t hard_values_limit_bytes = std::numeric_limits<std::size_t>::max())
 {
     // Let the shifting and gradual modification handle blank space fragmenting
     // We don't know row sizes or byte lengths for each index, so if we try to evenly assign spaces, we could run out of memory
     // Todo: We can guarantee we won't by assuming uleb128_max_bytes indices each time if needed, but this is a rarely used function.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> dc;
+    dc.set_limits(hard_index_limit_bytes, hard_values_limit_bytes);
     dc.reserve_values(values_bytes);
     dc.reserve_indices(index_bytes);
 
@@ -272,7 +288,20 @@ void delta_csr_shift_row(
         const std::size_t new_start = L.byte_start[row] + target_byte_alloc;
 
         if (target_byte_alloc > cur_byte_alloc) {
-            ibuf.resize(ibuf.size() + (target_byte_alloc - cur_byte_alloc));
+            // Real, measured bug this closes: this call grows ibuf via a
+            // plain .resize(), completely bypassing reserve_indices()'s
+            // own max_indices_bytes check -- delta_csr_equalize_step()
+            // (the function actually called every synaptogenesis cycle,
+            // via SparseLinearLayer::equalizer_step()) routes through
+            // HERE, not through delta_csr_from_absolute/reserve_indices
+            // at all. Confirmed via a real stress test: nnz reached
+            // 127x the configured max_weights budget before this check
+            // existed, entirely through repeated equalizer_step() calls
+            // -- the expand_headroom()/set_limits() fixes elsewhere in
+            // this codebase never touch this path.
+            const std::size_t new_total = ibuf.size() + (target_byte_alloc - cur_byte_alloc);
+            if (new_total > dc.max_indices_bytes) throw std::bad_alloc();
+            ibuf.resize(new_total);
         }
         if (move_len > 0)
             std::memmove(ibuf.data() + new_start, ibuf.data() + move_src, move_len);
@@ -306,7 +335,11 @@ void delta_csr_shift_row(
         const std::size_t current_total = L.total_alloc_elems();
 
         if (target_elem_alloc > cur_elem_alloc) {
-            ValueAccessor<VALUES_TYPE>::resize(dc.values, current_total + (target_elem_alloc - cur_elem_alloc));
+            // See the byte-side check above -- same real bug, same fix.
+            const std::size_t new_total_elems = current_total + (target_elem_alloc - cur_elem_alloc);
+            if (ValueAccessor<VALUES_TYPE>::projected_byte_size(new_total_elems) > dc.max_values_bytes)
+                throw std::bad_alloc();
+            ValueAccessor<VALUES_TYPE>::resize(dc.values, new_total_elems);
         }
         
         ValueAccessor<VALUES_TYPE>::move(dc.values, new_start, move_src, move_len);

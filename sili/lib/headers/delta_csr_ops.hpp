@@ -135,11 +135,22 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom(
     delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, ptrs, idx, w, imp);
 
     const std::size_t n = idx.size();
+    // Propagate the INPUT dc's own hard limits through -- without this,
+    // the freshly-constructed result below starts with DEFAULT
+    // (unbounded) limits, so it can grow arbitrarily past whatever
+    // budget the caller originally set via set_limits(), regardless of
+    // how small n*(1+blank_fraction) is relative to it. A real, measured
+    // bug (see delta_csr_from_absolute's own comment): nnz reached 127x
+    // the intended max_weights budget in a synaptogenesis stress test
+    // before this fix, since repeated expand_headroom() calls each
+    // silently re-based the cap on current content instead of the
+    // original budget.
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, dc.layout.rows, dc.layout.cols,
         n * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
         static_cast<std::size_t>(n * (1.0 + blank_fraction)) + 64,
-        blank_fraction);
+        blank_fraction,
+        dc.max_indices_bytes, dc.max_values_bytes);
 }
 
 // Like expand_headroom() but sizes the total budget for at least
@@ -161,11 +172,17 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
     const std::size_t rows   = dc.layout.rows;
     const std::size_t n      = idx.size();
     const std::size_t budget = std::max(n, rows * min_nnz_per_row);
+    // See expand_headroom()'s identical comment -- propagate the INPUT
+    // dc's own hard limits through. If min_nnz_per_row*rows genuinely
+    // exceeds the layer's original max_weights budget, this now
+    // correctly throws std::bad_alloc instead of silently granting more
+    // than was ever configured.
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, rows, dc.layout.cols,
         budget * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
         static_cast<std::size_t>(budget * (1.0 + blank_fraction)) + 64,
-        blank_fraction);
+        blank_fraction,
+        dc.max_indices_bytes, dc.max_values_bytes);
 }
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
