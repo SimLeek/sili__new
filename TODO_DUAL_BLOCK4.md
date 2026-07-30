@@ -379,6 +379,147 @@ importance accessors) -- not a second, bolted-on object.
       pinned commit in requirements/setup instructions? a version tag on
       this repo?) not yet decided.
 
+## Next redesign: ULEB128 tile indexing + sparse/dense hybrid tile encoding
+
+Per direction (2026-07-29): `Block4Store`'s `unordered_map<uint64_t, Block4Tile>`
+costs 64 bits/tile just for the index key (128 tile + 64 key = 192 bits
+total), where the scattered path's own ULEB128 delta-encoded column index
+typically costs only 8-16 bits (confirmed empirically this session: 100%
+single-byte at realistic density). Two separable pieces, in priority
+order:
+
+### Part A -- ULEB128 tile indexing (replaces the hash map)
+
+Give `Block4Store` its own `DeltaCSRLayout` (row_ptr/byte_ptr bookkeeping,
+already value-agnostic, reused as-is) + ULEB128-encoded `indices_buf` over
+BLOCK coordinates (block_row = row/4, block_col = col/4) + a parallel
+`std::vector<Block4Tile>` values array, instead of the hash map + separate
+`by_block_row` reverse-index. 128 (tile) + 8-16 (uleb128 tile index) =
+136-144 bits total, down from 192.
+
+Not a drop-in reuse of `delta_csr_row_insert_col`/`delta_csr_row_remove_col`
+-- those are shaped around `ValueAccessor<VALUES_TYPE>`'s weight+importance
+FLOAT PAIR interface (`insert_col(..., value_type weight, value_type
+importance)`), and `Block4Tile` is one opaque 128-bit blob, not a
+(weight, importance) pair -- forcing it through that exact signature would
+be a worse fit than writing a parallel set of functions. Plan:
+
+- [ ] New `block4_row_insert_col`/`block4_row_remove_col` (delta_csr_memory.hpp
+      or block4.hpp) mirroring `delta_csr_row_insert_col`/`remove_col`'s
+      *algorithm* exactly (uleb128 delta re-encoding, byte-shift via
+      memmove, headroom checks) but operating on `std::vector<Block4Tile>`
+      directly instead of through `ValueAccessor`. `delta_csr_shift_row`
+      itself (byte/elem capacity growth) IS value-agnostic already --
+      check whether it's directly reusable as-is once the layout/buf
+      shape matches, before writing a parallel version of that one too.
+- [ ] Rework `Block4Store`: drop `unordered_map<uint64_t, Block4Tile> tiles`
+      and `unordered_map<uint32_t, unordered_set<uint32_t>> by_block_row`,
+      replace with `DeltaCSRLayout block_layout` + `std::vector<uint8_t>
+      indices_buf` + `std::vector<Block4Tile> tile_values`. Keep the
+      PUBLIC API shape (`get_or_create(br,bc)`, `find(br,bc)`,
+      `erase(br,bc)`, `n_tiles()`, `live_synapses()`) so call sites don't
+      all need to change -- `find`/`get_or_create` become an O(row_nnz)
+      cursor walk instead of O(1) hash lookup (row_nnz here = tiles in
+      that one block-row, expected small given block4's own
+      collision-limited population -- verify this assumption holds, don't
+      just assert it).
+- [ ] Update the ~8 point-lookup call sites in `delta_csr_memory.hpp`
+      (`block4_maybe_promote`, `block4_demote_tile`, the Step 1b/5 hooks
+      in `delta_csr_synap_row_step`) -- these use `find`/`get_or_create`/
+      `erase` directly, should mostly Just Work against the new API if the
+      signatures are preserved, but verify each one (some also touch
+      `by_block_row` directly for the "does this block-row have any
+      tiles" check, which needs to become "does this block-row have
+      row_nnz > 0" via the new layout instead).
+- [ ] Update the 2 flat-tile-collection loops in `linear_disldo.hpp`
+      (forward's and backward's `for (auto& kv : weights.block4.tiles)`
+      preambles, which flatten into `live_tiles`/`tile_br`/`tile_bc`
+      vectors for `#pragma omp for` parallelization) to walk every
+      block-row's cursor instead -- order doesn't matter to the existing
+      per-tile math (already fully parallel, no cross-tile dependency),
+      only that all live tiles get collected once.
+- [ ] Multiply/divide-by-4 audit: every (br,bc) at the Block4Store boundary
+      is a BLOCK coordinate (real row/col already divided by 4 by the
+      caller, per the existing convention) -- the new layout's `rows`/
+      `cols` should be `ceil(n_in/4)`/`ceil(n_out/4)`, not `n_in`/`n_out`.
+      Verify at construction (wherever `Block4Store` gets sized/
+      constructed today) and audit for any place still assuming raw
+      row/col scale.
+- [ ] Update the 4 `test_disldo_block4_*.cpp` files (now real ctest
+      entries, not just ad-hoc runs -- see the SIMD-writeback commit) for
+      whatever internal-field references break, plus a new correctness
+      test for `block4_row_insert_col`/`remove_col` themselves
+      (insert/remove/reinsert at various block-row positions, boundary
+      rows, capacity-exhaustion-returns-false, matching the existing
+      `test_disldo_synaptogenesis.cpp`-style coverage for the scattered
+      path's own insert/remove).
+- [ ] Verify: full ctest suite, ASan/UBSan on the new insert/remove
+      functions specifically, a real pybind rebuild +
+      `bench_block4_layer.py` correctness check (quality err, nnz/tile
+      counts), and update TODO_DUAL_BLOCK4.md with the real measured bit
+      budget (not just the 136-144 estimate) and any speed delta (O(1)
+      hash lookup -> O(row_nnz) cursor walk could go either way on real
+      timing, measure don't assume).
+
+### Part B -- sparse/dense hybrid tile encoding + fixed-latency SIMD unpack (novel, higher-risk, do after Part A)
+
+Per direction: the tile's own 128-bit storage slot becomes two possible
+encodings, chosen by active-synapse count (no per-tile presence bit
+needed -- count discriminates the mode itself):
+- **Sparse mode** (<=10 active synapses): an ORDERED list of 12-bit
+  entries (4-bit sub-index = 2-bit local row + 2-bit local col, since
+  it's a fixed 4x4 tile; 8-bit weight+importance nibble pair, same byte
+  format as today), plus ~8 bits of header (count/section info) -- fits
+  in 128 bits since 10*12+8=128.
+- **Dense mode** (>=11 active): today's flat 16x8-bit array, since
+  11*12=132 would overflow the 128-bit budget. Hardcode this threshold
+  with the math as a one-line comment, not a derived/configurable
+  constant -- it's exact, not a tuning knob.
+
+Unpack (sparse -> dense scratch, for the existing forward/backward SIMD
+math to operate on unchanged): always exactly 4 SIMD-4 passes (one per
+tile row li=0..3), constant-time regardless of actual count -- each pass
+grabs the next 4 entries from the front of the ordered list, uses each
+entry's local-row sub-index bits to determine via shift/mask whether it
+belongs to THIS row (landing it at the right local-col slot if so, zeroed
+if its row is further ahead), and remembers where the ordered list left
+off for the next pass. Sub-indices get dropped once unpacked into the
+dense scratch buffer.
+
+**Open question, not yet confirmed with the user:** re-packing after
+backward's writeback (dense scratch -> compact ordered form again,
+including possibly crossing the 10/11-entry threshold either direction)
+wasn't spelled out in the original description (only unpack was) -- my
+assumption is it's needed (backward changes byte values in place today,
+`tile.at(li,lj) = ...`, and the whole point of the compact encoding is
+that storage stays compact after training updates, not just at
+promotion time) but this needs explicit confirmation before Part B
+implementation starts, since it's the more novel/failure-prone half of
+this redesign and shapes the API a lot (in-place update vs.
+decode-modify-reencode-every-call).
+
+- [ ] Confirm the re-pack requirement/design with the user before writing
+      code for this part.
+- [ ] Design + implement the sparse-mode 128-bit layout (entry
+      packing/unpacking bit layout, header format).
+- [ ] Implement the fixed-latency 4-pass SIMD unpack (block4.hpp,
+      alongside `block4_vec_decode_fp4`/`block4_vec_quantize_stochastic_fp4`).
+- [ ] Implement re-pack (pending the confirmation above).
+- [ ] Wire into forward/backward: decode-to-scratch before the existing
+      SIMD math, re-encode-to-storage after (if the re-pack requirement
+      is confirmed).
+- [ ] Update `count_live()`/promotion/demotion: sparse mode's count is
+      now free (the ordered list's own length), no more O(16) byte scan
+      needed at all, in either mode.
+- [ ] Correctness tests: round-trip decode/encode for all counts 0..16,
+      the exact 10/11 threshold boundary, ASan/UBSan.
+- [ ] Timing verification: confirm the "always 4 SIMD-4 calls, constant
+      time" claim actually holds (profile, don't assume) and measure
+      real per-synapse bit cost across a realistic count distribution
+      (not just the worst-case/best-case endpoints).
+- [ ] Update TODO_DUAL_BLOCK4.md with final measured bit budget and any
+      speed delta vs. Part A's dense-only 136-144-bit design.
+
 ## Explicitly NOT changing
 
 - The prototype branch (`feature/sili-ell-benchmark`, PR #22) and its
