@@ -5,39 +5,15 @@
 #include <stdexcept>
 #include <vector>
 
-// ── block4: dense 4x4 tiles, integrated into SparseLinearWeightsDelta ──────
-//
-// Production version of the prototype validated on feature/sili-ell-benchmark
-// (PR #22, kept as reference, not merged): a real speedup (2-13x on the real
-// MiniCPM5-1B-Base checkpoint, scaling with density) with verified no quality
-// cost vs. disldo's own FP4 loss, from storing the LOCALLY-DENSE part of a
-// sparse matrix as small dense tiles (no per-synapse gather -- position IS
-// the column once a tile is active) alongside the existing scattered
-// ULEB128-delta CSR (disldo) for everything else.
-//
-// Differences from the prototype, both real fixes, not stylistic:
-//   - Shares the OWNING SparseLinearWeightsDelta's existing per-row
-//     value_scale/importance_scale (not a separate scale array) -- the
-//     prototype's own leftover path needed a late fix for exactly this
-//     (a real 2.07x quality regression on one real tensor, traced to a
-//     duplicated/unsynced scale). One authoritative scale per row,
-//     regardless of which representation currently holds a given synapse,
-//     makes promotion/demotion a lossless BYTE copy (re-quantizing an
-//     already-exact FP4_TABLE value via fp4_quantize() round-trips exactly,
-//     no requantization error introduced by moving between representations).
-//   - Tile presence is a hash map (br,bc) -> tile, not a full block-CSR
-//     rebuild -- needed for O(1)-ish promotion/demotion of a SINGLE tile at
-//     a time (see delta_csr_memory.hpp's synap_row_step hook), not a
-//     whole-matrix batch split the way the prototype's split_for_block4 was.
-//
-// This is a 4x4 dense tile, not a generic NxN one -- BLOCK4_TILE_SIZE exists
-// only as a compile-time override for re-tuning that one fixed number (see
-// TODO_DUAL_BLOCK4.md's settled design decisions), not as a hook for runtime
-// or templated generality nothing here actually needs. Don't widen anything
-// in this file "to be safe" for a size this isn't and was never asked to be.
+// block4: dense 4x4 tiles in a larger sparse matrix for SIMD optimization  
+
+
+// Block4 = 4. Changing this might break everything for obvious reasons.
 #ifndef SILI_BLOCK4_TILE_SIZE
-#define SILI_BLOCK4_TILE_SIZE 4
+#define SILI_BLOCK4_TILE_SIZE 4 
 #endif
+
+// 2 is chosen for speed & memory compared to pure csr after testing
 #ifndef SILI_BLOCK4_PROMOTE_MIN_LIVE
 #define SILI_BLOCK4_PROMOTE_MIN_LIVE 2
 #endif
@@ -46,52 +22,41 @@ constexpr uint32_t BLOCK4_TILE = SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_TILE_SLOTS = SILI_BLOCK4_TILE_SIZE * SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 
-// ── block4 4-wide SIMD helpers ───────────────────────────────────────────────
+// block4 4-wide SIMD helpers
 //
-// float only -- this codebase's only real VALUES_TYPE::value_type, and
-// deliberately not templated: block4 is a concrete 4x4 tile, not a generic
-// abstraction (see the header comment above), so this doesn't pretend to
-// support a hypothetical double path nothing here actually uses.
+// Currently the only supported activation and backprop value is float32.
 //
-// GCC/Clang's vector_size extension, not raw target intrinsics: portable
-// across whatever SIMD width the build target actually has (SSE/AVX/NEON),
-// and it's what actually gets the compiler to emit real SIMD for block4's
-// per-column state in disldo_backward -- confirmed via -fopt-info-vec that
-// the auto-vectorizer's own SLP pass, working from plain scalar arrays,
-// could PROVE the loop vectorizable but rejected it as unprofitable (cost
-// model didn't like an array-indexed load it couldn't prove was contiguous).
-// An explicit vector type doesn't leave that judgment call to the
-// auto-vectorizer's cost heuristics.
+// GCC/Clang's vector_size extension is portable across SSE/AVX/NEON/etc.,
+// and got the compiler to emit real SIMD for block4's for backprop, 
+// confirmed via -fopt-info-vec that it vectorizes, and while plain scalar
+// arrays could vectorize, they weren't as fast since gcc couldn't prove they
+// array indexed load was contiguous.
 using Block4Vec  = float    __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(float))));
 using Block4VecU = uint32_t __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(uint32_t))));
 static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float), "Block4Vec width must match BLOCK4_TILE");
 
 inline Block4Vec block4_vec_load(const float* p) {
     Block4Vec v;
-    std::memcpy(&v, p, sizeof(v));   // unaligned-safe load, no UB regardless of p's alignment
+    std::memcpy(&v, p, sizeof(v));   // unaligned-safe load
     return v;
 }
 inline void block4_vec_store(float* p, Block4Vec v) {
     std::memcpy(p, &v, sizeof(v));
 }
-// Hardcoded to 4 elements, not a BLOCK4_TILE-driven loop -- a real,
-// measured bug found via callgrind: a runtime-indexed loop over a
-// vector-extension type's lanes (`for (i...) v[i]=x`) forces GCC to treat
-// the whole vector as memory instead of a register, compiling to a real
-// scalar loop, NOT a single broadcast instruction -- 7.6% of all
-// instructions in a profiled disldo_backward run were this "vectorized"
-// broadcast helper alone. A 4-element brace-init list is a genuine single
-// broadcast op; this file already commits to exactly 4 (see the header
-// comment -- BLOCK4_TILE_SIZE is a compile-time override knob for
-// re-tuning, not a hook for a generic-width loop nothing here needs).
+
+// `for (i...) v[i]=x` forces GCC to treat the whole vector as memory 
+// instead of a register, and 7.6% of all instructions in a disldo_backward 
+// run were this "vectorized" broadcast helper alone. This turns multiple
+// load/store ops into a single op.
 inline Block4Vec block4_vec_broadcast(float x) {
     return Block4Vec{x, x, x, x};
 }
 inline Block4VecU block4_vecu_broadcast(uint32_t x) {
     return Block4VecU{x, x, x, x};
 }
+
 // Elementwise |x| via an IEEE-754 sign-bit clear -- std::abs isn't defined
-// for GCC vector-extension types, and this avoids a per-lane branch.
+// for GCC vector-extension types.
 inline Block4Vec block4_vec_abs(Block4Vec x) {
     Block4VecU bits;
     std::memcpy(&bits, &x, sizeof(bits));
@@ -100,26 +65,17 @@ inline Block4Vec block4_vec_abs(Block4Vec x) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
-// Hardcoded 4-term sum, not a BLOCK4_TILE-driven loop -- same real,
-// measured bug as block4_vec_broadcast above (runtime-indexed access
-// forces scalar memory traffic instead of a real horizontal-add): this
-// one function alone was 12.16% of all instructions in a profiled
-// disldo_backward run. Constant-index element extraction (x[0] etc, index
-// known at compile time) is what actually lets GCC treat x as a register
-// and emit a real extract+add sequence instead of a loop.
+
+// Hardcoded 4-term sum. Similar fix as block4_vec_broadcast above.
+// This one function was 12.16% of all instructions in a disldo_backward run. 
 inline float block4_vec_hsum(Block4Vec x) {
     return x[0] + x[1] + x[2] + x[3];
 }
-// 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes BLOCK4_TILE codes in one
-// shot instead of BLOCK4_TILE separate FP4_TABLE[code] lookups. Same
-// branchless bit formula as the scalar version (see fp4quant.hpp's header
-// comment on why it's exact, not an approximation), with the two branches
-// combined via a compare-mask blend instead of an if/else -- GCC/Clang
-// vector-extension comparison operators already return an all-ones/all-
-// zero mask per lane, so `(a & mask) | (b & ~mask)` is the whole blend,
-// no scalar branching anywhere. Verified bit-exact against
-// fp4_decode_bits() (equivalently FP4_TABLE) for all 65536 4-tuples of
-// codes -- see test_fp4_bitshift.cpp.
+
+// 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes 4 codes in one
+// shot instead of 4 separate FP4_TABLE[code] lookups. 
+// Verified bit-exact against fp4_decode_bits()
+// (see test_fp4_bitshift.cpp.)
 inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
     const Block4VecU one_u  = block4_vecu_broadcast(1u);
     const Block4VecU zero_u = block4_vecu_broadcast(0u);
@@ -146,14 +102,9 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
 }
 
 // 4-wide fp4_quantize_stochastic (fp4quant.hpp) -- stochastically quantizes
-// BLOCK4_TILE values in one shot instead of BLOCK4_TILE separate scalar
-// calls. Same dithered-rounding formula as the scalar version (see
-// fp4quant.hpp's header comment for why the |v|>=1.0 branch's bit-add
-// dithering is exact, not approximate), branches combined via
-// compare-mask blends like block4_vec_decode_fp4 above. The 4 per-lane
-// RNG draws stay genuinely scalar (fp4_stochastic_next_u64() x4) -- the
-// SIMD win here is in the branch/arithmetic, not the RNG itself, which is
-// a handful of xorshift ops regardless of lane count. Verified against
+// 4 values in one shot. 
+// See fp4quant.hpp's header comment for why the |v|>=1.0 branch's bit-add
+// dithering is exact, not approximate. Verified against
 // fp4_quantize_stochastic() via matched-seed statistical (mean-converges-
 // to-v) and saturation/exact-value checks -- see test_fp4_stochastic.cpp.
 inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
@@ -209,49 +160,19 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
     Block4VecU mag_code =
         (mag_sat & sat_mask) | (mag_low & low_mask) | (mag_mid & mid_mask) | (mag_norm & norm_mask);
 
-    // Never the repurposed NaN slot (8) for a genuinely near-zero lane --
-    // same rule as fp4_encode_bits/fp4_quantize_stochastic.
+    // Never the repurposed NaN slot (8) for a genuinely near-zero lane
     const Block4VecU zero_mag_mask = (mag_code == block4_vecu_broadcast(0u));
     // sign is bit 31 (0x80000000) or 0; >>28 moves it to bit 3 (0x8 or 0),
-    // exactly the code's sign-bit position -- no separate mask needed.
     const Block4VecU sign_bit = sign >> 28;
     return (sign_bit | mag_code) & ~zero_mag_mask;
 }
 
-// One dense tile: BLOCK4_TILE_SLOTS bytes, (imp4<<4|w4) per slot, stored
-// [local_j * BLOCK4_TILE + local_i] (row=local_i, col=local_j within the
-// tile -- matches disldo's own row=input/col=output CSR orientation, see
-// linear_disldo.hpp's own orientation note, so NO transpose is needed
-// between block4 and disldo's shared row indexing here, unlike the
-// prototype which used the opposite (row=output) convention and needed an
-// explicit orientation fix -- done differently and more simply here from
-// the start).
-//
-// No liveness bit, no live_count. Every slot in a promoted tile is a real
-// synapse, weight=0.0 included -- that's what "dense" means; a value-based
-// liveness signal (data[slot] == 0) is a sparse-domain idea that doesn't
-// belong here, and turned into a real bug the first time it was tried: a
-// genuinely-live synapse whose weight AND importance both round to
-// FP4_TABLE's zero entry (common -- 0.0 is nearest for anything near the
-// origin, and a freshly-grown synapse starts at weight=0.0 exactly) was
-// indistinguishable from an empty slot, silently dropping it from forward,
-// from backward's gradient update (permanently -- it could never train away
-// from zero), and from every read path. Forward/backward now process all
-// BLOCK4_TILE_SLOTS slots of a live tile unconditionally -- see
-// linear_disldo.hpp. (This didn't cost any SIMD either way: confirmed via
-// -fopt-info-vec that these loops don't auto-vectorize regardless, blocked
-// by the FP4_TABLE gather and the get_value_scale/get_output_scale calls,
-// not by any liveness branch.)
-//
-// count_live() is a cold-path, on-demand O(16) byte scan (weight nibble
-// nonzero), used only by promotion/demotion/reporting to decide whether a
-// tile still holds enough real data to justify staying block4 -- not a
-// structural oracle, just a cheap heuristic. A slot whose value happens to
-// be exactly (0.0 weight, 0.0 importance) at the moment of that scan reads
-// as "not live" here, same as before -- but the consequence is now minor
-// (it just doesn't count toward this cycle's demotion/reporting tally,
-// nothing more) instead of being permanently unreachable, since forward and
-// backward no longer consult this at all.
+// One dense tile: 16 bytes, (4-bit importance<<4|4-bit weight) per slot,
+// stored [local_j * 4 + local_i] (Matches disldo's CSR orientation,
+// so no transpose is needed)
+// 
+// count_live() is a full O(16) byte scan, but used only by 
+// promotion/demotion/reporting 
 struct Block4Tile {
     uint8_t data[BLOCK4_TILE_SLOTS] = {0};
 
@@ -261,37 +182,24 @@ struct Block4Tile {
     uint8_t  at(uint32_t local_i, uint32_t local_j) const { return data[slot_index(local_i, local_j)]; }
 
     uint32_t count_live() const {
-        // Whole byte, not just the weight nibble: a freshly-grown synapse
-        // starts at weight=0.0 by convention (see delta_csr_memory.hpp's
-        // Step 6) with only a nonzero importance -- checking the weight
-        // nibble alone would miss it here the same way it did before this
-        // was ever tracked as a separate liveness bit.
-        uint32_t n = 0;
+        // todo: check if (data[i]>>4 != 0) or (data[i]>>4 > min_importance)
+	// performs better, because low importance synapses aren't important
+	// enough to count.
+	uint32_t n = 0;
         for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
             if (data[i] != 0) ++n;
         return n;
     }
 };
 
-// ── Sparse-packed tile encoding (compression, per direction) ────────────────
+// Sparse-packed tile encoding for better compression
 //
-// A tile's 16 bytes can ALSO be interpreted as a compact list of active
-// synapses instead of the flat dense array above -- both are exactly 16
-// bytes, chosen per-tile by a Block4Store::switch_point comparison (see
-// below), not a hardcoded design decision: dense is strictly faster
-// (direct access, no pack/unpack), sparse is strictly smaller in the
-// cases that matter (fewer than SILI_BLOCK4_SPARSE_MAX_COUNT live
-// synapses -- most newly-promoted tiles, since promotion starts at just
-// BLOCK4_PROMOTE_MIN_LIVE=2).
+// Note: dense is strictly faster (direct access, no pack/unpack), 
+// sparse is strictly smaller for 10 or fewer synapses (11*12=132>128)
+// since 2 bits are needed for each x,y index in the 4-block, 
+// adding 4 bits to the 8 bits per param we already have.
 //
-// Layout: byte[0]=count, bytes[1..5]=SILI_BLOCK4_SPARSE_MAX_COUNT position
-// nibbles (2 per byte, slot_index 0-15), bytes[6..15]=SILI_BLOCK4_SPARSE_MAX_COUNT
-// value bytes (byte-identical format to Block4Tile::data -- weight nibble
-// | importance nibble<<4). 10*12+8=128 bits exactly; 11 would need 132,
-// over budget -- this arithmetic is exact, not a tuning knob, even though
-// the SWITCH POINT deciding whether to actually USE sparse mode below 10
-// is (Block4Store::switch_point, default 10, settable down to 0 to
-// disable compression entirely).
+// Default 10, settable down to 0 to disable compression entirely.
 #ifndef SILI_BLOCK4_SPARSE_MAX_COUNT
 #define SILI_BLOCK4_SPARSE_MAX_COUNT 10
 #endif
@@ -299,15 +207,7 @@ static_assert(SILI_BLOCK4_SPARSE_MAX_COUNT * 12 + 8 <= 128,
     "sparse tile encoding must fit in the same 128 bits as the dense one");
 constexpr uint32_t BLOCK4_SPARSE_MAX_COUNT = SILI_BLOCK4_SPARSE_MAX_COUNT;
 
-// Prototyped and speed-tested in isolation before landing here (see
-// conversation, sparse_tile_unpack.cpp, not part of the repo): three SIMD
-// unpack variants (binary-decomposition scatter, one-shot
-// __builtin_shuffle, and a version avoiding a runtime-indexed vector
-// write) were all measurably SLOWER than this plain scalar loop, at
-// EVERY active-synapse count from 0 to 10, confirmed via disassembly to
-// be real SIMD codegen (not another hidden version of the
-// block4_vec_hsum/broadcast bug) -- for N this small (<=10 elements, 16
-// bytes), the compiler's own scalar codegen already wins. Trust it.
+// Every SIMD optimization we tried here was slower than these scalar versions
 inline uint8_t block4_sparse_get_pos(const uint8_t packed[16], uint32_t i) {
     const uint8_t b = packed[1 + i / 2];
     return (i % 2 == 0) ? uint8_t(b >> 4) : uint8_t(b & 0xFu);
@@ -318,6 +218,8 @@ inline void block4_sparse_set_pos(uint8_t packed[16], uint32_t i, uint8_t pos) {
     else            b = uint8_t((b & 0xF0u) | (pos & 0xFu));
 }
 
+// todo: this is a fucking joke. There's nothing "packed" here if the packed size, 16, is equal
+//  to the desne size, BLOCK4_TILE_SLOTS, or 16. 'packed' MUST be a pointer, NOT a fixed length array.
 inline void block4_sparse_unpack(const uint8_t packed[16], uint8_t dense[BLOCK4_TILE_SLOTS]) {
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i) dense[i] = 0;
     const uint8_t count = packed[0];
@@ -325,10 +227,9 @@ inline void block4_sparse_unpack(const uint8_t packed[16], uint8_t dense[BLOCK4_
         dense[block4_sparse_get_pos(packed, i)] = packed[6 + i];
 }
 
-// Packs `dense` into `packed` -- caller's responsibility to have already
-// checked count_live(dense) <= BLOCK4_SPARSE_MAX_COUNT (this function
-// doesn't re-check; Block4TileHandle's destructor is the one call site
-// that decides mode, see below).
+// todo: fix this shit too. Both of these ops save ZERO memory and are just a waste of resources as is.
+//  They should take as much or less time by shrinking the for loop 
+//  and the measured used memory should be smaller.
 inline void block4_sparse_pack(const uint8_t dense[BLOCK4_TILE_SLOTS], uint8_t packed[16]) {
     uint8_t count = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i) {
@@ -340,65 +241,24 @@ inline void block4_sparse_pack(const uint8_t dense[BLOCK4_TILE_SLOTS], uint8_t p
     packed[0] = count;
 }
 
-// ── Tile index: ULEB128 delta-CSR over BLOCK coordinates ────────────────────
-//
-// Previously an unordered_map<uint64_t, Block4Tile> (64-bit key -- 128 tile
-// + 64 key = 192 bits/tile) + a separate unordered_map<uint32_t,
-// unordered_set<uint32_t>> reverse index for the per-block-row liveness
-// check. Per direction: reuse the SAME ULEB128 delta-encoding the scattered
-// path already uses for its own column indices (confirmed this session:
-// 100% single-byte at realistic density), just at BLOCK granularity
-// (block_row = row/BLOCK4_TILE, block_col = col/BLOCK4_TILE) -- 128 tile +
-// 8-16 uleb128 index = 136-144 bits/tile, and the per-block-row liveness
-// check becomes "row_nnz(br) > 0" on this same layout instead of a second
-// data structure to keep in sync.
-//
-// DeltaCSRLayout and DeltaCSRRowCursor (delta_csr_types.hpp, just above --
-// this file is now included AFTER both) are reused directly, unchanged --
-// neither ever referenced VALUES_TYPE/ValueAccessor, so nothing about them
-// needed to change for a Block4Tile "value" instead of a float pair.
-//
-// block4_row_insert_tile/remove_tile below are NOT calls to the existing
-// delta_csr_row_insert_col/remove_col (delta_csr_memory.hpp) -- those are
-// shaped around ValueAccessor<VALUES_TYPE>'s weight+importance FLOAT PAIR
-// interface (`insert_col(..., value_type weight, value_type importance)`),
-// and a Block4Tile is one opaque 128-bit blob, not a (weight, importance)
-// pair -- forcing it through that signature would be a worse fit than a
-// parallel set of functions with the same shifting algorithm.
-
-// Grows row `row`'s byte/elem allocation to at least the given targets,
-// for any row EXCEPT the last -- mirrors delta_csr_shift_row's exact
-// algorithm (byte_start/byte_end/elem_start/elem_end bookkeeping,
-// memmove-based shift of every row after this one) but operates on
-// One stored tile slot: either 16 dense bytes (is_sparse=false, byte-
-// identical to Block4Tile::data) or the compact packed form
-// (is_sparse=true, see block4_sparse_pack/unpack above). Bundled with its
-// own discriminator flag, not a parallel array -- a single memmove during
-// row insert/remove/shift (below) keeps both in sync atomically, no
-// separate bookkeeping needed. There's genuinely no spare bit inside the
-// 128-bit payload itself for a self-describing flag (both encodings use
-// every bit -- 16*8=128 dense, 10*12+8=128 sparse), so this HAS to live
-// outside; bundling it here (a per-TILE cost, not per-byte or per-bit)
-// keeps it cheap in the aggregate -- amortized over the >=2 synapses
-// every promoted tile holds (BLOCK4_PROMOTE_MIN_LIVE), let alone a fuller
-// one.
+// todo: this stores in a fixed size-16 array when 2-10 may be compressed
+// Use a new pointer instead when is_sparse==True, so a uint8_t pointer
+// Since we already use DeltaCSRLayout we're often doing near random accessor
+// anyway and not always sequential, and if we actually use the database system
+// like we're supposed to, the compressed sizes still should be contiguous.
+// So is_sparse==false could advance BLOCK4_TILE_SLOTS on an array while 
+// is_sparse==true could advance 2-10 positions on an array
 struct Block4StoredTile {
     uint8_t data[BLOCK4_TILE_SLOTS] = {0};
     bool    is_sparse = false;
 };
 
-// `values` (std::vector<Block4StoredTile>) directly, not through ValueAccessor.
-// Deliberately does nothing for the LAST row (row+1 == L.rows) -- same
-// real subtlety as delta_csr_shift_row: there's no "next row" to shift out
-// of the way, so growing the last row needs a different, simpler path
-// (see block4_grow_last_row below) -- this isn't a bug carried over
-// blindly, it's the same shape as the scattered path's own
-// equalize_to_capacity, which special-cases the last row for exactly this
-// reason.
+//todo: this needs to guarantee it doesn't grow being max allowed size
+//this also uses Block4StoredTile
 inline void block4_row_shift(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
-    std::vector<Block4StoredTile>& values,
+    std::vector<Block4StoredTile>& values, // needs vector not ValueAccessor
     std::size_t row,
     std::size_t target_byte_alloc,
     std::size_t target_elem_alloc)
@@ -434,10 +294,9 @@ inline void block4_row_shift(
         if (target_elem_alloc > cur_elem_alloc)
             values.resize(current_total + (target_elem_alloc - cur_elem_alloc));
         if (move_len > 0)
-            // Block4Tile is trivially copyable (a plain uint8_t[16]), so a
+            // An uncompressed Block4Tile is trivially copyable (a plain uint8_t[16]), so a
             // raw memmove here is exactly as safe as std::vector's own
-            // internal moves would be -- same reasoning delta_csr_shift_row
-            // relies on via ValueAccessor::move for FP4BiPacked.
+            // internal moves would be
             std::memmove(values.data() + new_start, values.data() + move_src,
                          move_len * sizeof(Block4StoredTile));
         if (target_elem_alloc < cur_elem_alloc)
@@ -452,12 +311,10 @@ inline void block4_row_shift(
     }
 }
 
-// Last-row growth: no row follows it, so no memmove is needed -- just
-// extend the flat buffers and the row's own end marker (L.byte_start[rows]/
-// L.elem_start[rows] double as "end of the last row's allocation" since
-// there's no row `rows` to have its own start). Mirrors
-// SparseLinearLayer::equalize_to_capacity's identical last-row special
-// case (cpu_backend.cpp).
+// todo: Expanding beyond max allocated size or max RAM is NEVER allowed. Fix this.
+// If we need to expand size, we either just CANNOT, or we must trade with other systems
+// such as the sparse csr system. Resize is not allowed if trading is not implemented
+// and trading would be a future feature.
 inline void block4_grow_last_row(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
@@ -480,13 +337,8 @@ inline void block4_grow_last_row(
     }
 }
 
-// Grows row `row` by exactly enough for ONE more tile (uleb128_max_bytes
-// worst case on the byte side, +1 element) -- not amortized/doubling
-// growth: block4's own population is inherently small (collision-limited
-// via growth, confirmed empirically this session), so a fixed
-// exactly-enough-for-one-more increment avoids overreserving without a
-// meaningful cost in practice. Dispatches to block4_row_shift or
-// block4_grow_last_row depending on whether `row` is the last one.
+// todo: this needs to be re-written to guarantee it doesn't grow past
+// allocated memory or system RAM
 inline void block4_ensure_row_headroom(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
@@ -501,13 +353,8 @@ inline void block4_ensure_row_headroom(
         block4_grow_last_row(L, ibuf, values, target_b, target_e);
 }
 
-// Insert `tile` at block-column `new_col` in block-row `row`, sorted order,
-// in place. Returns true on success, false if the row has insufficient
-// blank space (caller should grow via block4_ensure_row_headroom and
-// retry -- Block4Store::get_or_create below does this automatically).
 // Mirrors delta_csr_row_insert_col's exact algorithm (delta_csr_memory.hpp)
-// -- same uleb128 re-encoding/byte-shift/headroom-check shape -- but writes
-// a whole Block4Tile directly instead of going through
+// but writes a whole Block4Tile directly instead of going through
 // ValueAccessor<VALUES_TYPE>::set(weight, importance).
 inline bool block4_row_insert_tile(
     DeltaCSRLayout& L,
@@ -584,8 +431,7 @@ inline bool block4_row_insert_tile(
     return true;
 }
 
-// Remove the tile at block-column `target_col` in block-row `row`, if
-// present. Mirrors delta_csr_row_remove_col's exact algorithm
+// Mirrors delta_csr_row_remove_col's exact algorithm
 // (delta_csr_memory.hpp) -- same delta-merge/byte-shift-left shape -- for
 // `std::vector<Block4StoredTile>` directly.
 inline bool block4_row_remove_tile(
@@ -647,11 +493,13 @@ inline bool block4_row_remove_tile(
     return false;
 }
 
-// Live-count scan usable on either a Block4Tile::data array or an
-// unpacked scratch buffer -- same "whole byte, not just weight nibble"
-// reasoning as Block4Tile::count_live() (see its own comment above), just
+// Same as Block4Tile::count_live(), but
 // callable on a raw pointer since Block4TileHandle's scratch buffer isn't
 // always wrapped in a full Block4Tile object.
+//
+// todo: check if (data[i]>>4 != 0) or (data[i]>>4 > min_importance)
+// performs better, because low importance synapses aren't important
+// enough to count.
 inline uint32_t block4_count_live(const uint8_t dense[BLOCK4_TILE_SLOTS]) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
@@ -661,51 +509,10 @@ inline uint32_t block4_count_live(const uint8_t dense[BLOCK4_TILE_SLOTS]) {
 
 struct Block4Store;
 
-// RAII accessor for ONE logical tile's synapse data, transparent to
-// whether the underlying storage is dense or sparse-packed (see
-// Block4StoredTile/block4_sparse_pack/unpack above) -- returned by
-// Block4Store::find()/get_or_create() instead of a raw pointer, since a
-// raw pointer to sparse-packed bytes would be garbage under .at().
-//
-// Dense tile: .at() is a direct pass-through into storage (same cost as
-// today's Block4Tile::at()) -- the destructor does nothing extra; whether
-// a dense tile should NOW compress is decided at the same explicit
-// pruning-event checkpoint that already decides demotion
-// (delta_csr_memory.hpp), not automatically on every access, to avoid
-// adding an O(16) scan to every forward/backward call.
-//
-// Sparse tile: unpacks once into an internal scratch buffer at
-// construction; .at() reads/writes the scratch copy; the destructor
-// re-packs (only if actually touched) back into the compact form,
-// upgrading to dense if the live count now exceeds Block4Store's
-// switch_point.
-//
-// Coordinate-based, NOT a cached pointer: re-looks-up its (br,bc) via a
-// fresh Block4Store::raw_find() at destruction time instead of caching a
-// pointer from construction. This matters for real correctness, not just
-// style -- delta_csr_memory.hpp has call sites where a handle for (br,bc)
-// is still logically in scope when block4_demote_tile() (which calls
-// Block4Store::erase() on that SAME (br,bc)) runs, e.g. Step 5 of
-// delta_csr_synap_row_step: writes a byte via a handle, checks
-// count_live(), and if now below threshold calls block4_demote_tile()
-// -- which erases the very entry the handle refers to. A cached pointer
-// would dangle after that erase()'s internal memmove; re-looking-up by
-// coordinate at destruction time instead just finds nothing and no-ops,
-// which is exactly correct (nothing to write back once the tile's been
-// demoted out of block4 entirely). find()/get_or_create()'s own O(row_nnz)
-// cost (proven negligible this session, block4's own collision-limited
-// population keeps row_nnz tiny) makes the extra lookup cheap enough not
-// to matter.
+// RAII accessor for one logical tile's synapse data,
 class Block4TileHandle {
     Block4Store* store_ = nullptr;
-    // Cached at construction, used DIRECTLY by at() for the dense case --
-    // safe because every .at() call in a handle's lifetime necessarily
-    // happens before that handle's own destructor runs, and this handle's
-    // OWN destructor is the only place a structural operation on this
-    // SAME (br,bc) could have invalidated it in between -- see the
-    // destructor's own comment for why it re-looks-up by coordinate
-    // instead of trusting this cached pointer. Do NOT use stored_ in the
-    // destructor.
+    // Cached at construction for optimization
     Block4StoredTile* stored_ = nullptr;
     uint32_t br_ = 0, bc_ = 0;
     uint8_t scratch_[BLOCK4_TILE_SLOTS] = {0};
@@ -716,18 +523,7 @@ class Block4TileHandle {
 public:
     Block4TileHandle() = default;
     Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc);
-    // Fast-path constructor for a caller that already knows this tile's
-    // exact position in tile_values (e.g. it just walked row_cursor(br)
-    // itself and can track block_layout.elem_start[br]+k as it advances --
-    // see Block4Store::at_index()). Skips raw_find()'s O(row_nnz) re-scan
-    // entirely -- that redundant re-scan (once during the caller's own
-    // collection walk to discover which tiles exist, then AGAIN via
-    // find()'s own internal raw_find() to fetch each one) measured as the
-    // dominant real cost of block4's forward/backward hot loop at batch=1
-    // (see conversation): batch=1 has too little per-tile compute (16
-    // FLOPs) to amortize even one O(row_nnz) scan, let alone two. No
-    // bounds/coordinate check -- passing a stale or wrong elem_pos is UB,
-    // unlike find()'s self-verifying coordinate lookup.
+    // Fast-path constructor
     Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos);
     ~Block4TileHandle();
 
@@ -762,13 +558,7 @@ public:
     }
 
     // Raw read-only pointer to this tile's 16 bytes (scratch_ if sparse,
-    // stored_->data if dense), resolved ONCE instead of per-.at()-call.
-    // For a hot loop that reads many slots of the SAME tile (forward's
-    // decode step reads all 16 via 4 separate 4-wide passes, one per lj),
-    // going through .at() every time re-branches on was_sparse_ 16 times
-    // for a value that can't change mid-tile -- this lets a caller hoist
-    // that branch to once. Does NOT mark dirty (read-only by design); a
-    // caller that also writes must still use at() for those writes.
+    // stored_->data if dense), for faster reads
     const uint8_t* raw_data() const { return was_sparse_ ? scratch_ : stored_->data; }
 };
 
@@ -777,47 +567,18 @@ struct Block4Store {
     std::vector<uint8_t>           indices_buf;    // uleb128-encoded block-col deltas
     std::vector<Block4StoredTile>  tile_values;    // parallel to block_layout's elem_start/elem_end
 
-    // Max active-synapse count for sparse (compressed) mode -- default
-    // BLOCK4_SPARSE_MAX_COUNT (10, the exact 10*12+8=128 arithmetic), but
-    // a real, per-store, runtime-adjustable compression parameter, not a
-    // fixed design decision (per direction): lower it to compress more
-    // aggressively (more tiles pay the scalar pack/unpack cost, less
-    // memory), set to 0 to disable compression entirely (every tile
-    // always dense, byte-for-byte today's pre-compression behavior).
+    // default BLOCK4_SPARSE_MAX_COUNT (10, the exact 10*12+8=128 arithmetic)
+    // saves the most memory, but lowering may increase speed
+    // todo: fix the other parts so this ACTUALLY saves memory
     uint32_t switch_point = BLOCK4_SPARSE_MAX_COUNT;
 
-    // Persistent scratch buffers for disldo_forward/disldo_backward's
-    // per-call tile collection (linear_disldo.hpp) -- reused (cleared in
-    // place, capacity kept) across calls instead of freshly heap-allocated
-    // every single call. Real, measured cost, not a hypothetical
-    // micro-optimization: this library's target workload is real-time
-    // online learning (batch=1, one forward+backward per step, not
-    // amortized over a training batch), and a callgrind profile of
-    // disldo_backward on a fully block4-resident 512x512 layer (16384
-    // tiles) showed ~12% of total instruction count inside
-    // std::vector's allocate/deallocate alone, from tile_br/tile_bc/
-    // tile_elem/row_live_count/t_row_grad being reconstructed from
-    // scratch every call (see TODO_DUAL_BLOCK4.md). Only types that
-    // don't depend on the calling function's VALUES_TYPE live here
-    // (coordinate/index bookkeeping, not the value_type-typed per-thread
-    // accumulator buffers, which stay local to disldo_forward/backward).
-    // Plain (non-mutable) members are fine: both disldo_forward and
-    // disldo_backward take a non-const SparseLinearWeightsDelta&, and a
-    // single Block4Store is never called into concurrently from multiple
-    // top-level forward/backward invocations (num_cpus parallelizes
-    // WITHIN one call, not across calls) -- the same assumption every
-    // other per-call scratch state in this codebase already makes.
+    // Persistent scratch buffers for disldo_forward/disldo_backward
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem;
     std::vector<uint32_t>    scratch_row_live_count; // backward only
     std::vector<double>      scratch_row_grad;        // backward only
 
-    // Sizes an EMPTY store for a layer of n_in x n_out real (not block)
-    // dimensions. Zero initial per-row headroom -- growth is lazy, on
-    // first insert into a given block-row (see get_or_create), matching
-    // the whole point of this redesign (don't waste memory reserving
-    // space most block-rows will never use, since block4 population is
-    // inherently sparse even after promotion).
+    // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
         block_layout.rows = (n_in + BLOCK4_TILE - 1) / BLOCK4_TILE;
@@ -835,15 +596,11 @@ struct Block4Store {
         return DeltaCSRRowCursor<uint32_t>(indices_buf.data(), block_layout, br);
     }
 
-    // Raw storage access -- NOT part of the intended public API (that's
-    // find()/get_or_create(), returning a Block4TileHandle); used
-    // internally by Block4TileHandle itself, which needs the actual
-    // storage slot (to read its is_sparse flag and either unpack it or
-    // hand out a direct pointer). Exposed as a regular public member
-    // (not a leading-underscore/private member) only because
-    // Block4TileHandle's out-of-line methods need it and this codebase
-    // doesn't otherwise use private/friend elsewhere in this file --
-    // treat it as internal regardless.
+    // Raw storage access --  used internally by Block4TileHandle itself, 
+    // which needs the actual storage slot to read its is_sparse flag 
+    // and either unpack it or hand out a direct pointer). 
+    // Exposed as a regular public member because
+    // Block4TileHandle's out-of-line methods need it
     Block4StoredTile* raw_find(uint32_t br, uint32_t bc) {
         if (br >= block_layout.rows) return nullptr;
         auto cur = row_cursor(br);
@@ -858,25 +615,11 @@ struct Block4Store {
     }
 
     Block4TileHandle find(uint32_t br, uint32_t bc) { return Block4TileHandle(*this, br, bc); }
-    // const overload: delegates to the non-const version via const_cast,
-    // same pattern this had before the ULEB128/handle redesign (and
-    // still safe for the same reason -- a caller that received this
-    // through a `const auto tile = ...` local, as every read-only call
-    // site in this codebase does, can only reach Block4TileHandle's
-    // const at()/count_live() overloads, which never write; nothing
-    // about this object's actual state changes for a genuinely read-only
-    // caller).
     Block4TileHandle find(uint32_t br, uint32_t bc) const {
         return const_cast<Block4Store*>(this)->find(br, bc);
     }
 
     // Fast path for a caller that already walked row_cursor(br) itself
-    // (e.g. disldo_forward/backward's block4 collection loop) and can
-    // supply the tile's exact element index directly -- see
-    // Block4TileHandle's matching constructor for why this exists. The
-    // caller is responsible for elem_pos being correct (block_layout's
-    // own elem_start[br]+k for the k-th tile encountered while walking
-    // row_cursor(br)); no verification is performed here.
     Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos) {
         return Block4TileHandle(*this, br, bc, elem_pos);
     }
@@ -886,17 +629,14 @@ struct Block4Store {
 
     Block4TileHandle get_or_create(uint32_t br, uint32_t bc) {
         if (raw_find(br, bc) == nullptr) {
-            // A real, easy-to-hit mistake, not hypothetical (caught via
-            // ASan testing this session's own ULEB128 tile-indexing
-            // redesign): a Block4Store that was never sized via
+            // A Block4Store that was never sized via
             // init(n_in, n_out) has block_layout.rows == 0, so
             // block_layout.byte_start/elem_start are both empty --
             // silently proceeding to block4_row_insert_tile below would
-            // index them out of bounds (a real SEGV, not just UB in
-            // theory). block4_maybe_promote (delta_csr_memory.hpp)
+            // index them out of bounds. 
+	    // block4_maybe_promote (delta_csr_memory.hpp)
             // lazily self-inits before ever reaching here; a caller
-            // invoking get_or_create() directly (bypassing promotion,
-            // e.g. a hand-built test fixture) doesn't have that safety
+            // invoking get_or_create() directly doesn't have that safety
             // net, since this function has no n_in/n_out to lazily size
             // to on its own -- fail loud instead of corrupting memory.
             if (br >= block_layout.rows)
@@ -917,15 +657,10 @@ struct Block4Store {
         block4_row_remove_tile(block_layout, indices_buf, tile_values, br, bc);
     }
 
-    // Explicit compression check -- packs the tile at (br,bc) into sparse
-    // mode if it's currently dense AND its live count is <= switch_point.
-    // A no-op if already sparse, already over switch_point, or the tile
-    // doesn't exist. Deliberately NOT automatic (not run on every write,
-    // not in Block4TileHandle's destructor for dense tiles) -- called
-    // only at the same explicit pruning-event checkpoint that already
-    // decides block4<->scattered demotion (delta_csr_memory.hpp), so
-    // compression doesn't add an O(16) scan to every forward/backward
-    // call, only to the (much rarer) structural growth/pruning events.
+    // Explicit compression check
+    // todo: if the is_sparse size ever changed, make a pointer to 
+    // 'current_location' and call this on each memory management step,
+    // not synaptogenesis/pruning step.
     void maybe_compress(uint32_t br, uint32_t bc) {
         Block4StoredTile* stored = raw_find(br, bc);
         if (!stored || stored->is_sparse) return;
@@ -939,9 +674,8 @@ struct Block4Store {
 
     std::size_t n_tiles() const { return block_layout.total_nnz; }
 
-    // Cold-path reporting only (nnz(), diagnostics) -- O(n_tiles * 16), not
-    // called from forward/backward. Must walk per-row (elem_start[r]..
-    // elem_end[r]), not tile_values[0..total_nnz) -- rows have blank
+    // Cold-path reporting only (nnz(), diagnostics) -- O(n_tiles * 16),
+    // Must walk per-row (elem_start[r].. elem_end[r]) -- rows have blank
     // (unused) element slots between them, same as the scattered path's
     // own values array. Sparse-mode tiles' count is free (the stored
     // count byte, packed[0]) -- no unpack needed just to report it.
@@ -980,12 +714,8 @@ inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint3
 
 inline Block4TileHandle::~Block4TileHandle() {
     if (!dirty_ || !valid_ || !was_sparse_) return;
-    // Dense tiles need no destructor-time work: at() already wrote
-    // directly into stored_ (storage). Only a touched SPARSE tile needs
-    // re-packing -- re-fetches by COORDINATE here (not stored_, which may
-    // be stale by now) -- see the class comment for why.
     Block4StoredTile* stored = store_->raw_find(br_, bc_);
-    if (!stored) return; // erased in the meantime -- nothing to write back, not an error
+    if (!stored) return; // was already erased
     const uint32_t n = block4_count_live(scratch_);
     if (n <= store_->switch_point) {
         block4_sparse_pack(scratch_, stored->data);
