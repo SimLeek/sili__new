@@ -300,51 +300,47 @@ void disldo_forward(
                 // whether this tile is sparse-packed -- a property that
                 // can't change mid-tile). See Block4TileHandle::raw_data().
                 const uint8_t* tdata = tile.raw_data();
-                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                    if (col >= n_out) continue;
+                // Decode this column's whole 4-wide weight vector via
+                // block4_vec_decode_fp4 (fp4quant.hpp's bit-shift
+                // formula, not FP4_TABLE[code]'s 4 separate gathers --
+                // see fp4quant.hpp's header comment); the remaining
+                // per-row scale multiply/clamp stays scalar
+                // (get_value_scale(row) itself isn't a SIMD operation).
+                //
+                // NOTE (measured, not assumed): an isolated microbenchmark
+                // suggested scalar FP4_TABLE decode should win here too
+                // (same as backward's decode, below) -- but swapping it
+                // in for THIS specific loop measurably regressed the
+                // real disldo_forward benchmark at batch=1 (~1.71x ->
+                // ~1.55x speedup vs scattered CSR at 100% density,
+                // reproduced consistently across repeats), unlike
+                // backward where the same swap was a real, consistent
+                // win. Reverted here; kept for backward. Compiler
+                // codegen interactions with the surrounding code
+                // apparently differ enough between the two functions
+                // that the isolated test's result didn't transfer --
+                // trust the real benchmark over the isolated one. See
+                // TODO_DUAL_BLOCK4.md's Part C.
+                //
+                // LJ templated (compile-time constant), not a runtime
+                // `for (lj...)` loop: -fopt-info-vec confirmed GCC could
+                // not vectorize the runtime version at all -- "loop nest
+                // containing two or more consecutive inner loops cannot
+                // be vectorized" (the li-decode loop followed by the
+                // b-batch loop, both nested inside the lj loop). A
+                // per-LJ templated lambda gives the compiler 4 SEPARATE,
+                // independent instantiations instead of one loop nest it
+                // has to reason about jointly -- each with a compile-time-
+                // known column offset, matching the pattern already used
+                // for the decode step's own 4-way unroll. See
+                // TODO_DUAL_BLOCK4.md's Part C for the measured effect.
+                auto process_col = [&]<uint32_t LJ>() {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + LJ;
+                    if (col >= n_out) return;
                     const value_type out_scale = weights.get_output_scale(col);
 
-                    // Decode this column's whole 4-wide weight vector ONCE,
-                    // outside the batch loop -- table lookup and the
-                    // get_value_scale() call (a branch on row bounds) both
-                    // block auto-vectorization if left inside the batch
-                    // loop, and neither depends on b. row_idx clamps an
-                    // out-of-range row (last, partial tile) to a safe
-                    // in-bounds index; w4 is 0 there regardless (real
-                    // in-bounds slots never quantize to exactly this
-                    // combination unless genuinely zero), so the clamped
-                    // read never contributes -- keeps the per-batch loop
-                    // below branch-free without reading out of bounds.
-                    // Decode all BLOCK4_TILE weight codes in one SIMD op
-                    // (block4_vec_decode_fp4, fp4quant.hpp's bit-shift
-                    // formula, not FP4_TABLE[code]'s 4 separate gathers --
-                    // see fp4quant.hpp's header comment) -- the remaining
-                    // per-row scale multiply/clamp still has to stay
-                    // scalar (get_value_scale(row) itself isn't a SIMD
-                    // operation), but the decode step no longer is either.
-                    // Hardcoded 4-way unroll (constant lane indices), not a
-                    // BLOCK4_TILE-driven loop -- see backward's identical
-                    // fix and its comment for why: a runtime-indexed
-                    // vector-extension read/write compiles to real scalar
-                    // memory traffic instead of a register op.
-                    //
-                    // NOTE (measured, not assumed): an isolated microbenchmark
-                    // suggested scalar FP4_TABLE decode should win here too
-                    // (same as backward's decode, below) -- but swapping it
-                    // in for THIS specific loop measurably regressed the
-                    // real disldo_forward benchmark at batch=1 (~1.71x ->
-                    // ~1.55x speedup vs scattered CSR at 100% density,
-                    // reproduced consistently across repeats), unlike
-                    // backward where the same swap was a real, consistent
-                    // win. Reverted here; kept for backward. Compiler
-                    // codegen interactions with the surrounding code
-                    // apparently differ enough between the two functions
-                    // that the isolated test's result didn't transfer --
-                    // trust the real benchmark over the isolated one. See
-                    // TODO_DUAL_BLOCK4.md's Part C.
-                    const Block4VecU w_codes = {uint32_t(tdata[Block4Tile::slot_index(0, lj)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(1, lj)] & 0xFu),
-                                                 uint32_t(tdata[Block4Tile::slot_index(2, lj)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(3, lj)] & 0xFu)};
+                    const Block4VecU w_codes = {uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
+                                                 uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
                     const Block4Vec w_decoded = block4_vec_decode_fp4(w_codes);
                     const value_type w_decoded_arr[BLOCK4_TILE] = {value_type(w_decoded[0]), value_type(w_decoded[1]),
                                                                      value_type(w_decoded[2]), value_type(w_decoded[3])};
@@ -369,7 +365,12 @@ void disldo_forward(
                             acc += w4[li] * in_row[row_idx[li]];
                         mo[static_cast<std::size_t>(b) * n_out + col] += acc;
                     }
-                }
+                };
+                process_col.template operator()<0>();
+                process_col.template operator()<1>();
+                process_col.template operator()<2>();
+                process_col.template operator()<3>();
+                static_assert(BLOCK4_TILE == 4, "process_col above is hand-unrolled for exactly 4 columns");
             }
         }
         for (int t = 0; t < num_cpus; ++t) {
