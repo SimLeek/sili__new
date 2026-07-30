@@ -725,8 +725,27 @@ void block4_maybe_promote(
         // weights.block4.init(n_in, n_out) explicitly -- a real, easy-to-
         // hit latent crash, not hypothetical (caught while updating this
         // session's own test suite for the ULEB128 tile-indexing redesign).
-        if (weights.block4.block_layout.rows == 0 && L.rows > 0)
+        if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
+            // Real cap enforcement, even for a caller that never
+            // explicitly called weights.block4.set_limits() itself
+            // (e.g. one that relies entirely on this lazy self-init,
+            // unlike SparseLinearLayer's constructor, which sets real
+            // limits up front) -- default derived from the scattered
+            // CSR side's own limits (dc.max_values_bytes is ~1
+            // byte/synapse for FP4BiPacked, the only VALUES_TYPE that
+            // reaches this branch, so it's a reasonable max_weights
+            // proxy). Same /BLOCK4_TILE_SLOTS derivation as
+            // SparseLinearLayer's constructor -- see its comment for
+            // why (tiles trend toward MAXIMUM fill under real
+            // training, not minimum, so budgeting by
+            // BLOCK4_PROMOTE_MIN_LIVE was measurably too generous).
+            // Floor of 4 tiles -- see SparseLinearLayer's identical
+            // comment (cpu_backend.cpp) for why.
+            weights.block4.set_limits(
+                dc.max_indices_bytes,
+                std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * sizeof(Block4StoredTile));
+        }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
         const uint32_t bc = uint32_t(col / BLOCK4_TILE);
         const uint32_t li = uint32_t(row % BLOCK4_TILE);

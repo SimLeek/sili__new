@@ -2,6 +2,7 @@
 #include "fp4quant.hpp"
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -253,15 +254,26 @@ struct Block4StoredTile {
     bool    is_sparse = false;
 };
 
-//todo: this needs to guarantee it doesn't grow being max allowed size
-//this also uses Block4StoredTile
+// Real, enforced cap -- max_indices_bytes/max_tile_bytes default to
+// SIZE_MAX (unbounded, matching every existing caller that doesn't
+// pass them) but Block4Store::get_or_create/ensure_row_headroom always
+// pass its OWN configured budget. Fixes a real, measured bug: this
+// function (called every synaptogenesis cycle a tile gets promoted or
+// grows) used to call ibuf.resize()/values.resize() unconditionally,
+// with NO check against any budget at all -- confirmed via a stress
+// test showing block4 growing to ~1.9x a layer's max_weights with zero
+// resistance, entirely through this path (the scattered CSR side's
+// OWN equivalent bug -- delta_csr_shift_row -- was fixed separately;
+// see conversation / TODO_DUAL_BLOCK4.md).
 inline void block4_row_shift(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
     std::vector<Block4StoredTile>& values, // needs vector not ValueAccessor
     std::size_t row,
     std::size_t target_byte_alloc,
-    std::size_t target_elem_alloc)
+    std::size_t target_elem_alloc,
+    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
 {
     const std::size_t cur_byte_alloc = L.row_alloc_bytes(row);
     if (cur_byte_alloc != target_byte_alloc && row + 1 < L.rows) {
@@ -269,8 +281,11 @@ inline void block4_row_shift(
         const std::size_t move_len  = L.byte_start[L.rows] - move_src;
         const std::size_t new_start = L.byte_start[row] + target_byte_alloc;
 
-        if (target_byte_alloc > cur_byte_alloc)
-            ibuf.resize(ibuf.size() + (target_byte_alloc - cur_byte_alloc));
+        if (target_byte_alloc > cur_byte_alloc) {
+            const std::size_t new_total = ibuf.size() + (target_byte_alloc - cur_byte_alloc);
+            if (new_total > max_indices_bytes) throw std::bad_alloc();
+            ibuf.resize(new_total);
+        }
         if (move_len > 0)
             std::memmove(ibuf.data() + new_start, ibuf.data() + move_src, move_len);
         if (target_byte_alloc < cur_byte_alloc)
@@ -291,8 +306,11 @@ inline void block4_row_shift(
         const std::size_t new_start = L.elem_start[row] + target_elem_alloc;
         const std::size_t current_total = L.total_alloc_elems();
 
-        if (target_elem_alloc > cur_elem_alloc)
-            values.resize(current_total + (target_elem_alloc - cur_elem_alloc));
+        if (target_elem_alloc > cur_elem_alloc) {
+            const std::size_t new_total_elems = current_total + (target_elem_alloc - cur_elem_alloc);
+            if (new_total_elems * sizeof(Block4StoredTile) > max_tile_bytes) throw std::bad_alloc();
+            values.resize(new_total_elems);
+        }
         if (move_len > 0)
             // An uncompressed Block4Tile is trivially copyable (a plain uint8_t[16]), so a
             // raw memmove here is exactly as safe as std::vector's own
@@ -311,46 +329,48 @@ inline void block4_row_shift(
     }
 }
 
-// todo: Expanding beyond max allocated size or max RAM is NEVER allowed. Fix this.
-// If we need to expand size, we either just CANNOT, or we must trade with other systems
-// such as the sparse csr system. Resize is not allowed if trading is not implemented
-// and trading would be a future feature.
+// See block4_row_shift's identical comment -- same real bug, same fix.
 inline void block4_grow_last_row(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
     std::vector<Block4StoredTile>& values,
     std::size_t target_byte_alloc,
-    std::size_t target_elem_alloc)
+    std::size_t target_elem_alloc,
+    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
 {
     if (L.rows == 0) return;
     const std::size_t r = L.rows - 1;
     const std::size_t cur_b = L.row_alloc_bytes(r);
     const std::size_t cur_e = L.row_alloc_elems(r);
     if (target_byte_alloc > cur_b) {
-        ibuf.resize(ibuf.size() + (target_byte_alloc - cur_b), uint8_t(0));
+        const std::size_t new_total = ibuf.size() + (target_byte_alloc - cur_b);
+        if (new_total > max_indices_bytes) throw std::bad_alloc();
+        ibuf.resize(new_total, uint8_t(0));
         L.byte_start[L.rows] = L.byte_start[r] + target_byte_alloc;
     }
     if (target_elem_alloc > cur_e) {
         const std::size_t new_total = L.elem_start[r] + target_elem_alloc;
+        if (new_total * sizeof(Block4StoredTile) > max_tile_bytes) throw std::bad_alloc();
         values.resize(new_total);
         L.elem_start[L.rows] = new_total;
     }
 }
 
-// todo: this needs to be re-written to guarantee it doesn't grow past
-// allocated memory or system RAM
 inline void block4_ensure_row_headroom(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
     std::vector<Block4StoredTile>& values,
-    std::size_t row)
+    std::size_t row,
+    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
 {
     const std::size_t target_b = L.row_alloc_bytes(row) + uleb128_max_bytes<uint32_t>();
     const std::size_t target_e = L.row_alloc_elems(row) + 1;
     if (row + 1 < L.rows)
-        block4_row_shift(L, ibuf, values, row, target_b, target_e);
+        block4_row_shift(L, ibuf, values, row, target_b, target_e, max_indices_bytes, max_tile_bytes);
     else
-        block4_grow_last_row(L, ibuf, values, target_b, target_e);
+        block4_grow_last_row(L, ibuf, values, target_b, target_e, max_indices_bytes, max_tile_bytes);
 }
 
 // Mirrors delta_csr_row_insert_col's exact algorithm (delta_csr_memory.hpp)
@@ -572,6 +592,25 @@ struct Block4Store {
     // todo: fix the other parts so this ACTUALLY saves memory
     uint32_t switch_point = BLOCK4_SPARSE_MAX_COUNT;
 
+    // Real, enforced growth cap -- a SEPARATE, independent budget from
+    // the scattered CSR side's own max_indices_bytes/max_values_bytes
+    // (DeltaCSRWeights), per direction: block4 and scattered represent
+    // the same underlying weights, but sharing one combined budget
+    // between the two representations would need real cross-structure
+    // accounting (which one currently "owns" how many bytes of a
+    // shared pool) -- deferred as a real, acknowledged simplification,
+    // not the safest but simplest correct choice for now. Defaults to
+    // unbounded (SIZE_MAX) for any Block4Store that never calls
+    // set_limits() -- e.g. hand-built test fixtures -- matching
+    // DeltaCSRWeights's own default-unbounded convention.
+    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t max_tile_bytes    = std::numeric_limits<std::size_t>::max();
+
+    void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
+        max_indices_bytes = indices_limit_bytes;
+        max_tile_bytes    = tile_limit_bytes;
+    }
+
     // Persistent scratch buffers for disldo_forward/disldo_backward
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem;
@@ -644,7 +683,11 @@ struct Block4Store {
                     "Block4Store::get_or_create: block_row out of range -- "
                     "was Block4Store::init(n_in, n_out) called?");
             if (!block4_row_insert_tile(block_layout, indices_buf, tile_values, br, bc, Block4StoredTile{})) {
-                block4_ensure_row_headroom(block_layout, indices_buf, tile_values, br);
+                // Real cap enforcement -- see block4_row_shift's comment.
+                // Throws std::bad_alloc if this tile would push block4's
+                // OWN budget (set_limits(), independent from the
+                // scattered CSR side's) past its configured max.
+                block4_ensure_row_headroom(block_layout, indices_buf, tile_values, br, max_indices_bytes, max_tile_bytes);
                 const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_values, br, bc, Block4StoredTile{});
                 (void)ok; // block4_ensure_row_headroom grows by exactly enough for one more tile -- this must succeed
             }

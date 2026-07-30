@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -308,6 +309,43 @@ public:
             _idx_budget_bytes,
             ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
         weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
+        // Real, enforced cap for block4 -- see block4.hpp's
+        // block4_row_shift comment for the bug this closes (block4
+        // grew unboundedly, confirmed reaching ~1.9x max_weights with
+        // zero resistance in a stress test). Deliberately a SEPARATE
+        // budget from weights.connections.set_limits() above, not a
+        // shared one (per direction) -- sized the same way: indices
+        // mirrors the scattered side's own formula (block4's own
+        // uleb128 tile-position index, same encoding, smaller
+        // coordinate range so this is conservative/safe not tight).
+        //
+        // Tile data budget: max_weights / BLOCK4_TILE_SLOTS tiles, NOT
+        // max_weights tiles and NOT max_weights/BLOCK4_PROMOTE_MIN_LIVE
+        // tiles either -- both tried and measured too generous. A tile
+        // holds 2-16 live synapses; dividing by BLOCK4_PROMOTE_MIN_LIVE
+        // (2, assuming worst-case MINIMAL fill) sounds conservative but
+        // is backwards: once promoted, a tile is treated as fully dense
+        // by forward/backward (every slot touched on every call, see
+        // TODO_DUAL_BLOCK4.md's switch_point findings), so REAL tiles
+        // trend toward MAXIMUM fill under training, not minimum.
+        // Confirmed, not hypothetical: at max_weights=200, the /2
+        // formula (100-tile budget) still let block4 reach 381 real
+        // synapses across only 47 tiles (avg ~8.1/tile, nowhere near
+        // the 100-tile cap) before this fix. Dividing by
+        // BLOCK4_TILE_SLOTS (16, max occupancy) instead keeps the
+        // worst-case synapse ceiling at max_weights exactly (every
+        // budgeted tile fully packed) -- the correct assumption given
+        // how tiles actually fill in practice.
+        // Floor of 4 tiles regardless of the formula above -- for a
+        // small max_weights (< BLOCK4_TILE_SLOTS), max_weights/16
+        // rounds down to 0, which would make block4 promotion
+        // impossible even for a legitimately tiny test/toy layer. 4
+        // tiles is a small, arbitrary-but-reasonable floor (matches
+        // this codebase's own small-layer test fixtures, e.g.
+        // test_disldo_block4_promotion.cpp's single-tile usage).
+        weights.block4.set_limits(
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * sizeof(Block4StoredTile));
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
