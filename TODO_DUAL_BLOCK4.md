@@ -1176,6 +1176,69 @@ smaller allocation.
   when trading old/unpromising weights for new ones under a memory/
   compression budget, not just a compression-accuracy fix.
 
+- **`disldo_backward` no longer throws on real budget exhaustion --
+  declines the growth and keeps running instead, done.** Per direction:
+  the row-partitioned fix above still let a tile resize's
+  `std::bad_alloc` (real budget exhaustion mid-write) propagate all the
+  way out of `disldo_backward`, aborting the whole call over ONE tile
+  out of possibly thousands -- fine for structural growth
+  (`get_or_create`/`block4_maybe_promote` inserting a genuinely NEW
+  tile, or the scattered CSR side's own equivalent, both explicitly
+  synaptogenesis-adjacent and still throw as before, a "handler decides
+  what to do" case), but wrong for a value-update op that a system
+  meant to run continuously shouldn't ever crash over. Fixed by moving
+  the resize+decline logic into a new `Block4Store::commit_dirty_sparse_tile`,
+  called from `~Block4TileHandle()`'s `was_sparse_` branch: on
+  `std::bad_alloc` from `block4_resize_tile_in_row`, the tile just keeps
+  its old stored bytes exactly as they were (the budget check runs
+  before any mutation, so a caught throw means nothing was written at
+  all -- never a partial write) and increments a new
+  `Block4Store::dropped_growth_events` counter (via `std::atomic_ref`,
+  not a `std::atomic` field, so `Block4Store` stays trivially copyable)
+  instead of throwing -- exposed to Python as
+  `layer.block4.dropped_growth_events` so a caller doing its own memory
+  management can still detect and react to dropped updates.
+
+  **A real finding surfaced while building the test for this**: given
+  ONLY the normal `get_or_create`/`maybe_compress`/`disldo_backward` API
+  surface, this decline path is essentially unreachable in practice.
+  `block4_ensure_row_headroom` conservatively reserves a full
+  `BLOCK4_TILE_SLOTS` (16) bytes for every NEW tile at creation time,
+  regardless of whether it ends up compressed -- and since that
+  reservation is *never* returned (compress/erase only reduce a row's
+  USED bytes, never its ALLOCATED bytes), a row's headroom pool is an
+  exact, permanent conservation of "16 minus each tile's current size",
+  which by construction always covers any individual tile (or even all
+  of them at once) regrowing back to its own 16-byte reservation. The
+  test that verifies this decline mechanism
+  (`test_backward_declines_growth_gracefully_under_budget_exhaustion`)
+  has to directly shrink a row's allocation via `Block4Store`'s public
+  fields to construct a genuinely tight scenario at all. **This also
+  means tile COUNT capacity within a given `max_tile_bytes` budget
+  hasn't actually increased from the real-compression work (see
+  above)** -- only `total_tile_used_bytes()` (the diagnostic/reporting
+  figure) shrinks from compression; `total_tile_alloc_bytes()` (what
+  actually gates how many tiles can exist) is still sized as if every
+  tile were permanently dense. Whether the original "4x larger AIs"
+  goal needs `block4_ensure_row_headroom`'s reservation policy itself
+  to become compression-aware (not just per-tile storage) is a real,
+  open, NOT yet decided question -- flagging clearly rather than
+  quietly declaring the memory-scaling goal met.
+
+  Verified: a dedicated test drives `disldo_backward` through 2000 real
+  iterations under a deliberately tiny scattered-CSR budget (structural
+  growth throwing as expected/handled) with zero backward-path crashes;
+  the decline-and-continue mechanism itself verified via the
+  directly-constructed test above; full ctest suite clean; the same
+  ThreadSanitizer harness used for the row-partitioning fix still shows
+  zero worker-vs-worker races. A real, measured speed regression was
+  caught and fixed along the way: putting the try/catch directly inside
+  `~Block4TileHandle()` (even though the hot, common early-return path
+  never reaches it) measurably hurt codegen for that destructor --
+  moved into the separate `commit_dirty_sparse_tile` instead, called
+  only from the (rare) `was_sparse_` branch, keeping the destructor
+  itself tiny and try/catch-free.
+
 - **Memory-cap + compression benchmark, done.**
   `tests/unit/test_block4_memory_cap_and_compression.cpp` (ctest,
   hard-CHECK, permanent): drives 1500 iterations of real online

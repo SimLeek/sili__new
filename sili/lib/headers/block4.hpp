@@ -1,5 +1,6 @@
 #pragma once
 #include "fp4quant.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -698,9 +699,9 @@ struct Block4Store;
 // tile_data in place (always exactly BLOCK4_TILE_SLOTS bytes -- never
 // resizes). A sparse tile unpacks into scratch_ at construction and, if
 // dirtied, re-packs (or promotes to dense) at destruction -- see
-// ~Block4TileHandle()'s comment for why that can genuinely need to grow
-// this tile's footprint in tile_data, and why the destructor is therefore
-// NOT noexcept.
+// ~Block4TileHandle()'s comment for what happens when that genuinely
+// needs to grow this tile's footprint but the store's budget won't allow
+// it (declined, not thrown -- see Block4Store::dropped_growth_events).
 class Block4TileHandle {
     Block4Store* store_ = nullptr;
     uint32_t br_ = 0, bc_ = 0;
@@ -719,7 +720,7 @@ public:
     // linear_disldo.hpp's collection loop) -- skips raw_find()'s redundant
     // O(row_nnz) re-scan.
     Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos);
-    ~Block4TileHandle() noexcept(false);
+    ~Block4TileHandle();
 
     Block4TileHandle(Block4TileHandle&& other) noexcept {
         store_ = other.store_; br_ = other.br_; bc_ = other.bc_; byte_pos_ = other.byte_pos_;
@@ -727,12 +728,7 @@ public:
         was_sparse_ = other.was_sparse_; dirty_ = other.dirty_; valid_ = other.valid_;
         other.valid_ = false; other.dirty_ = false; // moved-from: destructor becomes a no-op
     }
-    // NOT noexcept -- flushing the handle being overwritten (below) can
-    // throw std::bad_alloc under real budget exhaustion, same as the
-    // destructor it calls. The move CONSTRUCTOR above never has that
-    // problem (a freshly-initialized `this` is never dirty_), so it's
-    // safe to leave implicitly noexcept.
-    Block4TileHandle& operator=(Block4TileHandle&& other) {
+    Block4TileHandle& operator=(Block4TileHandle&& other) noexcept {
         if (this == &other) return *this;
         // Flush any pending write of THIS handle before taking over
         // other's state -- moving must not silently drop a re-pack.
@@ -798,6 +794,27 @@ struct Block4Store {
         max_indices_bytes = indices_limit_bytes;
         max_tile_bytes    = tile_limit_bytes;
     }
+
+    // Incremented (via std::atomic_ref -- see ~Block4TileHandle()) every
+    // time a VALUE update to an EXISTING tile can't be persisted because
+    // growing its storage would exceed max_tile_bytes. By design this is
+    // the ONLY signal for that condition -- no exception is thrown (see
+    // ~Block4TileHandle()'s comment for why: a backward/value-update op
+    // dropping one write and continuing is far better for a system meant
+    // to run continuously than aborting the whole call). Plain
+    // std::uint64_t, not std::atomic<std::uint64_t>, so Block4Store stays
+    // trivially copyable -- multiple threads in disldo_backward's row-
+    // partitioned parallel loop can each increment this independently via
+    // std::atomic_ref, same guarantee as a real atomic field without
+    // giving up copyability. A caller doing its own memory management
+    // (equalizer_step()/expand_headroom(), or just deciding the budget
+    // needs to grow) can poll this after a call to detect and react to
+    // dropped updates -- structural growth (get_or_create/
+    // block4_maybe_promote inserting a genuinely NEW tile, or the
+    // scattered CSR side's own equivalent) is NOT covered by this and
+    // still throws std::bad_alloc as before -- that's a "handler decides
+    // what to do" case, not a "keep training running regardless" one.
+    std::uint64_t dropped_growth_events = 0;
 
     // Persistent scratch buffers for disldo_forward/disldo_backward
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
@@ -942,6 +959,68 @@ struct Block4Store {
         tile_is_sparse[elem_pos] = 1;
     }
 
+    // Out-of-line, called only from ~Block4TileHandle()'s was_sparse_
+    // branch (rare -- most handles are the dense fast path, which never
+    // reaches this at all). Kept SEPARATE from the destructor itself,
+    // not inlined into it, specifically so the try/catch this needs
+    // (see its own comment) can't affect codegen for the destructor's
+    // own hot, common early-return path -- measured, not assumed: with
+    // the try/catch inlined directly into ~Block4TileHandle(), backward's
+    // speedup over the dense floor at 100% fill dropped from ~1.97x to
+    // ~1.82x even though every tile in that benchmark is dense and never
+    // reaches the try block at all (scripts/bench_block4_vs_dense_fp4.cpp).
+    void commit_dirty_sparse_tile(uint32_t br, uint32_t bc, const uint8_t scratch[BLOCK4_TILE_SLOTS]) {
+        // Re-fetch by COORDINATE, not a cached pointer/offset -- another
+        // call could have inserted/removed a DIFFERENT tile in this same
+        // row in between, shifting every later tile's byte position (see
+        // block4_row_insert_tile/remove_tile). Concurrent erasure of THIS
+        // SAME tile is the other real hazard this guards (see
+        // test_erase_while_handle_alive).
+        std::size_t elem_pos = 0;
+        const std::size_t fresh_byte_pos = raw_find(br, bc, &elem_pos);
+        if (fresh_byte_pos == std::numeric_limits<std::size_t>::max()) return; // was already erased
+
+        const uint32_t n = block4_count_live(scratch);
+        uint8_t packed[BLOCK4_TILE_SLOTS];
+        std::size_t new_len;
+        bool now_sparse;
+        if (n <= switch_point) {
+            block4_sparse_pack(scratch, packed);
+            new_len = block4_sparse_packed_len(uint8_t(n));
+            now_sparse = true;
+        } else {
+            std::memcpy(packed, scratch, BLOCK4_TILE_SLOTS);
+            new_len = BLOCK4_TILE_SLOTS;
+            now_sparse = false;
+        }
+        const std::size_t cur_len = tile_len_at(elem_pos, fresh_byte_pos);
+        // Real budget exhaustion during this resize is handled by
+        // DECLINING the growth, not throwing: per direction, a value-
+        // update op (this represents applying an already-computed
+        // backward/promotion write) dropping just that one write and
+        // letting the caller keep running is far better for a system
+        // meant to run continuously than aborting the whole call over
+        // one tile out of possibly thousands. The tile keeps its OLD
+        // stored bytes/size exactly as they were before this touch --
+        // block4_resize_tile_in_row's budget check runs before any
+        // mutation, so a caught std::bad_alloc means nothing was written
+        // at all, never a partial write. Indicated via
+        // dropped_growth_events so a caller doing its own memory
+        // management can still detect and react to this -- structural
+        // growth (get_or_create/block4_maybe_promote inserting a
+        // genuinely NEW tile) is a DIFFERENT code path and still throws
+        // std::bad_alloc as before; that's a "handler decides what to do
+        // before proceeding" case (synaptogenesis), not a "value update,
+        // keep going regardless" one.
+        try {
+            block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
+                                       br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+            tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
+        } catch (const std::bad_alloc&) {
+            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     std::size_t n_tiles() const { return block_layout.total_nnz; }
 
     // Real total bytes currently allocated for tile storage (across every
@@ -1039,40 +1118,17 @@ inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint3
 // beforehand regardless of real content -- an earlier version did the
 // latter (see TODO_DUAL_BLOCK4.md's "force_dense_at" writeup for why
 // that was wrong: it discarded genuine, persistent compression from
-// sparsity-encouraging losses like L1/KL on every single touch). Since
-// this destructor can now genuinely throw from INSIDE that parallel
-// region, disldo_backward also wraps each thread's row-processing in a
-// try/catch (OpenMP does not support exceptions crossing the parallel-
-// region boundary) and re-throws once on the master thread after the
-// region joins.
-inline Block4TileHandle::~Block4TileHandle() noexcept(false) {
+// sparsity-encouraging losses like L1/KL on every single touch).
+//
+// Kept tiny and try/catch-free on purpose -- see
+// Block4Store::commit_dirty_sparse_tile's comment (block4.hpp) for why
+// the actual repack/resize/decline logic lives in a separate, out-of-
+// line function instead of inline here: a try/catch anywhere in this
+// destructor's body measurably hurt codegen for its own common,
+// early-return (dense/clean/invalid) path, which is by far the hottest
+// one (every dense tile touched by disldo_backward destructs through
+// exactly this function).
+inline Block4TileHandle::~Block4TileHandle() {
     if (!dirty_ || !valid_ || !was_sparse_) return;
-    // Re-fetch by COORDINATE, not the byte_pos_ cached at construction --
-    // another call could have inserted/removed a DIFFERENT tile in this
-    // same row in between, shifting every later tile's byte position
-    // (see block4_row_insert_tile/remove_tile). Concurrent erasure of
-    // THIS SAME tile is the other real hazard this guards (see
-    // test_erase_while_handle_alive).
-    std::size_t elem_pos = 0;
-    const std::size_t fresh_byte_pos = store_->raw_find(br_, bc_, &elem_pos);
-    if (fresh_byte_pos == std::numeric_limits<std::size_t>::max()) return; // was already erased
-
-    const uint32_t n = block4_count_live(scratch_);
-    uint8_t packed[BLOCK4_TILE_SLOTS];
-    std::size_t new_len;
-    bool now_sparse;
-    if (n <= store_->switch_point) {
-        block4_sparse_pack(scratch_, packed);
-        new_len = block4_sparse_packed_len(uint8_t(n));
-        now_sparse = true;
-    } else {
-        std::memcpy(packed, scratch_, BLOCK4_TILE_SLOTS);
-        new_len = BLOCK4_TILE_SLOTS;
-        now_sparse = false;
-    }
-    const std::size_t cur_len = store_->tile_len_at(elem_pos, fresh_byte_pos);
-    block4_resize_tile_in_row(store_->block_layout, store_->tile_byte_start, store_->tile_byte_end,
-                               store_->tile_data, br_, fresh_byte_pos, cur_len, packed, new_len,
-                               store_->max_tile_bytes);
-    store_->tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
+    store_->commit_dirty_sparse_tile(br_, bc_, scratch_);
 }

@@ -36,6 +36,15 @@ public:
     // compression entirely.
     uint32_t get_switch_point() const { return store->switch_point; }
     void set_switch_point(uint32_t v) { store->switch_point = v; }
+    // How many times a backward/promotion value-update to an EXISTING
+    // tile couldn't be persisted because growing its storage would have
+    // exceeded the store's own memory budget -- see block4.hpp:
+    // Block4Store::dropped_growth_events / ~Block4TileHandle(). By
+    // design this is declined, not thrown, so training/inference keeps
+    // running; a caller doing its own memory management can poll this to
+    // detect and react (equalizer_step()/expand_headroom(), or just
+    // accepting some updates are being dropped under the current budget).
+    std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
 private:
     Block4Store* store;
 };
@@ -964,7 +973,13 @@ PYBIND11_MODULE(_cpu, m)
              "Tiles with <= switch_point live synapses may be packed into the"
              " sparse-encoded tile layout instead of staying fully dense (see"
              " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
-             " 0 disables compression entirely. Default 10.");
+             " 0 disables compression entirely. Default 10.")
+        .def_property_readonly("dropped_growth_events", &Block4View::dropped_growth_events,
+             "Count of backward/promotion value-updates to an existing tile that"
+             " couldn't be persisted because growing its storage would have"
+             " exceeded the memory budget -- declined (with the tile keeping its"
+             " old value), not thrown, so training keeps running. Nonzero means"
+             " some updates are being silently dropped under the current budget.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 

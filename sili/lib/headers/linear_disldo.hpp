@@ -11,7 +11,6 @@
 #include "sparse_struct.hpp"
 #include "parallel.hpp"
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -732,19 +731,6 @@ void disldo_backward(
         std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
         t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
 
-        // Real growth-cap exhaustion (std::bad_alloc, thrown from inside
-        // a Block4TileHandle destructor's resize -- see block4.hpp) can
-        // now happen from WITHIN the parallel region below, since tiles
-        // resize based on real content instead of being forced dense
-        // beforehand. OpenMP does not support exceptions propagating
-        // across a #pragma omp parallel region's boundary -- an
-        // uncaught throw inside a worker thread is undefined behavior
-        // (in practice, std::terminate). Each thread catches locally and
-        // records into this shared flag; the master thread re-throws
-        // once, after the region joins, so the caller sees the same
-        // std::bad_alloc it always would have.
-        std::atomic<bool> block4_bad_alloc{false};
-
         #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
@@ -763,13 +749,17 @@ void disldo_backward(
             // resizing ONE tile shifts every LATER tile in ITS OWN row,
             // which is exactly the memory a same-row thread already owns
             // exclusively, never memory another thread could be reading
-            // or writing. schedule(static): row widths CAN vary a lot
-            // (some rows have far more live tiles than others), which in
-            // principle makes static's flat contiguous split load-balance
-            // worse than schedule(dynamic)/schedule(guided) once
-            // num_cpus > 1 -- tried both, measured worse in practice:
-            // their real per-chunk dispatch overhead showed up as a real
-            // backward slowdown at high tile density even at num_cpus=1
+            // or writing. (Real budget exhaustion during that resize is
+            // handled by declining the growth, not throwing -- see
+            // ~Block4TileHandle()'s comment -- so there's no exception-
+            // across-the-parallel-region-boundary concern here either.)
+            // schedule(static): row widths CAN vary a lot (some rows have
+            // far more live tiles than others), which in principle makes
+            // static's flat contiguous split load-balance worse than
+            // schedule(dynamic)/schedule(guided) once num_cpus > 1 --
+            // tried both, measured worse in practice: their real
+            // per-chunk dispatch overhead showed up as a real backward
+            // slowdown at high tile density even at num_cpus=1
             // (scripts/bench_block4_vs_dense_fp4.cpp: dynamic/guided both
             // measured ~1.69x speedup over the dense floor at 100% fill,
             // vs ~1.97x for static -- worse than even the pre-this-fix
@@ -780,7 +770,6 @@ void disldo_backward(
             // imbalance actually costing more wall-clock time than this.
             #pragma omp for schedule(static)
             for (std::size_t br = 0; br < BL4.rows; ++br) {
-            try {
             for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti) {
                 const uint32_t bc = tile_bc[ti];
                 // Non-const: this tile is both read (precompute) and
@@ -1078,20 +1067,8 @@ void disldo_backward(
                     }
                 } // closes for (li...)
             } // closes for (ti...)
-            } // closes try
-            catch (const std::bad_alloc&) {
-                // See the block4_bad_alloc declaration's comment -- this
-                // thread's remaining rows in this omp-for chunk are
-                // simply skipped (their weight updates are lost for this
-                // call), matching how a single-threaded bad_alloc from
-                // this same handle-destructor path would already abort
-                // the rest of THAT row's work; the caller sees the same
-                // std::bad_alloc either way, once the region joins below.
-                block4_bad_alloc.store(true, std::memory_order_relaxed);
-            } // closes catch
             } // closes for (br...)
         } // closes #pragma omp parallel
-        if (block4_bad_alloc.load()) throw std::bad_alloc();
 
         if (learning_rate != value_type(0)) {
             for (std::size_t row = 0; row < n_in; ++row) {

@@ -196,9 +196,92 @@ static void test_real_compression_shrinks_measured_memory() {
                 n_tiles, used_bytes, dense_equivalent_bytes, compression_ratio);
 }
 
+static void test_backward_declines_growth_gracefully_under_budget_exhaustion() {
+    // Per direction: a resize DECLINED under real budget exhaustion must
+    // not throw at all (unlike get_or_create's own structural-growth
+    // path, which still throws std::bad_alloc as before -- see
+    // ~Block4TileHandle()'s comment) -- the write is silently dropped
+    // (old stored bytes kept exactly as they were) and
+    // Block4Store::dropped_growth_events is incremented instead, so
+    // training/inference keeps running and a caller doing its own
+    // memory management can still detect this happened.
+    //
+    // NOTE on construction: block4_ensure_row_headroom conservatively
+    // reserves a full BLOCK4_TILE_SLOTS (16) bytes for every NEW tile at
+    // creation time, regardless of whether it ends up compressed. Given
+    // ONLY the normal get_or_create/maybe_compress/disldo_backward API
+    // surface, that means a row's own local headroom can never actually
+    // run out for an individual tile regrowing back toward its own
+    // 16-byte reservation -- the row-level headroom pool is an exact
+    // conservation of "16 minus each tile's current size", which always
+    // covers any subset of tiles regrowing (this is itself a real,
+    // separate finding: tile COUNT capacity within a given max_tile_bytes
+    // hasn't actually increased from real compression, only the
+    // used-bytes accounting has -- see TODO_DUAL_BLOCK4.md). This test
+    // constructs a genuinely tight row directly (Block4Store's fields
+    // are public specifically so internals like this can be exercised)
+    // to verify the decline-and-continue mechanism for real, since it
+    // matters the moment either max_tile_bytes is lowered below an
+    // already-allocated row's own footprint, or a future, less
+    // conservative row-headroom formula is used.
+    Block4Store store;
+    store.init(16, 16);
+    store.switch_point = 2;
+    {
+        auto h = store.get_or_create(0, 0);
+        h.at(0, 0) = 0x11;
+        h.at(0, 1) = 0x22; // 2 live
+    }
+    store.maybe_compress(0, 0);
+    CHECK(store.is_sparse(0, 0), "setup: tile should be compressed");
+    const std::size_t before_bytes = store.total_tile_used_bytes();
+
+    // Clamp row 0's own allocation down to exactly its current usage
+    // (zero row-local headroom) -- tile_data's real vector size is
+    // untouched (still safe to memmove/resize within), only the
+    // logical boundary every row-growth check reads is tightened.
+    const std::size_t shrink_by = BLOCK4_TILE_SLOTS - before_bytes;
+    for (std::size_t r = 1; r <= store.block_layout.rows; ++r)
+        store.tile_byte_start[r] -= shrink_by;
+    CHECK(store.tile_byte_start[1] - store.tile_byte_start[0] == before_bytes,
+          "row 0's allocation should now be exactly %zu bytes (zero headroom)", before_bytes);
+    // ...and cap the GLOBAL budget at exactly the real (unshrunk)
+    // tile_data size, so growing this row at all -- which now
+    // necessarily means growing tile_data itself -- exceeds it.
+    store.set_limits(std::numeric_limits<std::size_t>::max(), store.total_tile_alloc_bytes());
+
+    bool threw = false;
+    try {
+        auto h = store.find(0, 0);
+        h.at(0, 2) = 0x33; // 3 live > switch_point=2 -- destructor must try to grow to dense
+    } catch (...) {
+        threw = true;
+    }
+    CHECK(!threw, "declining a resize under budget exhaustion must not throw");
+    CHECK(store.dropped_growth_events > 0,
+          "declining the resize should have incremented dropped_growth_events, got %llu",
+          static_cast<unsigned long long>(store.dropped_growth_events));
+
+    // The write was dropped, not partially applied: this tile must
+    // still read back its OLD stored bytes exactly -- slot (0,2) was
+    // never actually persisted, even though the .at() assignment into
+    // the handle's in-memory scratch buffer itself succeeded.
+    {
+        auto h = store.find(0, 0);
+        CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22,
+              "original values must survive a declined-growth destructor");
+        CHECK(h.at(0, 2) == 0,
+              "the declined write itself must not have been persisted");
+    }
+    std::printf("test_backward_declines_growth_gracefully_under_budget_exhaustion: "
+                "dropped_growth_events=%llu, no exception thrown\n",
+                static_cast<unsigned long long>(store.dropped_growth_events));
+}
+
 int main() {
     test_memory_cap_never_exceeded_under_stress();
     test_real_compression_shrinks_measured_memory();
+    test_backward_declines_growth_gracefully_under_budget_exhaustion();
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
