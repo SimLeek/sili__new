@@ -1,20 +1,10 @@
 #ifndef __DELTA_CSR_MEMORY_HPP_
 #define __DELTA_CSR_MEMORY_HPP_
 
-// Split out of sparse_struct.hpp (see conversation). Row-level memory
-// operations on DeltaCSRWeights: build from / convert to absolute CSR,
-// blank-space (headroom) management, row insert/remove/rebuild,
-// synaptogenesis application (synap_row_step) and candidate generation
-// (build_probes) -- these two are natural pairs (generate candidates, then
-// apply them), kept together here. Whole-structure memory ops (compact,
-// expand_headroom) and the actual forward/backward computation are in
-// delta_csr_ops.hpp instead.
-//
-// NOTE: build_probes' docstring was previously separated from its own
-// function by ~130 unrelated lines (compact/expand_headroom got inserted
-// between them by an earlier edit) -- fixed here, docstring now sits
-// directly above the function it documents.
-
+// Row-level memory operations on DeltaCSRWeights: 
+//  build from / convert to absolute CSR, blank-space (headroom) management, 
+//  row insert/remove/rebuild, synaptogenesis application (synap_row_step) 
+//  and candidate generation (build_probes) 
 #include "delta_csr_types.hpp"
 #include <unordered_set>
 #include <numeric>
@@ -32,25 +22,9 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     std::size_t rows, std::size_t cols,
     std::size_t index_bytes, std::size_t values_bytes,
     float blank_fraction = 0.2f,
-    // Hard ceiling this call must never allocate past, independent of
-    // index_bytes/values_bytes above -- those are just this ONE call's
-    // requested reservation, which a caller like expand_headroom() can
-    // compute from CURRENT content size with no awareness of the
-    // layer's original max_weights budget. Defaults to SIZE_MAX
-    // (unbounded, today's pre-existing behavior) for callers that don't
-    // care. Real bug this fixes: DeltaCSRWeights::set_limits() applied
-    // AFTER this function returns is too late -- reserve_values/
-    // reserve_indices below already ran against a freshly-constructed
-    // dc's own default (unbounded) limits by then. See
-    // TODO_DUAL_BLOCK4.md / conversation for the real, measured
-    // overshoot this closes (nnz reached 127x max_weights in a stress
-    // test before this fix).
     std::size_t hard_index_limit_bytes = std::numeric_limits<std::size_t>::max(),
     std::size_t hard_values_limit_bytes = std::numeric_limits<std::size_t>::max())
 {
-    // Let the shifting and gradual modification handle blank space fragmenting
-    // We don't know row sizes or byte lengths for each index, so if we try to evenly assign spaces, we could run out of memory
-    // Todo: We can guarantee we won't by assuming uleb128_max_bytes indices each time if needed, but this is a rarely used function.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> dc;
     dc.set_limits(hard_index_limit_bytes, hard_values_limit_bytes);
@@ -77,24 +51,6 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
         }
     }
 
-
-    // BUG FIX (see conversation): this was `std::size_t blank_fraction = `
-    // with nothing after the `=` before the next statement -- valid C++ that
-    // silently parsed as the chained assignment `blank_fraction = (L.byte_start[0] = 0)`,
-    // zeroing the intended growth-headroom fraction. Confirmed via direct
-    // testing: delta_csr_row_rebuild() failed silently on every row of a
-    // freshly-imported layer (row_alloc_bytes/row_alloc_elems left almost no
-    // slack), so synaptogenesis could never actually grow a connection --
-    // exactly matching this function's own TODO comment above ("we could run
-    // out of memory... can guarantee we won't by assuming uleb128_max_bytes").
-    // 0.2 (20% headroom, elementwise and bytewise) mirrors this session's own
-    // delta_csr_from_absolute (1.2x multiplier) -- proven sufficient for
-    // ordinary synaptogenesis rates in testing throughout this project.
-    // blank_fraction is now a parameter (default 0.2, matching the original
-    // fixed value -- see conversation for the earlier bug where this was
-    // accidentally hardcoded via an incomplete assignment). Exposed so
-    // expand() can offer real caller control over how much headroom to
-    // restore, rather than reusing a fixed amount unconditionally.
     L.byte_start[0] = 0;
     L.elem_start[0] = 0;
     for (std::size_t r = 0; r < rows; ++r) {
@@ -166,15 +122,8 @@ void delta_csr_to_absolute(
     }
 }
 
-// Like delta_csr_to_absolute() above, but also merges in any block4-resident
-// synapses (sorted back into column order per row) -- needed because a
-// caller reading only weights.connections would otherwise silently lose
-// every synapse currently promoted into block4. See cpu_backend.cpp's
-// get_weights_vals()/get_indices()/get_ptrs()/get_importance(), whose
-// whole purpose is exposing "every live synapse" to Python regardless of
-// which representation currently holds it -- returns STORED (not
-// scale-multiplied) weight/importance, same convention as
-// delta_csr_to_absolute() and ValueAccessor::get_w/get_imp.
+// Like delta_csr_to_absolute() above, but also merges in any block4-resident synapses
+// todo: move else functionality into delta_block4_to_absolute to improve code quality
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_combined_to_absolute(
     const SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
@@ -224,24 +173,13 @@ void delta_csr_combined_to_absolute(
                 auto bc_cursor = weights.block4.row_cursor(br);
                 for (std::size_t bk = 0; bk < n_bc; ++bk) {
                     const uint32_t bc = bc_cursor.advance();
-                    // const: read-only export path, should not mark a
-                    // sparse tile's handle dirty (no wasted re-pack of
-                    // unchanged content).
+                    // const: read-only export path
                     const auto tile = weights.block4.find(br, bc);
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const uint8_t byte = tile.at(li, lj);
-                        // A tile is dense (every slot is a real synapse --
-                        // see block4.hpp), but this export path shouldn't
-                        // flood the caller with empty filler slots; "byte
-                        // nonzero" (both nibbles, not just weight -- a
-                        // freshly-grown synapse starts at weight=0.0 with
-                        // only a nonzero importance) is a cheap, good-enough
-                        // heuristic for "worth exporting", not a liveness
-                        // oracle -- a slot trained to exactly (0.0, 0.0) is
-                        // simply skipped this call, same as it would be in
-                        // the scattered CSR path if pruned.
-                        if (byte == 0) continue;
-                        const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+			// we consider weight==0 & importance==0 as empty
+                        if (byte == 0) continue;                       
+			const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         if (col >= L.cols) continue;
                         row_entries.push_back({
                             COL_TYPE(col), FP4_TABLE[byte & 0xFu], FP4_TABLE[(byte >> 4) & 0xFu]});
@@ -261,7 +199,7 @@ void delta_csr_combined_to_absolute(
     }
 }
 
-// ── Blank-space management ────────────────────────────────────────────────────
+// Blank-space management
 
 inline std::size_t delta_csr_target_alloc_bytes(const DeltaCSRLayout& L) {
     return L.rows > 0 ? (L.total_alloc_bytes() + L.rows - 1) / L.rows : 0;
@@ -280,7 +218,7 @@ void delta_csr_shift_row(
     auto& L    = dc.layout;
     auto& ibuf = dc.indices_buf;
 
-    // ── byte side ────────────────────────────────────────────────────────────
+    // byte side
     const std::size_t cur_byte_alloc = L.row_alloc_bytes(row);
     if (cur_byte_alloc != target_byte_alloc && row + 1 < L.rows) {
         const std::size_t move_src  = L.byte_start[row + 1];
@@ -288,17 +226,6 @@ void delta_csr_shift_row(
         const std::size_t new_start = L.byte_start[row] + target_byte_alloc;
 
         if (target_byte_alloc > cur_byte_alloc) {
-            // Real, measured bug this closes: this call grows ibuf via a
-            // plain .resize(), completely bypassing reserve_indices()'s
-            // own max_indices_bytes check -- delta_csr_equalize_step()
-            // (the function actually called every synaptogenesis cycle,
-            // via SparseLinearLayer::equalizer_step()) routes through
-            // HERE, not through delta_csr_from_absolute/reserve_indices
-            // at all. Confirmed via a real stress test: nnz reached
-            // 127x the configured max_weights budget before this check
-            // existed, entirely through repeated equalizer_step() calls
-            // -- the expand_headroom()/set_limits() fixes elsewhere in
-            // this codebase never touch this path.
             const std::size_t new_total = ibuf.size() + (target_byte_alloc - cur_byte_alloc);
             if (new_total > dc.max_indices_bytes) throw std::bad_alloc();
             ibuf.resize(new_total);
@@ -314,19 +241,12 @@ void delta_csr_shift_row(
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             L.byte_start[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.byte_start[r]) + byte_delta);
-        // byte_end[r] for r > row must shift by the same delta: the memmove
-        // physically relocated the data for those rows, so byte_end[r] is now
-        // pointing to the wrong (old) position. Without this update,
-        // row_nnz(r) reads as 0 or underflows for any r > row during a bulk
-        // equalization pass (safe in the one-per-cycle path only because
-        // synap_step rebuilds byte_end via row_rebuild before the equalizer
-        // touches each row).
         for (std::size_t r = row + 1; r < L.rows; ++r)
             L.byte_end[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.byte_end[r]) + byte_delta);
     }
 
-    // ── element side ─────────────────────────────────────────────────────────
+    // element side
     const std::size_t cur_elem_alloc = L.row_alloc_elems(row);
     if (cur_elem_alloc != target_elem_alloc && row + 1 < L.rows) {
         const std::size_t move_src  = L.elem_start[row + 1];
@@ -335,7 +255,6 @@ void delta_csr_shift_row(
         const std::size_t current_total = L.total_alloc_elems();
 
         if (target_elem_alloc > cur_elem_alloc) {
-            // See the byte-side check above -- same real bug, same fix.
             const std::size_t new_total_elems = current_total + (target_elem_alloc - cur_elem_alloc);
             if (ValueAccessor<VALUES_TYPE>::projected_byte_size(new_total_elems) > dc.max_values_bytes)
                 throw std::bad_alloc();
@@ -354,9 +273,6 @@ void delta_csr_shift_row(
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             L.elem_start[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.elem_start[r]) + elem_delta);
-        // Same fix as byte side: elem_end for shifted rows must track the
-        // physical move. row_nnz(r) = elem_end[r] - elem_start[r] underflows
-        // if elem_start is updated but elem_end is not.
         for (std::size_t r = row + 1; r < L.rows; ++r)
             L.elem_end[r] = static_cast<std::size_t>(
                 static_cast<std::ptrdiff_t>(L.elem_end[r]) + elem_delta);
@@ -376,7 +292,7 @@ void delta_csr_equalize_step(
     current_row = (current_row + 1) % dc.layout.rows;
 }
 
-// ── Row-level insert / remove (for incremental synaptogenesis) ────────────────
+// Row-level insert / remove (for incremental synaptogenesis)
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 COL_TYPE delta_csr_row_last_col(
@@ -398,15 +314,7 @@ bool delta_csr_row_rebuild(
 {
     auto& L = dc.layout;
     const std::size_t n = cols.size();
-    // BUG FIX (see conversation): must capture the OLD row_nnz BEFORE
-    // L.elem_end[row] is overwritten below -- row_nnz(row) reads
-    // elem_end[row]-elem_start[row], so calling it AFTER the write (as the
-    // original code did, a few lines down) always returns the NEW count,
-    // making nnz_delta = n - n = 0 unconditionally. Confirmed via direct
-    // testing: delta_csr_row_rebuild reported success and correctly wrote
-    // new synapse data, but dc.nnz()/total_nnz never changed -- so every
-    // caller relying on nnz() to observe growth (including synaptogenesis
-    // callers checking "did this actually grow") silently saw no change.
+
     const std::size_t old_row_nnz = L.row_nnz(row);
 
     uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
@@ -497,20 +405,12 @@ void delta_csr_row_remove(
 }
 
 
-// ── In-place insert/remove for delta-encoded rows ────────────────────────────
+// In-place insert/remove for delta-encoded rows
 //
-// These replace the old "read all, rebuild from scratch" pattern in
-// delta_csr_synap_row_step. The key property: removing a connection shrinks
-// the row's byte count by (delta_A_bytes + delta_B_bytes - delta_AB_bytes),
-// which is at least 0 and usually positive. Inserting a connection expands by
-// delta_new_bytes + delta_updated_next_bytes - delta_old_next_bytes, which for
-// typical small-delta layers (column indices 0..n_out where n_out <= 16384) is
-// 1-2 bytes. Doing removals first then insertions means the freed bytes from
-// removals are immediately available for insertions -- synaptogenesis with
-// equal add/remove counts works with near-zero headroom.
-
 // Remove the connection at column `target_col` from row `row` in-place.
 // Returns false if target_col is not found (no-op).
+//
+// Calling this before adding requires less headroom.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 bool delta_csr_row_remove_col(
@@ -581,8 +481,7 @@ bool delta_csr_row_remove_col(
 // Insert a new connection at `new_col` in row `row` in sorted order, in-place.
 // Returns true on success, false if the row has insufficient blank space.
 // On false: the row's blank space is exhausted. Call equalizer_step() to
-// redistribute space from adjacent rows, then retry. Callers must not
-// silently skip on false -- check the return value and handle it.
+// redistribute space from adjacent rows, then retry.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 bool delta_csr_row_insert_col(
@@ -672,37 +571,10 @@ bool delta_csr_row_insert_col(
     return true;
 }
 
-// ── block4 promotion / demotion ──────────────────────────────────────────────
+// block4 promotion / demotion
 //
-// Directional by design (see TODO_DUAL_BLOCK4.md's "Design decisions"):
-// growth (synaptogenesis) can only PROMOTE scattered -> block4; pruning can
-// only DEMOTE block4 -> scattered. Never the reverse. Checked at the
-// specific event touching the specific tile, not a periodic sweep.
-//
-// Both directions move a synapse's weight+importance losslessly: block4
-// shares the OWNING SparseLinearWeightsDelta's own value_scale/output_scale
-// with the scattered path (see block4.hpp), so re-quantizing an
-// already-exact FP4_TABLE value via fp4_quantize() round-trips exactly --
-// going through ValueAccessor::get_w/get_imp (float, exact table lookup)
-// and fp4_quantize() (exact round-trip) on the way, rather than poking
-// FP4BiPacked's internal byte layout directly.
-//
-// out_degree is intentionally left untouched by both: it already counts a
-// synapse once, at its ORIGINAL scattered insertion (this file's own
-// delta_csr_synap_row_step Step 6), and means "total live synapses feeding
-// this column regardless of current representation" -- both disldo_backward's
-// scattered path and block4's own backward write into the SAME output_scale
-// gradient buffer, normalized once by out_degree (see linear_disldo.hpp).
-// Only an actual prune (a real removal, not a representation move) changes
-// it -- see delta_csr_synap_row_step's Step 5 below.
-
-// Growth-only hook: call after a NEW synapse was just inserted into the
-// scattered CSR at (row, col). If the tile covering (row, col) is already
-// block4, migrates just this one synapse in. Otherwise scans the tile's
-// <=BLOCK4_TILE rows of scattered CSR data within its column span; if the
-// live count (including this new synapse) meets BLOCK4_PROMOTE_MIN_LIVE,
-// promotes the WHOLE tile (every synapse found in its coverage moves out of
-// `connections` into a new Block4Tile). Never demotes.
+// growth (synaptogenesis) can only promote scattered -> block4; pruning can
+// only DEMOTE block4 -> scattered.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 void block4_maybe_promote(
@@ -715,33 +587,9 @@ void block4_maybe_promote(
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
         auto& L  = dc.layout;
-        // Lazy self-init, not a requirement every construction site has to
-        // remember: this is the ONLY place a block4 tile is ever first
-        // created (block4_demote_tile only ever runs on an already-promoted
-        // tile, so it can't be reached with an uninitialized store either).
-        // Without this, weights.block4.get_or_create() below would index
-        // block_layout's byte_start/elem_start (both empty, rows=0) out of
-        // bounds the first time ANY caller forgot to call
-        // weights.block4.init(n_in, n_out) explicitly -- a real, easy-to-
-        // hit latent crash, not hypothetical (caught while updating this
-        // session's own test suite for the ULEB128 tile-indexing redesign).
-        if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
+        // Lazy self-init
+	if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
-            // Real cap enforcement, even for a caller that never
-            // explicitly called weights.block4.set_limits() itself
-            // (e.g. one that relies entirely on this lazy self-init,
-            // unlike SparseLinearLayer's constructor, which sets real
-            // limits up front) -- default derived from the scattered
-            // CSR side's own limits (dc.max_values_bytes is ~1
-            // byte/synapse for FP4BiPacked, the only VALUES_TYPE that
-            // reaches this branch, so it's a reasonable max_weights
-            // proxy). Same /BLOCK4_TILE_SLOTS derivation as
-            // SparseLinearLayer's constructor -- see its comment for
-            // why (tiles trend toward MAXIMUM fill under real
-            // training, not minimum, so budgeting by
-            // BLOCK4_PROMOTE_MIN_LIVE was measurably too generous).
-            // Floor of 4 tiles -- see SparseLinearLayer's identical
-            // comment (cpu_backend.cpp) for why.
             weights.block4.set_limits(
                 dc.max_indices_bytes,
                 std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
@@ -763,16 +611,8 @@ void block4_maybe_promote(
                     {
                         auto tile = weights.block4.find(br, bc);
                         tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
-                    } // tile's scope ends here -- a sparse tile's own
-                      // destructor already re-evaluates compression on
-                      // any dirty write (re-packs or promotes to dense as
-                      // needed); a dense tile's destructor is a no-op, so
-                      // maybe_compress below closes the one remaining gap
-                      // (a dense tile that's STILL under switch_point
-                      // after this single-synapse add would otherwise
-                      // never become compressed until some other
-                      // pruning-driven event touches it).
-                    weights.block4.maybe_compress(br, bc);
+                    } 
+		    weights.block4.maybe_compress(br, bc);
                     delta_csr_row_remove_col(dc, row, col);
                     return;
                 }
@@ -808,32 +648,15 @@ void block4_maybe_promote(
                 const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
                 tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
             }
-        } // tile's scope ends here -- get_or_create's tile always starts
-          // dense, so this destructor is a no-op regardless, but ending
-          // its lifetime before maybe_compress below keeps the ordering
-          // unambiguous.
-        // A newly-promoted tile is typically small (found.size() can be
-        // as low as BLOCK4_PROMOTE_MIN_LIVE=2) -- give it a chance to
-        // start compressed right away, same explicit-check pattern as
-        // everywhere else (never automatic on every write).
-        weights.block4.maybe_compress(br, bc);
-        // Removal happens after ALL reads above -- each row's synapses are
-        // fully read before any of them are removed, so a removal's shift of
-        // later byte offsets in that row can never invalidate an elem_idx
-        // this loop still needs.
+        }
+	weights.block4.maybe_compress(br, bc);
         for (const auto& f : found)
             delta_csr_row_remove_col(dc, f.row, f.col);
     }
 }
 
-// Pruning-only hook: demotes the WHOLE tile at (br,bc) back to the scattered
-// CSR -- every remaining live synapse in it moves into `connections` via
-// delta_csr_row_insert_col, then the tile is erased. Called only after a
-// block4-resident synapse was just pruned and the tile's count_live() (an
-// on-demand scan, see block4.hpp) dropped below BLOCK4_PROMOTE_MIN_LIVE
-// (never called for growth). Throws if a
-// target row has run out of blank space -- same contract as
-// delta_csr_synap_row_step's own Step 6.
+// Pruning-only hook.
+// Throws if a target row has run out of blank space 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 void block4_demote_tile(
@@ -856,9 +679,6 @@ void block4_demote_tile(
                 if (row >= L.rows) continue;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const uint8_t byte  = tile.at(li, lj);
-                    // Same "byte nonzero" heuristic as the export path above --
-                    // re-inserting an exactly-(0.0,0.0) slot into the scattered
-                    // CSR would just be storing a meaningless entry.
                     if (byte == 0) continue;
                     const uint8_t wcode = byte & 0xFu;
                     const std::size_t col = col_lo + lj;
@@ -876,24 +696,14 @@ void block4_demote_tile(
                     }
                 }
             }
-        } // tile's scope ends here, BEFORE erase() -- this read-only handle's
-          // destructor would try to re-pack a now-invalidated pointer if it
-          // outlived the erase() below (see Block4TileHandle's class comment
-          // for why the destructor re-fetches by coordinate rather than
-          // trusting a cached pointer -- this scoping is still the right
-          // fix here regardless, since there's nothing meaningful to write
-          // back to a tile about to be erased anyway).
-        weights.block4.erase(br, bc);
+        } 
+	weights.block4.erase(br, bc);
     }
 }
 
-// ── Incremental synaptogenesis step ──────────────────────────────────────────
+// Incremental synaptogenesis step
 //
-// Replaces the old "read all, merge, rebuild from scratch" approach with
-// in-place per-connection insert and remove. This eliminates the need to
-// pre-allocate uleb128_max (5) bytes per potential connection: for typical
-// layers (n_out <= 16384), deltas encode in 1-2 bytes, so the blank space per
-// row only needs to cover the NET GROWTH per step (additions - removals).
+// in-place per-connection insert and remove. 
 //
 // Algorithm per row:
 //   1. Walk row once: collect (col, weight, importance) for all connections.
@@ -909,10 +719,6 @@ void block4_demote_tile(
 //      the error by calling equalizer_step() to redistribute blank space from
 //      adjacent rows, then retry. If the total pool is exhausted, the error
 //      message explains what to do (prune more / lower max_row_weights).
-//
-// out_degree update mirrors the old implementation: decrement for removed
-// columns, increment for added columns.
-
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 bool delta_csr_synap_row_step(
@@ -932,13 +738,6 @@ bool delta_csr_synap_row_step(
     const std::size_t n_scattered = L.row_nnz(row);
     const bool has_probes = weights.probes.indices[0] &&
                             !weights.probes.indices[0]->empty();
-    // block4-resident entries for this row's block-row, across every
-    // block-column that currently has a live tile there -- looked up via
-    // Block4Store::by_block_row so this stays cheap even when the store
-    // holds many tiles elsewhere in the layer (see block4.hpp). Merged into
-    // the SAME cutoff/max_row_weights ranking as the scattered entries
-    // below: capacity and importance-cutoff decisions treat both
-    // representations as one pool for this row, per design.
     const uint32_t br = uint32_t(row / BLOCK4_TILE);
     const uint32_t li = uint32_t(row % BLOCK4_TILE);
     std::vector<uint32_t> b4_bc, b4_lj;
@@ -949,17 +748,9 @@ bool delta_csr_synap_row_step(
             auto bc_cursor = weights.block4.row_cursor(br);
             for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 const uint32_t bc = bc_cursor.advance();
-                // const: read-only discovery scan, should not mark a
-                // sparse tile's handle dirty.
-                const auto tile = weights.block4.find(br, bc);
+                // const: read-only discovery scan
+		const auto tile = weights.block4.find(br, bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    // "Byte nonzero" as the discovery heuristic -- same
-                    // reasoning as the export/demote paths: a tile slot
-                    // trained to exactly (0.0, 0.0) isn't a meaningful
-                    // synapse for capacity/pruning accounting purposes,
-                    // same as an absent scattered CSR entry. Weight nibble
-                    // alone would miss a freshly-grown synapse (weight=0.0
-                    // by Step 6's insert convention, importance nonzero).
                     if (tile.at(li, lj) == 0) continue;
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= L.cols) continue;
@@ -972,7 +763,7 @@ bool delta_csr_synap_row_step(
     const std::size_t n_exist = n_scattered + b4_bc.size();
     if (n_exist == 0 && !has_probes) return false;
 
-    // ── Step 1: Read existing connections (scattered, then block4) ────────
+    // Step 1: Read existing connections (scattered, then block4)
     std::vector<COL_TYPE>   exist_cols(n_exist);
     std::vector<value_type> exist_w(n_exist), exist_imp(n_exist);
     std::vector<bool>       exist_is_b4(n_exist, false);
@@ -999,7 +790,7 @@ bool delta_csr_synap_row_step(
         }
     }
 
-    // ── Step 2: Collect probes for this row ────────────────────────────────
+    // Step 2: Collect probes for this row
     std::vector<COL_TYPE>   probe_cols;
     std::vector<value_type> probe_scores;
     if (has_probes) {
@@ -1015,8 +806,7 @@ bool delta_csr_synap_row_step(
         }
     }
 
-    // ── Step 3: Determine which connections to remove ──────────────────────
-    // Collect indices into exist_* sorted by importance ascending.
+    // Step 3: Determine which connections to remove
     std::vector<std::size_t> by_imp(n_exist);
     std::iota(by_imp.begin(), by_imp.end(), 0);
     std::sort(by_imp.begin(), by_imp.end(),
@@ -1035,11 +825,10 @@ bool delta_csr_synap_row_step(
     }
     // Sort descending so scattered removes happen high col first -- keeps
     // byte positions of lower-col elements stable while we walk and remove
-    // (block4 removes don't shift anything, order doesn't matter for them).
     std::sort(to_remove.begin(), to_remove.end(),
               [](const RemoveEntry& a, const RemoveEntry& b) { return a.col > b.col; });
 
-    // ── Step 4: Determine which probes to add ─────────────────────────────
+    // Step 4: Determine which probes to add
     // Filter out probes that already have a connection.
     {
         std::unordered_set<COL_TYPE> exist_set(exist_cols.begin(), exist_cols.end());
@@ -1073,11 +862,7 @@ bool delta_csr_synap_row_step(
         probe_scores = std::move(add_scores);
     }
 
-    // ── Step 5: Apply removes (in-place, high-col first) ──────────────────
-    // A real prune either way (scattered delete, or block4 byte-silence) --
-    // out_degree is decremented in both cases, unlike promotion/demotion's
-    // pure representation moves (see the block4_maybe_promote/
-    // block4_demote_tile comment above).
+    // Step 5: Apply removes (in-place, high-col first)
     for (const auto& re : to_remove) {
         if (re.is_b4) {
             if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
@@ -1088,18 +873,11 @@ bool delta_csr_synap_row_step(
                     auto tile = weights.block4.find(br, bc);
                     if (tile && tile.at(li, lj) != 0) {
                         tile.at(li, lj) = 0;
-                        // count_live() is a cheap O(16) on-demand scan (cold
-                        // path -- one prune event, not every backward call);
-                        // see block4.hpp for why there's no incrementally
-                        // tracked live_count anymore.
                         should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
                     }
-                } // tile's scope ends here, BEFORE block4_demote_tile below --
-                  // that function calls weights.block4.erase() on this SAME
-                  // (br,bc), which would invalidate an outstanding handle's
-                  // cached pointer (see Block4TileHandle's class comment).
-                if (should_demote)
-                    block4_demote_tile(weights, br, bc); // pruning-only: demotes, never promotes
+                } 
+		if (should_demote)
+                    block4_demote_tile(weights, br, bc);
             }
         } else {
             delta_csr_row_remove_col(dc, row, re.col);
@@ -1108,18 +886,13 @@ bool delta_csr_synap_row_step(
             --weights.out_degree[re.col];
     }
 
-    // ── Step 6: Apply adds in-place ──────────────────────────────────────
-    // Throws on first insertion failure (no blank space in this row).
-    // Caller should call equalizer_step() to redistribute blank from adjacent
-    // rows before retrying. If the total pool is exhausted, prune more
-    // aggressively (lower max_row_weights or raise importance_cutoff).
+    // Step 6: Apply adds in-place
     for (std::size_t i = 0; i < probe_cols.size(); ++i) {
         const COL_TYPE col = probe_cols[i];
         if (!delta_csr_row_insert_col(dc, row, col, value_type(0), probe_scores[i])) {
             const std::size_t used  = dc.layout.byte_end[row] - dc.layout.byte_start[row];
             const std::size_t alloc = dc.layout.row_alloc_bytes(row);
-            // Include the probe index so callers can infer the exact split:
-            // probes[0..i-1] were successfully inserted, probes[i..n-1] remain.
+            // Include the probe index so callers can infer the exact split
             throw std::runtime_error(
                 "delta_csr_synap_row_step: row " + std::to_string(row) +
                 " ran out of blank space at probe_index=" + std::to_string(i) +
@@ -1131,9 +904,6 @@ bool delta_csr_synap_row_step(
         }
         if (!weights.out_degree.empty())
             ++weights.out_degree[col];
-        // Growth-only hook: may immediately move this synapse (and possibly
-        // its whole tile) into block4 -- never demotes. See the comment
-        // block above block4_maybe_promote's definition.
         if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>)
             block4_maybe_promote(weights, row, col);
     }
@@ -1141,7 +911,7 @@ bool delta_csr_synap_row_step(
     return true;
 }
 
-// ── Probe generation (outer product, top-k) ───────────────────────────────────
+// Probe generation (outer product, top-k)
 
 /**
  * @brief Build COO probe candidates for synaptogenesis via outer product.
@@ -1163,7 +933,7 @@ bool delta_csr_synap_row_step(
  *
  * Complexity: O(n_inputs + n_outputs) for the top-k selection, O(k^2 *
  * avg_row_nnz) for the existing-connection filter -- fine for small k
- * (typically 64-256, matching genesis_build_probes' historical usage).
+ * (typically 2-4).
  *
  * @param weights             Layer state -- probes are replaced.
  * @param neuron_input_accum  [n_inputs] accumulated |x| across recent passes.
@@ -1188,18 +958,6 @@ bool delta_csr_synap_row_step(
  *                            wasted-slots effect is more pronounced -- not
  *                            worth the extra cost for small layers.
  *
- * NOTE (test): with k >= n_inputs and k >= n_outputs, every input/output is
- * a candidate, so probe count == (n_inputs*n_outputs - existing_nnz) minus
- * any duplicate outer-product collisions (none possible here since inputs
- * and outputs are each selected without repetition) -- a useful upper-bound
- * regression check.
- * NOTE (test): a pair that already exists in connections must never appear
- * in probes, regardless of how high its accum-derived importance would be.
- * NOTE (test): per_row=true must yield >= as many probes as per_row=false
- * for the same (weights, accum, k) -- guaranteed since per_row never wastes
- * a candidate slot on an already-connected pair. Construct a case where a
- * row's shared-top-k output set is dominated by its own existing
- * connections (global mode starves it) to see the difference concretely.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_build_probes(
@@ -1222,7 +980,7 @@ void delta_csr_build_probes(
     const std::size_t kk_in  = std::min(static_cast<std::size_t>(k), n_in);
     const std::size_t kk     = static_cast<std::size_t>(k);
 
-    // ── Top-k inputs by accumulated activity (shared by both modes) ──────────
+    // Top-k inputs by accumulated activity (shared by both modes)
     std::vector<std::size_t> in_idx(n_in);
     std::iota(in_idx.begin(), in_idx.end(), 0);
     std::partial_sort(in_idx.begin(), in_idx.begin() + kk_in, in_idx.end(),
@@ -1235,7 +993,7 @@ void delta_csr_build_probes(
     std::vector<value_type>  pval;
 
     if (!per_row) {
-        // ── Global mode: one shared top-k output set, outer product, filter after ──
+        // Global mode: one shared top-k output set, outer product, filter after
         const std::size_t kk_out = std::min(kk, n_out);
         std::vector<std::size_t> out_idx(n_out);
         std::iota(out_idx.begin(), out_idx.end(), 0);
@@ -1265,7 +1023,7 @@ void delta_csr_build_probes(
             }
         }
     } else {
-        // ── Per-row mode: independent top-k per row, existing conns excluded
+        // Per-row mode: independent top-k per row, existing conns excluded
         //    DURING selection -- guarantees up to k genuinely-new candidates
         //    per row instead of losing slots to duplicates found afterward.
         prow.reserve(kk_in * kk);
@@ -1280,7 +1038,7 @@ void delta_csr_build_probes(
                 for (std::size_t i = 0; i < n_exist; ++i) exist_cols[i] = cur.advance();
             }
 
-            // Candidates = all outputs NOT already connected to this row.
+            // Candidates = all outputs not already connected to this row.
             std::vector<std::size_t> cand;
             cand.reserve(n_out);
             for (std::size_t c = 0; c < n_out; ++c)
