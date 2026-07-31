@@ -11,7 +11,7 @@
 // ValueAccessor<FP4BiPacked>/ValueAccessor<DeltaCSRBiValues<T>>,
 // DeltaCSRLayout/DeltaCSRRowCursor/DeltaCSRWeights, SparseLinearWeightsDelta.
 // Free functions operating on these types are in delta_csr_memory.hpp and
-// delta_csr_ops.hpp. sparse_struct.hpp remains a valid, working include
+// sisldo_ops.hpp. sparse_struct.hpp remains a valid, working include
 // (umbrella of all three) for any existing code.
 
 #include <algorithm>

@@ -136,7 +136,7 @@ public:
     {
         output_buf.assign(batch * n_outputs(), V(0));
         auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
-        sisldo_forward(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
+        sisldo_forward_trivalues(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
 
         return py::array_t<V>(
             {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
@@ -167,7 +167,7 @@ public:
         auto out_grad_csr = numpy_to_sparse_input(
             dy_sparse_ptrs, dy_sparse_indices, dy_sparse_values, batch, n_outputs());
 
-        sisldo_backward(
+        sisldo_backward_trivalues(
             input_csr, weights, out_grad_csr,
             dx.data(), (V*)dybuf.ptr,
             neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate,
@@ -258,9 +258,9 @@ public:
 // sparse, e.g. after a top-k/threshold step run BETWEEN layers -- that
 // sparsification is intentionally a separate operation, not something this
 // class decides for itself) had no surviving implementation anywhere in
-// this repo. forward_sparse uses delta_csr_forward (already existed in
+// this repo. forward_sparse uses sisldo_forward (already existed in
 // this file, generic over VALUES_TYPE); backward_sparse uses
-// delta_csr_backward_sparse_grad (dense input, sparse gradient -- see
+// disldo_backward_sparse_grad (dense input, sparse gradient -- see
 // forward_sparse/backward_sparse comment below for why these are NOT
 // mirror images of each other). Both verified correct against
 // hand-computed references before wiring up -- see conversation.
@@ -454,7 +454,7 @@ public:
     {
         auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
         output_buf.assign(batch * n_outputs(), V(0));
-        delta_csr_forward<S, FP4BiPacked, COL_TYPE>(
+        sisldo_forward<S, FP4BiPacked, COL_TYPE>(
             input, weights, output_buf.data(), learning_rate, num_cpus);
         return py::array_t<V>(
             {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
@@ -470,7 +470,7 @@ public:
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
-        delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+        disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});

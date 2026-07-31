@@ -1336,13 +1336,13 @@ smaller allocation.
   EVERY single access -- realistic steady-state usage, where most
   tiles don't flip every touch, pays this far less often).
 - **Done: sparse CSR input now routes through block4-aware
-  `delta_csr_forward`/`delta_csr_backward_sparse_grad`, with a real,
+  `sisldo_forward`/`disldo_backward_sparse_grad`, with a real,
   measured speed win over dense input at every tested density.**
 
-  **The bug closed**: neither `delta_csr_forward` (forward_sparse) nor
-  `delta_csr_backward_sparse_grad` (backward_sparse) ever touched
+  **The bug closed**: neither `sisldo_forward` (forward_sparse) nor
+  `disldo_backward_sparse_grad` (backward_sparse) ever touched
   `weights.block4` at all (confirmed via `grep -n block4
-  delta_csr_ops.hpp` returning nothing beforehand) -- any layer with
+  sisldo_ops.hpp` returning nothing beforehand) -- any layer with
   block4-promoted synapses silently dropped their contribution through
   either sparse-input path. Independent of and pre-dating this
   session's speed work.
@@ -1399,7 +1399,7 @@ smaller allocation.
   which does NOT match block4's row-major layout (no column index
   exists), so gathering "all tiles at this bc across every br" would
   need a full row scan per active bc -- expensive. Instead,
-  `delta_csr_backward_sparse_grad`'s block4 phase parallelizes by
+  `disldo_backward_sparse_grad`'s block4 phase parallelizes by
   BLOCK-ROW (like the scattered path in the same function already
   does) and has each row do its own independent merge-scan against the
   sorted gradient CSR (mirroring the scattered loop's own
@@ -1413,7 +1413,7 @@ smaller allocation.
 
   Correctness-first scalar port for both directions (no `Block4Vec`
   SIMD, no batch-loop vectorization) -- matches the measured-not-
-  assumed philosophy already established for `delta_csr_forward`'s
+  assumed philosophy already established for `sisldo_forward`'s
   original scattered-path block4 addition; revisit with real profiling
   if a benchmark ever shows this scalar version is the bottleneck.
   `KNOWN SIMPLIFICATION` carried over unchanged from `disldo_backward`:
@@ -1517,7 +1517,7 @@ smaller allocation.
      code directly -- per the user, raw codes alone (16 levels) aren't
      enough resolution to break ties meaningfully.
 
-     Applied to both `delta_csr_backward_sparse_grad` (only for its
+     Applied to both `disldo_backward_sparse_grad` (only for its
      `learning_rate != 0` branch -- the `== 0` branch never writes, so
      it keeps the plain, cheaper shared-store read path) and
      `disldo_backward` (applied UNCONDITIONALLY, even at
@@ -1529,7 +1529,7 @@ smaller allocation.
      slowdown on `disldo_backward`'s READ-ONLY (`learning_rate == 0`,
      e.g. eval/inference) path specifically, from the now-unconditional
      row snapshot+merge-back overhead that buys nothing when nothing is
-     ever written. `delta_csr_backward_sparse_grad` avoids this same
+     ever written. `disldo_backward_sparse_grad` avoids this same
      cost by branching, same as it already needed to for other reasons.
      Not yet decided whether `disldo_backward`'s read-only path is worth
      the same split -- flagged here as a known, measured, deferred

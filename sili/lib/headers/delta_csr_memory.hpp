@@ -925,7 +925,7 @@ bool delta_csr_synap_row_step(
  * Generic over VALUES_TYPE via ValueAccessor -- works identically for
  * FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit) with no
  * separate implementation, matching delta_csr_synap_row_step (which
- * applies these probes) and delta_csr_forward/backward.
+ * applies these probes) and sisldo_forward/backward.
  *
  * Existing-connection check uses DeltaCSRRowCursor directly (no full row
  * materialization) -- O(row_nnz) per candidate input row, same complexity

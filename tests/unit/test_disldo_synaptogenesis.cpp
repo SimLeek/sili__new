@@ -351,14 +351,14 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     CHECK(weights.connections.nnz() + weights.block4.live_synapses() > nnz_before);
 }
 
-// ── delta_csr_backward_sparse_grad ────────────────────────────────────────────
+// ── disldo_backward_sparse_grad ────────────────────────────────────────────
 //
 // Dense input, sparse gradient -- deliberately the ONLY sparse-gradient
 // backward variant (see conversation: sparse-input backward was confirmed
 // wrong and removed). These tests exist specifically to verify the actual
 // point of that design, not just basic correctness.
 
-TEST_CASE("delta_csr_backward_sparse_grad: dx reaches a row whose input was exactly zero",
+TEST_CASE("disldo_backward_sparse_grad: dx reaches a row whose input was exactly zero",
          "[disldo][backward][regression]") {
     // The core property this design exists for: a row that "didn't fire"
     // (input==0) must still receive a correct, nonzero dx if its connected
@@ -389,7 +389,7 @@ TEST_CASE("delta_csr_backward_sparse_grad: dx reaches a row whose input was exac
     dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
-    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+    disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.0f, 1);
 
     // dx[1] = W[1,1] * dy[1] = 0.5 * 0.8 = 0.4 -- weight-only, independent
@@ -402,7 +402,7 @@ TEST_CASE("delta_csr_backward_sparse_grad: dx reaches a row whose input was exac
     CHECK(dx[2] == Catch::Approx(0.0f).margin(1e-5f));
 }
 
-TEST_CASE("delta_csr_backward_sparse_grad: weight update stays near-static for a row that didn't fire",
+TEST_CASE("disldo_backward_sparse_grad: weight update stays near-static for a row that didn't fire",
          "[disldo][backward][regression]") {
     // Complementary half of the same property: dx reaches the row (above),
     // but the WEIGHT update should still scale with the true input value,
@@ -430,7 +430,7 @@ TEST_CASE("delta_csr_backward_sparse_grad: weight update stays near-static for a
     dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
-    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+    disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.1f, 1);
 
     auto cur = weights.connections.row_cursor(1);
@@ -440,7 +440,7 @@ TEST_CASE("delta_csr_backward_sparse_grad: weight update stays near-static for a
     CHECK(w1_after == Catch::Approx(0.5f).margin(1e-3f));
 }
 
-TEST_CASE("delta_csr_backward_sparse_grad matches dense reference when gradient covers everything",
+TEST_CASE("disldo_backward_sparse_grad matches dense reference when gradient covers everything",
          "[disldo][backward]") {
     // Sanity check: with every output column present in the "sparse"
     // gradient (i.e. it's not really sparse), results must match a plain
@@ -468,7 +468,7 @@ TEST_CASE("delta_csr_backward_sparse_grad matches dense reference when gradient 
     dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.3f, -0.5f, 0.2f, 0.4f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
-    delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+    disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         input.data(), SIZE_TYPE(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(), 0.0f, 1);
 
     // Same reference as the disldo_backward dense test: dx[0]=0.05, dx[1]=-0.25, dx[2]=1.2

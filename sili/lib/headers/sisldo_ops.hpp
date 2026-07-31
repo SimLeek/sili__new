@@ -1,10 +1,10 @@
-#ifndef __DELTA_CSR_OPS_HPP_
-#define __DELTA_CSR_OPS_HPP_
+#ifndef __SISLDO_OPS_HPP_
+#define __SISLDO_OPS_HPP_
 
 // Split out of sparse_struct.hpp (see conversation). Whole-structure memory
 // operations (compact/expand_headroom -- opposite operations, see their own
-// docstrings) and the actual forward/backward computation: delta_csr_forward
-// (SISLDO -- sparse input) and delta_csr_backward_sparse_grad (dense input,
+// docstrings) and the actual forward/backward computation: sisldo_forward
+// (SISLDO -- sparse input) and disldo_backward_sparse_grad (dense input,
 // sparse gradient -- deliberately NOT sparse input; see its own docstring
 // for why sparse-input backward permanently loses the ability to correct
 // "didn't fire & should have").
@@ -32,7 +32,7 @@
  *
  * Generic over VALUES_TYPE via ValueAccessor -- one implementation for both
  * FP4BiPacked and DeltaCSRBiValues<float>, matching the rest of this file's
- * pattern (delta_csr_forward/backward/build_probes/synap_row_step).
+ * pattern (sisldo_forward/backward/build_probes/synap_row_step).
  *
  * NOTE (test): must be lossless -- decode every synapse from the input and
  * the output (column indices via row_cursor, weight/importance via
@@ -187,7 +187,7 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-void delta_csr_forward(
+void sisldo_forward(
     const CSRInput<SIZE_TYPE, typename ValueAccessor<VALUES_TYPE>::value_type>& input_tensor,
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     typename ValueAccessor<VALUES_TYPE>::value_type* output,
@@ -580,7 +580,7 @@ void delta_csr_forward(
 // loses the ability to correct "didn't fire & should have" (a row not in the
 // sparse input representation has no computational path to receive gradient
 // at all, regardless of how strong the signal is). Only "fired & shouldn't
-// have" could ever be fixed. Replaced by delta_csr_backward_sparse_grad
+// have" could ever be fixed. Replaced by disldo_backward_sparse_grad
 // below (dense input, sparse gradient) -- the only sparse-gradient backward
 // variant that should exist. Confirmed zero real callers before removal
 // (only this file's own definition matched a search for "delta_csr_backward(").
@@ -612,7 +612,7 @@ void delta_csr_forward(
 // the first.
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-void delta_csr_backward_sparse_grad(
+void disldo_backward_sparse_grad(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,   // dense [batch, n_inputs]
     SIZE_TYPE batch,
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
@@ -639,7 +639,7 @@ void delta_csr_backward_sparse_grad(
                 std::abs((*out_grad_sparse.values[0])[j]);
 
     // Hoisted out of the dc.empty() branch below (used by the block4 phase
-    // too, which -- same bug/fix as delta_csr_forward -- must NOT be
+    // too, which -- same bug/fix as sisldo_forward -- must NOT be
     // skipped just because the scattered side has zero nnz.
     if (weights.value_scale.size() < n_inputs)
         weights.value_scale.resize(n_inputs, value_type(1));
@@ -647,7 +647,7 @@ void delta_csr_backward_sparse_grad(
         weights.value_scale_importance.resize(n_inputs, value_type(0));
 
     // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do"
-    // -- see delta_csr_forward's identical fix/comment. A layer can be
+    // -- see sisldo_forward's identical fix/comment. A layer can be
     // entirely block4-resident and still have real work in the block4
     // phase below, appended after this guarded block instead of an
     // unconditional early return.
@@ -712,7 +712,7 @@ void delta_csr_backward_sparse_grad(
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 // BUG FIX: out_scale/output_importance_scale were never read
                 // here, unlike disldo_backward's identical row*col
-                // combination -- see delta_csr_forward's matching fix.
+                // combination -- see sisldo_forward's matching fix.
                 const value_type  out_scale = weights.get_output_scale(col);
                 const value_type  combined_scale = val_scale * out_scale;
                 const value_type  w        = w_stored * combined_scale;   // -> true units
@@ -787,7 +787,7 @@ void delta_csr_backward_sparse_grad(
 
     // ── block4 contribution ─────────────────────────────────────────────────
     //
-    // Real, previously-silent bug this closes: same as delta_csr_forward's
+    // Real, previously-silent bug this closes: same as sisldo_forward's
     // (see its comment) -- block4-resident synapses were never touched by
     // this function at all. FP4-specific (block4 is FP4-only), hence the
     // if constexpr guard.
@@ -796,7 +796,7 @@ void delta_csr_backward_sparse_grad(
     // (row_cursor + og_ptr walking forward through sorted out_grad_sparse),
     // applied one level up -- per TILE (4 output columns) instead of per
     // synapse. PRECONDITION: out_grad_sparse's indices, within each batch
-    // row, must be ascending (same convention delta_csr_forward's input
+    // row, must be ascending (same convention sisldo_forward's input
     // requires -- see its comment).
     //
     // Parallelized by BLOCK-ROW (br), not by tile -- unlike disldo_backward
@@ -811,7 +811,7 @@ void delta_csr_backward_sparse_grad(
     // exclusive-ownership safety a block4 tile resize needs (see
     // block4_resize_tile_in_row's comment) for free.
     //
-    // Correctness-first scalar port (matches delta_csr_forward's own choice
+    // Correctness-first scalar port (matches sisldo_forward's own choice
     // not to bring over disldo_forward/backward's Block4Vec SIMD machinery
     // immediately) -- revisit with real profiling if a benchmark shows this
     // is a bottleneck, same as forward's documented approach.

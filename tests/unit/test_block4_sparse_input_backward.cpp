@@ -1,7 +1,7 @@
-// Correctness check for delta_csr_backward_sparse_grad's block4 phase
+// Correctness check for disldo_backward_sparse_grad's block4 phase
 // (backward_sparse's underlying op) vs disldo_backward (backward_dense) on
 // the SAME mixed scattered+block4 layer. Closes the same class of bug as
-// test_block4_sparse_input_forward.cpp -- delta_csr_backward_sparse_grad
+// test_block4_sparse_input_forward.cpp -- disldo_backward_sparse_grad
 // never referenced weights.block4 before this. See TODO_DUAL_BLOCK4.md.
 //
 // Primary check is at learning_rate=0 (dx only, deterministic -- no RNG
@@ -11,7 +11,7 @@
 // matching after a real learning step isn't meaningful to assert. A
 // separate lr>0 smoke test just checks for crashes/non-finite values.
 #include "../../sili/lib/headers/delta_csr_memory.hpp"
-#include "../../sili/lib/headers/delta_csr_ops.hpp"
+#include "../../sili/lib/headers/sisldo_ops.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
 #include <cstdio>
 #include <cmath>
@@ -99,7 +99,7 @@ int main() {
             dy_sparse.values[0]  = std::make_shared<std::vector<float>>(g_vals);
 
             std::vector<float> dx_sparse(n_in, 0.0f), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
-            delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+            disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
                 input.data(), 1, weights, dy_sparse,
                 dx_sparse.data(), ni_a2.data(), ng_a2.data(), 0.0f, 4, false);
 
@@ -146,7 +146,7 @@ int main() {
                 dx_d.data(), ni_a.data(), ng_a.data(), 0.05f, 4, false, true);
 
             std::vector<float> dx_s(n_in, 0.0f), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
-            delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+            disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
                 input.data(), 1, weights_s, dy_sparse,
                 dx_s.data(), ni_a2.data(), ng_a2.data(), 0.05f, 4, false);
 

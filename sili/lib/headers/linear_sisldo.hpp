@@ -9,6 +9,12 @@
 #include <vector>
 
 //SISLDO: Sparse Input, Sparse Linear, Dense Output
+// sisldo_forward_trivalues/sisldo_backward_trivalues below: the older,
+// backburner high-precision TriValues path (WEIGHTS_T generic, not FP4).
+// The active FP4/block4 SISLDO ops (SparseLinearWeightsDelta) are
+// sisldo_forward in sisldo_ops.hpp -- named plainly since these two
+// can't collide (different weights types), suffixed here to free up the
+// plain name for the active path.
 
 ///Returns true if connections are unallocated or empty.
 template <typename SIZE_TYPE>
@@ -119,7 +125,7 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
 ///into connection strength scaled by @p learning_rate.
 // BUG FIX (see conversation): was `const WEIGHTS_T&` but conditionally mutates
 // conn_str[wptr] (activity-correlation importance update) when learning_rate != 0 -- same
-// pattern already found and fixed in delta_csr_forward (sparse_struct.hpp)
+// pattern already found and fixed in sisldo_forward (sparse_struct.hpp)
 // this session. This one "worked" only by accident for SparseLinearWeightsV
 // (TriValues, shared_ptr<vector> indirection -- const doesn't propagate
 // through the pointee) and genuinely fails for SparseLinearWeights
@@ -127,7 +133,7 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
 template <typename WEIGHTS_T, 
           typename VALUE_TYPE = typename WEIGHTS_T::value_type,
           typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
-void sisldo_forward(
+void sisldo_forward_trivalues(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
     WEIGHTS_T& weights,
     VALUE_TYPE* output,
@@ -248,7 +254,7 @@ void sisldo_forward(
 template <typename WEIGHTS_T, 
           typename VALUE_TYPE = typename WEIGHTS_T::value_type,
           typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
-void sisldo_backward(
+void sisldo_backward_trivalues(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& in_tensor,
     WEIGHTS_T& weights,
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& out_grad_sparse,

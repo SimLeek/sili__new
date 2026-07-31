@@ -87,7 +87,7 @@ TEST_CASE("integration_train_loop", "[integration_train_loop]") {
 
         // ── Forward ───────────────────────────────────────────────────────────
         std::vector<VALUE_TYPE> output(batch_size * n_outputs, 0.0f);
-        sisldo_forward(input, weights, output.data(), true, solidify, num_cpus);
+        sisldo_forward_trivalues(input, weights, output.data(), true, solidify, num_cpus);
 
         const VALUE_TYPE loss = mse_loss(output, desired);
         INFO("loss: " << loss);
@@ -119,7 +119,7 @@ TEST_CASE("integration_train_loop", "[integration_train_loop]") {
 
         // ── Backward ──────────────────────────────────────────────────────────
         std::vector<VALUE_TYPE> input_gradients(n_inputs, 0.0f);
-        sisldo_backward(input, weights, out_grad_sparse,
+        sisldo_backward_trivalues(input, weights, out_grad_sparse,
                         input_gradients.data(), output_gradients.data(),
                         neuron_input_accum.data(), neuron_grad_accum.data(),
                         num_cpus);
@@ -201,7 +201,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
 
     // With no connections, forward does nothing — all output = 0
     std::vector<VALUE_TYPE> output(n_outputs, 0.0f);
-    sisldo_forward(input, weights, output.data(), false, 0.01f, num_cpus);
+    sisldo_forward_trivalues(input, weights, output.data(), false, 0.01f, num_cpus);
     CHECK_VECTOR_ALMOST_EQUAL(output, std::vector<VALUE_TYPE>(n_outputs, 0.0f));
 
     // Accumulate over multiple iterations
@@ -223,7 +223,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
     const int accum_iters = 5;
     for (int i = 0; i < accum_iters; ++i) {
         std::fill(input_gradients.begin(), input_gradients.end(), 0.0f);
-        sisldo_backward(input, weights, out_grad_sparse,
+        sisldo_backward_trivalues(input, weights, out_grad_sparse,
                         input_gradients.data(), output_gradients.data(),
                         neuron_input_accum.data(), neuron_grad_accum.data(),
                         num_cpus);
@@ -308,7 +308,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
     (*weights.connections.values[0])[3] = 0.7f; // (3,2)
 
     std::vector<VALUE_TYPE> output2(n_outputs, 0.0f);
-    sisldo_forward(input, weights, output2.data(), false, 0.01f, num_cpus);
+    sisldo_forward_trivalues(input, weights, output2.data(), false, 0.01f, num_cpus);
 
     // batch0 (single batch): in1=3.0, in3=1.0
     // out0: in1*1.0*3.0 + in3*0.3*1.0 = 3.0 + 0.3 = 3.3
@@ -327,7 +327,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
     for (int iter = 0; iter < 10; ++iter) {
         INFO("post-genesis iter: " << iter);
         std::vector<VALUE_TYPE> out3(n_outputs, 0.0f);
-        sisldo_forward(input, weights, out3.data(), true, 0.01f, num_cpus);
+        sisldo_forward_trivalues(input, weights, out3.data(), true, 0.01f, num_cpus);
 
         auto grad3 = mse_grad(out3, desired);
         auto og_sparse = make_csr_input<SIZE_TYPE, VALUE_TYPE>(
@@ -338,7 +338,7 @@ TEST_CASE("integration_neurogenesis", "[integration_neurogenesis]") {
 
         std::vector<VALUE_TYPE> og_dense = {grad3[0], 0.0f, grad3[2]};
         std::vector<VALUE_TYPE> in_grad3(n_inputs, 0.0f);
-        sisldo_backward(input, weights, og_sparse,
+        sisldo_backward_trivalues(input, weights, og_sparse,
                         in_grad3.data(), og_dense.data(),
                         neuron_input_accum.data(), neuron_grad_accum.data(),
                         num_cpus);

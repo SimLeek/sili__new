@@ -1,4 +1,4 @@
-// Does delta_csr_backward_sparse_grad's block4 gradient-gather phase
+// Does disldo_backward_sparse_grad's block4 gradient-gather phase
 // (backward_sparse's underlying op) beat disldo_backward (dense gradient,
 // backward_dense) at a given density? Fresh process per density point,
 // matching bench_block4_sparse_input_forward.cpp's methodology.
@@ -15,7 +15,7 @@
 //   bench_block4_sparse_input_backward.cpp -o bench_b4_sparse_bwd
 //   ./bench_b4_sparse_bwd <grad_density 0.0-1.0> <num_cpus>
 #include "sili/lib/headers/delta_csr_memory.hpp"
-#include "sili/lib/headers/delta_csr_ops.hpp"
+#include "sili/lib/headers/sisldo_ops.hpp"
 #include "sili/lib/headers/linear_disldo.hpp"
 #include <chrono>
 #include <cstdio>
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     std::vector<float> dx_sparse(n_in), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
     const double sparse_ms = best_of(reps, [&]() {
         std::fill(dx_sparse.begin(), dx_sparse.end(), 0.0f);
-        delta_csr_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
             input.data(), 1, weights, dy_sparse,
             dx_sparse.data(), ni_a2.data(), ng_a2.data(), 0.0f, num_cpus, false);
     }) * 1e3;
@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     std::printf("density=%.3f (real=%.3f) num_cpus=%d n_tiles=%zu\n",
                 density, real_density, num_cpus, weights.block4.n_tiles());
     std::printf("  dense (disldo_backward):            %.4f ms\n", dense_ms);
-    std::printf("  sparse (delta_csr_backward_sparse_grad b4): %.4f ms\n", sparse_ms);
+    std::printf("  sparse (disldo_backward_sparse_grad b4): %.4f ms\n", sparse_ms);
     std::printf("  speedup (dense/sparse): %.2fx %s\n", dense_ms / sparse_ms,
                 dense_ms / sparse_ms > 1.0 ? "(sparse wins)" : "(dense wins)");
     return 0;
