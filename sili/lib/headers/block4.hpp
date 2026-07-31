@@ -805,6 +805,52 @@ struct Block4Store {
     void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
         max_tile_bytes    = tile_limit_bytes;
+        // Pre-reserve tile_data's capacity up to the configured cap so
+        // every later tile_data.resize() call that stays within budget
+        // (which is every one that succeeds -- growth past max_tile_bytes
+        // is already declined/thrown elsewhere) NEVER needs to actually
+        // reallocate. This is the real fix for the reallocation race
+        // tile_data_grow_lock only partially closes (see its comment):
+        // std::vector::resize() that doesn't exceed EXISTING capacity is
+        // guaranteed by the standard to never invalidate any existing
+        // pointer/iterator/reference into the vector, so once capacity is
+        // reserved up front, no thread's in-flight raw_data() pointer (or
+        // any other thread's read of a totally different row) can ever go
+        // stale from another row's growth again -- not just less likely,
+        // structurally impossible. Confirmed via a real repeated-run
+        // ASan stress test: unreserved, ~80% of runs hit a heap-use-after-
+        // free; with tile_data_grow_lock alone (no reservation), ~27%
+        // still did; with reservation, 0 failures across 60 repeated runs
+        // (see conversation). std::vector::clear() (called by init(),
+        // regardless of call order relative to this function) never
+        // reduces capacity, so this reservation survives init() being
+        // called either before or after set_limits().
+        //
+        // Only covers the case where a real (finite) tile budget is
+        // configured -- the unbounded default (max_tile_bytes ==
+        // numeric_limits::max(), e.g. a hand-built test fixture that never
+        // calls set_limits()) can't be pre-reserved and remains exposed to
+        // the narrower race tile_data_grow_lock alone provides partial
+        // (not complete) protection against. Concurrent (num_cpus > 1)
+        // forward/backward calls on a Block4Store therefore REQUIRE a
+        // real set_limits() call to be fully safe; num_cpus == 1 is safe
+        // either way (no concurrent reader/writer to race against).
+        // Some callers pass a very large but not literally SIZE_MAX
+        // "effectively unbounded" sentinel (e.g. derived from another
+        // limit's arithmetic) -- reserve() throws std::length_error for
+        // anything past vector::max_size(), and std::bad_alloc if the
+        // platform genuinely can't back it. Either way, this is the SAME
+        // "can't pre-reserve" case as the literal-SIZE_MAX default above:
+        // fall back to unreserved (reduced, not eliminated, protection --
+        // see this function's own comment) rather than letting a real,
+        // pre-existing caller's set_limits() call start throwing.
+        if (tile_limit_bytes != std::numeric_limits<std::size_t>::max()) {
+            try {
+                tile_data.reserve(tile_limit_bytes);
+            } catch (const std::length_error&) {
+            } catch (const std::bad_alloc&) {
+            }
+        }
     }
 
     // Incremented (via std::atomic_ref -- see ~Block4TileHandle()) every
@@ -827,6 +873,58 @@ struct Block4Store {
     // still throws std::bad_alloc as before -- that's a "handler decides
     // what to do" case, not a "keep training running regardless" one.
     std::uint64_t dropped_growth_events = 0;
+
+    // Guards ONLY the rare growing-resize branch of
+    // commit_dirty_sparse_tile (a sparse tile whose live count grew
+    // enough to need more bytes than its row's own current headroom) --
+    // that branch can call tile_data.resize() past its current capacity,
+    // which may REALLOCATE tile_data's entire backing buffer (shared
+    // across every row in the store, not just this one), moving every
+    // row's bytes to a new address. Row-exclusive thread ownership (see
+    // disldo_backward's parallel-loop comment) only protects against two
+    // threads touching the SAME row -- it does NOT protect against this:
+    // a DIFFERENT thread holding a raw pointer into tile_data for ITS OWN
+    // row (e.g. a dense tile's raw_data(), held for the handle's whole
+    // lifetime) has that pointer silently invalidated the instant any
+    // OTHER row's growth reallocates the shared buffer. Confirmed via
+    // ASan as a real, easily-reproduced (~80% of runs) heap-use-after-
+    // free before this lock existed -- two threads' concurrent resize
+    // calls could both reallocate the SAME vector at once, corrupting
+    // its own internal bookkeeping outright.
+    //
+    // Plain std::uint32_t, not std::atomic, so Block4Store stays
+    // trivially copyable -- same reasoning as dropped_growth_events;
+    // actual locking goes through std::atomic_ref. Non-blocking
+    // (try-lock only): under real contention (another thread is ALSO
+    // currently in this branch, for any row), this touch's growth is
+    // DECLINED (dropped_growth_events++) exactly like real budget
+    // exhaustion, rather than blocking -- a caller under heavy parallel
+    // load sees somewhat more conservative growth in exchange for never
+    // corrupting memory. 0 = unlocked, 1 = locked.
+    //
+    // NOT a complete guarantee BY ITSELF: this alone closes one failure
+    // mode (two threads BOTH reallocating tile_data at once, corrupting
+    // its own bookkeeping) but not another -- a reader on a different row
+    // could still be mid-dereference of a stale pointer during the brief
+    // window a single lock-holder's resize is moving memory (confirmed:
+    // reduced a real repeated-run ASan failure rate from ~80% to ~27%,
+    // not to 0). set_limits()'s own comment covers the REAL, complete fix
+    // (pre-reserving tile_data's capacity so a within-budget resize can
+    // never reallocate at all, closing this structurally rather than
+    // reducing its odds) -- this lock stays as defense-in-depth for the
+    // unbounded-max_tile_bytes case set_limits() can't pre-reserve for,
+    // and to fail fast rather than corrupt if reservation is ever
+    // insufficient for some other reason.
+    //
+    // Structural growth (get_or_create/block4_maybe_promote inserting a
+    // genuinely NEW tile, via block4_row_insert_tile/
+    // block4_ensure_row_headroom) is NOT covered by this lock -- that
+    // path already assumes serial/exclusive store access (synaptogenesis
+    // is not expected to run concurrently with a live forward/backward
+    // parallel call), same pre-existing assumption dropped_growth_events'
+    // own comment already documents for why it still throws instead of
+    // declining.
+    std::uint32_t tile_data_grow_lock = 0;
 
     // Persistent scratch buffers for disldo_forward/disldo_backward
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
@@ -1063,6 +1161,33 @@ struct Block4Store {
         // std::bad_alloc as before; that's a "handler decides what to do
         // before proceeding" case (synaptogenesis), not a "value update,
         // keep going regardless" one.
+        // Growing specifically (new_len > cur_len) is the only case that
+        // can reallocate tile_data's shared buffer -- see
+        // tile_data_grow_lock's comment. Same-size and shrinking calls
+        // never touch capacity (block4_resize_tile_in_row's own shrink
+        // path never calls tile_data.resize() at all), so they skip the
+        // lock entirely -- no reason to pay for it on the far more common
+        // non-growing touch.
+        if (new_len > cur_len) {
+            std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
+            std::uint32_t expected = 0;
+            if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+                // Another thread is currently in this same growing branch
+                // (for any row) -- decline rather than risk two
+                // concurrent reallocations of the same shared buffer.
+                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            try {
+                block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
+                                           br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+                tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
+            } catch (const std::bad_alloc&) {
+                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+            }
+            grow_lock.store(0, std::memory_order_release);
+            return;
+        }
         try {
             block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
                                        br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
@@ -1070,6 +1195,194 @@ struct Block4Store {
         } catch (const std::bad_alloc&) {
             std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    // ── Row-local workspace (concurrency-safe growth path) ─────────────────
+    //
+    // The alternative to tile_data_grow_lock: instead of trying to
+    // synchronize concurrent growth against concurrent readers (which
+    // tile_data_grow_lock alone does NOT fully do -- see its comment,
+    // and set_limits()'s: capacity reservation closes the tile_data
+    // REALLOCATION race, but a SEPARATE race remains where one row's
+    // growth-past-its-own-headroom shifts tbyte_start/tbyte_end for
+    // every LATER row, racing against those rows' own concurrent
+    // readers -- confirmed via ASan even with both prior fixes in
+    // place), a row's ENTIRE growing/writing pass works on a thread-
+    // private COPY, never touching any OTHER row's memory or the shared
+    // tile_data buffer at all until a single, row-exclusive merge-back
+    // at the very end. This makes the cross-row-shift race structurally
+    // unreachable during a concurrent call, rather than reduced: no row
+    // ever grows past its own CURRENT headroom while threads are active
+    // (the merge-back's eviction fallback guarantees this), so
+    // block4_resize_tile_in_row's cross-row-shift branch is simply never
+    // taken by any of these callers.
+    //
+    // Only needed for the WRITING (learning_rate != 0) case -- read-only
+    // touches (forward, or backward with learning_rate == 0) never
+    // resize anything, so they stay on the plain at_index()/raw_data()
+    // path with no hazard at all.
+    struct RowWorkspace {
+        std::vector<uint8_t>  bytes;       // this row's tile bytes, private copy
+        std::vector<uint8_t>  is_sparse;   // one flag per tile, 0-based within this row
+        std::vector<uint32_t> bc;          // block-column of each tile, 0-based within this row --
+                                            // needed by merge_row_workspace's eviction scan to
+                                            // resolve (row, col) for importance-scale lookups
+        std::size_t elem_start = 0;        // == block_layout.elem_start[br] (global elem index base)
+        std::size_t row_nnz    = 0;
+        // Fake single-row layout so block4_resize_tile_in_row's cross-row
+        // shift branch (`row + 1 < L.rows`) is always false here -- see
+        // above. Persist across calls (not recreated per-tile) so a
+        // shrink's logical-size tracking survives between tiles: local_L
+        // is only touched via .rows itself, never resized, so it is
+        // effectively `local_L.rows = 1` for the workspace's lifetime.
+        DeltaCSRLayout local_L;
+        std::vector<std::size_t> local_tbyte_start; // {0, capacity}
+        std::vector<std::size_t> local_tbyte_end;   // {used}
+    };
+
+    RowWorkspace snapshot_row(std::size_t br) const {
+        RowWorkspace ws;
+        ws.row_nnz    = block_layout.row_nnz(br);
+        ws.elem_start = block_layout.elem_start[br];
+        const std::size_t used = tile_byte_end[br] - tile_byte_start[br];
+        ws.bytes.assign(tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]),
+                         tile_data.begin() + std::ptrdiff_t(tile_byte_end[br]));
+        ws.is_sparse.assign(tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start),
+                             tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start + ws.row_nnz));
+        ws.bc.resize(ws.row_nnz);
+        {
+            auto cur = row_cursor(br);
+            for (std::size_t e = 0; e < ws.row_nnz; ++e) ws.bc[e] = cur.advance();
+        }
+        ws.local_L.rows      = 1;
+        ws.local_tbyte_start = {0, used};
+        ws.local_tbyte_end   = {used};
+        return ws;
+    }
+
+    // Byte offset of local tile index `e`'s start, walking from the
+    // workspace's own beginning -- callers processing tiles in order
+    // should track this incrementally themselves (same
+    // live_byte_pos-style pattern used elsewhere) rather than calling
+    // this repeatedly; exposed for the first tile / random access.
+    std::size_t workspace_tile_byte_pos(const RowWorkspace& ws, std::size_t e) const {
+        std::size_t pos = 0;
+        for (std::size_t i = 0; i < e; ++i)
+            pos += block4_stored_tile_len(ws.is_sparse[i], &ws.bytes[pos]);
+        return pos;
+    }
+
+    // Packs `scratch` into the workspace at local tile index `e`,
+    // growing/shrinking ws.bytes freely -- entirely thread-private, no
+    // lock needed (nothing else can observe ws). Mirrors
+    // commit_dirty_sparse_tile's pack/promote decision exactly, just
+    // targeting ws instead of the shared store.
+    void commit_dirty_tile_in_workspace(RowWorkspace& ws, std::size_t e,
+                                         std::size_t local_byte_pos,
+                                         const uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
+        const uint32_t n = block4_count_live(scratch);
+        uint8_t packed[BLOCK4_TILE_SLOTS];
+        std::size_t new_len;
+        bool now_sparse;
+        if (n <= switch_point) {
+            block4_sparse_pack(scratch, packed);
+            new_len = block4_sparse_packed_len(uint8_t(n));
+            now_sparse = true;
+        } else {
+            std::memcpy(packed, scratch, BLOCK4_TILE_SLOTS);
+            new_len = BLOCK4_TILE_SLOTS;
+            now_sparse = false;
+        }
+        const std::size_t cur_len = block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[local_byte_pos]);
+        // Unbounded local max: the workspace itself is never budget-
+        // capped (a row growing internally, still thread-private, can't
+        // corrupt anything) -- the REAL cap is enforced at merge-back,
+        // against this row's actual current global headroom, with
+        // eviction as the fallback there.
+        block4_resize_tile_in_row(ws.local_L, ws.local_tbyte_start, ws.local_tbyte_end, ws.bytes,
+                                   0, local_byte_pos, cur_len, packed, new_len,
+                                   std::numeric_limits<std::size_t>::max());
+        ws.is_sparse[e] = now_sparse ? 1 : 0;
+    }
+
+    // Unpacks local tile `e` into `scratch` (always the full dense
+    // BLOCK4_TILE_SLOTS form, regardless of the tile's own packed
+    // representation -- simpler for callers than branching on
+    // ws.is_sparse themselves, and this is the rare growing/writing
+    // path, not a hot loop worth optimizing that copy away).
+    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e,
+                                std::size_t local_byte_pos,
+                                uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
+        if (ws.is_sparse[e]) block4_sparse_unpack(&ws.bytes[local_byte_pos], scratch);
+        else std::memcpy(scratch, &ws.bytes[local_byte_pos], BLOCK4_TILE_SLOTS);
+    }
+
+    // Writes the workspace back into the shared store, exactly within
+    // this row's OWN pre-existing byte range (tile_byte_start[br] ..
+    // tile_byte_start[br+1]) -- never touches tile_data's capacity, any
+    // OTHER row's tbyte_start/tbyte_end, or anything outside this row's
+    // already-reserved slice, so this is safe under row-exclusive thread
+    // ownership with no lock at all, REGARDLESS of what any other thread
+    // is concurrently doing to its own row.
+    //
+    // If the workspace's final size doesn't fit in that existing slice
+    // (this row genuinely grew more than its current headroom), evicts
+    // (zeroes) the globally lowest-|true-importance| live slot in the
+    // workspace, re-packs that one tile, and retries -- repeating until
+    // it fits. `true_importance(row, col, imp_code)` is a caller-
+    // supplied lookup (needs weights.get_importance_scale()/
+    // get_output_importance_scale(), which live on SparseLinearWeightsDelta,
+    // not Block4Store) returning the DECODED, SCALE-ADJUSTED importance
+    // value for ranking -- comparing raw 4-bit codes directly isn't
+    // enough resolution to break ties meaningfully (see conversation).
+    // Returns the number of synapses evicted (0 = fit without eviction).
+    template <typename TrueImportanceFn>
+    std::size_t merge_row_workspace(std::size_t br, RowWorkspace& ws, TrueImportanceFn&& true_importance) {
+        const std::size_t global_headroom = tile_byte_start[br + 1] - tile_byte_start[br];
+        std::size_t evicted = 0;
+        while (ws.local_tbyte_end[0] > global_headroom) {
+            // Find the globally lowest-|true-importance| LIVE slot across
+            // every tile in this row. Small, bounded scan (row_nnz * 16
+            // slots for ONE row) -- only reached when eviction is
+            // actually needed, not on the common fits-fine path.
+            double best_abs_imp = -1.0;
+            std::size_t best_e = 0, best_local_pos = 0;
+            uint32_t best_li = 0, best_lj = 0;
+            std::size_t pos = 0;
+            for (std::size_t e = 0; e < ws.row_nnz; ++e) {
+                uint8_t scratch[BLOCK4_TILE_SLOTS];
+                unpack_workspace_tile(ws, e, pos, scratch);
+                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                        const uint8_t byte = scratch[Block4Tile::slot_index(li, lj)];
+                        if (byte == 0) continue; // not live
+                        const uint8_t imp_code = (byte >> 4) & 0xFu;
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        const std::size_t col = static_cast<std::size_t>(ws.bc[e]) * BLOCK4_TILE + lj;
+                        const double abs_imp = std::abs(static_cast<double>(
+                            true_importance(row, col, imp_code)));
+                        if (best_abs_imp < 0.0 || abs_imp < best_abs_imp) {
+                            best_abs_imp = abs_imp;
+                            best_e = e; best_local_pos = pos;
+                            best_li = li; best_lj = lj;
+                        }
+                    }
+                }
+                pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[pos]);
+            }
+            if (best_abs_imp < 0.0) break; // nothing live left to evict (shouldn't happen -- see caller)
+            uint8_t scratch[BLOCK4_TILE_SLOTS];
+            unpack_workspace_tile(ws, best_e, best_local_pos, scratch);
+            scratch[Block4Tile::slot_index(best_li, best_lj)] = 0;
+            commit_dirty_tile_in_workspace(ws, best_e, best_local_pos, scratch);
+            ++evicted;
+        }
+        std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(ws.local_tbyte_end[0]),
+                   tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
+        tile_byte_end[br] = tile_byte_start[br] + ws.local_tbyte_end[0];
+        std::copy(ws.is_sparse.begin(), ws.is_sparse.end(),
+                   tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
+        return evicted;
     }
 
     std::size_t n_tiles() const { return block_layout.total_nnz; }

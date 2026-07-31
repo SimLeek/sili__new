@@ -660,70 +660,41 @@ void disldo_backward(
     // incorrect one -- acceptable for a first working version; revisit if
     // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
     if (weights.block4.n_tiles() > 0) {
-        // Coordinates + storage index -- see forward's identical comment
-        // above for why (handles are move-only RAII, constructed fresh
-        // per-tile inside the parallel loop body below; elem_pos/byte_pos
-        // let that construction skip find()'s redundant O(row_nnz)
-        // re-scan via at_index() instead).
-        // Persistent scratch (Block4Store::scratch_*), not fresh vectors
-        // every call -- see forward's identical comment above and
-        // block4.hpp: batch=1 real-time calls can't amortize repeated
-        // heap allocation of these the way a large training batch could.
-        std::vector<uint32_t>&    tile_br   = weights.block4.scratch_tile_br;
-        std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
-        std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
-        std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
+        // row_ti_start: cumulative tile count per block-row, needed to
+        // split the row-partitioned parallel loop below (each thread's
+        // #pragma omp for chunk is a contiguous BLOCK-ROW range, but tile
+        // COUNTS per row vary, so row_ti_start[br]..row_ti_start[br+1]
+        // gives each row's tile-count window within that chunk -- NOT
+        // storage offsets: since the row-workspace rewrite (see
+        // conversation), tile byte/elem positions are tracked entirely
+        // within each row's own RowWorkspace, snapshotted fresh per row,
+        // not precomputed globally here (a global precompute was the
+        // root of the byte_pos-staleness class of bugs this rewrite
+        // closes -- see Block4Store::RowWorkspace's comment).
         std::vector<std::size_t>& row_ti_start = weights.block4.scratch_row_ti_start;
-        const std::size_t n_b4 = weights.block4.n_tiles();
-        // resize()+direct indexing, not reserve()+push_back() -- see
-        // forward's identical comment above (real, measured cost:
-        // push_back's per-call capacity check across ~3*n_tiles calls,
-        // independent of whether the backing allocation is fresh or
-        // reused).
-        tile_br.resize(n_b4);
-        tile_bc.resize(n_b4);
-        tile_elem.resize(n_b4);
-        tile_byte.resize(n_b4);
+        const auto& BL4 = weights.block4.block_layout;
+        row_ti_start.resize(BL4.rows + 1);
 
         // Per-row slot count across ALL block4 tiles touching that row
         // (not just one tile), needed for both lr_per_row_nnz and the
         // unconditional scale_eff_lr normalization. Every tile contributes
         // exactly BLOCK4_TILE slots per row it covers -- dense, no
         // per-slot scan needed (see block4.hpp: a live tile's slots are
-        // all real synapses, weight=0.0 included). Computed directly per
-        // block-row here (n_bc * BLOCK4_TILE, known before the tile loop
-        // even starts) instead of a separate second pass re-walking
-        // tile_br after the fact -- same result, one fewer O(n_tiles) pass.
+        // all real synapses, weight=0.0 included).
         std::vector<uint32_t>& row_live_count = weights.block4.scratch_row_live_count;
         row_live_count.assign(n_in, 0);
-        const auto& BL4 = weights.block4.block_layout;
-        row_ti_start.resize(BL4.rows + 1);
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
             row_ti_start[br] = ti; // written unconditionally -- an empty
             // row (n_bc==0) still needs a valid (empty) [start,start)
             // range for the parallel loop's row-partitioned split below.
             const std::size_t n_bc = BL4.row_nnz(br);
+            ti += n_bc;
             if (n_bc == 0) continue;
             const uint32_t row_count = uint32_t(n_bc) * BLOCK4_TILE;
             for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                 const std::size_t row = br * BLOCK4_TILE + li;
                 if (row < n_in) row_live_count[row] = row_count;
-            }
-            auto bc_cursor = weights.block4.row_cursor(br);
-            std::size_t elem_pos = BL4.elem_start[br];
-            std::size_t byte_pos = weights.block4.tile_byte_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
-                tile_br[ti] = uint32_t(br);
-                tile_bc[ti] = bc_cursor.advance();
-                tile_elem[ti] = elem_pos;
-                tile_byte[ti] = byte_pos;
-                // Real length (sparse or dense), NOT force-advanced by
-                // BLOCK4_TILE_SLOTS -- this loop no longer forces
-                // anything dense (see the parallel loop below for why
-                // that's no longer necessary), so tiles stay exactly
-                // whatever the real content last left them as.
-                byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
         row_ti_start[BL4.rows] = ti;
@@ -770,27 +741,51 @@ void disldo_backward(
             // imbalance actually costing more wall-clock time than this.
             #pragma omp for schedule(static)
             for (std::size_t br = 0; br < BL4.rows; ++br) {
-            for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti) {
-                const uint32_t bc = tile_bc[ti];
-                // Non-const: this tile is both read (precompute) and
-                // written (writeback) below, spanning this whole
-                // iteration -- one handle, unpacks once if sparse,
-                // re-packs once (if touched) when it goes out of scope
-                // at the end of this iteration, genuinely reflecting
-                // whatever the write left it as (sparse or dense) --
-                // see ~Block4TileHandle()'s comment for why that's safe
-                // here specifically (row-exclusive thread ownership).
-                // at_index(): skip find()'s redundant re-scan, see
-                // collection loop's comment above.
-                auto tile = weights.block4.at_index(uint32_t(br), bc, tile_elem[ti], tile_byte[ti]);
-                // Resolved ONCE per tile for the read-only decode below
-                // instead of once per .at() call (16 calls/tile
-                // otherwise) -- see forward's identical hoist and
-                // Block4TileHandle::raw_data()'s comment. Only valid for
-                // READS; the write-back further down still goes through
-                // tile.at(...) = ..., which marks the handle dirty.
-                const uint8_t* tdata = tile.raw_data();
-
+            if (row_ti_start[br] == row_ti_start[br + 1]) continue; // empty row
+            // BUG FIX (see conversation): the OLD version of this loop read
+            // and wrote each tile directly through the shared store (via
+            // at_index()'s fast path), relying only on row-exclusive thread
+            // ownership for safety. That protects against two threads
+            // touching the SAME row, but NOT against a DIFFERENT row's
+            // growth: growing row X past its own current headroom shifts
+            // tbyte_start/tbyte_end -- and physically MEMMOVES the tile
+            // BYTES themselves -- for every row after X, including
+            // whatever row this thread owns. Confirmed via ASan as a real,
+            // reproducible heap-use-after-free / negative-size memmove
+            // even with tile_data's capacity pre-reserved (which only
+            // fixes buffer REALLOCATION, a separate hazard) and even with
+            // a lock guarding concurrent growers (which only fixes two
+            // growers racing each other, not a grower racing this row's
+            // reader). See delta_csr_backward_sparse_grad's identical fix
+            // in delta_csr_ops.hpp for the full writeup.
+            //
+            // Fix: snapshot this row into a thread-private workspace
+            // ONCE, do all reads/writes against that private copy, then
+            // merge back in one row-exclusive step at the end (evicting
+            // lowest-importance synapses if this row grew past its own
+            // existing headroom rather than shifting anything else -- see
+            // Block4Store::merge_row_workspace's comment). This makes the
+            // cross-row-shift hazard structurally unreachable rather than
+            // merely less likely: no row growing through this workspace
+            // path ever calls the shared store's cross-row-shifting
+            // resize at all. Used UNCONDITIONALLY (even when
+            // learning_rate == 0, which never actually writes anything
+            // back) rather than branching read-only vs writing: dx doesn't
+            // depend on whether writes happen, this keeps a single tested
+            // code path instead of two, and it stays correct even if some
+            // OTHER concurrent caller on the same store is writing at the
+            // same time.
+            // process_tile: the per-tile gradient math (SIMD batch loop,
+            // stochastic requantize) extracted into a lambda so the
+            // read-only and writing branches below share EXACTLY one
+            // implementation instead of two copies that could drift
+            // apart -- only how `tdata` is SOURCED differs between them,
+            // never the math. Every write inside is already gated by
+            // `learning_rate != value_type(0)` (unchanged from before
+            // this split), so calling this from the read-only branch is
+            // provably a no-op write-wise, not just assumed safe.
+            auto process_tile = [&](uint32_t bc, uint8_t* tdata) -> bool {
+                bool tile_dirty = false;
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                     if (row >= n_in) continue;
@@ -1044,15 +1039,17 @@ void disldo_backward(
                                 const Block4VecU new_imp_codes = block4_vec_quantize_stochastic_fp4(imp_to_encode);
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     mcol[col4[lj]] += mcol4[lj];
-                                    tile.at(li, lj) = uint8_t((new_imp_codes[lj] << 4) | new_w_codes[lj]);
+                                    tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_codes[lj] << 4) | new_w_codes[lj]);
                                 }
+                                tile_dirty = true;
                             } else {
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     if (!col_valid4[lj]) continue;
                                     mcol[col4[lj]] += mcol4[lj];
                                     const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
                                     const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
-                                    tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
+                                    tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
+                                    tile_dirty = true;
                                 }
                             }
                         } else {
@@ -1061,12 +1058,72 @@ void disldo_backward(
                                 mcol[col4[lj]] += mcol4[lj];
                                 const uint8_t new_w   = fp4_quantize_stochastic(cw4[lj] / combined_scale4[lj]);
                                 const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
-                                tile.at(li, lj) = uint8_t((new_imp << 4) | new_w);
+                                tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
+                                tile_dirty = true;
                             }
                         }
                     }
                 } // closes for (li...)
-            } // closes for (ti...)
+                return tile_dirty;
+            }; // closes process_tile
+
+            if (learning_rate == value_type(0)) {
+                // Read-only: process_tile structurally never writes here
+                // (every write inside it is gated by learning_rate != 0),
+                // so no resize can ever happen -- the plain shared-store
+                // at_index() path has no concurrency hazard at all in
+                // this case (see Block4Store::RowWorkspace's comment on
+                // why that hazard is specifically about growth). Skips
+                // the row-workspace snapshot+merge-back entirely, since
+                // it would just copy the row's bytes in and back out
+                // unchanged -- measured real overhead for zero benefit
+                // when nothing is ever written (see conversation).
+                auto bc_cursor = weights.block4.row_cursor(br);
+                std::size_t elem_pos = BL4.elem_start[br];
+                std::size_t byte_pos = weights.block4.tile_byte_start[br];
+                for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti, ++elem_pos) {
+                    const uint32_t bc = bc_cursor.advance();
+                    const auto tile = weights.block4.at_index(uint32_t(br), bc, elem_pos, byte_pos);
+                    // const_cast: safe specifically because this branch
+                    // only runs when learning_rate == value_type(0),
+                    // under which process_tile provably never writes
+                    // through tdata (every write is gated by the same
+                    // condition inside it) -- not a general-purpose cast,
+                    // just avoiding a second (const-parametrized) copy of
+                    // process_tile for a write that can't happen here.
+                    process_tile(bc, const_cast<uint8_t*>(tile.raw_data()));
+                    byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                }
+            } else {
+                // Writing: row-local workspace -- see the comment above
+                // this whole block4 section (row_ti_start's comment) and
+                // Block4Store::RowWorkspace's own comment for why this is
+                // necessary under concurrency, not just an optimization.
+                auto ws = weights.block4.snapshot_row(br);
+                std::size_t live_byte_pos = 0;
+                for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti) {
+                    const std::size_t e  = ti - row_ti_start[br];
+                    const uint32_t    bc = ws.bc[e];
+                    const std::size_t this_byte_pos = live_byte_pos;
+                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS];
+                    weights.block4.unpack_workspace_tile(ws, e, this_byte_pos, scratch_buf);
+                    const bool tile_dirty = process_tile(bc, scratch_buf);
+                    if (tile_dirty)
+                        weights.block4.commit_dirty_tile_in_workspace(ws, e, this_byte_pos, scratch_buf);
+                    live_byte_pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
+                } // closes for (ti...)
+                // Merge back -- evicts lowest-|true-importance| synapses
+                // only if this row genuinely grew past its own current
+                // headroom (see Block4Store::merge_row_workspace's
+                // comment).
+                weights.block4.merge_row_workspace(br, ws,
+                    [&](std::size_t ev_row, std::size_t ev_col, uint8_t ev_imp_code) -> double {
+                        const value_type imp_scale     = weights.get_importance_scale(ev_row);
+                        const value_type out_imp_scale = weights.get_output_importance_scale(ev_col);
+                        return static_cast<double>(FP4_TABLE[ev_imp_code & 0xFu])
+                             * static_cast<double>(imp_scale) * static_cast<double>(out_imp_scale);
+                    });
+            }
             } // closes for (br...)
         } // closes #pragma omp parallel
 

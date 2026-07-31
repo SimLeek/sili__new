@@ -197,8 +197,17 @@ void delta_csr_forward(
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
-    if (dc.empty()) return;
 
+    // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do" --
+    // a layer can be entirely block4-resident (dc.empty() == true) and still
+    // have real work below in the block4 phase. Historically this function
+    // returned here unconditionally, which silently skipped the block4
+    // phase too for any all-block4 layer (found via a benchmark reporting
+    // an implausible, density-independent ~0.0001ms for the sparse path --
+    // it was hitting this return before ever reaching block4 code). L's
+    // rows/cols come from dc.layout's shape, which stays valid even when
+    // nnz is 0 (set at construction, e.g. delta_csr_from_absolute), so it's
+    // safe to keep using L below regardless of dc.empty().
     const auto& L           = dc.layout;
     const std::size_t out_cols    = L.cols;
     const std::size_t num_outputs = static_cast<std::size_t>(input_tensor.rows) * out_cols;
@@ -213,6 +222,7 @@ void delta_csr_forward(
 
     std::vector<SIZE_TYPE> work_offsets;
 
+    if (!dc.empty()) {
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid      = omp_get_thread_num();
@@ -345,12 +355,224 @@ void delta_csr_forward(
             }
         }
     }
+    }
 
     for (std::size_t i = 0; i < num_outputs; ++i)
         output[i] += all_outputs[i];
     if (original_contributions_output)
         for (std::size_t i = 0; i < num_inputs; ++i)
             original_contributions_output[i] += all_contributions[i];
+
+    // ── block4 contribution ─────────────────────────────────────────────────
+    //
+    // Real, previously-silent bug this closes: everything above only ever
+    // touches weights.connections (the scattered CSR side) -- block4-
+    // resident synapses (created automatically by ordinary synaptogenesis,
+    // see block4_maybe_promote) were NEVER read here at all, so a layer
+    // with any block4 tiles gave silently wrong output through
+    // forward_sparse(). block4 is FP4-specific (see block4.hpp), hence the
+    // if constexpr guard -- this whole section compiles to nothing for any
+    // other VALUES_TYPE.
+    //
+    // Read-only, same as disldo_forward's own block4 loop
+    // (linear_disldo.hpp): forward does NOT update per-synapse block4
+    // weight/importance inline (that's a documented, pre-existing gap --
+    // see disldo_forward's "KNOWN GAP" comment -- not something this
+    // change is expected to newly fix), so no learning_rate handling is
+    // needed here, only decode + multiply + accumulate.
+    //
+    // Design A (see TODO_DUAL_BLOCK4.md / conversation): reuses the exact
+    // work_offsets/chunk/w_start/w_end shape the scattered pass above
+    // already uses, one level up -- over ACTIVE windows (block-rows with
+    // >=1 nonzero input AND >=1 live block4 tile) instead of over
+    // individual scattered synapses. A window's real "work" is its block4
+    // tile count (weights.block4.block_layout.row_nnz(br)), mirroring how
+    // the scattered pre-pass above sizes work by L.row_nnz(in_idx).
+    // Explicitly a first, measured-not-assumed choice -- see the
+    // investigation this same commit's benchmark records: if the serial
+    // gather pre-pass turns out to dominate at realistic densities,
+    // Design B (direct per-active-window binary search, no pre-pass) is
+    // the documented fallback, not a hypothetical.
+    //
+    // PRECONDITION: input_tensor's indices, within each batch row, must be
+    // ascending (standard CSR convention) -- required for the gather to
+    // find a window's up-to-4 entries via one contiguous scan instead of a
+    // search. top_k()'s own output is sorted by magnitude, not index --
+    // callers must run sort_indices() (parallel.hpp) first if their input
+    // came from there. Not re-checked/enforced here (same convention the
+    // scattered pass above already silently assumes).
+    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        if (weights.block4.n_tiles() > 0) {
+            const auto& BL4 = weights.block4.block_layout;
+
+            std::vector<value_type> all_b4_outputs(
+                static_cast<std::size_t>(num_cpus) * num_outputs, value_type(0));
+
+            // Per-batch scratch, reused across batches (not reallocated
+            // per batch) -- same reasoning as block4.hpp's own persistent
+            // scratch buffers: batch=1 real-time calls can't amortize
+            // repeated heap allocation.
+            std::vector<SIZE_TYPE>   win_br;           // active window's block-row index
+            std::vector<value_type>  win_vals;         // flat, 4 per window: win_vals[4*w + li]
+            std::vector<SIZE_TYPE>   win_work_offsets;  // cumulative block4 tile count per window
+
+            #pragma omp parallel num_threads(num_cpus)
+            {
+                const int tid      = omp_get_thread_num();
+                const int nthreads = omp_get_num_threads();
+                value_type* thread_output =
+                    all_b4_outputs.data() + static_cast<std::size_t>(tid) * num_outputs;
+
+                for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
+                    const SIZE_TYPE batch_start  = (*input_tensor.ptrs[0])[batch];
+                    const SIZE_TYPE batch_end    = (*input_tensor.ptrs[0])[batch + 1];
+                    const SIZE_TYPE batch_nnz    = batch_end - batch_start;
+                    const SIZE_TYPE batch_offset = batch * static_cast<SIZE_TYPE>(out_cols);
+
+                    #pragma omp single
+                    {
+                        win_br.clear();
+                        win_vals.clear();
+                        win_work_offsets.clear();
+                        win_work_offsets.push_back(0);
+
+                        SIZE_TYPE i = 0;
+                        while (i < batch_nnz) {
+                            const SIZE_TYPE idx0 = (*input_tensor.indices[0])[batch_start + i];
+                            const SIZE_TYPE br = idx0 / static_cast<SIZE_TYPE>(BLOCK4_TILE);
+                            const SIZE_TYPE window_lo = br * static_cast<SIZE_TYPE>(BLOCK4_TILE);
+                            const SIZE_TYPE window_hi = window_lo + static_cast<SIZE_TYPE>(BLOCK4_TILE);
+
+                            // Gather every entry in [i, batch_nnz) that
+                            // still falls in this SAME window -- sorted
+                            // input means these are exactly the entries
+                            // contiguous from i (see PRECONDITION above),
+                            // so this is a single forward scan, not a
+                            // search.
+                            value_type local[4] = {value_type(0), value_type(0),
+                                                    value_type(0), value_type(0)};
+                            SIZE_TYPE j = i;
+                            while (j < batch_nnz) {
+                                const SIZE_TYPE idxj = (*input_tensor.indices[0])[batch_start + j];
+                                if (idxj >= window_hi) break;
+                                local[idxj - window_lo] = (*input_tensor.values[0])[batch_start + j];
+                                ++j;
+                            }
+
+                            const std::size_t row_nnz_b4 =
+                                static_cast<std::size_t>(br) < BL4.rows ? BL4.row_nnz(br) : 0;
+                            if (row_nnz_b4 > 0) {
+                                win_br.push_back(br);
+                                win_vals.push_back(local[0]);
+                                win_vals.push_back(local[1]);
+                                win_vals.push_back(local[2]);
+                                win_vals.push_back(local[3]);
+                                win_work_offsets.push_back(
+                                    win_work_offsets.back() + static_cast<SIZE_TYPE>(row_nnz_b4));
+                            }
+                            i = j;
+                        }
+                    }
+
+                    const SIZE_TYPE n_windows  = static_cast<SIZE_TYPE>(win_br.size());
+                    const SIZE_TYPE total_work = win_work_offsets.back();
+
+                    if (total_work > 0) {
+                        const SIZE_TYPE chunk   = (total_work + nthreads - 1) / nthreads;
+                        const SIZE_TYPE w_start = std::min(static_cast<SIZE_TYPE>(tid) * chunk, total_work);
+                        const SIZE_TYPE w_end   = std::min(w_start + chunk, total_work);
+
+                        if (w_start < w_end) {
+                            SIZE_TYPE wi = static_cast<SIZE_TYPE>(
+                                std::upper_bound(win_work_offsets.begin(), win_work_offsets.end(), w_start)
+                                - win_work_offsets.begin()) - 1;
+
+                            SIZE_TYPE last_wi = std::numeric_limits<SIZE_TYPE>::max();
+                            DeltaCSRRowCursor<uint32_t> bc_cursor;
+                            std::size_t elem_pos = 0, byte_pos = 0;
+
+                            for (SIZE_TYPE w = w_start; w < w_end; ++w) {
+                                while (wi + 1 < n_windows && win_work_offsets[wi + 1] <= w) ++wi;
+
+                                const SIZE_TYPE br          = win_br[wi];
+                                const SIZE_TYPE tile_offset = w - win_work_offsets[wi];
+                                const value_type* local     = &win_vals[static_cast<std::size_t>(wi) * 4];
+
+                                if (wi != last_wi) {
+                                    // Walk from this row's start, tracking
+                                    // elem_pos/byte_pos as we go (mirrors
+                                    // disldo_forward's collection loop) --
+                                    // avoids find()'s redundant O(row_nnz)
+                                    // rescan below: it did the SAME walk
+                                    // twice per tile (once here via the
+                                    // cursor, once again inside find()'s
+                                    // raw_find), measured as the dominant
+                                    // real overhead vs. dense at high
+                                    // density (2.7x slower than dense for
+                                    // identical tile-work at density=0.9,
+                                    // serial pre-pass itself <1% of total
+                                    // time -- see conversation/benchmark).
+                                    bc_cursor = weights.block4.row_cursor(static_cast<std::size_t>(br));
+                                    elem_pos = BL4.elem_start[br];
+                                    byte_pos = weights.block4.tile_byte_start[br];
+                                    for (SIZE_TYPE s = 0; s < tile_offset; ++s) {
+                                        bc_cursor.advance();
+                                        byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                                        ++elem_pos;
+                                    }
+                                    last_wi = wi;
+                                } else {
+                                    byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                                    ++elem_pos;
+                                }
+                                const uint32_t bc = bc_cursor.advance();
+
+                                // const at_index(): the walk above already
+                                // knows this tile's exact storage position
+                                // -- skip find()'s redundant rescan (see
+                                // comment above). Read-only, does not mark
+                                // the handle dirty, same as disldo_forward's
+                                // own block4 loop.
+                                const auto tile = weights.block4.at_index(
+                                    static_cast<uint32_t>(br), bc, elem_pos, byte_pos);
+                                const uint8_t* tdata = tile.raw_data();
+
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const std::size_t col = static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
+                                    if (col >= out_cols) continue;
+                                    const value_type out_scale = weights.get_output_scale(col);
+
+                                    value_type acc = value_type(0);
+                                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                        const std::size_t row =
+                                            static_cast<std::size_t>(br) * BLOCK4_TILE + li;
+                                        if (row >= num_inputs) continue;
+                                        const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
+                                        if (byte == 0) continue;
+                                        const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        const value_type w_true =
+                                            w_decoded * weights.get_value_scale(row) * out_scale;
+                                        acc += w_true * local[li];
+                                    }
+                                    thread_output[batch_offset + col] += acc;
+                                }
+                            }
+                        }
+                    }
+                    #pragma omp barrier
+                }
+            }
+
+            // Sum EVERY thread's private slice, not just thread 0's --
+            // mirrors disldo_forward's own identical final block4
+            // reduction (linear_disldo.hpp).
+            for (int t = 0; t < num_cpus; ++t) {
+                const value_type* s = all_b4_outputs.data() + static_cast<std::size_t>(t) * num_outputs;
+                for (std::size_t i = 0; i < num_outputs; ++i)
+                    output[i] += s[i];
+            }
+        }
+    }
 }
 
 // delta_csr_backward (sparse input + sparse gradient) removed here -- see
@@ -406,6 +628,7 @@ void delta_csr_backward_sparse_grad(
     auto& dc = weights.connections;
     const auto& L = dc.layout;
     const std::size_t n_inputs = L.rows;
+    const std::size_t out_cols = L.cols;
 
     for (SIZE_TYPE b = 0; b < batch; ++b)
         for (std::size_t r = 0; r < n_inputs; ++r)
@@ -415,8 +638,20 @@ void delta_csr_backward_sparse_grad(
             neuron_grad_accum[(*out_grad_sparse.indices[0])[j]] +=
                 std::abs((*out_grad_sparse.values[0])[j]);
 
-    if (dc.empty()) return;
+    // Hoisted out of the dc.empty() branch below (used by the block4 phase
+    // too, which -- same bug/fix as delta_csr_forward -- must NOT be
+    // skipped just because the scattered side has zero nnz.
+    if (weights.value_scale.size() < n_inputs)
+        weights.value_scale.resize(n_inputs, value_type(1));
+    if (weights.value_scale_importance.size() < n_inputs)
+        weights.value_scale_importance.resize(n_inputs, value_type(0));
 
+    // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do"
+    // -- see delta_csr_forward's identical fix/comment. A layer can be
+    // entirely block4-resident and still have real work in the block4
+    // phase below, appended after this guarded block instead of an
+    // unconditional early return.
+    if (!dc.empty()) {
     // Importance stats accumulators across batches -- each batch's
     // #pragma omp parallel for is a SEPARATE parallel region (re-created
     // every batch iteration), so reduction() handles within-one-batch
@@ -434,10 +669,6 @@ void delta_csr_backward_sparse_grad(
     // outer loop is serial, so also race-free). Applied once after all
     // batches -- "sum first, then apply lr" per conversation.
     std::vector<double> scale_grad_sums(n_inputs, 0.0);
-    if (weights.value_scale.size() < n_inputs)
-        weights.value_scale.resize(n_inputs, value_type(1));
-    if (weights.value_scale_importance.size() < n_inputs)
-        weights.value_scale_importance.resize(n_inputs, value_type(0));
 
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
@@ -550,6 +781,275 @@ void delta_csr_backward_sparse_grad(
             weights.value_scale_importance[r] -= raw_update;
             const value_type vs_imp = weights.value_scale_importance[r];
             weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
+        }
+    }
+    } // closes if (!dc.empty())
+
+    // ── block4 contribution ─────────────────────────────────────────────────
+    //
+    // Real, previously-silent bug this closes: same as delta_csr_forward's
+    // (see its comment) -- block4-resident synapses were never touched by
+    // this function at all. FP4-specific (block4 is FP4-only), hence the
+    // if constexpr guard.
+    //
+    // Gather design: mirrors the scattered loop above's own merge-scan
+    // (row_cursor + og_ptr walking forward through sorted out_grad_sparse),
+    // applied one level up -- per TILE (4 output columns) instead of per
+    // synapse. PRECONDITION: out_grad_sparse's indices, within each batch
+    // row, must be ascending (same convention delta_csr_forward's input
+    // requires -- see its comment).
+    //
+    // Parallelized by BLOCK-ROW (br), not by tile -- unlike disldo_backward
+    // (which partitions by flat tile index and therefore needs cross-thread
+    // accumulator buffers, since two different tiles can share a block-row
+    // when they differ only in block-column), here each br owns exactly 4
+    // unique input rows (br*4..br*4+3) that NO OTHER br ever touches, and a
+    // thread processes one br's tiles serially within itself -- so
+    // value_scale/dx/importance-stat writes for those 4 rows can go
+    // straight into shared (non-per-thread) accumulators with no race,
+    // simpler than disldo_backward's scheme. This also gives the same row-
+    // exclusive-ownership safety a block4 tile resize needs (see
+    // block4_resize_tile_in_row's comment) for free.
+    //
+    // Correctness-first scalar port (matches delta_csr_forward's own choice
+    // not to bring over disldo_forward/backward's Block4Vec SIMD machinery
+    // immediately) -- revisit with real profiling if a benchmark shows this
+    // is a bottleneck, same as forward's documented approach.
+    //
+    // KNOWN SIMPLIFICATION (documented, not a bug, mirrors disldo_backward's
+    // identical one): a row with both scattered and block4 synapses gets
+    // two sequential value_scale gradient steps (this section's own, after
+    // the scattered section's own above) rather than one combined step.
+    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        if (weights.block4.n_tiles() > 0) {
+            const auto& BL4 = weights.block4.block_layout;
+            const std::size_t tiles_r = BL4.rows;
+
+            // Safe to write directly (no per-thread buffer / final
+            // reduction needed): each row is exclusively owned by one
+            // br across the WHOLE function (br = row/4, no two br's
+            // share a row), and different batches' parallel regions
+            // never overlap in time (each is fully joined before the
+            // next begins) -- see comment above.
+            std::vector<double> row_scale_grad_sums(n_inputs, 0.0);
+
+            double b4_total_sum_abs_new = 0.0, b4_total_sum_abs_old = 0.0;
+            double b4_total_sum_sq_new  = 0.0, b4_total_sum_sq_old  = 0.0;
+            value_type b4_total_max_new = value_type(0);
+
+            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+                const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
+
+                double batch_sum_abs_new = 0.0, batch_sum_abs_old = 0.0;
+                double batch_sum_sq_new  = 0.0, batch_sum_sq_old  = 0.0;
+                value_type batch_max_new = value_type(0);
+
+                #pragma omp parallel for num_threads(num_cpus) schedule(static) \
+                    reduction(+:batch_sum_abs_new, batch_sum_abs_old, batch_sum_sq_new, batch_sum_sq_old) \
+                    reduction(max:batch_max_new)
+                for (std::size_t br = 0; br < tiles_r; ++br) {
+                    const std::size_t row_nnz_b4 = BL4.row_nnz(br);
+                    if (row_nnz_b4 == 0) continue;
+                    // Total live slots across ALL of this row's tiles this
+                    // call -- every tile contributes exactly BLOCK4_TILE
+                    // slots per row it covers (dense, weight=0.0 included,
+                    // see block4.hpp), mirrors disldo_backward's
+                    // row_live_count.
+                    const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
+
+                    value_type dx_accum[BLOCK4_TILE]       = {0, 0, 0, 0};
+                    double     row_grad_local[BLOCK4_TILE] = {0, 0, 0, 0};
+
+                    if (learning_rate == value_type(0)) {
+                        // Read-only: no writes anywhere in this row, so no
+                        // resize can ever happen -- the plain shared-store
+                        // at_index() path has no concurrency hazard at all
+                        // here (see Block4Store::RowWorkspace's comment on
+                        // why that hazard is specifically about growth).
+                        auto bc_cursor = weights.block4.row_cursor(br);
+                        std::size_t elem_pos = BL4.elem_start[br];
+                        std::size_t byte_pos = weights.block4.tile_byte_start[br];
+                        SIZE_TYPE og_ptr = og_start;
+
+                        for (std::size_t e = 0; e < row_nnz_b4; ++e) {
+                            const uint32_t    bc        = bc_cursor.advance();
+                            const std::size_t window_lo = static_cast<std::size_t>(bc) * BLOCK4_TILE;
+                            const std::size_t window_hi = window_lo + BLOCK4_TILE;
+
+                            while (og_ptr < og_end &&
+                                   static_cast<std::size_t>((*out_grad_sparse.indices[0])[og_ptr]) < window_lo)
+                                ++og_ptr;
+
+                            value_type dy_local[BLOCK4_TILE] = {0, 0, 0, 0};
+                            bool any = false;
+                            for (SIZE_TYPE p = og_ptr;
+                                 p < og_end && static_cast<std::size_t>((*out_grad_sparse.indices[0])[p]) < window_hi;
+                                 ++p) {
+                                const std::size_t col = static_cast<std::size_t>((*out_grad_sparse.indices[0])[p]);
+                                dy_local[col - window_lo] = (*out_grad_sparse.values[0])[p];
+                                any = true;
+                            }
+
+                            if (any) {
+                                const auto tile = weights.block4.at_index(
+                                    static_cast<uint32_t>(br), bc, elem_pos, byte_pos);
+                                const uint8_t* tdata = tile.raw_data();
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const std::size_t row = br * BLOCK4_TILE + li;
+                                    if (row >= n_inputs) continue;
+                                    const value_type val_scale = weights.get_value_scale(row);
+                                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                        if (dy_local[lj] == value_type(0)) continue;
+                                        const std::size_t col = window_lo + lj;
+                                        if (col >= out_cols) continue;
+                                        const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
+                                        const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        const value_type out_scale = weights.get_output_scale(col);
+                                        const value_type w = w_decoded * val_scale * out_scale;
+                                        dx_accum[li] += w * dy_local[lj];
+                                    }
+                                }
+                            }
+                            byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                            ++elem_pos;
+                        }
+                    } else {
+                        // Writing: use a row-local workspace so growth never
+                        // touches shared tile_data/tbyte_start/tbyte_end
+                        // until a single row-exclusive merge-back at the
+                        // end -- see Block4Store::RowWorkspace's comment
+                        // for why the plain shared-store path (find()-free
+                        // or not) is NOT safe here under concurrent
+                        // per-row-owning threads, confirmed via ASan.
+                        auto ws = weights.block4.snapshot_row(br);
+                        SIZE_TYPE og_ptr = og_start;
+                        std::size_t local_pos = 0;
+
+                        for (std::size_t e = 0; e < row_nnz_b4; ++e) {
+                            const uint32_t    bc        = ws.bc[e];
+                            const std::size_t window_lo = static_cast<std::size_t>(bc) * BLOCK4_TILE;
+                            const std::size_t window_hi = window_lo + BLOCK4_TILE;
+
+                            while (og_ptr < og_end &&
+                                   static_cast<std::size_t>((*out_grad_sparse.indices[0])[og_ptr]) < window_lo)
+                                ++og_ptr;
+
+                            value_type dy_local[BLOCK4_TILE] = {0, 0, 0, 0};
+                            bool any = false;
+                            for (SIZE_TYPE p = og_ptr;
+                                 p < og_end && static_cast<std::size_t>((*out_grad_sparse.indices[0])[p]) < window_hi;
+                                 ++p) {
+                                const std::size_t col = static_cast<std::size_t>((*out_grad_sparse.indices[0])[p]);
+                                dy_local[col - window_lo] = (*out_grad_sparse.values[0])[p];
+                                any = true;
+                            }
+
+                            const std::size_t this_local_pos = local_pos;
+                            if (any) {
+                                uint8_t scratch[BLOCK4_TILE_SLOTS];
+                                weights.block4.unpack_workspace_tile(ws, e, this_local_pos, scratch);
+                                bool dirty = false;
+
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const std::size_t row = br * BLOCK4_TILE + li;
+                                    if (row >= n_inputs) continue;
+                                    const value_type in_val    = input[static_cast<std::size_t>(b) * n_inputs + row];
+                                    const value_type val_scale = weights.get_value_scale(row);
+                                    const value_type imp_scale = weights.get_importance_scale(row);
+                                    const value_type effective_lr = lr_per_row_nnz
+                                        ? learning_rate / static_cast<value_type>(nnz_row)
+                                        : learning_rate;
+                                    const value_type scale_eff_lr =
+                                        learning_rate / static_cast<value_type>(nnz_row);
+
+                                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                        if (dy_local[lj] == value_type(0)) continue;
+                                        const std::size_t col = window_lo + lj;
+                                        if (col >= out_cols) continue;
+
+                                        const uint8_t byte = scratch[Block4Tile::slot_index(li, lj)];
+                                        const value_type w_decoded      = FP4_TABLE[byte & 0xFu];
+                                        const value_type out_scale      = weights.get_output_scale(col);
+                                        const value_type combined_scale = val_scale * out_scale;
+                                        const value_type w               = w_decoded * combined_scale;
+                                        const value_type dy_val          = dy_local[lj];
+                                        dx_accum[li] += w * dy_val;
+
+                                        const value_type out_imp_scale = weights.get_output_importance_scale(col);
+                                        const value_type combined_imp_scale = imp_scale * out_imp_scale;
+                                        const value_type imp_decoded = FP4_TABLE[(byte >> 4) & 0xFu];
+                                        const value_type grad = dy_val * in_val;
+                                        value_type imp = imp_decoded * combined_imp_scale;
+                                        imp -= grad * effective_lr;
+                                        const value_type new_w = w + (-effective_lr * grad)
+                                                                  / (value_type(1) + std::abs(imp));
+                                        const uint8_t new_w_code   = fp4_quantize_stochastic(new_w / combined_scale);
+                                        const uint8_t new_imp_code = fp4_quantize_stochastic(imp / combined_imp_scale);
+                                        scratch[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
+                                        dirty = true;
+
+                                        const value_type actual_imp = FP4_TABLE[new_imp_code] * combined_imp_scale;
+                                        const value_type stored_imp = imp_decoded * combined_imp_scale;
+                                        batch_sum_abs_new += std::abs(static_cast<double>(actual_imp));
+                                        batch_sum_abs_old += std::abs(static_cast<double>(stored_imp));
+                                        batch_sum_sq_new  += static_cast<double>(actual_imp) * actual_imp;
+                                        batch_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
+                                        batch_max_new = std::max(batch_max_new, std::abs(actual_imp));
+
+                                        row_grad_local[li] += static_cast<double>(w_decoded)
+                                            * static_cast<double>(out_scale) * (scale_eff_lr * dy_val * in_val);
+                                    }
+                                }
+                                if (dirty)
+                                    weights.block4.commit_dirty_tile_in_workspace(ws, e, this_local_pos, scratch);
+                            }
+                            local_pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_local_pos]);
+                        } // tiles in this row
+
+                        // Merge back -- evicts lowest-|true-importance|
+                        // synapses only if this row genuinely grew past its
+                        // own current headroom (see merge_row_workspace's
+                        // comment). True importance uses the SAME per-row/
+                        // per-col scale lookups as above, per conversation
+                        // (raw 4-bit codes alone aren't enough resolution
+                        // to rank meaningfully).
+                        weights.block4.merge_row_workspace(br, ws,
+                            [&](std::size_t ev_row, std::size_t ev_col, uint8_t ev_imp_code) -> double {
+                                const value_type imp_scale     = weights.get_importance_scale(ev_row);
+                                const value_type out_imp_scale = weights.get_output_importance_scale(ev_col);
+                                return static_cast<double>(FP4_TABLE[ev_imp_code & 0xFu])
+                                     * static_cast<double>(imp_scale) * static_cast<double>(out_imp_scale);
+                            });
+                    }
+
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        if (row >= n_inputs) continue;
+                        input_gradients[static_cast<std::size_t>(b) * n_inputs + row] += dx_accum[li];
+                        if (learning_rate != value_type(0))
+                            row_scale_grad_sums[row] += row_grad_local[li];
+                    }
+                } // br
+
+                b4_total_sum_abs_new += batch_sum_abs_new; b4_total_sum_abs_old += batch_sum_abs_old;
+                b4_total_sum_sq_new  += batch_sum_sq_new;  b4_total_sum_sq_old  += batch_sum_sq_old;
+                b4_total_max_new = std::max(b4_total_max_new, batch_max_new);
+            } // batch
+
+            if (learning_rate != value_type(0)) {
+                weights.update_importance_stats_aggregate(
+                    b4_total_sum_abs_new, b4_total_sum_abs_old,
+                    b4_total_sum_sq_new,  b4_total_sum_sq_old, b4_total_max_new);
+
+                for (std::size_t row = 0; row < n_inputs; ++row) {
+                    if (row_scale_grad_sums[row] == 0.0) continue;
+                    const value_type raw_update = static_cast<value_type>(row_scale_grad_sums[row]);
+                    weights.value_scale_importance[row] -= raw_update;
+                    const value_type vs_imp = weights.value_scale_importance[row];
+                    weights.value_scale[row] -= raw_update / (value_type(1) + std::abs(vs_imp));
+                }
+            }
         }
     }
 }

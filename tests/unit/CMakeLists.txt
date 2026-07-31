@@ -151,6 +151,8 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_combined_absolute
     test_block4_sparse_tile
     test_block4_memory_cap_and_compression
+    test_block4_sparse_input_forward
+    test_block4_sparse_input_backward
     test_fp4_bitshift
     test_fp4_stochastic
 )
