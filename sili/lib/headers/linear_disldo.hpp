@@ -11,6 +11,7 @@
 #include "sparse_struct.hpp"
 #include "parallel.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -673,6 +674,7 @@ void disldo_backward(
         std::vector<uint32_t>&    tile_bc   = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
+        std::vector<std::size_t>& row_ti_start = weights.block4.scratch_row_ti_start;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back() -- see
         // forward's identical comment above (real, measured cost:
@@ -696,8 +698,12 @@ void disldo_backward(
         std::vector<uint32_t>& row_live_count = weights.block4.scratch_row_live_count;
         row_live_count.assign(n_in, 0);
         const auto& BL4 = weights.block4.block_layout;
+        row_ti_start.resize(BL4.rows + 1);
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
+            row_ti_start[br] = ti; // written unconditionally -- an empty
+            // row (n_bc==0) still needs a valid (empty) [start,start)
+            // range for the parallel loop's row-partitioned split below.
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0) continue;
             const uint32_t row_count = uint32_t(n_bc) * BLOCK4_TILE;
@@ -710,43 +716,35 @@ void disldo_backward(
             std::size_t byte_pos = weights.block4.tile_byte_start[br];
             for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
                 tile_br[ti] = uint32_t(br);
-                const uint32_t bc = bc_cursor.advance();
-                tile_bc[ti] = bc;
-                // Backward writes every one of a tile's 16 slots on every
-                // touch (see the write-back below) -- promote any still-
-                // sparse tile to dense HERE, serially, before the
-                // parallel region below even starts. See
-                // Block4Store::force_dense_at's comment for why this
-                // can't safely happen inside the parallel loop: resizing
-                // a sparse tile shifts every LATER tile in its row, which
-                // would race against another thread reading/writing that
-                // same row if done concurrently -- a real hazard the old
-                // fixed-16-byte-per-tile storage never had.
-                // force_dense_at (not force_dense(br,bc)): this loop
-                // already knows elem_pos/byte_pos from its own walk, so
-                // use the O(1) core directly -- calling force_dense(br,bc)
-                // here would make it re-derive them via its own raw_find()
-                // row scan on every tile, turning this collection loop
-                // into an O(row_nnz^2) scan (a real, measured regression
-                // caught via scripts/bench_block4_vs_dense_fp4.cpp before
-                // this call was fixed).
-                weights.block4.force_dense_at(uint32_t(br), elem_pos, byte_pos);
+                tile_bc[ti] = bc_cursor.advance();
                 tile_elem[ti] = elem_pos;
                 tile_byte[ti] = byte_pos;
-                byte_pos += BLOCK4_TILE_SLOTS; // guaranteed dense now
+                // Real length (sparse or dense), NOT force-advanced by
+                // BLOCK4_TILE_SLOTS -- this loop no longer forces
+                // anything dense (see the parallel loop below for why
+                // that's no longer necessary), so tiles stay exactly
+                // whatever the real content last left them as.
+                byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
+        row_ti_start[BL4.rows] = ti;
 
         std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
         t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in, 0.0);
 
-        // Hoisted out of the loop condition below -- see forward's
-        // identical fix/comment (block4.hpp): re-evaluating
-        // tile_br.size() every iteration instead of once measured as a
-        // real, large cost (8.78% of forward's total instruction count
-        // at 100% density). n_b4 (already computed above) is exactly
-        // this same value, so no extra call needed either way.
-        const int64_t n_tiles_local = int64_t(n_b4);
+        // Real growth-cap exhaustion (std::bad_alloc, thrown from inside
+        // a Block4TileHandle destructor's resize -- see block4.hpp) can
+        // now happen from WITHIN the parallel region below, since tiles
+        // resize based on real content instead of being forced dense
+        // beforehand. OpenMP does not support exceptions propagating
+        // across a #pragma omp parallel region's boundary -- an
+        // uncaught throw inside a worker thread is undefined behavior
+        // (in practice, std::terminate). Each thread catches locally and
+        // records into this shared flag; the master thread re-throws
+        // once, after the region joins, so the caller sees the same
+        // std::bad_alloc it always would have.
+        std::atomic<bool> block4_bad_alloc{false};
+
         #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
@@ -754,26 +752,48 @@ void disldo_backward(
             value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
             double* mrow = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in;
 
+            // Partitioned BY BLOCK-ROW, not by flat tile index -- each
+            // thread exclusively owns every tile in the rows it's
+            // assigned, processed sequentially within that row (the
+            // inner `for (ti...)` below), so no two threads ever touch
+            // the same row's tile_data concurrently. This is what makes
+            // it safe for a tile's handle to resize (real sparse<->dense
+            // transitions, driven by real content) inside this parallel
+            // region at all -- see block4_resize_tile_in_row's comment:
+            // resizing ONE tile shifts every LATER tile in ITS OWN row,
+            // which is exactly the memory a same-row thread already owns
+            // exclusively, never memory another thread could be reading
+            // or writing. schedule(static): row widths CAN vary a lot
+            // (some rows have far more live tiles than others), which in
+            // principle makes static's flat contiguous split load-balance
+            // worse than schedule(dynamic)/schedule(guided) once
+            // num_cpus > 1 -- tried both, measured worse in practice:
+            // their real per-chunk dispatch overhead showed up as a real
+            // backward slowdown at high tile density even at num_cpus=1
+            // (scripts/bench_block4_vs_dense_fp4.cpp: dynamic/guided both
+            // measured ~1.69x speedup over the dense floor at 100% fill,
+            // vs ~1.97x for static -- worse than even the pre-this-fix
+            // documented baseline of ~1.88x), where there's no actual
+            // load-balancing benefit to buy that overhead with in the
+            // first place. Revisit if a real, measured multi-thread
+            // workload with genuinely lopsided row widths shows static's
+            // imbalance actually costing more wall-clock time than this.
             #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < n_tiles_local; ++ti) {
-                const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+            for (std::size_t br = 0; br < BL4.rows; ++br) {
+            try {
+            for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti) {
+                const uint32_t bc = tile_bc[ti];
                 // Non-const: this tile is both read (precompute) and
                 // written (writeback) below, spanning this whole
                 // iteration -- one handle, unpacks once if sparse,
                 // re-packs once (if touched) when it goes out of scope
-                // at the end of this iteration. at_index(): skip find()'s
-                // redundant re-scan, see collection loop's comment above.
-                // Every tile reaching this parallel loop was already
-                // force_dense()'d in the SERIAL collection loop above, so
-                // this handle is always the dense fast path here -- its
-                // destructor is a guaranteed no-op (see
-                // ~Block4TileHandle()'s comment), which is what makes this
-                // loop safe to parallelize at all: a variable-length
-                // sparse tile's own destructor can resize and shift every
-                // LATER tile in its row (see block4_resize_tile_in_row),
-                // which would race against another thread touching that
-                // same row if it could happen here.
-                auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)], tile_byte[std::size_t(ti)]);
+                // at the end of this iteration, genuinely reflecting
+                // whatever the write left it as (sparse or dense) --
+                // see ~Block4TileHandle()'s comment for why that's safe
+                // here specifically (row-exclusive thread ownership).
+                // at_index(): skip find()'s redundant re-scan, see
+                // collection loop's comment above.
+                auto tile = weights.block4.at_index(uint32_t(br), bc, tile_elem[ti], tile_byte[ti]);
                 // Resolved ONCE per tile for the read-only decode below
                 // instead of once per .at() call (16 calls/tile
                 // otherwise) -- see forward's identical hoist and
@@ -1056,9 +1076,22 @@ void disldo_backward(
                             }
                         }
                     }
-                }
-            }
-        }
+                } // closes for (li...)
+            } // closes for (ti...)
+            } // closes try
+            catch (const std::bad_alloc&) {
+                // See the block4_bad_alloc declaration's comment -- this
+                // thread's remaining rows in this omp-for chunk are
+                // simply skipped (their weight updates are lost for this
+                // call), matching how a single-threaded bad_alloc from
+                // this same handle-destructor path would already abort
+                // the rest of THAT row's work; the caller sees the same
+                // std::bad_alloc either way, once the region joins below.
+                block4_bad_alloc.store(true, std::memory_order_relaxed);
+            } // closes catch
+            } // closes for (br...)
+        } // closes #pragma omp parallel
+        if (block4_bad_alloc.load()) throw std::bad_alloc();
 
         if (learning_rate != value_type(0)) {
             for (std::size_t row = 0; row < n_in; ++row) {

@@ -1082,6 +1082,100 @@ smaller allocation.
   previously-documented density point (100% fill: 1.93x vs documented
   1.88x; 50%: 3.83x vs 3.74x; 10%: 16.11x vs 15.85x; forward's ~5x
   gap, `learning_rate=0`'s real cost, unchanged).
+- **`force_dense_at` SUPERSEDED -- its own justification was wrong,
+  caught in review before merge.** The bullet above documents
+  `force_dense_at`'s original design and verification; both are
+  historically accurate but the design itself was later found
+  incorrect and replaced (this bullet). "Backward touches all 16
+  slots on every call, so a touched tile ends up dense regardless" is
+  true for a random/non-converging `dy` signal (what it was measured
+  under), but false once a genuinely sparsity-encouraging loss is in
+  the loop -- and this codebase's own energy function (`sili/energy.py`)
+  has a KL sparsity term that's explicitly part of the synaptogenesis
+  story, so this isn't a hypothetical case. Direct diagnostic (fixed
+  input/target, real `dy = out - target`, watching a tile that starts
+  fully dense): under plain backward alone `count_live` stays at 16;
+  under backward + an external L1-style shrink step (soft-threshold,
+  the normal way L1/proximal regularization is implemented, as a step
+  separate from the task-loss backward) it settles at 0 and STAYS
+  there. With `force_dense_at` in place: `maybe_compress` genuinely
+  shrinks the tile to 1 byte, which survives right up until the very
+  next `disldo_backward` call, which unconditionally blows it back to
+  16 bytes regardless of what the write itself would have kept it at
+  -- discarding real, persistent compression on every single touch, in
+  exactly the regime (memory-constrained systems relying on
+  sparsity-encouraging losses to keep block4 tiles small) this whole
+  feature exists for. (Two methodology corrections along the way,
+  also worth keeping: an early version of this diagnostic used
+  deterministic `fp4_quantize` on unscaled values, "must shift >0.25
+  raw units or nothing moves" -- real `disldo_backward` uses
+  `fp4_quantize_stochastic`, not deterministic, and composes through
+  `value_scale`/`output_scale`; measured directly, a small-but-nonzero
+  true weight -- e.g. 0.1 -- reads as exactly code 0 on ~80% of
+  stochastic touches, so real compression opportunities are far more
+  common than the deterministic framing suggested. A `target=all-zero`
+  full-training-loop variant of the diagnostic was itself confounded:
+  `value_scale` can collapse toward 0 as an easier way to shrink
+  output than moving individual weights, so it doesn't cleanly isolate
+  per-weight sparsity either -- noted for anyone reusing this
+  diagnostic shape later, not resolved.)
+
+  **Fix: partition `disldo_backward`'s parallel block4 loop BY
+  BLOCK-ROW instead of by flat tile index**, so each thread
+  exclusively owns every tile in the rows it's assigned (processed
+  sequentially within that row) -- removes `force_dense`/
+  `force_dense_at` entirely; a tile's `Block4TileHandle` destructor
+  just does its normal thing (unpack if sparse, write, re-pack based
+  on real final content), which is now safe because no two threads
+  can ever touch the same row's `tile_data` concurrently (the actual
+  hazard resizing introduces -- see the bullet above). Schedule choice
+  measured, not assumed: `schedule(dynamic)` and `schedule(guided)`
+  both regressed backward's speedup over the dense floor at 100% fill
+  from ~1.93x to ~1.69x even at `num_cpus=1` (real per-chunk dispatch
+  overhead with no load-balancing benefit to buy it at one thread);
+  plain `schedule(static)` at the row level fully recovered and
+  slightly beat every previously-documented density point (100%:
+  1.97x vs 1.88x; 50%: 3.87x vs 3.74x; 10%: 19.75x vs 15.85x) --
+  revisit only if a real multi-thread workload with genuinely lopsided
+  row widths shows static's load imbalance actually costing wall-clock
+  time.
+
+  Since a tile's resize (and its `std::bad_alloc` on real budget
+  exhaustion) now genuinely happens INSIDE the parallel region instead
+  of a safe serial pre-pass, and OpenMP doesn't support exceptions
+  crossing a `#pragma omp parallel` region's boundary, each thread's
+  per-row work is wrapped in its own `try`/`catch(std::bad_alloc&)`,
+  setting a shared `std::atomic<bool>` that the master thread checks
+  and re-throws from after the region joins -- the caller still sees
+  the same `std::bad_alloc` it always would have.
+
+  Verified: full ctest suite clean (same pre-existing flaky set:
+  #19/#35/#51 -- one additional test, `test_scale_handling.cpp`'s
+  per-row `importance_scale` Hebbian test, was observed to fail
+  intermittently across repeated runs with NO code changes between
+  runs and doesn't touch block4/backward at all, confirming it's a
+  pre-existing RNG-order dependency in the shared Catch2 binary, not
+  caused by this fix); a dedicated ThreadSanitizer harness (same one
+  used to verify `force_dense_at` originally) still reports zero
+  worker-vs-worker races under the new row-partitioned scheduling; the
+  original diagnostic that demonstrated the bug now shows the SAME
+  tile staying compressed (`is_sparse=true`, 1-3 bytes) through the
+  exact same real `disldo_backward` call that previously blew it back
+  to 16 bytes every time.
+
+  **Follow-up (not yet done, deferred by direction):** a real
+  liveness-tracking gap surfaced alongside this -- a slot whose WEIGHT
+  reaches 0 doesn't necessarily have its IMPORTANCE reach 0 too
+  (nothing currently forces that), so `count_live()`'s "byte != 0"
+  heuristic can overcount live synapses for weights that are
+  functionally dead. Proposed fix (not yet implemented): a small decay
+  parameter applied to both the per-synapse stochastic FP4 update and
+  the row/rank-1 importance scales, so stale importance actually
+  decays over time instead of sitting at whatever it last was --
+  this doubles as a real, principled way to rank synapses for pruning
+  when trading old/unpromising weights for new ones under a memory/
+  compression budget, not just a compression-accuracy fix.
+
 - **Memory-cap + compression benchmark, done.**
   `tests/unit/test_block4_memory_cap_and_compression.cpp` (ctest,
   hard-CHECK, permanent): drives 1500 iterations of real online

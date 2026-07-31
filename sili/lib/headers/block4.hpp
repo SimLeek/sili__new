@@ -804,6 +804,18 @@ struct Block4Store {
     std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t>    scratch_row_live_count; // backward only
     std::vector<double>      scratch_row_grad;        // backward only
+    // backward only: scratch_tile_br/bc/elem/byte are filled in row-major
+    // order (see linear_disldo.hpp's collection loop), so row br's tiles
+    // occupy [scratch_row_ti_start[br], scratch_row_ti_start[br+1]) --
+    // lets backward's parallel loop partition work BY ROW instead of by
+    // flat tile index, so two threads can never touch the same row's
+    // tile_data concurrently (real tile resizing shifts every later tile
+    // in its row -- see block4_resize_tile_in_row -- so row-exclusive
+    // ownership, not a flat static split, is what makes it safe to let
+    // tiles genuinely compress/decompress based on real content inside
+    // the parallel region, instead of forcing every touched tile dense
+    // beforehand regardless of what the loss actually did to it).
+    std::vector<std::size_t> scratch_row_ti_start;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
@@ -930,47 +942,6 @@ struct Block4Store {
         tile_is_sparse[elem_pos] = 1;
     }
 
-    // Serial-only: promotes the tile at (br,bc) to dense NOW, regardless
-    // of switch_point, if it's currently sparse. disldo_backward
-    // (linear_disldo.hpp) calls this during its SERIAL collection pass,
-    // for every tile it's about to touch, BEFORE entering its parallel
-    // region -- backward writes every one of a tile's 16 slots on every
-    // call, so a touched tile ends up dense immediately regardless,
-    // matching the same finding that motivated block4's memory-cap
-    // formula (tiles trend toward full occupancy under real training,
-    // not minimal). Doing the resize here, serially, avoids two threads
-    // racing on the SAME row's tile_data: unlike the old fixed-16-byte-
-    // per-tile design, resizing ONE tile physically shifts every LATER
-    // tile in its row (see block4_resize_tile_in_row), so it can never
-    // safely happen concurrently with another thread reading/writing
-    // that row -- a real hazard this redesign introduces that the old
-    // fixed-stride storage accidentally couldn't hit.
-    void force_dense(uint32_t br, uint32_t bc) {
-        std::size_t elem_pos = 0;
-        const std::size_t byte_pos = raw_find(br, bc, &elem_pos);
-        if (byte_pos == std::numeric_limits<std::size_t>::max()) return;
-        force_dense_at(br, elem_pos, byte_pos);
-    }
-
-    // O(1) core, for a caller that already knows elem_pos/byte_pos from
-    // its own sequential row walk (disldo_backward's collection loop --
-    // see linear_disldo.hpp). force_dense(br,bc) above re-derives these
-    // via raw_find() first; calling it per-tile from a loop that's
-    // ALREADY walking the row in order would turn that walk into an
-    // O(row_nnz^2) scan (this was a real, measured regression caught via
-    // scripts/bench_block4_vs_dense_fp4.cpp -- backward's speedup over
-    // the dense floor dropped from the documented ~1.88x to ~1.44x
-    // before this split existed).
-    void force_dense_at(uint32_t br, std::size_t elem_pos, std::size_t byte_pos) {
-        if (!tile_is_sparse[elem_pos]) return;
-        const std::size_t old_len = block4_stored_tile_len(true, &tile_data[byte_pos]);
-        uint8_t dense[BLOCK4_TILE_SLOTS];
-        block4_sparse_unpack(&tile_data[byte_pos], dense);
-        block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                   br, byte_pos, old_len, dense, BLOCK4_TILE_SLOTS, max_tile_bytes);
-        tile_is_sparse[elem_pos] = 0;
-    }
-
     std::size_t n_tiles() const { return block_layout.total_nnz; }
 
     // Real total bytes currently allocated for tile storage (across every
@@ -1057,9 +1028,23 @@ inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint3
 // codebase (get_or_create, equalizer_step, ...). A dense handle's
 // destructor never reaches this (dense tiles mutate in place, always
 // exactly BLOCK4_TILE_SLOTS bytes, never resized), so this only fires for
-// the was_sparse_ case. See Block4Store::force_dense for why
-// disldo_backward's parallel loop avoids ever hitting this path
-// concurrently.
+// the was_sparse_ case.
+//
+// A resize here physically shifts every LATER tile in this row (see
+// block4_resize_tile_in_row) -- unsafe if another thread could be
+// reading/writing that same row concurrently. disldo_backward
+// (linear_disldo.hpp) handles this by partitioning its parallel loop BY
+// BLOCK-ROW (each thread exclusively owns whole rows, never sharing one
+// with another thread) instead of forcing every touched tile dense
+// beforehand regardless of real content -- an earlier version did the
+// latter (see TODO_DUAL_BLOCK4.md's "force_dense_at" writeup for why
+// that was wrong: it discarded genuine, persistent compression from
+// sparsity-encouraging losses like L1/KL on every single touch). Since
+// this destructor can now genuinely throw from INSIDE that parallel
+// region, disldo_backward also wraps each thread's row-processing in a
+// try/catch (OpenMP does not support exceptions crossing the parallel-
+// region boundary) and re-throws once on the master thread after the
+// region joins.
 inline Block4TileHandle::~Block4TileHandle() noexcept(false) {
     if (!dirty_ || !valid_ || !was_sparse_) return;
     // Re-fetch by COORDINATE, not the byte_pos_ cached at construction --
