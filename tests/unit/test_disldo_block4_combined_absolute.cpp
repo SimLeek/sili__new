@@ -39,9 +39,13 @@ int main() {
     // block4: tile (0,0) with (row0,col1)=1.0 and (row2,col3)=0.5 -- row0
     // now has BOTH a scattered entry (col5) AND a block4 entry (col1), so
     // this also checks per-row merging/sorting, not just concatenation.
-    auto tile = weights.block4.get_or_create(0, 0);
-    tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
-    tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.75f) << 4);
+    // Scoped -- see test_disldo_block4_forward.cpp's identical comment:
+    // the destructor is what persists these writes now.
+    {
+        auto tile = weights.block4.get_or_create(0, 0);
+        tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
+        tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.75f) << 4);
+    }
 
     std::vector<SIZE_TYPE> op, oi;
     std::vector<float> ow, oimp;

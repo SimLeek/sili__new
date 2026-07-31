@@ -206,24 +206,14 @@ static void test_backward_declines_growth_gracefully_under_budget_exhaustion() {
     // training/inference keeps running and a caller doing its own
     // memory management can still detect this happened.
     //
-    // NOTE on construction: block4_ensure_row_headroom conservatively
-    // reserves a full BLOCK4_TILE_SLOTS (16) bytes for every NEW tile at
-    // creation time, regardless of whether it ends up compressed. Given
-    // ONLY the normal get_or_create/maybe_compress/disldo_backward API
-    // surface, that means a row's own local headroom can never actually
-    // run out for an individual tile regrowing back toward its own
-    // 16-byte reservation -- the row-level headroom pool is an exact
-    // conservation of "16 minus each tile's current size", which always
-    // covers any subset of tiles regrowing (this is itself a real,
-    // separate finding: tile COUNT capacity within a given max_tile_bytes
-    // hasn't actually increased from real compression, only the
-    // used-bytes accounting has -- see TODO_DUAL_BLOCK4.md). This test
-    // constructs a genuinely tight row directly (Block4Store's fields
-    // are public specifically so internals like this can be exercised)
-    // to verify the decline-and-continue mechanism for real, since it
-    // matters the moment either max_tile_bytes is lowered below an
-    // already-allocated row's own footprint, or a future, less
-    // conservative row-headroom formula is used.
+    // Row headroom is now genuinely compression-aware (see block4.hpp:
+    // new tiles start empty and grow via exact-shortfall-only resizing,
+    // no dense-worst-case over-provisioning), so a row ends up at (or
+    // very near) zero headroom naturally from ordinary use -- unlike an
+    // earlier version of this test, no manual internal-state
+    // construction is needed to reach this scenario; just cap the
+    // budget at the current real allocation so ANY further growth is
+    // genuinely impossible.
     Block4Store store;
     store.init(16, 16);
     store.switch_point = 2;
@@ -232,22 +222,12 @@ static void test_backward_declines_growth_gracefully_under_budget_exhaustion() {
         h.at(0, 0) = 0x11;
         h.at(0, 1) = 0x22; // 2 live
     }
-    store.maybe_compress(0, 0);
-    CHECK(store.is_sparse(0, 0), "setup: tile should be compressed");
+    CHECK(store.is_sparse(0, 0), "setup: tile should size itself sparse immediately");
     const std::size_t before_bytes = store.total_tile_used_bytes();
+    CHECK(before_bytes == block4_sparse_packed_len(2),
+          "sanity: 2-live tile should be exactly %zu bytes, got %zu",
+          block4_sparse_packed_len(2), before_bytes);
 
-    // Clamp row 0's own allocation down to exactly its current usage
-    // (zero row-local headroom) -- tile_data's real vector size is
-    // untouched (still safe to memmove/resize within), only the
-    // logical boundary every row-growth check reads is tightened.
-    const std::size_t shrink_by = BLOCK4_TILE_SLOTS - before_bytes;
-    for (std::size_t r = 1; r <= store.block_layout.rows; ++r)
-        store.tile_byte_start[r] -= shrink_by;
-    CHECK(store.tile_byte_start[1] - store.tile_byte_start[0] == before_bytes,
-          "row 0's allocation should now be exactly %zu bytes (zero headroom)", before_bytes);
-    // ...and cap the GLOBAL budget at exactly the real (unshrunk)
-    // tile_data size, so growing this row at all -- which now
-    // necessarily means growing tile_data itself -- exceeds it.
     store.set_limits(std::numeric_limits<std::size_t>::max(), store.total_tile_alloc_bytes());
 
     bool threw = false;

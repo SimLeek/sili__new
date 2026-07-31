@@ -511,12 +511,23 @@ public:
     // Stateful convenience wrapper around delta_csr_equalize_step (memory
     // rebalancing -- redistributes blank space between neighboring rows'
     // territory so growth headroom stays reasonably even across the
-    // layer). Own internal cursor, separate from synap_step's.
+    // layer). Own internal cursor, separate from synap_step's. Also
+    // steps block4's own row-headroom equalizer (Block4Store::
+    // equalize_step, own independent cursor) -- same idea, applied to
+    // block4's tile_data allocation: without this, bytes a row's tile
+    // freed by compressing (see block4.hpp: new tiles start empty, sized
+    // to real content, not dense-worst-case) stay permanently locked to
+    // that one row, unusable anywhere else in the matrix.
     S      _equalize_row = 0;
+    S      _block4_equalize_row = 0;
     void equalizer_step() {
         std::size_t row = static_cast<std::size_t>(_equalize_row);
         delta_csr_equalize_step<S, FP4BiPacked, COL_TYPE>(weights.connections, row);
         _equalize_row = static_cast<S>(row);
+
+        std::size_t b4_row = static_cast<std::size_t>(_block4_equalize_row);
+        weights.block4.equalize_step(b4_row);
+        _block4_equalize_row = static_cast<S>(b4_row);
     }
 
     // One-time setup: grow each row until it has at least target_elems
@@ -1019,7 +1030,10 @@ PYBIND11_MODULE(_cpu, m)
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
-             "pool is large enough for max_row_weights connections per row.")
+             "pool is large enough for max_row_weights connections per row.\n"
+             "Also steps block4's own tile-storage row-headroom equalizer\n"
+             "(own independent cursor) -- lets bytes a row's tiles freed by\n"
+             "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayer::equalize_to_capacity,
              py::arg("target_elems_per_row"),
              py::arg("target_bytes_per_row") = 0,

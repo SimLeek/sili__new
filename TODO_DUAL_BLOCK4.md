@@ -1239,6 +1239,70 @@ smaller allocation.
   only from the (rare) `was_sparse_` branch, keeping the destructor
   itself tiny and try/catch-free.
 
+- **The open question above -- RESOLVED: row-level headroom is now
+  genuinely compression-aware, done.** Per direction (verbatim: "Entire
+  matrix headroom is the fixed max. row-headroom which takes from that
+  is not fixed and should be compression aware... Giving back space so
+  the rest of the matrix can use it isn't too much of a change, is it?")
+  -- correct, and it wasn't. Two changes, both reusing infrastructure
+  that already existed:
+  1. **New tiles start EMPTY (1 byte, `block4_sparse_packed_len(0)`),
+     not dense.** `block4_row_insert_tile`/`block4_ensure_row_headroom`
+     no longer reserve `BLOCK4_TILE_SLOTS` up front for a tile that
+     might end up compressed -- a fresh tile's `Block4TileHandle` starts
+     `was_sparse_=true` (empty), so its first real write flows through
+     the SAME `commit_dirty_sparse_tile` auto-sizing every sparse tile
+     already uses, sized to real content from the moment of creation.
+     `block4_resize_tile_in_row`'s grow path only ever adds the exact
+     shortfall (no padding), so a row's allocation now tracks real
+     occupancy far more tightly than the old fixed reservation ever did.
+     `block4_maybe_promote`'s newly-promoted tiles (often only
+     `BLOCK4_PROMOTE_MIN_LIVE`=2 synapses) get this for free -- real,
+     small footprints from the moment of promotion, not just after a
+     later explicit `maybe_compress()`.
+  2. **`Block4Store::equalize_step(current_row)`, mirroring the
+     scattered CSR side's own `delta_csr_equalize_step` exactly**: one
+     row per call, shifted toward the store-wide average allocation via
+     `block4_row_shift` (already bidirectional, built in the
+     variable-length-storage redesign). A row's real mechanism for
+     "giving space back": `block4_row_shift`'s shrink branch physically
+     truncates `tile_data` (a real `std::vector::resize`, exactly like
+     `delta_csr_shift_row`'s own shrink) -- `tile_data.size()` drops
+     while `max_tile_bytes` stays fixed, re-opening genuine headroom
+     under that fixed ceiling for `block4_resize_tile_in_row`'s own grow
+     check to succeed on ANY row's later growth, not a literal transfer
+     of bytes into one specific row's window. Wired into
+     `SparseLinearLayer::equalizer_step()` (own independent row cursor,
+     same call site/cadence as the scattered CSR side's own step).
+
+  A real methodology lesson from writing the test for this
+  (`test_equalize_step_redistributes_block4_row_headroom`,
+  `tests/unit/test_block4_sparse_tile.cpp`): the first version of the
+  test asserted `total_tile_alloc_bytes()` stays EXACTLY constant across
+  `equalize_step()` calls ("pure redistribution") -- wrong; it can
+  legitimately DROP (freeing global headroom via truncation, per the
+  mechanism above) and the test needed fixing to check `<=`, not `==`.
+  Both directions verified directly: a tile that's over-provisioned
+  (built dense, pruned back down, compressed) frees its slack via
+  `equalize_step()`, and a DIFFERENT tile whose growth was previously
+  declined (`dropped_growth_events` incremented, real budget exhaustion)
+  succeeds on retry after that redistribution runs, with zero new drops.
+
+  This also required fixing three existing tests
+  (`test_disldo_block4_forward/backward/combined_absolute.cpp`) that had
+  a real, now-exposed latent bug: they kept a `get_or_create()`-returned
+  handle alive as a named variable (not scoped to `{}`) while writing
+  into it, then read the tile back out through a SEPARATE code path
+  (`disldo_forward`, `delta_csr_combined_to_absolute`) before the
+  writing handle's destructor ever ran. Under the OLD always-dense
+  design this worked by accident (dense writes are always in-place, no
+  destructor-driven flush needed); under real sparse-by-default storage,
+  a handle's writes only reach `tile_data` when it destructs -- exactly
+  the same RAII discipline `block4_maybe_promote`'s own scoped block
+  already used correctly. `block4_maybe_promote`'s own call site, and
+  every other real (non-test) `get_or_create()` call site, were already
+  correctly scoped -- checked directly, not assumed.
+
 - **Memory-cap + compression benchmark, done.**
   `tests/unit/test_block4_memory_cap_and_compression.cpp` (ctest,
   hard-CHECK, permanent): drives 1500 iterations of real online

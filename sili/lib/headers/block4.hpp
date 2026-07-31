@@ -438,9 +438,12 @@ inline void block4_ensure_row_headroom(
     std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
 {
     const std::size_t target_idx  = L.row_alloc_bytes(row) + uleb128_max_bytes<uint32_t>();
-    // New tiles always start dense (BLOCK4_TILE_SLOTS bytes) -- see
-    // block4_row_insert_tile.
-    const std::size_t target_tile = (tbyte_start[row + 1] - tbyte_start[row]) + BLOCK4_TILE_SLOTS;
+    // New tiles start EMPTY (1 byte, block4_sparse_packed_len(0)), not
+    // dense -- see block4_row_insert_tile. Real content-driven sizing
+    // happens the moment the caller's handle destructs (the same
+    // was_sparse_ auto-pack machinery every sparse tile already goes
+    // through), not a fixed BLOCK4_TILE_SLOTS reservation up front.
+    const std::size_t target_tile = (tbyte_start[row + 1] - tbyte_start[row]) + block4_sparse_packed_len(0);
     const std::size_t target_elem = L.row_alloc_elems(row) + 1;
     if (row + 1 < L.rows)
         block4_row_shift(L, ibuf, tbyte_start, tbyte_end, tile_data, tile_is_sparse, row,
@@ -451,8 +454,15 @@ inline void block4_ensure_row_headroom(
 }
 
 // Mirrors delta_csr_row_insert_col's exact algorithm (delta_csr_memory.hpp).
-// New tiles always start dense and all-zero (BLOCK4_TILE_SLOTS bytes) --
-// the caller writes into it afterward via Block4TileHandle.
+// New tiles start EMPTY (1 byte -- a sparse-packed tile with count=0),
+// not dense -- the caller writes into it afterward via Block4TileHandle,
+// whose destructor sizes the tile based on what actually got written
+// (see ~Block4TileHandle() / Block4Store::commit_dirty_sparse_tile),
+// same as any other sparse tile. This is what makes block4's memory
+// budget genuinely reflect real occupancy from the moment a tile is
+// created (e.g. block4_maybe_promote's newly-promoted tiles, often only
+// BLOCK4_PROMOTE_MIN_LIVE=2 synapses), not dense-worst-case regardless
+// of content.
 inline bool block4_row_insert_tile(
     DeltaCSRLayout& L,
     std::vector<uint8_t>& ibuf,
@@ -514,7 +524,7 @@ inline bool block4_row_insert_tile(
     if (L.row_nnz(row) >= L.row_alloc_elems(row))
         return false;
     const std::size_t used_tile_bytes = tbyte_end[row] - tbyte_start[row];
-    const std::size_t new_tile_len = BLOCK4_TILE_SLOTS; // new tiles always start dense
+    const std::size_t new_tile_len = block4_sparse_packed_len(0); // new tiles start empty (1 byte)
     if (new_tile_len > (tbyte_start[row + 1] - tbyte_start[row]) - used_tile_bytes)
         return false;
 
@@ -534,6 +544,8 @@ inline bool block4_row_insert_tile(
         const std::size_t shift_len  = tbyte_end[row] - shift_from;
         if (shift_len > 0)
             std::memmove(tile_data.data() + shift_from + new_tile_len, tile_data.data() + shift_from, shift_len);
+        // new_tile_len is 1 -- writes just the sparse-tile count byte
+        // (0 = empty), not a full BLOCK4_TILE_SLOTS dense zero-fill.
         std::memset(tile_data.data() + ins_tbyte_pos, 0, new_tile_len);
         tbyte_end[row] += new_tile_len;
     }
@@ -541,7 +553,7 @@ inline bool block4_row_insert_tile(
     if (ins_elem_pos < L.elem_end[row])
         std::memmove(tile_is_sparse.data() + ins_elem_pos + 1, tile_is_sparse.data() + ins_elem_pos,
                      L.elem_end[row] - ins_elem_pos);
-    tile_is_sparse[ins_elem_pos] = 0; // false = dense
+    tile_is_sparse[ins_elem_pos] = 1; // true = sparse (empty, count=0) -- see comment above
 
     L.elem_end[row]++;
     L.total_nnz++;
@@ -957,6 +969,45 @@ struct Block4Store {
         block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
                                    br, byte_pos, BLOCK4_TILE_SLOTS, packed, new_len, max_tile_bytes);
         tile_is_sparse[elem_pos] = 1;
+    }
+
+    // Redistributes ROW-level headroom -- max_indices_bytes/max_tile_bytes
+    // (the ENTIRE store's budget) stay fixed; this only reshuffles how
+    // much of that fixed budget each individual row currently reserves,
+    // exactly mirroring the scattered CSR side's own
+    // delta_csr_equalize_step (delta_csr_memory.hpp). One row per call
+    // (current_row cycles through them), shifted toward the store-wide
+    // AVERAGE row allocation via block4_row_shift, which already
+    // supports both directions: a row sitting on excess headroom (e.g.
+    // several tiles that compressed down, freeing bytes THAT row alone
+    // was hoarding -- see block4_row_insert_tile's real-per-tile-
+    // reservation comment) SHRINKS -- block4_row_shift's shrink branch
+    // physically truncates tile_data itself (a real std::vector::resize,
+    // same as delta_csr_shift_row's own shrink), which is what actually
+    // "gives the bytes back to the rest of the matrix": tile_data.size()
+    // drops while max_tile_bytes stays fixed, re-opening real headroom
+    // for block4_resize_tile_in_row's OWN grow check (see
+    // commit_dirty_sparse_tile) to succeed on ANY row's later growth --
+    // not a literal transfer of bytes into one specific row's window. A
+    // row that's tight (freshly grown, lots of live tiles) GROWS here
+    // the same way, drawing on whatever headroom currently exists below
+    // max_tile_bytes. A real, periodic caller
+    // (SparseLinearLayer::equalizer_step(), same cadence as the
+    // scattered side's own call) is what actually lets space freed by
+    // ONE row's compression become usable elsewhere in the matrix, not
+    // just sit unreachable in the row it was freed in.
+    void equalize_step(std::size_t& current_row) {
+        if (block_layout.rows == 0) return;
+        const std::size_t row = current_row % block_layout.rows;
+        const std::size_t target_idx = block_layout.rows > 0
+            ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows : 0;
+        const std::size_t target_tile = block_layout.rows > 0
+            ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows : 0;
+        const std::size_t target_elem = block_layout.rows > 0
+            ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows : 0;
+        block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data, tile_is_sparse,
+                          row, target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
+        current_row = (current_row + 1) % block_layout.rows;
     }
 
     // Out-of-line, called only from ~Block4TileHandle()'s was_sparse_
