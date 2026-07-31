@@ -165,9 +165,9 @@ TEST_CASE("generate_new_weights_csc", "[generate_new_weights_csc]") {
     REQUIRE(result_empty.nnz() == 0);
 }
 
-// ── sisldo_forward ────────────────────────────────────────────────────────────
+// ── sisldo_forward_trivalues ────────────────────────────────────────────────────────────
 
-TEST_CASE("sisldo_forward", "[sisldo_forward]") {
+TEST_CASE("sisldo_forward_trivalues", "[sisldo_forward_trivalues]") {
     using SIZE_TYPE  = int;
     using VALUE_TYPE = float;
 
@@ -196,14 +196,14 @@ TEST_CASE("sisldo_forward", "[sisldo_forward]") {
     // batch1: in1 has no connections; in2*w1=0.45, in2*w2=1.05
     //   output[3..5] = [0, 0.45, 1.05]
     std::vector<VALUE_TYPE> output(6, 0.0f);
-    sisldo_forward(input, weights, output.data(), false, 0.01f, 4);
+    sisldo_forward_trivalues(input, weights, output.data(), false, 0.01f, 4);
 
     CHECK_VECTOR_ALMOST_EQUAL(output,
         std::vector<VALUE_TYPE>({0.5f, 1.15f, 0.35f, 0.0f, 0.45f, 1.05f}));
 
     // With train=true, importance (values[2]) should update
     std::fill(output.begin(), output.end(), 0.0f);
-    sisldo_forward(input, weights, output.data(), true, 0.01f, 4);
+    sisldo_forward_trivalues(input, weights, output.data(), true, 0.01f, 4);
 
     // importance[i] += weight_value * input_value * solidify
     // ptr0 (in0→out0): 0.5*1.0*0.01=0.005
@@ -222,14 +222,14 @@ TEST_CASE("sisldo_forward", "[sisldo_forward]") {
     empty_weights.connections.rows = 4;
     empty_weights.connections.cols = 3;
     std::vector<VALUE_TYPE> output_empty(6, 99.0f);
-    sisldo_forward(input, empty_weights, output_empty.data(), false, 0.01f, 4);
+    sisldo_forward_trivalues(input, empty_weights, output_empty.data(), false, 0.01f, 4);
     CHECK_VECTOR_ALMOST_EQUAL(output_empty,
         std::vector<VALUE_TYPE>(6, 99.0f)); // untouched
 }
 
-// ── sisldo_backward ───────────────────────────────────────────────────────────
+// ── sisldo_backward_trivalues ───────────────────────────────────────────────────────────
 
-TEST_CASE("sisldo_backward", "[sisldo_backward]") {
+TEST_CASE("sisldo_backward_trivalues", "[sisldo_backward_trivalues]") {
     using SIZE_TYPE  = int;
     using VALUE_TYPE = float;
 
@@ -263,7 +263,7 @@ TEST_CASE("sisldo_backward", "[sisldo_backward]") {
     std::vector<VALUE_TYPE> neuron_input_accum(4, 0.0f);
     std::vector<VALUE_TYPE> neuron_grad_accum(3, 0.0f);
 
-    sisldo_backward(input, weights, out_grad_sparse,
+    sisldo_backward_trivalues(input, weights, out_grad_sparse,
                     input_gradients.data(), output_gradients.data(),
                     neuron_input_accum.data(), neuron_grad_accum.data(), 4);
 
@@ -318,7 +318,7 @@ TEST_CASE("sisldo_backward", "[sisldo_backward]") {
     std::fill(weights.connections.values[1]->begin(),
               weights.connections.values[1]->end(), 0.0f);
 
-    sisldo_backward(input, weights, out_grad_sparse,
+    sisldo_backward_trivalues(input, weights, out_grad_sparse,
                     input_gradients.data(), output_gradients.data(),
                     neuron_input_accum.data(), neuron_grad_accum.data(), 4);
 
@@ -336,7 +336,7 @@ TEST_CASE("sisldo_backward", "[sisldo_backward]") {
     std::fill(weights.connections.values[1]->begin(),
               weights.connections.values[1]->end(), 0.0f);
 
-    sisldo_backward(input, weights, out_grad_sparse,
+    sisldo_backward_trivalues(input, weights, out_grad_sparse,
                     input_gradients.data(), output_gradients.data(),
                     neuron_input_accum.data(), neuron_grad_accum.data(), 4);
 
@@ -356,7 +356,7 @@ TEST_CASE("sisldo_backward", "[sisldo_backward]") {
     std::fill(weights.connections.values[1]->begin(),
               weights.connections.values[1]->end(), 0.0f);
 
-    sisldo_backward(input, weights, out_grad_sparse,
+    sisldo_backward_trivalues(input, weights, out_grad_sparse,
                     input_gradients.data(), output_gradients.data(),
                     neuron_input_accum.data(), neuron_grad_accum.data(), 4);
 

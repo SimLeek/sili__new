@@ -20,8 +20,8 @@
 //
 // Generic over VALUES_TYPE via ValueAccessor -- works identically for
 // FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit fallback),
-// matching delta_csr_forward (the SISLDO/sparse-input forward equivalent
-// in delta_csr_ops.hpp) and delta_csr_synap_row_step / delta_csr_build_probes,
+// matching sisldo_forward (the SISLDO/sparse-input forward equivalent
+// in sisldo_ops.hpp) and delta_csr_synap_row_step / delta_csr_build_probes,
 // which already use this same pattern.
 //
 // Supersedes the previous float32/absolute-CSR disldo_forward/disldo_backward
@@ -47,7 +47,7 @@
  *
  * NOTE (test): with learning_rate=0, output must equal the dense matmul
  * input @ W_dense where W_dense[r,c] = weight of synapse (r->c). Same
- * reference check used for delta_csr_forward and for this session's
+ * reference check used for sisldo_forward and for this session's
  * standalone disldo_ops.hpp (see conversation) -- both passed it.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
@@ -756,8 +756,8 @@ void disldo_backward(
             // fixes buffer REALLOCATION, a separate hazard) and even with
             // a lock guarding concurrent growers (which only fixes two
             // growers racing each other, not a grower racing this row's
-            // reader). See delta_csr_backward_sparse_grad's identical fix
-            // in delta_csr_ops.hpp for the full writeup.
+            // reader). See disldo_backward_sparse_grad's identical fix
+            // in sisldo_ops.hpp for the full writeup.
             //
             // Fix: snapshot this row into a thread-private workspace
             // ONCE, do all reads/writes against that private copy, then

@@ -1,12 +1,12 @@
-// Correctness check for delta_csr_forward's block4 phase (forward_sparse's
+// Correctness check for sisldo_forward's block4 phase (forward_sparse's
 // underlying op) vs disldo_forward (forward_dense) on the SAME mixed
 // scattered+block4 layer -- must match exactly (same weights, same math,
 // only input representation differs). Closes a real, previously-silent
-// bug: delta_csr_forward never referenced weights.block4 at all before
+// bug: sisldo_forward never referenced weights.block4 at all before
 // this, so any layer with block4-promoted synapses silently dropped their
 // contribution through forward_sparse(). See TODO_DUAL_BLOCK4.md.
 #include "../../sili/lib/headers/delta_csr_memory.hpp"
-#include "../../sili/lib/headers/delta_csr_ops.hpp"
+#include "../../sili/lib/headers/sisldo_ops.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
 #include <cstdio>
 #include <cmath>
@@ -81,7 +81,7 @@ int main() {
         x_sparse.values[0]  = std::make_shared<std::vector<float>>(x_vals);
 
         std::vector<float> y_sparse(n_out, 0.0f);
-        delta_csr_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
             x_sparse, weights, y_sparse.data(), 0.0f, 4);
 
         for (int c = 0; c < n_out; ++c) {
@@ -112,7 +112,7 @@ int main() {
         x_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_idx);
         x_sparse.values[0] = std::make_shared<std::vector<float>>(x_vals);
         std::vector<float> y_sparse(n_out, 0.0f);
-        delta_csr_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 0.0f, 1);
+        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 0.0f, 1);
         int local_fail = 0;
         for (int c = 0; c < n_out; ++c)
             if (std::abs(y_dense[c] - y_sparse[c]) >= 1e-4f) ++local_fail;

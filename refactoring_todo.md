@@ -127,7 +127,7 @@ document's earlier categorization) -- verdicts below are as specific as
 given, not guessed at.
 
 ### Confirmed safe to delete (cpu_sparse_io)
-- `sparse_struct.hpp` -- superseded: `delta_csr_forward`/`delta_csr_backward`
+- `sparse_struct.hpp` -- superseded: `sisldo_forward`/`delta_csr_backward`
   already do what this did.
 - `linear_sisldo.hpp` -- "just the old sparse input sparse layer, which we
   already have."

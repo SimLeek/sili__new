@@ -1,6 +1,6 @@
 #include "../../sili/lib/headers/sparse_struct.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
-#include "../../sili/lib/headers/delta_csr_ops.hpp"
+#include "../../sili/lib/headers/sisldo_ops.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 
@@ -834,7 +834,7 @@ TEST_CASE("disldo_backward with broadcast dy_raw: dx matches finite-difference g
     }
 }
 
-// ── delta_csr_forward / delta_csr_backward_sparse_grad: output_scale ──────────
+// ── sisldo_forward / disldo_backward_sparse_grad: output_scale ──────────
 //
 // BUG FIX regression tests: these two (the SISLDO/sparse-input path, used by
 // SparseLinearLayer::forward_sparse/backward_sparse) never read output_scale
@@ -844,7 +844,7 @@ TEST_CASE("disldo_backward with broadcast dy_raw: dx matches finite-difference g
 // FoldedLayer.from_descriptor(value_scale_mode="rank1")) run through
 // forward_sparse/backward_sparse silently dropped output_scale entirely.
 
-TEST_CASE("delta_csr_forward's output reflects value_scale * output_scale jointly (rank-1)",
+TEST_CASE("sisldo_forward's output reflects value_scale * output_scale jointly (rank-1)",
          "[scale][output_scale][sisldo][regression]") {
     // Same setup/expected values as disldo_forward's matching test above --
     // sparse-input and dense-input forward must agree exactly given the
@@ -871,13 +871,13 @@ TEST_CASE("delta_csr_forward's output reflects value_scale * output_scale jointl
     in.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{2.0f});
 
     std::vector<float> output(2, 0.0f);
-    delta_csr_forward<S, FP4BiPacked, COL_TYPE>(in, weights, output.data(), 0.0f, 1);
+    sisldo_forward<S, FP4BiPacked, COL_TYPE>(in, weights, output.data(), 0.0f, 1);
 
     CHECK(output[0] == Catch::Approx(0.6f).margin(1e-4f));    // 0.3 * 2.0
     CHECK(output[1] == Catch::Approx(6.0f).margin(1e-4f));    // 3.0 * 2.0
 }
 
-TEST_CASE("delta_csr_backward_sparse_grad's dx and value_scale gradient account for output_scale",
+TEST_CASE("disldo_backward_sparse_grad's dx and value_scale gradient account for output_scale",
          "[scale][output_scale][sisldo][regression]") {
     using S = int;
     using COL_TYPE = uint32_t;
@@ -901,7 +901,7 @@ TEST_CASE("delta_csr_backward_sparse_grad's dx and value_scale gradient account 
     dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{1.0f});
 
     std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
-    delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+    disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), weights, dy, dx.data(), in_acc.data(), gr_acc.data(),
         /*learning_rate=*/0.0f, 1);
 
@@ -916,7 +916,7 @@ TEST_CASE("delta_csr_backward_sparse_grad's dx and value_scale gradient account 
     // (same importance-damping pattern as disldo_backward's own
     // value_scale update).
     std::vector<float> dx2(1, 0.0f), in_acc2(1, 0.0f), gr_acc2(1, 0.0f);
-    delta_csr_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+    disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), weights, dy, dx2.data(), in_acc2.data(), gr_acc2.data(),
         /*learning_rate=*/0.1f, 1);
     const float raw_update = 0.1f * (2.0f * 0.5f * 1.0f);
