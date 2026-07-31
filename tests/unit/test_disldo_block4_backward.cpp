@@ -32,9 +32,13 @@ int main() {
     weights.block4.init(n_in, n_out);
     weights.recompute_stats();
 
-    auto tile = weights.block4.get_or_create(0, 0);
-    tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
-    tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4);
+    // Scoped -- see test_disldo_block4_forward.cpp's identical comment:
+    // the destructor is what persists these writes now.
+    {
+        auto tile = weights.block4.get_or_create(0, 0);
+        tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);
+        tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4);
+    }
 
     std::vector<float> x(n_in, 0.f);
     x[0] = 3.0f; x[1] = 1.0f; x[2] = 2.0f;

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -35,6 +36,15 @@ public:
     // compression entirely.
     uint32_t get_switch_point() const { return store->switch_point; }
     void set_switch_point(uint32_t v) { store->switch_point = v; }
+    // How many times a backward/promotion value-update to an EXISTING
+    // tile couldn't be persisted because growing its storage would have
+    // exceeded the store's own memory budget -- see block4.hpp:
+    // Block4Store::dropped_growth_events / ~Block4TileHandle(). By
+    // design this is declined, not thrown, so training/inference keeps
+    // running; a caller doing its own memory management can poll this to
+    // detect and react (equalizer_step()/expand_headroom(), or just
+    // accepting some updates are being dropped under the current budget).
+    std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
 private:
     Block4Store* store;
 };
@@ -294,7 +304,57 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        // Real, enforced cap -- without this, DeltaCSRWeights::
+        // max_indices_bytes/max_values_bytes sit at their default
+        // SIZE_MAX, so reserve_indices()/reserve_values() (called by
+        // expand_headroom() during synaptogenesis) never actually
+        // throw, and max_weights only bounds the INITIAL allocation
+        // above, not later growth. Matches the exact budget just
+        // reserved (values in bytes, via projected_byte_size -- see
+        // delta_csr_from_absolute's own "values_bytes" parameter, which
+        // is actually an nnz count despite the name, same units
+        // reserve_values() takes).
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
         weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
+        // Real, enforced cap for block4 -- see block4.hpp's
+        // block4_row_shift comment for the bug this closes (block4
+        // grew unboundedly, confirmed reaching ~1.9x max_weights with
+        // zero resistance in a stress test). Deliberately a SEPARATE
+        // budget from weights.connections.set_limits() above, not a
+        // shared one (per direction) -- sized the same way: indices
+        // mirrors the scattered side's own formula (block4's own
+        // uleb128 tile-position index, same encoding, smaller
+        // coordinate range so this is conservative/safe not tight).
+        //
+        // Tile data budget: max_weights / BLOCK4_TILE_SLOTS tiles, NOT
+        // max_weights tiles and NOT max_weights/BLOCK4_PROMOTE_MIN_LIVE
+        // tiles either -- both tried and measured too generous. A tile
+        // holds 2-16 live synapses; dividing by BLOCK4_PROMOTE_MIN_LIVE
+        // (2, assuming worst-case MINIMAL fill) sounds conservative but
+        // is backwards: once promoted, a tile is treated as fully dense
+        // by forward/backward (every slot touched on every call, see
+        // TODO_DUAL_BLOCK4.md's switch_point findings), so REAL tiles
+        // trend toward MAXIMUM fill under training, not minimum.
+        // Confirmed, not hypothetical: at max_weights=200, the /2
+        // formula (100-tile budget) still let block4 reach 381 real
+        // synapses across only 47 tiles (avg ~8.1/tile, nowhere near
+        // the 100-tile cap) before this fix. Dividing by
+        // BLOCK4_TILE_SLOTS (16, max occupancy) instead keeps the
+        // worst-case synapse ceiling at max_weights exactly (every
+        // budgeted tile fully packed) -- the correct assumption given
+        // how tiles actually fill in practice.
+        // Floor of 4 tiles regardless of the formula above -- for a
+        // small max_weights (< BLOCK4_TILE_SLOTS), max_weights/16
+        // rounds down to 0, which would make block4 promotion
+        // impossible even for a legitimately tiny test/toy layer. 4
+        // tiles is a small, arbitrary-but-reasonable floor (matches
+        // this codebase's own small-layer test fixtures, e.g.
+        // test_disldo_block4_promotion.cpp's single-tile usage).
+        weights.block4.set_limits(
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
@@ -451,12 +511,23 @@ public:
     // Stateful convenience wrapper around delta_csr_equalize_step (memory
     // rebalancing -- redistributes blank space between neighboring rows'
     // territory so growth headroom stays reasonably even across the
-    // layer). Own internal cursor, separate from synap_step's.
+    // layer). Own internal cursor, separate from synap_step's. Also
+    // steps block4's own row-headroom equalizer (Block4Store::
+    // equalize_step, own independent cursor) -- same idea, applied to
+    // block4's tile_data allocation: without this, bytes a row's tile
+    // freed by compressing (see block4.hpp: new tiles start empty, sized
+    // to real content, not dense-worst-case) stay permanently locked to
+    // that one row, unusable anywhere else in the matrix.
     S      _equalize_row = 0;
+    S      _block4_equalize_row = 0;
     void equalizer_step() {
         std::size_t row = static_cast<std::size_t>(_equalize_row);
         delta_csr_equalize_step<S, FP4BiPacked, COL_TYPE>(weights.connections, row);
         _equalize_row = static_cast<S>(row);
+
+        std::size_t b4_row = static_cast<std::size_t>(_block4_equalize_row);
+        weights.block4.equalize_step(b4_row);
+        _block4_equalize_row = static_cast<S>(b4_row);
     }
 
     // One-time setup: grow each row until it has at least target_elems
@@ -539,6 +610,14 @@ public:
     // this model is about to resume training rather than just be deployed.
     void compact() {
         weights.connections = ::compact<S, FP4BiPacked, COL_TYPE>(weights.connections);
+        // compact()/expand_headroom() rebuild via delta_csr_from_absolute
+        // internally, which returns a BRAND NEW DeltaCSRWeights -- the
+        // limits set at construction don't carry over onto it, silently
+        // reverting to unbounded (SIZE_MAX) otherwise. Re-apply every
+        // time this member gets reassigned wholesale.
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Opposite of compact(): restores growth headroom, normalized to exactly
@@ -548,6 +627,11 @@ public:
     // exception rather than silently doing nothing if headroom is missing.
     void expand_headroom(float blank_fraction = 0.2f) {
         weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
+        // See compact()'s identical comment -- re-apply the cap after
+        // every wholesale reassignment of weights.connections.
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Like expand_headroom() but guarantees each row has headroom for at
@@ -560,6 +644,18 @@ public:
             weights.connections,
             static_cast<std::size_t>(min_nnz_per_row),
             blank_fraction);
+        // See compact()'s identical comment. NOTE (real, not yet fully
+        // closed gap): if min_nnz_per_row * n_rows exceeds the layer's
+        // own construction-time budget, THIS call can still allocate
+        // past _idx_budget_bytes/_val_budget_nnz once (the internal
+        // delta_csr_from_absolute doesn't know about those numbers) --
+        // re-applying the cap here doesn't undo that, only prevents any
+        // FURTHER growth beyond it afterward. Calling this with a
+        // min_nnz_per_row inconsistent with max_weights is still a real
+        // way to exceed the intended budget; not fixed here.
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Per-ROW scale applied to stored importance/weight to get true units
@@ -648,6 +744,18 @@ public:
         const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
             p, idx, w, imp, rows, cols, idx_budget, val_budget);
+        // If the loaded checkpoint genuinely has more weights than this
+        // layer was originally constructed for, idx_budget/val_budget
+        // above already grew past _idx_budget_bytes/_val_budget_nnz to
+        // fit it (existing behavior, not new) -- update the STORED
+        // budget to match so it becomes the real floor for future
+        // set_limits() calls (compact()/expand_headroom()) instead of
+        // silently shrinking back down to the old, now-too-small one.
+        _idx_budget_bytes = idx_budget;
+        _val_budget_nnz   = val_budget;
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
         // load_weights replaces .connections wholesale, so out_degree
         // (needed by output_scale's own gradient, disldo_backward) must be
@@ -737,6 +845,13 @@ public:
             static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
             static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
+        // Real, enforced cap -- see SparseLinearLayer's identical fix
+        // for why (max_indices_bytes/max_values_bytes default to
+        // SIZE_MAX otherwise, making reserve_indices/reserve_values a
+        // no-op check).
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
@@ -806,10 +921,16 @@ public:
         std::vector<S> idx((S*)ib.ptr, (S*)ib.ptr + ib.size);
         std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
         std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
+        const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
+        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
         weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
-            p, idx, w, imp_v, rows, cols,
-            std::max(_idx_budget_bytes, idx.size() * 8 + 4096),
-            std::max(_val_budget_nnz,   idx.size() + 64));
+            p, idx, w, imp_v, rows, cols, idx_budget, val_budget);
+        // See SparseLinearLayer::load_weights' identical fix/comment.
+        _idx_budget_bytes = idx_budget;
+        _val_budget_nnz   = val_budget;
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
     }
 
@@ -863,7 +984,13 @@ PYBIND11_MODULE(_cpu, m)
              "Tiles with <= switch_point live synapses may be packed into the"
              " sparse-encoded tile layout instead of staying fully dense (see"
              " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
-             " 0 disables compression entirely. Default 10.");
+             " 0 disables compression entirely. Default 10.")
+        .def_property_readonly("dropped_growth_events", &Block4View::dropped_growth_events,
+             "Count of backward/promotion value-updates to an existing tile that"
+             " couldn't be persisted because growing its storage would have"
+             " exceeded the memory budget -- declined (with the tile keeping its"
+             " old value), not thrown, so training keeps running. Nonzero means"
+             " some updates are being silently dropped under the current budget.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
@@ -903,7 +1030,10 @@ PYBIND11_MODULE(_cpu, m)
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
-             "pool is large enough for max_row_weights connections per row.")
+             "pool is large enough for max_row_weights connections per row.\n"
+             "Also steps block4's own tile-storage row-headroom equalizer\n"
+             "(own independent cursor) -- lets bytes a row's tiles freed by\n"
+             "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayer::equalize_to_capacity,
              py::arg("target_elems_per_row"),
              py::arg("target_bytes_per_row") = 0,

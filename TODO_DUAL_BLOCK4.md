@@ -1002,6 +1002,343 @@ own benchmark run) don't answer that question at all.
       right choice (established this session) but the surrounding
       per-tile-column code isn't otherwise special-cased for batch=1.
 
+## Memory safety + real variable-length compression (done)
+
+Follow-up to the sections above: neither the scattered CSR side nor
+block4 actually enforced `max_weights` during synaptogenesis, and
+block4's "compression" (`is_sparse` flag) never shrank real memory --
+`Block4StoredTile` was a fixed 16(+1) bytes regardless of occupancy, so
+a compressed tile was repacked bytes *within the same slot*, not a
+smaller allocation.
+
+- **Scattered CSR cap enforcement.** `set_limits()` existed but was
+  never called anywhere; wired into `SparseLinearLayer`/`DISLDOLayerV`
+  constructors and re-applied after `compact()`/`expand_headroom()`/
+  `expand_headroom_to()`/`load_weights()` (each rebuilds `connections`
+  via `delta_csr_from_absolute`, which defaults to unbounded). The real
+  dominant bug was `delta_csr_shift_row()` -- called every
+  synaptogenesis cycle via `equalizer_step()` -- growing `ibuf`/`values`
+  via raw `.resize()` with zero budget check, confirmed via a stress
+  test reaching 127x `max_weights` with no resistance. Fixed with real
+  `throw std::bad_alloc()` checks before every resize.
+- **block4 cap enforcement.** Same class of fix
+  (`block4_row_shift`/`grow_last_row`/`ensure_row_headroom` all gained
+  real budget checks) plus a budget-formula correction: sizing by
+  `max_weights / BLOCK4_PROMOTE_MIN_LIVE` (2) assumed tiles stay
+  minimally filled, but tiles trend toward FULL occupancy under real
+  training (every `disldo_backward` touch writes all 16 slots) --
+  `max_weights / BLOCK4_TILE_SLOTS` (16) is the correct, empirically
+  verified divisor.
+- **Real variable-length tile storage.** `Block4StoredTile` (fixed
+  16+1 bytes) replaced with a flat `tile_data: vector<uint8_t>` byte
+  buffer + per-row `tile_byte_start`/`tile_byte_end` (mirrors
+  `DeltaCSRLayout`'s own byte/elem split, but for tile bytes -- a
+  second, independently-growable row-byte layout alongside the
+  existing one for `indices_buf`) + `tile_is_sparse: vector<uint8_t>`
+  (explicit per-tile flag, since a sparse tile at
+  `BLOCK4_SPARSE_MAX_COUNT` is byte-length-identical to dense).
+  `block4_sparse_pack`/`unpack`/`get_pos`/`set_pos` now take pointers,
+  not fixed `uint8_t[16]` arrays, and the packed length scales with the
+  tile's ACTUAL live count (`1 + ceil(count/2) + count` bytes, e.g. 2
+  live synapses = 4 bytes = 32 bits, matching the "24 bits for 2
+  params" estimate from the original ask), not a fixed per-store size
+  tied to `switch_point` -- real compression at the DEFAULT
+  `switch_point` (10) already, not just when tuned down. Verified with
+  an exact-byte-count unit test
+  (`test_real_compression_shrinks_footprint`,
+  `tests/unit/test_block4_sparse_tile.cpp`).
+- **A real concurrency hazard this redesign introduced, found and
+  fixed before it shipped.** `disldo_backward`'s parallel per-tile loop
+  used to be safe under the OLD fixed-16-byte design specifically
+  *because* no tile's resize could ever move any OTHER tile's storage.
+  Under real variable-length storage, resizing one tile (sparse<->dense
+  transition) memmoves every LATER tile in its row -- two threads
+  processing different tiles in the same block-row could race on that
+  row's `tile_data`. Fixed via `Block4Store::force_dense_at()`: backward's
+  existing SERIAL collection pass (which already walks every tile it's
+  about to touch, in order) now promotes any still-sparse tile to dense
+  THERE, before the parallel region starts -- justified by the same
+  full-occupancy finding above (backward touches all 16 slots on every
+  call, so a touched tile ends up dense immediately regardless).
+  Verified with a dedicated ThreadSanitizer stress harness driving real
+  `disldo_forward`/`disldo_backward` at `num_cpus=8` with `switch_point=2`
+  (forces heavy sparse<->dense churn every call): all flagged races
+  involved "main thread" stack reuse across sequential,
+  barrier-separated `omp parallel` regions (a known GCC-libgomp+TSan
+  instrumentation gap -- the identical pattern reproduces between two
+  calls of the UNMODIFIED `disldo_forward` alone, with zero block4
+  involvement), and zero races were found between two genuinely
+  concurrent worker threads.
+- **A real, measured speed regression, found and fixed before merge.**
+  The initial version of `force_dense` re-derived a tile's
+  `elem_pos`/`byte_pos` via its own `raw_find()` row scan every call --
+  called once per tile from a collection loop that was ALREADY walking
+  the row in order, turning that loop into an O(row_nnz²) scan. Caught
+  via `scripts/bench_block4_vs_dense_fp4.cpp`: backward's speedup over
+  the dense floor dropped from the documented ~1.88x to ~1.44x at 100%
+  fill. Fixed by splitting out `force_dense_at(br, elem_pos, byte_pos)`,
+  an O(1) core the collection loop calls directly with values it
+  already has. Post-fix, speed matches or slightly beats every
+  previously-documented density point (100% fill: 1.93x vs documented
+  1.88x; 50%: 3.83x vs 3.74x; 10%: 16.11x vs 15.85x; forward's ~5x
+  gap, `learning_rate=0`'s real cost, unchanged).
+- **`force_dense_at` SUPERSEDED -- its own justification was wrong,
+  caught in review before merge.** The bullet above documents
+  `force_dense_at`'s original design and verification; both are
+  historically accurate but the design itself was later found
+  incorrect and replaced (this bullet). "Backward touches all 16
+  slots on every call, so a touched tile ends up dense regardless" is
+  true for a random/non-converging `dy` signal (what it was measured
+  under), but false once a genuinely sparsity-encouraging loss is in
+  the loop -- and this codebase's own energy function (`sili/energy.py`)
+  has a KL sparsity term that's explicitly part of the synaptogenesis
+  story, so this isn't a hypothetical case. Direct diagnostic (fixed
+  input/target, real `dy = out - target`, watching a tile that starts
+  fully dense): under plain backward alone `count_live` stays at 16;
+  under backward + an external L1-style shrink step (soft-threshold,
+  the normal way L1/proximal regularization is implemented, as a step
+  separate from the task-loss backward) it settles at 0 and STAYS
+  there. With `force_dense_at` in place: `maybe_compress` genuinely
+  shrinks the tile to 1 byte, which survives right up until the very
+  next `disldo_backward` call, which unconditionally blows it back to
+  16 bytes regardless of what the write itself would have kept it at
+  -- discarding real, persistent compression on every single touch, in
+  exactly the regime (memory-constrained systems relying on
+  sparsity-encouraging losses to keep block4 tiles small) this whole
+  feature exists for. (Two methodology corrections along the way,
+  also worth keeping: an early version of this diagnostic used
+  deterministic `fp4_quantize` on unscaled values, "must shift >0.25
+  raw units or nothing moves" -- real `disldo_backward` uses
+  `fp4_quantize_stochastic`, not deterministic, and composes through
+  `value_scale`/`output_scale`; measured directly, a small-but-nonzero
+  true weight -- e.g. 0.1 -- reads as exactly code 0 on ~80% of
+  stochastic touches, so real compression opportunities are far more
+  common than the deterministic framing suggested. A `target=all-zero`
+  full-training-loop variant of the diagnostic was itself confounded:
+  `value_scale` can collapse toward 0 as an easier way to shrink
+  output than moving individual weights, so it doesn't cleanly isolate
+  per-weight sparsity either -- noted for anyone reusing this
+  diagnostic shape later, not resolved.)
+
+  **Fix: partition `disldo_backward`'s parallel block4 loop BY
+  BLOCK-ROW instead of by flat tile index**, so each thread
+  exclusively owns every tile in the rows it's assigned (processed
+  sequentially within that row) -- removes `force_dense`/
+  `force_dense_at` entirely; a tile's `Block4TileHandle` destructor
+  just does its normal thing (unpack if sparse, write, re-pack based
+  on real final content), which is now safe because no two threads
+  can ever touch the same row's `tile_data` concurrently (the actual
+  hazard resizing introduces -- see the bullet above). Schedule choice
+  measured, not assumed: `schedule(dynamic)` and `schedule(guided)`
+  both regressed backward's speedup over the dense floor at 100% fill
+  from ~1.93x to ~1.69x even at `num_cpus=1` (real per-chunk dispatch
+  overhead with no load-balancing benefit to buy it at one thread);
+  plain `schedule(static)` at the row level fully recovered and
+  slightly beat every previously-documented density point (100%:
+  1.97x vs 1.88x; 50%: 3.87x vs 3.74x; 10%: 19.75x vs 15.85x) --
+  revisit only if a real multi-thread workload with genuinely lopsided
+  row widths shows static's load imbalance actually costing wall-clock
+  time.
+
+  Since a tile's resize (and its `std::bad_alloc` on real budget
+  exhaustion) now genuinely happens INSIDE the parallel region instead
+  of a safe serial pre-pass, and OpenMP doesn't support exceptions
+  crossing a `#pragma omp parallel` region's boundary, each thread's
+  per-row work is wrapped in its own `try`/`catch(std::bad_alloc&)`,
+  setting a shared `std::atomic<bool>` that the master thread checks
+  and re-throws from after the region joins -- the caller still sees
+  the same `std::bad_alloc` it always would have.
+
+  Verified: full ctest suite clean (same pre-existing flaky set:
+  #19/#35/#51 -- one additional test, `test_scale_handling.cpp`'s
+  per-row `importance_scale` Hebbian test, was observed to fail
+  intermittently across repeated runs with NO code changes between
+  runs and doesn't touch block4/backward at all, confirming it's a
+  pre-existing RNG-order dependency in the shared Catch2 binary, not
+  caused by this fix); a dedicated ThreadSanitizer harness (same one
+  used to verify `force_dense_at` originally) still reports zero
+  worker-vs-worker races under the new row-partitioned scheduling; the
+  original diagnostic that demonstrated the bug now shows the SAME
+  tile staying compressed (`is_sparse=true`, 1-3 bytes) through the
+  exact same real `disldo_backward` call that previously blew it back
+  to 16 bytes every time.
+
+  **Follow-up (not yet done, deferred by direction):** a real
+  liveness-tracking gap surfaced alongside this -- a slot whose WEIGHT
+  reaches 0 doesn't necessarily have its IMPORTANCE reach 0 too
+  (nothing currently forces that), so `count_live()`'s "byte != 0"
+  heuristic can overcount live synapses for weights that are
+  functionally dead. Proposed fix (not yet implemented): a small decay
+  parameter applied to both the per-synapse stochastic FP4 update and
+  the row/rank-1 importance scales, so stale importance actually
+  decays over time instead of sitting at whatever it last was --
+  this doubles as a real, principled way to rank synapses for pruning
+  when trading old/unpromising weights for new ones under a memory/
+  compression budget, not just a compression-accuracy fix.
+
+- **`disldo_backward` no longer throws on real budget exhaustion --
+  declines the growth and keeps running instead, done.** Per direction:
+  the row-partitioned fix above still let a tile resize's
+  `std::bad_alloc` (real budget exhaustion mid-write) propagate all the
+  way out of `disldo_backward`, aborting the whole call over ONE tile
+  out of possibly thousands -- fine for structural growth
+  (`get_or_create`/`block4_maybe_promote` inserting a genuinely NEW
+  tile, or the scattered CSR side's own equivalent, both explicitly
+  synaptogenesis-adjacent and still throw as before, a "handler decides
+  what to do" case), but wrong for a value-update op that a system
+  meant to run continuously shouldn't ever crash over. Fixed by moving
+  the resize+decline logic into a new `Block4Store::commit_dirty_sparse_tile`,
+  called from `~Block4TileHandle()`'s `was_sparse_` branch: on
+  `std::bad_alloc` from `block4_resize_tile_in_row`, the tile just keeps
+  its old stored bytes exactly as they were (the budget check runs
+  before any mutation, so a caught throw means nothing was written at
+  all -- never a partial write) and increments a new
+  `Block4Store::dropped_growth_events` counter (via `std::atomic_ref`,
+  not a `std::atomic` field, so `Block4Store` stays trivially copyable)
+  instead of throwing -- exposed to Python as
+  `layer.block4.dropped_growth_events` so a caller doing its own memory
+  management can still detect and react to dropped updates.
+
+  **A real finding surfaced while building the test for this**: given
+  ONLY the normal `get_or_create`/`maybe_compress`/`disldo_backward` API
+  surface, this decline path is essentially unreachable in practice.
+  `block4_ensure_row_headroom` conservatively reserves a full
+  `BLOCK4_TILE_SLOTS` (16) bytes for every NEW tile at creation time,
+  regardless of whether it ends up compressed -- and since that
+  reservation is *never* returned (compress/erase only reduce a row's
+  USED bytes, never its ALLOCATED bytes), a row's headroom pool is an
+  exact, permanent conservation of "16 minus each tile's current size",
+  which by construction always covers any individual tile (or even all
+  of them at once) regrowing back to its own 16-byte reservation. The
+  test that verifies this decline mechanism
+  (`test_backward_declines_growth_gracefully_under_budget_exhaustion`)
+  has to directly shrink a row's allocation via `Block4Store`'s public
+  fields to construct a genuinely tight scenario at all. **This also
+  means tile COUNT capacity within a given `max_tile_bytes` budget
+  hasn't actually increased from the real-compression work (see
+  above)** -- only `total_tile_used_bytes()` (the diagnostic/reporting
+  figure) shrinks from compression; `total_tile_alloc_bytes()` (what
+  actually gates how many tiles can exist) is still sized as if every
+  tile were permanently dense. Whether the original "4x larger AIs"
+  goal needs `block4_ensure_row_headroom`'s reservation policy itself
+  to become compression-aware (not just per-tile storage) is a real,
+  open, NOT yet decided question -- flagging clearly rather than
+  quietly declaring the memory-scaling goal met.
+
+  Verified: a dedicated test drives `disldo_backward` through 2000 real
+  iterations under a deliberately tiny scattered-CSR budget (structural
+  growth throwing as expected/handled) with zero backward-path crashes;
+  the decline-and-continue mechanism itself verified via the
+  directly-constructed test above; full ctest suite clean; the same
+  ThreadSanitizer harness used for the row-partitioning fix still shows
+  zero worker-vs-worker races. A real, measured speed regression was
+  caught and fixed along the way: putting the try/catch directly inside
+  `~Block4TileHandle()` (even though the hot, common early-return path
+  never reaches it) measurably hurt codegen for that destructor --
+  moved into the separate `commit_dirty_sparse_tile` instead, called
+  only from the (rare) `was_sparse_` branch, keeping the destructor
+  itself tiny and try/catch-free.
+
+- **The open question above -- RESOLVED: row-level headroom is now
+  genuinely compression-aware, done.** Per direction (verbatim: "Entire
+  matrix headroom is the fixed max. row-headroom which takes from that
+  is not fixed and should be compression aware... Giving back space so
+  the rest of the matrix can use it isn't too much of a change, is it?")
+  -- correct, and it wasn't. Two changes, both reusing infrastructure
+  that already existed:
+  1. **New tiles start EMPTY (1 byte, `block4_sparse_packed_len(0)`),
+     not dense.** `block4_row_insert_tile`/`block4_ensure_row_headroom`
+     no longer reserve `BLOCK4_TILE_SLOTS` up front for a tile that
+     might end up compressed -- a fresh tile's `Block4TileHandle` starts
+     `was_sparse_=true` (empty), so its first real write flows through
+     the SAME `commit_dirty_sparse_tile` auto-sizing every sparse tile
+     already uses, sized to real content from the moment of creation.
+     `block4_resize_tile_in_row`'s grow path only ever adds the exact
+     shortfall (no padding), so a row's allocation now tracks real
+     occupancy far more tightly than the old fixed reservation ever did.
+     `block4_maybe_promote`'s newly-promoted tiles (often only
+     `BLOCK4_PROMOTE_MIN_LIVE`=2 synapses) get this for free -- real,
+     small footprints from the moment of promotion, not just after a
+     later explicit `maybe_compress()`.
+  2. **`Block4Store::equalize_step(current_row)`, mirroring the
+     scattered CSR side's own `delta_csr_equalize_step` exactly**: one
+     row per call, shifted toward the store-wide average allocation via
+     `block4_row_shift` (already bidirectional, built in the
+     variable-length-storage redesign). A row's real mechanism for
+     "giving space back": `block4_row_shift`'s shrink branch physically
+     truncates `tile_data` (a real `std::vector::resize`, exactly like
+     `delta_csr_shift_row`'s own shrink) -- `tile_data.size()` drops
+     while `max_tile_bytes` stays fixed, re-opening genuine headroom
+     under that fixed ceiling for `block4_resize_tile_in_row`'s own grow
+     check to succeed on ANY row's later growth, not a literal transfer
+     of bytes into one specific row's window. Wired into
+     `SparseLinearLayer::equalizer_step()` (own independent row cursor,
+     same call site/cadence as the scattered CSR side's own step).
+
+  A real methodology lesson from writing the test for this
+  (`test_equalize_step_redistributes_block4_row_headroom`,
+  `tests/unit/test_block4_sparse_tile.cpp`): the first version of the
+  test asserted `total_tile_alloc_bytes()` stays EXACTLY constant across
+  `equalize_step()` calls ("pure redistribution") -- wrong; it can
+  legitimately DROP (freeing global headroom via truncation, per the
+  mechanism above) and the test needed fixing to check `<=`, not `==`.
+  Both directions verified directly: a tile that's over-provisioned
+  (built dense, pruned back down, compressed) frees its slack via
+  `equalize_step()`, and a DIFFERENT tile whose growth was previously
+  declined (`dropped_growth_events` incremented, real budget exhaustion)
+  succeeds on retry after that redistribution runs, with zero new drops.
+
+  This also required fixing three existing tests
+  (`test_disldo_block4_forward/backward/combined_absolute.cpp`) that had
+  a real, now-exposed latent bug: they kept a `get_or_create()`-returned
+  handle alive as a named variable (not scoped to `{}`) while writing
+  into it, then read the tile back out through a SEPARATE code path
+  (`disldo_forward`, `delta_csr_combined_to_absolute`) before the
+  writing handle's destructor ever ran. Under the OLD always-dense
+  design this worked by accident (dense writes are always in-place, no
+  destructor-driven flush needed); under real sparse-by-default storage,
+  a handle's writes only reach `tile_data` when it destructs -- exactly
+  the same RAII discipline `block4_maybe_promote`'s own scoped block
+  already used correctly. `block4_maybe_promote`'s own call site, and
+  every other real (non-test) `get_or_create()` call site, were already
+  correctly scoped -- checked directly, not assumed.
+
+- **Memory-cap + compression benchmark, done.**
+  `tests/unit/test_block4_memory_cap_and_compression.cpp` (ctest,
+  hard-CHECK, permanent): drives 1500 iterations of real online
+  training + aggressive synaptogenesis under a tight shared budget,
+  asserting the REAL allocated-byte totals (both scattered CSR and
+  block4, both the indices and tile-data sides) never exceed
+  `set_limits()`'s configured caps -- the actual guarantee the original
+  ask was about ("guarantee memory doesn't go outside of max capacity
+  during synaptogenesis... so that synaptogenesis doesn't crash the
+  AI"). A second test builds 40 tiles at 2 live synapses each,
+  compresses them, and asserts the measured footprint is EXACTLY
+  `n_tiles * block4_sparse_packed_len(2)` bytes (a real 4.00x
+  reduction vs the dense-equivalent), not just that an `is_sparse`
+  flag flipped.
+- **Speed cost of compression, measured (`scripts/bench_block4_memory_and_compression.cpp`,
+  informational, not ctest).** A full online-training loop turned out
+  NOT to exercise compression at all -- `disldo_backward` writes every
+  slot of a touched tile on every call, so an actively-trained tile is
+  forced back to full occupancy before compression has any lasting
+  effect (measured 1.00x under that workload, confirming the
+  established "tiles trend toward full occupancy" finding applies to
+  compression persistence too, not just the memory-cap budget
+  formula). Real compression's value is for tiles NOT under active
+  per-step training. Rewritten to directly drive the pack/unpack/resize
+  machinery instead: repeatedly nudge 2000 tiles' live count up across
+  `switch_point` (forcing a real sparse->dense resize) then back down
+  (forcing a real dense->sparse resize via `maybe_compress`), a
+  worst-case constant-churn scenario. Result: real, sustained 4.00x
+  compression, at ~441ns/cycle vs ~319ns/cycle uncompressed (~1.4x
+  slower per touch when a tile is oscillating across the threshold on
+  EVERY single access -- realistic steady-state usage, where most
+  tiles don't flip every touch, pays this far less often).
+- **Not yet done**: routing sparse CSR input through sisldo ops (dense
+  input already goes through disldo) and finding/documenting the
+  density crossover point where sparse input becomes faster.
+
 ## Explicitly NOT changing
 
 - The prototype branch (`feature/sili-ell-benchmark`, PR #22) and its
