@@ -1335,9 +1335,215 @@ smaller allocation.
   slower per touch when a tile is oscillating across the threshold on
   EVERY single access -- realistic steady-state usage, where most
   tiles don't flip every touch, pays this far less often).
-- **Not yet done**: routing sparse CSR input through sisldo ops (dense
-  input already goes through disldo) and finding/documenting the
-  density crossover point where sparse input becomes faster.
+- **Done: sparse CSR input now routes through block4-aware
+  `delta_csr_forward`/`delta_csr_backward_sparse_grad`, with a real,
+  measured speed win over dense input at every tested density.**
+
+  **The bug closed**: neither `delta_csr_forward` (forward_sparse) nor
+  `delta_csr_backward_sparse_grad` (backward_sparse) ever touched
+  `weights.block4` at all (confirmed via `grep -n block4
+  delta_csr_ops.hpp` returning nothing beforehand) -- any layer with
+  block4-promoted synapses silently dropped their contribution through
+  either sparse-input path. Independent of and pre-dating this
+  session's speed work.
+
+  **Design chosen**: Design A (reuse the existing `work_offsets`
+  serial-prepass + `upper_bound`/cursor-advance pattern the scattered
+  path already used, applied one level up at window granularity) --
+  NOT Design B (direct per-active-window binary search, no prepass).
+  Chosen empirically, not by assumption, per plan: a diagnostic
+  isolating just the prepass (`diag_b4_overhead_breakdown.cpp`) showed
+  it costs <1% of total runtime even at 90% density (0.0013ms of a
+  ~0.86ms call) -- never a real bottleneck, so Design B's whole reason
+  to exist (avoid prepass cost) didn't apply here.
+
+  **The real bottleneck, found and fixed**: the actual overhead came
+  from `Block4TileHandle::find(br, bc)`, called after the window-gather
+  loop had ALREADY walked the row's cursor to discover `bc` -- `find()`
+  re-derives the tile's byte position via `raw_find()`, an INDEPENDENT
+  O(row_nnz) linear rescan from the row's start, duplicating work the
+  caller just did. `disldo_forward`/`disldo_backward` already avoid
+  this via `at_index(br, bc, elem_pos, byte_pos)` (a fast path for a
+  caller that already knows the position); the new sparse-input phases
+  didn't use it at first. Before the fix: at 90% input density, the
+  sparse forward path touched the exact same 16384 tiles as dense yet
+  took 2.7x LONGER (0.86ms vs dense's 0.32ms) for identical work --
+  dense actually won at every density from 30% to 90%, exactly the
+  failure mode flagged as a possibility during planning ("if we drop
+  40% vector4 inputs for 60% dense input and it doesn't give a
+  speedup, that needs investigating"). After switching to `at_index`
+  (tracking `elem_pos`/`byte_pos` live as the window-gather loop
+  advances its own cursor, mirroring `disldo_forward`'s collection-loop
+  pattern exactly): sparse wins at every tested density, including 90%.
+
+  Measured (512x512, fully block4-resident, num_cpus=4, fresh process
+  per point, `scripts/bench_block4_sparse_input_forward.cpp` /
+  `scripts/bench_block4_sparse_input_backward.cpp`):
+
+  | density | forward speedup | backward speedup |
+  |---------|-----------------|-------------------|
+  | 90%     | 1.73x           | 1.63x             |
+  | 60%     | 1.98x           | 2.81x             |
+  | 30%     | 2.26x           | 3.37x             |
+  | 10%     | 5.61x           | 5.34x             |
+  | 5%      | 8.92x           | 12.82x            |
+
+  No crossover density needed documenting -- sparse wins across the
+  WHOLE tested range once the redundant-rescan bug was fixed, not just
+  past some low-density threshold.
+
+  **Backward's design differs from `disldo_backward`'s**: forward's
+  gather groups INPUT entries by block-ROW (`br = in_idx/4`), a direct
+  match for block4's row-major storage, so it's a straightforward port.
+  Backward's gradient is sparse by block-COLUMN (`bc = out_idx/4`),
+  which does NOT match block4's row-major layout (no column index
+  exists), so gathering "all tiles at this bc across every br" would
+  need a full row scan per active bc -- expensive. Instead,
+  `delta_csr_backward_sparse_grad`'s block4 phase parallelizes by
+  BLOCK-ROW (like the scattered path in the same function already
+  does) and has each row do its own independent merge-scan against the
+  sorted gradient CSR (mirroring the scattered loop's own
+  `og_ptr`-walking merge, just per-tile instead of per-synapse). A
+  useful side effect: since each block-row owns exactly 4 unique input
+  rows that no other block-row ever touches, value_scale/dx/importance-
+  stat updates can write directly into shared (non-per-thread)
+  accumulators with no race -- simpler than `disldo_backward`'s
+  tile-partitioned scheme, which needs per-thread buffers + a final
+  reduction because two different tiles CAN share a block-row there.
+
+  Correctness-first scalar port for both directions (no `Block4Vec`
+  SIMD, no batch-loop vectorization) -- matches the measured-not-
+  assumed philosophy already established for `delta_csr_forward`'s
+  original scattered-path block4 addition; revisit with real profiling
+  if a benchmark ever shows this scalar version is the bottleneck.
+  `KNOWN SIMPLIFICATION` carried over unchanged from `disldo_backward`:
+  a row with both scattered and block4 synapses gets two sequential
+  value_scale gradient steps rather than one combined step.
+
+  **A second, unrelated, pre-existing bug found and fixed along the
+  way**: while validating the new backward code under a real learning
+  step (lr>0), `disldo_backward` itself crashed (ASan: negative-size
+  `memmove` inside `block4_resize_tile_in_row`) on a small mixed
+  scattered+block4 layer. Root cause: `disldo_backward`'s block4 phase
+  precomputes every tile's byte offset ONCE, in a serial pass, before
+  its parallel region runs (`tile_byte[ti]`). If an EARLIER tile in the
+  SAME row resizes during the parallel loop (routine whenever
+  `learning_rate != 0` and a tile's live count crosses `switch_point`),
+  every LATER tile's precomputed offset in that row goes stale --
+  `at_index()`'s fast-path constructor trusts the given offset without
+  re-verifying, so the next tile's handle unpacks garbage from the
+  wrong location, and its write-back can then corrupt `tile_data`.
+  This is NOT something introduced this session -- it's been present
+  since the row-partitioned parallel scheduling was added earlier, and
+  apparently never triggered by prior benchmarks/tests (which mostly
+  exercised layers that start and stay fully dense, or ran at lr=0).
+  Fixed by tracking `byte_pos` LIVE per-row instead (same technique
+  already used in the new sparse-input code, which is why that code
+  never hit this): `weights.block4.tile_byte_start[br]` initialized
+  once per row, then advanced via `tile_len_at(elem_pos, byte_pos)`
+  AFTER each tile's handle has actually destructed (requiring the tile-
+  using code to be wrapped in its own inner scope so the destructor --
+  and any resize it triggers -- runs before the advance, not after).
+  `tile_bc[ti]`/`tile_elem[ti]` stay valid as precomputed (resize
+  changes a tile's byte LENGTH, never its column or element index).
+  Full ctest suite re-run clean after the fix (88 tests, same 3
+  pre-existing flaky ones: #19/#35/#51, confirmed unrelated).
+
+  Correctness: `tests/unit/test_block4_sparse_input_forward.cpp` /
+  `test_block4_sparse_input_backward.cpp` (permanent, ctest-wired) --
+  mixed scattered+block4 layers, sparse-input vs dense-input compared
+  across multiple densities including 5%/95% edges and num_cpus=1/4;
+  backward's lr>0 branch checked as a finite-values smoke test only
+  (bit-exact match isn't meaningful there -- see the tests' own comment
+  on why stochastic requantization RNG call order differs between the
+  two implementations).
+
+  **A THIRD bug found and fixed, deeper than the first two, discovered
+  while validating the above under real concurrent (num_cpus>1)
+  training**: `Block4Store::tile_data` is ONE buffer shared across every
+  block-row in the store. Row-exclusive thread ownership (established
+  earlier this session for the byte_pos-staleness fix) only protects
+  against two threads touching the SAME row -- it does NOT protect
+  against a DIFFERENT hazard: when row X's growth exceeds its own
+  current headroom, `block4_resize_tile_in_row` doesn't just resize
+  `tile_data` (which can reallocate the whole shared buffer, moving
+  every row) -- it also physically MEMMOVES every LATER row's bytes and
+  shifts their `tbyte_start`/`tbyte_end` bookkeeping to make room. A
+  different thread reading or writing its OWN row at that exact moment
+  can have its bytes silently relocated out from under it, or read
+  half-updated bookkeeping. Confirmed via ASan (`heap-use-after-free`,
+  then `negative-size-param` in `memmove`) as a real, reproducible
+  (~80% of stress-test runs) failure once real concurrent learning was
+  exercised -- not hypothetical.
+
+  Fixed in three escalating layers, each closing more of the gap
+  (documented here because the first two were shipped, measured
+  insufficient, and superseded -- not because they were wrong to try):
+  1. `Block4Store::tile_data_grow_lock` (non-blocking, try-lock only):
+     serializes concurrent GROWING resizes against each other so two
+     threads can never both reallocate `tile_data` at once. Reduced the
+     stress-test failure rate from ~80% to ~27% -- closes one real
+     failure mode, not the whole hazard (a non-growing reader on a
+     different row can still race a lock-holder's actual resize).
+  2. `Block4Store::set_limits()` now pre-reserves `tile_data`'s capacity
+     up to `max_tile_bytes` when finite. `std::vector::resize()` that
+     stays within already-reserved capacity never reallocates or moves
+     existing elements (a real standard guarantee, not a heuristic), so
+     this structurally eliminates the ADDRESS-reallocation half of the
+     hazard once a real budget is configured. Reduced failures further
+     (~27% to ~7.5%) but NOT to zero -- the cross-row byte-SHIFT
+     (memmove + tbyte_start/tbyte_end update) is a separate hazard
+     reservation doesn't touch.
+  3. **The real fix (closes it structurally, verified 0 failures across
+     125+ repeated stress runs at two different scales, up to
+     num_cpus=8)**: `Block4Store::RowWorkspace` + `snapshot_row()` /
+     `commit_dirty_tile_in_workspace()` / `merge_row_workspace()`. Per
+     the user's own proposed design: instead of writing through the
+     shared store and trying to synchronize against it, copy the row's
+     current bytes into a thread-private workspace once, do ALL of that
+     row's reads/writes/resizes against the private copy (grows freely,
+     no lock, nothing else can observe it), then merge back in one
+     row-exclusive step -- writing ONLY into this row's own
+     pre-existing byte range, never touching `tile_data`'s capacity or
+     any OTHER row's bookkeeping at all. If the row's final size doesn't
+     fit back into its existing headroom, evicts (zeroes) the globally
+     lowest-|true-importance| live synapse in the workspace and retries
+     until it fits, rather than ever growing into another row's space.
+     Because NO row using this path ever calls the cross-row-shifting
+     resize branch, the hazard becomes structurally unreachable during a
+     concurrent call, not just less likely. True importance for eviction
+     ranking uses the DECODED, scale-adjusted value (`FP4_TABLE[code] *
+     importance_scale * output_importance_scale`), not the raw 4-bit
+     code directly -- per the user, raw codes alone (16 levels) aren't
+     enough resolution to break ties meaningfully.
+
+     Applied to both `delta_csr_backward_sparse_grad` (only for its
+     `learning_rate != 0` branch -- the `== 0` branch never writes, so
+     it keeps the plain, cheaper shared-store read path) and
+     `disldo_backward` (applied UNCONDITIONALLY, even at
+     `learning_rate == 0`, for simplicity -- one tested code path
+     instead of two, and correct even if some other concurrent caller
+     on the same store happens to be writing at the same time). This
+     was a deliberate simplicity-over-speed tradeoff for
+     `disldo_backward` specifically: measured cost is a real ~18%
+     slowdown on `disldo_backward`'s READ-ONLY (`learning_rate == 0`,
+     e.g. eval/inference) path specifically, from the now-unconditional
+     row snapshot+merge-back overhead that buys nothing when nothing is
+     ever written. `delta_csr_backward_sparse_grad` avoids this same
+     cost by branching, same as it already needed to for other reasons.
+     Not yet decided whether `disldo_backward`'s read-only path is worth
+     the same split -- flagged here as a known, measured, deferred
+     optimization rather than fixed silently or left unmeasured.
+
+  disldo_backward's block4 collection pass was also simplified after
+  this rewrite: it used to precompute a GLOBAL flat array of every
+  tile's byte position across the whole store (`scratch_tile_byte`) --
+  exactly the stale-precomputed-offset pattern the second bug fix (byte_
+  pos-staleness) above had to work around per-row. The row-workspace
+  design makes that global precompute unnecessary entirely (each row's
+  positions are tracked fresh, locally, at snapshot time) -- removed,
+  leaving only the `row_ti_start`/`row_live_count` bookkeeping the
+  parallel loop's row-partitioning genuinely still needs.
 
 ## Explicitly NOT changing
 
