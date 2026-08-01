@@ -45,6 +45,20 @@ public:
     // detect and react (equalizer_step()/expand_headroom(), or just
     // accepting some updates are being dropped under the current budget).
     std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
+    // Every live (block_row, block_col) tile coordinate, row-major --
+    // Block4Store::live_tile_coords() (block4.hpp). Counts alone
+    // (tiles()/synapses()) don't say WHERE connections live; this closes
+    // that gap for block4-resident weights, mirroring how
+    // SparseLinearLayer.ptrs/.indices already expose the scattered side.
+    std::pair<py::array_t<uint32_t>, py::array_t<uint32_t>> tile_coords() const {
+        std::vector<uint32_t> br, bc;
+        store->live_tile_coords(br, bc);
+        py::array_t<uint32_t> out_br((py::ssize_t)br.size());
+        py::array_t<uint32_t> out_bc((py::ssize_t)bc.size());
+        std::copy(br.begin(), br.end(), (uint32_t*)out_br.request().ptr);
+        std::copy(bc.begin(), bc.end(), (uint32_t*)out_bc.request().ptr);
+        return {out_br, out_bc};
+    }
 private:
     Block4Store* store;
 };
@@ -990,7 +1004,13 @@ PYBIND11_MODULE(_cpu, m)
              " couldn't be persisted because growing its storage would have"
              " exceeded the memory budget -- declined (with the tile keeping its"
              " old value), not thrown, so training keeps running. Nonzero means"
-             " some updates are being silently dropped under the current budget.");
+             " some updates are being silently dropped under the current budget.")
+        .def("tile_coords", &Block4View::tile_coords,
+             "Returns (block_rows, block_cols): every live tile's (br, bc)"
+             " coordinate, row-major, as two parallel uint32 numpy arrays."
+             " Counts alone (tiles()/synapses()) don't say WHERE connections"
+             " live -- use this to inspect block4-resident weight structure"
+             " directly (e.g. which side of a diagonal a connection falls on).");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 

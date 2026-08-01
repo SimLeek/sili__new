@@ -1038,6 +1038,30 @@ struct Block4Store {
 
     std::size_t n_tiles() const { return block_layout.total_nnz; }
 
+    // Every live (br, bc) tile coordinate, row-major -- the introspection
+    // block_layout already supports internally (row_cursor/row_nnz) but
+    // had no external accessor: a caller could get counts (n_tiles()) but
+    // not which positions are actually live, needed to report where
+    // recurrent/cross-fold-depth connections land (e.g. above vs below a
+    // diagonal) for a block4-resident weight matrix. Two parallel arrays
+    // (not a vector of pairs) so pybind can hand back plain numpy arrays
+    // without a custom struct binding.
+    void live_tile_coords(std::vector<uint32_t>& out_br, std::vector<uint32_t>& out_bc) const {
+        out_br.clear();
+        out_bc.clear();
+        out_br.reserve(block_layout.total_nnz);
+        out_bc.reserve(block_layout.total_nnz);
+        for (std::size_t br = 0; br < block_layout.rows; ++br) {
+            const std::size_t n = block_layout.row_nnz(br);
+            if (n == 0) continue;
+            auto cur = row_cursor(br);
+            for (std::size_t e = 0; e < n; ++e) {
+                out_br.push_back(static_cast<uint32_t>(br));
+                out_bc.push_back(cur.advance());
+            }
+        }
+    }
+
     std::size_t total_tile_alloc_bytes() const { return tile_data.size(); }
     std::size_t total_tile_used_bytes() const {
         std::size_t n = 0;
