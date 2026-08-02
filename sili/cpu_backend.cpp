@@ -1597,6 +1597,64 @@ PYBIND11_MODULE(_cpu, m)
         "Backward pass for banded_attention. causal must match the forward\n"
         "call. Returns (dQ, dK, dV) each [T or K, d].");
 
+    m.def("gaussian_attention",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           py::array_t<float> centers, py::array_t<float> sigmas,
+           int num_cpus, bool causal) {
+            auto qb=q.request(), kb=k.request(), vb=v.request();
+            auto cb=centers.request(), sb=sigmas.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
+            auto ob = out.request();
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
+            gaussian_attention_forward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (float*)ob.ptr, T, K, d,
+                (const float*)cb.ptr, (const float*)sb.ptr, num_cpus, causal);
+            return out;
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("centers"), py::arg("sigmas"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        "Full (every query x every key) attention with a learnable per-query\n"
+        "Gaussian log-bias: score[q,j] = Q[q].K[j]*scale - (j-centers[q])^2/\n"
+        "(2*sigmas[q]^2), then softmax as usual. Q/K/V are [T or K, d] float32\n"
+        "numpy arrays; centers/sigmas are [T]. sigmas must be strictly positive\n"
+        "-- callers should store an unconstrained log_sigma and exponentiate\n"
+        "before calling in (see sili.tensor.exp), not pass raw trainable sigma\n"
+        "directly. Returns [T, d] output.");
+
+    m.def("gaussian_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+           py::array_t<float> dO, py::array_t<float> centers, py::array_t<float> sigmas,
+           int num_cpus, bool causal) {
+            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            auto cb=centers.request(), sb=sigmas.request();
+            const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
+            py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
+            py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
+            py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
+            py::array_t<float> dCenters({(py::ssize_t)T});
+            py::array_t<float> dSigmas({(py::ssize_t)T});
+            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
+            auto dcb=dCenters.request(), dsb=dSigmas.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
+            std::fill((float*)dcb.ptr, (float*)dcb.ptr + T, 0.0f);
+            std::fill((float*)dsb.ptr, (float*)dsb.ptr + T, 0.0f);
+            gaussian_attention_backward(
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
+                (const float*)dob.ptr,
+                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
+                (float*)dcb.ptr, (float*)dsb.ptr,
+                T, K, d, (const float*)cb.ptr, (const float*)sb.ptr, num_cpus, causal);
+            return py::make_tuple(dQ, dK, dV, dCenters, dSigmas);
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
+        py::arg("centers"), py::arg("sigmas"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        "Backward pass for gaussian_attention. centers/sigmas must match the\n"
+        "forward call. Returns (dQ, dK, dV, dCenters, dSigmas).");
+
     m.def("sparse_banded_attention_backward",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            py::array_t<float> dO,

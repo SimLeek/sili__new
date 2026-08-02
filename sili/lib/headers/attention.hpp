@@ -674,4 +674,192 @@ inline void sparse_attention_backward(
     }
 }
 
+// ── Gaussian-weighted full attention ──────────────────────────────────────────
+
+/**
+ * @brief Full (every query x every key) attention with a learnable
+ * per-query Gaussian log-bias on top of the usual Q.K score.
+ *
+ * Unlike banded_attention_forward (a HARD cutoff band around a FIXED,
+ * non-learnable geometric-diagonal center) or sparse_attention_forward
+ * (data-driven top-k selection), every key is always reachable by every
+ * query -- what changes is how strongly nearby keys are preferred, via
+ * a per-query center/sigma that training can move:
+ *
+ *   score[q,j] = (Q[q].K[j])*scale - (j - center[q])^2 / (2*sigma[q]^2)
+ *
+ * then softmax over j as usual. sigma must be strictly positive (the
+ * caller is expected to store an unconstrained log_sigma and exponentiate
+ * before calling in -- see sili.tensor.exp -- rather than this function
+ * enforcing positivity itself).
+ *
+ * Cost: O(T x K x d), no top-k/banding overhead -- intended for SMALL T/K
+ * (e.g. a handful to a few dozen), not token-sequence-length attention.
+ *
+ * Layout: q [T x d], k_mat/v [K x d], output [T x d] (caller zeroes),
+ * centers/sigmas [T] (one pair per query row).
+ *
+ * NOTE (test): sigma -> 0 with center exactly on integer key index j0
+ * should concentrate output[q] == v[j0] (the Gaussian bias overwhelms
+ * the Q.K term as sigma shrinks).
+ */
+inline void gaussian_attention_forward(
+    const float* q,
+    const float* k_mat,
+    const float* v,
+    float*       output,
+    std::size_t  T,
+    std::size_t  K,
+    std::size_t  d,
+    const float* centers,   ///< [T] -- per-query center position (float, can be fractional)
+    const float* sigmas,    ///< [T] -- per-query std dev, must be > 0
+    int          num_cpus = 4,
+    bool         causal = false)
+{
+    if (T == 0 || K == 0 || d == 0) return;
+    const float scale = 1.0f / std::sqrt(float(d));
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* qr   = q + t * d;
+        float*       outr = output + t * d;
+        const float  c = centers[t];
+        const float  inv_2s2 = 1.0f / (2.0f * sigmas[t] * sigmas[t]);
+
+        std::vector<float> scores(K);
+        for (std::size_t j = 0; j < K; ++j) {
+            if (causal && j > t) { scores[j] = -1e38f; continue; }
+            const float* kr = k_mat + j * d;
+            float dot = 0.0f;
+            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            const float diff = float(j) - c;
+            scores[j] = dot * scale - diff * diff * inv_2s2;
+        }
+
+        float max_s = -1e38f;
+        for (std::size_t j = 0; j < K; ++j) max_s = std::max(max_s, scores[j]);
+        float sum_e = 0.0f;
+        for (std::size_t j = 0; j < K; ++j) {
+            scores[j] = std::exp(scores[j] - max_s);
+            sum_e += scores[j];
+        }
+        const float inv_sum = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
+
+        for (std::size_t j = 0; j < K; ++j) {
+            const float w  = scores[j] * inv_sum;
+            const float* vr = v + j * d;
+            for (std::size_t i = 0; i < d; ++i) outr[i] += w * vr[i];
+        }
+    }
+}
+
+
+/**
+ * @brief Backward pass for gaussian_attention_forward.
+ *
+ * Standard attention backward for dQ/dK/dV (same math as
+ * banded_attention_backward -- see its own header comment), PLUS
+ * dCenters/dSigmas from the same per-(q,j) softmax-Jacobian term
+ * ds[q,j] the dQ/dK computation already needs:
+ *
+ *   ds[q,j]        = attn[q,j] * (dO[q].V[j] - g[q])
+ *   dCenters[q]    = sum_j( ds[q,j] * (j - center[q]) / sigma[q]^2 )
+ *   dSigmas[q]     = sum_j( ds[q,j] * (j - center[q])^2 / sigma[q]^3 )
+ *
+ * (from d(score)/d(center) = (j-center)/sigma^2 and d(score)/d(sigma) =
+ * (j-center)^2/sigma^3, chain-ruled through the same softmax Jacobian
+ * that produces ds[q,j] for dQ/dK -- score = dot*scale - (j-c)^2/(2s^2),
+ * so d(score)/dc = (j-c)/s^2 and d(score)/ds = (j-c)^2/s^3 directly).
+ *
+ * dCenters/dSigmas are PER QUERY ROW t -- like dQ, each row is owned by
+ * exactly one thread, no locking needed (unlike dK/dV, which every
+ * query's row can write to and need a critical section).
+ */
+inline void gaussian_attention_backward(
+    const float* q,
+    const float* k_mat,
+    const float* v,
+    const float* dO,
+    float*       dQ,
+    float*       dK,
+    float*       dV,
+    float*       dCenters,   ///< [T] accumulated gradient output
+    float*       dSigmas,    ///< [T] accumulated gradient output
+    std::size_t  T,
+    std::size_t  K,
+    std::size_t  d,
+    const float* centers,
+    const float* sigmas,
+    int          num_cpus = 4,
+    bool         causal = false)
+{
+    if (T == 0 || K == 0 || d == 0) return;
+    const float scale = 1.0f / std::sqrt(float(d));
+
+    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* qr  = q  + t * d;
+        const float* dOr = dO + t * d;
+        float*       dQr = dQ + t * d;
+        const float  c = centers[t];
+        const float  s = sigmas[t];
+        const float  inv_2s2 = 1.0f / (2.0f * s * s);
+
+        std::vector<float> attn(K);
+        float max_s = -1e38f;
+        for (std::size_t j = 0; j < K; ++j) {
+            if (causal && j > t) { attn[j] = -1e38f; continue; }
+            const float* kr = k_mat + j * d;
+            float dot = 0.0f;
+            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            const float diff = float(j) - c;
+            attn[j] = dot * scale - diff * diff * inv_2s2;
+            if (attn[j] > max_s) max_s = attn[j];
+        }
+        float sum_e = 0.0f;
+        for (std::size_t j = 0; j < K; ++j) {
+            attn[j] = (causal && j > t) ? 0.0f : std::exp(attn[j] - max_s);
+            sum_e += attn[j];
+        }
+        const float inv_sum = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
+        for (std::size_t j = 0; j < K; ++j) attn[j] *= inv_sum;
+
+        // g[t] = sum_j( attn[t,j] * (dO[t].V[j]) )
+        float g = 0.0f;
+        for (std::size_t j = 0; j < K; ++j) {
+            const float* vr = v + j * d;
+            float dot = 0.0f;
+            for (std::size_t i = 0; i < d; ++i) dot += dOr[i] * vr[i];
+            g += attn[j] * dot;
+        }
+
+        float dc = 0.0f, ds_sigma = 0.0f;
+        #pragma omp critical
+        {
+            for (std::size_t j = 0; j < K; ++j) {
+                const std::size_t kp = j;
+                const float*      vr  = v  + kp * d;
+                float*             dVr = dV + kp * d;
+                float*             dKr = dK + kp * d;
+
+                for (std::size_t i = 0; i < d; ++i) dVr[i] += attn[j] * dOr[i];
+
+                float dov = 0.0f;
+                for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+                const float ds = attn[j] * (dov - g);
+
+                const float* kr = k_mat + kp * d;
+                for (std::size_t i = 0; i < d; ++i) dKr[i] += ds * scale * qr[i];
+                for (std::size_t i = 0; i < d; ++i) dQr[i] += ds * scale * kr[i];
+
+                const float diff = float(j) - c;
+                dc       += ds * diff / (s * s);
+                ds_sigma += ds * diff * diff / (s * s * s);
+            }
+        }
+        dCenters[t] += dc;
+        dSigmas[t]  += ds_sigma;
+    }
+}
+
 #endif // __ATTENTION_HPP_

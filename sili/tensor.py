@@ -180,6 +180,18 @@ def tanh(a: Tensor) -> Tensor:
     return out
 
 
+def exp(a: Tensor) -> Tensor:
+    """d(exp(x))/dx = exp(x) -- standard use is the log-sigma -> sigma
+    positivity trick (train an unconstrained log_sigma parameter,
+    exponentiate before using it as a strictly-positive scale/spread),
+    so nothing downstream needs to special-case sign/zero."""
+    e   = np.exp(np.asarray(a.data, dtype=np.float32))
+    out = Tensor(e, (a,), "exp", a.backend)
+    def _bwd(): _acc(a, e * np.asarray(out.grad, dtype=np.float32))
+    out._backward = _bwd
+    return out
+
+
 def reduce_sum(a: Tensor, axis=None) -> Tensor:
     out = Tensor(a.backend.sum(a.data, axis), (a,), "sum", a.backend)
     def _bwd(): _acc(a, a.backend.broadcast_to(out.grad, a.data))
@@ -350,6 +362,40 @@ def banded_attention(q: Tensor, k: Tensor, v: Tensor,
             qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
             half_bandwidth, num_cpus, causal)
         _acc(q, dQ); _acc(k, dK); _acc(v, dV)
+    out._backward = _bwd
+    return out
+
+
+def gaussian_attention(q: Tensor, k: Tensor, v: Tensor,
+                       centers: Tensor, sigmas: Tensor,
+                       num_cpus: int = 4, causal: bool = False) -> Tensor:
+    """Full (every query x every key) attention with a learnable per-query
+    Gaussian log-bias on top of the usual Q.K score -- differentiable
+    w.r.t. q/k/v AND centers/sigmas (unlike banded_attention's fixed,
+    non-learnable geometric-diagonal band). See attention.hpp for the
+    exact math.
+
+    centers/sigmas are [T] Tensors (one pair per query row) -- pass them
+    as real Tensor objects (not raw arrays) so Module.parameters() picks
+    them up as trainable leaves and gradients flow into centers.grad/
+    sigmas.grad like any other parameter.
+
+    sigmas must stay strictly positive through training. This function
+    does not enforce that itself -- callers should store an unconstrained
+    log_sigma parameter and pass `exp(log_sigma)` in here (see `exp()`
+    above), not a raw trainable sigma directly, so the existing autograd
+    chain rule keeps it positive automatically."""
+    from sili import _cpu
+    qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
+    cd = np.ascontiguousarray(centers.data, dtype=np.float32)
+    sd = np.ascontiguousarray(sigmas.data, dtype=np.float32)
+    out_np = _cpu.gaussian_attention(qd, kd, vd, cd, sd, num_cpus, causal)
+    out = Tensor(out_np, (q, k, v, centers, sigmas), "gaussian_attention", q.backend)
+    def _bwd():
+        dQ, dK, dV, dC, dS = _cpu.gaussian_attention_backward(
+            qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
+            cd, sd, num_cpus, causal)
+        _acc(q, dQ); _acc(k, dK); _acc(v, dV); _acc(centers, dC); _acc(sigmas, dS)
     out._backward = _bwd
     return out
 
