@@ -192,6 +192,17 @@ def exp(a: Tensor) -> Tensor:
     return out
 
 
+def log(a: Tensor) -> Tensor:
+    """d(log(x))/dx = 1/x. Mirrors exp()'s pattern exactly -- standard
+    use here is a softmax-cross-entropy loss built from exp/reduce_sum/
+    gather rather than a dedicated cross-entropy op."""
+    l   = np.log(np.asarray(a.data, dtype=np.float32))
+    out = Tensor(l, (a,), "log", a.backend)
+    def _bwd(): _acc(a, np.asarray(out.grad, dtype=np.float32) / np.asarray(a.data, dtype=np.float32))
+    out._backward = _bwd
+    return out
+
+
 def reduce_sum(a: Tensor, axis=None) -> Tensor:
     out = Tensor(a.backend.sum(a.data, axis), (a,), "sum", a.backend)
     def _bwd(): _acc(a, a.backend.broadcast_to(out.grad, a.data))
