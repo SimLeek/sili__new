@@ -1,6 +1,28 @@
 import numpy as np
 
-from sili.tensor import Tensor, log
+from sili.tensor import Tensor, log, reduce_sum
+
+
+class TestReduceSumBackwardAxis:
+    def test_backward_correct_for_every_axis_on_a_2d_tensor(self):
+        # Regression: reduce_sum's backward used to just call
+        # backend.broadcast_to(out.grad, a.data) directly -- correct by
+        # coincidence for axis=0 (the remaining shape happens to already
+        # be right-aligned with the original), wrong for any other axis
+        # (e.g. axis=-1 drops a NON-trailing... well, drops the trailing
+        # dim itself, but broadcasting [T] back to [T,hidden] tries to
+        # align it against the wrong (hidden) dimension) -- raised a
+        # shape error outright rather than silently computing something
+        # wrong. Found while building a batched RMSNorm for sili_peridot.
+        for axis in [None, 0, 1, -1]:
+            x = Tensor(np.arange(12, dtype=np.float32).reshape(3, 4))
+            s = reduce_sum(x, axis=axis)
+            s.grad = (np.ones_like(s.data) if s.data.ndim
+                       else np.array(1.0, dtype=np.float32))
+            s._backward()
+            np.testing.assert_array_equal(
+                x.grad, np.ones((3, 4), dtype=np.float32),
+                err_msg=f"axis={axis!r}")
 
 
 class TestLog:
