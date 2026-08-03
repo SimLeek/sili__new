@@ -205,7 +205,18 @@ def log(a: Tensor) -> Tensor:
 
 def reduce_sum(a: Tensor, axis=None) -> Tensor:
     out = Tensor(a.backend.sum(a.data, axis), (a,), "sum", a.backend)
-    def _bwd(): _acc(a, a.backend.broadcast_to(out.grad, a.data))
+    def _bwd():
+        g = np.asarray(out.grad, dtype=np.float32)
+        if axis is not None:
+            # backend.sum drops `axis` entirely (no keepdims) -- for any
+            # axis other than 0, the reduced dim isn't trailing, so
+            # broadcast_to's plain np.broadcast_to (right-aligned) would
+            # try to match the wrong dimensions. Re-insert `axis` as a
+            # size-1 dim first so broadcasting expands the RIGHT one.
+            # (axis=0 previously "worked" only by coincidence -- the
+            # remaining shape happens to already be right-aligned.)
+            g = np.expand_dims(g, axis)
+        _acc(a, a.backend.broadcast_to(g, a.data))
     out._backward = _bwd
     return out
 
