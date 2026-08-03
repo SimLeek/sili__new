@@ -138,10 +138,18 @@ public:
         auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
         sisldo_forward_trivalues(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
 
-        return py::array_t<V>(
-            {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
-            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
-            output_buf.data(), py::cast(this));
+        // COPY output_buf out, not a view into it -- output_buf is a
+        // member reused (assign()'d over) by every future forward call
+        // on this same object; a caller holding a PREVIOUS call's
+        // returned array alive (e.g. comparing before/after a training
+        // step, or ordinary Tensor-graph code keeping intermediates
+        // around for backprop) would silently see it change out from
+        // under them once this layer is called again. See
+        // JOURNAL.md/sili_peridot's tile-recurrence work for how this
+        // was found -- a real, reproducible, previously-unknown bug.
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
     }
 
     // ── Backward ─────────────────────────────────────────────────────────────
@@ -384,10 +392,11 @@ public:
         disldo_forward<S, FP4BiPacked, COL_TYPE>(src, _last_batch, _last_cols, weights,
                        output_buf.data(), learning_rate, num_cpus);
 
-        return py::array_t<V>(
-            {(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()},
-            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
-            output_buf.data(), py::cast(this));
+        // COPY, not a view -- see forward_sparse's own comment above for
+        // why (output_buf is reused/overwritten by every future call).
+        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
     }
 
     // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
@@ -456,10 +465,12 @@ public:
         output_buf.assign(batch * n_outputs(), V(0));
         sisldo_forward<S, FP4BiPacked, COL_TYPE>(
             input, weights, output_buf.data(), learning_rate, num_cpus);
-        return py::array_t<V>(
-            {(py::ssize_t)batch, (py::ssize_t)n_outputs()},
-            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
-            output_buf.data(), py::cast(this));
+        // COPY, not a view -- see SISLDOLayerV::forward_sparse's own
+        // comment for why (output_buf is reused/overwritten by every
+        // future call on this same object).
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
     }
 
     py::array_t<V> backward_sparse(
@@ -877,10 +888,12 @@ public:
         disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
                        output_buf.data(), learning_rate, num_cpus);
 
-        return py::array_t<V>(
-            {(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()},
-            {(py::ssize_t)(n_outputs() * sizeof(V)), (py::ssize_t)sizeof(V)},
-            output_buf.data(), py::cast(this));
+        // COPY, not a view -- see SparseLinearLayer::forward_dense's own
+        // comment for why (output_buf is reused/overwritten by every
+        // future call on this same object).
+        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
     }
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
