@@ -1,6 +1,57 @@
 import numpy as np
 
-from sili.tensor import Tensor, log, reduce_sum
+from sili.tensor import Tensor, add, mul, log, reduce_sum
+
+
+class TestBroadcastingBackward:
+    def _finite_diff_grad(self, f, x_data, eps=1e-3):
+        g = np.zeros_like(x_data)
+        it = np.nditer(x_data, flags=["multi_index"])
+        for _ in it:
+            idx = it.multi_index
+            plus = x_data.copy(); plus[idx] += eps
+            minus = x_data.copy(); minus[idx] -= eps
+            g[idx] = (f(plus) - f(minus)) / (2 * eps)
+        return g
+
+    def test_mul_broadcast_shapes_reduce_correctly(self):
+        # Regression: mul()'s backward used to accumulate the
+        # UNREDUCED elementwise product directly, which only matches
+        # the operand's own shape when both operands are already the
+        # same shape -- broadcasting a=[3,4] against b=[3,1] (found
+        # while building a batched RMSNorm for sili_peridot, scaling
+        # each row by its own reciprocal-RMS) silently produced a
+        # WRONG-shaped grad for b (or crashed downstream, e.g. inside
+        # a following reshape's backward, depending what consumed it).
+        rng = np.random.RandomState(1)
+        a_data = rng.randn(3, 4).astype(np.float32)
+        b_data = rng.randn(3, 1).astype(np.float32)
+
+        a, b = Tensor(a_data.copy()), Tensor(b_data.copy())
+        out = mul(a, b)
+        out.grad = np.ones_like(out.data)
+        out._backward()
+        assert a.grad.shape == (3, 4)
+        assert b.grad.shape == (3, 1)
+
+        expected_b_grad = self._finite_diff_grad(
+            lambda bp: (a_data * bp).sum(), b_data)
+        np.testing.assert_allclose(b.grad, expected_b_grad, rtol=1e-2, atol=1e-2)
+
+    def test_add_broadcast_shapes_reduce_correctly(self):
+        # Same bug, add()'s side -- a vector bias b=[hidden] added to a
+        # batched a=[T,hidden] (e.g. RMSNorm's own learned weight).
+        rng = np.random.RandomState(2)
+        a_data = rng.randn(3, 4).astype(np.float32)
+        b_data = rng.randn(4).astype(np.float32)
+
+        a, b = Tensor(a_data.copy()), Tensor(b_data.copy())
+        out = add(a, b)
+        out.grad = np.ones_like(out.data)
+        out._backward()
+        assert a.grad.shape == (3, 4)
+        assert b.grad.shape == (4,)
+        np.testing.assert_allclose(b.grad, np.full(4, 3.0, dtype=np.float32))
 
 
 class TestReduceSumBackwardAxis:

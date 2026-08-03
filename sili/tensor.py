@@ -127,7 +127,10 @@ class Tensor:
 
 def add(a: Tensor, b: Tensor) -> Tensor:
     out = Tensor(a.backend.add(a.data, b.data), (a, b), "add", a.backend)
-    def _bwd(): _acc(a, out.grad); _acc(b, out.grad)
+    def _bwd():
+        g = np.asarray(out.grad)
+        _acc(a, _unbroadcast_to(g, np.asarray(a.data).shape))
+        _acc(b, _unbroadcast_to(g, np.asarray(b.data).shape))
     out._backward = _bwd
     return out
 
@@ -135,8 +138,10 @@ def add(a: Tensor, b: Tensor) -> Tensor:
 def mul(a: Tensor, b: Tensor) -> Tensor:
     out = Tensor(a.backend.mul(a.data, b.data), (a, b), "mul", a.backend)
     def _bwd():
-        _acc(a, a.backend.mul(b.data, out.grad))
-        _acc(b, b.backend.mul(a.data, out.grad))
+        da = a.backend.mul(b.data, out.grad)
+        db = b.backend.mul(a.data, out.grad)
+        _acc(a, _unbroadcast_to(da, np.asarray(a.data).shape))
+        _acc(b, _unbroadcast_to(db, np.asarray(b.data).shape))
     out._backward = _bwd
     return out
 
@@ -443,6 +448,22 @@ def sparse_banded_attention(q: Tensor, k: Tensor, v: Tensor,
 # ══════════════════════════════════════════════════════════════════════════════
 #  Gradient helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _unbroadcast_to(grad, target_shape: tuple):
+    """Sum `grad` down to `target_shape`, undoing whatever numpy
+    broadcasting happened in a forward op -- numpy right-aligns shapes,
+    so: drop any EXTRA leading axes grad has beyond target_shape's own
+    rank (sum them away entirely), then for each remaining axis where
+    target_shape is 1 but grad's is larger, sum over that axis
+    (keepdims, so the axis count still matches)."""
+    grad = np.asarray(grad)
+    while grad.ndim > len(target_shape):
+        grad = grad.sum(axis=0)
+    for i, t_dim in enumerate(target_shape):
+        if t_dim == 1 and grad.shape[i] != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
+
 
 def _acc(node: Tensor, grad) -> None:
     if node.grad is None:
