@@ -132,11 +132,11 @@ public:
 
     py::array_t<V> forward_sparse(
         py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch, V learning_rate)
+        S batch)
     {
         output_buf.assign(batch * n_outputs(), V(0));
         auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
-        sisldo_forward_trivalues(input_csr, weights, output_buf.data(), learning_rate, num_cpus);
+        sisldo_forward_trivalues(input_csr, weights, output_buf.data(), num_cpus);
 
         // COPY output_buf out, not a view into it -- output_buf is a
         // member reused (assign()'d over) by every future forward call
@@ -380,7 +380,7 @@ public:
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
-    py::array_t<V> forward_dense(py::array_t<V> x, V learning_rate = 0.01) {
+    py::array_t<V> forward_dense(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
@@ -390,7 +390,7 @@ public:
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, FP4BiPacked, COL_TYPE>(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), learning_rate, num_cpus);
+                       output_buf.data(), num_cpus);
 
         // COPY, not a view -- see forward_sparse's own comment above for
         // why (output_buf is reused/overwritten by every future call).
@@ -459,12 +459,12 @@ public:
 
     py::array_t<V> forward_sparse(
         py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch, V learning_rate = 0.0f)
+        S batch)
     {
         auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
         output_buf.assign(batch * n_outputs(), V(0));
         sisldo_forward<S, FP4BiPacked, COL_TYPE>(
-            input, weights, output_buf.data(), learning_rate, num_cpus);
+            input, weights, output_buf.data(), num_cpus);
         // COPY, not a view -- see SISLDOLayerV::forward_sparse's own
         // comment for why (output_buf is reused/overwritten by every
         // future call on this same object).
@@ -876,7 +876,7 @@ public:
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
     Block4View block4() { return Block4View(weights.block4); }
 
-    py::array_t<V> forward(py::array_t<V> x, V learning_rate = 0.01) {
+    py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
@@ -886,7 +886,7 @@ public:
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), learning_rate, num_cpus);
+                       output_buf.data(), num_cpus);
 
         // COPY, not a view -- see SparseLinearLayer::forward_dense's own
         // comment for why (output_buf is reused/overwritten by every
@@ -1012,7 +1012,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
-             py::arg("x"), py::arg("learning_rate") = 0.01f)
+             py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true,
@@ -1024,7 +1024,7 @@ PYBIND11_MODULE(_cpu, m)
              "optimization, not for production use.")
         .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.0f)
+             py::arg("batch"))
         .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
@@ -1222,7 +1222,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward",              &DISLDOLayerV::forward,
-             py::arg("x"), py::arg("learning_rate") = 0.01f)
+             py::arg("x"))
         .def("backward",             &DISLDOLayerV::backward,
              py::arg("dy"), py::arg("learning_rate"))
         .def("build_probes",         &DISLDOLayerV::build_probes,

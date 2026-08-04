@@ -33,22 +33,32 @@
 // ── forward ───────────────────────────────────────────────────────────────────
 
 /**
- * @brief Dense-input forward pass with inline importance tracking update.
+ * @brief Dense-input forward pass. Pure computation, no side effects.
  *
  * @param input          [batch x in_cols] row-major dense.
  * @param batch, in_cols Input dimensions.
- * @param weights        Layer state (importance updated in place if learning_rate != 0).
+ * @param weights        Layer state (read-only here).
  * @param output         [batch x out_cols] accumulated into (caller zeroes first).
- * @param learning_rate  Importance update rate (0 = off). Controls activity-based
- *                       importance tracking (|x|*|h|*lr). Does NOT change weight
- *                       values -- those are updated only by backward_dense() via
- *                       the task gradient.
  * @param num_cpus       OpenMP thread count.
  *
- * NOTE (test): with learning_rate=0, output must equal the dense matmul
- * input @ W_dense where W_dense[r,c] = weight of synapse (r->c). Same
- * reference check used for sisldo_forward and for this session's
- * standalone disldo_ops.hpp (see conversation) -- both passed it.
+ * No learning_rate parameter -- forward used to run its own gradient-free
+ * Hebbian/activity-correlation importance update whenever a nonzero
+ * learning_rate was passed, independently of whether a matching
+ * backward_dense() call would ever follow. Confirmed as a real footgun
+ * (traced directly: fired on every forward call including ones with no
+ * corresponding gradient, e.g. every non-query tick of an online RNN,
+ * measurably corrupting training at low learning rates independent of
+ * any real task signal). Importance is now updated ONLY by
+ * disldo_backward(), coupled to a real gradient, same principle as
+ * weight updates always having been backward-only. REMOVED, not just
+ * disabled -- a caller that still wants an unconditional Hebbian
+ * activity-correlation signal should build that explicitly, not get it
+ * silently bundled into every forward pass.
+ *
+ * NOTE (test): output must equal the dense matmul input @ W_dense where
+ * W_dense[r,c] = weight of synapse (r->c). Same reference check used
+ * for sisldo_forward and for this session's standalone disldo_ops.hpp
+ * (see conversation) -- both passed it.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void disldo_forward(
@@ -57,7 +67,6 @@ void disldo_forward(
     SIZE_TYPE    in_cols,
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     typename ValueAccessor<VALUES_TYPE>::value_type* output,
-    typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
     int          num_cpus = 4)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
@@ -67,15 +76,6 @@ void disldo_forward(
     const std::size_t n_in  = L.rows;
     const std::size_t n_out = L.cols;
     const std::size_t ost   = static_cast<std::size_t>(batch) * n_out;
-
-    // value_scale is gradient-trainable (disldo_backward), so -- same as
-    // every per-synapse weight -- it needs a forward-side importance
-    // update too (Hebbian activity correlation, not just the backward
-    // gradient step). Pre-size for safe indexed writes inside the
-    // per-row parallel loop below (each row is thread-exclusive, so no
-    // race once sized).
-    if (weights.value_scale_importance.size() < n_in)
-        weights.value_scale_importance.resize(n_in, value_type(0));
 
     // dc.empty() no longer means "nothing to do": block4 (below) may hold
     // live synapses even when the scattered CSR is empty (e.g. everything
@@ -90,91 +90,26 @@ void disldo_forward(
         const int tid = omp_get_thread_num();
         value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
 
-        // Per-thread local accumulators -- see update_importance_stats()'s
-        // THREAD SAFETY comment (delta_csr_types.hpp). Calling
-        // weights.update_importance_stats() directly from inside this
-        // parallel loop would race on the shared importance_l1/l2_sq/
-        // max_abs fields (a real bug found and fixed -- see conversation).
-        // Each thread sums locally here; one aggregate call per thread
-        // (not per synapse) after the loop applies the combined total.
-        double local_sum_abs_new = 0.0, local_sum_abs_old = 0.0;
-        double local_sum_sq_new  = 0.0, local_sum_sq_old  = 0.0;
-        value_type local_max_new = value_type(0);
-
         #pragma omp for schedule(static)
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n_row = L.row_nnz(r);
             if (n_row == 0) continue;
 
             auto cursor = dc.row_cursor(r);
-            const value_type imp_scale = weights.get_importance_scale(r);
             const value_type val_scale = weights.get_value_scale(r);
-            // value_scale's own forward importance signal: this row's
-            // total contribution to the output, same activity-correlation
-            // update as a per-synapse weight's, applied once per row
-            // (sum first) for the same reason value_scale's backward
-            // update sums first -- see disldo_backward.
-            double row_contrib_sum = 0.0;
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 const value_type  out_scale = weights.get_output_scale(col);
                 const value_type  w        = w_stored * val_scale * out_scale;   // -> true units
-                // Same row*col combination as the weight's own scale --
-                // a synapse's stored importance lives at the same (row,
-                // col) position as its stored weight, so its
-                // representability scale needs the same two factors.
-                const value_type  out_imp_scale   = weights.get_output_importance_scale(col);
-                const value_type  combined_imp_scale = imp_scale * out_imp_scale;
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
                     if (iv == value_type(0)) continue;
                     const value_type contrib = w * iv;
                     mo[static_cast<std::size_t>(b) * n_out + col] += contrib;
-                    row_contrib_sum += static_cast<double>(contrib);
-
-                    if (learning_rate != value_type(0)) {
-                        const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        value_type imp = stored_imp * combined_imp_scale;   // -> true units
-                        imp += contrib * learning_rate / (value_type(1) + std::abs(imp));
-                        ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, w_stored, imp / combined_imp_scale);
-                        // Read back the ACTUAL post-quantization stored value -- FP4BiPacked
-                        // rounds to the nearest FP4_TABLE entry, so it can differ from what
-                        // was just written. Stats must track what's really in the buffer.
-                        const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
-                        local_sum_abs_old += std::abs(static_cast<double>(stored_imp));
-                        local_sum_sq_new  += static_cast<double>(actual_stored) * actual_stored;
-                        local_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
-                        local_max_new = std::max(local_max_new, std::abs(actual_stored));
-                    }
                 }
-            }
-            if (learning_rate != value_type(0) && row_contrib_sum != 0.0) {
-                // Normalize by n_row -- same reasoning as backward's
-                // scale_eff_lr = lr/nnz_this_row: row_contrib_sum grows
-                // with fan-out (more synapses -> larger raw sum), and
-                // without this a wide row's importance would blow up
-                // and freeze value_scale's own backward step immediately.
-                const value_type avg_contrib = static_cast<value_type>(row_contrib_sum)
-                                              / static_cast<value_type>(n_row);
-                value_type vs_imp = weights.value_scale_importance[r];
-                vs_imp += avg_contrib * learning_rate / (value_type(1) + std::abs(vs_imp));
-                weights.value_scale_importance[r] = vs_imp;
-            }
-        }
-
-        // One aggregate call per THREAD (not per synapse) -- critical
-        // section cost is now O(num_cpus), not O(nnz).
-        if (learning_rate != value_type(0)) {
-            #pragma omp critical
-            {
-                weights.update_importance_stats_aggregate(
-                    local_sum_abs_new, local_sum_abs_old,
-                    local_sum_sq_new,  local_sum_sq_old,
-                    local_max_new);
             }
         }
     }
@@ -389,33 +324,10 @@ void disldo_forward(
         }
     }
 
-    // output_scale's forward importance: its own "contrib" is the final
-    // output value at that column (post fold reduction above), same
-    // activity-correlation formula as everything else. Only when
-    // output_scale is actually trainable (see output_scale_is_trainable);
-    // each column is independent, so this parallelizes trivially.
-    if (learning_rate != value_type(0) && weights.output_scale_is_trainable) {
-        if (weights.output_scale_importance.size() < n_out)
-            weights.output_scale_importance.resize(n_out, value_type(0));
-        #pragma omp parallel for num_threads(num_cpus) schedule(static)
-        for (std::size_t c = 0; c < n_out; ++c) {
-            const std::size_t deg = c < weights.out_degree.size()
-                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
-            if (deg == 0) continue;
-            double col_contrib_sum = 0.0;
-            for (SIZE_TYPE b = 0; b < batch; ++b)
-                col_contrib_sum += static_cast<double>(output[static_cast<std::size_t>(b) * n_out + c]);
-            if (col_contrib_sum == 0.0) continue;
-            // Normalize by out_degree[c] -- same reasoning as backward's
-            // col_eff_lr = lr/out_degree[c]: output[.,c] grows with
-            // fan-in (more rows feeding this column -> larger sum).
-            const value_type avg_contrib = static_cast<value_type>(col_contrib_sum)
-                                          / static_cast<value_type>(deg);
-            value_type os_imp = weights.output_scale_importance[c];
-            os_imp += avg_contrib * learning_rate / (value_type(1) + std::abs(os_imp));
-            weights.output_scale_importance[c] = os_imp;
-        }
-    }
+    // output_scale/value_scale importance are no longer touched here --
+    // see this function's own docstring: forward is pure now, importance
+    // updates only ever happen in disldo_backward, coupled to a real
+    // gradient.
 }
 
 // ── backward ─────────────────────────────────────────────────────────────────

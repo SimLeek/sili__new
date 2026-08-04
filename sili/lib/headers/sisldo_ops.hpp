@@ -186,12 +186,19 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
 }
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
+// No learning_rate parameter -- matches disldo_forward's own fix (see
+// linear_disldo.hpp's disldo_forward docstring for the full rationale):
+// this used to run a gradient-free Hebbian/activity-correlation
+// importance update whenever a nonzero learning_rate was passed,
+// unconditionally on whether a matching backward call would ever
+// follow. Real footgun, confirmed via direct tracing on the DISLDO
+// sibling -- REMOVED here too, not just disabled. Importance updates
+// only ever happen in a backward pass now, coupled to a real gradient.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void sisldo_forward(
     const CSRInput<SIZE_TYPE, typename ValueAccessor<VALUES_TYPE>::value_type>& input_tensor,
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     typename ValueAccessor<VALUES_TYPE>::value_type* output,
-    typename ValueAccessor<VALUES_TYPE>::value_type   learning_rate = 0.01f,
     const int    num_cpus = 4,
     typename ValueAccessor<VALUES_TYPE>::value_type* original_contributions_output = nullptr)
 {
@@ -232,13 +239,6 @@ void sisldo_forward(
         value_type* thread_contrib = original_contributions_output
             ? all_contributions.data() + static_cast<std::size_t>(tid) * num_inputs
             : nullptr;
-
-        // Per-thread local accumulators, persisting across all batches --
-        // see disldo_forward's THREAD SAFETY comment. Aggregated once,
-        // after the batch loop below, not per synapse.
-        double local_sum_abs_new = 0.0, local_sum_abs_old = 0.0;
-        double local_sum_sq_new  = 0.0, local_sum_sq_old  = 0.0;
-        value_type local_max_new = value_type(0);
 
         for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
             const SIZE_TYPE batch_start  = (*input_tensor.ptrs[0])[batch];
@@ -304,38 +304,12 @@ void sisldo_forward(
                     const value_type  wval      = wval_stored * combined_scale;   // -> true units
                     const value_type  contrib   = wval * in_val;
 
-                    if (learning_rate != 0) {
-                        const value_type imp_scale  = weights.get_importance_scale(in_idx);
-                        const value_type out_imp_scale = weights.get_output_importance_scale(out_idx);
-                        const value_type combined_imp_scale = imp_scale * out_imp_scale;
-                        const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
-                        value_type cur_imp = stored_imp * combined_imp_scale;   // -> true units
-                        cur_imp += contrib * learning_rate / (value_type(1) + std::abs(cur_imp));
-                        ValueAccessor<VALUES_TYPE>::set(dc.values, wptr, wval_stored, cur_imp / combined_imp_scale);
-                        // Read back post-quantization actual -- see disldo_forward's comment.
-                        const value_type actual_stored = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, wptr);
-                        local_sum_abs_new += std::abs(static_cast<double>(actual_stored));
-                        local_sum_abs_old += std::abs(static_cast<double>(stored_imp));
-                        local_sum_sq_new  += static_cast<double>(actual_stored) * actual_stored;
-                        local_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
-                        local_max_new = std::max(local_max_new, std::abs(actual_stored));
-                    }
-
                     thread_output[batch_offset + out_idx] += contrib;
                     if (thread_contrib)
                         thread_contrib[in_idx] += in_val * wval;
                 }
             }
             #pragma omp barrier
-        }
-
-        if (learning_rate != 0) {
-            #pragma omp critical
-            {
-                weights.update_importance_stats_aggregate(
-                    local_sum_abs_new, local_sum_abs_old,
-                    local_sum_sq_new,  local_sum_sq_old, local_max_new);
-            }
         }
 
         for (int stride = 1; stride < nthreads; stride <<= 1) {

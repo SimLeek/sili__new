@@ -121,23 +121,22 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
     return gen_coo;
 }
 
-///Sparse matmul of @p weights and @p input_tensor; accumulates forward contributions
-///into connection strength scaled by @p learning_rate.
-// BUG FIX (see conversation): was `const WEIGHTS_T&` but conditionally mutates
-// conn_str[wptr] (activity-correlation importance update) when learning_rate != 0 -- same
-// pattern already found and fixed in sisldo_forward (sparse_struct.hpp)
-// this session. This one "worked" only by accident for SparseLinearWeightsV
-// (TriValues, shared_ptr<vector> indirection -- const doesn't propagate
-// through the pointee) and genuinely fails for SparseLinearWeights
-// (FP4BiPacked as a direct, non-indirected member -- const DOES propagate).
-template <typename WEIGHTS_T, 
+///Sparse matmul of @p weights and @p input_tensor.
+// No learning_rate parameter -- matches disldo_forward's own fix (see
+// linear_disldo.hpp): this used to run a gradient-free Hebbian/activity
+// -correlation importance update (conn_str[wptr] +=...) whenever a
+// nonzero learning_rate was passed, unconditionally on whether a
+// matching backward call would ever follow. Real footgun, confirmed via
+// direct tracing on the DISLDO sibling -- REMOVED here too. Importance
+// updates only ever happen in a backward pass now, coupled to a real
+// gradient.
+template <typename WEIGHTS_T,
           typename VALUE_TYPE = typename WEIGHTS_T::value_type,
           typename SIZE_TYPE  = typename WEIGHTS_T::size_type>
 void sisldo_forward_trivalues(
     const CSRInput<SIZE_TYPE, VALUE_TYPE>& input_tensor,
-    WEIGHTS_T& weights,
+    const WEIGHTS_T& weights,
     VALUE_TYPE* output,
-    VALUE_TYPE learning_rate = 0.01,
     const int num_cpus = 4,
     VALUE_TYPE* original_contributions_output = nullptr)
 {
@@ -150,7 +149,6 @@ void sisldo_forward_trivalues(
     const auto& conn_ptrs    = *weights.connections.ptrs[0];
     const auto& conn_indices = *weights.connections.indices[0];
     const auto& conn_val    = *weights.connections.values[0];
-    auto&       conn_str    = *weights.connections.values[1];
 
     std::vector<VALUE_TYPE> all_outputs((size_t)num_cpus * num_outputs, VALUE_TYPE(0));
     std::vector<VALUE_TYPE> all_contributions(
@@ -205,8 +203,6 @@ void sisldo_forward_trivalues(
                     const VALUE_TYPE wval    = conn_val[wptr];
                     const SIZE_TYPE  out_idx = conn_indices[wptr];
                     const VALUE_TYPE contrib = wval * in_val;
-
-                    if (learning_rate!=0) conn_str[wptr] += contrib * learning_rate / (VALUE_TYPE(1) + std::abs(conn_str[wptr]));
 
                     thread_output[batch_offset + out_idx] += contrib;
 
