@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
+#include "fp8quant.hpp"
 // block4.hpp is included further down (right before SparseLinearWeightsDelta,
 // the only thing here that needs Block4Store's full definition) -- Block4Store
 // itself now reuses DeltaCSRLayout/DeltaCSRRowCursor (defined below), so
@@ -272,6 +273,46 @@ struct ValueAccessor<FP4BiPacked> {
     }
 };
 
+/// Trait to handle FP8BiValues -- one full byte per value (weight,
+/// importance separately), OCP MX E4M3 codec (fp8quant.hpp). Same shape
+/// as ValueAccessor<DeltaCSRBiValues<T>> below, only value_type stays
+/// the DECODED float (matching ValueAccessor<FP4BiPacked>'s convention,
+/// not DeltaCSRBiValues<T>'s raw-passthrough one) since the byte array
+/// itself holds an encoded code, not a usable float directly.
+template <>
+struct ValueAccessor<FP8BiValues> {
+    using value_type = float;
+    static value_type get_w(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.weights[i]); }
+    static value_type get_imp(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.importance[i]); }
+    static void set(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize(w);
+        v.importance[i] = fp8_quantize(imp);
+    }
+    /// Gradient-driven update only -- see fp8_quantize_stochastic()'s
+    /// own docstring (fp8quant.hpp) for why this is separate from set().
+    static void set_stochastic(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_stochastic(w);
+        v.importance[i] = fp8_quantize_stochastic(imp);
+    }
+    static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) {
+        v.weights.resize(n, fp8_quantize(val));
+        v.importance.resize(n, fp8_quantize(imp));
+    }
+    static void move(FP8BiValues& v, std::size_t dest, std::size_t src, std::size_t count) {
+        if (count == 0) return;
+        std::memmove(v.weights.data() + dest, v.weights.data() + src, count);
+        std::memmove(v.importance.data() + dest, v.importance.data() + src, count);
+    }
+    static void reserve(FP8BiValues& v, std::size_t n) {
+        v.weights.reserve(n);
+        v.importance.reserve(n);
+    }
+
+    static std::size_t projected_byte_size(std::size_t n) {
+        return n * 2;  // 1 byte weight + 1 byte importance per element
+    }
+};
+
 /// Fallback standard vector equivalent for floats (e.g. CSRSynapsesV uses)
 template <typename T>
 struct DeltaCSRBiValues {
@@ -441,10 +482,24 @@ struct DeltaCSRWeights {
 
 // ── SparseLinearWeightsDelta ─────────────────────────────────────────────────
 
+// Selects which Block4Store variant SparseLinearWeightsDelta.block4 (below)
+// uses, keyed on VALUES_TYPE -- default (Block4Store, the FP4-1-byte-per
+// -slot dense-tile layout) matches every existing instantiation's exact
+// prior behavior unchanged; only FP8BiValues gets Block4Store8 (2 bytes/
+// slot, fp8quant.hpp's E4M3 codec -- see block4.hpp's own comment on why
+// this needed a fully separate store, not a template-parameter retrofit
+// of Block4Store itself). A pure additive trait, not a modification to
+// either existing type.
+template <typename VALUES_TYPE>
+struct Block4StoreFor { using type = Block4Store; };
+template <>
+struct Block4StoreFor<FP8BiValues> { using type = Block4Store8; };
+
 template <class SIZE_TYPE, class VALUES_TYPE = FP4BiPacked, class COL_TYPE = uint32_t>
 struct SparseLinearWeightsDelta {
     using size_type  = SIZE_TYPE;
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    using block4_type = typename Block4StoreFor<VALUES_TYPE>::type;
 
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
@@ -456,7 +511,11 @@ struct SparseLinearWeightsDelta {
     // lossless byte copy, not a requantization. Promotion/demotion logic
     // lives in delta_csr_memory.hpp (needs delta_csr_row_insert_col/
     // _remove_col, which would be a circular include from here).
-    Block4Store block4;
+    //
+    // Type selected via Block4StoreFor<VALUES_TYPE> (above) -- Block4Store
+    // for every existing VALUES_TYPE (FP4BiPacked, DeltaCSRBiValues<T>,
+    // unchanged), Block4Store8 for FP8BiValues.
+    block4_type block4;
 
     // Per-ROW scale applied to STORED importance to get TRUE units before
     // any importance arithmetic (the activity-correlation `1+|imp|` denominator, the

@@ -136,8 +136,8 @@ void delta_csr_combined_to_absolute(
     const auto& dc = weights.connections;
     const auto& L  = dc.layout;
 
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-        // block4 is FP4-specific (see block4.hpp) -- always empty otherwise.
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+        // block4 is FP4/FP8-specific (see block4.hpp) -- always empty otherwise.
         delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
             dc, out_ptrs, out_indices, out_weights, out_importance);
         return;
@@ -175,14 +175,27 @@ void delta_csr_combined_to_absolute(
                     const uint32_t bc = bc_cursor.advance();
                     // const: read-only export path
                     const auto tile = weights.block4.find(br, bc);
-                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                        const uint8_t byte = tile.at(li, lj);
-			// we consider weight==0 & importance==0 as empty
-                        if (byte == 0) continue;                       
-			const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                        if (col >= L.cols) continue;
-                        row_entries.push_back({
-                            COL_TYPE(col), FP4_TABLE[byte & 0xFu], FP4_TABLE[(byte >> 4) & 0xFu]});
+                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const uint8_t w_byte   = tile.at_weight(li, lj);
+                            const uint8_t imp_byte = tile.at_importance(li, lj);
+                            // we consider weight==0 & importance==0 as empty
+                            if (w_byte == 0 && imp_byte == 0) continue;
+                            const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                            if (col >= L.cols) continue;
+                            row_entries.push_back({
+                                COL_TYPE(col), fp8_decode_bits(w_byte), fp8_decode_bits(imp_byte)});
+                        }
+                    } else {
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const uint8_t byte = tile.at(li, lj);
+                            // we consider weight==0 & importance==0 as empty
+                            if (byte == 0) continue;
+                            const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                            if (col >= L.cols) continue;
+                            row_entries.push_back({
+                                COL_TYPE(col), FP4_TABLE[byte & 0xFu], FP4_TABLE[(byte >> 4) & 0xFu]});
+                        }
                     }
                 }
             }
@@ -581,18 +594,30 @@ void block4_maybe_promote(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     std::size_t row, COL_TYPE col)
 {
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-        (void)weights; (void)row; (void)col; // block4 is FP4-specific.
+    constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
+    constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
+    if constexpr (!is_fp4 && !is_fp8) {
+        (void)weights; (void)row; (void)col; // block4 is FP4/FP8-specific.
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
         auto& L  = dc.layout;
-        // Lazy self-init
+        // Lazy self-init. Tile-count budget identical for both formats
+        // (max_values_bytes synapses at max fill of BLOCK4_TILE_SLOTS=16/
+        // tile); byte budget differs (BLOCK4_TILE_SLOTS8_BYTES=32/tile for
+        // FP8 vs BLOCK4_TILE_SLOTS=16 for FP4, matching
+        // SparseLinearLayer8's own identical constructor-time sizing).
 	if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
-            weights.block4.set_limits(
-                dc.max_indices_bytes,
-                std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
+            if constexpr (is_fp8) {
+                weights.block4.set_limits(
+                    dc.max_indices_bytes,
+                    std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS8_BYTES);
+            } else {
+                weights.block4.set_limits(
+                    dc.max_indices_bytes,
+                    std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
+            }
         }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
         const uint32_t bc = uint32_t(col / BLOCK4_TILE);
@@ -610,8 +635,13 @@ void block4_maybe_promote(
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     {
                         auto tile = weights.block4.find(br, bc);
-                        tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
-                    } 
+                        if constexpr (is_fp8) {
+                            tile.at_weight(li, lj)     = fp8_quantize(w);
+                            tile.at_importance(li, lj) = fp8_quantize(imp);
+                        } else {
+                            tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                        }
+                    }
 		    weights.block4.maybe_compress(br, bc);
                     delta_csr_row_remove_col(dc, row, col);
                     return;
@@ -646,7 +676,12 @@ void block4_maybe_promote(
                 const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
                 const uint32_t fli = uint32_t(f.row - row_lo);
                 const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
-                tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                if constexpr (is_fp8) {
+                    tile.at_weight(fli, flj)     = fp8_quantize(w);
+                    tile.at_importance(fli, flj) = fp8_quantize(imp);
+                } else {
+                    tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
+                }
             }
         }
 	weights.block4.maybe_compress(br, bc);
@@ -663,7 +698,8 @@ void block4_demote_tile(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     uint32_t br, uint32_t bc)
 {
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !is_fp8) {
         (void)weights; (void)br; (void)bc;
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
@@ -678,14 +714,21 @@ void block4_demote_tile(
                 const std::size_t row = row_lo + li;
                 if (row >= L.rows) continue;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    const uint8_t byte  = tile.at(li, lj);
-                    if (byte == 0) continue;
-                    const uint8_t wcode = byte & 0xFu;
+                    value_type w, imp;
+                    if constexpr (is_fp8) {
+                        const uint8_t w_byte   = tile.at_weight(li, lj);
+                        const uint8_t imp_byte = tile.at_importance(li, lj);
+                        if (w_byte == 0 && imp_byte == 0) continue;
+                        w   = fp8_decode_bits(w_byte);
+                        imp = fp8_decode_bits(imp_byte);
+                    } else {
+                        const uint8_t byte = tile.at(li, lj);
+                        if (byte == 0) continue;
+                        w   = FP4_TABLE[byte & 0xFu];
+                        imp = FP4_TABLE[(byte >> 4) & 0xFu];
+                    }
                     const std::size_t col = col_lo + lj;
                     if (col >= L.cols) continue;
-                    const uint8_t impcode = (byte >> 4) & 0xFu;
-                    const value_type w   = FP4_TABLE[wcode];
-                    const value_type imp = FP4_TABLE[impcode];
                     if (!delta_csr_row_insert_col(dc, row, COL_TYPE(col), w, imp)) {
                         throw std::runtime_error(
                             "block4_demote_tile: row " + std::to_string(row) +
@@ -696,7 +739,7 @@ void block4_demote_tile(
                     }
                 }
             }
-        } 
+        }
 	weights.block4.erase(br, bc);
     }
 }
@@ -728,6 +771,9 @@ bool delta_csr_synap_row_step(
     SIZE_TYPE max_row_weights)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
+    constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
+    constexpr bool has_block4 = is_fp4 || is_fp8;
     auto& dc = weights.connections;
     auto& L  = dc.layout;
     if (L.rows == 0) return false;
@@ -741,7 +787,7 @@ bool delta_csr_synap_row_step(
     const uint32_t br = uint32_t(row / BLOCK4_TILE);
     const uint32_t li = uint32_t(row % BLOCK4_TILE);
     std::vector<uint32_t> b4_bc, b4_lj;
-    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    if constexpr (has_block4) {
         if (br < weights.block4.block_layout.rows) {
             const auto& BL = weights.block4.block_layout;
             const std::size_t n_bc = BL.row_nnz(br);
@@ -751,7 +797,11 @@ bool delta_csr_synap_row_step(
                 // const: read-only discovery scan
 		const auto tile = weights.block4.find(br, bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                    if (tile.at(li, lj) == 0) continue;
+                    if constexpr (is_fp8) {
+                        if (tile.at_weight(li, lj) == 0 && tile.at_importance(li, lj) == 0) continue;
+                    } else {
+                        if (tile.at(li, lj) == 0) continue;
+                    }
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                     if (col >= L.cols) continue;
                     b4_bc.push_back(bc);
@@ -777,15 +827,20 @@ bool delta_csr_synap_row_step(
                 dc.values, L.elem_start[row] + k);
         }
     }
-    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    if constexpr (has_block4) {
         for (std::size_t j = 0; j < b4_bc.size(); ++j) {
             const std::size_t k = n_scattered + j;
             const uint32_t bc = b4_bc[j], lj = b4_lj[j];
             auto tile = weights.block4.find(br, bc);
-            const uint8_t byte = tile.at(li, lj);
             exist_cols[k]  = COL_TYPE(std::size_t(bc) * BLOCK4_TILE + lj);
-            exist_w[k]     = FP4_TABLE[byte & 0xFu];
-            exist_imp[k]   = FP4_TABLE[(byte >> 4) & 0xFu];
+            if constexpr (is_fp8) {
+                exist_w[k]   = fp8_decode_bits(tile.at_weight(li, lj));
+                exist_imp[k] = fp8_decode_bits(tile.at_importance(li, lj));
+            } else {
+                const uint8_t byte = tile.at(li, lj);
+                exist_w[k]   = FP4_TABLE[byte & 0xFu];
+                exist_imp[k] = FP4_TABLE[(byte >> 4) & 0xFu];
+            }
             exist_is_b4[k] = true;
         }
     }
@@ -865,17 +920,25 @@ bool delta_csr_synap_row_step(
     // Step 5: Apply removes (in-place, high-col first)
     for (const auto& re : to_remove) {
         if (re.is_b4) {
-            if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+            if constexpr (has_block4) {
                 const uint32_t bc = uint32_t(re.col) / BLOCK4_TILE;
                 const uint32_t lj = uint32_t(re.col) % BLOCK4_TILE;
                 bool should_demote = false;
                 {
                     auto tile = weights.block4.find(br, bc);
-                    if (tile && tile.at(li, lj) != 0) {
-                        tile.at(li, lj) = 0;
-                        should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
+                    if constexpr (is_fp8) {
+                        if (tile && (tile.at_weight(li, lj) != 0 || tile.at_importance(li, lj) != 0)) {
+                            tile.at_weight(li, lj)     = 0;
+                            tile.at_importance(li, lj) = 0;
+                            should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
+                        }
+                    } else {
+                        if (tile && tile.at(li, lj) != 0) {
+                            tile.at(li, lj) = 0;
+                            should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
+                        }
                     }
-                } 
+                }
 		if (should_demote)
                     block4_demote_tile(weights, br, bc);
             }
@@ -904,7 +967,7 @@ bool delta_csr_synap_row_step(
         }
         if (!weights.out_degree.empty())
             ++weights.out_degree[col];
-        if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>)
+        if constexpr (has_block4)
             block4_maybe_promote(weights, row, col);
     }
 

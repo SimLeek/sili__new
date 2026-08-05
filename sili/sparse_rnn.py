@@ -408,6 +408,56 @@ class DISLDOLayer32(_SparseLayerBase):
         return out
 
 
+class DISLDOLayer8(_SparseLayerBase):
+    """Same disldo_forward/disldo_backward kernels as DISLDOLayer/
+    DISLDOLayer32, generic over VALUES_TYPE -- this instantiation uses
+    real 8-bit storage (_cpu.SparseLinearLayer8, OCP MX E4M3 per-value
+    codec, fp8quant.hpp) instead of FP4BiPacked or the 32-bit float
+    fallback. Same call convention as DISLDOLayer/DISLDOLayer32
+    (forward(x, learning_rate, lr_per_row_nnz, damp_by_importance)).
+
+    Combined with the existing per-row `value_scale`/per-col
+    `output_scale` (rank-1) mechanism already shared by every
+    DISLDOLayer-family class, this is the concrete "8-bit + rank-1
+    scale, weight AND importance both quantized" scheme validated in
+    sili_peridot's toy-model quantization sweep (three task families,
+    ten configs, never lost to native FP4) -- see sili_peridot's
+    JOURNAL.md for the full writeup this class is built from.
+
+    SCOPE, current: scattered CSR path only, same as DISLDOLayer32 --
+    no block4 dense-tile SIMD promotion yet (real follow-up, not a
+    template swap: block4.hpp's tile storage is hardcoded to FP4's
+    1-byte nibble-packed layout, E4M3 needs 2 full bytes/slot)."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+                damp_by_importance: bool = True) -> Tensor:
+        if not isinstance(x, Tensor):
+            x = Tensor(np.asarray(x, dtype=np.float32))
+        x_np   = np.asarray(x.data, dtype=np.float32)
+        was_1d = x_np.ndim == 1
+        out_np = self._c.forward(x_np)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        out = Tensor(out_np, _children=(x,), _op="disldo8", backend=x.backend)
+
+        def _bwd():
+            if out.grad is not None:
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                       damp_by_importance=damp_by_importance)
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
+
+        out._backward = _bwd
+        return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SISLDOLayer — Sparse Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
