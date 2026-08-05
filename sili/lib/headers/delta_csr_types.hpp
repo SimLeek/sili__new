@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <vector>
 #include "fp4quant.hpp"
+#include "fp8quant.hpp"
 // block4.hpp is included further down (right before SparseLinearWeightsDelta,
 // the only thing here that needs Block4Store's full definition) -- Block4Store
 // itself now reuses DeltaCSRLayout/DeltaCSRRowCursor (defined below), so
@@ -269,6 +270,46 @@ struct ValueAccessor<FP4BiPacked> {
 
     static std::size_t projected_byte_size(std::size_t n) {
         return n; 
+    }
+};
+
+/// Trait to handle FP8BiValues -- one full byte per value (weight,
+/// importance separately), OCP MX E4M3 codec (fp8quant.hpp). Same shape
+/// as ValueAccessor<DeltaCSRBiValues<T>> below, only value_type stays
+/// the DECODED float (matching ValueAccessor<FP4BiPacked>'s convention,
+/// not DeltaCSRBiValues<T>'s raw-passthrough one) since the byte array
+/// itself holds an encoded code, not a usable float directly.
+template <>
+struct ValueAccessor<FP8BiValues> {
+    using value_type = float;
+    static value_type get_w(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.weights[i]); }
+    static value_type get_imp(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.importance[i]); }
+    static void set(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize(w);
+        v.importance[i] = fp8_quantize(imp);
+    }
+    /// Gradient-driven update only -- see fp8_quantize_stochastic()'s
+    /// own docstring (fp8quant.hpp) for why this is separate from set().
+    static void set_stochastic(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_stochastic(w);
+        v.importance[i] = fp8_quantize_stochastic(imp);
+    }
+    static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) {
+        v.weights.resize(n, fp8_quantize(val));
+        v.importance.resize(n, fp8_quantize(imp));
+    }
+    static void move(FP8BiValues& v, std::size_t dest, std::size_t src, std::size_t count) {
+        if (count == 0) return;
+        std::memmove(v.weights.data() + dest, v.weights.data() + src, count);
+        std::memmove(v.importance.data() + dest, v.importance.data() + src, count);
+    }
+    static void reserve(FP8BiValues& v, std::size_t n) {
+        v.weights.reserve(n);
+        v.importance.reserve(n);
+    }
+
+    static std::size_t projected_byte_size(std::size_t n) {
+        return n * 2;  // 1 byte weight + 1 byte importance per element
     }
 };
 

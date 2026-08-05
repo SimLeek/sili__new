@@ -1,5 +1,6 @@
 #pragma once
 #include "fp4quant.hpp"
+#include "fp8quant.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -176,6 +177,88 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
     // sign is bit 31 (0x80000000) or 0; >>28 moves it to bit 3 (0x8 or 0),
     const Block4VecU sign_bit = sign >> 28;
     return (sign_bit | mag_code) & ~zero_mag_mask;
+}
+
+// 4-wide fp8_decode_bits (fp8quant.hpp) -- decodes 4 E4M3 codes in one
+// shot. Fast path handles the common normal-code case via the same
+// field-placement bit trick as block4_vec_decode_fp4; the rare
+// subnormal/NaN-slot lanes (no single shared exponent bracket to
+// exploit, same reason fp8_decode_bits' own scalar version branches
+// there) are corrected via the exact scalar reference per-lane, matching
+// this file's own established precedent (block4_sparse_get_pos/
+// block4_sparse_set_pos's comment: "every SIMD optimization we tried
+// here was slower than these scalar versions") rather than forcing a
+// full 8-way vectorized subnormal blend for a path block4-promoted
+// tiles rarely hit (promotion favours the more-important, less-often-
+// near-zero synapses in the first place).
+inline Block4Vec block4_vec_decode_fp8(Block4VecU codes) {
+    const Block4VecU one_u = block4_vecu_broadcast(1u);
+    const Block4VecU s = (codes >> 7) & one_u;
+    const Block4VecU e = (codes >> 3) & block4_vecu_broadcast(0xFu);
+    const Block4VecU m = codes & block4_vecu_broadcast(7u);
+
+    const Block4VecU bits_normal =
+        (s << 31) | ((e + block4_vecu_broadcast(120u)) << 23) | (m << 20);
+
+    Block4Vec result;
+    std::memcpy(&result, &bits_normal, sizeof(result));
+
+    uint32_t codes_arr[SILI_BLOCK4_TILE_SIZE];
+    std::memcpy(codes_arr, &codes, sizeof(codes_arr));
+    float result_arr[SILI_BLOCK4_TILE_SIZE];
+    std::memcpy(result_arr, &result, sizeof(result_arr));
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        const uint32_t e_i = (codes_arr[i] >> 3) & 0xFu;
+        const uint32_t m_i = codes_arr[i] & 0x7u;
+        if (e_i == 0u || (e_i == 15u && m_i == 7u))
+            result_arr[i] = fp8_decode_bits(uint8_t(codes_arr[i]));
+    }
+    std::memcpy(&result, result_arr, sizeof(result));
+    return result;
+}
+
+// 4-wide fp8_quantize_stochastic (fp8quant.hpp) -- same split as
+// block4_vec_decode_fp8 above: the common normal-range case uses the
+// exact same dithered-carry technique as block4_vec_quantize_stochastic_fp4
+// (just E4M3's bit widths), rare subnormal/saturating/NaN lanes fall
+// back to the scalar reference.
+inline Block4VecU block4_vec_quantize_stochastic_fp8(Block4Vec v) {
+    Block4VecU bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const Block4VecU sign  = bits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU abits = bits & block4_vecu_broadcast(0x7FFFFFFFu);
+
+    const uint64_t r0 = fp4_stochastic_next_u64();
+    const uint64_t r1 = fp4_stochastic_next_u64();
+    const uint64_t r2 = fp4_stochastic_next_u64();
+    const uint64_t r3 = fp4_stochastic_next_u64();
+    const Block4VecU dither20 = {uint32_t(r0 & 0xFFFFFu), uint32_t(r1 & 0xFFFFFu),
+                                  uint32_t(r2 & 0xFFFFFu), uint32_t(r3 & 0xFFFFFu)};
+
+    Block4VecU rounded = abits + dither20;
+    const Block4VecU nan_slot_u = block4_vecu_broadcast(FP8_NAN_SLOT_BITS);
+    const Block4VecU over_mask = (rounded >= nan_slot_u);
+    rounded = (rounded & ~over_mask) | (block4_vecu_broadcast(FP8_MAX_BITS) & over_mask);
+    const Block4VecU exp_field = (rounded >> 23) & block4_vecu_broadcast(0xFFu);
+    const Block4VecU m3        = (rounded >> 20) & block4_vecu_broadcast(0x7u);
+    const Block4VecU e4        = exp_field - block4_vecu_broadcast(120u);
+    const Block4VecU sign_bit  = sign >> 24;  // bit31 -> bit7
+    Block4VecU result = sign_bit | (e4 << 3) | m3;
+
+    uint32_t bits_arr[SILI_BLOCK4_TILE_SIZE];
+    std::memcpy(bits_arr, &bits, sizeof(bits_arr));
+    uint32_t result_arr[SILI_BLOCK4_TILE_SIZE];
+    std::memcpy(result_arr, &result, sizeof(result_arr));
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        float vi;
+        std::memcpy(&vi, &bits_arr[i], sizeof(vi));
+        const uint32_t ab = bits_arr[i] & 0x7FFFFFFFu;
+        if (ab < FP8_MIN_NORMAL_BITS || ab >= FP8_NAN_SLOT_BITS || ab > 0x7F800000u)
+            result_arr[i] = fp8_quantize_stochastic(vi);
+    }
+    Block4VecU final_result;
+    std::memcpy(&final_result, result_arr, sizeof(final_result));
+    return final_result;
 }
 
 // One dense tile: 16 bytes, (4-bit importance<<4|4-bit weight) per slot,

@@ -987,6 +987,203 @@ public:
     }
 };
 
+// ── SparseLinearLayer8 ──────────────────────────────────────────────────────
+// FP8 (OCP MX E4M3, fp8quant.hpp) real quantized storage -- the "alt, not
+// replace" FP8 sibling to SparseLinearLayer's production FP4, requested
+// after sili_peridot's toy-model quantization sweep validated 8-bit +
+// rank-1 scale (weight AND importance both quantized) as consistently,
+// substantially better than native FP4 across three task families (see
+// sili_peridot's JOURNAL.md). Same disldo_forward/disldo_backward/
+// build_probes/synap_row_step functions as SparseLinearLayer/DISLDOLayerV,
+// generic via ValueAccessor<FP8BiValues> -- no separate kernel needed for
+// the scattered path.
+//
+// SCOPE, stated plainly rather than silently: this class currently covers
+// the SCATTERED path only, matching DISLDOLayerV's own scope exactly
+// (weights.block4 stays default-constructed/empty -- never initialized,
+// so disldo_forward/disldo_backward's `if (weights.block4.n_tiles() > 0)`
+// guards never fire and block4's FP4-specific decode path is never
+// touched). Full block4 promotion support (matching SparseLinearLayer's
+// combined scattered+dense-tile-SIMD feature parity, per direct
+// instruction) is real, substantial follow-up work -- Block4Tile/
+// Block4TileHandle's dense-tile storage and accessor API are hardcoded
+// to FP4's 1-byte nibble-packed (weight,importance) layout throughout
+// (confirmed by reading block4.hpp's Block4TileHandle::at()/tile_data
+// indexing directly), and E4M3 needs 2 full bytes/slot -- a real
+// structural addition to block4.hpp (new Block4Tile8/Block4Store8 types)
+// plus new FP8-dispatch branches inside disldo_forward/disldo_backward's
+// existing block4 code sections, not a template-parameter swap. Not
+// started here; this class's own docstring/PR should be updated when
+// that lands rather than silently claiming feature parity it doesn't
+// have yet.
+class SparseLinearLayer8 {
+public:
+    using S = int;
+    using V = float;
+    using COL_TYPE = uint32_t;
+    using VT = FP8BiValues;
+
+    SparseLinearWeightsDelta<S, VT, COL_TYPE> weights;
+    std::vector<V>            neuron_input_accum;
+    std::vector<V>            neuron_grad_accum;
+    std::vector<V>            output_buf;
+    int                       num_cpus;
+
+    std::vector<V> _last_input;
+    S              _last_batch = 0;
+    S              _last_cols  = 0;
+    std::size_t    _idx_budget_bytes = 4096;
+    std::size_t    _val_budget_nnz   = 64;
+
+    SparseLinearLayer8(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+        : num_cpus(cpus),
+          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
+    {
+        std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
+        std::vector<S> empty_idx;
+        std::vector<V> empty_w, empty_imp;
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
+            empty_ptrs, empty_idx, empty_w, empty_imp,
+            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            static_cast<std::size_t>(max_weights) + 64);
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.recompute_stats();
+        weights.probes.rows = n_inputs;
+        weights.probes.cols = n_outputs;
+        neuron_input_accum.assign(n_inputs,  V(0));
+        neuron_grad_accum .assign(n_outputs, V(0));
+        weights.out_degree.assign(n_outputs, S(0));
+    }
+
+    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
+    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    Block4View block4() { return Block4View(weights.block4); }
+
+    // Per-ROW/per-COLUMN (rank-1) scale -- true_w = stored_w *
+    // value_scale[row] * output_scale[col], SAME mechanism SparseLinearLayer
+    // (FP4) already uses (SparseLinearWeightsDelta's value_scale/
+    // output_scale members are VALUES_TYPE-agnostic, not FP4-specific --
+    // checked directly in delta_csr_types.hpp before exposing these here).
+    // This is the concrete "rank-1 scale" half of the "8-bit + rank-1,
+    // weight+importance quantized" scheme validated in sili_peridot's
+    // toy-model sweep -- output_scale only becomes gradient-trainable in
+    // backward() once set_output_scale_raw has been called at least once
+    // (see SparseLinearLayer's own identical set_output_scale_raw docstring).
+    V get_value_scale(S row)  const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
+    V get_output_scale(S col) const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
+    void set_value_scale_raw(S row, V scale)  { weights.set_value_scale_raw(static_cast<std::size_t>(row), scale); }
+    void set_output_scale_raw(S col, V scale) { weights.set_output_scale_raw(static_cast<std::size_t>(col), scale); }
+
+    py::array_t<V> forward(py::array_t<V> x) {
+        auto xbuf     = x.request();
+        _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+
+        const V* src  = (V*)xbuf.ptr;
+        _last_input.assign(src, src + _last_batch * _last_cols);
+
+        output_buf.assign(_last_batch * n_outputs(), V(0));
+        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
+                       output_buf.data(), num_cpus);
+
+        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
+    }
+
+    py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        auto dybuf = dy.request();
+        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        disldo_backward<S, VT, COL_TYPE>(
+            _last_input.data(), _last_batch, _last_cols,
+            (V*)dybuf.ptr, weights,
+            dx.data(),
+            neuron_input_accum.data(), neuron_grad_accum.data(),
+            learning_rate,
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    void build_probes(S k, bool per_row = false) {
+        delta_csr_build_probes<S, VT, COL_TYPE>(
+            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
+    }
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
+        std::size_t row = static_cast<std::size_t>(current_row);
+        return delta_csr_synap_row_step<S, VT, COL_TYPE>(
+            weights, row, importance_cutoff, max_row_weights);
+    }
+    void zero_accum() {
+        std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
+        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+    }
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
+                      py::array_t<V> vals,  py::array_t<V> imp) {
+        auto pb=ptrs.request(), ib=indices.request(),
+             vb=vals.request(), impb=imp.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
+        std::vector<S> idx((S*)ib.ptr, (S*)ib.ptr + ib.size);
+        std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
+        std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
+        const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
+        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
+            p, idx, w, imp_v, rows, cols, idx_budget, val_budget);
+        _idx_budget_bytes = idx_budget;
+        _val_budget_nnz   = val_budget;
+        weights.connections.set_limits(
+            _idx_budget_bytes,
+            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.recompute_stats();
+    }
+
+    // ── Zero-copy numpy views ────────────────────────────────────────────────
+    py::array_t<V> get_neuron_input_accum() {
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
+                              neuron_input_accum.data(), py::cast(this)); }
+    py::array_t<V> get_neuron_grad_accum() {
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
+                              neuron_grad_accum.data(), py::cast(this)); }
+    py::array_t<V> get_weights_vals() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)ow.size());
+        std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
+        return result;
+    }
+    py::array_t<V> get_importance() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
+        py::array_t<V> result((py::ssize_t)oimp.size());
+        std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
+        return result;
+    }
+    py::array_t<S> get_indices() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)oi.size());
+        std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
+        return result;
+    }
+    py::array_t<S> get_ptrs() {
+        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
+        py::array_t<S> result((py::ssize_t)op.size());
+        std::copy(op.begin(), op.end(), (S*)result.request().ptr);
+        return result;
+    }
+};
+
 PYBIND11_MODULE(_cpu, m)
 {
     // ── Block4View ────────────────────────────────────────────────────────────
@@ -1257,6 +1454,61 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
         .def_property_readonly("block4",    &DISLDOLayerV::block4, py::keep_alive<0, 1>());
+
+    // ── SparseLinearLayer8 ───────────────────────────────────────────────────
+    py::class_<SparseLinearLayer8>(m, "SparseLinearLayer8")
+        .def(py::init<int, int, int, int>(),
+             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
+             py::arg("num_cpus") = 4)
+        .def("forward",              &SparseLinearLayer8::forward,
+             py::arg("x"))
+        .def("backward",             &SparseLinearLayer8::backward,
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+        .def("build_probes",         &SparseLinearLayer8::build_probes,
+             py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum",           &SparseLinearLayer8::zero_accum)
+        .def_property_readonly("neuron_input_accum", &SparseLinearLayer8::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",       &SparseLinearLayer8::get_weights_vals)
+        .def_property_readonly("importance",         &SparseLinearLayer8::get_importance)
+        .def_property_readonly("indices",            &SparseLinearLayer8::get_indices)
+        .def_property_readonly("ptrs",               &SparseLinearLayer8::get_ptrs)
+        .def("load_weights",        &SparseLinearLayer8::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("get_value_scale",      &SparseLinearLayer8::get_value_scale,
+             py::arg("row"),
+             "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
+             "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
+             "mechanism SparseLinearLayer (FP4) uses.")
+        .def("set_value_scale_raw",  &SparseLinearLayer8::set_value_scale_raw,
+             py::arg("row"), py::arg("scale"),
+             "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
+             "same convention as SparseLinearLayer::set_value_scale_raw.")
+        .def("get_output_scale",     &SparseLinearLayer8::get_output_scale,
+             py::arg("col"),
+             "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
+             "any column not yet touched.")
+        .def("set_output_scale_raw", &SparseLinearLayer8::set_output_scale_raw,
+             py::arg("col"), py::arg("scale"),
+             "Set output_scale[col] directly. Calling this at least once makes\n"
+             "output_scale gradient-trainable in backward(), like value_scale --\n"
+             "this is what makes the row+col scale genuinely rank-1, matching the\n"
+             "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
+            return py::array_t<SparseLinearLayer8::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(SparseLinearLayer8::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
+        .def_readonly ("num_cpus",  &SparseLinearLayer8::num_cpus)
+        .def_property_readonly("n_inputs",  &SparseLinearLayer8::n_inputs)
+        .def_property_readonly("n_outputs", &SparseLinearLayer8::n_outputs)
+        .def_property_readonly("nnz",       &SparseLinearLayer8::nnz)
+        .def_property_readonly("block4",    &SparseLinearLayer8::block4, py::keep_alive<0, 1>());
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //
