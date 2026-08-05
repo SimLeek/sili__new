@@ -348,17 +348,36 @@ void disldo_forward(
  * @param learning_rate     Update step.
  * @param num_cpus          Thread count.
  * @param damp_by_importance When true (default): the weight update is
- *        divided by (1+|ci|), so a synapse that's accumulated a lot of
- *        same-direction gradient pressure gets progressively smaller
- *        steps -- a per-synapse adaptive-learning-rate effect. When
- *        false: the raw (-effective_lr * g) step is applied directly,
- *        with no damping -- ci is still tracked/updated identically
- *        either way (importance stays meaningful for pruning/
- *        synaptogenesis decisions regardless), only its use as a
- *        WEIGHT-UPDATE damping factor is toggled. Exists specifically
- *        so a caller can A/B this mechanism against itself on the same
- *        kernel -- see sili_peridot's/sili__new's importance-damping-
- *        as-optimizer integration test.
+ *        divided by (sqrt(ci)+eps), where ci is an RMSprop-style
+ *        exponential moving average of g^2 (decayed, magnitude-only) --
+ *        a per-synapse adaptive-learning-rate effect, same one extra
+ *        scalar of state per synapse this always used, just tracking a
+ *        different quantity. When false: the raw (-effective_lr * g)
+ *        step is applied directly, with no damping -- ci is still
+ *        tracked/updated identically either way (importance stays
+ *        meaningful for pruning/synaptogenesis decisions regardless),
+ *        only its use as a WEIGHT-UPDATE damping factor is toggled.
+ *        Exists specifically so a caller can A/B this mechanism against
+ *        itself on the same kernel -- see sili_peridot's/sili__new's
+ *        importance-damping-as-optimizer integration test.
+ *
+ *        REPLACED (see conversation/JOURNAL.md), not just retuned: the
+ *        previous formula (ci -= g*effective_lr, an undecayed running
+ *        SUM of SIGNED gradient, divide by 1+|ci|) was confirmed via a
+ *        real ablation to converge no better than plain SGD -- it has a
+ *        structural blind spot where sign-oscillating (noisy) gradient
+ *        pressure CANCELS in the sum, so damping barely engages exactly
+ *        when it should. A dense-Tensor RMSprop control (one scalar of
+ *        state per parameter, decayed g^2, no momentum/second buffer)
+ *        reached essentially full-Adam convergence quality on the same
+ *        task at the same storage budget -- this formula ports that
+ *        result in, still one scalar/synapse, no new storage.
+ * @param beta2  Decay rate for ci's g^2 EMA (default 0.999, matching
+ *        this project's own AdamOptimizer convention). Only used when
+ *        damp_by_importance is true.
+ * @param eps    Numerical floor added to sqrt(ci) so a synapse with zero
+ *        accumulated gradient magnitude doesn't produce a divide-by-zero
+ *        (matches Adam's own eps convention, default 1e-8).
  *
  * NOTE (test): with learning_rate=0, input_grad must equal W_dense^T @ output_grad
  * per batch sample, weights/importance unchanged. Same reference check as
@@ -377,7 +396,9 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  learning_rate = 0.01f,
     int          num_cpus = 4,
     bool         lr_per_row_nnz = false,
-    bool         damp_by_importance = true)
+    bool         damp_by_importance = true,
+    typename ValueAccessor<VALUES_TYPE>::value_type  beta2 = 0.999f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
@@ -503,9 +524,12 @@ void disldo_backward(
                     const value_type g   = dyv * iv;
 
                     if (learning_rate != value_type(0)) {
-                        ci -= g * effective_lr;
+                        // RMSprop-style: ci = decayed EMA of g^2 (magnitude-only,
+                        // recency-weighted), damp by sqrt(ci)+eps instead of 1+|ci|
+                        // -- see this function's own docstring for why.
+                        ci = beta2 * ci + (value_type(1) - beta2) * g * g;
                         cw += damp_by_importance
-                            ? (-effective_lr * g) / (value_type(1) + std::abs(ci))
+                            ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                             : (-effective_lr * g);
                         // dL/d(val_scale[r]) = stored_w * out_scale[col] * dy * input
                         // dL/d(out_scale[col]) = stored_w * val_scale[r] * dy * input
@@ -527,13 +551,13 @@ void disldo_backward(
                 }
             }
             if (learning_rate != value_type(0)) {
-                // Same damping pattern as a per-synapse weight: importance
-                // updates first (undamped), then the value_scale step
-                // itself is damped by the freshly-updated importance.
-                const value_type raw_update = static_cast<value_type>(scale_eff_lr * scale_grad_sum);
-                weights.value_scale_importance[r] -= raw_update;
-                const value_type vs_imp = weights.value_scale_importance[r];
-                weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
+                // Same RMSprop pattern as a per-synapse weight: importance
+                // tracks a decayed EMA of the RAW (pre-lr) gradient sum's
+                // square, the value_scale step is damped by sqrt of that.
+                const value_type g_agg = static_cast<value_type>(scale_grad_sum);
+                value_type& vs_imp = weights.value_scale_importance[r];
+                vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+                weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
             }
         }
 
@@ -832,7 +856,9 @@ void disldo_backward(
                         if (full_tile_cols) {
                             const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
                             const Block4Vec val_scale_v    = block4_vec_broadcast(val_scale);
-                            const Block4Vec one_v          = block4_vec_broadcast(1.0f);
+                            const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
+                            const Block4Vec one_minus_beta2_v = block4_vec_broadcast(1.0f - beta2);
+                            const Block4Vec eps_v          = block4_vec_broadcast(eps);
                             Block4Vec cw_v        = block4_vec_load(cw4);
                             Block4Vec ci_v         = block4_vec_load(ci4);
                             const Block4Vec cw_orig_v      = block4_vec_load(cw_orig4);
@@ -846,10 +872,14 @@ void disldo_backward(
                                     output_grad + static_cast<std::size_t>(b) * n_out + col_base);
                                 const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
                                 if (training) {
-                                    ci_v -= g_v * effective_lr_v;
+                                    // RMSprop-style: decayed EMA of g^2, damp by
+                                    // sqrt(ci)+eps -- see disldo_backward's own
+                                    // docstring for why (matches the scattered
+                                    // per-synapse path above exactly).
+                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v);
                                     const Block4Vec neg_lr_g_v = -(effective_lr_v * g_v);
                                     const Block4Vec delta_v = damp_by_importance
-                                        ? neg_lr_g_v / (one_v + block4_vec_abs(ci_v))
+                                        ? neg_lr_g_v / (block4_vec_sqrt(ci_v) + eps_v)
                                         : neg_lr_g_v;
                                     cw_v += delta_v;
                                     // mrow_local accumulates in DOUBLE, one
@@ -891,9 +921,9 @@ void disldo_backward(
                                     const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4[lj]];
                                     const value_type g   = dyv * iv;
                                     if (learning_rate != value_type(0)) {
-                                        ci4[lj] -= g * effective_lr;
+                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * g * g;
                                         cw4[lj] += damp_by_importance
-                                            ? (-effective_lr * g) / (value_type(1) + std::abs(ci4[lj]))
+                                            ? (-effective_lr * g) / (std::sqrt(ci4[lj]) + eps)
                                             : (-effective_lr * g);
                                         mrow_local += static_cast<double>(cw_orig4[lj]) * static_cast<double>(out_scale4[lj]) * g;
                                         mcol4[lj] += cw_orig4[lj] * val_scale * g;
@@ -917,9 +947,9 @@ void disldo_backward(
                                 const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4[lj]];
                                 const value_type g   = dyv * iv;
                                 if (learning_rate != value_type(0)) {
-                                    ci4[lj] -= g * effective_lr;
+                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * g * g;
                                     cw4[lj] += damp_by_importance
-                                        ? (-effective_lr * g) / (value_type(1) + std::abs(ci4[lj]))
+                                        ? (-effective_lr * g) / (std::sqrt(ci4[lj]) + eps)
                                         : (-effective_lr * g);
                                     mrow_local += static_cast<double>(cw_orig4[lj]) * static_cast<double>(out_scale4[lj]) * g;
                                     mcol4[lj] += cw_orig4[lj] * val_scale * g;
@@ -1048,10 +1078,10 @@ void disldo_backward(
                     sum += t_row_grad[static_cast<std::size_t>(t) * n_in + row];
                 if (sum == 0.0) continue;
                 const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
-                const value_type raw_update = static_cast<value_type>(scale_eff_lr * sum);
-                weights.value_scale_importance[row] -= raw_update;
-                const value_type vs_imp = weights.value_scale_importance[row];
-                weights.value_scale[row] -= raw_update / (value_type(1) + std::abs(vs_imp));
+                const value_type g_agg = static_cast<value_type>(sum);
+                value_type& vs_imp = weights.value_scale_importance[row];
+                vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+                weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
             }
         }
     }
@@ -1075,11 +1105,11 @@ void disldo_backward(
             for (int t = 0; t < num_cpus; ++t)
                 col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
             const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
-            // Same importance-damping pattern as value_scale's own update.
-            const value_type raw_update = static_cast<value_type>(col_eff_lr * col_grad_sum);
-            weights.output_scale_importance[c] -= raw_update;
-            const value_type os_imp = weights.output_scale_importance[c];
-            weights.output_scale[c] -= raw_update / (value_type(1) + std::abs(os_imp));
+            // Same RMSprop pattern as value_scale's own update.
+            const value_type g_agg = static_cast<value_type>(col_grad_sum);
+            value_type& os_imp = weights.output_scale_importance[c];
+            os_imp = beta2 * os_imp + (value_type(1) - beta2) * g_agg * g_agg;
+            weights.output_scale[c] -= col_eff_lr * g_agg / (std::sqrt(os_imp) + eps);
         }
     }
 }

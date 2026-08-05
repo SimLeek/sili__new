@@ -1,6 +1,7 @@
 #pragma once
 #include "fp4quant.hpp"
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -68,9 +69,18 @@ inline Block4Vec block4_vec_abs(Block4Vec x) {
 }
 
 // Hardcoded 4-term sum. Similar fix as block4_vec_broadcast above.
-// This one function was 12.16% of all instructions in a disldo_backward run. 
+// This one function was 12.16% of all instructions in a disldo_backward run.
 inline float block4_vec_hsum(Block4Vec x) {
     return x[0] + x[1] + x[2] + x[3];
+}
+
+// Elementwise sqrt -- GCC vector-extension types have no built-in sqrt.
+// Used by the RMSprop-style importance damping (decayed mean-of-g^2,
+// see linear_disldo.hpp's disldo_backward) instead of block4_vec_abs.
+inline Block4Vec block4_vec_sqrt(Block4Vec x) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::sqrt(x[i]);
+    return result;
 }
 
 // 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes 4 codes in one

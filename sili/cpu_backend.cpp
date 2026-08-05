@@ -402,7 +402,7 @@ public:
     // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
 
     py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
-                                  bool damp_by_importance = true) {
+                                  bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE>(
@@ -411,7 +411,7 @@ public:
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -476,14 +476,16 @@ public:
     py::array_t<V> backward_sparse(
         py::array_t<V> x,   // DENSE input -- see class comment for why
         py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
-        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false)
+        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false,
+        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f)
     {
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
         disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz);
+            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz,
+            damp_by_importance, beta2, eps);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -897,7 +899,7 @@ public:
     }
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
-                             bool damp_by_importance = true) {
+                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, VT, COL_TYPE>(
@@ -906,7 +908,7 @@ public:
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1016,20 +1018,23 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              "damp_by_importance=True (default): weight update divided by\n"
-             "(1+|importance|), a per-synapse adaptive-learning-rate effect.\n"
-             "False: raw update, no damping -- importance is still tracked\n"
-             "identically either way, only its use to shape the weight step\n"
-             "is toggled. For A/B-testing whether the damping itself helps\n"
-             "optimization, not for production use.")
+             "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
+             "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
+             "effect. False: raw update, no damping -- importance is still\n"
+             "tracked identically either way, only its use to shape the\n"
+             "weight step is toggled. For A/B-testing whether the damping\n"
+             "itself helps optimization, not for production use. beta2/eps\n"
+             "only affect the True case.")
         .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
              py::arg("ptrs"), py::arg("indices"), py::arg("values"),
              py::arg("batch"))
         .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false)
+             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
@@ -1226,7 +1231,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward",             &DISLDOLayerV::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,

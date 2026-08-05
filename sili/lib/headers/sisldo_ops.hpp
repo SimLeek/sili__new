@@ -596,7 +596,10 @@ void disldo_backward_sparse_grad(
     typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
     typename ValueAccessor<VALUES_TYPE>::value_type   learning_rate = 0.01f,
     const int    num_cpus = 4,
-    bool         lr_per_row_nnz = false)
+    bool         lr_per_row_nnz = false,
+    bool         damp_by_importance = true,
+    typename ValueAccessor<VALUES_TYPE>::value_type   beta2 = 0.999f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   eps = 1e-8f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
@@ -667,12 +670,10 @@ void disldo_backward_sparse_grad(
             const value_type effective_lr = lr_per_row_nnz
                 ? learning_rate / static_cast<value_type>(nnz_this_row)
                 : learning_rate;
-
-            // value_scale gradient ALWAYS divides by nnz_this_row -- see
-            // disldo_backward's scale_eff_lr comment for the full reasoning.
-            // Applied once after all batches, not per-synapse.
-            const value_type scale_eff_lr =
-                learning_rate / static_cast<value_type>(nnz_this_row);
+            // value_scale's own scale_eff_lr (= learning_rate/nnz_this_row,
+            // ALWAYS, independent of lr_per_row_nnz -- see disldo_backward's
+            // comment) is applied once after all batches now, not folded in
+            // per-synapse -- see the final application loop below.
 
             auto cursor = dc.row_cursor(r);
             SIZE_TYPE  og_ptr   = og_start;   // fresh per row -- each row does its own merge
@@ -710,9 +711,12 @@ void disldo_backward_sparse_grad(
                     const value_type grad = dy_val * in_val;   // scales with true input value
                     const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     value_type imp = stored_imp * combined_imp_scale;   // -> true units
-                    imp -= grad * effective_lr;
-                    const value_type new_w = w + (-effective_lr * grad)
-                                              / (value_type(1) + std::abs(imp));
+                    // RMSprop-style: decayed EMA of g^2 -- see disldo_backward's
+                    // own docstring in linear_disldo.hpp for the full rationale.
+                    imp = beta2 * imp + (value_type(1) - beta2) * grad * grad;
+                    const value_type new_w = w + (damp_by_importance
+                        ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
+                        : (-effective_lr * grad));
                     ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
@@ -723,8 +727,12 @@ void disldo_backward_sparse_grad(
                     // value_scale gradient: stored_w * out_scale[col] * dy_val * in_val
                     // (true_w = stored_w * val_scale * out_scale, so val_scale's own
                     // gradient holds out_scale fixed -- see disldo_backward's comment).
+                    // Raw (pre-lr) gradient contribution -- scale_eff_lr is
+                    // applied once at the end instead of folded in here, so
+                    // the RMSprop importance below tracks true g^2, not
+                    // (lr*g)^2 (see disldo_backward's identical convention).
                     scale_grad_sums[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
-                                          * (scale_eff_lr * dy_val * in_val);
+                                          * (dy_val * in_val);
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
@@ -741,20 +749,19 @@ void disldo_backward_sparse_grad(
             total_sum_sq_new_i,  total_sum_sq_old_i, total_max_new_i);
 
         // Apply value_scale gradient once per row, after ALL batches.
-        // scale_grad_sums[r] already has scale_eff_lr folded in
-        // (multiplied per-synapse during accumulation above so the final
-        // subtraction is just a direct assignment-minus). Damped by
-        // value_scale_importance, same pattern as disldo_backward's
-        // matching update (importance updates first, undamped, then the
-        // value_scale step itself is damped by the freshly-updated
-        // importance) -- this path never got that fix when it was added
-        // to disldo_backward.
+        // scale_grad_sums[r] holds the RAW (pre-lr) gradient sum now (see
+        // the accumulation site above) -- scale_eff_lr is recomputed here
+        // and applied once, same RMSprop pattern as disldo_backward's
+        // matching update in linear_disldo.hpp.
         for (std::size_t r = 0; r < n_inputs; ++r) {
             if (scale_grad_sums[r] == 0.0) continue;
-            const value_type raw_update = static_cast<value_type>(scale_grad_sums[r]);
-            weights.value_scale_importance[r] -= raw_update;
-            const value_type vs_imp = weights.value_scale_importance[r];
-            weights.value_scale[r] -= raw_update / (value_type(1) + std::abs(vs_imp));
+            const std::size_t nnz_this_row = L.row_nnz(r);
+            if (nnz_this_row == 0) continue;
+            const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_this_row);
+            const value_type g_agg = static_cast<value_type>(scale_grad_sums[r]);
+            value_type& vs_imp = weights.value_scale_importance[r];
+            vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+            weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
         }
     }
     } // closes if (!dc.empty())
@@ -934,8 +941,10 @@ void disldo_backward_sparse_grad(
                                     const value_type effective_lr = lr_per_row_nnz
                                         ? learning_rate / static_cast<value_type>(nnz_row)
                                         : learning_rate;
-                                    const value_type scale_eff_lr =
-                                        learning_rate / static_cast<value_type>(nnz_row);
+                                    // value_scale's own scale_eff_lr is applied
+                                    // once after all batches now, not folded in
+                                    // per-synapse -- see the final application
+                                    // loop below (recomputed there from nnz_row).
 
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         if (dy_local[lj] == value_type(0)) continue;
@@ -955,9 +964,12 @@ void disldo_backward_sparse_grad(
                                         const value_type imp_decoded = FP4_TABLE[(byte >> 4) & 0xFu];
                                         const value_type grad = dy_val * in_val;
                                         value_type imp = imp_decoded * combined_imp_scale;
-                                        imp -= grad * effective_lr;
-                                        const value_type new_w = w + (-effective_lr * grad)
-                                                                  / (value_type(1) + std::abs(imp));
+                                        // RMSprop-style, matching the scattered
+                                        // path above and disldo_backward.
+                                        imp = beta2 * imp + (value_type(1) - beta2) * grad * grad;
+                                        const value_type new_w = w + (damp_by_importance
+                                            ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
+                                            : (-effective_lr * grad));
                                         const uint8_t new_w_code   = fp4_quantize_stochastic(new_w / combined_scale);
                                         const uint8_t new_imp_code = fp4_quantize_stochastic(imp / combined_imp_scale);
                                         scratch[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
@@ -972,7 +984,7 @@ void disldo_backward_sparse_grad(
                                         batch_max_new = std::max(batch_max_new, std::abs(actual_imp));
 
                                         row_grad_local[li] += static_cast<double>(w_decoded)
-                                            * static_cast<double>(out_scale) * (scale_eff_lr * dy_val * in_val);
+                                            * static_cast<double>(out_scale) * (dy_val * in_val);
                                     }
                                 }
                                 if (dirty)
@@ -1018,10 +1030,16 @@ void disldo_backward_sparse_grad(
 
                 for (std::size_t row = 0; row < n_inputs; ++row) {
                     if (row_scale_grad_sums[row] == 0.0) continue;
-                    const value_type raw_update = static_cast<value_type>(row_scale_grad_sums[row]);
-                    weights.value_scale_importance[row] -= raw_update;
-                    const value_type vs_imp = weights.value_scale_importance[row];
-                    weights.value_scale[row] -= raw_update / (value_type(1) + std::abs(vs_imp));
+                    // nnz_row for this row's block-row -- same derivation as
+                    // the accumulation loop above (row_nnz_b4 * BLOCK4_TILE).
+                    const std::size_t br = row / BLOCK4_TILE;
+                    const std::size_t nnz_row = (br < BL4.rows ? BL4.row_nnz(br) : 0) * BLOCK4_TILE;
+                    if (nnz_row == 0) continue;
+                    const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
+                    const value_type g_agg = static_cast<value_type>(row_scale_grad_sums[row]);
+                    value_type& vs_imp = weights.value_scale_importance[row];
+                    vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+                    weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
                 }
             }
         }
