@@ -276,8 +276,23 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
         indices[row * k:(row + 1) * k] = cols
         values[row * k:(row + 1) * k]  = rng.standard_normal(k).astype(np.float32) * scale
         ptrs[row + 1] = ptrs[row] + k
-    c.load_weights(ptrs, indices, values)
-    c.equalize_to_capacity(per_row)
+    if hasattr(c, "equalize_to_capacity"):
+        # SparseLinearLayer (FP4) convention -- 3-arg load_weights,
+        # equalize_to_capacity grows per-row headroom for later
+        # synaptogenesis.
+        c.load_weights(ptrs, indices, values)
+        c.equalize_to_capacity(per_row)
+    else:
+        # DISLDOLayerV (32-bit DeltaCSRBiValues<float> fallback) --
+        # identical disldo_forward/backward math, no FP4 quantization.
+        # No equalize_to_capacity binding (no growth-headroom use case
+        # here -- this class exists for isolating FP4 quantization
+        # itself as a variable, not for synaptogenesis experiments) and
+        # load_weights takes an explicit importance array (zeros: fresh
+        # connections start with no accumulated importance, matching
+        # the FP4 class's own default).
+        importance = np.zeros_like(values)
+        c.load_weights(ptrs, indices, values, importance)
     return per_row
 
 
@@ -296,7 +311,8 @@ class DISLDOLayer(_SparseLayerBase):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True) -> Tensor:
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+                damp_by_importance: bool = True) -> Tensor:
         # forward_dense/backward_dense always return [batch, cols] --
         # even for a bare 1-D [cols] input, batch is implicitly 1, but
         # the OUTPUT shape stays 2-D regardless. Squeeze that back out
@@ -332,7 +348,58 @@ class DISLDOLayer(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
-                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz)
+                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                             damp_by_importance=damp_by_importance)
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
+
+        out._backward = _bwd
+        return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISLDOLayer32 — same DISLDO math, DeltaCSRBiValues<float> (32-bit) instead
+#  of FP4BiPacked -- isolates FP4 quantization itself as a variable, not a
+#  synaptogenesis/production layer (no equalize_to_capacity, no block4
+#  promotion path exercised here). See JOURNAL.md: built specifically to
+#  separate "FP4's coarse quantization noise" from "the importance-damping
+#  update rule" as candidate explanations for DISLDO's training instability.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DISLDOLayer32(_SparseLayerBase):
+    """Same disldo_forward/disldo_backward kernels as DISLDOLayer, generic
+    over VALUES_TYPE -- this instantiation uses the 32-bit float fallback
+    (_cpu.DISLDOLayerV) instead of 4-bit FP4BiPacked. Same call convention
+    as DISLDOLayer (forward(x, learning_rate, lr_per_row_nnz,
+    damp_by_importance)).
+
+    NOT a general-purpose production layer: no equalize_to_capacity (no
+    growth-headroom use case here), no block4 promotion. Pure diagnostic
+    -- same math, no quantization, to isolate what FP4's coarseness
+    specifically contributes vs. the update-rule math itself."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+                damp_by_importance: bool = True) -> Tensor:
+        if not isinstance(x, Tensor):
+            x = Tensor(np.asarray(x, dtype=np.float32))
+        x_np   = np.asarray(x.data, dtype=np.float32)
+        was_1d = x_np.ndim == 1
+        out_np = self._c.forward(x_np)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        out = Tensor(out_np, _children=(x,), _op="disldo32", backend=x.backend)
+
+        def _bwd():
+            if out.grad is not None:
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                       damp_by_importance=damp_by_importance)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)

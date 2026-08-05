@@ -896,7 +896,8 @@ public:
         return result;
     }
 
-    py::array_t<V> backward(py::array_t<V> dy, V learning_rate) {
+    py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+                             bool damp_by_importance = true) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         disldo_backward<S, VT, COL_TYPE>(
@@ -905,7 +906,7 @@ public:
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus);
+            num_cpus, lr_per_row_nnz, damp_by_importance);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1224,7 +1225,8 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward",              &DISLDOLayerV::forward,
              py::arg("x"))
         .def("backward",             &DISLDOLayerV::backward,
-             py::arg("dy"), py::arg("learning_rate"))
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true)
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
