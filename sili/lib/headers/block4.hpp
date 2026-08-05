@@ -616,7 +616,14 @@ inline bool block4_row_insert_tile(
     std::vector<uint8_t>& tile_data,
     std::vector<uint8_t>& tile_is_sparse,
     std::size_t row,
-    uint32_t new_col)
+    uint32_t new_col,
+    // Defaulted to FP4's tile-length formula -- every existing (FP4)
+    // caller is unaffected. Block4Store8 passes block4_stored_tile_len8
+    // explicitly (real bug found via ASan: this function walks a row's
+    // EXISTING tiles to find the insert position, and without this it
+    // silently used FP4's 1-byte/entry formula on FP8's 2-byte/entry
+    // tiles, corrupting the row's own byte bookkeeping).
+    std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len)
 {
     const std::size_t n = L.row_nnz(row);
 
@@ -645,7 +652,7 @@ inline bool block4_row_insert_tile(
             next_dlen     = dlen;
             break;
         }
-        const std::size_t tlen = block4_stored_tile_len(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
+        const std::size_t tlen = tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
         prev_col   = col;
         byte_pos  += dlen;
         elem_pos++;
@@ -712,7 +719,10 @@ inline bool block4_row_remove_tile(
     std::vector<uint8_t>& tile_data,
     std::vector<uint8_t>& tile_is_sparse,
     std::size_t row,
-    uint32_t target_col)
+    uint32_t target_col,
+    // See block4_row_insert_tile's identical parameter for why this
+    // exists -- same real bug (ASan-confirmed), same fix.
+    std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len)
 {
     const std::size_t n = L.row_nnz(row);
     if (n == 0) return false;
@@ -726,7 +736,7 @@ inline bool block4_row_remove_tile(
         std::size_t delta_len = 0;
         const uint32_t delta = uleb128_decode<uint32_t>(ibuf.data() + byte_pos, delta_len);
         const uint32_t col   = prev_col + delta;
-        const std::size_t tlen = block4_stored_tile_len(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
+        const std::size_t tlen = tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
 
         if (col == target_col) {
             const std::size_t next_byte_pos = byte_pos + delta_len;
@@ -1451,11 +1461,11 @@ struct Block4Store8 {
                     "Block4Store8::get_or_create: block_row out of range -- "
                     "was Block4Store8::init(n_in, n_out) called?");
             if (!block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                         tile_data, tile_is_sparse, br, bc)) {
+                                         tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8)) {
                 block4_ensure_row_headroom(block_layout, indices_buf, tile_byte_start, tile_byte_end,
                                             tile_data, tile_is_sparse, br, max_indices_bytes, max_tile_bytes);
                 const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                                        tile_data, tile_is_sparse, br, bc);
+                                                        tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8);
                 (void)ok;
             }
         }
@@ -1465,7 +1475,7 @@ struct Block4Store8 {
     void erase(uint32_t br, uint32_t bc) {
         if (br >= block_layout.rows) return;
         block4_row_remove_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                tile_data, tile_is_sparse, br, bc);
+                                tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8);
     }
 
     void maybe_compress(uint32_t br, uint32_t bc) {
