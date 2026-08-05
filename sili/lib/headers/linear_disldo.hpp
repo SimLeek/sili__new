@@ -284,9 +284,25 @@ void disldo_forward(
                     if (col >= n_out) return;
                     const value_type out_scale = weights.get_output_scale(col);
 
-                    const Block4VecU w_codes = {uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
-                                                 uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
-                    const Block4Vec w_decoded = block4_vec_decode_fp4(w_codes);
+                    // FP8 dispatch: Block4Tile8's layout is a full byte/
+                    // slot (no nibble mask) and decodes via E4M3
+                    // (fp8quant.hpp/block4_vec_decode_fp8), not FP4's
+                    // table-driven bit-shift codec -- the ONLY thing that
+                    // differs from the FP4 branch below; everything past
+                    // this point (row-scale multiply, batch accumulation)
+                    // is identical float32 math regardless of storage
+                    // width, per direct instruction. FP4 branch is
+                    // byte-for-byte the pre-existing code, untouched.
+                    Block4Vec w_decoded;
+                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        const Block4VecU w_codes = {uint32_t(tdata[Block4Tile8::slot_index(0, LJ)]), uint32_t(tdata[Block4Tile8::slot_index(1, LJ)]),
+                                                     uint32_t(tdata[Block4Tile8::slot_index(2, LJ)]), uint32_t(tdata[Block4Tile8::slot_index(3, LJ)])};
+                        w_decoded = block4_vec_decode_fp8(w_codes);
+                    } else {
+                        const Block4VecU w_codes = {uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
+                                                     uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu), uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
+                        w_decoded = block4_vec_decode_fp4(w_codes);
+                    }
                     const value_type w_decoded_arr[BLOCK4_TILE] = {value_type(w_decoded[0]), value_type(w_decoded[1]),
                                                                      value_type(w_decoded[2]), value_type(w_decoded[3])};
 
@@ -776,6 +792,62 @@ void disldo_backward(
                     // Unconditional, before the per-lj bounds check below,
                     // since decoding an out-of-bounds column's byte is
                     // harmless (the branch below discards it).
+                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        // FP8 (E4M3) block4 weight+importance update --
+                        // scalar, correctness-first (matches this very
+                        // function's own "hypothetical non-float
+                        // value_type" scalar-fallback precedent below,
+                        // just decoding via fp8_decode_bits/
+                        // fp8_quantize_stochastic and Block4Tile8's two
+                        // half-arrays instead of one FP4 nibble-packed
+                        // byte). SIMD is real, scoped follow-up work,
+                        // not attempted here -- per-lj sequential
+                        // (not batched across the tile-column like the
+                        // FP4 branch below), mathematically equivalent
+                        // since cw/ci's online update has no cross-
+                        // column coupling (only mdx_row's final sum
+                        // combines columns, and float addition order
+                        // there is not precision-critical anywhere else
+                        // in this codebase either).
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                            if (col >= n_out) continue;
+                            const uint32_t slot = Block4Tile8::slot_index(li, lj);
+                            const value_type out_scale     = weights.get_output_scale(col);
+                            const value_type out_imp_scale = weights.get_output_importance_scale(col);
+                            const value_type combined_scale     = val_scale * out_scale;
+                            const value_type combined_imp_scale = imp_scale * out_imp_scale;
+                            const value_type cw_orig = fp8_decode_bits(tdata[slot]);
+                            value_type cw = cw_orig * combined_scale;
+                            value_type ci = fp8_decode_bits(tdata[BLOCK4_TILE + slot]) * combined_imp_scale;
+
+                            value_type mcol_local = value_type(0);
+                            double     mrow_local  = 0.0;
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                                value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
+                                const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
+                                const value_type g   = dyv * iv;
+                                if (learning_rate != value_type(0)) {
+                                    ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                                    cw += damp_by_importance
+                                        ? (-effective_lr * g) / (std::sqrt(ci) + eps)
+                                        : (-effective_lr * g);
+                                    mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
+                                    mcol_local  += cw_orig * val_scale * g;
+                                }
+                                *mdx_row += cw * dyv;
+                            }
+                            if (learning_rate != value_type(0)) {
+                                mrow[row] += mrow_local;
+                                mcol[col] += mcol_local;
+                                tdata[slot]                  = fp8_quantize_stochastic(cw / combined_scale);
+                                tdata[BLOCK4_TILE + slot]    = fp8_quantize_stochastic(ci / combined_imp_scale);
+                                tile_dirty = true;
+                            }
+                        }
+                        continue; // this li done -- skip the FP4 branch entirely
+                    }
                     const uint8_t byte0 = tdata[Block4Tile::slot_index(li, 0)], byte1 = tdata[Block4Tile::slot_index(li, 1)],
                                   byte2 = tdata[Block4Tile::slot_index(li, 2)], byte3 = tdata[Block4Tile::slot_index(li, 3)];
                     const value_type w_decoded_arr[BLOCK4_TILE]   = {FP4_TABLE[byte0 & 0xFu], FP4_TABLE[byte1 & 0xFu],
@@ -1047,12 +1119,21 @@ void disldo_backward(
                     const std::size_t e  = ti - row_ti_start[br];
                     const uint32_t    bc = ws.bc[e];
                     const std::size_t this_byte_pos = live_byte_pos;
-                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS];
+                    // Sized per VALUES_TYPE: FP8's Block4Tile8 is 32
+                    // bytes/tile (2/slot), not FP4's 16 (1/slot) --
+                    // a real stack buffer overflow otherwise (caught via
+                    // -fsanitize=address / gcc's own stringop-overflow
+                    // warning when this was still hardcoded to
+                    // BLOCK4_TILE_SLOTS for both types).
+                    uint8_t scratch_buf[std::is_same_v<VALUES_TYPE, FP8BiValues> ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS];
                     weights.block4.unpack_workspace_tile(ws, e, this_byte_pos, scratch_buf);
                     const bool tile_dirty = process_tile(bc, scratch_buf);
                     if (tile_dirty)
                         weights.block4.commit_dirty_tile_in_workspace(ws, e, this_byte_pos, scratch_buf);
-                    live_byte_pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
+                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>)
+                        live_byte_pos += block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
+                    else
+                        live_byte_pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
                 } // closes for (ti...)
                 // Merge back -- evicts lowest-|true-importance| synapses
                 // only if this row genuinely grew past its own current
@@ -1062,8 +1143,14 @@ void disldo_backward(
                     [&](std::size_t ev_row, std::size_t ev_col, uint8_t ev_imp_code) -> double {
                         const value_type imp_scale     = weights.get_importance_scale(ev_row);
                         const value_type out_imp_scale = weights.get_output_importance_scale(ev_col);
-                        return static_cast<double>(FP4_TABLE[ev_imp_code & 0xFu])
-                             * static_cast<double>(imp_scale) * static_cast<double>(out_imp_scale);
+                        // FP8's Block4Store8::merge_row_workspace passes the
+                        // FULL importance byte (an E4M3 code), not FP4's
+                        // 4-bit nibble -- see Block4Store8::merge_row_workspace's
+                        // own docstring (block4.hpp).
+                        const double decoded = std::is_same_v<VALUES_TYPE, FP8BiValues>
+                            ? static_cast<double>(fp8_decode_bits(ev_imp_code))
+                            : static_cast<double>(FP4_TABLE[ev_imp_code & 0xFu]);
+                        return decoded * static_cast<double>(imp_scale) * static_cast<double>(out_imp_scale);
                     });
             }
             } // closes for (br...)

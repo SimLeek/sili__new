@@ -482,10 +482,24 @@ struct DeltaCSRWeights {
 
 // ── SparseLinearWeightsDelta ─────────────────────────────────────────────────
 
+// Selects which Block4Store variant SparseLinearWeightsDelta.block4 (below)
+// uses, keyed on VALUES_TYPE -- default (Block4Store, the FP4-1-byte-per
+// -slot dense-tile layout) matches every existing instantiation's exact
+// prior behavior unchanged; only FP8BiValues gets Block4Store8 (2 bytes/
+// slot, fp8quant.hpp's E4M3 codec -- see block4.hpp's own comment on why
+// this needed a fully separate store, not a template-parameter retrofit
+// of Block4Store itself). A pure additive trait, not a modification to
+// either existing type.
+template <typename VALUES_TYPE>
+struct Block4StoreFor { using type = Block4Store; };
+template <>
+struct Block4StoreFor<FP8BiValues> { using type = Block4Store8; };
+
 template <class SIZE_TYPE, class VALUES_TYPE = FP4BiPacked, class COL_TYPE = uint32_t>
 struct SparseLinearWeightsDelta {
     using size_type  = SIZE_TYPE;
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    using block4_type = typename Block4StoreFor<VALUES_TYPE>::type;
 
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
     COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
@@ -497,7 +511,11 @@ struct SparseLinearWeightsDelta {
     // lossless byte copy, not a requantization. Promotion/demotion logic
     // lives in delta_csr_memory.hpp (needs delta_csr_row_insert_col/
     // _remove_col, which would be a circular include from here).
-    Block4Store block4;
+    //
+    // Type selected via Block4StoreFor<VALUES_TYPE> (above) -- Block4Store
+    // for every existing VALUES_TYPE (FP4BiPacked, DeltaCSRBiValues<T>,
+    // unchanged), Block4Store8 for FP8BiValues.
+    block4_type block4;
 
     // Per-ROW scale applied to STORED importance to get TRUE units before
     // any importance arithmetic (the activity-correlation `1+|imp|` denominator, the

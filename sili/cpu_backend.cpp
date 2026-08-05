@@ -49,6 +49,23 @@ private:
     Block4Store* store;
 };
 
+// FP8 counterpart to Block4View, for Block4Store8 -- same fields/role,
+// separate class since Block4View is hardcoded to Block4Store& (see
+// delta_csr_types.hpp's Block4StoreFor<VALUES_TYPE> trait for why
+// SparseLinearWeightsDelta.block4 is Block4Store8 specifically for
+// FP8BiValues).
+class Block4View8 {
+public:
+    explicit Block4View8(Block4Store8& s) : store(&s) {}
+    std::size_t tiles()    const { return store->n_tiles(); }
+    std::size_t synapses() const { return store->live_synapses(); }
+    uint32_t get_switch_point() const { return store->switch_point; }
+    void set_switch_point(uint32_t v) { store->switch_point = v; }
+    std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
+private:
+    Block4Store8* store;
+};
+
 // ── SISLDOLayer ───────────────────────────────────────────────────────────────
 // Sparse Input, Sparse Linear, Dense Output layer.
 //
@@ -1051,6 +1068,16 @@ public:
         weights.connections.set_limits(
             _idx_budget_bytes,
             ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
+        // Same budget-sizing convention as SparseLinearLayer's (FP4)
+        // constructor -- tile COUNT budget identical (max_weights synapses
+        // at max fill of BLOCK4_TILE_SLOTS=16/tile), but multiplied by
+        // BLOCK4_TILE_SLOTS8_BYTES (32, a dense FP8 tile's real byte size)
+        // instead of FP4's 16, since that's what set_limits' second
+        // argument actually budgets (tile_data bytes, not tile count).
+        weights.block4.set_limits(
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS8_BYTES);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
@@ -1062,7 +1089,7 @@ public:
     S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
-    Block4View block4() { return Block4View(weights.block4); }
+    Block4View8 block4() { return Block4View8(weights.block4); }
 
     // Per-ROW/per-COLUMN (rank-1) scale -- true_w = stored_w *
     // value_scale[row] * output_scale[col], SAME mechanism SparseLinearLayer
