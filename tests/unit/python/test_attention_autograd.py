@@ -18,6 +18,7 @@ import pytest
 
 from sili.tensor import (
     Tensor, sparse_attention, banded_attention, sparse_banded_attention,
+    gaussian_attention, exp,
 )
 
 
@@ -193,6 +194,96 @@ class TestSparseBandedAttentionAutograd:
 
         numeric = _numeric_grad(self._loss_fn(q_np, k_np, v.data, half_bw, inner_k), v.data)
         np.testing.assert_allclose(v.grad, numeric, atol=2e-2, rtol=2e-2)
+
+
+def _random_centers_sigmas(T, K, seed):
+    rng = np.random.default_rng(seed)
+    centers = rng.uniform(0.0, K, T).astype(np.float32)
+    log_sigmas = rng.uniform(-0.5, 0.5, T).astype(np.float32)  # sigma in ~[0.6, 1.6]
+    return centers, log_sigmas
+
+
+class TestGaussianAttentionAutograd:
+    """gaussian_attention: full attention with a learnable per-query
+    Gaussian log-bias -- gradient-checks centers/sigmas specifically
+    (the genuinely new part; dQ/dK/dV reuse the same math already
+    covered for the other three variants above), and confirms sigma is
+    trained via log_sigma+exp (see sili.tensor.exp), not passed raw."""
+
+    def _loss_fn(self, q_np, k_np, v_np, centers_np, log_sigmas_np):
+        def fn():
+            q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+            centers = Tensor(centers_np.copy())
+            sigmas = exp(Tensor(log_sigmas_np.copy()))
+            out = gaussian_attention(q, k, v, centers, sigmas)
+            return float(_scalar_loss(out).data)
+        return fn
+
+    def test_dCenters_matches_finite_difference(self):
+        T, K, d = 5, 6, 4
+        q_np, k_np, v_np = _random_qkv(T, K, d, seed=40)
+        centers_np, log_sigmas_np = _random_centers_sigmas(T, K, seed=41)
+
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        centers = Tensor(centers_np.copy())
+        log_sigmas = Tensor(log_sigmas_np.copy())
+        sigmas = exp(log_sigmas)
+        out = gaussian_attention(q, k, v, centers, sigmas)
+        _scalar_loss(out).backward()
+
+        numeric = _numeric_grad(
+            self._loss_fn(q_np, k_np, v_np, centers.data, log_sigmas_np), centers.data)
+        np.testing.assert_allclose(centers.grad, numeric, atol=2e-2, rtol=2e-2)
+
+    def test_dLogSigma_matches_finite_difference(self):
+        # Gradient checked on log_sigma (the actual trained parameter),
+        # not raw sigma -- confirms the exp() chain rule is wired
+        # correctly end to end, not just gaussian_attention's own
+        # dSigmas output in isolation.
+        T, K, d = 5, 6, 4
+        q_np, k_np, v_np = _random_qkv(T, K, d, seed=42)
+        centers_np, log_sigmas_np = _random_centers_sigmas(T, K, seed=43)
+
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        centers = Tensor(centers_np.copy())
+        log_sigmas = Tensor(log_sigmas_np.copy())
+        sigmas = exp(log_sigmas)
+        out = gaussian_attention(q, k, v, centers, sigmas)
+        _scalar_loss(out).backward()
+
+        numeric = _numeric_grad(
+            self._loss_fn(q_np, k_np, v_np, centers_np, log_sigmas.data), log_sigmas.data)
+        np.testing.assert_allclose(log_sigmas.grad, numeric, atol=2e-2, rtol=2e-2)
+
+    def test_dQ_matches_finite_difference(self):
+        T, K, d = 5, 6, 4
+        q_np, k_np, v_np = _random_qkv(T, K, d, seed=44)
+        centers_np, log_sigmas_np = _random_centers_sigmas(T, K, seed=45)
+
+        q = Tensor(q_np.copy()); k = Tensor(k_np.copy()); v = Tensor(v_np.copy())
+        centers = Tensor(centers_np.copy())
+        sigmas = exp(Tensor(log_sigmas_np.copy()))
+        out = gaussian_attention(q, k, v, centers, sigmas)
+        _scalar_loss(out).backward()
+
+        numeric = _numeric_grad(
+            self._loss_fn(q.data, k_np, v_np, centers_np, log_sigmas_np), q.data)
+        np.testing.assert_allclose(q.grad, numeric, atol=2e-2, rtol=2e-2)
+
+    def test_sigma_near_zero_concentrates_on_nearest_key(self):
+        K, d = 5, 3
+        rng = np.random.default_rng(46)
+        q_np = rng.standard_normal((1, d)).astype(np.float32)
+        k_np = rng.standard_normal((K, d)).astype(np.float32)
+        v_np = rng.standard_normal((K, d)).astype(np.float32)
+        j0 = 3
+
+        q = Tensor(q_np); k = Tensor(k_np); v = Tensor(v_np)
+        centers = Tensor(np.array([float(j0)], dtype=np.float32))
+        sigmas = Tensor(np.array([1e-3], dtype=np.float32))
+        out = gaussian_attention(q, k, v, centers, sigmas)
+
+        np.testing.assert_allclose(out.data[0], v_np[j0], atol=1e-4)
 
 
 class TestCausalAttentionAutograd:

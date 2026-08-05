@@ -222,7 +222,8 @@ class _SparseLayerBase(Module):
             self._c.equalize_to_capacity(max_row_weights)
 
 
-def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
+def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
+                           rng: Optional[np.random.Generator] = None) -> int:
     """A freshly-constructed SparseLinearLayer has zero connections and
     produces literal all-zero output until synaptogenesis grows some.
     NOT strictly required when EnergyDynamics is in the loop (as it is
@@ -249,13 +250,22 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int) -
     CSR rows are INPUTS, columns are OUTPUTS (disldo_forward iterates
     `for r in range(n_inputs)`, each row's nonzero entries its output
     connections) -- see linear_disldo.hpp.
+
+    `rng`: defaults to `np.random.default_rng()` (fresh OS entropy,
+    genuinely non-reproducible by design -- NOT affected by
+    `np.random.seed()`, which only controls the legacy global
+    `RandomState`, not this Generator API). Pass an explicit
+    `np.random.default_rng(seed)` to get reproducible wiring for tests
+    -- direct request: keep true randomness as the default, only make
+    it OVERRIDABLE, not seeded-by-default.
     """
     # load_weights is a tight/exact-fit encode regardless of any prior
     # allocation -- equalize_to_capacity must be called AFTER it, not
     # before, or the headroom gets compacted away immediately (verified
     # empirically).
     per_row = max(2, max_weights // max(1, n_inputs))
-    rng   = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     k     = max(1, min(n_outputs, per_row // 2))  # leave half the row's headroom free to grow into
     scale = 1.0 / np.sqrt(k)
     ptrs    = np.zeros(n_inputs + 1, dtype=np.int32)
@@ -282,9 +292,9 @@ class DISLDOLayer(_SparseLayerBase):
     docstring). No batch dimension required for online (single-sample) use."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
     def forward(self, x, learning_rate: float = 0.0) -> Tensor:
         # forward_dense/backward_dense always return [batch, cols] --
@@ -331,9 +341,10 @@ class SISLDOLayer(_SparseLayerBase):
     forward_sparse call above -- not an approximation, just reusing it."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, backprop_p: float = 0.03):
+                 num_cpus: int = 4, backprop_p: float = 0.03,
+                 rng: Optional[np.random.Generator] = None):
         self._c         = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         self.backprop_p = backprop_p
 
     def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:

@@ -486,3 +486,94 @@ TEST_CASE("banded_attention_backward: causal gradients match finite differences"
     }
     CHECK(max_err < 1e-2f);
 }
+
+// ── gaussian_attention: full attention with a learnable per-query Gaussian bias
+
+TEST_CASE("gaussian_attention: sigma->0 with center on an integer key concentrates output on that key's V",
+         "[attention][gaussian]") {
+    const std::size_t K = 5, d = 3;
+    std::mt19937 rng(40);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(d), Kmat(K*d), V(K*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : Kmat) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    const std::size_t j0 = 2;
+    std::vector<float> centers = {float(j0)};
+    std::vector<float> sigmas  = {1e-3f};
+    std::vector<float> out(d, 0.0f);
+    gaussian_attention_forward(Q.data(), Kmat.data(), V.data(), out.data(),
+                               1, K, d, centers.data(), sigmas.data(), 1, false);
+
+    for (std::size_t i = 0; i < d; ++i)
+        CHECK(out[i] == Catch::Approx(V[j0*d+i]).margin(1e-4));
+}
+
+TEST_CASE("gaussian_attention: with sigma very large, reduces to plain dense softmax attention (Gaussian bias vanishes)",
+         "[attention][gaussian]") {
+    const std::size_t T = 4, d = 4;
+    std::mt19937 rng(41);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> Q(T*d), K(T*d), V(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+
+    std::vector<float> centers(T, 0.0f);
+    std::vector<float> sigmas(T, 1e6f);   // bias term ~0 for any finite (j-center)
+    std::vector<float> out(T*d, 0.0f);
+    gaussian_attention_forward(Q.data(), K.data(), V.data(), out.data(),
+                               T, T, d, centers.data(), sigmas.data(), 1, false);
+
+    auto naive = naive_attention(Q, K, V, T, d);
+    for (std::size_t i = 0; i < T*d; ++i)
+        CHECK(out[i] == Catch::Approx(naive[i]).margin(1e-3));
+}
+
+TEST_CASE("gaussian_attention_backward: dCenters and dSigmas match finite differences",
+         "[attention][gaussian][backward]") {
+    const std::size_t T = 5, K = 6, d = 4;
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::uniform_real_distribution<float> center_dist(0.0f, float(K));
+    std::uniform_real_distribution<float> sigma_dist(0.5f, 2.0f);
+
+    std::vector<float> Q(T*d), Kmat(K*d), V(K*d), dO(T*d);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : Kmat) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    for (auto& v : dO) v = dist(rng);
+    std::vector<float> centers(T), sigmas(T);
+    for (auto& v : centers) v = center_dist(rng);
+    for (auto& v : sigmas)  v = sigma_dist(rng);
+
+    std::vector<float> dQ(T*d,0), dK(K*d,0), dV(K*d,0), dC(T,0), dS(T,0);
+    gaussian_attention_backward(Q.data(), Kmat.data(), V.data(), dO.data(),
+                                dQ.data(), dK.data(), dV.data(), dC.data(), dS.data(),
+                                T, K, d, centers.data(), sigmas.data(), 1, false);
+
+    auto fwd_loss = [&](const std::vector<float>& c, const std::vector<float>& s) {
+        std::vector<float> o(T*d, 0.0f);
+        gaussian_attention_forward(Q.data(), Kmat.data(), V.data(), o.data(),
+                                   T, K, d, c.data(), s.data(), 1, false);
+        float loss = 0.0f;
+        for (std::size_t j = 0; j < T*d; ++j) loss += o[j] * dO[j];
+        return loss;
+    };
+
+    const float eps = 1e-3f;
+    float max_err = 0.0f;
+    for (std::size_t t = 0; t < T; ++t) {
+        auto cp = centers, cm = centers;
+        cp[t] += eps; cm[t] -= eps;
+        float num_dc = (fwd_loss(cp, sigmas) - fwd_loss(cm, sigmas)) / (2.0f * eps);
+        max_err = std::max(max_err, std::abs(num_dc - dC[t]));
+
+        auto sp = sigmas, sm = sigmas;
+        sp[t] += eps; sm[t] -= eps;
+        float num_ds = (fwd_loss(centers, sp) - fwd_loss(centers, sm)) / (2.0f * eps);
+        max_err = std::max(max_err, std::abs(num_ds - dS[t]));
+    }
+    CHECK(max_err < 1e-2f);
+}

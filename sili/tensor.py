@@ -127,7 +127,10 @@ class Tensor:
 
 def add(a: Tensor, b: Tensor) -> Tensor:
     out = Tensor(a.backend.add(a.data, b.data), (a, b), "add", a.backend)
-    def _bwd(): _acc(a, out.grad); _acc(b, out.grad)
+    def _bwd():
+        g = np.asarray(out.grad)
+        _acc(a, _unbroadcast_to(g, np.asarray(a.data).shape))
+        _acc(b, _unbroadcast_to(g, np.asarray(b.data).shape))
     out._backward = _bwd
     return out
 
@@ -135,8 +138,10 @@ def add(a: Tensor, b: Tensor) -> Tensor:
 def mul(a: Tensor, b: Tensor) -> Tensor:
     out = Tensor(a.backend.mul(a.data, b.data), (a, b), "mul", a.backend)
     def _bwd():
-        _acc(a, a.backend.mul(b.data, out.grad))
-        _acc(b, b.backend.mul(a.data, out.grad))
+        da = a.backend.mul(b.data, out.grad)
+        db = b.backend.mul(a.data, out.grad)
+        _acc(a, _unbroadcast_to(da, np.asarray(a.data).shape))
+        _acc(b, _unbroadcast_to(db, np.asarray(b.data).shape))
     out._backward = _bwd
     return out
 
@@ -180,9 +185,43 @@ def tanh(a: Tensor) -> Tensor:
     return out
 
 
+def exp(a: Tensor) -> Tensor:
+    """d(exp(x))/dx = exp(x) -- standard use is the log-sigma -> sigma
+    positivity trick (train an unconstrained log_sigma parameter,
+    exponentiate before using it as a strictly-positive scale/spread),
+    so nothing downstream needs to special-case sign/zero."""
+    e   = np.exp(np.asarray(a.data, dtype=np.float32))
+    out = Tensor(e, (a,), "exp", a.backend)
+    def _bwd(): _acc(a, e * np.asarray(out.grad, dtype=np.float32))
+    out._backward = _bwd
+    return out
+
+
+def log(a: Tensor) -> Tensor:
+    """d(log(x))/dx = 1/x. Mirrors exp()'s pattern exactly -- standard
+    use here is a softmax-cross-entropy loss built from exp/reduce_sum/
+    gather rather than a dedicated cross-entropy op."""
+    l   = np.log(np.asarray(a.data, dtype=np.float32))
+    out = Tensor(l, (a,), "log", a.backend)
+    def _bwd(): _acc(a, np.asarray(out.grad, dtype=np.float32) / np.asarray(a.data, dtype=np.float32))
+    out._backward = _bwd
+    return out
+
+
 def reduce_sum(a: Tensor, axis=None) -> Tensor:
     out = Tensor(a.backend.sum(a.data, axis), (a,), "sum", a.backend)
-    def _bwd(): _acc(a, a.backend.broadcast_to(out.grad, a.data))
+    def _bwd():
+        g = np.asarray(out.grad, dtype=np.float32)
+        if axis is not None:
+            # backend.sum drops `axis` entirely (no keepdims) -- for any
+            # axis other than 0, the reduced dim isn't trailing, so
+            # broadcast_to's plain np.broadcast_to (right-aligned) would
+            # try to match the wrong dimensions. Re-insert `axis` as a
+            # size-1 dim first so broadcasting expands the RIGHT one.
+            # (axis=0 previously "worked" only by coincidence -- the
+            # remaining shape happens to already be right-aligned.)
+            g = np.expand_dims(g, axis)
+        _acc(a, a.backend.broadcast_to(g, a.data))
     out._backward = _bwd
     return out
 
@@ -354,6 +393,40 @@ def banded_attention(q: Tensor, k: Tensor, v: Tensor,
     return out
 
 
+def gaussian_attention(q: Tensor, k: Tensor, v: Tensor,
+                       centers: Tensor, sigmas: Tensor,
+                       num_cpus: int = 4, causal: bool = False) -> Tensor:
+    """Full (every query x every key) attention with a learnable per-query
+    Gaussian log-bias on top of the usual Q.K score -- differentiable
+    w.r.t. q/k/v AND centers/sigmas (unlike banded_attention's fixed,
+    non-learnable geometric-diagonal band). See attention.hpp for the
+    exact math.
+
+    centers/sigmas are [T] Tensors (one pair per query row) -- pass them
+    as real Tensor objects (not raw arrays) so Module.parameters() picks
+    them up as trainable leaves and gradients flow into centers.grad/
+    sigmas.grad like any other parameter.
+
+    sigmas must stay strictly positive through training. This function
+    does not enforce that itself -- callers should store an unconstrained
+    log_sigma parameter and pass `exp(log_sigma)` in here (see `exp()`
+    above), not a raw trainable sigma directly, so the existing autograd
+    chain rule keeps it positive automatically."""
+    from sili import _cpu
+    qd, kd, vd = _attn_f32(q), _attn_f32(k), _attn_f32(v)
+    cd = np.ascontiguousarray(centers.data, dtype=np.float32)
+    sd = np.ascontiguousarray(sigmas.data, dtype=np.float32)
+    out_np = _cpu.gaussian_attention(qd, kd, vd, cd, sd, num_cpus, causal)
+    out = Tensor(out_np, (q, k, v, centers, sigmas), "gaussian_attention", q.backend)
+    def _bwd():
+        dQ, dK, dV, dC, dS = _cpu.gaussian_attention_backward(
+            qd, kd, vd, np.ascontiguousarray(out.grad, dtype=np.float32),
+            cd, sd, num_cpus, causal)
+        _acc(q, dQ); _acc(k, dK); _acc(v, dV); _acc(centers, dC); _acc(sigmas, dS)
+    out._backward = _bwd
+    return out
+
+
 def sparse_banded_attention(q: Tensor, k: Tensor, v: Tensor,
                             half_bandwidth: int, inner_k: int = 0,
                             num_cpus: int = 4, causal: bool = False) -> Tensor:
@@ -375,6 +448,22 @@ def sparse_banded_attention(q: Tensor, k: Tensor, v: Tensor,
 # ══════════════════════════════════════════════════════════════════════════════
 #  Gradient helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _unbroadcast_to(grad, target_shape: tuple):
+    """Sum `grad` down to `target_shape`, undoing whatever numpy
+    broadcasting happened in a forward op -- numpy right-aligns shapes,
+    so: drop any EXTRA leading axes grad has beyond target_shape's own
+    rank (sum them away entirely), then for each remaining axis where
+    target_shape is 1 but grad's is larger, sum over that axis
+    (keepdims, so the axis count still matches)."""
+    grad = np.asarray(grad)
+    while grad.ndim > len(target_shape):
+        grad = grad.sum(axis=0)
+    for i, t_dim in enumerate(target_shape):
+        if t_dim == 1 and grad.shape[i] != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
+
 
 def _acc(node: Tensor, grad) -> None:
     if node.grad is None:
