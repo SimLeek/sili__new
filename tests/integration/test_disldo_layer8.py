@@ -125,6 +125,49 @@ class TestDISLDOLayer8RankOneScale:
         assert layer._c.get_output_scale(0) == 1.0
 
 
+class TestDISLDOLayer8Synaptogenesis:
+    """Growth/pruning through the real C++/pybind path (build_probes ->
+    synap_row_step -> block4 promotion/demotion, delta_csr_memory.hpp).
+    Regression test for a real gap found this session: Block4View8 (the
+    class SparseLinearLayer8.block4 returns) was never registered with
+    pybind, so this raised "Unregistered type: Block4View8" from Python
+    despite compiling and working fine in pure C++ -- the underlying
+    promotion/demotion logic itself is validated much more thoroughly at
+    the C++ level (test_disldo_block4_promotion_fp8.cpp, under ASan)."""
+
+    def test_growth_and_block4_introspection_do_not_crash(self):
+        layer = DISLDOLayer8(8, 8, 256, num_cpus=1, rng=np.random.default_rng(0))
+        x = np.zeros((1, 8), dtype=np.float32)
+        for i in range(8):
+            xi = x.copy()
+            xi[0, i] = 1.0
+            layer._c.forward(xi)
+            layer._c.backward(np.ones((1, 8), dtype=np.float32), 0.05,
+                              lr_per_row_nnz=False, damp_by_importance=True)
+
+        layer._c.build_probes(1, per_row=True)
+        row = 0
+        for _ in range(8):
+            layer._c.synap_row_step(row, -1e9, 4)
+            row = (row + 1) % 8
+
+        # The real regression check: touching .block4 must not raise
+        # "Unregistered type" (or anything else).
+        assert layer._c.block4.tiles >= 0
+        assert layer._c.block4.synapses >= 0
+        assert np.all(np.isfinite(layer._c.weights_vals))
+        assert np.all(np.isfinite(layer._c.importance))
+
+        out = layer.forward(np.random.RandomState(1).randn(1, 8).astype(np.float32), learning_rate=0.05)
+        out.grad = np.ones_like(out.data)
+        out.backward()
+        assert np.all(np.isfinite(layer._c.weights_vals))
+
+        for i in range(8):
+            layer._c.synap_row_step(i, 1e9, 4)
+        assert layer._c.block4.tiles >= 0  # still reachable after pruning
+
+
 class TestDISLDOLayer8TrainingConvergence:
     """Real online-regression convergence check (predict a fixed random
     target layer's own output), comparable to DISLDOLayer32 at a

@@ -1232,6 +1232,27 @@ PYBIND11_MODULE(_cpu, m)
              " old value), not thrown, so training keeps running. Nonzero means"
              " some updates are being silently dropped under the current budget.");
 
+    // ── Block4View8 (FP8 counterpart, real bug found+fixed: this class was
+    //    never registered here, so SparseLinearLayer8.block4 raised
+    //    "Unregistered type" from Python despite compiling fine in C++) ──
+    py::class_<Block4View8>(m, "Block4View8")
+        .def_property_readonly("tiles",    &Block4View8::tiles,
+             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("synapses", &Block4View8::synapses,
+             "Number of synapses currently living in block4 (subset of nnz) --"
+             " purely observational.")
+        .def_property("switch_point", &Block4View8::get_switch_point, &Block4View8::set_switch_point,
+             "Tiles with <= switch_point live synapses may be packed into the"
+             " sparse-encoded tile layout instead of staying fully dense (see"
+             " block4.hpp: Block4Store8::switch_point, Block4Store8::maybe_compress)."
+             " 0 disables compression entirely. Default BLOCK4_SPARSE_MAX_COUNT8 (12).")
+        .def_property_readonly("dropped_growth_events", &Block4View8::dropped_growth_events,
+             "Count of backward/promotion value-updates to an existing tile that"
+             " couldn't be persisted because growing its storage would have"
+             " exceeded the memory budget -- declined (with the tile keeping its"
+             " old value), not thrown, so training keeps running. Nonzero means"
+             " some updates are being silently dropped under the current budget.");
+
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
     py::class_<SparseLinearLayer>(m, "SparseLinearLayer")
