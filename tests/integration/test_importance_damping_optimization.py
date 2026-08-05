@@ -1,40 +1,71 @@
 """
 tests/integration/test_importance_damping_optimization.py
 ──────────────────────────────────────────────────────────
-Does per-synapse importance (`ci`) damping the weight update
-(disldo_backward: `update = -effective_lr * g / (1 + |ci|)`, see
-linear_disldo.hpp) actually provide an optimization benefit, or is it
-just correctly-computed arithmetic that happens to also be plausible?
-tests/unit/test_scale_handling.cpp already covers the arithmetic
-extensively (gradient accumulation correctness, defaults, sum-first-
-then-apply-lr precision, joint value_scale*output_scale factoring) --
-grepped first to confirm none of it does an A/B convergence/stability
-comparison. This file is that comparison, not a duplicate.
+Does per-synapse importance (`ci`) damping the weight update actually
+provide an optimization benefit, or is it just correctly-computed
+arithmetic that happens to also be plausible? tests/unit/
+test_scale_handling.cpp already covers the arithmetic extensively
+(gradient accumulation correctness, defaults, sum-first-then-apply-lr
+precision, joint value_scale*output_scale factoring) -- grepped first
+to confirm none of it does an A/B convergence/stability comparison.
+This file is that comparison, not a duplicate.
 
-Mechanism under test: a synapse that keeps getting pushed the same
-direction accumulates |ci|, which shrinks ITS OWN subsequent updates --
-a per-synapse adaptive-learning-rate effect, closer in spirit to Adam's
-second-moment denominator than to a fixed learning rate. The prediction
-this test checks: at a learning rate aggressive enough to make a
-NAIVE, undamped fixed-step update oscillate/diverge, the damped
-version should stay meaningfully more stable -- at a learning rate
-gentle enough that neither oscillates, damping should have no
-particular advantage (pure step-shrinking, no stability problem to
-fix). Both regimes are checked below.
+REPLACED FORMULA (see linear_disldo.hpp's disldo_backward docstring,
+JOURNAL.md): `ci` used to be a raw, undecayed running SUM of SIGNED
+gradient (`ci -= g*effective_lr`, damped by `1+|ci|`) -- confirmed via
+a real sili_peridot RNN ablation to converge no better than plain SGD,
+because sign-oscillating (noisy) gradient pressure CANCELS in that
+sum, so damping barely engages exactly when it should. `ci` is now a
+decayed EMA of g^2 (RMSprop-style: `ci = beta2*ci + (1-beta2)*g*g`,
+damped by `sqrt(ci)+eps`) -- confirmed on the SAME real RNN task to
+reach essentially full-Adam convergence quality (loss ~0.005, 100%
+accuracy) at the identical storage budget (still one scalar/synapse).
+
+DIRECT, IMPORTANT TRADE-OFF, found empirically when this test was
+updated for the new formula (not guessed, not silently patched around):
+on THIS file's own task -- continuous MSE regression toward a fixed
+target, no learning-rate schedule -- the new RMSprop-style damping is
+consistently WORSE than the undamped update across every learning rate
+swept (0.05-0.5), not just noisier. This is expected, well-documented
+behavior of RMSprop/Adam-style adaptive methods (e.g. Wilson et al.
+2017, "The Marginal Value of Adaptive Gradient Methods in Machine
+Learning"): numerator and denominator shrink together near a minimum,
+so the step size doesn't naturally decay the way plain SGD's does,
+leaving adaptive methods sitting on a higher noise floor for tasks
+that need tight continuous convergence, absent external LR annealing.
+
+The real, validated win (see sili_peridot's JOURNAL.md and the RNN
+convergence-curve scripts, e.g. scripts/disldo_tanh_no_bptt_ablation.py
+and its dense/32-bit siblings) is real and large (loss ~1.1->0.005,
+100% accuracy, matching full Adam) -- but checked directly (not
+assumed) that it is NOT simply "classification beats regression": a
+small standalone single-layer logistic-regression classification task
+(sigmoid + binary cross-entropy, no recurrence) built to test that
+framing showed damping LOSING there too (0-1/5 seeds across several
+learning rates). The real win appears tied to something specific about
+the RNN task's structure -- one set of weights trained online across
+MANY sequences of varying length/content, each contributing only a
+single (mostly-one-tick) gradient sample -- not yet isolated further,
+and not cheaply reproducible as a small self-contained sili__new test
+without rebuilding a chunk of that structure here. Left as a real,
+open, DOCUMENTED gap rather than a fabricated small-task test standing
+in for it: trust the cross-repo sili_peridot evidence for the
+recurrent-task claim, this file's own tests for the regression
+trade-off specifically.
+
+Per direct decision: this is a real, accepted trade-off, not something
+to abstract away right now (a swappable-optimizer-shape mechanism is a
+real future option, not built here -- would add real complexity for a
+case this project doesn't currently need). The aggressive-LR test
+below is kept as a HONEST CHARACTERIZATION of that trade-off (documents
+what's true now, doesn't assert a "damping wins" claim that no longer
+holds for this task) rather than deleted or silently loosened.
 
 SparseLinearLayer.backward_dense's damp_by_importance parameter
-(new -- see linear_disldo.hpp/cpu_backend.cpp) makes this a true
-same-kernel A/B: same FP4 storage, same forward/backward code path,
-only whether `ci` is USED to shape the weight step differs. `ci`
-itself is tracked identically either way.
-
-Empirically explored before writing this (not guessed): swept
-learning rates 0.05-0.5 on a small sparse layer, found the effect is
-real but not universal on any single random seed at the aggressive
-end (6/7 seeds favored damping at lr=0.5, one reversed) -- so this
-test is a small multi-seed ENSEMBLE (aggregate + majority-of-trials),
-not a single cherry-picked seed, honestly reflecting that this is a
-statistical tendency of the mechanism, not a per-instance guarantee.
+(see linear_disldo.hpp/cpu_backend.cpp) makes this a true same-kernel
+A/B: same FP4 storage, same forward/backward code path, only whether
+`ci` is USED to shape the weight step differs. `ci` itself is tracked
+identically either way.
 """
 from __future__ import annotations
 
@@ -85,7 +116,7 @@ def _run_online_regression(layer, x_list, y_list, lr: float, damp: bool, rng_see
     _cpu.seed_fp4_stochastic_rng(rng_seed)
     losses = []
     for x, y in zip(x_list, y_list):
-        out = layer.forward_dense(x, 0.0).squeeze(0)
+        out = layer.forward_dense(x).squeeze(0)
         err = out - y
         losses.append(float(np.mean(err ** 2)))
         dy = (2.0 / len(y) * err).astype(np.float32)
@@ -101,18 +132,29 @@ def _make_task(n_in: int, n_out: int, k: int, n_steps: int, x_seed: int, target_
     rng = np.random.default_rng(x_seed)
     x_list = [rng.standard_normal(n_in).astype(np.float32) for _ in range(n_steps)]
     target_layer = _build_sparse_layer(n_in, n_out, k, seed=target_seed, scale=1.0)
-    y_list = [target_layer.forward_dense(x, 0.0).squeeze(0).copy() for x in x_list]
+    y_list = [target_layer.forward_dense(x).squeeze(0).copy() for x in x_list]
     return x_list, y_list
 
 
 class TestImportanceDampingAggressiveLearningRate:
-    """At a learning rate large enough to make the undamped update
-    oscillate, damping should measurably help -- both on average
-    across trials and in most individual trials."""
+    """HONEST CHARACTERIZATION, not a "damping wins" claim -- see module
+    docstring for the real trade-off this documents. Under the OLD
+    raw-signed-sum formula, damping reliably reduced aggregate
+    steady-state loss by ~10-18% on this exact task/LR/seed set. Under
+    the CURRENT RMSprop-style formula, re-measured directly (not
+    assumed) when this test was updated: damping is modestly WORSE on
+    aggregate (measured ~1.3x undamped's loss, wins roughly half of
+    individual trials, not most) -- expected given RMSprop-style
+    methods don't shrink step size near a continuous-regression minimum
+    the way plain SGD does, absent an LR schedule (see module
+    docstring). This test now asserts what's actually true: neither
+    variant diverges/blows up at this learning rate, and damped loss
+    stays within a bounded multiple of undamped's -- a real trade-off,
+    not a broken kernel."""
 
     N_IN, N_OUT, K = 8, 8, 5
     N_STEPS = 400
-    LR = 0.5  # empirically aggressive enough to destabilize the undamped case, see module docstring
+    LR = 0.5  # same LR the old formula's advantage was measured at
     TRIAL_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8]
 
     def _run_trial(self, seed: int):
@@ -127,7 +169,7 @@ class TestImportanceDampingAggressiveLearningRate:
         # init) dominating the comparison.
         return float(np.mean(losses_damp[-100:])), float(np.mean(losses_undamp[-100:]))
 
-    def test_damping_reduces_aggregate_steady_state_loss(self):
+    def test_neither_diverges_and_damped_stays_within_bounded_multiple(self):
         damp_means, undamp_means = [], []
         for seed in self.TRIAL_SEEDS:
             d, u = self._run_trial(seed)
@@ -142,19 +184,16 @@ class TestImportanceDampingAggressiveLearningRate:
         print(f"aggregate: damp={agg_damp:.4f} undamp={agg_undamp:.4f} "
              f"damping wins {n_wins}/{len(self.TRIAL_SEEDS)} trials")
 
-        # Aggregate: damping should be a real margin better on average,
-        # not just barely -- 10% is well inside what was measured
-        # empirically (~18% in exploration) with room for re-run noise.
-        assert agg_damp < agg_undamp * 0.9, (
-            f"expected damping to reduce aggregate steady-state loss by >=10%, got "
-            f"damp={agg_damp:.4f} undamp={agg_undamp:.4f}"
-        )
-        # Majority of individual trials: damping is a statistical
-        # tendency of the mechanism, not a per-instance guarantee (one
-        # of 7 seeds reversed during exploration) -- require most, not
-        # all, trials to favor it.
-        assert n_wins >= (len(self.TRIAL_SEEDS) * 2) // 3, (
-            f"expected damping to win most individual trials, got {n_wins}/{len(self.TRIAL_SEEDS)}"
+        assert np.all(np.isfinite(damp_means)) and np.all(np.isfinite(undamp_means))
+        # Real trade-off, not a broken kernel: damped is expected to run
+        # somewhat WORSE here (measured ~1.3x), not dramatically -- 2x is
+        # a generous bound catching an actual regression (e.g. a sign
+        # error in the new formula) without failing on ordinary re-run
+        # noise around the ~1.3x measured ratio.
+        assert agg_damp < agg_undamp * 2.0, (
+            f"damped loss blew up far past the expected/measured ~1.3x trade-off "
+            f"ratio -- damp={agg_damp:.4f} undamp={agg_undamp:.4f}, possible real "
+            f"regression in the RMSprop-style formula, not just the known trade-off"
         )
 
 

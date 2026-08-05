@@ -276,8 +276,23 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
         indices[row * k:(row + 1) * k] = cols
         values[row * k:(row + 1) * k]  = rng.standard_normal(k).astype(np.float32) * scale
         ptrs[row + 1] = ptrs[row] + k
-    c.load_weights(ptrs, indices, values)
-    c.equalize_to_capacity(per_row)
+    if hasattr(c, "equalize_to_capacity"):
+        # SparseLinearLayer (FP4) convention -- 3-arg load_weights,
+        # equalize_to_capacity grows per-row headroom for later
+        # synaptogenesis.
+        c.load_weights(ptrs, indices, values)
+        c.equalize_to_capacity(per_row)
+    else:
+        # DISLDOLayerV (32-bit DeltaCSRBiValues<float> fallback) --
+        # identical disldo_forward/backward math, no FP4 quantization.
+        # No equalize_to_capacity binding (no growth-headroom use case
+        # here -- this class exists for isolating FP4 quantization
+        # itself as a variable, not for synaptogenesis experiments) and
+        # load_weights takes an explicit importance array (zeros: fresh
+        # connections start with no accumulated importance, matching
+        # the FP4 class's own default).
+        importance = np.zeros_like(values)
+        c.load_weights(ptrs, indices, values, importance)
     return per_row
 
 
@@ -296,18 +311,36 @@ class DISLDOLayer(_SparseLayerBase):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
-    def forward(self, x, learning_rate: float = 0.0) -> Tensor:
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+                damp_by_importance: bool = True) -> Tensor:
         # forward_dense/backward_dense always return [batch, cols] --
         # even for a bare 1-D [cols] input, batch is implicitly 1, but
         # the OUTPUT shape stays 2-D regardless. Squeeze that back out
         # when the input was 1-D so a single online sample round-trips
         # to 1-D, matching this class's own no-batch-dimension
         # docstring; leave genuinely 2-D (batched) input alone.
+        #
+        # lr_per_row_nnz default True preserves prior behavior (was
+        # hardcoded) -- exists at all because it was previously
+        # unreachable from this wrapper: `learning_rate` silently meant
+        # "learning_rate / row_degree", not the literal rate passed in.
+        # That normalization exists to keep aggregate row updates
+        # comparable when synaptogenesis makes degree vary WITHIN a
+        # layer -- at uniform density (no synaptogenesis, or a
+        # deliberately dense/parameter-matched layer) it does nothing
+        # but silently shrink the effective rate by the row's degree.
+        # Pass False for a literal, degree-independent learning rate.
+        #
+        # forward_dense no longer takes learning_rate at all (see
+        # JOURNAL.md) -- it used to run its own gradient-free Hebbian
+        # importance update on every call, independent of whether a
+        # backward() would ever follow. Real weight/importance updates
+        # now happen ONLY in backward_dense, below.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
         was_1d = x_np.ndim == 1
-        out_np = self._c.forward_dense(x_np, learning_rate)
+        out_np = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         out = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
@@ -315,7 +348,58 @@ class DISLDOLayer(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
-                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=True)
+                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                             damp_by_importance=damp_by_importance)
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
+
+        out._backward = _bwd
+        return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISLDOLayer32 — same DISLDO math, DeltaCSRBiValues<float> (32-bit) instead
+#  of FP4BiPacked -- isolates FP4 quantization itself as a variable, not a
+#  synaptogenesis/production layer (no equalize_to_capacity, no block4
+#  promotion path exercised here). See JOURNAL.md: built specifically to
+#  separate "FP4's coarse quantization noise" from "the importance-damping
+#  update rule" as candidate explanations for DISLDO's training instability.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DISLDOLayer32(_SparseLayerBase):
+    """Same disldo_forward/disldo_backward kernels as DISLDOLayer, generic
+    over VALUES_TYPE -- this instantiation uses the 32-bit float fallback
+    (_cpu.DISLDOLayerV) instead of 4-bit FP4BiPacked. Same call convention
+    as DISLDOLayer (forward(x, learning_rate, lr_per_row_nnz,
+    damp_by_importance)).
+
+    NOT a general-purpose production layer: no equalize_to_capacity (no
+    growth-headroom use case here), no block4 promotion. Pure diagnostic
+    -- same math, no quantization, to isolate what FP4's coarseness
+    specifically contributes vs. the update-rule math itself."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
+                damp_by_importance: bool = True) -> Tensor:
+        if not isinstance(x, Tensor):
+            x = Tensor(np.asarray(x, dtype=np.float32))
+        x_np   = np.asarray(x.data, dtype=np.float32)
+        was_1d = x_np.ndim == 1
+        out_np = self._c.forward(x_np)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        out = Tensor(out_np, _children=(x,), _op="disldo32", backend=x.backend)
+
+        def _bwd():
+            if out.grad is not None:
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                       damp_by_importance=damp_by_importance)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -348,10 +432,17 @@ class SISLDOLayer(_SparseLayerBase):
         self.backprop_p = backprop_p
 
     def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
-        """x.data must be a CSR. grad flows back as a dense ndarray."""
+        """x.data must be a CSR. grad flows back as a dense ndarray.
+
+        `learning_rate` kept in this wrapper's own signature (matches
+        every other layer's forward() call convention throughout this
+        project) but no longer forwarded to forward_sparse -- it used to
+        run its own gradient-free Hebbian importance update on every
+        call, independent of whether backward() would ever follow. Real
+        weight/importance updates now happen ONLY in backward_sparse."""
         csr    = x.data
         out_np = self._c.forward_sparse(
-            csr.ptrs, csr.indices, csr.values, csr.rows, learning_rate).squeeze(0)
+            csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
         out    = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
 
         def _bwd():
@@ -658,21 +749,14 @@ class FoldedLayer(Module):
         Returns: sili Tensor [batch, out_dim]
 
         Wired into sili autograd: calling loss.backward() propagates through
-        this layer automatically. Two separate update paths run in the C++ kernels:
-
-          - forward_dense(x, lr) [this method]:
-              Computes output AND updates IMPORTANCE via activity correlation
-              (|x| * |h| * lr). This does NOT change weight values.
-              Importance tracks which connections are actively used, guiding
-              synaptogenesis pruning/growing decisions later.
-
-          - backward_dense(dy, lr) [_backward, called by loss.backward()]:
-              Updates WEIGHT VALUES via task gradient (standard backprop).
-              Also updates importance via gradient magnitude.
-              This is what enables the network to learn tasks.
-
-        Note: calling forward_dense with lr=0 disables importance tracking.
-        Weight values never change without a backward() call.
+        this layer automatically. forward_dense(x) [this method] is a pure
+        computation (no learning_rate, no side effects -- see JOURNAL.md:
+        it used to also update IMPORTANCE via activity correlation on every
+        call, independent of whether backward() would ever follow, a real
+        footgun now removed). backward_dense(dy, lr) [_backward, called by
+        loss.backward()] is the only place weight values AND importance
+        ever change, via the task gradient -- that's what enables the
+        network to learn tasks.
         """
         x_np = np.asarray(x.data, dtype=np.float32)
         squeezed = x_np.ndim == 1
@@ -680,10 +764,10 @@ class FoldedLayer(Module):
             x_np = x_np[np.newaxis, :]
         batch   = x_np.shape[0]
         out_dim = next(iter(self._out_dims.values()))
-        lr      = self.lr
+        lr      = self.lr  # used by the backward closure below, not forward
 
         # Single call per suffix -- the full stacked matrix is one layer.
-        raw_parts = [layer.forward_dense(x_np, lr)
+        raw_parts = [layer.forward_dense(x_np)
                      for layer in self._sili_layers.values()]
         raw_np = sum(raw_parts)   # [batch, n_folds * out_dim]
 
@@ -906,9 +990,9 @@ class FoldedColumnLayer(FoldedLayer):
         squeezed = x_np.ndim == 1
         if squeezed:
             x_np = x_np[np.newaxis, :]
-        lr = self.lr
+        lr = self.lr  # used by the backward closure below, not forward
 
-        raw_parts = [layer.forward_dense(x_np, lr)
+        raw_parts = [layer.forward_dense(x_np)
                      for layer in self._sili_layers.values()]
         raw_np = sum(raw_parts)   # [batch, n_folds*out_dim] -- kept as-is
         if squeezed:
@@ -1209,7 +1293,7 @@ def apply_fold_skip(skip_layer, x: "Tensor", lr: float = 0.01) -> "Tensor":
     if squeezed:
         x_np = x_np[np.newaxis, :]
 
-    out_np = skip_layer.forward_dense(x_np, lr)
+    out_np = skip_layer.forward_dense(x_np)
     if squeezed:
         out_np = out_np.squeeze(0)
     out = Tensor(out_np, _children=(x,), _op="fold_skip", backend=x.backend)

@@ -186,7 +186,7 @@ class TestBuildFoldSkipLayer:
         layer = build_fold_skip_layer(n_folds, out_dim, num_cpus=1)
         total = n_folds * out_dim
         x = Tensor(np.random.randn(total).astype(np.float32))
-        out_np = layer.forward_dense(x.data[np.newaxis, :], 0.1)
+        out_np = layer.forward_dense(x.data[np.newaxis, :])
         assert np.all(np.isfinite(out_np))
         # All-zero weights -> all-zero output pre-training, regardless of x.
         assert np.allclose(out_np, 0.0)
