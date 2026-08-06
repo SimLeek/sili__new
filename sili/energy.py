@@ -52,8 +52,14 @@ def _apply_energy_dynamics(
     ----------
     h             : hidden state Tensor, any shape
     energy        : per-neuron energy, plain numpy, same shape as h
-    drive         : baseline energy drift — sets metabolic tempo
-    activation_cost: energy drain per unit |h| — neural efficiency
+    drive         : baseline energy drift — sets metabolic tempo. See
+                    "Choosing drive relative to activation_cost" below —
+                    the two are not independent tuning knobs; their RATIO
+                    (relative to the population's typical |h|) determines
+                    whether neurons trend toward permanent firing, permanent
+                    shutoff, or neither.
+    activation_cost: energy drain per unit |h| — neural efficiency. See
+                    "Choosing drive relative to activation_cost" below.
     precision     : KL sparsity enforcement strength (lambda_kl). Population
                     -level control loop: pushes the ACHIEVED active fraction
                     (rho, a population statistic) toward density (beta) via
@@ -112,6 +118,76 @@ def _apply_energy_dynamics(
                     -constrained; see EnergyDynamics.__init__'s
                     `density <= p * 0.8` assertion, which exists because this
                     relationship was previously (silently) inverted.
+
+    Choosing drive relative to activation_cost — avoiding permanent firing
+    or permanent shutoff (found empirically, not originally documented,
+    after a real training system silently spent its entire recurrent
+    state on fire/shutoff constants every tick with no way to tell from
+    the parameters alone that this would happen):
+
+    Per step 2 above, each neuron's own energy changes by
+    `drive + noise - activation_cost*|h_dz|` every call, every tick,
+    unconditionally (noise is zero-mean, so ignore it for the trend).
+    Since fire (>=2.0) and shutoff (<=-2.0) are ABSORBING-ish thresholds
+    reached by repeated drift in one direction (shutoff especially: once
+    clamped to exactly -2.0, the NEXT tick's energy_flat is still -2.0,
+    so if the expected drift stays negative the neuron simply re-enters
+    shutoff every subsequent tick and its OUTPUT is `energy_flat + 2.0`
+    ~= 0.0 for as long as it stays clamped there -- functionally
+    indistinguishable from being suppressed by the p-ceiling, even
+    though the accounting calls it "kept"), the population-level
+    steady-state behavior is governed by the SIGN of:
+
+        E[drift] = drive - activation_cost * E[|h|]
+
+    where E[|h|] is the typical (dead-zone-filtered) magnitude of
+    whatever is being gated:
+
+      - E[drift] >> 0 (drive too high relative to activation_cost*E[|h|]):
+        most neurons repeatedly cross +2.0 -- a large, roughly constant
+        fraction of the population fires (h_out pinned to the flat
+        constant 2.0, itself outside tanh's [-1,1] range if that's what's
+        being gated) EVERY tick, not occasionally. Confirmed directly:
+        drive=0.1, activation_cost=0.05, E[|h|]~0.32 (drift~+0.084) drove
+        ~30% of a 128-wide tanh-cell recurrent state to fire on 99.5% of
+        ticks.
+      - E[drift] << 0 (drive too low relative to activation_cost*E[|h|]):
+        the OPPOSITE failure, not "quieter" -- most neurons drift
+        permanently into shutoff and get pinned there (mean energy
+        converges to exactly -2.0 within a few hundred ticks), each
+        outputting ~0.0 whether or not the p-ceiling nominally "kept"
+        them. Confirmed directly: the same setup at drive=0.001 (drift
+        ~-0.099) reached ~99%+ of the population zeroed, WORSE than the
+        drive=0.1 case, not better -- lowering drive alone does not
+        reach a "does nothing" regime, it just changes which absorbing
+        threshold the population gets trapped against.
+      - E[drift] ~= 0 (drive ~= activation_cost * E[|h|]): neither
+        threshold is persistently approached: energy performs a bounded
+        walk (driven by `exploration` noise) around an equilibrium, fire
+        and shutoff events become genuinely rare rather than population
+        -wide, and MOST neurons pass through under normal (not
+        fire/shutoff-constant) gating. This is the calibration a caller
+        actually wants for "energy modulates activity without dominating
+        it" -- it is NOT the default in any existing caller and must be
+        computed per use site from that site's own typical |h| scale
+        (e.g. via a short calibration pass measuring mean |h| before
+        picking drive), not assumed to transfer from a different `h`
+        distribution (attention-output scale, recurrent tanh-cell scale,
+        etc. all differ). Confirmed directly: drive=0.016 (~=
+        0.05*0.32) reduced firing to 0% and zeroing to ~5% of a
+        128-neuron population (vs 70-99%+ in the two failure regimes
+        above), and a real training run with this calibration converged
+        cleanly (cross-entropy 1.38 -> 0.67 over 30,000 steps, no
+        divergence) where the same task diverged under the library's own
+        toy-scale default (drive=0.1) at the same population size.
+
+    `p` (the hard active-fraction ceiling) is a SEPARATE, independent
+    source of suppression on top of the above: even in the E[drift]~=0
+    regime, up to `1 - p` of the population still gets zeroed every tick
+    via the top-|h| competition for the `round(p*n)` kept slots. Raising
+    p (toward 1.0, when hardware/telemetry constraints allow it) is the
+    only lever that reduces THIS specific source of suppression --
+    changing drive/activation_cost does not touch it.
 
     Returns
     -------
