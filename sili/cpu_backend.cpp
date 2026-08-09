@@ -1033,7 +1033,14 @@ public:
 // started here; this class's own docstring/PR should be updated when
 // that lands rather than silently claiming feature parity it doesn't
 // have yet.
-class SparseLinearLayer8 {
+// Templated over ScalePolicy/DeferredScaleWrite (see delta_csr_types.hpp's
+// ScalePolicy docstring and linear_disldo.hpp's disldo_backward) so the
+// three real, compiled variants below (SparseLinearLayer8 = today's exact
+// behavior, SparseLinearLayer8Resync, SparseLinearLayer8AdaMax) share ONE
+// implementation instead of three hand-copied classes -- only backward()'s
+// disldo_backward<...> call site actually differs between them.
+template <typename ScalePolicy = RMSpropScalePolicy<float>, bool DeferredScaleWrite = false>
+class SparseLinearLayer8Impl {
 public:
     using S = int;
     using V = float;
@@ -1052,7 +1059,7 @@ public:
     std::size_t    _idx_budget_bytes = 4096;
     std::size_t    _val_budget_nnz   = 64;
 
-    SparseLinearLayer8(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
+    SparseLinearLayer8Impl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus),
           _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
           _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
@@ -1127,7 +1134,7 @@ public:
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        disldo_backward<S, VT, COL_TYPE>(
+        disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
@@ -1210,6 +1217,16 @@ public:
         return result;
     }
 };
+
+// Real, compiled variants -- see SparseLinearLayer8Impl's own docstring.
+// SparseLinearLayer8 is EXACTLY today's behavior (both defaults), the other
+// two are the real (not fake-quantize-simulated) test of whether fixing
+// value_scale/output_scale's staleness (Resync) and/or its update rule
+// (AdaMax) closes the out-of-context gap found in sili_peridot's toy
+// simulation -- see delta_csr_types.hpp's ScalePolicy docstring.
+using SparseLinearLayer8       = SparseLinearLayer8Impl<>;
+using SparseLinearLayer8Resync = SparseLinearLayer8Impl<RMSpropScalePolicy<float>, true>;
+using SparseLinearLayer8AdaMax = SparseLinearLayer8Impl<AdaMaxScalePolicy<float>, true>;
 
 PYBIND11_MODULE(_cpu, m)
 {
@@ -1557,6 +1574,121 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_outputs", &SparseLinearLayer8::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8::nnz)
         .def_property_readonly("block4",    &SparseLinearLayer8::block4, py::keep_alive<0, 1>());
+
+    // SparseLinearLayer8Resync: exact SparseLinearLayer8 API, but the real
+    // DeferredScaleWrite fix (value_scale/output_scale stay consistent with
+    // stored codes -- see SparseLinearLayer8Impl/ScalePolicy docstrings).
+    py::class_<SparseLinearLayer8Resync>(m, "SparseLinearLayer8Resync")
+        .def(py::init<int, int, int, int>(),
+             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
+             py::arg("num_cpus") = 4)
+        .def("forward",              &SparseLinearLayer8Resync::forward,
+             py::arg("x"))
+        .def("backward",             &SparseLinearLayer8Resync::backward,
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+        .def("build_probes",         &SparseLinearLayer8Resync::build_probes,
+             py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step",       &SparseLinearLayer8Resync::synap_row_step,
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum",           &SparseLinearLayer8Resync::zero_accum)
+        .def_property_readonly("neuron_input_accum", &SparseLinearLayer8Resync::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8Resync::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",       &SparseLinearLayer8Resync::get_weights_vals)
+        .def_property_readonly("importance",         &SparseLinearLayer8Resync::get_importance)
+        .def_property_readonly("indices",            &SparseLinearLayer8Resync::get_indices)
+        .def_property_readonly("ptrs",               &SparseLinearLayer8Resync::get_ptrs)
+        .def("load_weights",        &SparseLinearLayer8Resync::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("get_value_scale",      &SparseLinearLayer8Resync::get_value_scale,
+             py::arg("row"),
+             "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
+             "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
+             "mechanism SparseLinearLayer (FP4) uses.")
+        .def("set_value_scale_raw",  &SparseLinearLayer8Resync::set_value_scale_raw,
+             py::arg("row"), py::arg("scale"),
+             "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
+             "same convention as SparseLinearLayer::set_value_scale_raw.")
+        .def("get_output_scale",     &SparseLinearLayer8Resync::get_output_scale,
+             py::arg("col"),
+             "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
+             "any column not yet touched.")
+        .def("set_output_scale_raw", &SparseLinearLayer8Resync::set_output_scale_raw,
+             py::arg("col"), py::arg("scale"),
+             "Set output_scale[col] directly. Calling this at least once makes\n"
+             "output_scale gradient-trainable in backward(), like value_scale --\n"
+             "this is what makes the row+col scale genuinely rank-1, matching the\n"
+             "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def_property_readonly("out_degree", [](const SparseLinearLayer8Resync& self) {
+            return py::array_t<SparseLinearLayer8Resync::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(SparseLinearLayer8Resync::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
+        .def_readonly ("num_cpus",  &SparseLinearLayer8Resync::num_cpus)
+        .def_property_readonly("n_inputs",  &SparseLinearLayer8Resync::n_inputs)
+        .def_property_readonly("n_outputs", &SparseLinearLayer8Resync::n_outputs)
+        .def_property_readonly("nnz",       &SparseLinearLayer8Resync::nnz)
+        .def_property_readonly("block4",    &SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>());
+
+    // SparseLinearLayer8AdaMax: exact SparseLinearLayer8 API, but with the
+    // AdaMax-style decayed-running-max scale update (also with the
+    // DeferredScaleWrite fix -- AdaMax's growth-is-instant safety property
+    // only matters if the stored code actually reflects it).
+    py::class_<SparseLinearLayer8AdaMax>(m, "SparseLinearLayer8AdaMax")
+        .def(py::init<int, int, int, int>(),
+             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
+             py::arg("num_cpus") = 4)
+        .def("forward",              &SparseLinearLayer8AdaMax::forward,
+             py::arg("x"))
+        .def("backward",             &SparseLinearLayer8AdaMax::backward,
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+        .def("build_probes",         &SparseLinearLayer8AdaMax::build_probes,
+             py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step",       &SparseLinearLayer8AdaMax::synap_row_step,
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum",           &SparseLinearLayer8AdaMax::zero_accum)
+        .def_property_readonly("neuron_input_accum", &SparseLinearLayer8AdaMax::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8AdaMax::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",       &SparseLinearLayer8AdaMax::get_weights_vals)
+        .def_property_readonly("importance",         &SparseLinearLayer8AdaMax::get_importance)
+        .def_property_readonly("indices",            &SparseLinearLayer8AdaMax::get_indices)
+        .def_property_readonly("ptrs",               &SparseLinearLayer8AdaMax::get_ptrs)
+        .def("load_weights",        &SparseLinearLayer8AdaMax::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("get_value_scale",      &SparseLinearLayer8AdaMax::get_value_scale,
+             py::arg("row"),
+             "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
+             "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
+             "mechanism SparseLinearLayer (FP4) uses.")
+        .def("set_value_scale_raw",  &SparseLinearLayer8AdaMax::set_value_scale_raw,
+             py::arg("row"), py::arg("scale"),
+             "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
+             "same convention as SparseLinearLayer::set_value_scale_raw.")
+        .def("get_output_scale",     &SparseLinearLayer8AdaMax::get_output_scale,
+             py::arg("col"),
+             "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
+             "any column not yet touched.")
+        .def("set_output_scale_raw", &SparseLinearLayer8AdaMax::set_output_scale_raw,
+             py::arg("col"), py::arg("scale"),
+             "Set output_scale[col] directly. Calling this at least once makes\n"
+             "output_scale gradient-trainable in backward(), like value_scale --\n"
+             "this is what makes the row+col scale genuinely rank-1, matching the\n"
+             "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def_property_readonly("out_degree", [](const SparseLinearLayer8AdaMax& self) {
+            return py::array_t<SparseLinearLayer8AdaMax::S>(
+                {(py::ssize_t)self.weights.out_degree.size()},
+                {sizeof(SparseLinearLayer8AdaMax::S)},
+                self.weights.out_degree.data(),
+                py::cast(&self));
+        })
+        .def_readonly ("num_cpus",  &SparseLinearLayer8AdaMax::num_cpus)
+        .def_property_readonly("n_inputs",  &SparseLinearLayer8AdaMax::n_inputs)
+        .def_property_readonly("n_outputs", &SparseLinearLayer8AdaMax::n_outputs)
+        .def_property_readonly("nnz",       &SparseLinearLayer8AdaMax::nnz)
+        .def_property_readonly("block4",    &SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>());
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

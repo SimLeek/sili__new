@@ -458,6 +458,37 @@ class DISLDOLayer8(_SparseLayerBase):
         return out
 
 
+class DISLDOLayer8Resync(DISLDOLayer8):
+    """Real DISLDOLayer8 (true C++ E4M3 storage, not a fake-quantize
+    simulation) with the DeferredScaleWrite fix: touched entries'
+    stored codes are written out only after value_scale/output_scale
+    are both finalized for the backward() call, instead of immediately
+    under the stale pre-update scale. Direct test of whether that
+    staleness (not the update RULE) explains the real-vs-simulation
+    out-of-context gap found in sili_peridot's toy quantization sweep
+    -- see delta_csr_types.hpp's ScalePolicy docstring and
+    linear_disldo.hpp's disldo_backward for the mechanism, and
+    sili_peridot/JOURNAL.md's 2026-08-09 tile-recurrence entries for
+    the investigation this was built to answer."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayer8Resync(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
+class DISLDOLayer8AdaMax(DISLDOLayer8):
+    """Same as DISLDOLayer8Resync (DeferredScaleWrite also on), but
+    value_scale/output_scale use an AdaMax-style decayed running-max
+    update instead of RMSprop -- see AdaMaxScalePolicy's own docstring,
+    delta_csr_types.hpp."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayer8AdaMax(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SISLDOLayer — Sparse Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
