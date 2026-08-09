@@ -408,6 +408,24 @@ struct AdaMaxScalePolicy {
     }
 };
 
+// No-op: scale/scale_state are never touched, so scale stays at whatever
+// it was initialized/set to (value_type(1) by default -- see
+// SparseLinearWeightsDelta's value_scale.resize(n, value_type(1)) --
+// i.e. value_scale[row]*output_scale[col] is permanently the identity
+// multiply, true_w == stored_w). Direct real-hardware test of the
+// "zero trained scale" hypothesis (sili_peridot's fixed_digit_residual_
+// quantize/TrueMultiDigitLayer work) instead of just fixing staleness --
+// use with DeferredScaleWrite=true or false, doesn't matter here since
+// there's nothing to defer (scale never changes either way).
+template <typename VALUE_TYPE>
+struct NoScalePolicy {
+    static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
+                        VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
+                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/) {
+        // Intentionally does nothing.
+    }
+};
+
 // ── Layout metadata ───────────────────────────────────────────────────────────
 
 struct DeltaCSRLayout {

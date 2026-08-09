@@ -417,9 +417,22 @@ void disldo_forward(
 // JOURNAL.md for why this scope was chosen (block4 promotion only
 // fires from synaptogenesis, so scattered-only already covers every
 // layer that hasn't triggered growth yet).
+// StochasticRounding (default true, current behavior): scattered-path
+// weight/importance stores use ValueAccessor::set_stochastic (unbiased
+// dithered rounding, real per-step noise) when true, or the deterministic
+// nearest-neighbour ValueAccessor::set (fp4_quantize/fp8 equivalent, zero
+// added noise) when false. Scoped to the scattered path only, same as
+// ScalePolicy/DeferredScaleWrite above -- block4's dense-tile SIMD
+// quantize_stochastic calls are untouched (real follow-up, not yet needed:
+// no toy config here triggers block4 promotion). Built to test whether
+// real FP4's per-step dithered rounding, not value_scale staleness, is
+// what makes it collapse to chance where a deterministic-rounding fp32
+// shadow control (sili_peridot's fixed_digit_residual_quantize /
+// TrueMultiDigitLayer's simulate_quantize) succeeds by a wide margin --
+// see sili_peridot/JOURNAL.md.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
           typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
-          bool DeferredScaleWrite = false>
+          bool DeferredScaleWrite = false, bool StochasticRounding = true>
 void disldo_backward(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,
     SIZE_TYPE    batch,
@@ -617,7 +630,11 @@ void disldo_backward(
                         local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
                         local_max_new_i = std::max(local_max_new_i, std::abs(ci));
                     } else {
-                        ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                        if constexpr (StochasticRounding) {
+                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                        } else {
+                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                        }
                         const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                         local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
@@ -1439,9 +1456,15 @@ void disldo_backward(
                     const value_type final_out_imp_scale = weights.get_output_importance_scale(entry.col);
                     const value_type final_combined_scale = final_val_scale * final_out_scale;
                     const value_type final_combined_imp_scale = final_imp_scale * final_out_imp_scale;
-                    ValueAccessor<VALUES_TYPE>::set_stochastic(
-                        dc.values, entry.vb,
-                        entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
+                    if constexpr (StochasticRounding) {
+                        ValueAccessor<VALUES_TYPE>::set_stochastic(
+                            dc.values, entry.vb,
+                            entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
+                    } else {
+                        ValueAccessor<VALUES_TYPE>::set(
+                            dc.values, entry.vb,
+                            entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
+                    }
                 }
             }
         }

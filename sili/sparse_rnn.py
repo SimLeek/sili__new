@@ -358,6 +358,77 @@ class DISLDOLayer(_SparseLayerBase):
         return out
 
 
+class DISLDOLayerResync(DISLDOLayer):
+    """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
+    simulation) with the DeferredScaleWrite fix applied -- the FP4
+    counterpart of DISLDOLayer8Resync. Plain DISLDOLayer/SparseLinearLayer
+    used the DEFAULT ScalePolicy/DeferredScaleWrite=false template args
+    (the same stale-code path SparseLinearLayer8Resync was built to fix
+    for FP8), never updated when that fix landed -- see
+    sili_peridot/JOURNAL.md's TrueMultiDigitLayer entry: real FP4
+    per-digit training collapsed to chance while an architecturally
+    identical fp32-shadow control succeeded by a wide margin, which is
+    what prompted checking whether FP4 had this same staleness bug too."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayerResync(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
+class DISLDOLayerNoScale(DISLDOLayer):
+    """Real DISLDOLayer (true C++ FP4 storage) with value_scale/
+    output_scale permanently forced to 1.0 -- never trained, nothing to
+    go stale, direct hardware test of the "zero trained scale" design
+    (sili_peridot's fixed_digit_residual_quantize/TrueMultiDigitLayer
+    work) instead of just fixing the staleness bug. See NoScalePolicy's
+    docstring, delta_csr_types.hpp."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayerNoScale(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
+class DISLDOLayerDeterministic(DISLDOLayer):
+    """Real DISLDOLayer (true C++ FP4 storage), same RMSprop scale handling
+    as plain DISLDOLayer, but the weight/importance store uses deterministic
+    nearest-neighbour rounding (fp4_quantize) instead of stochastic dithered
+    rounding (fp4_quantize_stochastic). Isolates rounding noise from any
+    value_scale mechanism -- built after DISLDOLayerResync/NoScale both
+    still collapsed to chance on sili_peridot's out-of-context curriculum,
+    to test whether real FP4's per-step stochastic rounding (not value_scale
+    staleness) is what the deterministic-rounding fp32-shadow controls
+    (fixed_digit_residual_quantize, TrueMultiDigitLayer's simulate_quantize)
+    were actually avoiding. See StochasticRounding's docstring,
+    linear_disldo.hpp."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
+class DISLDOLayerResyncDeterministic(DISLDOLayer):
+    """DeferredScaleWrite fix + deterministic rounding together."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayerResyncDeterministic(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
+class DISLDOLayerNoScaleDeterministic(DISLDOLayer):
+    """value_scale/output_scale forced off + deterministic rounding
+    together -- the closest real-hardware match to the zero-trained-scale,
+    deterministic-quantize design of fixed_digit_residual_quantize."""
+
+    def __init__(self, in_features: int, out_features: int, max_weights: int,
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+        self._c = _cpu.SparseLinearLayerNoScaleDeterministic(in_features, out_features, max_weights, num_cpus)
+        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer32 — same DISLDO math, DeltaCSRBiValues<float> (32-bit) instead
 #  of FP4BiPacked -- isolates FP4 quantization itself as a variable, not a
