@@ -472,6 +472,29 @@ inline void block4_row_shift(
     std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
     std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
 {
+    // Real bug found via ASan (heap-buffer-overflow READ, downstream of
+    // this function shrinking a row's allocation below what it's
+    // ALREADY using): this function redistributes/resizes row `row`'s
+    // headroom toward the three target_* allocations, but never checked
+    // those targets against row `row`'s own CURRENT usage before this
+    // fix -- called from equalize_step() (redistributes toward the
+    // AVERAGE allocation across every row) as well as
+    // block4_ensure_row_headroom()'s growth path. A row using more than
+    // the average would get its allocation shrunk below its own used
+    // bytes, immediately violating the "used <= capacity" invariant
+    // this shares with merge_row_workspace's own fix (see that
+    // function's comment, block4.hpp) -- same class of bug, different
+    // code path, found the same way (row_ti_start/row_nnz still agreed
+    // with block_layout, but tile_byte_end[row] no longer fit within
+    // tile_byte_start[row+1] after an equalizer_step() cycle). Clamp
+    // each target up to at least this row's own current usage --
+    // redistribution/growth still fully succeeds, it just can't shrink
+    // a row past what's genuinely already stored in it. Shared by both
+    // Block4Store (FP4) and Block4Store8 (FP8) -- one fix covers both.
+    target_idx_byte_alloc  = std::max(target_idx_byte_alloc,  L.byte_end[row] - L.byte_start[row]);
+    target_tile_byte_alloc = std::max(target_tile_byte_alloc, tbyte_end[row] - tbyte_start[row]);
+    target_elem_alloc      = std::max(target_elem_alloc,      L.elem_end[row] - L.elem_start[row]);
+
     // indices_buf byte side (uleb128 column deltas)
     const std::size_t cur_idx_alloc = L.row_alloc_bytes(row);
     if (cur_idx_alloc != target_idx_byte_alloc && row + 1 < L.rows) {
@@ -939,6 +962,24 @@ struct Block4Store {
 
     std::uint32_t tile_data_grow_lock = 0;
 
+    // merge_row_workspace's own drop counters -- distinct from
+    // dropped_growth_events above (a per-TILE commit growth failure)
+    // since this is a per-ROW eviction+merge shortfall: this row's
+    // structural minimum footprint (>= 1 byte per distinct block-column
+    // touched, even once every slot in it is evicted to empty) still
+    // exceeds its allocated headroom after eviction already ran. Same
+    // philosophy as dropped_growth_events: no lock, no throw, no inline
+    // grow (this runs inside disldo_backward's #pragma omp parallel
+    // region, and growing the shared tile_data here would be a genuine
+    // multi-threaded resize race against other rows' in-flight reads --
+    // real callers use num_cpus>1) -- the write-back is clamped to
+    // whatever whole tiles fit in the existing headroom, the row's
+    // trailing tiles silently keep their PRE-this-call content, and the
+    // network keeps training. This counter is the signal that
+    // expand_headroom_to() needs a bigger budget for this layer.
+    std::uint64_t row_merge_overflow_events = 0;
+    std::uint64_t row_merge_overflow_bytes_dropped = 0;
+
     // Persistent scratch buffers for disldo_forward/disldo_backward
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
@@ -1231,17 +1272,65 @@ struct Block4Store {
                 }
                 pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[pos]);
             }
-            if (best_abs_imp < 0.0) break; // nothing live left to evict (shouldn't happen -- see caller)
+            if (best_abs_imp < 0.0) break; // nothing live left to evict -- see the
+                                            // clamp fallback right below for why
+                                            // this can genuinely happen.
             uint8_t scratch[BLOCK4_TILE_SLOTS];
             unpack_workspace_tile(ws, best_e, best_local_pos, scratch);
             scratch[Block4Tile::slot_index(best_li, best_lj)] = 0;
             commit_dirty_tile_in_workspace(ws, best_e, best_local_pos, scratch);
             ++evicted;
         }
-        std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(ws.local_tbyte_end[0]),
+        // Real bug found via ASan (heap-buffer-overflow READ in
+        // unpack_workspace_tile, downstream of this function's write-back
+        // formerly being unconditional): eviction above is the PREFERRED
+        // mechanism for staying within this row's existing headroom (keeps
+        // nnz bounded via importance-based pruning, matching
+        // synaptogenesis's own max_row_weights cap). But eviction alone
+        // can't always reduce far enough: each of this row's `row_nnz`
+        // distinct block-columns needs at least 1 byte of PER-TILE
+        // structural overhead even once every slot in it is evicted to
+        // empty (block4_sparse_packed_len(0) == 1), so a row touching many
+        // distinct columns can have a genuine minimum footprint above
+        // global_headroom that no amount of eviction can shrink -- the
+        // while loop above then exits via the "nothing live left to evict"
+        // break, STILL over budget. Confirmed directly via a debug walk:
+        // tile_byte_end found already 7 bytes past its own row's capacity
+        // ceiling after several synaptogenesis growth cycles, corrupting
+        // the next row's stored bytes.
+        //
+        // Same philosophy as dropped_growth_events (commit_dirty_sparse_tile,
+        // above): no lock, no throw, no inline grow of the SHARED tile_data
+        // -- this runs inside disldo_backward's #pragma omp parallel region
+        // (one thread per block-row range), and real callers use
+        // num_cpus>1, so resizing the shared store here would be a genuine
+        // multi-threaded reallocation race against other rows' in-flight
+        // reads, not just a hypothetical. Instead: clamp the write-back to
+        // however many WHOLE tiles fit within global_headroom (found by
+        // re-walking ws.bytes, which is self-consistent by construction --
+        // never a partial/mid-tile cut), leave this row's remaining
+        // trailing tiles at their PRE-this-call content in the real store
+        // (silently not receiving this step's update), and keep training.
+        // row_merge_overflow_events/_bytes_dropped is the signal a caller
+        // should watch to know when this layer's max_row_weights genuinely
+        // needs expand_headroom_to() with a bigger budget.
+        std::size_t fit_pos = 0, fit_tiles = 0;
+        for (std::size_t e = 0; e < ws.row_nnz; ++e) {
+            if (fit_pos >= ws.bytes.size()) break;
+            const std::size_t tlen = block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[fit_pos]);
+            if (fit_pos + tlen > global_headroom) break;
+            fit_pos += tlen;
+            ++fit_tiles;
+        }
+        if (fit_tiles < ws.row_nnz) {
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_bytes_dropped)
+                .fetch_add(ws.local_tbyte_end[0] - fit_pos, std::memory_order_relaxed);
+        }
+        std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(fit_pos),
                    tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
-        tile_byte_end[br] = tile_byte_start[br] + ws.local_tbyte_end[0];
-        std::copy(ws.is_sparse.begin(), ws.is_sparse.end(),
+        tile_byte_end[br] = tile_byte_start[br] + fit_pos;
+        std::copy(ws.is_sparse.begin(), ws.is_sparse.begin() + std::ptrdiff_t(fit_tiles),
                    tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
         return evicted;
     }
@@ -1387,6 +1476,11 @@ struct Block4Store8 {
 
     std::uint64_t dropped_growth_events = 0;
     std::uint32_t tile_data_grow_lock = 0;
+
+    // See Block4Store::row_merge_overflow_events' own comment (block4.hpp,
+    // above) -- identical mechanism, mirrored here for FP8.
+    std::uint64_t row_merge_overflow_events = 0;
+    std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
     std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
@@ -1664,10 +1758,27 @@ struct Block4Store8 {
             commit_dirty_tile_in_workspace(ws, best_e, best_local_pos, scratch);
             ++evicted;
         }
-        std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(ws.local_tbyte_end[0]),
+        // Same fix as Block4Store::merge_row_workspace (block4.hpp,
+        // above) -- see its comment for the full ASan-found bug this
+        // replaced. Clamp the write-back to however many WHOLE tiles fit
+        // within global_headroom instead of writing back unconditionally.
+        std::size_t fit_pos = 0, fit_tiles = 0;
+        for (std::size_t e = 0; e < ws.row_nnz; ++e) {
+            if (fit_pos >= ws.bytes.size()) break;
+            const std::size_t tlen = block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[fit_pos]);
+            if (fit_pos + tlen > global_headroom) break;
+            fit_pos += tlen;
+            ++fit_tiles;
+        }
+        if (fit_tiles < ws.row_nnz) {
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_bytes_dropped)
+                .fetch_add(ws.local_tbyte_end[0] - fit_pos, std::memory_order_relaxed);
+        }
+        std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(fit_pos),
                    tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
-        tile_byte_end[br] = tile_byte_start[br] + ws.local_tbyte_end[0];
-        std::copy(ws.is_sparse.begin(), ws.is_sparse.end(),
+        tile_byte_end[br] = tile_byte_start[br] + fit_pos;
+        std::copy(ws.is_sparse.begin(), ws.is_sparse.begin() + std::ptrdiff_t(fit_tiles),
                    tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
         return evicted;
     }
