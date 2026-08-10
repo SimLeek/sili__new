@@ -45,6 +45,18 @@ public:
     // detect and react (equalizer_step()/expand_headroom(), or just
     // accepting some updates are being dropped under the current budget).
     std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
+    // How many times a row's write-back in merge_row_workspace couldn't
+    // fit its full content within the row's existing headroom even
+    // after eviction ran (see block4.hpp: Block4Store::
+    // merge_row_workspace's own comment for the real bug this
+    // replaced -- an unconditional write-back that silently corrupted
+    // the next row). Same declined-not-thrown philosophy as
+    // dropped_growth_events: the row's trailing tiles keep their
+    // pre-call content and training keeps running. Watch this counter
+    // (and _bytes below) to know when this layer's max_row_weights
+    // genuinely needs expand_headroom_to() with a bigger budget.
+    std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
+    std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
 private:
     Block4Store* store;
 };
@@ -62,6 +74,8 @@ public:
     uint32_t get_switch_point() const { return store->switch_point; }
     void set_switch_point(uint32_t v) { store->switch_point = v; }
     std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
+    std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
+    std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
 private:
     Block4Store8* store;
 };
@@ -1284,7 +1298,21 @@ PYBIND11_MODULE(_cpu, m)
              " couldn't be persisted because growing its storage would have"
              " exceeded the memory budget -- declined (with the tile keeping its"
              " old value), not thrown, so training keeps running. Nonzero means"
-             " some updates are being silently dropped under the current budget.");
+             " some updates are being silently dropped under the current budget.")
+        .def_property_readonly("row_merge_overflow_events", &Block4View::row_merge_overflow_events,
+             "Count of backward() calls where a row's block4 write-back couldn't"
+             " fit its full content within the row's existing headroom, even"
+             " after evicting every low-importance synapse it could (each"
+             " distinct block-column touched needs >=1 byte of structural"
+             " overhead that eviction alone can't shrink away). Declined, not"
+             " thrown -- the row's trailing tiles keep their pre-call content"
+             " and training keeps running. Nonzero means this layer's"
+             " max_row_weights genuinely needs expand_headroom_to() with a"
+             " bigger budget.")
+        .def_property_readonly("row_merge_overflow_bytes_dropped",
+             &Block4View::row_merge_overflow_bytes_dropped,
+             "Cumulative bytes of intended row content dropped by"
+             " row_merge_overflow_events, across every occurrence.");
 
     // ── Block4View8 (FP8 counterpart, real bug found+fixed: this class was
     //    never registered here, so SparseLinearLayer8.block4 raised
@@ -1305,7 +1333,19 @@ PYBIND11_MODULE(_cpu, m)
              " couldn't be persisted because growing its storage would have"
              " exceeded the memory budget -- declined (with the tile keeping its"
              " old value), not thrown, so training keeps running. Nonzero means"
-             " some updates are being silently dropped under the current budget.");
+             " some updates are being silently dropped under the current budget.")
+        .def_property_readonly("row_merge_overflow_events", &Block4View8::row_merge_overflow_events,
+             "Count of backward() calls where a row's block4 write-back couldn't"
+             " fit its full content within the row's existing headroom, even"
+             " after evicting every low-importance synapse it could. Declined,"
+             " not thrown -- the row's trailing tiles keep their pre-call"
+             " content and training keeps running. Nonzero means this layer's"
+             " max_row_weights genuinely needs expand_headroom_to() with a"
+             " bigger budget.")
+        .def_property_readonly("row_merge_overflow_bytes_dropped",
+             &Block4View8::row_merge_overflow_bytes_dropped,
+             "Cumulative bytes of intended row content dropped by"
+             " row_merge_overflow_events, across every occurrence.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
