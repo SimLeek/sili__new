@@ -353,7 +353,76 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     }
 
     static std::size_t projected_byte_size(std::size_t n) {
-        return n * sizeof(T) * 2; 
+        return n * sizeof(T) * 2;
+    }
+};
+
+// ── Scale-update policies ─────────────────────────────────────────────────────
+//
+// Swappable in-place optimizer for value_scale/output_scale (disldo_backward's
+// scattered path, linear_disldo.hpp). Template parameter, not a runtime flag --
+// each policy is a stateless struct with one static `update()`, so choosing a
+// policy costs nothing at runtime (inlined, no branch, no vtable) and callers
+// select it by template argument, matching this codebase's existing VALUES_TYPE
+// convention (SparseLinearLayer vs SparseLinearLayer8 vs DISLDOLayerV are
+// already separate hand-instantiated callers of one shared templated
+// implementation, not one class runtime-branching on a stored enum).
+//
+// Built to compare real update rules for value_scale/output_scale against a
+// toy Python fake-quantize simulation's closed-form full-layer refit
+// (sili_peridot's QuantizedDISLDOLayer32/rank1_fake_quantize) that reaches
+// near-perfect accuracy on an out-of-context recall task while the real
+// RMSprop-based scale update collapses -- see sili_peridot/JOURNAL.md's
+// 2026-08-09 tile-recurrence entries for the full investigation.
+
+template <typename VALUE_TYPE>
+struct RMSpropScalePolicy {
+    // Extracted verbatim from disldo_backward's existing inline formula --
+    // must stay bit-identical to today's behavior (this is the default,
+    // used by every existing caller).
+    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
+                        VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
+                        VALUE_TYPE beta2, VALUE_TYPE eps) {
+        scale_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * g_agg * g_agg;
+        scale -= eff_lr * g_agg / (std::sqrt(scale_state) + eps);
+    }
+};
+
+template <typename VALUE_TYPE>
+struct AdaMaxScalePolicy {
+    // Matches AdaMax's own decayed running-max second-moment tracker
+    // (Kingma & Ba 2015, Adam paper sec 7) applied to value_scale/
+    // output_scale instead of a gradient: scale_state tracks
+    // max(beta2*scale_state, |g_agg|) -- growth is INSTANT (never lets
+    // scale_state fall below the current gradient magnitude, matching
+    // the max-cover safety property a real fixed-point scale needs:
+    // never let a stored value exceed what its levels can represent),
+    // shrink is gradual (only the decay term reduces it, when nothing
+    // larger has been seen recently). No sqrt needed -- scale_state is
+    // already in the same units as |g_agg|, unlike RMSprop's g^2 EMA.
+    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
+                        VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
+                        VALUE_TYPE beta2, VALUE_TYPE eps) {
+        scale_state = std::max(beta2 * scale_state, std::abs(g_agg));
+        scale -= eff_lr * g_agg / (scale_state + eps);
+    }
+};
+
+// No-op: scale/scale_state are never touched, so scale stays at whatever
+// it was initialized/set to (value_type(1) by default -- see
+// SparseLinearWeightsDelta's value_scale.resize(n, value_type(1)) --
+// i.e. value_scale[row]*output_scale[col] is permanently the identity
+// multiply, true_w == stored_w). Direct real-hardware test of the
+// "zero trained scale" hypothesis (sili_peridot's fixed_digit_residual_
+// quantize/TrueMultiDigitLayer work) instead of just fixing staleness --
+// use with DeferredScaleWrite=true or false, doesn't matter here since
+// there's nothing to defer (scale never changes either way).
+template <typename VALUE_TYPE>
+struct NoScalePolicy {
+    static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
+                        VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
+                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/) {
+        // Intentionally does nothing.
     }
 };
 

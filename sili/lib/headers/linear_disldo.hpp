@@ -399,7 +399,40 @@ void disldo_forward(
  * per batch sample, weights/importance unchanged. Same reference check as
  * delta_csr_backward.
  */
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+// ScalePolicy / DeferredScaleWrite: swappable value_scale/output_scale
+// update, added to compare real update rules against a toy Python
+// fake-quantize simulation's closed-form full-layer refit -- see
+// ScalePolicy's own docstring (delta_csr_types.hpp) and
+// sili_peridot/JOURNAL.md's 2026-08-09 tile-recurrence entries. Both
+// parameters default to exactly today's behavior so every existing
+// caller (SparseLinearLayer, SparseLinearLayer8, DISLDOLayerV, etc.)
+// is unaffected without any changes on their part.
+//
+// SCOPE: covers the SCATTERED path only (this function's per-row loop
+// below and the shared output_scale reduction at the end). Block4's
+// own internal value_scale update (further down, inside
+// `if (weights.block4.n_tiles() > 0)`) is intentionally left
+// untouched by both parameters -- real future work, not started here;
+// see [[project_hybrid_precision_plan]] (sili_peridot memory) /
+// JOURNAL.md for why this scope was chosen (block4 promotion only
+// fires from synaptogenesis, so scattered-only already covers every
+// layer that hasn't triggered growth yet).
+// StochasticRounding (default true, current behavior): scattered-path
+// weight/importance stores use ValueAccessor::set_stochastic (unbiased
+// dithered rounding, real per-step noise) when true, or the deterministic
+// nearest-neighbour ValueAccessor::set (fp4_quantize/fp8 equivalent, zero
+// added noise) when false. Scoped to the scattered path only, same as
+// ScalePolicy/DeferredScaleWrite above -- block4's dense-tile SIMD
+// quantize_stochastic calls are untouched (real follow-up, not yet needed:
+// no toy config here triggers block4 promotion). Built to test whether
+// real FP4's per-step dithered rounding, not value_scale staleness, is
+// what makes it collapse to chance where a deterministic-rounding fp32
+// shadow control (sili_peridot's fixed_digit_residual_quantize /
+// TrueMultiDigitLayer's simulate_quantize) succeeds by a wide margin --
+// see sili_peridot/JOURNAL.md.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
+          typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
+          bool DeferredScaleWrite = false, bool StochasticRounding = true>
 void disldo_backward(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,
     SIZE_TYPE    batch,
@@ -417,6 +450,21 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    // Only meaningful when DeferredScaleWrite -- a touched scattered
+    // entry's true-units (cw, ci) get cached here instead of stored
+    // immediately, and are written out via set_stochastic only after
+    // BOTH value_scale[row] and output_scale[col] are finalized for
+    // this whole call (output_scale's own reduction runs last, after
+    // every row AND after block4 -- see the end of this function).
+    struct DeferredScaleWriteEntry {
+        std::size_t vb;
+        value_type  cw;
+        value_type  ci;
+        std::size_t row;
+        COL_TYPE    col;
+    };
+    std::vector<std::vector<DeferredScaleWriteEntry>> t_deferred;
+    if constexpr (DeferredScaleWrite) t_deferred.resize(static_cast<std::size_t>(num_cpus));
     auto& dc = weights.connections;
     const auto& L = dc.layout;
     const std::size_t n_in  = L.rows;
@@ -465,6 +513,8 @@ void disldo_backward(
         const int tid = omp_get_thread_num();
         value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
         value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
+        [[maybe_unused]] std::vector<DeferredScaleWriteEntry>* mdeferred = nullptr;
+        if constexpr (DeferredScaleWrite) mdeferred = &t_deferred[static_cast<std::size_t>(tid)];
 
         // Per-thread importance stats accumulators -- see disldo_forward's
         // comment and update_importance_stats()'s THREAD SAFETY note.
@@ -557,23 +607,50 @@ void disldo_backward(
                     mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                 }
                 if (learning_rate != value_type(0)) {
-                    ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
-                    const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
-                    local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
-                    local_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
-                    local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
-                    local_max_new_i = std::max(local_max_new_i, std::abs(actual_imp));
+                    if constexpr (DeferredScaleWrite) {
+                        // Defer the store until value_scale[r] AND
+                        // output_scale[col] are BOTH finalized for this
+                        // call (value_scale[r] finalizes right after this
+                        // row's loop below; output_scale finalizes in the
+                        // shared reduction at the very end of this
+                        // function, after every row and after block4) --
+                        // storing now would use the stale pre-update
+                        // scale, exactly the bug this parameter exists to
+                        // fix. Stats use the pre-store true-units `ci`
+                        // directly as a stand-in for the post-quantization
+                        // readback (the real stored code doesn't exist yet
+                        // when the write is deferred) -- a documented
+                        // approximation, harmless since these stats are
+                        // purely observational and unused by anything in
+                        // a no-synaptogenesis training loop.
+                        mdeferred->push_back(DeferredScaleWriteEntry{vb, cw, ci, r, col});
+                        local_sum_abs_new_i += std::abs(static_cast<double>(ci));
+                        local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
+                        local_sum_sq_new_i  += static_cast<double>(ci) * ci;
+                        local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
+                        local_max_new_i = std::max(local_max_new_i, std::abs(ci));
+                    } else {
+                        if constexpr (StochasticRounding) {
+                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                        } else {
+                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                        }
+                        const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                        local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
+                        local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
+                        local_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
+                        local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
+                        local_max_new_i = std::max(local_max_new_i, std::abs(actual_imp));
+                    }
                 }
             }
             if (learning_rate != value_type(0)) {
-                // Same RMSprop pattern as a per-synapse weight: importance
-                // tracks a decayed EMA of the RAW (pre-lr) gradient sum's
-                // square, the value_scale step is damped by sqrt of that.
+                // Scale update via the swappable policy (default
+                // RMSpropScalePolicy reproduces this exact formula) --
+                // see ScalePolicy's own docstring, delta_csr_types.hpp.
                 const value_type g_agg = static_cast<value_type>(scale_grad_sum);
-                value_type& vs_imp = weights.value_scale_importance[r];
-                vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
-                weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
+                ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
+                                    g_agg, scale_eff_lr, beta2, eps);
             }
         }
 
@@ -1353,11 +1430,43 @@ void disldo_backward(
             for (int t = 0; t < num_cpus; ++t)
                 col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
             const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
-            // Same RMSprop pattern as value_scale's own update.
+            // Scale update via the swappable policy -- same as
+            // value_scale's own update above.
             const value_type g_agg = static_cast<value_type>(col_grad_sum);
-            value_type& os_imp = weights.output_scale_importance[c];
-            os_imp = beta2 * os_imp + (value_type(1) - beta2) * g_agg * g_agg;
-            weights.output_scale[c] -= col_eff_lr * g_agg / (std::sqrt(os_imp) + eps);
+            ScalePolicy::update(weights.output_scale[c], weights.output_scale_importance[c],
+                                g_agg, col_eff_lr, beta2, eps);
+        }
+    }
+
+    // Deferred-store replay: only the scattered-path entries buffered
+    // above (block4 stays untouched by DeferredScaleWrite, see this
+    // function's own docstring) -- now that value_scale[row] AND
+    // output_scale[col] are BOTH fully finalized for this call (every
+    // row's update above, block4's own update if it ran, and the
+    // output_scale reduction just above), write each buffered entry's
+    // true-units (cw, ci) back out under the scale that's actually in
+    // effect now, not the stale one from when it was computed.
+    if constexpr (DeferredScaleWrite) {
+        if (learning_rate != value_type(0)) {
+            for (int t = 0; t < num_cpus; ++t) {
+                for (const auto& entry : t_deferred[static_cast<std::size_t>(t)]) {
+                    const value_type final_val_scale = weights.get_value_scale(entry.row);
+                    const value_type final_out_scale = weights.get_output_scale(entry.col);
+                    const value_type final_imp_scale = weights.get_importance_scale(entry.row);
+                    const value_type final_out_imp_scale = weights.get_output_importance_scale(entry.col);
+                    const value_type final_combined_scale = final_val_scale * final_out_scale;
+                    const value_type final_combined_imp_scale = final_imp_scale * final_out_imp_scale;
+                    if constexpr (StochasticRounding) {
+                        ValueAccessor<VALUES_TYPE>::set_stochastic(
+                            dc.values, entry.vb,
+                            entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
+                    } else {
+                        ValueAccessor<VALUES_TYPE>::set(
+                            dc.values, entry.vb,
+                            entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
+                    }
+                }
+            }
         }
     }
 }

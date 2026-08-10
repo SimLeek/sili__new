@@ -346,7 +346,8 @@ class EnergyDynamics(Module):
             reactivity: float = 0.01,    # alpha  — homeostatic gain
             p: float          = 0.05,    # hard ceiling on active fraction
     ):
-        assert 0.01 <= activation_cost <= 0.5, "activation_cost (gamma) must be in [0.01, 0.5]"
+        assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
+            "activation_cost (gamma) must be positive and <= 4.0"
         assert 0.0  <  density         < 1.0,  "density (beta) must be in (0, 1)"
         assert 0.0  <  p               <= 1.0, "p must be in (0, 1]"
         # p is a hardware/telemetry compute-limit ceiling, not a sparsity
