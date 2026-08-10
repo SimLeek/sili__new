@@ -146,14 +146,14 @@ def main():
 
     # Quality check BEFORE growth.
     dense0 = dense_reference(layer, n_in, n_out, layer.ptrs, layer.indices, layer.weights_vals)
-    y0 = layer.forward_dense(x, learning_rate=0.0)
+    y0 = layer.forward_dense(x)
     ref0 = x @ dense0
     report["quality_before_growth_max_abs_err"] = float(np.max(np.abs(y0 - ref0)))
 
     report["forward_before_growth"] = time_calls(
-        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls, args.warmup_calls)
+        lambda: layer.forward_dense(x), args.n_calls, args.warmup_calls)
 
-    y_for_bwd = layer.forward_dense(x, learning_rate=0.0)
+    y_for_bwd = layer.forward_dense(x)
     report["backward_before_growth"] = time_calls(
         lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls, args.warmup_calls)
 
@@ -180,12 +180,12 @@ def main():
     # reconstructed from the (block4-aware, see delta_csr_combined_to_absolute)
     # combined ptrs/indices/weights_vals.
     dense1 = dense_reference(layer, n_in, n_out, layer.ptrs, layer.indices, layer.weights_vals)
-    y1 = layer.forward_dense(x, learning_rate=0.0)
+    y1 = layer.forward_dense(x)
     ref1 = x @ dense1
     report["quality_after_growth_max_abs_err"] = float(np.max(np.abs(y1 - ref1)))
 
     report["forward_after_growth"] = time_calls(
-        lambda: layer.forward_dense(x, learning_rate=0.0), args.n_calls, args.warmup_calls)
+        lambda: layer.forward_dense(x), args.n_calls, args.warmup_calls)
     report["backward_after_growth"] = time_calls(
         lambda: layer.backward_dense(dy, learning_rate=0.01), args.n_calls, args.warmup_calls)
 
