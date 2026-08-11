@@ -296,6 +296,56 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _preseed_dense(c, n_inputs: int, n_outputs: int,
+                   rng: Optional[np.random.Generator] = None,
+                   quantize_fn=None) -> int:
+    """Fully dense counterpart to `_preseed_random_sparse` -- every
+    (input, output) pair connected, loaded straight into block4 via
+    `load_dense_codes` (sili__new's `block4_load_dense`, see its own
+    docstring for the loading-vs-quantization design split). Added per
+    direct request to test whether this project's usual random-SPARSE
+    "echo network" preseed is itself a significant source of seed
+    -to-seed accuracy variance in toy comparisons (reservoir-computing
+    -style connectivity-draw sensitivity), independent of whatever else
+    is being compared (base, bits, etc.).
+
+    `quantize_fn`: defaults to `_cpu.fp4_quantize_array` (this class's
+    VALUES_TYPE). Kept as a parameter, not hardcoded, so a caller can
+    swap in a different quantization scheme (rank-1 scale fit, etc.)
+    without this function needing to change -- matches
+    block4_load_dense's own loading/quantization separation.
+
+    IMPORTANT, found directly while verifying this: init scale can NOT
+    just be `_preseed_random_sparse`'s own `1/sqrt(k)` fan-in scaling
+    carried over naively. FP4 (E2M1) has a FIXED absolute
+    zero-rounding floor (~0.25, independent of layer width) -- at
+    typical toy widths (state_width=128, `1/sqrt(128)~=0.09`), nearly
+    EVERY drawn value would quantize to code 0 ("not live"), silently
+    collapsing "dense init" back down to mostly-empty regardless of
+    what was intended. Confirmed empirically: scale=0.3 gave only
+    23/64 live codes on an 8x8 test matrix; scale=2.0 gave 60/64.
+    Uses a FIXED (not fan-in-shrunk) scale instead, matching how
+    `fixed_digit_residual_quantize`'s `e_shared` already solves the
+    identical problem for the digit-residual scheme -- fan-in
+    normalization is left to training dynamics (value_scale/
+    output_scale, or an outer composition's own factors, e.g.
+    TrueMultiDigitLayer's `base**-i`), not baked into the raw
+    pre-quantization float magnitude. Not yet tuned beyond "clearly
+    stays live" -- revisit if the real dense sweep shows this scale
+    itself needs adjusting.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if quantize_fn is None:
+        quantize_fn = _cpu.fp4_quantize_array
+    scale = 1.5  # fixed, not fan-in-scaled -- see docstring above
+    dense = (rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale)
+    weight_codes = quantize_fn(dense.flatten())
+    importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
+    c.load_dense_codes(weight_codes, importance_codes)
+    return n_outputs  # every row is already at max capacity -- nothing left to grow into
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,9 +357,13 @@ class DISLDOLayer(_SparseLayerBase):
     docstring). No batch dimension required for online (single-sample) use."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True) -> Tensor:
@@ -404,9 +458,13 @@ class DISLDOLayerDeterministic(DISLDOLayer):
     linear_disldo.hpp."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
