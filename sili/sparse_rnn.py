@@ -334,27 +334,45 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
        direction -- confirmed empirically on the real curriculum: every
        one of base=4/6/12/24 collapsed to pure CHANCE (mean_acc~0.094,
        std~0.003 across 3 seeds), identically regardless of base. Root
-       cause: row-output variance scales with `n_active_connections *
-       raw_value_variance` -- sparse's k=5 connections at scale
-       `1/sqrt(5)` give variance ~1 (properly normalized); dense's 128
-       connections at raw scale 1.5 give variance ~128*1.5^2~=288,
-       almost certainly saturating whatever clip/RMSNorm sits downstream
-       and destroying the learning signal the same way no matter what
-       `base` is -- exactly explaining why every dense arm gave
-       identical numbers.
+       cause: `output[c] = sum_r input[r] * weight[r,c]` -- its variance
+       scales with the number of ROWS feeding column `c` (that
+       column's fan-in, i.e. its live-connection count across rows),
+       not the row's own width. Sparse's k=5 connections/row at scale
+       `1/sqrt(5)` keep that sum's variance ~1 (properly normalized);
+       dense's ~128 connections/column at raw scale 1.5 give variance
+       ~128*1.5^2~=288, almost certainly saturating whatever clip/
+       RMSNorm sits downstream and destroying the learning signal the
+       same way no matter what `base` is -- exactly explaining why
+       every dense arm gave identical numbers.
 
-    Fix: keep the RAW quantized value at a representable magnitude
-    (avoids problem 1), but immediately apply a fan-in-correcting
-    `value_scale` via `set_value_scale_raw` as METADATA (documented
-    pattern: `true_w = stored_w * value_scale`, "set directly WITHOUT
-    re-encoding stored weights") so the network sees the SAME
+       IMPORTANT CORRECTION (per direct review): the first fix applied
+       this correction via per-ROW `value_scale` scaled by `1/sqrt
+       (n_outputs)` -- the WRONG axis. It only happened to produce a
+       working number in testing because q/k/v/o_proj are square
+       (n_inputs==n_outputs), making the wrong-axis correction
+       numerically coincide with the right one there; it would have
+       been wrong for lm_head (16x10, not square). Also computed from
+       the ASSUMED `n_outputs`/`n_inputs`, not the REAL post
+       -quantization live count -- wrong whenever problem 1's
+       zero-code collisions leave a row/column short of full density
+       (as they do here: confirmed ~87.5% actual density at scale=1.5,
+       not 100%).
+
+    Fix: after loading, compute the REAL per-column live count
+    directly from `weight_codes` (code 0 = not live, same convention
+    `block4_load_dense`/every other block4 path already uses -- no
+    assumption about density), and apply a fan-in-correcting
+    `output_scale` PER COLUMN via `set_output_scale_raw` as METADATA
+    (documented pattern: `true_w = stored_w * value_scale[row] *
+    output_scale[col]`, "set directly WITHOUT re-encoding stored
+    weights") -- output_scale is the per-COLUMN half of that product,
+    matching the axis the variance actually depends on. `output_scale[c]
+    = 1/(raw_scale * sqrt(col_nnz[c]))` reproduces the same
     effectively-normalized weight distribution `_preseed_random_sparse`
-    already produces (`standard_normal(n_outputs) * 1/sqrt(n_outputs)`)
-    -- just reached via metadata instead of by shrinking the stored
-    code, which would reintroduce problem 1. `value_scale[row] =
-    1/(raw_scale * sqrt(n_outputs))` derives directly from that
-    equivalence (raw_value/raw_scale is the unit-variance draw;
-    multiplying by 1/sqrt(n_outputs) matches the sparse convention).
+    already produces for a k-wide row, generalized to each column's
+    OWN real fan-in rather than an assumed uniform width. `value_scale`
+    (per-row) is left at its default 1.0 -- this correction lives
+    entirely on the column axis, matching the math above.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -365,10 +383,13 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     weight_codes = quantize_fn(dense.flatten())
     importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
     c.load_dense_codes(weight_codes, importance_codes)
-    # Fan-in correction via value_scale metadata -- see docstring point 2.
-    value_scale = 1.0 / (scale * np.sqrt(n_outputs))
-    for row in range(n_inputs):
-        c.set_value_scale_raw(row, float(value_scale))
+    # Fan-in correction via output_scale metadata, from REAL per-column
+    # live counts (code 0 = not live) -- see docstring point 2.
+    live = weight_codes.reshape(n_inputs, n_outputs) != 0
+    col_nnz = live.sum(axis=0)
+    output_scale = 1.0 / (scale * np.sqrt(np.maximum(col_nnz, 1)))
+    for col in range(n_outputs):
+        c.set_output_scale_raw(col, float(output_scale[col]))
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
