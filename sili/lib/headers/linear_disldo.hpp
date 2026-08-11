@@ -1404,9 +1404,24 @@ void disldo_backward(
                 if (sum == 0.0) continue;
                 const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
                 const value_type g_agg = static_cast<value_type>(sum);
+                // Hand-inlined here rather than routed through ScalePolicy
+                // (block4 path predates that abstraction) -- same NaN/Inf
+                // guard as ScalePolicy::update and for the same reason:
+                // sum (double, accumulated across possibly many more live
+                // synapses per row under dense connectivity) can overflow
+                // to Inf when narrowed to value_type, and vs_imp's EMA
+                // never decays a stray Inf back down, so once-off overflow
+                // becomes permanent corruption. See delta_csr_types.hpp's
+                // RMSpropScalePolicy::update docstring for the full trace
+                // (sili_peridot, JOURNAL.md 2026-08-10).
+                if (!std::isfinite(g_agg)) continue;
                 value_type& vs_imp = weights.value_scale_importance[row];
-                vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
-                weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
+                const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+                if (!std::isfinite(new_vs_imp)) continue;
+                const value_type new_vs = weights.value_scale[row] - scale_eff_lr * g_agg / (std::sqrt(new_vs_imp) + eps);
+                if (!std::isfinite(new_vs)) continue;
+                vs_imp = new_vs_imp;
+                weights.value_scale[row] = new_vs;
             }
         }
     }

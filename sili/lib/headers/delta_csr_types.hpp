@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -378,13 +379,33 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
 template <typename VALUE_TYPE>
 struct RMSpropScalePolicy {
     // Extracted verbatim from disldo_backward's existing inline formula --
-    // must stay bit-identical to today's behavior (this is the default,
-    // used by every existing caller).
+    // must stay bit-identical to today's behavior on finite inputs (this
+    // is the default, used by every existing caller) -- PLUS a NaN/Inf
+    // guard. scale/scale_state update INLINE every step and are never
+    // touched by any external gradient clip (unlike an optimizer-managed
+    // parameter) -- a single overflowed g_agg (e.g. dense connectivity's
+    // much larger fan-in summing far more per-column gradient terms than
+    // sparse ever does, narrowed from a double accumulator to VALUE_TYPE
+    // with no range check upstream) turns scale_state permanently Inf
+    // (beta2*Inf never decays back down), then sqrt(Inf)+eps -> Inf,
+    // g_agg/Inf -> Inf or Inf/Inf -> NaN, and once scale is NaN every
+    // future beta2*NaN+... stays NaN forever. Confirmed via direct
+    // diagnostic in sili_peridot (dense connectivity, JOURNAL.md
+    // 2026-08-10): output_scale went NaN in lockstep with the whole
+    // model while the raw stored weight code itself stayed correctly
+    // bounded. Skip the update entirely on a non-finite input/result
+    // rather than letting it corrupt scale/scale_state -- makes NaN
+    // structurally unreachable through this path, not just unlikely.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps) {
-        scale_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * g_agg * g_agg;
-        scale -= eff_lr * g_agg / (std::sqrt(scale_state) + eps);
+        if (!std::isfinite(g_agg)) return;
+        const VALUE_TYPE new_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * g_agg * g_agg;
+        if (!std::isfinite(new_state)) return;
+        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(new_state) + eps);
+        if (!std::isfinite(new_scale)) return;
+        scale_state = new_state;
+        scale = new_scale;
     }
 };
 
@@ -400,11 +421,20 @@ struct AdaMaxScalePolicy {
     // shrink is gradual (only the decay term reduces it, when nothing
     // larger has been seen recently). No sqrt needed -- scale_state is
     // already in the same units as |g_agg|, unlike RMSprop's g^2 EMA.
+    // Same NaN/Inf guard as RMSpropScalePolicy::update above, and for the
+    // same reason -- scale_state's std::max never lets a stray Inf decay
+    // back down either, so an overflowed g_agg is just as permanently
+    // corrupting here without this check.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps) {
-        scale_state = std::max(beta2 * scale_state, std::abs(g_agg));
-        scale -= eff_lr * g_agg / (scale_state + eps);
+        if (!std::isfinite(g_agg)) return;
+        const VALUE_TYPE new_state = std::max(beta2 * scale_state, std::abs(g_agg));
+        if (!std::isfinite(new_state)) return;
+        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (new_state + eps);
+        if (!std::isfinite(new_scale)) return;
+        scale_state = new_state;
+        scale = new_scale;
     }
 };
 
