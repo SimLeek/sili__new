@@ -690,6 +690,100 @@ void block4_maybe_promote(
     }
 }
 
+// Bulk LOADING (not quantization) of already-quantized dense weight/
+// importance codes directly into block4 storage, bypassing the scattered
+// -CSR side and the importance-gated growth-insertion path entirely.
+// `weight_codes`/`importance_codes` are raw FP4 (0-15) or FP8 (E4M3 byte)
+// codes, row-major n_in x n_out -- the CALLER decides how those codes were
+// produced (round-to-nearest via fp4_quantize_array/fp8_quantize_array,
+// a rank-1-scaled fit, a residual scheme, real gradient-derived importance
+// for a converted checkpoint, etc.); this function does no quantization
+// and no scale division of its own, matching Block4Store's own native
+// tile-write interface (`tile.at(li,lj)`/`at_weight`/`at_importance` are
+// raw uint8_t&, zero quantization logic) rather than ValueAccessor::set's
+// float-in-quantize-on-write convention used by load_weights()/
+// block4_maybe_promote. If a row/col value_scale is wanted, set it
+// afterward via set_value_scale_raw()/set_output_scale_raw() -- same
+// two-step pattern sili_peridot's own FoldedLayer.from_descriptor already
+// uses for the scattered-CSR path (sparse_rnn.py).
+//
+// weights.connections (scattered side) is left untouched (zero nnz),
+// mirroring load_weights()'s own "only touch the side being loaded"
+// precedent -- the combined .nnz property (connections.nnz() +
+// block4.live_synapses(), both live-computed, not cached) then correctly
+// reports n_in*n_out once this returns.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+void block4_load_dense(
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    const uint8_t* weight_codes, const uint8_t* importance_codes,
+    std::size_t n_in, std::size_t n_out)
+{
+    constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
+    constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
+    if constexpr (!is_fp4 && !is_fp8) {
+        (void)weights; (void)weight_codes; (void)importance_codes; (void)n_in; (void)n_out;
+    } else {
+        const uint32_t block_rows = uint32_t((n_in  + BLOCK4_TILE - 1) / BLOCK4_TILE);
+        const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
+
+        weights.block4.init(n_in, n_out);
+        // Sized for full density (every tile ends up dense, no
+        // synaptogenesis growth expected after a static load). Indices
+        // budget: EVERY row starts with zero pre-allocated index bytes
+        // (Block4Store::init() zero-fills tile_byte_start/byte_start), so
+        // inserting the first tile into any row goes through
+        // block4_ensure_row_headroom's growth path, which requests up to
+        // uleb128_max_bytes<uint32_t>() (5) bytes per entry -- found
+        // directly (bad_alloc thrown at a too-small budget) that this can
+        // be requested more than once per tile as block4_row_shift
+        // cascades a growth request through earlier rows to make room in
+        // a later one. 16 bytes/tile is a generous multiple of that
+        // 5-byte worst case to absorb the cascade without hand-deriving
+        // its exact worst case; indices bytes are cheap relative to tile
+        // bytes so over-provisioning here costs little. A caller that
+        // DOES want future growth on this layer can call
+        // expand_headroom_to() afterward, same as any other layer.
+        const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
+        if constexpr (is_fp8) {
+            weights.block4.set_limits(idx_budget, std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS8_BYTES);
+        } else {
+            weights.block4.set_limits(idx_budget, std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS);
+        }
+
+        for (uint32_t br = 0; br < block_rows; ++br) {
+            const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+            const std::size_t row_hi = std::min(row_lo + BLOCK4_TILE, n_in);
+            for (uint32_t bc = 0; bc < block_cols; ++bc) {
+                const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+                const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, n_out);
+                auto tile = weights.block4.get_or_create(br, bc);
+                for (std::size_t row = row_lo; row < row_hi; ++row) {
+                    const uint32_t li = uint32_t(row - row_lo);
+                    for (std::size_t col = col_lo; col < col_hi; ++col) {
+                        const uint32_t lj = uint32_t(col - col_lo);
+                        const std::size_t idx = row * n_out + col;
+                        if constexpr (is_fp8) {
+                            tile.at_weight(li, lj)     = weight_codes[idx];
+                            tile.at_importance(li, lj) = importance_codes[idx];
+                        } else {
+                            tile.at(li, lj) = uint8_t(weight_codes[idx] | (importance_codes[idx] << 4));
+                        }
+                    }
+                }
+                // tile's destructor (scope end) commits scratch_ back to
+                // the store, choosing dense vs sparse-packed encoding
+                // based on live count vs switch_point -- for a fresh
+                // get_or_create'd tile (always starts sparse/empty) with
+                // every slot written, this always picks dense. No
+                // separate maybe_compress() call needed here (that's for
+                // re-checking an EXISTING tile's encoding, not relevant
+                // to a from-scratch bulk load of brand-new tiles).
+            }
+        }
+    }
+}
+
 // Pruning-only hook.
 // Throws if a target row has run out of blank space 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,

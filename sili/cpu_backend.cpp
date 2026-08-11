@@ -817,6 +817,26 @@ public:
         for (S c : idx) ++weights.out_degree[c];
     }
 
+    // Bulk LOADING (not quantization) of already-quantized dense weight/
+    // importance codes directly into block4 -- see block4_load_dense's own
+    // docstring (delta_csr_memory.hpp) for the full loading-vs-quantization
+    // design rationale. weight_codes/importance_codes are row-major n_in x
+    // n_out uint8 arrays (already-decided FP4 codes 0-15) -- produce them
+    // via fp4_quantize_array() for simple deterministic rounding, or any
+    // other scheme; this method does no quantization itself.
+    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+        auto wb = weight_codes.request(), ib = importance_codes.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        block4_load_dense<S, FP4BiPacked, COL_TYPE>(
+            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        // Every row connects to every column -- out_degree[c] = rows for
+        // every c, matching load_weights()'s own "rebuild from what was
+        // just loaded" precedent (needed for output_scale's gradient, see
+        // disldo_backward's out_degree normalization).
+        weights.out_degree.assign(cols, S(rows));
+    }
+
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
         return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
@@ -1232,6 +1252,16 @@ public:
         weights.recompute_stats();
     }
 
+    // See SparseLinearLayerImpl::load_dense_codes' docstring (this file) --
+    // same loading-only contract, FP8 (E4M3) codes instead of FP4 nibbles.
+    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+        auto wb = weight_codes.request(), ib = importance_codes.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        block4_load_dense<S, VT, COL_TYPE>(
+            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+    }
+
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
         return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
@@ -1526,6 +1556,12 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer::get_ptrs)
         .def("load_weights",        &SparseLinearLayer::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayer::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"),
+             "Bulk-load already-quantized dense FP4 codes directly into block4,\n"
+             "bypassing scattered CSR entirely. See block4_load_dense's docstring\n"
+             "(delta_csr_memory.hpp) -- loading only, no quantization performed\n"
+             "here; produce codes via fp4_quantize_array() or any other scheme.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer& self) {
             return py::array_t<SparseLinearLayer::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -1740,6 +1776,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerResync::get_ptrs)
         .def("load_weights",        &SparseLinearLayerResync::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerResync::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerResync& self) {
             return py::array_t<SparseLinearLayerResync::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -1955,6 +1993,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerNoScale::get_ptrs)
         .def("load_weights",        &SparseLinearLayerNoScale::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerNoScale::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerNoScale& self) {
             return py::array_t<SparseLinearLayerNoScale::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2170,6 +2210,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerDeterministic& self) {
             return py::array_t<SparseLinearLayerDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2384,6 +2426,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerResyncDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerResyncDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerResyncDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerResyncDeterministic& self) {
             return py::array_t<SparseLinearLayerResyncDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2597,6 +2641,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerNoScaleDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerNoScaleDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerNoScaleDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerNoScaleDeterministic& self) {
             return py::array_t<SparseLinearLayerNoScaleDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2692,6 +2738,13 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"),
+             "Bulk-load already-quantized dense FP8 (E4M3) codes directly into\n"
+             "block4, bypassing scattered CSR entirely. See block4_load_dense's\n"
+             "docstring (delta_csr_memory.hpp) -- loading only, no quantization\n"
+             "performed here; produce codes via fp8_quantize_array() or any other\n"
+             "scheme.")
         .def("get_value_scale",      &SparseLinearLayer8::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2749,6 +2802,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8Resync::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8Resync::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8Resync::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def("get_value_scale",      &SparseLinearLayer8Resync::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2807,6 +2862,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8AdaMax::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8AdaMax::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8AdaMax::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def("get_value_scale",      &SparseLinearLayer8AdaMax::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2914,6 +2971,48 @@ PYBIND11_MODULE(_cpu, m)
         py::arg("x"), py::arg("k"), py::arg("num_threads") = 4,
         "Exact top-k sparsity conversion for forward and backward passes."
     );
+
+    // ── Bulk quantize-array utilities ───────────────────────────────────────
+    //
+    // Standalone, layer-independent elementwise float32->code conversion --
+    // deliberately kept SEPARATE from block4_load_dense (delta_csr_memory.hpp)
+    // and its "load_dense_codes" pybind bindings below: loading (placing
+    // already-decided codes into storage) and quantization (deciding what
+    // code represents a float) are different concerns. This is the simple
+    // deterministic round-to-nearest scheme (reuses the existing scalar
+    // fp4_quantize/fp8_quantize codecs, unchanged); a caller wanting a
+    // smarter scheme (rank-1 scale fit, residual decomposition, etc.) can
+    // produce codes some other way and hand them directly to
+    // load_dense_codes instead of calling these.
+    m.def("fp4_quantize_array",
+        [](py::array_t<float> vals) -> py::array_t<uint8_t> {
+            auto buf = vals.request();
+            py::array_t<uint8_t> out(buf.size);
+            const float* src = (const float*)buf.ptr;
+            uint8_t* dst = (uint8_t*)out.request().ptr;
+            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp4_quantize(src[i]);
+            return out;
+        },
+        py::arg("vals"),
+        "Deterministic FP4 (E2M1) quantize, elementwise -- same scalar\n"
+        "fp4_quantize() semantics every insertion path in this codebase\n"
+        "already uses, just applied over a whole array at once. Output\n"
+        "codes (0-15) are the RAW magnitude+sign code, not scaled by any\n"
+        "row/col value_scale -- pre-divide by scale yourself before calling\n"
+        "this if you want one, same convention as load_weights().");
+
+    m.def("fp8_quantize_array",
+        [](py::array_t<float> vals) -> py::array_t<uint8_t> {
+            auto buf = vals.request();
+            py::array_t<uint8_t> out(buf.size);
+            const float* src = (const float*)buf.ptr;
+            uint8_t* dst = (uint8_t*)out.request().ptr;
+            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp8_quantize(src[i]);
+            return out;
+        },
+        py::arg("vals"),
+        "Deterministic FP8 (E4M3) quantize, elementwise -- FP8 counterpart\n"
+        "to fp4_quantize_array(), same scale convention (pre-divide yourself).");
 
     m.def("seed_fp4_stochastic_rng", &fp4_seed_stochastic_rng, py::arg("seed"),
         "Reseed the CALLING thread's FP4 stochastic-rounding RNG (see "

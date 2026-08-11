@@ -148,6 +148,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_forward
     test_disldo_block4_backward
     test_disldo_block4_promotion
+    test_block4_load_dense
     test_disldo_block4_combined_absolute
     test_block4_sparse_tile
     test_block4_memory_cap_and_compression
