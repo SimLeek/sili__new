@@ -315,34 +315,60 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     without this function needing to change -- matches
     block4_load_dense's own loading/quantization separation.
 
-    IMPORTANT, found directly while verifying this: init scale can NOT
-    just be `_preseed_random_sparse`'s own `1/sqrt(k)` fan-in scaling
-    carried over naively. FP4 (E2M1) has a FIXED absolute
-    zero-rounding floor (~0.25, independent of layer width) -- at
-    typical toy widths (state_width=128, `1/sqrt(128)~=0.09`), nearly
-    EVERY drawn value would quantize to code 0 ("not live"), silently
-    collapsing "dense init" back down to mostly-empty regardless of
-    what was intended. Confirmed empirically: scale=0.3 gave only
-    23/64 live codes on an 8x8 test matrix; scale=2.0 gave 60/64.
-    Uses a FIXED (not fan-in-shrunk) scale instead, matching how
-    `fixed_digit_residual_quantize`'s `e_shared` already solves the
-    identical problem for the digit-residual scheme -- fan-in
-    normalization is left to training dynamics (value_scale/
-    output_scale, or an outer composition's own factors, e.g.
-    TrueMultiDigitLayer's `base**-i`), not baked into the raw
-    pre-quantization float magnitude. Not yet tuned beyond "clearly
-    stays live" -- revisit if the real dense sweep shows this scale
-    itself needs adjusting.
+    IMPORTANT, found directly while verifying this (two real bugs, both
+    fixed, in order):
+
+    1. Init scale can NOT just be `_preseed_random_sparse`'s own
+       `1/sqrt(k)` fan-in scaling carried over naively into the RAW
+       quantized value. FP4 (E2M1) has a FIXED absolute zero-rounding
+       floor (~0.25, independent of layer width) -- at typical toy
+       widths (state_width=128, `1/sqrt(128)~=0.09`), nearly EVERY
+       drawn value would quantize to code 0 ("not live"), silently
+       collapsing "dense init" back down to mostly-empty regardless of
+       what was intended. Confirmed empirically: raw scale=0.3 gave
+       only 23/64 live codes on an 8x8 test matrix; scale=1.5-2.0 gave
+       ~90%+ live.
+
+    2. Using a FIXED raw scale (1.5) WITHOUT any compensating fan-in
+       correction elsewhere is ALSO wrong, just in the opposite
+       direction -- confirmed empirically on the real curriculum: every
+       one of base=4/6/12/24 collapsed to pure CHANCE (mean_acc~0.094,
+       std~0.003 across 3 seeds), identically regardless of base. Root
+       cause: row-output variance scales with `n_active_connections *
+       raw_value_variance` -- sparse's k=5 connections at scale
+       `1/sqrt(5)` give variance ~1 (properly normalized); dense's 128
+       connections at raw scale 1.5 give variance ~128*1.5^2~=288,
+       almost certainly saturating whatever clip/RMSNorm sits downstream
+       and destroying the learning signal the same way no matter what
+       `base` is -- exactly explaining why every dense arm gave
+       identical numbers.
+
+    Fix: keep the RAW quantized value at a representable magnitude
+    (avoids problem 1), but immediately apply a fan-in-correcting
+    `value_scale` via `set_value_scale_raw` as METADATA (documented
+    pattern: `true_w = stored_w * value_scale`, "set directly WITHOUT
+    re-encoding stored weights") so the network sees the SAME
+    effectively-normalized weight distribution `_preseed_random_sparse`
+    already produces (`standard_normal(n_outputs) * 1/sqrt(n_outputs)`)
+    -- just reached via metadata instead of by shrinking the stored
+    code, which would reintroduce problem 1. `value_scale[row] =
+    1/(raw_scale * sqrt(n_outputs))` derives directly from that
+    equivalence (raw_value/raw_scale is the unit-variance draw;
+    multiplying by 1/sqrt(n_outputs) matches the sparse convention).
     """
     if rng is None:
         rng = np.random.default_rng()
     if quantize_fn is None:
         quantize_fn = _cpu.fp4_quantize_array
-    scale = 1.5  # fixed, not fan-in-scaled -- see docstring above
+    scale = 1.5  # fixed, not fan-in-scaled -- keeps codes representable, see docstring point 1
     dense = (rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale)
     weight_codes = quantize_fn(dense.flatten())
     importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
     c.load_dense_codes(weight_codes, importance_codes)
+    # Fan-in correction via value_scale metadata -- see docstring point 2.
+    value_scale = 1.0 / (scale * np.sqrt(n_outputs))
+    for row in range(n_inputs):
+        c.set_value_scale_raw(row, float(value_scale))
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
