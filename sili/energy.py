@@ -43,6 +43,8 @@ def _apply_energy_dynamics(
         activation_threshold: float = 1e-4,  # dead zone threshold (architectural)
         reactivity: float = 0.01,    # alpha  — homeostatic correction gain
         p: float = 0.05,             # HARD CEILING on active neuron fraction
+        fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
+        fire_cost: Optional[float] = None,  # opt-in: firing drains this much (overrides 2*gamma)
 ) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
@@ -112,6 +114,31 @@ def _apply_energy_dynamics(
                     -constrained; see EnergyDynamics.__init__'s
                     `density <= p * 0.8` assertion, which exists because this
                     relationship was previously (silently) inverted.
+    fire_reset_to_zero : opt-in (default False, preserves existing behavior
+                    exactly). When True, a fire event sets e <- 0.0 instead
+                    of the default e <- e - 2*gamma refractory drain. Per
+                    direct design discussion: the default drain is tiny
+                    relative to `drive` whenever the opposing continuous
+                    term (gamma*|h|) is small (e.g. a cold, near-zero-init
+                    population) -- the population can climb back to
+                    threshold and re-fire within a handful of steps,
+                    degenerating from "rare recovery event" into
+                    near-continuous forced-firing that saturates the
+                    downstream output to a near-constant value regardless
+                    of real input. Firing is a discrete, metabolically
+                    distinct event from normal continuous operation
+                    (biologically: an action potential), so a hard reset is
+                    a more direct model than a small linear drain. Does NOT
+                    weaken Theorem 6(a) (Ω = {|e|<=2} positively invariant)
+                    -- that proof only requires the post-fire update to
+                    strictly reduce |e|, which e<-0 satisfies unconditionally
+                    (energy-proofs.md). Mutually exclusive with fire_cost.
+    fire_cost       : opt-in (default None, preserves existing behavior).
+                    If set, a fire event subtracts this fixed amount instead
+                    of 2*gamma -- e.g. a large fire_cost models "firing is
+                    metabolically much more expensive than the linear
+                    activation_cost accounting used elsewhere" without fully
+                    resetting to zero. Ignored if fire_reset_to_zero=True.
 
     Returns
     -------
@@ -170,7 +197,12 @@ def _apply_energy_dynamics(
         new_energy[shutoff_mask]     = -2.0
 
     if fire_mask.any():
-        new_energy[fire_mask] -= 2.0 * activation_cost   # refractory drain
+        if fire_reset_to_zero:
+            new_energy[fire_mask] = 0.0
+        elif fire_cost is not None:
+            new_energy[fire_mask] -= float(fire_cost)
+        else:
+            new_energy[fire_mask] -= 2.0 * activation_cost   # refractory drain (default, unchanged)
 
     # ── 4. Hard-ceiling top_p gate ───────────────────────────────────────────
     # p is a HARD CEILING — no condition may exceed it.
@@ -345,6 +377,8 @@ class EnergyDynamics(Module):
             activation_threshold: float = 1e-4,  # dead zone threshold
             reactivity: float = 0.01,    # alpha  — homeostatic gain
             p: float          = 0.05,    # hard ceiling on active fraction
+            fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
+            fire_cost: Optional[float] = None,  # opt-in: firing drains this much
     ):
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
             "activation_cost (gamma) must be positive and <= 4.0"
@@ -374,6 +408,8 @@ class EnergyDynamics(Module):
         self.activation_threshold = float(activation_threshold)
         self.reactivity           = float(reactivity)
         self.p                    = float(p)
+        self.fire_reset_to_zero   = bool(fire_reset_to_zero)
+        self.fire_cost            = None if fire_cost is None else float(fire_cost)
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
@@ -434,6 +470,7 @@ class EnergyDynamics(Module):
             h, self.energy,
             self.drive, self.activation_cost, self.precision, density,
             self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
+            self.fire_reset_to_zero, self.fire_cost,
         )
         return h_out, self.aux_loss, self.actual_p
 

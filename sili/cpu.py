@@ -91,12 +91,16 @@ class CpuBackend(Backend):
         return np.abs(np.asarray(a, dtype=np.float32))
 
     def abs_backward(self, a, grad) -> np.ndarray:
-        local_gradient = np.sign(np.asarray(a, dtype=np.float32))
+        a_arr = np.asarray(a, dtype=np.float32)
+        local_gradient = np.sign(a_arr)
         # The fix for synaptogenesis from zero:
         # np.sign(0.0) returns 0.0, which severs the gradient flow.
         # We assign a valid subgradient (e.g., 1.0 or a small positive value)
         # to force the optimizer to push the weights and "wake up" the neuron.
-        local_gradient[a == 0.0] = 1.0
+        # np.where (not in-place item assignment) -- np.sign() on a 0-d/
+        # scalar input returns a bare numpy scalar, not an ndarray, which
+        # doesn't support `local_gradient[mask] = ...`.
+        local_gradient = np.where(a_arr == 0.0, np.float32(1.0), local_gradient)
 
         return local_gradient * grad
 
