@@ -47,6 +47,7 @@ def _apply_energy_dynamics(
         fire_cost: Optional[float] = None,  # opt-in: firing drains this much (overrides 2*gamma)
         fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
         wake_sign: Optional[np.ndarray] = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
+        rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw below
 ) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
@@ -157,6 +158,17 @@ def _apply_energy_dynamics(
                     direction every time. EnergyDynamics.forward derives
                     this once from a fixed seed and reuses it; direct
                     callers must supply their own.
+    rng             : opt-in (default None, preserves exact existing
+                    behavior: draws from bare global numpy RNG state).
+                    The exploration noise draw below previously had no
+                    way to be seeded at all -- confirmed directly this
+                    makes energy-enabled runs genuinely non-reproducible
+                    run-to-run even with an otherwise identical config
+                    (task RNG, FP4 rounding RNG, and everything else
+                    seeded), since whatever consumed global numpy state
+                    earlier in the process shifts this draw. Pass a
+                    seeded np.random.Generator (matching DISLDOLayer's
+                    own rng= convention) for reproducible comparisons.
 
     Returns
     -------
@@ -200,7 +212,8 @@ def _apply_energy_dynamics(
     # |h_dz|   — active representation drains energy
     # Constraint: exploration must stay below drive/2 during waking
     #             to remain in curiosity regime, not hallucination regime.
-    noise      = np.random.normal(0.0, exploration, size=(n,)).astype(dtype)
+    noise_src  = rng if rng is not None else np.random
+    noise      = noise_src.normal(0.0, exploration, size=(n,)).astype(dtype)
     new_energy = energy_flat + drive + noise - activation_cost * np.abs(h_dz)
 
     # ── 3. Hard thresholds (integrate-and-fire) ──────────────────────────────
@@ -413,6 +426,7 @@ class EnergyDynamics(Module):
             fire_cost: Optional[float] = None,  # opt-in: firing drains this much
             fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient at fired positions
             wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
+            rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw
     ):
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
             "activation_cost (gamma) must be positive and <= 4.0"
@@ -446,6 +460,7 @@ class EnergyDynamics(Module):
         self.fire_cost            = None if fire_cost is None else float(fire_cost)
         self.fire_wake_gradient   = None if fire_wake_gradient is None else float(fire_wake_gradient)
         self.wake_seed            = int(wake_seed)
+        self.rng                  = rng
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
@@ -519,6 +534,7 @@ class EnergyDynamics(Module):
             self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
             self.fire_reset_to_zero, self.fire_cost,
             self.fire_wake_gradient, self._wake_sign,
+            self.rng,
         )
         return h_out, self.aux_loss, self.actual_p
 
