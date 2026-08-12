@@ -48,7 +48,10 @@ def _apply_energy_dynamics(
         fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
         wake_sign: Optional[np.ndarray] = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
         rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw below
-) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray]:
+        wake_gate_steps: Optional[int] = None,  # opt-in: recency threshold for the per-neuron drive boost below
+        wake_drive_multiplier: float = 1.0,  # multiplier on drive for neurons stale past wake_gate_steps
+        steps_since_fired: Optional[np.ndarray] = None,  # caller-owned per-neuron recency counter, same shape as h
+) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
     autograd graph.
@@ -169,6 +172,31 @@ def _apply_energy_dynamics(
                     earlier in the process shifts this draw. Pass a
                     seeded np.random.Generator (matching DISLDOLayer's
                     own rng= convention) for reproducible comparisons.
+    wake_gate_steps : opt-in (default None, preserves exact existing
+                    behavior). If set, neurons whose steps_since_fired
+                    (see below) has reached or passed this many calls
+                    without firing get `drive * wake_drive_multiplier`
+                    instead of plain `drive` -- a per-neuron recency
+                    -gated boost, distinct from the population-level
+                    `p`/`density` knobs and from fire_wake_gradient
+                    (which delivers a one-off gradient at fire time,
+                    not an ongoing drive change). Proposed to address
+                    the classic dead-neuron problem generally (not just
+                    zero-init specifically): a neuron that hasn't fired
+                    in a long time gets pushed harder toward threshold,
+                    while recently-active neighbors keep the normal
+                    (lower-noise) setting.
+    wake_drive_multiplier : multiplier applied to drive for stale
+                    neurons when wake_gate_steps is set. 1.0 (default)
+                    is a no-op even with wake_gate_steps set.
+    steps_since_fired : caller-owned per-neuron counter (same shape as
+                    h), required if wake_gate_steps is set. Incremented
+                    every call, reset to 0 wherever a neuron actually
+                    fired-and-was-kept this call. EnergyDynamics.forward
+                    owns this as running state (like self.energy);
+                    direct callers of this function must persist and
+                    pass back the returned new_steps_since_fired
+                    themselves.
 
     Returns
     -------
@@ -190,6 +218,10 @@ def _apply_energy_dynamics(
                  (not h_out's post-gating fire/shutoff constants), rather
                  than re-deriving sparsity via an independent top-k pass
                  that could disagree with what energy actually decided.
+    new_steps_since_fired : updated recency counter, same shape as h
+                 (always returned, even when wake_gate_steps is None --
+                 harmless to ignore, cheap to compute, and lets a caller
+                 start tracking recency before deciding to gate on it).
     """
 
     b              = h.backend
@@ -214,7 +246,20 @@ def _apply_energy_dynamics(
     #             to remain in curiosity regime, not hallucination regime.
     noise_src  = rng if rng is not None else np.random
     noise      = noise_src.normal(0.0, exploration, size=(n,)).astype(dtype)
-    new_energy = energy_flat + drive + noise - activation_cost * np.abs(h_dz)
+
+    # Per-neuron recency-gated drive boost -- see wake_gate_steps' own
+    # docstring. steps_since_fired_flat defaults to all-zeros (nobody
+    # "stale" yet) rather than requiring the caller to pre-populate it,
+    # so a fresh EnergyDynamics with wake_gate_steps set doesn't boost
+    # everything on step 1.
+    ssf_flat = (np.asarray(steps_since_fired, dtype=np.int64).ravel()
+                if steps_since_fired is not None else np.zeros(n, dtype=np.int64))
+    if wake_gate_steps is not None:
+        stale = ssf_flat >= wake_gate_steps
+        effective_drive = np.where(stale, drive * wake_drive_multiplier, drive).astype(dtype)
+    else:
+        effective_drive = drive
+    new_energy = energy_flat + effective_drive + noise - activation_cost * np.abs(h_dz)
 
     # ── 3. Hard thresholds (integrate-and-fire) ──────────────────────────────
     # Shutoff resolved first — frees budget slots before fire claims them.
@@ -385,7 +430,15 @@ def _apply_energy_dynamics(
         normal_kept, kept_fire, shutoff_in_kept,
     ])).astype(np.int32)
 
-    return h_out, new_energy.reshape(energy.shape), aux_loss, actual_p, kept_indices
+    # Recency counter for wake_gate_steps -- reset wherever a neuron
+    # actually fired-and-was-kept this call, incremented everywhere else.
+    new_ssf = ssf_flat + 1
+    if len(kept_fire) > 0:
+        new_ssf[kept_fire] = 0
+    new_steps_since_fired = new_ssf.reshape(energy.shape)
+
+    return (h_out, new_energy.reshape(energy.shape), aux_loss, actual_p,
+            kept_indices, new_steps_since_fired)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -427,6 +480,8 @@ class EnergyDynamics(Module):
             fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient at fired positions
             wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
             rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw
+            wake_gate_steps: Optional[int] = None,  # opt-in: per-neuron recency threshold for the drive boost below
+            wake_drive_multiplier: float = 1.0,  # multiplier on drive for neurons stale past wake_gate_steps
     ):
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
             "activation_cost (gamma) must be positive and <= 4.0"
@@ -461,9 +516,14 @@ class EnergyDynamics(Module):
         self.fire_wake_gradient   = None if fire_wake_gradient is None else float(fire_wake_gradient)
         self.wake_seed            = int(wake_seed)
         self.rng                  = rng
+        self.wake_gate_steps      = None if wake_gate_steps is None else int(wake_gate_steps)
+        self.wake_drive_multiplier = float(wake_drive_multiplier)
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
+        # Per-neuron recency counter for wake_gate_steps -- same shape
+        # as energy, lazily (re)initialized alongside it.
+        self.steps_since_fired: Optional[np.ndarray] = None
         # Lazily built on first forward() call, once h's shape is known --
         # a fixed +-1 pattern per position, seeded (not global RNG) so it's
         # reproducible and doesn't consume the project's own seeded
@@ -520,6 +580,7 @@ class EnergyDynamics(Module):
             # Reset energy on shape change (e.g. body switch, region resize)
             self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
             self._wake_sign = None
+            self.steps_since_fired = np.zeros(h.shape, dtype=np.int64)
 
         if self.fire_wake_gradient is not None and self._wake_sign is None:
             n = int(np.prod(h.shape))
@@ -528,13 +589,15 @@ class EnergyDynamics(Module):
 
         density = self.density if density_override is None else float(density_override)
 
-        h_out, self.energy, self.aux_loss, self.actual_p, self.kept_indices = _apply_energy_dynamics(
+        (h_out, self.energy, self.aux_loss, self.actual_p, self.kept_indices,
+         self.steps_since_fired) = _apply_energy_dynamics(
             h, self.energy,
             self.drive, self.activation_cost, self.precision, density,
             self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
             self.fire_reset_to_zero, self.fire_cost,
             self.fire_wake_gradient, self._wake_sign,
             self.rng,
+            self.wake_gate_steps, self.wake_drive_multiplier, self.steps_since_fired,
         )
         return h_out, self.aux_loss, self.actual_p
 
