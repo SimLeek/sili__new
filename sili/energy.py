@@ -45,6 +45,8 @@ def _apply_energy_dynamics(
         p: float = 0.05,             # HARD CEILING on active neuron fraction
         fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
         fire_cost: Optional[float] = None,  # opt-in: firing drains this much (overrides 2*gamma)
+        fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
+        wake_sign: Optional[np.ndarray] = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
 ) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
@@ -139,6 +141,22 @@ def _apply_energy_dynamics(
                     metabolically much more expensive than the linear
                     activation_cost accounting used elsewhere" without fully
                     resetting to zero. Ignored if fire_reset_to_zero=True.
+    fire_wake_gradient : opt-in (default None). Adds `fire_wake_gradient *
+                    wake_sign * h` at KEPT-FIRED positions only, whose
+                    gradient is exactly `fire_wake_gradient * wake_sign`
+                    there regardless of h's value -- a hard, deterministic
+                    magnitude, unlike energy_loss's gradient (depends on
+                    `new_energy_t - setpoint`). Caller must size this to
+                    clear whatever downstream quantization floor applies
+                    (this module has no visibility into layer-specific
+                    scale) -- tune empirically against a direct before/after
+                    weight measurement, not by derivation.
+    wake_sign       : required if fire_wake_gradient is set. Precomputed
+                    +-1 array, same length as h.ravel(), fixed per position
+                    so fired neurons don't all get pushed the same
+                    direction every time. EnergyDynamics.forward derives
+                    this once from a fixed seed and reuses it; direct
+                    callers must supply their own.
 
     Returns
     -------
@@ -330,6 +348,20 @@ def _apply_energy_dynamics(
     energy_loss  = (reactivity / 2.0) * ((new_energy_t - setpoint)**2).sum()
     aux_loss     = kl_val + energy_loss     # float + Tensor -> Tensor via _coerce
 
+    # Guaranteed-magnitude gradient at kept-fired positions -- see
+    # fire_wake_gradient's own docstring. Deliberately separate from
+    # energy_loss above (whose gradient depends on new_energy_t - setpoint,
+    # not a hard guarantee): `(h * wake_gate).sum()` backprops exactly
+    # `wake_gate` into h regardless of h's actual value.
+    if fire_wake_gradient is not None and len(kept_fire) > 0:
+        assert wake_sign is not None, \
+            "wake_sign is required when fire_wake_gradient is set"
+        wake_sign_flat = np.asarray(wake_sign, dtype=dtype).ravel()
+        wake_gate_np = np.zeros(n, dtype=dtype)
+        wake_gate_np[kept_fire] = fire_wake_gradient * wake_sign_flat[kept_fire]
+        wake_gate_t = Tensor(wake_gate_np.reshape(original_shape), backend=h.backend)
+        aux_loss = aux_loss + (h * wake_gate_t).sum()
+
     # kept_indices: the gate decision energy already made, exposed so a
     # caller can build a CSR straight from it (indices here, values from
     # PRE-gating h_np at these same positions) instead of re-deriving
@@ -379,6 +411,8 @@ class EnergyDynamics(Module):
             p: float          = 0.05,    # hard ceiling on active fraction
             fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
             fire_cost: Optional[float] = None,  # opt-in: firing drains this much
+            fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient at fired positions
+            wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
     ):
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
             "activation_cost (gamma) must be positive and <= 4.0"
@@ -410,9 +444,16 @@ class EnergyDynamics(Module):
         self.p                    = float(p)
         self.fire_reset_to_zero   = bool(fire_reset_to_zero)
         self.fire_cost            = None if fire_cost is None else float(fire_cost)
+        self.fire_wake_gradient   = None if fire_wake_gradient is None else float(fire_wake_gradient)
+        self.wake_seed            = int(wake_seed)
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
+        # Lazily built on first forward() call, once h's shape is known --
+        # a fixed +-1 pattern per position, seeded (not global RNG) so it's
+        # reproducible and doesn't consume the project's own seeded
+        # stochastic-rounding RNG stream.
+        self._wake_sign: Optional[np.ndarray] = None
 
         # Cached for inspection / logging
         self.aux_loss: Optional[Tensor] = None
@@ -463,6 +504,12 @@ class EnergyDynamics(Module):
         if self.energy is None or self.energy.shape != h.shape:
             # Reset energy on shape change (e.g. body switch, region resize)
             self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
+            self._wake_sign = None
+
+        if self.fire_wake_gradient is not None and self._wake_sign is None:
+            n = int(np.prod(h.shape))
+            self._wake_sign = np.random.RandomState(self.wake_seed).choice(
+                [-1.0, 1.0], size=n).astype(np.float32)
 
         density = self.density if density_override is None else float(density_override)
 
@@ -471,6 +518,7 @@ class EnergyDynamics(Module):
             self.drive, self.activation_cost, self.precision, density,
             self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
             self.fire_reset_to_zero, self.fire_cost,
+            self.fire_wake_gradient, self._wake_sign,
         )
         return h_out, self.aux_loss, self.actual_p
 
