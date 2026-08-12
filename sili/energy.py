@@ -451,16 +451,28 @@ def _apply_energy_dynamics(
     # but that's complicated. Doing that would allow neurons at e=t to fire rapidly
     # and go to e=-t quickly, but there doesn't seem to be much actual benefit to that.
 
-    c_np = (energy_flat + drive + noise).reshape(original_shape)
-    c_t = Tensor(c_np.astype(dtype), backend=h.backend)
-    # Abs backward in sili is defined in every backend with `grad[a == 0.0] = 1.0`
-    # in pytorch, you would use `h_abs = torch.where(h == 0, h, torch.abs(h))` and then use h_abs instead of abs(h)
-    new_energy_t = c_t - activation_cost * abs(h)
-    # stale_t masks OUT awake neurons' contribution entirely -- per
-    # wake_gate_steps' docstring, they get zero ongoing gradient pressure
-    # from this term while awake, not just a reduced drive.
-    stale_t     = Tensor(stale.astype(dtype).reshape(original_shape), backend=h.backend)
-    energy_loss = (reactivity / 2.0) * (((new_energy_t - setpoint)**2) * stale_t).sum()
+    # Restricted to STALE positions via gather (true topological exclusion),
+    # NOT `expr * stale_mask` -- confirmed directly this matters, not just
+    # style: L1-sparsity's own known unbounded-output tendency can push
+    # abs(h) large enough at an AWAKE position (never corrected by any
+    # energy mechanism while masked off) that (new_energy_t-setpoint)**2
+    # overflows to inf in float32 -- and `inf * 0.0 == nan`, so a plain
+    # multiplicative mask does NOT protect against contamination; the nan
+    # poisons the whole .sum() and thus the ENTIRE aux_loss gradient, for
+    # every parameter, awake or stale. gather() never evaluates abs(h) at
+    # excluded positions in the first place, so this can't happen no
+    # matter how large an awake neuron's h grows.
+    stale_idx = np.where(stale)[0]
+    if len(stale_idx) > 0:
+        c_stale_np = (energy_flat + drive + noise)[stale_idx]
+        c_stale_t  = Tensor(c_stale_np.astype(dtype), backend=h.backend)
+        h_stale    = gather(h, stale_idx)
+        # Abs backward in sili is defined in every backend with `grad[a == 0.0] = 1.0`
+        # in pytorch, you would use `h_abs = torch.where(h == 0, h, torch.abs(h))` and then use h_abs instead of abs(h)
+        new_energy_t_stale = c_stale_t - activation_cost * abs(h_stale)
+        energy_loss = (reactivity / 2.0) * ((new_energy_t_stale - setpoint)**2).sum()
+    else:
+        energy_loss = Tensor(np.float32(0.0), backend=h.backend)
     aux_loss    = kl_val + energy_loss     # float + Tensor -> Tensor via _coerce
 
     # Guaranteed-magnitude gradient at kept-fired positions -- see
