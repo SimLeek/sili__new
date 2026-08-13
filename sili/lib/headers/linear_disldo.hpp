@@ -1270,7 +1270,36 @@ void disldo_backward(
                     }
                     if (learning_rate != value_type(0)) {
                         mrow[row] += mrow_local;   // mrow is double* already, no down/up-cast needed
-                        if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
+                        if constexpr (!StochasticRounding) {
+                            // Deterministic: NOT gated by the SIMD fast path above --
+                            // no deterministic block4_vec_quantize_fp4 SIMD kernel
+                            // exists yet (only block4_vec_quantize_stochastic_fp4
+                            // does), so this always uses the scalar fp4_quantize()
+                            // codec, mirroring the scattered-CSR path's own
+                            // if constexpr (StochasticRounding) branch above.
+                            // Correctness first -- a SIMD deterministic variant
+                            // would be a reasonable follow-up perf optimization,
+                            // not needed for SparseLinearLayerDeterministic to
+                            // actually BE deterministic, which this fixes: before
+                            // this, block4 (dense/promoted) synapses ALWAYS used
+                            // fp4_quantize_stochastic() here regardless of the
+                            // StochasticRounding template parameter, silently
+                            // making "Deterministic" layers non-deterministic
+                            // whenever they touched block4 storage (confirmed via
+                            // a standalone C++ repro: back-to-back runs of the
+                            // exact same binary gave different final nnz purely
+                            // from this unseeded/uncontrolled stochastic rounding,
+                            // with NO memory corruption or uninitialized reads
+                            // involved -- valgrind memcheck came back clean).
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (!col_valid4[lj]) continue;
+                                mcol[col4[lj]] += mcol4[lj];
+                                const uint8_t new_w   = fp4_quantize(cw4[lj] / combined_scale4[lj]);
+                                const uint8_t new_imp = fp4_quantize(ci4[lj] / combined_imp_scale4[lj]);
+                                tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
+                                tile_dirty = true;
+                            }
+                        } else if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
                             if (full_tile_cols) {
                                 // 2 SIMD stochastic-quantize calls (4 lanes
                                 // each) instead of 8 scalar
