@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1294,8 +1296,10 @@ void disldo_backward(
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 if (!col_valid4[lj]) continue;
                                 mcol[col4[lj]] += mcol4[lj];
-                                const uint8_t new_w   = fp4_quantize(cw4[lj] / combined_scale4[lj]);
-                                const uint8_t new_imp = fp4_quantize(ci4[lj] / combined_imp_scale4[lj]);
+                                const value_type w_ratio   = cw4[lj] / combined_scale4[lj];
+                                const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                const uint8_t new_w   = fp4_quantize(w_ratio);
+                                const uint8_t new_imp = fp4_quantize(imp_ratio);
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                 tile_dirty = true;
                             }
@@ -1457,7 +1461,9 @@ void disldo_backward(
 
     for (int t = 0; t < num_cpus; ++t) {
         const value_type* s = t_dx.data() + static_cast<std::size_t>(t) * dst;
-        for (std::size_t i = 0; i < dst; ++i) input_grad[i] += s[i];
+        for (std::size_t i = 0; i < dst; ++i) {
+            input_grad[i] += s[i];
+        }
     }
 
     if (learning_rate != value_type(0) && output_scale_trainable) {
