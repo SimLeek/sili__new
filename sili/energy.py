@@ -208,6 +208,19 @@ def _apply_energy_dynamics(
                     enough; the ENTIRE mechanism must be gated. Do not
                     reintroduce either narrower version without
                     re-verifying stability.
+    stagger_wake_init : opt-in (default False). Only meaningful with
+                    wake_gate_steps set. steps_since_fired resets to
+                    all-zeros on every shape change (see forward()) --
+                    with nothing having fired yet (e.g. all-zero-init),
+                    every neuron reaches "stale" on the exact same step
+                    (step == wake_gate_steps), so the whole population
+                    becomes fire-eligible simultaneously instead of the
+                    intended staggered wake-up. When True, initializes
+                    steps_since_fired to a uniform random draw over
+                    [0, wake_gate_steps) instead, spreading first
+                    eligibility across the first wake_gate_steps calls.
+                    Uses `rng` if given, else RandomState(wake_seed) --
+                    same convention as wake_sign's own seeded draw.
     steps_since_fired : caller-owned per-neuron counter (same shape as
                     h), required if wake_gate_steps is set. Incremented
                     every call, reset to 0 wherever a neuron actually
@@ -550,6 +563,7 @@ class EnergyDynamics(Module):
             wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
             rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw
             wake_gate_steps: Optional[int] = None,  # opt-in: per-neuron recency threshold gating the whole mechanism
+            stagger_wake_init: bool = False,  # opt-in: randomize initial steps_since_fired instead of uniform zero
     ):
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
             "activation_cost (gamma) must be positive and <= 4.0"
@@ -585,6 +599,7 @@ class EnergyDynamics(Module):
         self.wake_seed            = int(wake_seed)
         self.rng                  = rng
         self.wake_gate_steps      = None if wake_gate_steps is None else int(wake_gate_steps)
+        self.stagger_wake_init    = bool(stagger_wake_init)
 
         # Running state — numpy, not a Tensor, not a learned parameter
         self.energy: Optional[np.ndarray] = None
@@ -647,7 +662,15 @@ class EnergyDynamics(Module):
             # Reset energy on shape change (e.g. body switch, region resize)
             self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
             self._wake_sign = None
-            self.steps_since_fired = np.zeros(h.shape, dtype=np.int64)
+            if self.wake_gate_steps is not None and self.stagger_wake_init:
+                if self.rng is not None:
+                    self.steps_since_fired = self.rng.integers(
+                        0, self.wake_gate_steps, size=h.shape).astype(np.int64)
+                else:
+                    self.steps_since_fired = np.random.RandomState(self.wake_seed).randint(
+                        0, self.wake_gate_steps, size=h.shape).astype(np.int64)
+            else:
+                self.steps_since_fired = np.zeros(h.shape, dtype=np.int64)
 
         if self.fire_wake_gradient is not None and self._wake_sign is None:
             n = int(np.prod(h.shape))
