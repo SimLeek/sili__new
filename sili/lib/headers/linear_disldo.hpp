@@ -449,7 +449,8 @@ void disldo_backward(
     bool         lr_per_row_nnz = false,
     bool         damp_by_importance = true,
     typename ValueAccessor<VALUES_TYPE>::value_type  beta2 = 0.999f,
-    typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f)
+    typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  beta1 = 0.9f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     // Only meaningful when DeferredScaleWrite -- a touched scattered
@@ -479,8 +480,16 @@ void disldo_backward(
             neuron_grad_accum[c]  += std::abs(output_grad[static_cast<std::size_t>(b) * n_out + c]);
     }
 
-    if (dc.empty() && weights.block4.n_tiles() == 0) return;
-
+    // Previously an early return here when both storages were empty --
+    // removed: the dead-row value_scale bootstrap pass (near the end of
+    // this function) needs to run precisely in that case (a genuinely
+    // fresh zero-synapse-init layer), so this can no longer be a pure
+    // early-exit. Everything below is already independently guarded
+    // (`if (!dc.empty())`, `if (weights.block4.n_tiles() > 0)`) and
+    // degrades to safe no-ops when both are empty -- this was an
+    // optimization for the doubly-empty case, not a correctness
+    // requirement, so removing it only costs a little extra harmless
+    // work in that case, not correctness.
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
@@ -508,6 +517,8 @@ void disldo_backward(
         weights.value_scale_importance.resize(n_in, value_type(0));
     if (weights.output_scale_importance.size() < n_out)
         weights.output_scale_importance.resize(n_out, value_type(0));
+    if (weights.value_scale_momentum.size() < n_in)
+        weights.value_scale_momentum.resize(n_in, value_type(0));
 
     if (!dc.empty()) {
     #pragma omp parallel num_threads(num_cpus)
@@ -1454,6 +1465,87 @@ void disldo_backward(
                 const value_type new_vs = weights.value_scale[row] - scale_eff_lr * g_agg / (std::sqrt(new_vs_imp) + eps);
                 if (!std::isfinite(new_vs)) continue;
                 vs_imp = new_vs_imp;
+                weights.value_scale[row] = new_vs;
+            }
+        }
+    }
+
+    // Dead-row (combined scattered CSR + block4) value_scale bootstrap:
+    // a row with ZERO live synapses in EITHER representation gets no
+    // gradient through either path above (both skip it via their own
+    // nnz==0 checks), so value_scale/value_scale_importance would stay
+    // frozen forever -- blocking any hope of bootstrapping predictions
+    // from a genuine zero-synapse init (not the same as all_zero_init,
+    // which keeps full block4 connectivity with weight=0 -- a TRULY
+    // zero-synapse row has no tile/synapse allocated at all). Checked
+    // here, after both the scattered and block4 sections above, using
+    // COMBINED liveness -- a row live in ONE representation but not the
+    // other is already correctly handled by its own path and must not
+    // be double-touched here. Deliberately NOT nested inside
+    // `if (weights.block4.n_tiles() > 0)` -- a layer with zero block4
+    // tiles (pure scattered CSR, or genuinely empty) is exactly the
+    // fresh zero-synapse-init case this exists for, and must still run.
+    //
+    // g_agg = input[row] * S[b], S[b] = sum_col(output_scale[col]*
+    // output_grad[b,col]) -- exact (distributive law), not an
+    // approximation, and S[b] doesn't depend on row, so it costs
+    // O(batch*n_out) ONCE regardless of how many rows are dead (only
+    // paid at all if at least one row actually is), not an
+    // O(n_in_dead*n_out) dense rescan per row -- real MiniCPM5-scale
+    // layers can't afford the latter even while mostly zero-synapse.
+    //
+    // Drives value_scale via a standard two-moment Adam step
+    // (value_scale_momentum = first moment, value_scale_importance
+    // reused as second moment -- safe here since it's provably untouched
+    // by both paths above whenever a row is dead in both) instead of a
+    // single-moment RMSprop step -- linear in g_agg (not g_agg^2), so
+    // E[update]=0 under zero-mean noise regardless of variance, letting
+    // a genuinely inconsistent signal cancel out and stay at zero
+    // (preserving sparsity) while a persistent bias still accumulates.
+    if (learning_rate != value_type(0)) {
+        auto block4_row_live = [&](std::size_t row) -> std::size_t {
+            const auto& bl = weights.block4.block_layout;
+            if (bl.rows == 0) return 0;
+            const std::size_t br = row / BLOCK4_TILE;
+            if (br >= bl.rows) return 0;
+            return bl.row_nnz(br) * BLOCK4_TILE;
+        };
+        bool any_dead_row = false;
+        for (std::size_t row = 0; row < n_in; ++row) {
+            if (L.row_nnz(row) == 0 && block4_row_live(row) == 0) { any_dead_row = true; break; }
+        }
+        if (any_dead_row) {
+            std::vector<double> dead_row_S(static_cast<std::size_t>(batch), 0.0);
+            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                double s = 0.0;
+                for (std::size_t col = 0; col < n_out; ++col) {
+                    s += static_cast<double>(weights.get_output_scale(col))
+                       * static_cast<double>(output_grad[static_cast<std::size_t>(b) * n_out + col]);
+                }
+                dead_row_S[static_cast<std::size_t>(b)] = s;
+            }
+            for (std::size_t row = 0; row < n_in; ++row) {
+                if (L.row_nnz(row) != 0 || block4_row_live(row) != 0) continue;
+                double sum = 0.0;
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                    if (iv == value_type(0)) continue;
+                    sum += static_cast<double>(iv) * dead_row_S[static_cast<std::size_t>(b)];
+                }
+                if (sum == 0.0) continue;
+                const value_type g_agg = static_cast<value_type>(sum);
+                if (!std::isfinite(g_agg)) continue;
+                value_type& m = weights.value_scale_momentum[row];
+                value_type& v = weights.value_scale_importance[row];
+                const value_type new_m = beta1 * m + (value_type(1) - beta1) * g_agg;
+                const value_type new_v = beta2 * v + (value_type(1) - beta2) * g_agg * g_agg;
+                if (!std::isfinite(new_m) || !std::isfinite(new_v)) continue;
+                const value_type dead_row_lr = learning_rate / static_cast<value_type>(n_out);
+                const value_type new_vs = weights.value_scale[row]
+                    - dead_row_lr * new_m / (std::sqrt(new_v) + eps);
+                if (!std::isfinite(new_vs)) continue;
+                m = new_m;
+                v = new_v;
                 weights.value_scale[row] = new_vs;
             }
         }

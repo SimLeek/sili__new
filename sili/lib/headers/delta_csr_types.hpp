@@ -694,6 +694,26 @@ struct SparseLinearWeightsDelta {
         return row < value_scale_importance.size() ? value_scale_importance[row] : value_type(0);
     }
 
+    // Adam-style FIRST moment (signed EMA of g_agg) for value_scale,
+    // companion to value_scale_importance's SECOND moment (EMA of
+    // g_agg^2, unsigned). Used only by the dead-row (nnz_row==0) path in
+    // disldo_backward -- the existing live-synapse value_scale update
+    // uses the instantaneous g_agg directly (RMSprop-style, unchanged).
+    // A dead row has no per-synapse importance (no synapse exists to
+    // hold one), so it needs its own signed accumulator to know which
+    // direction to nudge value_scale; value_scale_importance doubles as
+    // its second moment too (provably untouched by anything else while
+    // nnz_row==0, since the live-synapse loop skips the row entirely).
+    // Linear in g_agg (not g_agg^2) so E[update]=0 under zero-mean noise
+    // regardless of variance -- squaring the pretend/reactive direction
+    // (an earlier, rejected design) would have made an occasional large
+    // -magnitude gradient dominate the accumulated direction even under
+    // otherwise-cancelling noise.
+    std::vector<value_type> value_scale_momentum;
+    inline value_type get_value_scale_momentum(std::size_t row) const {
+        return row < value_scale_momentum.size() ? value_scale_momentum[row] : value_type(0);
+    }
+
     // Per-COLUMN counterpart to value_scale: true_w = stored_w *
     // value_scale[row] * output_scale[col]. Same lazy-sizing/default-1.0
     // convention. Gradient-updated by disldo_backward like value_scale is,
