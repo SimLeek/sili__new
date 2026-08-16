@@ -98,13 +98,13 @@ void disldo_forward(
             if (n_row == 0) continue;
 
             auto cursor = dc.row_cursor(r);
-            const value_type val_scale = weights.get_value_scale(r);
             for (std::size_t e = 0; e < n_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
                 const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                const value_type  out_scale = weights.get_output_scale(col);
-                const value_type  w        = w_stored * val_scale * out_scale;   // -> true units
+                // Rank-N scale (see scale_rank's own docstring) -- reduces
+                // to the exact original val_scale*out_scale at scale_rank==1.
+                const value_type  w = w_stored * weights.get_scale(r, col);   // -> true units
 
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -504,29 +504,34 @@ void disldo_backward(
     // Shared between the scattered loop below AND block4's own loop
     // further down -- both write into the same buffer (per-thread-private
     // slices, indexed by their own tid), summed once at the very end.
-    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out, value_type(0));
+    const std::size_t rank = weights.scale_rank;
+    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
-    // Pre-size value_scale/output_scale so that direct indexed writes
-    // from within the parallel region are safe (resize would race if
-    // called per-thread).
-    if (weights.value_scale.size() < n_in)
-        weights.value_scale.resize(n_in, value_type(1));
-    if (weights.output_scale.size() < n_out)
-        weights.output_scale.resize(n_out, value_type(1));
-    if (weights.value_scale_importance.size() < n_in)
-        weights.value_scale_importance.resize(n_in, value_type(0));
-    if (weights.output_scale_importance.size() < n_out)
-        weights.output_scale_importance.resize(n_out, value_type(0));
-    if (weights.value_scale_momentum.size() < n_in)
-        weights.value_scale_momentum.resize(n_in, value_type(0));
+    // Pre-size value_scale/output_scale (now n_in*rank / n_out*rank, see
+    // scale_rank's own docstring) so that direct indexed writes from
+    // within the parallel region are safe (resize would race if called
+    // per-thread).
+    if (weights.value_scale.size() < n_in * rank)
+        weights.value_scale.resize(n_in * rank, value_type(1));
+    if (weights.output_scale.size() < n_out * rank)
+        weights.output_scale.resize(n_out * rank, value_type(1));
+    if (weights.value_scale_importance.size() < n_in * rank)
+        weights.value_scale_importance.resize(n_in * rank, value_type(0));
+    if (weights.output_scale_importance.size() < n_out * rank)
+        weights.output_scale_importance.resize(n_out * rank, value_type(0));
+    if (weights.value_scale_momentum.size() < n_in * rank)
+        weights.value_scale_momentum.resize(n_in * rank, value_type(0));
 
     if (!dc.empty()) {
     #pragma omp parallel num_threads(num_cpus)
     {
         const int tid = omp_get_thread_num();
         value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
-        value_type* mcol = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out;
+        // Per-component now: mcol[col*rank+k]. Indexing helper local to
+        // this thread, rank captured from the enclosing scope.
+        value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
+        auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
         [[maybe_unused]] std::vector<DeferredScaleWriteEntry>* mdeferred = nullptr;
         if constexpr (DeferredScaleWrite) mdeferred = &t_deferred[static_cast<std::size_t>(tid)];
 
@@ -582,8 +587,12 @@ void disldo_backward(
             // applying lr per-individual-contribution inside the innermost
             // loop risks each increment falling below ULP(value_scale) in
             // float32 and disappearing. The double accumulator + single
-            // application avoids that.
+            // application avoids that. scale_grad_sum (single double) is
+            // the DeferredScaleWrite-only path's accumulator (component 0
+            // only, see that branch's own scope note); scale_grad_sum_rank
+            // is the non-deferred path's per-component accumulator.
             double scale_grad_sum = 0.0;
+            std::vector<double> scale_grad_sum_rank(rank, 0.0);
             for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
@@ -623,7 +632,7 @@ void disldo_backward(
                                 ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                                 : (-effective_lr * g);
                             scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
-                            mcol[col] += cw_orig * val_scale * g;
+                            mcol_at(col, 0) += cw_orig * val_scale * g;
                         }
                         mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                     }
@@ -650,21 +659,24 @@ void disldo_backward(
                 } else {
                     // NEW formula: quant (the stored CODE) is the primary
                     // optimized quantity now, updated DIRECTLY via
-                    // dL/d(quant) = g * combined_scale -- proper chain
-                    // rule on true_w = quant * combined_scale -- instead
-                    // of the old true-units round-trip (cw += ...;
-                    // new_code = cw / combined_scale), which DIVIDED by
-                    // combined_scale, backwards: made a LARGER scale
-                    // SHRINK the per-call code step instead of growing
-                    // it. This version is unconditionally nonzero given
-                    // combined_scale != 0, so quant can escape exactly 0
-                    // without needing stochastic rounding, no matter how
-                    // small learning_rate is, given enough persistent
-                    // -signal steps (value_scale itself keeps growing
+                    // dL/d(quant) = g * S(row,col) -- proper chain rule on
+                    // true_w = quant * S -- instead of the old true-units
+                    // round-trip (cw += ...; new_code = cw / combined_scale),
+                    // which DIVIDED by the scale, backwards: made a LARGER
+                    // scale SHRINK the per-call code step instead of
+                    // growing it. This version is unconditionally nonzero
+                    // given S != 0, so quant can escape exactly 0 without
+                    // needing stochastic rounding, no matter how small
+                    // learning_rate is, given enough persistent-signal
+                    // steps (each value_scale component keeps growing
                     // under the same signal, per its own update just
                     // below, giving quant ever more leverage over time).
+                    // S = weights.get_scale(r,col), a sum over `rank`
+                    // outer-product components (rank=1 reproduces the
+                    // exact original val_scale*out_scale).
+                    const value_type S = weights.get_scale(r, col);
                     value_type quant = cw_orig;
-                    value_type cw = quant * combined_scale;  // true units, for dx -- refreshed after any update
+                    value_type cw = quant * S;  // true units, for dx -- refreshed after any update
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
                         const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
@@ -675,27 +687,35 @@ void disldo_backward(
                             // -- see this function's own docstring for why.
                             ci = beta2 * ci + (value_type(1) - beta2) * g * g;
                             quant += damp_by_importance
-                                ? (-effective_lr * g * combined_scale) / (std::sqrt(ci) + eps)
-                                : (-effective_lr * g * combined_scale);
-                            cw = quant * combined_scale;
-                            // dL/d(val_scale[r]) = g * quant (out_scale
-                            // held fixed) -- vanishes EXACTLY at quant=0,
-                            // which is exactly the case that needs to
-                            // escape. (zero_escape_eps + |quant|)
-                            // substitutes a floor for the vanishing
-                            // |quant| term -- magnitude only, quant's own
-                            // SIGN is already correctly carried by ITS
-                            // OWN update above via signed value_scale;
-                            // value_scale's own sign here is free/
-                            // arbitrary (confirmed acceptable directly --
-                            // only its magnitude growing under a
+                                ? (-effective_lr * g * S) / (std::sqrt(ci) + eps)
+                                : (-effective_lr * g * S);
+                            cw = quant * S;
+                            // dL/d(value_scale_k(r,k)) = g * quant *
+                            // output_scale_k(col,k), for EACH component k
+                            // (out_scale_k held fixed within its own term,
+                            // holding every OTHER component fixed too --
+                            // partial derivative of a sum of independent
+                            // outer products). Vanishes EXACTLY at quant=0
+                            // for every k simultaneously, which is exactly
+                            // the case that needs to escape.
+                            // (zero_escape_eps + |quant|) substitutes a
+                            // floor for the vanishing |quant| term --
+                            // magnitude only, quant's own SIGN is already
+                            // correctly carried by ITS OWN update above
+                            // via signed S; each component's own sign here
+                            // is free/arbitrary (confirmed acceptable
+                            // directly -- only magnitude growing under a
                             // persistent signal matters, same principle
                             // already validated by the dead-row bootstrap's
                             // noise-vs-signal test, applied here to the
-                            // live-but-zero-code case).
+                            // live-but-zero-code case, now per-component).
                             const value_type quant_floor = zero_escape_eps + std::abs(quant);
-                            scale_grad_sum += static_cast<double>(quant_floor) * static_cast<double>(out_scale) * g;
-                            mcol[col] += quant_floor * val_scale * g;
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                const value_type out_scale_k = weights.get_output_scale_k(col, k);
+                                const value_type val_scale_k = weights.get_value_scale_k(r, k);
+                                scale_grad_sum_rank[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * g;
+                                mcol_at(col, k) += quant_floor * val_scale_k * g;
+                            }
                         }
                         mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                     }
@@ -718,9 +738,22 @@ void disldo_backward(
                 // Scale update via the swappable policy (default
                 // RMSpropScalePolicy reproduces this exact formula) --
                 // see ScalePolicy's own docstring, delta_csr_types.hpp.
-                const value_type g_agg = static_cast<value_type>(scale_grad_sum);
-                ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
-                                    g_agg, scale_eff_lr, beta2, eps);
+                // DeferredScaleWrite still only updates component 0
+                // (scale_grad_sum, the old single-double accumulator) --
+                // rank>1 is only meaningful for the non-deferred branch
+                // above (scale_grad_sum_rank), matching that branch's own
+                // scope note.
+                if constexpr (!DeferredScaleWrite) {
+                    for (std::size_t k = 0; k < rank; ++k) {
+                        const value_type g_agg_k = static_cast<value_type>(scale_grad_sum_rank[k]);
+                        ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
+                                            g_agg_k, scale_eff_lr, beta2, eps);
+                    }
+                } else {
+                    const value_type g_agg = static_cast<value_type>(scale_grad_sum);
+                    ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
+                                        g_agg, scale_eff_lr, beta2, eps);
+                }
             }
         }
 
@@ -1572,38 +1605,48 @@ void disldo_backward(
             if (L.row_nnz(row) == 0 && block4_row_live(row) == 0) { any_dead_row = true; break; }
         }
         if (any_dead_row) {
-            std::vector<double> dead_row_S(static_cast<std::size_t>(batch), 0.0);
+            // dead_row_S[b][k] = sum_col(output_scale_k(col,k)*output_grad
+            // [b,col]) -- one independent sum per rank component (rank=1
+            // reproduces the exact original single-sum formula). Still
+            // row-independent, so still O(batch*n_out*rank) ONCE, not
+            // O(n_in_dead*n_out*rank) per row.
+            std::vector<double> dead_row_S(static_cast<std::size_t>(batch) * rank, 0.0);
             for (SIZE_TYPE b = 0; b < batch; ++b) {
-                double s = 0.0;
-                for (std::size_t col = 0; col < n_out; ++col) {
-                    s += static_cast<double>(weights.get_output_scale(col))
-                       * static_cast<double>(output_grad[static_cast<std::size_t>(b) * n_out + col]);
+                for (std::size_t k = 0; k < rank; ++k) {
+                    double s = 0.0;
+                    for (std::size_t col = 0; col < n_out; ++col) {
+                        s += static_cast<double>(weights.get_output_scale_k(col, k))
+                           * static_cast<double>(output_grad[static_cast<std::size_t>(b) * n_out + col]);
+                    }
+                    dead_row_S[static_cast<std::size_t>(b) * rank + k] = s;
                 }
-                dead_row_S[static_cast<std::size_t>(b)] = s;
             }
             for (std::size_t row = 0; row < n_in; ++row) {
                 if (L.row_nnz(row) != 0 || block4_row_live(row) != 0) continue;
-                double sum = 0.0;
-                for (SIZE_TYPE b = 0; b < batch; ++b) {
-                    const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
-                    if (iv == value_type(0)) continue;
-                    sum += static_cast<double>(iv) * dead_row_S[static_cast<std::size_t>(b)];
+                for (std::size_t k = 0; k < rank; ++k) {
+                    double sum = 0.0;
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+                        if (iv == value_type(0)) continue;
+                        sum += static_cast<double>(iv) * dead_row_S[static_cast<std::size_t>(b) * rank + k];
+                    }
+                    if (sum == 0.0) continue;
+                    const value_type g_agg = static_cast<value_type>(sum);
+                    if (!std::isfinite(g_agg)) continue;
+                    const std::size_t idx = row * rank + k;
+                    value_type& m = weights.value_scale_momentum[idx];
+                    value_type& v = weights.value_scale_importance[idx];
+                    const value_type new_m = beta1 * m + (value_type(1) - beta1) * g_agg;
+                    const value_type new_v = beta2 * v + (value_type(1) - beta2) * g_agg * g_agg;
+                    if (!std::isfinite(new_m) || !std::isfinite(new_v)) continue;
+                    const value_type dead_row_lr = learning_rate / static_cast<value_type>(n_out);
+                    const value_type new_vs = weights.value_scale[idx]
+                        - dead_row_lr * new_m / (std::sqrt(new_v) + eps);
+                    if (!std::isfinite(new_vs)) continue;
+                    m = new_m;
+                    v = new_v;
+                    weights.value_scale[idx] = new_vs;
                 }
-                if (sum == 0.0) continue;
-                const value_type g_agg = static_cast<value_type>(sum);
-                if (!std::isfinite(g_agg)) continue;
-                value_type& m = weights.value_scale_momentum[row];
-                value_type& v = weights.value_scale_importance[row];
-                const value_type new_m = beta1 * m + (value_type(1) - beta1) * g_agg;
-                const value_type new_v = beta2 * v + (value_type(1) - beta2) * g_agg * g_agg;
-                if (!std::isfinite(new_m) || !std::isfinite(new_v)) continue;
-                const value_type dead_row_lr = learning_rate / static_cast<value_type>(n_out);
-                const value_type new_vs = weights.value_scale[row]
-                    - dead_row_lr * new_m / (std::sqrt(new_v) + eps);
-                if (!std::isfinite(new_vs)) continue;
-                m = new_m;
-                v = new_v;
-                weights.value_scale[row] = new_vs;
             }
         }
     }
@@ -1620,20 +1663,24 @@ void disldo_backward(
         // once per column -- same "sum first, apply lr once" reasoning as
         // value_scale's own update. Normalizes by out_degree[c] (how many
         // rows feed this output), the column-axis equivalent of
-        // nnz_this_row; a column with zero connections is skipped.
+        // nnz_this_row; a column with zero connections is skipped. Now
+        // per-component (rank>1, see scale_rank's own docstring) --
+        // t_col_grad is laid out [thread][col][k].
         for (std::size_t c = 0; c < n_out; ++c) {
             const std::size_t deg = c < weights.out_degree.size()
                 ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
             if (deg == 0) continue;
-            double col_grad_sum = 0.0;
-            for (int t = 0; t < num_cpus; ++t)
-                col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out + c];
             const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
-            // Scale update via the swappable policy -- same as
-            // value_scale's own update above.
-            const value_type g_agg = static_cast<value_type>(col_grad_sum);
-            ScalePolicy::update(weights.output_scale[c], weights.output_scale_importance[c],
-                                g_agg, col_eff_lr, beta2, eps);
+            for (std::size_t k = 0; k < rank; ++k) {
+                double col_grad_sum = 0.0;
+                for (int t = 0; t < num_cpus; ++t)
+                    col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out * rank + c * rank + k];
+                // Scale update via the swappable policy -- same as
+                // value_scale's own update above.
+                const value_type g_agg = static_cast<value_type>(col_grad_sum);
+                ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
+                                    g_agg, col_eff_lr, beta2, eps);
+            }
         }
     }
 

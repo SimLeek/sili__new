@@ -671,27 +671,86 @@ struct SparseLinearWeightsDelta {
         output_importance_scale[col] = v;
     }
 
+    // RANK of the value_scale/output_scale factorization. true_w =
+    // quant * S[row,col], where S used to be a plain rank-1 outer product
+    // value_scale[row]*output_scale[col] -- now generalized to
+    // S[row,col] = sum_{k<scale_rank} value_scale_k(row,k) *
+    // output_scale_k(col,k), a sum of `scale_rank` outer products.
+    // Runtime-parameterized (not a C++ template per rank) so no new
+    // class/pybind binding is needed per rank value tried -- rank=1 is
+    // the default and reproduces the exact original behavior; storage
+    // for k>=1 defaults to 0.0 (see get_value_scale_k), so an
+    // unconfigured extra component contributes nothing until trained,
+    // and every existing call site (single-component get_value_scale/
+    // get_output_scale, meaning component 0) keeps working unmodified.
+    //
+    // WHY rank>1 at all: a single shared row-scalar (rank-1) can't serve
+    // a row whose columns have genuinely conflicting persistent gradient
+    // demand (column A wants the scale positive, column B wants it
+    // negative) -- the row-aggregate gradient driving value_scale sums
+    // g*quant across every column in the row, and opposite-signed real
+    // signal cancels there exactly like noise would, even though neither
+    // column's own signal is actually noisy. A second (u2,v2) component
+    // gives a second, independently-signed channel to absorb the
+    // opposite-signed column instead of cancelling against the first.
+    //
+    // SCOPE NOTE: only disldo_forward's and disldo_backward's SCATTERED
+    // -CSR paths are rank-aware. block4's own forward/backward SIMD
+    // paths (a separate, much larger set of functions) still read only
+    // value_scale[row]*output_scale[col] (component 0) -- a real,
+    // currently-dormant correctness gap: if a rank>1 layer's synapse
+    // ever gets promoted to block4 storage, its effective scale would
+    // SILENTLY drop every component beyond 0 at that point. Not yet hit
+    // in practice (growth from zero-synapse init lands in scattered CSR
+    // first, confirmed directly), but real once block4 promotion is
+    // exercised on a rank>1 layer -- tracked as a follow-up, not fixed
+    // here.
+    std::size_t scale_rank = 1;
+
     // Same per-row design, for STORED weight values instead of importance.
     // Same motivation, same lazy-sizing/default-1.0 pattern, same
-    // read/write convention (true_w = stored_w * scale).
+    // read/write convention (true_w = stored_w * scale). Storage is now
+    // row-major per-component: value_scale[row*scale_rank + k].
     std::vector<value_type> value_scale;
 
+    // Per-component accessor. Component 0 default-value 1.0 matches the
+    // original single-component convention (unset row => pass-through
+    // scale of 1); component k>=1 defaults to 0.0 so an untrained extra
+    // rank component is a pure no-op (S[row,col] reduces to exactly the
+    // rank-1 formula until that component is actually trained).
+    inline value_type get_value_scale_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        if (idx < value_scale.size()) return value_scale[idx];
+        return k == 0 ? value_type(1) : value_type(0);
+    }
+    inline void set_value_scale_raw_k(std::size_t row, std::size_t k, value_type v) {
+        const std::size_t idx = row * scale_rank + k;
+        if (idx >= value_scale.size())
+            value_scale.resize(idx + 1, value_type(1));  // grows lazily; see backfill note below
+        value_scale[idx] = v;
+    }
+    // Backward-compat single-component accessors -- component 0 only,
+    // exact original meaning/behavior at scale_rank==1.
     inline value_type get_value_scale(std::size_t row) const {
-        return row < value_scale.size() ? value_scale[row] : value_type(1);
+        return get_value_scale_k(row, 0);
     }
     inline void set_value_scale_raw(std::size_t row, value_type v) {
-        if (row >= value_scale.size()) value_scale.resize(row + 1, value_type(1));
-        value_scale[row] = v;
+        set_value_scale_raw_k(row, 0, v);
     }
 
     // value_scale/output_scale are themselves gradient-updated parameters
     // (disldo_backward), so -- like every per-synapse weight -- each gets
     // its own importance value damping its update step
     // (new = old - lr*grad / (1 + |importance|)). Default 0, same
-    // convention as per-synapse importance.
+    // convention as per-synapse importance. Same per-component,
+    // row-major layout as value_scale.
     std::vector<value_type> value_scale_importance;
+    inline value_type get_value_scale_importance_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        return idx < value_scale_importance.size() ? value_scale_importance[idx] : value_type(0);
+    }
     inline value_type get_value_scale_importance(std::size_t row) const {
-        return row < value_scale_importance.size() ? value_scale_importance[row] : value_type(0);
+        return get_value_scale_importance_k(row, 0);
     }
 
     // Adam-style FIRST moment (signed EMA of g_agg) for value_scale,
@@ -708,33 +767,68 @@ struct SparseLinearWeightsDelta {
     // regardless of variance -- squaring the pretend/reactive direction
     // (an earlier, rejected design) would have made an occasional large
     // -magnitude gradient dominate the accumulated direction even under
-    // otherwise-cancelling noise.
+    // otherwise-cancelling noise. Same per-component, row-major layout.
     std::vector<value_type> value_scale_momentum;
+    inline value_type get_value_scale_momentum_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        return idx < value_scale_momentum.size() ? value_scale_momentum[idx] : value_type(0);
+    }
     inline value_type get_value_scale_momentum(std::size_t row) const {
-        return row < value_scale_momentum.size() ? value_scale_momentum[row] : value_type(0);
+        return get_value_scale_momentum_k(row, 0);
     }
 
     // Per-COLUMN counterpart to value_scale: true_w = stored_w *
-    // value_scale[row] * output_scale[col]. Same lazy-sizing/default-1.0
-    // convention. Gradient-updated by disldo_backward like value_scale is,
-    // but ONLY once a caller has explicitly called set_output_scale_raw at
-    // least once -- output_scale_is_trainable tracks that (not
-    // output_scale.empty(), which disldo_backward's own internal resize
-    // would otherwise flip after the first call regardless of intent).
+    // S[row,col], S = sum_k value_scale_k(row,k)*output_scale_k(col,k).
+    // Same lazy-sizing/default convention (component 0 -> 1.0, k>=1 ->
+    // 0.0), same row-major-per-component layout: output_scale[col*
+    // scale_rank+k]. Gradient-updated by disldo_backward like value_scale
+    // is, but ONLY once a caller has explicitly called
+    // set_output_scale_raw{,_k} at least once -- output_scale_is_trainable
+    // tracks that (not output_scale.empty(), which disldo_backward's own
+    // internal resize would otherwise flip after the first call
+    // regardless of intent).
     std::vector<value_type> output_scale;
     std::vector<value_type> output_scale_importance;
     bool output_scale_is_trainable = false;
 
+    inline value_type get_output_scale_k(std::size_t col, std::size_t k) const {
+        const std::size_t idx = col * scale_rank + k;
+        if (idx < output_scale.size()) return output_scale[idx];
+        return k == 0 ? value_type(1) : value_type(0);
+    }
     inline value_type get_output_scale(std::size_t col) const {
-        return col < output_scale.size() ? output_scale[col] : value_type(1);
+        return get_output_scale_k(col, 0);
+    }
+    inline value_type get_output_scale_importance_k(std::size_t col, std::size_t k) const {
+        const std::size_t idx = col * scale_rank + k;
+        return idx < output_scale_importance.size() ? output_scale_importance[idx] : value_type(0);
     }
     inline value_type get_output_scale_importance(std::size_t col) const {
-        return col < output_scale_importance.size() ? output_scale_importance[col] : value_type(0);
+        return get_output_scale_importance_k(col, 0);
+    }
+    inline void set_output_scale_raw_k(std::size_t col, std::size_t k, value_type v) {
+        const std::size_t idx = col * scale_rank + k;
+        if (idx >= output_scale.size()) output_scale.resize(idx + 1, value_type(1));
+        output_scale[idx] = v;
+        output_scale_is_trainable = true;
     }
     inline void set_output_scale_raw(std::size_t col, value_type v) {
-        if (col >= output_scale.size()) output_scale.resize(col + 1, value_type(1));
-        output_scale[col] = v;
-        output_scale_is_trainable = true;
+        set_output_scale_raw_k(col, 0, v);
+    }
+
+    // Combined rank-N scale: S[row,col] = sum_{k<scale_rank}
+    // value_scale_k(row,k) * output_scale_k(col,k). THE quantity
+    // Hadamard-multiplied against quant in both disldo_forward and
+    // disldo_backward's quant-update -- replaces the old
+    // get_value_scale(row)*get_output_scale(col) two-call pattern
+    // wherever the caller wants full rank-N behavior (scattered-CSR
+    // forward/backward; block4's paths still use the two-call rank-1
+    // -only form, see scale_rank's own docstring).
+    inline value_type get_scale(std::size_t row, std::size_t col) const {
+        value_type s = value_type(0);
+        for (std::size_t k = 0; k < scale_rank; ++k)
+            s += get_value_scale_k(row, k) * get_output_scale_k(col, k);
+        return s;
     }
 
     // Running L1 / L2^2 / max|.| for STORED (quantized) importance and

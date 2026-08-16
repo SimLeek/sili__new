@@ -417,6 +417,21 @@ public:
     // callers otherwise) -- see Block4View, bound as layer.block4.
     Block4View block4() { return Block4View(weights.block4); }
 
+    // Rank of the value_scale/output_scale factorization -- see
+    // scale_rank's own docstring, delta_csr_types.hpp. Default 1
+    // (original behavior); set BEFORE any training call touches
+    // value_scale/output_scale, since changing rank after synapses
+    // already have per-component scale data stored would silently
+    // reinterpret that data under a different row-major stride. Only
+    // meaningful for disldo_forward/disldo_backward's SCATTERED-CSR
+    // path -- block4's own forward/backward remain rank-1-only (see
+    // scale_rank's own docstring for the tracked gap this implies).
+    std::size_t get_scale_rank() const { return weights.scale_rank; }
+    void set_scale_rank(std::size_t rank) {
+        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        weights.scale_rank = rank;
+    }
+
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
     py::array_t<V> forward_dense(py::array_t<V> x) {
@@ -721,6 +736,15 @@ public:
     V get_value_scale_importance(S row)  const { return weights.get_value_scale_importance(static_cast<std::size_t>(row)); }
     V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
     V get_output_importance_scale(S col) const { return weights.get_output_importance_scale(static_cast<std::size_t>(col)); }
+
+    // Per-component (rank>1) accessors -- see scale_rank's own docstring.
+    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
+    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
+    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
+    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Combined rank-N scale S(row,col) -- THE quantity Hadamard-multiplied
+    // against quant in both forward and backward.
+    V get_scale(S row, S col) const { return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col)); }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -1383,6 +1407,8 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
+        .def("get_scale_rank",       &SparseLinearLayer::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayer::set_scale_rank, py::arg("rank"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -1457,6 +1483,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale",      &SparseLinearLayer::get_value_scale,
              py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
+        .def("get_value_scale_k",    &SparseLinearLayer::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayer::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_scale",            &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
+             "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
+             "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
         .def("set_value_scale_raw",
              [](SparseLinearLayer& self, int row, float scale) {
                  self.weights.set_value_scale_raw(
@@ -2037,6 +2070,8 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
+        .def("get_scale_rank",       &SparseLinearLayerDeterministic::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -2111,6 +2146,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale",      &SparseLinearLayerDeterministic::get_value_scale,
              py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
+        .def("get_value_scale_k",    &SparseLinearLayerDeterministic::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayerDeterministic::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayerDeterministic::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_scale",            &SparseLinearLayerDeterministic::get_scale, py::arg("row"), py::arg("col"),
+             "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
+             "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
         .def("set_value_scale_raw",
              [](SparseLinearLayerDeterministic& self, int row, float scale) {
                  self.weights.set_value_scale_raw(
