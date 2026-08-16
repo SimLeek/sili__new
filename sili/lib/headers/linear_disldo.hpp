@@ -450,7 +450,8 @@ void disldo_backward(
     bool         damp_by_importance = true,
     typename ValueAccessor<VALUES_TYPE>::value_type  beta2 = 0.999f,
     typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f,
-    typename ValueAccessor<VALUES_TYPE>::value_type  beta1 = 0.9f)
+    typename ValueAccessor<VALUES_TYPE>::value_type  beta1 = 0.9f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     // Only meaningful when DeferredScaleWrite -- a touched scattered
@@ -590,63 +591,119 @@ void disldo_backward(
                 const value_type  ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                 const value_type  out_scale     = weights.get_output_scale(col);
                 const value_type  combined_scale = val_scale * out_scale;
-                value_type cw  = cw_orig * combined_scale;   // -> true units
                 // Same row*col combination as the weight's own scale --
                 // see the matching comment in disldo_forward.
                 const value_type  out_imp_scale      = weights.get_output_importance_scale(col);
                 const value_type  combined_imp_scale = imp_scale * out_imp_scale;
                 value_type ci  = ci_orig * combined_imp_scale;   // -> true units
 
-                for (SIZE_TYPE b = 0; b < batch; ++b) {
-                    const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
-                    const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
-                    const value_type g   = dyv * iv;
-
-                    if (learning_rate != value_type(0)) {
-                        // RMSprop-style: ci = decayed EMA of g^2 (magnitude-only,
-                        // recency-weighted), damp by sqrt(ci)+eps instead of 1+|ci|
-                        // -- see this function's own docstring for why.
-                        ci = beta2 * ci + (value_type(1) - beta2) * g * g;
-                        cw += damp_by_importance
-                            ? (-effective_lr * g) / (std::sqrt(ci) + eps)
-                            : (-effective_lr * g);
-                        // dL/d(val_scale[r]) = stored_w * out_scale[col] * dy * input
-                        // dL/d(out_scale[col]) = stored_w * val_scale[r] * dy * input
-                        // (true_w = stored_w * val_scale * out_scale, so each
-                        // scale's gradient holds the OTHER factor fixed)
-                        scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
-                        mcol[col] += cw_orig * val_scale * g;
+                if constexpr (DeferredScaleWrite) {
+                    // UNCHANGED, old true-units-round-trip formula --
+                    // value_scale[r]/output_scale[col] finalize AFTER
+                    // this loop (value_scale right below, output_scale in
+                    // the shared reduction at the very end of this
+                    // function), so eagerly multiplying the code's own
+                    // step by a not-yet-finalized combined_scale (the
+                    // "new" formula below) would reintroduce exactly the
+                    // staleness DeferredScaleWrite exists to avoid. Needs
+                    // its own separate treatment to get the zero-escape
+                    // property too -- not done here, so a DeferredScaleWrite
+                    // layer (SparseLinearLayerResync et al) does NOT yet
+                    // get deterministic-rounding zero-escape; only the
+                    // default (non-deferred) SparseLinearLayer/
+                    // SparseLinearLayerDeterministic do.
+                    value_type cw = cw_orig * combined_scale;
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
+                        const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
+                        const value_type g   = dyv * iv;
+                        if (learning_rate != value_type(0)) {
+                            ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                            cw += damp_by_importance
+                                ? (-effective_lr * g) / (std::sqrt(ci) + eps)
+                                : (-effective_lr * g);
+                            scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
+                            mcol[col] += cw_orig * val_scale * g;
+                        }
+                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                     }
-                    mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
-                }
-                if (learning_rate != value_type(0)) {
-                    if constexpr (DeferredScaleWrite) {
+                    if (learning_rate != value_type(0)) {
                         // Defer the store until value_scale[r] AND
                         // output_scale[col] are BOTH finalized for this
-                        // call (value_scale[r] finalizes right after this
-                        // row's loop below; output_scale finalizes in the
-                        // shared reduction at the very end of this
-                        // function, after every row and after block4) --
-                        // storing now would use the stale pre-update
-                        // scale, exactly the bug this parameter exists to
-                        // fix. Stats use the pre-store true-units `ci`
-                        // directly as a stand-in for the post-quantization
-                        // readback (the real stored code doesn't exist yet
-                        // when the write is deferred) -- a documented
-                        // approximation, harmless since these stats are
-                        // purely observational and unused by anything in
-                        // a no-synaptogenesis training loop.
+                        // call -- storing now would use the stale
+                        // pre-update scale, exactly the bug this parameter
+                        // exists to fix. Stats use the pre-store
+                        // true-units `ci` directly as a stand-in for the
+                        // post-quantization readback (the real stored
+                        // code doesn't exist yet when the write is
+                        // deferred) -- a documented approximation,
+                        // harmless since these stats are purely
+                        // observational and unused by anything in a
+                        // no-synaptogenesis training loop.
                         mdeferred->push_back(DeferredScaleWriteEntry{vb, cw, ci, r, col});
                         local_sum_abs_new_i += std::abs(static_cast<double>(ci));
                         local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
                         local_sum_sq_new_i  += static_cast<double>(ci) * ci;
                         local_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
                         local_max_new_i = std::max(local_max_new_i, std::abs(ci));
-                    } else {
+                    }
+                } else {
+                    // NEW formula: quant (the stored CODE) is the primary
+                    // optimized quantity now, updated DIRECTLY via
+                    // dL/d(quant) = g * combined_scale -- proper chain
+                    // rule on true_w = quant * combined_scale -- instead
+                    // of the old true-units round-trip (cw += ...;
+                    // new_code = cw / combined_scale), which DIVIDED by
+                    // combined_scale, backwards: made a LARGER scale
+                    // SHRINK the per-call code step instead of growing
+                    // it. This version is unconditionally nonzero given
+                    // combined_scale != 0, so quant can escape exactly 0
+                    // without needing stochastic rounding, no matter how
+                    // small learning_rate is, given enough persistent
+                    // -signal steps (value_scale itself keeps growing
+                    // under the same signal, per its own update just
+                    // below, giving quant ever more leverage over time).
+                    value_type quant = cw_orig;
+                    value_type cw = quant * combined_scale;  // true units, for dx -- refreshed after any update
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
+                        const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
+                        const value_type g   = dyv * iv;
+                        if (learning_rate != value_type(0)) {
+                            // RMSprop-style: ci = decayed EMA of g^2 (magnitude-only,
+                            // recency-weighted), damp by sqrt(ci)+eps instead of 1+|ci|
+                            // -- see this function's own docstring for why.
+                            ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                            quant += damp_by_importance
+                                ? (-effective_lr * g * combined_scale) / (std::sqrt(ci) + eps)
+                                : (-effective_lr * g * combined_scale);
+                            cw = quant * combined_scale;
+                            // dL/d(val_scale[r]) = g * quant (out_scale
+                            // held fixed) -- vanishes EXACTLY at quant=0,
+                            // which is exactly the case that needs to
+                            // escape. (zero_escape_eps + |quant|)
+                            // substitutes a floor for the vanishing
+                            // |quant| term -- magnitude only, quant's own
+                            // SIGN is already correctly carried by ITS
+                            // OWN update above via signed value_scale;
+                            // value_scale's own sign here is free/
+                            // arbitrary (confirmed acceptable directly --
+                            // only its magnitude growing under a
+                            // persistent signal matters, same principle
+                            // already validated by the dead-row bootstrap's
+                            // noise-vs-signal test, applied here to the
+                            // live-but-zero-code case).
+                            const value_type quant_floor = zero_escape_eps + std::abs(quant);
+                            scale_grad_sum += static_cast<double>(quant_floor) * static_cast<double>(out_scale) * g;
+                            mcol[col] += quant_floor * val_scale * g;
+                        }
+                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
+                    }
+                    if (learning_rate != value_type(0)) {
                         if constexpr (StochasticRounding) {
-                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, quant, ci / combined_imp_scale);
                         } else {
-                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, cw / combined_scale, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, quant, ci / combined_imp_scale);
                         }
                         const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
