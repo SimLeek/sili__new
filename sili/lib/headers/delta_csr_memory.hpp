@@ -743,14 +743,25 @@ void block4_maybe_promote(
 // same scoping as this session's other block4 rank-N/chain-rule work,
 // since the real toy/test model uses FP4, not FP8. A no-op for FP8 rather
 // than a silent miscompile.
+// min_slack_bytes: a floor added to EVERY row's blank space regardless of
+// blank_fraction -- default BLOCK4_TILE_SLOTS (one full FP4 dense tile) so
+// a row whose entire current content is a single empty sparse tile (1
+// byte) still gets enough room for that ONE tile to go fully dense
+// without immediately re-triggering eviction (blank_fraction alone rounds
+// to 0 extra bytes at that scale: 1 byte * 0.2 truncates to 0). Pass 0
+// (alongside blank_fraction=0) for a true tight compact -- see
+// block4_compact below, the opposite operation of this function, mirroring
+// compact()/expand_headroom()'s existing pairing on the scattered-CSR
+// side.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 void block4_expand_headroom(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    float blank_fraction = 0.2f)
+    float blank_fraction = 0.2f,
+    std::size_t min_slack_bytes = BLOCK4_TILE_SLOTS)
 {
     if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-        (void)weights; (void)blank_fraction;
+        (void)weights; (void)blank_fraction; (void)min_slack_bytes;
     } else {
     auto& store = weights.block4;
     const std::size_t rows = store.block_layout.rows;
@@ -771,16 +782,11 @@ void block4_expand_headroom(
     }
 
     // Lay out new tile_byte_start with blank_fraction slack -- same
-    // byte_blank formula as delta_csr_from_absolute, plus one full tile's
-    // worth of slack (BLOCK4_TILE_SLOTS, the FP4 dense-tile size) so a row
-    // whose entire current content is a single empty sparse tile (1 byte)
-    // still gets enough room for that ONE tile to go fully dense without
-    // immediately re-triggering eviction -- blank_fraction alone rounds to
-    // 0 extra bytes at that scale (1 byte * 0.2 truncates to 0).
+    // byte_blank formula as delta_csr_from_absolute, plus min_slack_bytes.
     std::vector<std::size_t> new_start(rows + 1, 0);
     for (std::size_t br = 0; br < rows; ++br) {
         const std::size_t blank = static_cast<std::size_t>(row_bytes[br] * blank_fraction)
-                                   + BLOCK4_TILE_SLOTS;
+                                   + min_slack_bytes;
         new_start[br + 1] = new_start[br] + row_bytes[br] + blank;
     }
 
@@ -803,6 +809,22 @@ void block4_expand_headroom(
     // tile_is_sparse/block_layout untouched -- per-tile content, sparsity
     // choice, and which (br,bc) tiles exist are all unchanged.
     }
+}
+
+// Opposite of block4_expand_headroom(): shrinks every row's tile-byte
+// headroom back down to EXACTLY its current live content, zero slack --
+// same "compact() normalizes to exactly 0%, expand() normalizes to
+// exactly blank_fraction" pairing sisldo_ops.hpp's compact()/
+// expand_headroom() already establish for the scattered-CSR side. Use
+// before a row is done growing (e.g. post-pruning, or a layer that's
+// plateaued) to reclaim the blank_fraction slack block4_load_dense/
+// block4_expand_headroom reserved. A subsequent call needing to grow
+// again should call block4_expand_headroom() again afterward, same as
+// the scattered-CSR compact()->expand_headroom() cycle.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+void block4_compact(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights) {
+    block4_expand_headroom(weights, 0.0f, std::size_t(0));
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,

@@ -875,6 +875,28 @@ public:
         weights.out_degree.assign(cols, S(rows));
     }
 
+    // block4-side counterpart to expand_headroom()/compact() above (which
+    // only ever touch weights.connections/scattered CSR -- see
+    // block4_expand_headroom's own docstring, delta_csr_memory.hpp, for
+    // why block4 needed its own separate pair). expand_block4_headroom
+    // gives every block4 row blank_fraction slack to grow into (called
+    // automatically by load_dense_codes' underlying block4_load_dense, but
+    // exposed directly too for a layer whose block4 content changed some
+    // other way, e.g. after compact_block4()). FP4-only, matching
+    // block4_expand_headroom's own scope.
+    void expand_block4_headroom(float blank_fraction = 0.2f) {
+        block4_expand_headroom<S, FP4BiPacked, COL_TYPE>(weights, blank_fraction);
+    }
+    // Opposite: shrinks every block4 row's tile-byte headroom back down to
+    // exactly its current live content, zero slack -- call once a layer's
+    // block4 content is done growing (e.g. post-pruning, or a plateaued
+    // layer) to reclaim the blank_fraction slack. Call
+    // expand_block4_headroom() again afterward before resuming training
+    // that needs block4 rows to grow further.
+    void compact_block4() {
+        block4_compact<S, FP4BiPacked, COL_TYPE>(weights);
+    }
+
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
         return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
@@ -1620,6 +1642,14 @@ PYBIND11_MODULE(_cpu, m)
              "bypassing scattered CSR entirely. See block4_load_dense's docstring\n"
              "(delta_csr_memory.hpp) -- loading only, no quantization performed\n"
              "here; produce codes via fp4_quantize_array() or any other scheme.")
+        .def("expand_block4_headroom", &SparseLinearLayer::expand_block4_headroom,
+             py::arg("blank_fraction") = 0.2f,
+             "block4-side counterpart to expand_headroom() -- that only ever\n"
+             "touches scattered CSR. Gives every block4 row blank_fraction slack\n"
+             "to grow into.")
+        .def("compact_block4", &SparseLinearLayer::compact_block4,
+             "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
+             "headroom back down to exactly its current live content.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer& self) {
             return py::array_t<SparseLinearLayer::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2279,6 +2309,14 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
         .def("load_dense_codes",    &SparseLinearLayerDeterministic::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
+        .def("expand_block4_headroom", &SparseLinearLayerDeterministic::expand_block4_headroom,
+             py::arg("blank_fraction") = 0.2f,
+             "block4-side counterpart to expand_headroom() -- that only ever\n"
+             "touches scattered CSR. Gives every block4 row blank_fraction slack\n"
+             "to grow into.")
+        .def("compact_block4", &SparseLinearLayerDeterministic::compact_block4,
+             "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
+             "headroom back down to exactly its current live content.")
         .def_property_readonly("out_degree", [](const SparseLinearLayerDeterministic& self) {
             return py::array_t<SparseLinearLayerDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
