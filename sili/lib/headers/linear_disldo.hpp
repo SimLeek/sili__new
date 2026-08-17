@@ -708,18 +708,38 @@ void disldo_backward(
                             // outer products). Vanishes EXACTLY at quant=0
                             // for every k simultaneously, which is exactly
                             // the case that needs to escape.
-                            // (zero_escape_eps + |quant|) substitutes a
-                            // floor for the vanishing |quant| term --
-                            // magnitude only, quant's own SIGN is already
-                            // correctly carried by ITS OWN update above
-                            // via signed S; each component's own sign here
-                            // is free/arbitrary (confirmed acceptable
-                            // directly -- only magnitude growing under a
-                            // persistent signal matters, same principle
-                            // already validated by the dead-row bootstrap's
-                            // noise-vs-signal test, applied here to the
-                            // live-but-zero-code case, now per-component).
-                            const value_type quant_floor = zero_escape_eps + std::abs(quant);
+                            //
+                            // CORRECTED (real bug, found via conversation --
+                            // see conversation for the full trace): the
+                            // floor must be GATED on quant==0, not applied
+                            // unconditionally as `zero_escape_eps +
+                            // |quant|`. The unconditional version silently
+                            // discarded quant's sign on EVERY synapse, not
+                            // just stuck-at-zero ones -- for any nonzero
+                            // quant (the overwhelming majority once
+                            // training gets going, including every
+                            // non-zero-init synapse from the very first
+                            // step), it fed the ALWAYS-POSITIVE quant_floor
+                            // into a formula whose correct gradient is
+                            // SIGNED. That's not a small epsilon bias, it's
+                            // wholesale directional corruption of every
+                            // trained synapse's contribution to
+                            // value_scale/output_scale's gradient --
+                            // confirmed as the root cause of a real,
+                            // reproducible failure: zero-init models
+                            // produced predictions and eval_acc BIT
+                            // -IDENTICAL to a completely untrained model
+                            // after 15000 real training steps, energy and
+                            // rank-N included (see
+                            // sili_peridot/scripts/zeroinit_minimal_repro.py).
+                            // Only quant==0 (the genuinely-stuck case,
+                            // where the correct gradient truly is zero and
+                            // sign is legitimately undefined/free -- this
+                            // part of the original reasoning was correct,
+                            // just applied too broadly) substitutes the
+                            // small positive epsilon; every other quant
+                            // value uses itself directly, exact and signed.
+                            const value_type quant_floor = (quant == value_type(0)) ? zero_escape_eps : quant;
                             for (std::size_t k = 0; k < rank; ++k) {
                                 const value_type out_scale_k = weights.get_output_scale_k(col, k);
                                 const value_type val_scale_k = weights.get_value_scale_k(r, k);
@@ -1307,7 +1327,6 @@ void disldo_backward(
                             const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
                             const Block4Vec one_minus_beta2_v = block4_vec_broadcast(1.0f - beta2);
                             const Block4Vec eps_v          = block4_vec_broadcast(eps);
-                            const Block4Vec zero_escape_eps_v = block4_vec_broadcast(zero_escape_eps);
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
                             Block4Vec quant_v = block4_vec_load(quant4);
                             Block4Vec ci_v    = block4_vec_load(ci4);
@@ -1349,13 +1368,30 @@ void disldo_backward(
                                         ? neg_lr_g_S_v / (block4_vec_sqrt(ci_v) + eps_v)
                                         : neg_lr_g_S_v;
                                     quant_v += delta_v;
-                                    // quant_floor = zero_escape_eps + |quant|
-                                    // -- floor for value_scale_k/
-                                    // output_scale_k's own gradient (vanishes
-                                    // exactly at quant=0 otherwise); quant's
-                                    // OWN update above needs no such floor
-                                    // (S is nonzero-driven, never multiplies
-                                    // a vanishing quant factor into itself).
+                                    // quant_floor: real signed quant for
+                                    // value_scale_k/output_scale_k's own
+                                    // gradient, EXCEPT exactly at quant==0
+                                    // (genuinely stuck, correct gradient
+                                    // truly is zero, sign legitimately
+                                    // free) where zero_escape_eps
+                                    // substitutes a floor instead -- see
+                                    // disldo_backward's scattered-path
+                                    // comment for the full correctness
+                                    // trace (CORRECTED: the old
+                                    // unconditional `eps+|quant|` discarded
+                                    // sign on every nonzero synapse, not
+                                    // just stuck ones -- confirmed as the
+                                    // root cause of a real zero-init
+                                    // training failure). No whole-vector
+                                    // compare-and-select op available for
+                                    // Block4Vec (same reason block4_vec_sqrt
+                                    // above is a plain per-lane loop, not a
+                                    // SIMD intrinsic) -- correctness first,
+                                    // matches that precedent exactly.
+                                    // quant's OWN update above needs no
+                                    // floor at all (S is nonzero-driven,
+                                    // never multiplies a vanishing quant
+                                    // factor into itself).
                                     // mrow_local_k accumulates in DOUBLE, one
                                     // horizontal-sum per (b,k) -- matches the
                                     // pre-SIMD code's own double-precision
@@ -1363,7 +1399,9 @@ void disldo_backward(
                                     // which is float-precision, matching the
                                     // original scalar code -- see this
                                     // block's own precision note below).
-                                    const Block4Vec quant_floor_v = zero_escape_eps_v + block4_vec_abs(quant_v);
+                                    Block4Vec quant_floor_v;
+                                    for (int lane = 0; lane < BLOCK4_TILE; ++lane)
+                                        quant_floor_v[lane] = (quant_v[lane] == 0.0f) ? zero_escape_eps : quant_v[lane];
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v));
                                         mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v;
@@ -1400,7 +1438,13 @@ void disldo_backward(
                                         quant4[lj] += damp_by_importance
                                             ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                             : (-effective_lr * g * S);
-                                        const value_type quant_floor = zero_escape_eps + std::abs(quant4[lj]);
+                                        // Gated on quant4[lj]==0 -- see the
+                                        // scattered-CSR path's identical fix
+                                        // for the full correctness trace
+                                        // (unconditional eps+|quant| was
+                                        // discarding sign on every nonzero
+                                        // synapse, not just stuck ones).
+                                        const value_type quant_floor = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
                                         for (std::size_t k = 0; k < rank; ++k) {
                                             mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
                                             mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;
@@ -1431,7 +1475,9 @@ void disldo_backward(
                                     quant4[lj] += damp_by_importance
                                         ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                         : (-effective_lr * g * S);
-                                    const value_type quant_floor = zero_escape_eps + std::abs(quant4[lj]);
+                                    // Gated on quant4[lj]==0 -- see the
+                                    // scattered-CSR path's identical fix.
+                                    const value_type quant_floor = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
                                         mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;

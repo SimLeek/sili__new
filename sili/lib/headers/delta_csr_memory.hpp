@@ -1011,7 +1011,35 @@ bool delta_csr_synap_row_step(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     std::size_t& current_row,
     typename ValueAccessor<VALUES_TYPE>::value_type importance_cutoff,
-    SIZE_TYPE max_row_weights)
+    SIZE_TYPE max_row_weights,
+    // Caps how many connections this ONE row-step call may remove --
+    // per direct request: without a cap, a single call can prune an
+    // entire row at once (e.g. importance_cutoff raised mid-training,
+    // or many probes tying at the eps floor above), which is exactly
+    // the kind of large abrupt connectivity loss synaptogenesis is
+    // meant to avoid (it's throttled to O(1)-ish per call by design --
+    // see synap_step's own docstring). Default is generous (rarely
+    // binds in normal operation) rather than tiny, since it's a safety
+    // ceiling, not a throttle on ordinary capacity-driven trimming.
+    SIZE_TYPE max_prune_per_step = SIZE_TYPE(8),
+    // A "ghost" floor: used ONLY for the importance_cutoff comparison
+    // below, NEVER written to storage anywhere. A synapse whose real,
+    // stored importance has decayed to exactly the FP4 zero code (a
+    // real, discrete quantization bucket many independently-decaying
+    // synapses can land on simultaneously -- FP4's smallest nonzero
+    // magnitude is 0.5, so 0 is a wide, common landing bucket) isn't
+    // automatically "below cutoff" the instant it gets there, without
+    // ever inflating what's actually persisted. Does NOT affect
+    // by_imp's sort order (lowest-real-importance-first removal
+    // priority is unchanged -- a floored synapse can still be removed
+    // via the keep>max_rw capacity criterion, just not solely because
+    // its stored value happens to be exactly 0). This also naturally
+    // protects a freshly-grown synapse (which starts with whatever its
+    // REAL probe score is, per delta_csr_build_probes -- often exactly
+    // 0 for a row with no activity yet, and stored as such): on its
+    // first subsequent synap_row_step visit it won't be evicted purely
+    // for reading as 0, giving real backprop time to move it for real.
+    typename ValueAccessor<VALUES_TYPE>::value_type importance_eps = typename ValueAccessor<VALUES_TYPE>::value_type(1e-3))
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
@@ -1115,10 +1143,11 @@ bool delta_csr_synap_row_step(
     struct RemoveEntry { COL_TYPE col; bool is_b4; };
     std::vector<RemoveEntry> to_remove;
     const std::size_t max_rw = static_cast<std::size_t>(max_row_weights);
-    for (std::size_t rank = 0; rank < n_exist; ++rank) {
+    const std::size_t max_prune = static_cast<std::size_t>(max_prune_per_step);
+    for (std::size_t rank = 0; rank < n_exist && to_remove.size() < max_prune; ++rank) {
         const std::size_t k    = by_imp[rank];
         const std::size_t keep = n_exist - to_remove.size();
-        if (exist_imp[k] < importance_cutoff || keep > max_rw)
+        if (std::max(exist_imp[k], importance_eps) < importance_cutoff || keep > max_rw)
             to_remove.push_back({exist_cols[k], exist_is_b4[k]});
     }
     // Sort descending so scattered removes happen high col first -- keeps
@@ -1273,6 +1302,16 @@ void delta_csr_build_probes(
     SIZE_TYPE k,
     bool per_row = false)
 {
+    // Probe scores are the REAL input_accum*grad_accum product, written
+    // verbatim as a newly-inserted synapse's stored importance (Step 6
+    // of delta_csr_synap_row_step) -- no eps floor here. A cold row/
+    // column genuinely has 0 signal and should be stored as 0; giving
+    // it a fake nonzero importance would write a value into FP4 storage
+    // that never actually happened. Protection against a freshly-grown
+    // (real importance=0) synapse being immediately re-pruned belongs
+    // entirely in delta_csr_synap_row_step's importance_cutoff
+    // comparison (a read-time-only "ghost" floor, never persisted) --
+    // see that function's own importance_eps parameter.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
     auto& L  = dc.layout;

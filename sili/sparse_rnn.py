@@ -183,15 +183,39 @@ class _SparseLayerBase(Module):
     @property
     def neuron_grad_accum(self)  -> np.ndarray: return self._c.neuron_grad_accum
 
-    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int):
+    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int,
+                       importance_eps: float = 1e-3, max_prune_per_step: int = 8):
         """Structural growth + memory rebalancing -- the only call here
         that ISN'T inline with forward/backward, since it changes which
         synapses exist rather than updating a value. No learning_rate:
         growth isn't a value update. Meant to be called every online
         step (cheap, O(1)-ish by design) -- see module docstring for why
-        an "every N steps" cadence would be wrong here."""
+        an "every N steps" cadence would be wrong here.
+
+        importance_eps is a READ-time-only "ghost" floor -- NEVER
+        written to storage anywhere. It floors an EXISTING synapse's
+        stored importance ONLY for synap_step's importance_cutoff
+        comparison -- a synapse whose real, ongoing-training importance
+        has decayed to exactly the FP4 zero code (a real, discrete
+        quantization bucket many independently-decaying synapses can
+        land on simultaneously -- FP4's smallest nonzero magnitude is
+        0.5, so 0 is a wide, common landing bucket) isn't automatically
+        "below cutoff" the instant it gets there. Does NOT affect
+        removal-priority sort order or capacity-driven
+        (keep > max_row_weights) pruning, and does NOT affect
+        build_probes at all -- a freshly-grown synapse is stored with
+        whatever its REAL probe score is (input_accum*grad_accum,
+        often exactly 0 for a row with no activity yet); this floor
+        just stops it being evicted purely for reading as 0 on its
+        first subsequent visit, giving real backprop time to move it.
+
+        max_prune_per_step: caps how many connections THIS row's call
+        may remove at once, regardless of why they tied for lowest
+        importance -- a safety ceiling (default rarely binds), not a
+        throttle on ordinary capacity trimming."""
         self._c.build_probes(k)
-        self._c.synap_step(importance_cutoff, max_row_weights)
+        self._c.synap_step(importance_cutoff, max_row_weights, max_prune_per_step=max_prune_per_step,
+                           importance_eps=importance_eps)
         self._c.equalizer_step()
 
     def state_dict(self) -> dict:
@@ -296,6 +320,41 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
+                     rng: Optional[np.random.Generator] = None,
+                     scale: float = 0.05) -> None:
+    """Sets scale_rank on the C++ layer and seeds components k>=1 (both
+    value_scale_k and output_scale_k) with small random values. Required:
+    per scale_rank's own docstring (delta_csr_types.hpp), k>=1 defaults to
+    0.0 on BOTH sides -- a genuine chicken-and-egg deadlock where neither
+    factor can ever get a nonzero gradient on its own unless at least one
+    side starts nonzero. rank=1 is a no-op (nothing to seed, matches the
+    original single-component behavior exactly).
+
+    Loop order matters here, not just cosmetically: set_value_scale_raw_k/
+    set_output_scale_raw_k lazily resize+fill new slots with 1.0 (the
+    correct default for component 0), so as long as every row's k=0 slot
+    gets touched by that fill BEFORE this function's own k>=1 writes land
+    (true here: row-major, k ascending from 1, one index at a time --
+    each row's k=0 slot is always filled-by-resize immediately before this
+    row's own k=1 write), every component-0 slot ends up correctly at 1.0
+    without ever being written explicitly. Do not reorder these loops
+    (e.g. column-major, or k descending) without re-verifying that still
+    holds.
+    """
+    if rank <= 1:
+        return
+    if rng is None:
+        rng = np.random.default_rng()
+    c.set_scale_rank(rank)
+    for r in range(n_inputs):
+        for k in range(1, rank):
+            c.set_value_scale_raw_k(r, k, float(rng.normal(0.0, scale)))
+    for col in range(n_outputs):
+        for k in range(1, rank):
+            c.set_output_scale_raw_k(col, k, float(rng.normal(0.0, scale)))
+
+
 def _preseed_dense(c, n_inputs: int, n_outputs: int,
                    rng: Optional[np.random.Generator] = None,
                    quantize_fn=None) -> int:
@@ -393,6 +452,32 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
+def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
+    """The genuinely-designed zero-weight-init: NO connections at all
+    (nnz=0), not a dense grid pre-loaded with weight=0 (see
+    _preseed_random_sparse's own docstring -- "a freshly-constructed
+    SparseLinearLayer has zero connections... this is purely an
+    optimization for a faster bootstrap, not a requirement"). Real
+    synapses are meant to be created by synaptogenesis()
+    (build_probes/synap_step/equalizer_step), each starting with a real
+    nonzero value the first time it's grown in -- not by gradient
+    -nudging a pre-existing zero. Per direct correction: pre-loading
+    weight=0/importance=1 into every slot (this project's earlier
+    `all_zero_init` mechanism) is a different, synthetic experimental
+    arm, not this one -- it has its own failure mode (an eps-shaped
+    backprop term can decay that seeded importance back toward 0) that
+    doesn't apply here since nothing exists to decay.
+
+    Only reserves per-row growth headroom via equalize_to_capacity --
+    safe to call directly on a fresh, never-load_weights'd layer
+    (unlike after _preseed_random_sparse's load_weights call, which
+    would immediately compact any headroom back away -- see that
+    function's own docstring)."""
+    per_row = max(2, max_weights // max(1, n_inputs))
+    c.equalize_to_capacity(per_row)
+    return per_row
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -405,12 +490,15 @@ class DISLDOLayer(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
-        if dense:
+        if empty_init:
+            self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
+        elif dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True) -> Tensor:
@@ -506,12 +594,15 @@ class DISLDOLayerDeterministic(DISLDOLayer):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
-        if dense:
+        if empty_init:
+            self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
+        elif dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):

@@ -565,10 +565,11 @@ public:
         delta_csr_build_probes<S, FP4BiPacked, COL_TYPE>(
             weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
     }
-    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
+                        V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(current_row);
         return delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+            weights, row, importance_cutoff, max_row_weights, max_prune_per_step, importance_eps);
     }
 
     // Stateful convenience wrapper around synap_row_step: advances an
@@ -581,10 +582,11 @@ public:
     // (synaptogenesis vs. memory rebalancing) and may reasonably progress
     // at different paces.
     S      _synap_row = 0;
-    bool synap_step(V importance_cutoff, S max_row_weights) {
+    bool synap_step(V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
+                    V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(_synap_row);
         const bool did = delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+            weights, row, importance_cutoff, max_row_weights, max_prune_per_step, importance_eps);
         _synap_row = static_cast<S>(row);
         return did;
     }
@@ -1480,9 +1482,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayer::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -1715,9 +1719,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerResync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResync::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerResync::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -1932,9 +1938,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerNoScale::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScale::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerNoScale::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2151,9 +2159,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2382,9 +2392,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerResyncDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResyncDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerResyncDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2597,9 +2609,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerNoScaleDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScaleDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerNoScaleDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
