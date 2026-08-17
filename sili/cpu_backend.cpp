@@ -57,6 +57,18 @@ public:
     // genuinely needs expand_headroom_to() with a bigger budget.
     std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
     std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
+    // Real, live memory accounting -- see block4.hpp's
+    // total_tile_used_bytes()/total_tile_alloc_bytes(): used_bytes sums
+    // each row's ACTUAL packed content (sparse-vs-dense per tile, exactly
+    // what merge_row_workspace itself would compute), alloc_bytes is the
+    // tile_data buffer's current capacity (used_bytes plus whatever
+    // per-row headroom slack -- e.g. block4_expand_headroom's
+    // blank_fraction -- is currently reserved but not yet live). The gap
+    // between them is the real cost of allowing rows room to grow; watch
+    // it to confirm that cost stays small relative to a fully-dense
+    // layer's n_in*n_out bytes, not silently approaching it.
+    std::size_t used_bytes()  const { return store->total_tile_used_bytes(); }
+    std::size_t alloc_bytes() const { return store->total_tile_alloc_bytes(); }
 private:
     Block4Store* store;
 };
@@ -1368,7 +1380,18 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("row_merge_overflow_bytes_dropped",
              &Block4View::row_merge_overflow_bytes_dropped,
              "Cumulative bytes of intended row content dropped by"
-             " row_merge_overflow_events, across every occurrence.");
+             " row_merge_overflow_events, across every occurrence.")
+        .def_property_readonly("used_bytes", &Block4View::used_bytes,
+             "Real bytes of ACTUAL tile content currently live (sparse-vs-dense"
+             " per tile, exactly what merge_row_workspace itself would compute)."
+             " Compare against n_in*n_out to see the real compression ratio at"
+             " the current sparsity level.")
+        .def_property_readonly("alloc_bytes", &Block4View::alloc_bytes,
+             "Current capacity of the tile_data buffer -- used_bytes plus"
+             " whatever per-row growth headroom is currently reserved but not"
+             " yet live (e.g. block4_expand_headroom's blank_fraction slack)."
+             " The gap (alloc_bytes - used_bytes) is the real memory cost of"
+             " allowing rows room to grow.");
 
     // ── Block4View8 (FP8 counterpart, real bug found+fixed: this class was
     //    never registered here, so SparseLinearLayer8.block4 raised

@@ -712,44 +712,158 @@ void block4_maybe_promote(
 // precedent -- the combined .nnz property (connections.nnz() +
 // block4.live_synapses(), both live-computed, not cached) then correctly
 // reports n_in*n_out once this returns.
+// Redistributes each block-row's TILE-BYTE headroom (tile_byte_start/
+// tile_byte_end/tile_data) to blank_fraction slack above its current
+// content, mirroring sisldo_ops.hpp's expand_headroom() for the scattered
+// -CSR side. Deliberately does NOT touch block_layout (which (br,bc) tiles
+// exist stays exactly the same -- this is not block4_load_dense's "place a
+// tile at every combination" behavior, just a byte-range redistribution)
+// or any tile's packed content/sparsity choice.
+//
+// WHY this exists (see conversation): merge_row_workspace (block4.hpp)
+// clamps a row's committed content to tile_byte_start[br+1]-
+// tile_byte_start[br] and EVICTS synapses to fit if it doesn't -- correct
+// behavior when a row is genuinely at its budget, but a real bug when a
+// row was simply never given any slack in the first place. block4_load_dense
+// (below) used to size each row's headroom to EXACTLY its initial packed
+// content (0 extra bytes) -- for a slot whose weight AND importance are both
+// 0 at load time, that content packs to a 1-byte empty-sparse tile, so the
+// very first weight that escapes 0 (needing the tile to go dense, 16 bytes)
+// got evicted right back out by merge_row_workspace on the SAME backward
+// call, silently undoing every gradient step forever.
+//
+// Deliberately NOT "reserve full dense-tile headroom per row" (rejected --
+// real memory blowup for large sparse layers, many of which would
+// otherwise fit) -- blank_fraction-proportional slack, distributed per row
+// exactly like the scattered path already does, is the same tradeoff this
+// codebase already made once and validated (delta_csr_from_absolute/
+// expand_headroom), not a new policy invented here.
+// FP4-only for now (block4_stored_tile_len is FP4's tile-length formula;
+// FP8's Block4Store8 needs block4_stored_tile_len8 and its own pass --
+// same scoping as this session's other block4 rank-N/chain-rule work,
+// since the real toy/test model uses FP4, not FP8. A no-op for FP8 rather
+// than a silent miscompile.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
+          typename COL_TYPE = uint32_t>
+void block4_expand_headroom(
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+    float blank_fraction = 0.2f)
+{
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+        (void)weights; (void)blank_fraction;
+    } else {
+    auto& store = weights.block4;
+    const std::size_t rows = store.block_layout.rows;
+    if (rows == 0) return;
+
+    // Each row's CURRENT content length -- same per-tile length accessor
+    // merge_row_workspace itself walks (block4_stored_tile_len), so this
+    // is exactly what's live today, no assumption about dense-vs-sparse.
+    std::vector<std::size_t> row_bytes(rows, 0);
+    for (std::size_t br = 0; br < rows; ++br) {
+        std::size_t pos = store.tile_byte_start[br];
+        const std::size_t n_bc = store.block_layout.row_nnz(br);
+        std::size_t elem_pos = store.block_layout.elem_start[br];
+        for (std::size_t k = 0; k < n_bc; ++k, ++elem_pos) {
+            pos += block4_stored_tile_len(store.tile_is_sparse[elem_pos], &store.tile_data[pos]);
+        }
+        row_bytes[br] = pos - store.tile_byte_start[br];
+    }
+
+    // Lay out new tile_byte_start with blank_fraction slack -- same
+    // byte_blank formula as delta_csr_from_absolute, plus one full tile's
+    // worth of slack (BLOCK4_TILE_SLOTS, the FP4 dense-tile size) so a row
+    // whose entire current content is a single empty sparse tile (1 byte)
+    // still gets enough room for that ONE tile to go fully dense without
+    // immediately re-triggering eviction -- blank_fraction alone rounds to
+    // 0 extra bytes at that scale (1 byte * 0.2 truncates to 0).
+    std::vector<std::size_t> new_start(rows + 1, 0);
+    for (std::size_t br = 0; br < rows; ++br) {
+        const std::size_t blank = static_cast<std::size_t>(row_bytes[br] * blank_fraction)
+                                   + BLOCK4_TILE_SLOTS;
+        new_start[br + 1] = new_start[br] + row_bytes[br] + blank;
+    }
+
+    if (new_start[rows] > store.max_tile_bytes) throw std::bad_alloc();
+
+    std::vector<uint8_t> new_data(new_start[rows], uint8_t(0));
+    for (std::size_t br = 0; br < rows; ++br) {
+        std::memcpy(new_data.data() + new_start[br],
+                    store.tile_data.data() + store.tile_byte_start[br],
+                    row_bytes[br]);
+    }
+
+    store.tile_data = std::move(new_data);
+    store.tile_byte_end.resize(rows);
+    for (std::size_t br = 0; br < rows; ++br) {
+        store.tile_byte_start[br] = new_start[br];
+        store.tile_byte_end[br]   = new_start[br] + row_bytes[br];
+    }
+    store.tile_byte_start[rows] = new_start[rows];
+    // tile_is_sparse/block_layout untouched -- per-tile content, sparsity
+    // choice, and which (br,bc) tiles exist are all unchanged.
+    }
+}
+
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
           typename COL_TYPE = uint32_t>
 void block4_load_dense(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     const uint8_t* weight_codes, const uint8_t* importance_codes,
-    std::size_t n_in, std::size_t n_out)
+    std::size_t n_in, std::size_t n_out,
+    float blank_fraction = 0.2f)
 {
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     if constexpr (!is_fp4 && !is_fp8) {
-        (void)weights; (void)weight_codes; (void)importance_codes; (void)n_in; (void)n_out;
+        (void)weights; (void)weight_codes; (void)importance_codes; (void)n_in; (void)n_out; (void)blank_fraction;
     } else {
         const uint32_t block_rows = uint32_t((n_in  + BLOCK4_TILE - 1) / BLOCK4_TILE);
         const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
 
         weights.block4.init(n_in, n_out);
-        // Sized for full density (every tile ends up dense, no
-        // synaptogenesis growth expected after a static load). Indices
-        // budget: EVERY row starts with zero pre-allocated index bytes
-        // (Block4Store::init() zero-fills tile_byte_start/byte_start), so
-        // inserting the first tile into any row goes through
-        // block4_ensure_row_headroom's growth path, which requests up to
-        // uleb128_max_bytes<uint32_t>() (5) bytes per entry -- found
-        // directly (bad_alloc thrown at a too-small budget) that this can
-        // be requested more than once per tile as block4_row_shift
-        // cascades a growth request through earlier rows to make room in
-        // a later one. 16 bytes/tile is a generous multiple of that
-        // 5-byte worst case to absorb the cascade without hand-deriving
-        // its exact worst case; indices bytes are cheap relative to tile
-        // bytes so over-provisioning here costs little. A caller that
-        // DOES want future growth on this layer can call
-        // expand_headroom_to() afterward, same as any other layer.
+        // Indices budget: EVERY row starts with zero pre-allocated index
+        // bytes (Block4Store::init() zero-fills tile_byte_start/
+        // byte_start), so inserting the first tile into any row goes
+        // through block4_ensure_row_headroom's growth path, which
+        // requests up to uleb128_max_bytes<uint32_t>() (5) bytes per
+        // entry -- found directly (bad_alloc thrown at a too-small
+        // budget) that this can be requested more than once per tile as
+        // block4_row_shift cascades a growth request through earlier
+        // rows to make room in a later one. 16 bytes/tile is a generous
+        // multiple of that 5-byte worst case to absorb the cascade
+        // without hand-deriving its exact worst case; indices bytes are
+        // cheap relative to tile bytes so over-provisioning here costs
+        // little.
+        //
+        // Tile-byte budget (the hard cap set_limits enforces, NOT the
+        // same thing as the per-row headroom block4_expand_headroom lays
+        // out below -- this is just the ceiling that layout is allowed
+        // to grow up to): sized for full density PLUS blank_fraction, not
+        // exactly full density with zero slack -- block4_expand_headroom
+        // below deliberately adds real per-row growth room on top of
+        // whatever's actually used, and a cap with zero slack to begin
+        // with makes that immediately throw bad_alloc regardless of how
+        // little is actually live. Note: expand_headroom_to()
+        // (sisldo_ops.hpp) only touches weights.connections (scattered
+        // CSR) -- it does NOT extend to block4 at all, despite an
+        // earlier version of this comment implying it did.
+        // block4_expand_headroom() (below, called automatically at the
+        // end of this function) is the real block4-side equivalent.
         const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
-        if constexpr (is_fp8) {
-            weights.block4.set_limits(idx_budget, std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS8_BYTES);
-        } else {
-            weights.block4.set_limits(idx_budget, std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS);
-        }
+        const std::size_t dense_tile_bytes = std::size_t(block_rows) * block_cols
+            * (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS);
+        // + block_rows*BLOCK4_TILE_SLOTS, not a single flat margin --
+        // block4_expand_headroom adds its minimum-slack term
+        // (BLOCK4_TILE_SLOTS) PER ROW, so the cap needs that same
+        // per-row margin summed across every row or a fully/near-fully
+        // dense load throws bad_alloc the moment expand_headroom runs
+        // (confirmed directly: real regression at frac_live=1.0 in
+        // testing, only a single BLOCK4_TILE_SLOTS margin here).
+        const std::size_t tile_budget =
+            static_cast<std::size_t>(dense_tile_bytes * (1.0 + blank_fraction))
+            + std::size_t(block_rows) * BLOCK4_TILE_SLOTS;
+        weights.block4.set_limits(idx_budget, tile_budget);
 
         for (uint32_t br = 0; br < block_rows; ++br) {
             const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
@@ -773,14 +887,27 @@ void block4_load_dense(
                 }
                 // tile's destructor (scope end) commits scratch_ back to
                 // the store, choosing dense vs sparse-packed encoding
-                // based on live count vs switch_point -- for a fresh
-                // get_or_create'd tile (always starts sparse/empty) with
-                // every slot written, this always picks dense. No
+                // based on live count vs switch_point -- picks dense
+                // whenever at least one slot's byte is nonzero (matches
+                // block4_count_live's own "live iff weight OR importance
+                // nonzero" convention), sparse-empty (1 byte) for a tile
+                // whose weight AND importance codes are ALL zero (real
+                // for a zero-init training layer, not just a hypothetical
+                // -- see block4_expand_headroom's docstring for why that
+                // specifically needs headroom reserved regardless). No
                 // separate maybe_compress() call needed here (that's for
                 // re-checking an EXISTING tile's encoding, not relevant
                 // to a from-scratch bulk load of brand-new tiles).
             }
         }
+        // Reserve real per-row growth slack for the tile-byte storage --
+        // see block4_expand_headroom's own docstring for exactly why this
+        // is needed even for a "static" load (a slot that's all-zero at
+        // load time, e.g. a zero-init training layer, packs to a 1-byte
+        // empty-sparse tile with otherwise zero headroom to grow back out
+        // of once training escapes it from 0). FP4-only for now, matching
+        // block4_expand_headroom's own scope.
+        if constexpr (is_fp4) block4_expand_headroom(weights, blank_fraction);
     }
 }
 
