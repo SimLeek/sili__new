@@ -671,6 +671,17 @@ struct SparseLinearWeightsDelta {
         output_importance_scale[col] = v;
     }
 
+    // Compile-time cap on scale_rank, used by block4's SIMD backward path
+    // (linear_disldo.hpp's process_tile) to size fixed stack arrays of
+    // per-rank-component Block4Vec accumulators instead of heap-allocating
+    // a std::vector on every tile-row visited (that loop runs extremely
+    // often -- once per (block-row, block-col, li) triple touched by
+    // backward -- so a heap alloc there would be a real, not hypothetical,
+    // regression). 4 is generous headroom over the rank=2 this was built
+    // for; raise it if a real use case needs more, but keep it small --
+    // it directly sizes stack buffers in the hot path.
+    static constexpr std::size_t SCALE_RANK_MAX = 4;
+
     // RANK of the value_scale/output_scale factorization. true_w =
     // quant * S[row,col], where S used to be a plain rank-1 outer product
     // value_scale[row]*output_scale[col] -- now generalized to
@@ -694,17 +705,26 @@ struct SparseLinearWeightsDelta {
     // gives a second, independently-signed channel to absorb the
     // opposite-signed column instead of cancelling against the first.
     //
-    // SCOPE NOTE: only disldo_forward's and disldo_backward's SCATTERED
-    // -CSR paths are rank-aware. block4's own forward/backward SIMD
-    // paths (a separate, much larger set of functions) still read only
-    // value_scale[row]*output_scale[col] (component 0) -- a real,
-    // currently-dormant correctness gap: if a rank>1 layer's synapse
-    // ever gets promoted to block4 storage, its effective scale would
-    // SILENTLY drop every component beyond 0 at that point. Not yet hit
-    // in practice (growth from zero-synapse init lands in scattered CSR
-    // first, confirmed directly), but real once block4 promotion is
-    // exercised on a rank>1 layer -- tracked as a follow-up, not fixed
-    // here.
+    // SCOPE NOTE: disldo_forward, and disldo_backward's scattered-CSR path
+    // AND block4's FP4 path (process_tile in linear_disldo.hpp) are all
+    // rank-aware, using weights.get_scale(row,col). The SIMD fast path
+    // keeps its 4-wide column vectorization regardless of rank by looping
+    // the (small, SCALE_RANK_MAX-capped) rank dimension outside the lane
+    // dimension with real Block4Vec accumulators per component, rather
+    // than falling back to scalar for rank>1.
+    //
+    // Still rank-1-only (component 0 of a rank>1 layer): block4's FP8
+    // branch (a separate, near-duplicate code path within the same
+    // process_tile lambda -- the real toy/test model uses FP4, not FP8,
+    // so this wasn't hit yet) and every DeferredScaleWrite class (e.g.
+    // SparseLinearLayerResync) on both scattered and block4 paths (see
+    // disldo_backward's own DeferredScaleWrite branch comment for why
+    // rank>1 doesn't apply there without more work: eager multiply-by-
+    // not-yet-finalized-scale would reintroduce the staleness
+    // DeferredScaleWrite exists to avoid). If a rank>1 layer ever uses
+    // FP8 block4 or a DeferredScaleWrite class, its effective scale
+    // silently drops every component beyond 0 there -- tracked as a
+    // follow-up, not fixed here.
     std::size_t scale_rank = 1;
 
     // Same per-row design, for STORED weight values instead of importance.

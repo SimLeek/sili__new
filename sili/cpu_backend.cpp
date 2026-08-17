@@ -429,6 +429,8 @@ public:
     std::size_t get_scale_rank() const { return weights.scale_rank; }
     void set_scale_rank(std::size_t rank) {
         if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        if (rank > decltype(weights)::SCALE_RANK_MAX)
+            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
         weights.scale_rank = rank;
     }
 
