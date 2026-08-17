@@ -32,7 +32,7 @@ TEST_CASE("disldo_forward matches dense reference", "[disldo][forward]") {
     std::vector<float> output(4, 0.0f);
 
     disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 0.0f, 1);
+        input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 1);
 
     // Dense reference: out[c] = sum_r W[r,c] * input[r]
     std::vector<float> expected = {1.5f, 0.3f, -2.0f, 6.0f};
@@ -561,7 +561,7 @@ TEST_CASE("disldo_forward's Hebbian update actually uses importance_scale, not j
     std::vector<float> input = {0.1f};
     std::vector<float> output(1, 0.0f);
     disldo_forward<S, FP4BiPacked, COL_TYPE>(
-        input.data(), S(1), S(1), weights, output.data(), /*learning_rate=*/1.0f, 1);
+        input.data(), S(1), S(1), weights, output.data(), 1);
 
     const float stored = ValueAccessor<FP4BiPacked>::get_imp(
         weights.connections.values, weights.connections.layout.elem_start[0]);
@@ -651,7 +651,7 @@ TEST_CASE("incremental stats match a fresh recompute after many forward+backward
         std::vector<float> input = {a, b, c};
         std::vector<float> output(4, 0.0f);
         disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 0.3f, 1);
+            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 1);
 
         std::vector<float> dy = {b, -a, c, a - b};
         std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);

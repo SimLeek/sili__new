@@ -117,7 +117,7 @@ int main() {
         std::vector<float> x(n_in, 0.f);
         x[0] = 5.0f;
         std::vector<float> y(n_out, 0.f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, weights, y.data(), 0.0f, 1);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, weights, y.data(), 1);
         // stored weight for the demoted synapse was probe_score-seeded via
         // insert_col(..., value_type(0), probe_scores[i]) in Step 6 -- i.e.
         // weight=0.0 initially (importance=score). So y should be all zero.

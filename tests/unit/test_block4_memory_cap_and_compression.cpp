@@ -109,7 +109,7 @@ static void test_memory_cap_never_exceeded_under_stress() {
         for (auto& v : x) v = data_dist(rng);
         for (auto& v : dy) v = data_dist(rng);
         std::vector<float> out(n_out, 0.0f), dx(n_in, 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, weights, out.data(), 0.05f, 2);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, weights, out.data(), 2);
         disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, dy.data(), weights, dx.data(),
                                                             nia.data(), nga.data(), 0.05f, 2, false, true);
 

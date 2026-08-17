@@ -72,7 +72,7 @@ int main() {
 
         std::vector<float> y_dense(n_out, 0.0f);
         disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_dense.data(), 1, n_in, weights, y_dense.data(), 0.0f, 4);
+            x_dense.data(), 1, n_in, weights, y_dense.data(), 4);
 
         CSRInput<SIZE_TYPE, float> x_sparse;
         x_sparse.rows = 1; x_sparse.cols = n_in;
@@ -82,7 +82,7 @@ int main() {
 
         std::vector<float> y_sparse(n_out, 0.0f);
         sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_sparse, weights, y_sparse.data(), 0.0f, 4);
+            x_sparse, weights, y_sparse.data(), 4);
 
         for (int c = 0; c < n_out; ++c) {
             CHECK(std::abs(y_dense[c] - y_sparse[c]) < 1e-4f,
@@ -105,14 +105,14 @@ int main() {
         }
         x_ptrs.push_back(static_cast<SIZE_TYPE>(x_idx.size()));
         std::vector<float> y_dense(n_out, 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_dense.data(), 1, n_in, weights, y_dense.data(), 0.0f, 1);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_dense.data(), 1, n_in, weights, y_dense.data(), 1);
         CSRInput<SIZE_TYPE, float> x_sparse;
         x_sparse.rows = 1; x_sparse.cols = n_in;
         x_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_ptrs);
         x_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_idx);
         x_sparse.values[0] = std::make_shared<std::vector<float>>(x_vals);
         std::vector<float> y_sparse(n_out, 0.0f);
-        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 0.0f, 1);
+        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 1);
         int local_fail = 0;
         for (int c = 0; c < n_out; ++c)
             if (std::abs(y_dense[c] - y_sparse[c]) >= 1e-4f) ++local_fail;
