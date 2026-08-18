@@ -31,10 +31,16 @@ int main() {
     // boundaries and near-zero RMSprop denominators that would otherwise
     // amplify a trivial floating-point summation-order difference
     // (scattered sums per-row; block4 sums per-tile, a genuinely different
-    // order) into a different quantized code at the very last bit.
+    // order) into a different quantized code at the very last bit. 0.07
+    // spacing (not 0.05) deliberately avoids landing exactly on FP4's
+    // 1.0/1.5 halfway boundary (1.25) the way 1.0+0.05*(i%7) does at
+    // i%7==5 -- confirmed directly: that exact coincidence made row 4
+    // col 1 (dense_w=1.25) round to opposite FP4 codes between the two
+    // arms after the update, a genuine floating-point non-associativity
+    // effect (not a bug), not something this test should be sensitive to.
     std::vector<float> dense_w(n_in * n_out);
     for (std::size_t i = 0; i < dense_w.size(); ++i)
-        dense_w[i] = 1.0f + 0.05f * float(i % 7);
+        dense_w[i] = 1.0f + 0.07f * float(i % 7);
     std::vector<uint8_t> weight_codes(n_in * n_out), importance_codes(n_in * n_out, 0);
     for (std::size_t i = 0; i < dense_w.size(); ++i)
         weight_codes[i] = fp4_quantize(dense_w[i]);

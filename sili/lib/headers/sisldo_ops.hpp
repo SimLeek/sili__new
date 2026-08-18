@@ -649,7 +649,7 @@ void disldo_backward_sparse_grad(
     std::vector<double> scale_grad_sums(n_inputs, 0.0);
     // Parallel forward-contribution accumulator, mirroring
     // disldo_backward's scale_grad_sum_contrib (linear_disldo.hpp) --
-    // same additive sum-then-square combination, now applied here too
+    // same additive (square-then-sum) combination, now applied here too
     // since this function shares the same value_scale/value_scale_importance
     // arrays and was previously the one path left using plain g^2.
     std::vector<double> scale_grad_sums_contrib(n_inputs, 0.0);
@@ -720,12 +720,14 @@ void disldo_backward_sparse_grad(
                     value_type imp = stored_imp * combined_imp_scale;   // -> true units
                     // Additive contrib combination, mirroring disldo_backward's
                     // own `ci` update (linear_disldo.hpp) -- see its docstring
-                    // for the full rationale (sum-then-square lets g and
-                    // contrib cancel on disagreement instead of both always
-                    // inflating imp). w here is the true (pre-update) weight,
-                    // same role as cw_orig there.
+                    // for the full rationale (square-then-sum, not sum-then-
+                    // square: a large-magnitude disagreement between grad
+                    // and contrib must still damp the step, not collapse
+                    // the denominator toward zero and explode it). w here
+                    // is the true (pre-update) weight, same role as
+                    // cw_orig there.
                     const value_type contrib = in_val * w;
-                    imp = beta2 * imp + (value_type(1) - beta2) * ((grad + contrib) * (grad + contrib));
+                    imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
                     const value_type new_w = w + (damp_by_importance
                         ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                         : (-effective_lr * grad));
@@ -775,8 +777,13 @@ void disldo_backward_sparse_grad(
             const value_type g_agg = static_cast<value_type>(scale_grad_sums[r]);
             const value_type contrib_agg = static_cast<value_type>(scale_grad_sums_contrib[r]);
             value_type& vs_imp = weights.value_scale_importance[r];
-            const value_type combined = g_agg + contrib_agg;
-            const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
+            // Square-then-sum (g_agg^2+contrib_agg^2), matching
+            // RMSpropScalePolicy::update's own combination -- see its
+            // docstring (delta_csr_types.hpp) for why sum-then-square is
+            // unsafe here (a large-magnitude disagreement between g_agg
+            // and contrib_agg could collapse the denominator toward zero
+            // and explode the step).
+            const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
             // Same Adam-style bias correction as RMSpropScalePolicy::update
             // (delta_csr_types.hpp) -- shares the SAME value_scale_importance
             // array as disldo_backward's scattered/block4 paths, so it needs
@@ -999,7 +1006,7 @@ void disldo_backward_sparse_grad(
                                         // the true (pre-update) weight decoded
                                         // just above.
                                         const value_type contrib = in_val * w;
-                                        imp = beta2 * imp + (value_type(1) - beta2) * ((grad + contrib) * (grad + contrib));
+                                        imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
                                         const value_type new_w = w + (damp_by_importance
                                             ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                                             : (-effective_lr * grad));
@@ -1076,8 +1083,10 @@ void disldo_backward_sparse_grad(
                     const value_type g_agg = static_cast<value_type>(row_scale_grad_sums[row]);
                     const value_type contrib_agg = static_cast<value_type>(row_scale_grad_sums_contrib[row]);
                     value_type& vs_imp = weights.value_scale_importance[row];
-                    const value_type combined = g_agg + contrib_agg;
-                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
+                    // Square-then-sum -- see the scattered path's identical
+                    // fix above / RMSpropScalePolicy's docstring
+                    // (delta_csr_types.hpp) for why sum-then-square is unsafe.
+                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
                     // Same bias correction as the scattered path's identical
                     // update above -- SAME value_scale_step counter (shared
                     // per-row across scattered and block4, matching

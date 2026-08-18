@@ -666,23 +666,40 @@ void disldo_backward(
                             // instead of reintroducing the old quant=0-forever
                             // deadlock a multiplicative gate would cause.
                             //
-                            // SUM first, THEN square -- (g+contrib)^2, not
-                            // g^2+contrib^2. If g (real gradient) and contrib
-                            // (current forward activity) point the SAME way,
-                            // they reinforce and ci grows -- real agreement
-                            // between "this synapse currently does something"
-                            // and "the task wants it to keep doing that
-                            // direction of thing" is genuine evidence of
-                            // importance. If they DISAGREE in sign, that's
-                            // evidence the synapse's current value and the
-                            // task's error signal conflict -- noise, not
-                            // importance, safe to prune/drift -- and summing
-                            // first lets them cancel. Sum-of-squares would be
-                            // wrong here: squaring destroys sign, so it would
-                            // treat agreement and disagreement identically
-                            // and always inflate ci regardless.
+                            // SQUARE first, THEN sum -- g^2+contrib^2, not
+                            // (g+contrib)^2. ci is the DIVISOR of the weight
+                            // update's step size (see cw's own update just
+                            // below), so its job is safety: never let the
+                            // denominator collapse toward zero while the
+                            // numerator (g) stays large. Sum-then-square
+                            // fails exactly that: when g and contrib are
+                            // large and near-opposite in sign (a real,
+                            // common case -- a synapse whose current value
+                            // and the task's error signal are pulling
+                            // against each other), (g+contrib)^2 can
+                            // collapse toward zero even though BOTH signals
+                            // are individually large, making the step
+                            // -effective_lr*g/(sqrt(ci)+eps) explode --
+                            // the same class of instability the value_scale
+                            // bias-correction fix elsewhere in this file
+                            // closes, just triggered by cancellation
+                            // instead of cold start (see conversation).
+                            // Square-then-sum is bounded below by
+                            // max(g,contrib)^2 regardless of sign, so a
+                            // large-magnitude disagreement still damps the
+                            // step (correctly -- a synapse under real
+                            // contention needs protecting from a jumpy
+                            // update, not less of it) instead of amplifying
+                            // it. This still captures the additive-signal
+                            // information-gain property the Lean proof
+                            // establishes (Joint.combined_signal_strictly_
+                            // informative, cited above) -- that proof is
+                            // about combining the two signals being more
+                            // informative than either alone in the
+                            // abstract, it does not prescribe sum-before-
+                            // square as the numeric encoding.
                             const value_type contrib = iv * cw_orig;
-                            ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                            ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
                             cw += damp_by_importance
                                 ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                                 : (-effective_lr * g);
@@ -753,7 +770,7 @@ void disldo_backward(
                             // SiliImportanceProof/ImportanceSignalInformationGain.lean,
                             // Joint.combined_signal_strictly_informative.
                             const value_type contrib = iv * cw_orig;
-                            ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                            ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
                             quant += damp_by_importance
                                 ? (-effective_lr * g * S) / (std::sqrt(ci) + eps)
                                 : (-effective_lr * g * S);
@@ -1200,7 +1217,7 @@ void disldo_backward(
                                         // rationale and the proved theorem
                                         // (Joint.combined_signal_strictly_informative).
                                         const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
-                                        ci_v = beta2_v * ci_v + one_minus_beta2_v * ((g_v + contrib_v) * (g_v + contrib_v));
+                                        ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v + contrib_v * contrib_v);
                                         const Block4Vec neg_lr_g_v = -(effective_lr_v * g_v);
                                         const Block4Vec delta_v = damp_by_importance
                                             ? neg_lr_g_v / (block4_vec_sqrt(ci_v) + eps_v)
@@ -1233,7 +1250,7 @@ void disldo_backward(
                                             // scattered path's identical fix
                                             // (Joint.combined_signal_strictly_informative).
                                             const value_type contrib = iv * cw_orig4_8[lj];
-                                            ci4_8[lj] = beta2 * ci4_8[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                                            ci4_8[lj] = beta2 * ci4_8[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
                                             cw4_8[lj] += damp_by_importance
                                                 ? (-effective_lr * g) / (std::sqrt(ci4_8[lj]) + eps)
                                                 : (-effective_lr * g);
@@ -1313,7 +1330,7 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * cw_orig;
-                                        ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                                        ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
                                         cw += damp_by_importance
                                             ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                                             : (-effective_lr * g);
@@ -1484,7 +1501,7 @@ void disldo_backward(
                                     // sili__new/lean_proofs/importance_signal_information_gain/
                                     // SiliImportanceProof/ImportanceSignalInformationGain.lean).
                                     const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
-                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * ((g_v + contrib_v) * (g_v + contrib_v));
+                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v + contrib_v * contrib_v);
                                     // dL/d(quant) = g*S -- proper chain rule
                                     // on true_w=quant*S (multiply, not
                                     // divide -- see disldo_backward's
@@ -1571,7 +1588,7 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * quant_orig4[lj];
-                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
                                         quant4[lj] += damp_by_importance
                                             ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                             : (-effective_lr * g * S);
@@ -1615,7 +1632,7 @@ void disldo_backward(
                                     // path's identical fix
                                     // (Joint.combined_signal_strictly_informative).
                                     const value_type contrib = iv * quant_orig4[lj];
-                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
+                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
                                     quant4[lj] += damp_by_importance
                                         ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                         : (-effective_lr * g * S);
@@ -1846,13 +1863,19 @@ void disldo_backward(
                     if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) continue;
                     const std::size_t idx = row * rank + k;
                     value_type& vs_imp = weights.value_scale_importance[idx];
-                    // Sum-then-square (g_agg+contrib_agg)^2, matching
+                    // Square-then-sum (g_agg^2+contrib_agg^2), matching
                     // RMSpropScalePolicy::update's own combination -- see
-                    // its docstring for why sum-of-squares is wrong here
-                    // (would let disagreeing signals both inflate the
-                    // estimate instead of letting them cancel).
-                    const value_type combined = g_agg + contrib_agg;
-                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
+                    // its docstring: sum-then-square lets a large-magnitude
+                    // g_agg/contrib_agg disagreement collapse this toward
+                    // zero, which would make the step below explode
+                    // (dividing by a near-zero denominator) -- exactly the
+                    // same class of instability the bias-correction fix
+                    // above closes, just triggered by cancellation instead
+                    // of cold start. Square-then-sum is bounded below by
+                    // max(g_agg,contrib_agg)^2 regardless of sign, so a
+                    // large disagreement still damps the step instead of
+                    // amplifying it.
+                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
                     if (!std::isfinite(new_vs_imp)) continue;
                     // Same Adam-style bias correction as
                     // RMSpropScalePolicy::update (delta_csr_types.hpp) --

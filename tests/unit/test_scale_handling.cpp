@@ -354,32 +354,35 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
         in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
 
     // g = dy*input = 1.0. contrib = iv*cw_orig = 1.0*2.0 = 2.0. ci =
-    // (1-beta2)*(g+contrib)^2 = 0.001*9.0 = 0.009 (fresh layer, ci_orig=0).
+    // (1-beta2)*(g^2+contrib^2) = 0.001*5.0 = 0.005 (square-then-sum, not
+    // sum-then-square -- see linear_disldo.hpp's own docstring: sum-then-
+    // square lets a large g/contrib disagreement collapse ci toward zero
+    // and explode the step; fresh layer, ci_orig=0).
     // quant's own step: S=val_scale*out_scale=0.5*4.0=2.0, effective_lr=0.1
-    // (lr_per_row_nnz=false), delta=-effective_lr*g*S/sqrt(ci)
-    // =-0.1*1.0*2.0/sqrt(0.009)~=-2.1082, so quant goes 2.0 -> -0.1082
-    // within this SAME call (batch=1, one step; see linear_disldo.hpp's own
-    // "quant_floor uses the post-update quant, not the stale pre-update
-    // code" comment). g_agg/contrib_agg mirror ci's own additive
-    // combination one level up (RMSpropScalePolicy, delta_csr_types.hpp):
+    // (lr_per_row_nnz=false), delta=-effective_lr*g*S/sqrt(ci), so quant
+    // goes 2.0 -> quant_floor within this SAME call (batch=1, one step;
+    // see linear_disldo.hpp's own "quant_floor uses the post-update
+    // quant, not the stale pre-update code" comment). g_agg/contrib_agg
+    // mirror ci's own additive combination one level up
+    // (RMSpropScalePolicy, delta_csr_types.hpp):
     // scale_grad_sum_rank[0]=quant_floor*out_scale*g,
     // scale_grad_sum_rank_contrib[0]=quant_floor*out_scale*contrib.
-    // combined=g_agg+contrib_agg, new_state=(1-beta2)*combined^2,
-    // new_scale=0.5-scale_eff_lr*g_agg/sqrt(new_state), scale_eff_lr=0.1/1=0.1.
+    // new_state=(1-beta2)*(g_agg^2+contrib_agg^2) (square-then-sum, same
+    // reasoning as ci above), new_scale=0.5-scale_eff_lr*g_agg/
+    // sqrt(new_state), scale_eff_lr=0.1/1=0.1.
     // Adam-style bias correction (RMSpropScalePolicy::update,
     // delta_csr_types.hpp): this is the FIRST-EVER update on a fresh
     // value_scale_step counter (step=1), so state_hat = new_state /
     // (1-beta2^1) = new_state/(1-beta2) -- exactly undoing the (1-beta2)
     // factor baked into new_state's own EMA formula, i.e. state_hat =
-    // combined^2 exactly.
+    // g_agg^2+contrib_agg^2 exactly.
     const float g = 1.0f, contrib = 2.0f;
-    const float ci = 0.001f * (g + contrib) * (g + contrib);
+    const float ci = 0.001f * (g * g + contrib * contrib);
     const float S_combined = 0.5f * 4.0f;
     const float quant_floor = 2.0f - 0.1f * g * S_combined / std::sqrt(ci);
     const float g_agg = quant_floor * 4.0f * g;
     const float contrib_agg = quant_floor * 4.0f * contrib;
-    const float combined = g_agg + contrib_agg;
-    const float new_state = 0.001f * combined * combined;
+    const float new_state = 0.001f * (g_agg * g_agg + contrib_agg * contrib_agg);
     const float beta2 = 0.999f;
     const float bias_correction = 1.0f - beta2;   // 1 - beta2^1
     const float state_hat = new_state / bias_correction;
@@ -547,8 +550,8 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
         in_acc.data(), gr_acc.data(), lr, 1);
 
     // g = dy*input = 1.0*3.0 = 3.0. contrib = iv*cw_orig = 3.0*2.0 = 6.0.
-    // ci = (1-beta2)*(g+contrib)^2 = 0.001*81 = 0.081 (fresh layer,
-    // ci_orig=0). quant's own step: S=val_scale*out_scale=0.5*1.0=0.5,
+    // ci = (1-beta2)*(g^2+contrib^2) = 0.001*45 = 0.045 (square-then-sum,
+    // fresh layer, ci_orig=0). quant's own step: S=val_scale*out_scale=0.5*1.0=0.5,
     // effective_lr=lr=0.1 (lr_per_row_nnz=false, nnz_this_row=1),
     // delta=-effective_lr*g*S/sqrt(ci), so quant goes 2.0 -> quant_floor
     // within this SAME call (batch=1). g_agg/contrib_agg mirror ci's own
@@ -557,13 +560,12 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
     // "value_scale's own gradient correctly accounts for a fixed
     // output_scale factor" above for the full trace.
     const float g = 3.0f, contrib = 6.0f;
-    const float ci = 0.001f * (g + contrib) * (g + contrib);
+    const float ci = 0.001f * (g * g + contrib * contrib);
     const float S_combined = 0.5f * 1.0f;
     const float quant_floor = 2.0f - lr * g * S_combined / std::sqrt(ci);
     const float g_agg = quant_floor * 1.0f * g;
     const float contrib_agg = quant_floor * 1.0f * contrib;
-    const float combined = g_agg + contrib_agg;
-    const float new_state = 0.001f * combined * combined;
+    const float new_state = 0.001f * (g_agg * g_agg + contrib_agg * contrib_agg);
     // Adam-style bias correction, first-ever update (step=1) -- see
     // "value_scale's own gradient correctly accounts for a fixed
     // output_scale factor" above for the full explanation.
@@ -1058,20 +1060,25 @@ TEST_CASE("disldo_backward_sparse_grad's dx and value_scale gradient account for
     // w_stored*out_scale*g = 2.0*0.5*1.0 = 1.0. contrib_agg =
     // w_stored*out_scale*contrib = 2.0*0.5*4.0 = 4.0. combined =
     // g_agg+contrib_agg = 5.0. new_vs_imp = (1-beta2)*combined^2 =
-    // 0.001*25 = 0.025 (fresh, vs_imp_orig=0 -- the lr=0.0 call above is a
-    // full no-op, gated entirely behind `learning_rate != 0`, so the
-    // lr=0.1 call below is genuinely the first-ever update -> step=1,
+    // combined via square-then-sum (not sum-then-square -- see
+    // linear_disldo.hpp's docstring: sum-then-square lets a large-
+    // magnitude g_agg/contrib_agg disagreement collapse the denominator
+    // toward zero and explode the step): new_vs_imp = (1-beta2)*
+    // (g_agg^2+contrib_agg^2) = 0.001*(1+16) = 0.017 (fresh,
+    // vs_imp_orig=0 -- the lr=0.0 call above is a full no-op, gated
+    // entirely behind `learning_rate != 0`, so the lr=0.1 call below is
+    // genuinely the first-ever update -> step=1,
     // bias_correction=1-beta2=0.001, vs_imp_hat=new_vs_imp/bias_correction
-    // = 25.0 exactly). value_scale -= scale_eff_lr*g_agg/sqrt(vs_imp_hat),
-    // scale_eff_lr=lr/nnz_this_row=0.1/1=0.1. Stored value_scale_importance
-    // is new_vs_imp itself (0.025), NOT the bias-corrected vs_imp_hat --
-    // matching RMSpropScalePolicy::update's own convention of storing the
-    // raw EMA and only bias-correcting the value READ out of it for the
-    // step (delta_csr_types.hpp).
+    // = g_agg^2+contrib_agg^2 = 17.0 exactly). value_scale -=
+    // scale_eff_lr*g_agg/sqrt(vs_imp_hat), scale_eff_lr=lr/nnz_this_row=
+    // 0.1/1=0.1. Stored value_scale_importance is new_vs_imp itself
+    // (0.017), NOT the bias-corrected vs_imp_hat -- matching
+    // RMSpropScalePolicy::update's own convention of storing the raw EMA
+    // and only bias-correcting the value READ out of it for the step
+    // (delta_csr_types.hpp).
     const float g_agg = 2.0f * 0.5f * 1.0f * 1.0f;
     const float contrib_agg = 2.0f * 0.5f * 4.0f;
-    const float combined = g_agg + contrib_agg;
-    const float new_vs_imp = 0.001f * combined * combined;
+    const float new_vs_imp = 0.001f * (g_agg * g_agg + contrib_agg * contrib_agg);
     const float beta2 = 0.999f;
     const float bias_correction = 1.0f - beta2;
     const float vs_imp_hat = new_vs_imp / bias_correction;

@@ -404,50 +404,52 @@ struct RMSpropScalePolicy {
     // Joint.combined_signal_strictly_informative). value_scale_importance/
     // output_scale_importance are the SAME kind of RMSprop second-moment
     // accumulator as ci, just aggregated over a row/column instead of a
-    // single synapse -- combined here the same way ci does: SUM first,
-    // THEN square ((g_agg+contrib_agg)^2), not sum-of-squares. Squaring
-    // the sum lets the two signals CANCEL when they disagree in sign --
-    // g_agg (real gradient) and contrib_agg (current forward activity)
-    // pointing opposite ways means the synapse's current value and the
-    // task's error signal disagree, which is evidence of noise, not
-    // importance, and should NOT inflate the estimate the way summing
-    // their squares would (squares destroy sign, so disagreement and
-    // agreement would look identical). The actual STEP below still uses
-    // g_agg alone (unbiased: E[step]=0 under zero-mean noise, only the
-    // magnitude ESTIMATE gets the extra signal). Defaults to 0 for
-    // callers that don't have one (e.g. NoScalePolicy siblings, or a
-    // caller not yet updated), reproducing plain RMSprop exactly.
+    // single synapse -- combined here the same way ci does: SQUARE first,
+    // THEN sum (g_agg^2+contrib_agg^2), not (g_agg+contrib_agg)^2. This
+    // value is the DIVISOR of the step below, so its job is safety, not
+    // just importance-ranking: sum-then-square lets a large-magnitude
+    // disagreement between g_agg and contrib_agg collapse the denominator
+    // toward zero even though both signals are individually large,
+    // exploding the step -- the same class of instability the bias-
+    // correction fix below closes, just triggered by cancellation instead
+    // of cold start (see conversation). Square-then-sum is bounded below
+    // by max(g_agg,contrib_agg)^2 regardless of sign, so a large
+    // disagreement still damps the step instead of amplifying it. The
+    // actual STEP below still uses g_agg alone (unbiased: E[step]=0 under
+    // zero-mean noise, only the magnitude ESTIMATE gets the extra
+    // signal). Defaults to 0 for callers that don't have one (e.g.
+    // NoScalePolicy siblings, or a caller not yet updated), reproducing
+    // plain RMSprop exactly.
     //
     // step: Adam-style bias correction counter (Kingma & Ba 2015, sec 3).
-    // scale_state starts at 0, so on step 1 it's (1-beta2)*combined^2 --
-    // badly SHRUNK toward zero, not combined^2 itself. Dividing by
-    // (1-beta2^step) undoes exactly that shrinkage: on step 1,
-    // state_hat = (1-beta2)*combined^2/(1-beta2) = combined^2 exactly, so
-    // the step size becomes -eff_lr*g/(|combined|+eps) instead of
-    // -eff_lr*g/(sqrt(1-beta2)*|combined|+eps) -- ~1/sqrt(1-beta2)
-    // (~31.6x at the default beta2=0.999) SMALLER, i.e. normal-sized
-    // instead of wildly inflated. This is purely an optimizer-internal
-    // correction (nothing to do with a model's own +b bias term) --
-    // confirmed as the real root cause of a genuine bug: value_scale
-    // swinging sign in a single first update (1.0 -> -3.1, lr=0.5),
-    // corrupting every synapse sharing that row (both scattered and
-    // block4-owned, since they share the same value_scale[row]) -- see
-    // test_disldo_block4_backward.cpp's regression test. Applied ONLY to
-    // value_scale_importance/output_scale_importance (row/column-level,
-    // one uint32_t counter each -- cheap), NOT to per-synapse `ci`
-    // (would need a counter the same size as ci itself, doubling memory
-    // for an FP4/FP8 format where every byte counts, for a
-    // self-limiting problem that doesn't compound across a whole row the
-    // way value_scale's does).
+    // scale_state starts at 0, so on step 1 it's (1-beta2)*(g_agg^2+
+    // contrib_agg^2) -- badly SHRUNK toward zero, not the true magnitude
+    // itself. Dividing by (1-beta2^step) undoes exactly that shrinkage:
+    // on step 1, state_hat = new_state/(1-beta2) = g_agg^2+contrib_agg^2
+    // exactly, so the step size becomes -eff_lr*g/(sqrt(g_agg^2+
+    // contrib_agg^2)+eps) instead of -eff_lr*g/(sqrt(1-beta2)*sqrt(...)+
+    // eps) -- ~1/sqrt(1-beta2) (~31.6x at the default beta2=0.999)
+    // SMALLER, i.e. normal-sized instead of wildly inflated. This is
+    // purely an optimizer-internal correction (nothing to do with a
+    // model's own +b bias term) -- confirmed as the real root cause of a
+    // genuine bug: value_scale swinging sign in a single first update
+    // (1.0 -> -3.1, lr=0.5), corrupting every synapse sharing that row
+    // (both scattered and block4-owned, since they share the same
+    // value_scale[row]) -- see test_disldo_block4_backward.cpp's
+    // regression test. Applied ONLY to value_scale_importance/
+    // output_scale_importance (row/column-level, one uint32_t counter
+    // each -- cheap), NOT to per-synapse `ci` (would need a counter the
+    // same size as ci itself, doubling memory for an FP4/FP8 format
+    // where every byte counts, for a self-limiting problem that doesn't
+    // compound across a whole row the way value_scale's does).
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
                         VALUE_TYPE contrib_agg = VALUE_TYPE(0),
                         uint32_t* step = nullptr) {
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
-        const VALUE_TYPE combined = g_agg + contrib_agg;
         const VALUE_TYPE new_state = beta2 * scale_state
-            + (VALUE_TYPE(1) - beta2) * (combined * combined);
+            + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
         if (!std::isfinite(new_state)) return;
         VALUE_TYPE state_hat = new_state;
         if (step != nullptr) {
@@ -479,16 +481,21 @@ struct AdaMaxScalePolicy {
     // same reason -- scale_state's std::max never lets a stray Inf decay
     // back down either, so an overflowed g_agg is just as permanently
     // corrupting here without this check.
-    // contrib_agg: same sum-then-magnitude combination as
-    // RMSpropScalePolicy (see its own docstring above, same
-    // disagreement-cancels rationale) -- |g_agg+contrib_agg| feeds the
-    // running max, not sqrt(g_agg^2+contrib_agg^2), so two signals
-    // pointing opposite ways partially or fully cancel instead of both
-    // inflating the tracked ceiling regardless of sign.
+    // contrib_agg: same safety rationale as RMSpropScalePolicy's own
+    // square-then-sum fix (see its docstring above) -- here the natural
+    // analog is max(|g_agg|,|contrib_agg|), NOT |g_agg+contrib_agg|.
+    // AdaMax's own state IS an L-infinity (max) norm tracker already
+    // (that's what distinguishes it from Adam's L2/RMSprop), so combining
+    // two signals via max is the same combine rule the policy already
+    // uses for combining across TIME (max(beta2*scale_state, ...)) --
+    // just applied across the two SIGNALS too. Summing before taking the
+    // magnitude would have the identical cancellation hole as sum-then-
+    // square did for RMSprop: two large, opposite-signed signals could
+    // net near zero and fail to register as a large ceiling at all.
     // step: accepted only for call-site signature compatibility with
     // RMSpropScalePolicy::update -- unused here. Per Kingma & Ba 2015
     // sec 7, AdaMax's running-MAX state doesn't have RMSprop's EMA
-    // cold-start shrinkage problem (max(0, |combined|) on step 1 is
+    // cold-start shrinkage problem (max(0, combined_mag) on step 1 is
     // already the true value, not a shrunk fraction of it), so there's
     // nothing for bias correction to fix.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
@@ -498,7 +505,7 @@ struct AdaMaxScalePolicy {
                         uint32_t* step = nullptr) {
         (void)step;
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
-        const VALUE_TYPE combined_mag = std::abs(g_agg + contrib_agg);
+        const VALUE_TYPE combined_mag = std::max(std::abs(g_agg), std::abs(contrib_agg));
         const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
         if (!std::isfinite(new_state)) return;
         const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (new_state + eps);
