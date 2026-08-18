@@ -1,6 +1,7 @@
 #pragma once
 #include "fp4quant.hpp"
 #include "fp8quant.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -81,6 +82,31 @@ inline float block4_vec_hsum(Block4Vec x) {
 inline Block4Vec block4_vec_sqrt(Block4Vec x) {
     Block4Vec result;
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::sqrt(x[i]);
+    return result;
+}
+
+// Elementwise max -- no whole-vector compare-and-select op available for
+// GCC vector-extension types (a<b produces a vector of comparison results,
+// not a single bool, so std::max doesn't compile for Block4Vec), same
+// reason block4_vec_sqrt above is a plain per-lane loop rather than a
+// built-in. Used by BoundedRMSpropSynapsePolicy<Block4Vec>::floor_ci
+// (delta_csr_types.hpp) to bound how fast per-synapse `ci` can decay.
+inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::max(a[i], b[i]);
+    return result;
+}
+
+// Elementwise clip to [-max_abs, max_abs], per-lane -- same "no built-in
+// compare-and-select" reason as block4_vec_max above. Used by
+// BoundedRMSpropSynapsePolicy<Block4Vec>::clip_delta (delta_csr_types.hpp)
+// as a hard, unconditional safety net on the per-synapse weight update
+// magnitude.
+inline Block4Vec block4_vec_clip_abs(Block4Vec x, Block4Vec max_abs) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        result[i] = x[i] > max_abs[i] ? max_abs[i] : (x[i] < -max_abs[i] ? -max_abs[i] : x[i]);
+    }
     return result;
 }
 

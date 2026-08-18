@@ -428,9 +428,40 @@ void disldo_forward(
 // shadow control (sili_peridot's fixed_digit_residual_quantize /
 // TrueMultiDigitLayer's simulate_quantize) succeeds by a wide margin --
 // see sili_peridot/JOURNAL.md.
+// SynapsePolicy: swappable per-synapse `ci` update (update_ci) + weight-delta
+// computation (update_cw) -- see PlainRMSpropSynapsePolicy/
+// BoundedRMSpropSynapsePolicy's own docstrings (delta_csr_types.hpp) for
+// the full root-cause story (late-training RMSprop divergence once ci
+// decays down to match a shrinking residual gradient, found via direct
+// trace on DISLDOLayer32; an lr-decay schedule "fixes" it by eventually
+// freezing the whole network, incompatible with this project's lifelong-
+// learning goal, hence a stationary per-synapse floor+clip instead).
+// Defaults to PlainRMSpropSynapsePolicy (today's exact formula,
+// bit-identical on finite inputs) so every existing caller is unaffected
+// without any changes on their part -- same convention as ScalePolicy
+// above. min_decay_frac/max_abs_delta are inert (ignored) under the
+// default Plain policy; only meaningful once a caller opts into
+// BoundedRMSpropSynapsePolicy.
+//
+// Template-TEMPLATE parameter (not a fully-instantiated `typename
+// SynapsePolicy = Policy<value_type>` like ScalePolicy above), because
+// this function's SIMD sites need the SAME chosen policy (Plain or
+// Bounded) instantiated at Block4Vec, not just value_type -- one caller-
+// visible choice, two internal instantiations (`SynapsePolicy` and
+// `SynapsePolicyVec` aliases below), rather than requiring every caller
+// to specify the policy twice. Placed LAST in the template parameter
+// list, not next to ScalePolicy -- existing callers across the test
+// suite explicitly specify template args positionally up through
+// DeferredScaleWrite/StochasticRounding (e.g.
+// `disldo_backward<S, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>,
+// false, false>`); inserting a new parameter anywhere before those would
+// silently shift every one of those positional args onto the wrong
+// parameter (confirmed directly: doing this broke the build with
+// "expected a class template, got 'false'").
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
           typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
-          bool DeferredScaleWrite = false, bool StochasticRounding = true>
+          bool DeferredScaleWrite = false, bool StochasticRounding = true,
+          template <typename> class SynapsePolicyT = PlainRMSpropSynapsePolicy>
 void disldo_backward(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,
     SIZE_TYPE    batch,
@@ -447,9 +478,18 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  beta2 = 0.999f,
     typename ValueAccessor<VALUES_TYPE>::value_type  eps = 1e-8f,
     typename ValueAccessor<VALUES_TYPE>::value_type  beta1 = 0.9f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  min_decay_frac = 0.0f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  max_abs_delta = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    // Same chosen policy (SynapsePolicyT), instantiated at both widths --
+    // scalar sites use SynapsePolicy, Block4Vec SIMD sites use
+    // SynapsePolicyVec. See this function's own template-parameter
+    // docstring above for why SynapsePolicyT is a template-template
+    // parameter rather than a fully-instantiated type like ScalePolicy.
+    using SynapsePolicy = SynapsePolicyT<value_type>;
+    using SynapsePolicyVec = SynapsePolicyT<Block4Vec>;
     // Only meaningful when DeferredScaleWrite -- a touched scattered
     // entry's true-units (cw, ci) get cached here instead of stored
     // immediately, and are written out via set_stochastic only after
@@ -699,10 +739,9 @@ void disldo_backward(
                             // abstract, it does not prescribe sum-before-
                             // square as the numeric encoding.
                             const value_type contrib = iv * cw_orig;
-                            ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                            cw += damp_by_importance
-                                ? (-effective_lr * g) / (std::sqrt(ci) + eps)
-                                : (-effective_lr * g);
+                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                            cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
+                                                            damp_by_importance, max_abs_delta);
                             scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                             mcol_at(col, 0) += cw_orig * val_scale * g;
                             // Parallel forward-contribution accumulation --
@@ -770,10 +809,9 @@ void disldo_backward(
                             // SiliImportanceProof/ImportanceSignalInformationGain.lean,
                             // Joint.combined_signal_strictly_informative.
                             const value_type contrib = iv * cw_orig;
-                            ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                            quant += damp_by_importance
-                                ? (-effective_lr * g * S) / (std::sqrt(ci) + eps)
-                                : (-effective_lr * g * S);
+                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                            quant += SynapsePolicy::update_cw(g, ci, S, effective_lr, eps,
+                                                               damp_by_importance, max_abs_delta);
                             cw = quant * S;
                             // dL/d(value_scale_k(r,k)) = g * quant *
                             // output_scale_k(col,k), for EACH component k
@@ -1195,8 +1233,9 @@ void disldo_backward(
                                 const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
                                 const Block4Vec val_scale_v    = block4_vec_broadcast(val_scale);
                                 const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
-                                const Block4Vec one_minus_beta2_v = block4_vec_broadcast(1.0f - beta2);
                                 const Block4Vec eps_v          = block4_vec_broadcast(eps);
+                                const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
+                                const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
                                 Block4Vec cw_v = block4_vec_load(cw4_8);
                                 Block4Vec ci_v = block4_vec_load(ci4_8);
                                 const Block4Vec cw_orig_v   = block4_vec_load(cw_orig4_8);
@@ -1217,11 +1256,10 @@ void disldo_backward(
                                         // rationale and the proved theorem
                                         // (Joint.combined_signal_strictly_informative).
                                         const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
-                                        ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v + contrib_v * contrib_v);
-                                        const Block4Vec neg_lr_g_v = -(effective_lr_v * g_v);
-                                        const Block4Vec delta_v = damp_by_importance
-                                            ? neg_lr_g_v / (block4_vec_sqrt(ci_v) + eps_v)
-                                            : neg_lr_g_v;
+                                        ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v);
+                                        const Block4Vec delta_v = SynapsePolicyVec::update_cw(
+                                            g_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
+                                            damp_by_importance, max_abs_delta_v);
                                         cw_v += delta_v;
                                         mrow_local8 += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * g_v));
                                         mcol_acc_v += cw_orig_v * val_scale_v * g_v;
@@ -1250,10 +1288,9 @@ void disldo_backward(
                                             // scattered path's identical fix
                                             // (Joint.combined_signal_strictly_informative).
                                             const value_type contrib = iv * cw_orig4_8[lj];
-                                            ci4_8[lj] = beta2 * ci4_8[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                                            cw4_8[lj] += damp_by_importance
-                                                ? (-effective_lr * g) / (std::sqrt(ci4_8[lj]) + eps)
-                                                : (-effective_lr * g);
+                                            ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g, contrib, beta2, min_decay_frac);
+                                            cw4_8[lj] += SynapsePolicy::update_cw(g, ci4_8[lj], value_type(1), effective_lr, eps,
+                                                                                  damp_by_importance, max_abs_delta);
                                             mrow_local8 += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * g;
                                             mcol4_8[lj] += cw_orig4_8[lj] * val_scale * g;
                                             mrow_local8_contrib += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * contrib;
@@ -1330,10 +1367,9 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * cw_orig;
-                                        ci = beta2 * ci + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                                        cw += damp_by_importance
-                                            ? (-effective_lr * g) / (std::sqrt(ci) + eps)
-                                            : (-effective_lr * g);
+                                        ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                                        cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
+                                                                        damp_by_importance, max_abs_delta);
                                         mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                                         mcol_local  += cw_orig * val_scale * g;
                                         mrow_local_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
@@ -1457,8 +1493,9 @@ void disldo_backward(
                         if (full_tile_cols) {
                             const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
                             const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
-                            const Block4Vec one_minus_beta2_v = block4_vec_broadcast(1.0f - beta2);
                             const Block4Vec eps_v          = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
                             Block4Vec quant_v = block4_vec_load(quant4);
                             Block4Vec ci_v    = block4_vec_load(ci4);
@@ -1501,17 +1538,16 @@ void disldo_backward(
                                     // sili__new/lean_proofs/importance_signal_information_gain/
                                     // SiliImportanceProof/ImportanceSignalInformationGain.lean).
                                     const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
-                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v + contrib_v * contrib_v);
+                                    ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v);
                                     // dL/d(quant) = g*S -- proper chain rule
                                     // on true_w=quant*S (multiply, not
                                     // divide -- see disldo_backward's
                                     // scattered-path comment this mirrors
                                     // exactly, and mcol_acc_v's own comment
                                     // 2 blocks up).
-                                    const Block4Vec neg_lr_g_S_v = -(effective_lr_v * g_v * combined_scale_v);
-                                    const Block4Vec delta_v = damp_by_importance
-                                        ? neg_lr_g_S_v / (block4_vec_sqrt(ci_v) + eps_v)
-                                        : neg_lr_g_S_v;
+                                    const Block4Vec delta_v = SynapsePolicyVec::update_cw(
+                                        g_v, ci_v, combined_scale_v, effective_lr_v, eps_v,
+                                        damp_by_importance, max_abs_delta_v);
                                     quant_v += delta_v;
                                     // quant_floor: real signed quant for
                                     // value_scale_k/output_scale_k's own
@@ -1588,10 +1624,9 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * quant_orig4[lj];
-                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                                        quant4[lj] += damp_by_importance
-                                            ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
-                                            : (-effective_lr * g * S);
+                                        ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac);
+                                        quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
+                                                                                damp_by_importance, max_abs_delta);
                                         // Gated on quant4[lj]==0 -- see the
                                         // scattered-CSR path's identical fix
                                         // for the full correctness trace
@@ -1632,10 +1667,9 @@ void disldo_backward(
                                     // path's identical fix
                                     // (Joint.combined_signal_strictly_informative).
                                     const value_type contrib = iv * quant_orig4[lj];
-                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * (g * g + contrib * contrib);
-                                    quant4[lj] += damp_by_importance
-                                        ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
-                                        : (-effective_lr * g * S);
+                                    ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac);
+                                    quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
+                                                                            damp_by_importance, max_abs_delta);
                                     // Gated on quant4[lj]==0 -- see the
                                     // scattered-CSR path's identical fix.
                                     const value_type quant_floor = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];

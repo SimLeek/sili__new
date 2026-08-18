@@ -535,6 +535,125 @@ struct NoScalePolicy {
     }
 };
 
+// ── Per-synapse ci-update policy (floor + clip) ───────────────────────────────
+//
+// Distinct from the ScalePolicy family above: those operate on value_scale/
+// output_scale (one scalar per ROW/COLUMN). This operates on per-synapse `ci`
+// (one scalar per SYNAPSE, linear_disldo.hpp's own RMSprop second-moment
+// accumulator) -- historically hand-duplicated at ~8 call sites (6 scalar +
+// 2 SIMD) rather than templated. Any future change to this formula should go
+// through ONE template parameter, not shotgun surgery across every site again
+// (this session already missed 2 SIMD sites once during an earlier revert,
+// caught only by test_block4_scattered_divergence.cpp).
+//
+// Root cause this exists to fix (see conversation): a plain RMSprop `ci` EMA
+// (beta2=0.999, no bias correction -- see RMSpropScalePolicy's own docstring
+// for why bias correction isn't applied to per-synapse ci, unlike
+// value_scale_importance/output_scale_importance) LAGS the true local
+// gradient scale near a converged solution. That lag is what keeps the step
+// naturally small during a long stable plateau (ci stays elevated relative to
+// the now-tiny residual gradient). But ci eventually decays down to match the
+// small residual too -- once it does, g/sqrt(ci) stops shrinking with the
+// error and returns to ~full lr-sized steps regardless of how small the
+// actual error is, causing overshoot, a larger resulting gradient, ci
+// ratcheting back up, and the cycle repeating/compounding. Confirmed
+// directly: a DISLDOLayer32 permutation-regression run stayed rock-stable at
+// SSE=3.0000 for 300+ steps then diverged past SSE=180 by step ~405, at a
+// CONSTANT lr, with `ci` visibly decaying from ~0.9 to ~0.66 right before
+// the spike.
+//
+// An lr-decay schedule (any monotonic-to-zero form, including 1/(1+step))
+// "fixes" this by eventually freezing the whole network -- incompatible with
+// this project's lifelong-learning goal. Both policies below are STATIONARY
+// (no dependency on step count / wall clock), so they stay compatible with
+// an infinite training horizon.
+//
+// Exactly two entry points per policy, each owning its full formula
+// end-to-end -- no math left inline at the call site, no third "combine"
+// wrapper, per direct correction (an earlier draft split the RMSprop
+// division/damp-branch out into the call site while only the floor and
+// clip lived in the policy -- half-templated, still shotgun-surgery-prone
+// for the actual optimizer math, the opposite of the point):
+//   - update_ci: the complete per-synapse second-moment update. Bounded's
+//     version additionally floors how fast ci is allowed to DECAY per step
+//     (`max(ema, min_decay_frac * ci_old)`), closing the lag directly.
+//     Explicitly NOT an AMSGrad-style permanent max: min_decay_frac<1 still
+//     lets ci decay, just not fast enough to resonate, so a synapse can
+//     still eventually "forget" a stale large-gradient event and re-adapt
+//     -- AMSGrad's true max was considered and rejected for this reason
+//     (would permanently suppress step size for any synapse that ever saw
+//     one large gradient, the opposite of what a lifelong learner needs,
+//     and would likely compound this project's own stuck-weights findings
+//     rather than fix them).
+//   - update_cw: the complete per-synapse weight delta -- the
+//     damp_by_importance branch, the division, and (Bounded only) a hard
+//     cap on |delta| independent of ci entirely, all in one place. The
+//     clip is the standard safety net non-episodic/continual training
+//     already uses everywhere else (e.g. PPO-style per-step update
+//     clipping), bounding worst-case overshoot unconditionally regardless
+//     of how update_ci behaves. `S` is the combined value_scale*out_scale
+//     factor some call sites multiply into the delta (pass VALUE_TYPE(1)
+//     for sites that don't scale) -- note `ci` itself never sees S, only
+//     the delta does (matches every existing call site's own convention).
+template <typename VALUE_TYPE>
+struct PlainRMSpropSynapsePolicy {
+    // Reproduces linear_disldo.hpp's EXISTING inline formula exactly,
+    // bit-for-bit, on finite inputs -- the default, used by every existing
+    // caller until explicitly opted into BoundedRMSpropSynapsePolicy below.
+    // No floor, no clip -- matches RMSpropScalePolicy's own "must stay
+    // bit-identical to today's behavior" convention.
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
+                                 VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/) {
+        return beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+    }
+
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
+                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
+                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/) {
+        return damp_by_importance
+            ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
+            : (-eff_lr * g * S);
+    }
+};
+
+template <typename VALUE_TYPE>
+struct BoundedRMSpropSynapsePolicy {
+    // Never let ci decay below `min_decay_frac * ci_old` in a single step,
+    // regardless of how small the current (g,contrib) is.
+    //
+    // IMPORTANT for choosing a value: plain EMA's own WORST-CASE per-step
+    // retention (g=contrib=0) is already exactly `beta2` -- `ci_new =
+    // beta2*ci_old` in that case, nothing decays faster than that. So
+    // min_decay_frac only has any effect at all when min_decay_frac > beta2
+    // (retain MORE than the natural EMA floor would); min_decay_frac <=
+    // beta2 is a silent no-op (the `max()` below always picks the ema
+    // branch). min_decay_frac=1.0 would freeze ci forever (never decays at
+    // all, AMSGrad-style, rejected -- see file-level docstring above);
+    // min_decay_frac=0.0 (or any value <= beta2) reproduces plain unbounded
+    // EMA decay (identical to PlainRMSpropSynapsePolicy). The intended use
+    // is a value strictly between beta2 and 1 -- bounds the DECAY RATE
+    // (slower than natural), not the decay itself.
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
+                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac) {
+        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        const VALUE_TYPE floor = min_decay_frac * ci;
+        return std::max(ema, floor);
+    }
+
+    // Same damp_by_importance/division formula as Plain, plus a hard,
+    // sign-preserving cap on the result.
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
+                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
+                                 bool damp_by_importance, VALUE_TYPE max_abs_delta) {
+        const VALUE_TYPE delta = damp_by_importance
+            ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
+            : (-eff_lr * g * S);
+        if (delta > max_abs_delta) return max_abs_delta;
+        if (delta < -max_abs_delta) return -max_abs_delta;
+        return delta;
+    }
+};
+
 // ── Layout metadata ───────────────────────────────────────────────────────────
 
 struct DeltaCSRLayout {
@@ -612,6 +731,57 @@ struct DeltaCSRRowCursor {
 // reuses both directly (both are already value-type-agnostic, no changes
 // needed to either). See conversation (ULEB128 block4 tile indexing).
 #include "block4.hpp"
+
+// ── Per-synapse ci-update policy: Block4Vec (SIMD) specializations ────────────
+//
+// The primary templates above (PlainRMSpropSynapsePolicy<VALUE_TYPE>/
+// BoundedRMSpropSynapsePolicy<VALUE_TYPE>) use std::max, which does not
+// compile for Block4Vec (GCC vector-extension `<` produces a vector of
+// comparison results, not a single bool -- same reason block4_vec_sqrt/
+// block4_vec_max/block4_vec_clip_abs above are hand-written per-lane loops
+// rather than calling std:: equivalents). Full explicit specializations,
+// not just a VALUE_TYPE=Block4Vec instantiation of the generic template --
+// mirrors this file's own scalar-vs-SIMD math duplication precedent
+// (disldo_backward's scattered scalar sites vs its Block4Vec SIMD sites
+// already hand-code the same formula twice; this policy abstraction
+// unifies the 8 CALL SITES onto one template parameter, it doesn't
+// eliminate the scalar/SIMD math split itself).
+template <>
+struct PlainRMSpropSynapsePolicy<Block4Vec> {
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
+                                Block4Vec beta2, Block4Vec /*min_decay_frac*/) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        return beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+    }
+
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
+                                Block4Vec eff_lr, Block4Vec eps,
+                                bool damp_by_importance, Block4Vec /*max_abs_delta*/) {
+        const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
+        return damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+    }
+};
+
+template <>
+struct BoundedRMSpropSynapsePolicy<Block4Vec> {
+    // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
+    // for the full min_decay_frac semantics (must exceed beta2 to bind).
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
+                                Block4Vec beta2, Block4Vec min_decay_frac) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec floor = min_decay_frac * ci;
+        return block4_vec_max(ema, floor);
+    }
+
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
+                                Block4Vec eff_lr, Block4Vec eps,
+                                bool damp_by_importance, Block4Vec max_abs_delta) {
+        const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
+        const Block4Vec delta = damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+        return block4_vec_clip_abs(delta, max_abs_delta);
+    }
+};
 
 // ── DeltaCSRWeights ──────────────────────────────────────────────────────────
 
