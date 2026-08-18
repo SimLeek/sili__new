@@ -152,6 +152,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_load_dense
     test_block4_scattered_divergence
     test_synapse_policy_dispatch
+    test_synapse_policy_long_horizon
     test_disldo_block4_combined_absolute
     test_block4_sparse_tile
     test_block4_memory_cap_and_compression
