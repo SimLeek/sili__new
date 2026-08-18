@@ -123,13 +123,13 @@ COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE> generate_new_weights_coo(
 
 ///Sparse matmul of @p weights and @p input_tensor.
 // No learning_rate parameter -- matches disldo_forward's own fix (see
-// linear_disldo.hpp): this used to run a gradient-free Hebbian/activity
-// -correlation importance update (conn_str[wptr] +=...) whenever a
-// nonzero learning_rate was passed, unconditionally on whether a
-// matching backward call would ever follow. Real footgun, confirmed via
-// direct tracing on the DISLDO sibling -- REMOVED here too. Importance
-// updates only ever happen in a backward pass now, coupled to a real
-// gradient.
+// linear_disldo.hpp): this used to run a gradient-free ADSP-style
+// (Activity-Dependent Structural Plasticity) importance update
+// (conn_str[wptr] +=...) whenever a nonzero learning_rate was passed,
+// unconditionally on whether a matching backward call would ever follow.
+// Real footgun, confirmed via direct tracing on the DISLDO sibling --
+// REMOVED here too. Importance updates only ever happen in a backward
+// pass now, coupled to a real gradient.
 template <typename WEIGHTS_T,
           typename VALUE_TYPE = typename WEIGHTS_T::value_type,
           typename SIZE_TYPE  = typename WEIGHTS_T::size_type>

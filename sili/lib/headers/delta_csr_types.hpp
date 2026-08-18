@@ -396,11 +396,35 @@ struct RMSpropScalePolicy {
     // bounded. Skip the update entirely on a non-finite input/result
     // rather than letting it corrupt scale/scale_state -- makes NaN
     // structurally unreachable through this path, not just unlikely.
+    // contrib_agg: row/column-aggregated forward-contribution signal
+    // (Σ x*w, mirroring per-synapse ci's own contrib=x*w term -- see
+    // linear_disldo.hpp's additive combination and
+    // sili__new/lean_proofs/importance_signal_information_gain/
+    // SiliImportanceProof/ImportanceSignalInformationGain.lean,
+    // Joint.combined_signal_strictly_informative). value_scale_importance/
+    // output_scale_importance are the SAME kind of RMSprop second-moment
+    // accumulator as ci, just aggregated over a row/column instead of a
+    // single synapse -- combined here the same way ci does: SUM first,
+    // THEN square ((g_agg+contrib_agg)^2), not sum-of-squares. Squaring
+    // the sum lets the two signals CANCEL when they disagree in sign --
+    // g_agg (real gradient) and contrib_agg (current forward activity)
+    // pointing opposite ways means the synapse's current value and the
+    // task's error signal disagree, which is evidence of noise, not
+    // importance, and should NOT inflate the estimate the way summing
+    // their squares would (squares destroy sign, so disagreement and
+    // agreement would look identical). The actual STEP below still uses
+    // g_agg alone (unbiased: E[step]=0 under zero-mean noise, only the
+    // magnitude ESTIMATE gets the extra signal). Defaults to 0 for
+    // callers that don't have one (e.g. NoScalePolicy siblings, or a
+    // caller not yet updated), reproducing plain RMSprop exactly.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps) {
-        if (!std::isfinite(g_agg)) return;
-        const VALUE_TYPE new_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * g_agg * g_agg;
+                        VALUE_TYPE beta2, VALUE_TYPE eps,
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0)) {
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        const VALUE_TYPE combined = g_agg + contrib_agg;
+        const VALUE_TYPE new_state = beta2 * scale_state
+            + (VALUE_TYPE(1) - beta2) * (combined * combined);
         if (!std::isfinite(new_state)) return;
         const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(new_state) + eps);
         if (!std::isfinite(new_scale)) return;
@@ -425,11 +449,19 @@ struct AdaMaxScalePolicy {
     // same reason -- scale_state's std::max never lets a stray Inf decay
     // back down either, so an overflowed g_agg is just as permanently
     // corrupting here without this check.
+    // contrib_agg: same sum-then-magnitude combination as
+    // RMSpropScalePolicy (see its own docstring above, same
+    // disagreement-cancels rationale) -- |g_agg+contrib_agg| feeds the
+    // running max, not sqrt(g_agg^2+contrib_agg^2), so two signals
+    // pointing opposite ways partially or fully cancel instead of both
+    // inflating the tracked ceiling regardless of sign.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps) {
-        if (!std::isfinite(g_agg)) return;
-        const VALUE_TYPE new_state = std::max(beta2 * scale_state, std::abs(g_agg));
+                        VALUE_TYPE beta2, VALUE_TYPE eps,
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0)) {
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        const VALUE_TYPE combined_mag = std::abs(g_agg + contrib_agg);
+        const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
         if (!std::isfinite(new_state)) return;
         const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (new_state + eps);
         if (!std::isfinite(new_scale)) return;
@@ -451,7 +483,8 @@ template <typename VALUE_TYPE>
 struct NoScalePolicy {
     static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
                         VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
-                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/) {
+                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
+                        VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0)) {
         // Intentionally does nothing.
     }
 };

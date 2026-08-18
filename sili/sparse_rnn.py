@@ -42,7 +42,7 @@ exist rather than updating a value. It's cheap and O(1)-ish by design —
 SparseRNNAgent.step() calls it every online step, not on an "every N steps"
 cadence (a periodic throttle would reintroduce the lag spikes this stepwise
 design exists to avoid). There is no importance-decay call in this API
-generation — importance already settles via the Hebbian/activity-correlation
+generation — importance already settles via the ADSP-style activity-correlation
 tracking inside forward/backward, and a separate periodic decay interacting
 correctly with FP4-quantized stored values would need more care than a simple
 multiply (values only resolve to FP4 granularity, and large-error entries
@@ -521,10 +521,11 @@ class DISLDOLayer(_SparseLayerBase):
         # Pass False for a literal, degree-independent learning rate.
         #
         # forward_dense no longer takes learning_rate at all (see
-        # JOURNAL.md) -- it used to run its own gradient-free Hebbian
-        # importance update on every call, independent of whether a
-        # backward() would ever follow. Real weight/importance updates
-        # now happen ONLY in backward_dense, below.
+        # JOURNAL.md) -- it used to run its own gradient-free ADSP-style
+        # (Activity-Dependent Structural Plasticity) importance update on
+        # every call, independent of whether a backward() would ever
+        # follow. Real weight/importance updates now happen ONLY in
+        # backward_dense, below.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -785,8 +786,9 @@ class SISLDOLayer(_SparseLayerBase):
         `learning_rate` kept in this wrapper's own signature (matches
         every other layer's forward() call convention throughout this
         project) but no longer forwarded to forward_sparse -- it used to
-        run its own gradient-free Hebbian importance update on every
-        call, independent of whether backward() would ever follow. Real
+        run its own gradient-free ADSP-style (Activity-Dependent
+        Structural Plasticity) importance update on every call,
+        independent of whether backward() would ever follow. Real
         weight/importance updates now happen ONLY in backward_sparse."""
         csr    = x.data
         out_np = self._c.forward_sparse(

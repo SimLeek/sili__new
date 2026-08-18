@@ -188,12 +188,13 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> expand_headroom_to(
 
 // No learning_rate parameter -- matches disldo_forward's own fix (see
 // linear_disldo.hpp's disldo_forward docstring for the full rationale):
-// this used to run a gradient-free Hebbian/activity-correlation
-// importance update whenever a nonzero learning_rate was passed,
-// unconditionally on whether a matching backward call would ever
-// follow. Real footgun, confirmed via direct tracing on the DISLDO
-// sibling -- REMOVED here too, not just disabled. Importance updates
-// only ever happen in a backward pass now, coupled to a real gradient.
+// this used to run a gradient-free ADSP-style (Activity-Dependent
+// Structural Plasticity) importance update whenever a nonzero
+// learning_rate was passed, unconditionally on whether a matching
+// backward call would ever follow. Real footgun, confirmed via direct
+// tracing on the DISLDO sibling -- REMOVED here too, not just disabled.
+// Importance updates only ever happen in a backward pass now, coupled to
+// a real gradient.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void sisldo_forward(
     const CSRInput<SIZE_TYPE, typename ValueAccessor<VALUES_TYPE>::value_type>& input_tensor,

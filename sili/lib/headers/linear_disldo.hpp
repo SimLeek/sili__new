@@ -45,16 +45,18 @@
  * @param num_cpus       OpenMP thread count.
  *
  * No learning_rate parameter -- forward used to run its own gradient-free
- * Hebbian/activity-correlation importance update whenever a nonzero
- * learning_rate was passed, independently of whether a matching
- * backward_dense() call would ever follow. Confirmed as a real footgun
- * (traced directly: fired on every forward call including ones with no
- * corresponding gradient, e.g. every non-query tick of an online RNN,
- * measurably corrupting training at low learning rates independent of
- * any real task signal). Importance is now updated ONLY by
- * disldo_backward(), coupled to a real gradient, same principle as
- * weight updates always having been backward-only. REMOVED, not just
- * disabled -- a caller that still wants an unconditional Hebbian
+ * ADSP-style (Activity-Dependent Structural Plasticity) importance update
+ * whenever a nonzero learning_rate was passed, independently of whether a
+ * matching backward_dense() call would ever follow. Not Hebbian learning
+ * (no VALUE changes here, only the importance/wiring-strength signal --
+ * closer to activity-driven synaptic sprouting/pruning than to a weight
+ * update). Confirmed as a real footgun (traced directly: fired on every
+ * forward call including ones with no corresponding gradient, e.g. every
+ * non-query tick of an online RNN, measurably corrupting training at low
+ * learning rates independent of any real task signal). Importance is now
+ * updated ONLY by disldo_backward(), coupled to a real gradient, same
+ * principle as weight updates always having been backward-only. REMOVED,
+ * not just disabled -- a caller that still wants an unconditional
  * activity-correlation signal should build that explicitly, not get it
  * silently bundled into every forward pass.
  *
@@ -132,15 +134,6 @@ void disldo_forward(
     // the scattered loop above never can (GCC: "complicated access
     // pattern", confirmed via -fopt-info-vec, never auto-vectorizes).
     //
-    // KNOWN GAP, not yet addressed: unlike the scattered path above, this
-    // does not yet update value_scale_importance/output_scale_importance's
-    // forward-side Hebbian signal for block4-owned synapses specifically
-    // -- those importance scales are updated only by whatever fraction of
-    // a row/column still has scattered synapses. Fine for a first working,
-    // speed-focused version; a real quality comparison against the
-    // scattered-only baseline should check whether this matters before
-    // being trusted for training quality claims, not just forward value
-    // correctness (which does not depend on this).
     if (weights.block4.n_tiles() > 0) {
         // Row-major cursor walk isn't parallel-for-friendly directly (same
         // reason the old hash-map iteration wasn't); collect (br,bc,elem_pos)
@@ -516,6 +509,17 @@ void disldo_backward(
     constexpr std::size_t SCALE_RANK_MAX = SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>::SCALE_RANK_MAX;
     assert(rank <= SCALE_RANK_MAX);
     std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
+    // Parallel forward-contribution accumulator, same shape/layout as
+    // t_col_grad -- mirrors the per-synapse ci fix (contrib=x*w combined
+    // additively with g into the RMSprop second moment, see
+    // sili__new/lean_proofs/importance_signal_information_gain/
+    // SiliImportanceProof/ImportanceSignalInformationGain.lean,
+    // Joint.combined_signal_strictly_informative) up one level: value_scale/
+    // output_scale's own importance (scale_state) is the SAME kind of
+    // RMSprop second-moment accumulator as ci, just aggregated over a row/
+    // column instead of a single synapse -- no principled reason for it to
+    // skip the same combination.
+    std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
     // Pre-size value_scale/output_scale (now n_in*rank / n_out*rank, see
@@ -542,6 +546,8 @@ void disldo_backward(
         // this thread, rank captured from the enclosing scope.
         value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
         auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
+        value_type* mcol_contrib_base = t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
+        auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_contrib_base[col * rank + k]; };
         [[maybe_unused]] std::vector<DeferredScaleWriteEntry>* mdeferred = nullptr;
         if constexpr (DeferredScaleWrite) mdeferred = &t_deferred[static_cast<std::size_t>(tid)];
 
@@ -603,6 +609,12 @@ void disldo_backward(
             // is the non-deferred path's per-component accumulator.
             double scale_grad_sum = 0.0;
             std::vector<double> scale_grad_sum_rank(rank, 0.0);
+            // Parallel forward-contribution accumulators, mirroring
+            // scale_grad_sum/scale_grad_sum_rank -- see t_col_grad_contrib's
+            // own comment above (same additive-combination rationale, one
+            // level up from per-synapse ci).
+            double scale_grad_sum_contrib = 0.0;
+            std::vector<double> scale_grad_sum_rank_contrib(rank, 0.0);
             for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
@@ -637,12 +649,49 @@ void disldo_backward(
                         const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
                         const value_type g   = dyv * iv;
                         if (learning_rate != value_type(0)) {
-                            ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                            // Additive combination of the backward
+                            // sensitivity signal (g = dy*x) with a forward
+                            // contribution signal (contrib = x*w): proved to
+                            // strictly improve the importance estimate's
+                            // information about the synapse's true
+                            // importance whenever the two are not
+                            // conditionally independent given it -- see
+                            // sili__new/lean_proofs/importance_signal_information_gain/
+                            // SiliImportanceProof/ImportanceSignalInformationGain.lean,
+                            // theorem Joint.combined_signal_strictly_informative
+                            // (built on Joint.entropy_le_condEntropy,
+                            // H(Θ|X,Y) ≤ H(Θ|X)). Additive, not multiplicative,
+                            // so ci still updates from contrib alone even
+                            // when g=0 (e.g. a zero-gradient backward call),
+                            // instead of reintroducing the old quant=0-forever
+                            // deadlock a multiplicative gate would cause.
+                            //
+                            // SUM first, THEN square -- (g+contrib)^2, not
+                            // g^2+contrib^2. If g (real gradient) and contrib
+                            // (current forward activity) point the SAME way,
+                            // they reinforce and ci grows -- real agreement
+                            // between "this synapse currently does something"
+                            // and "the task wants it to keep doing that
+                            // direction of thing" is genuine evidence of
+                            // importance. If they DISAGREE in sign, that's
+                            // evidence the synapse's current value and the
+                            // task's error signal conflict -- noise, not
+                            // importance, safe to prune/drift -- and summing
+                            // first lets them cancel. Sum-of-squares would be
+                            // wrong here: squaring destroys sign, so it would
+                            // treat agreement and disagreement identically
+                            // and always inflate ci regardless.
+                            const value_type contrib = iv * cw_orig;
+                            ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                             cw += damp_by_importance
                                 ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                                 : (-effective_lr * g);
                             scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                             mcol_at(col, 0) += cw_orig * val_scale * g;
+                            // Parallel forward-contribution accumulation --
+                            // see scale_grad_sum_contrib's own comment above.
+                            scale_grad_sum_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
+                            mcol_at_contrib(col, 0) += cw_orig * val_scale * contrib;
                         }
                         mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
                     }
@@ -695,7 +744,16 @@ void disldo_backward(
                             // RMSprop-style: ci = decayed EMA of g^2 (magnitude-only,
                             // recency-weighted), damp by sqrt(ci)+eps instead of 1+|ci|
                             // -- see this function's own docstring for why.
-                            ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                            //
+                            // Additive combination with the forward
+                            // contribution signal (contrib = x*w): see the
+                            // DeferredScaleWrite branch above (same fix,
+                            // same theorem) for the full rationale --
+                            // sili__new/lean_proofs/importance_signal_information_gain/
+                            // SiliImportanceProof/ImportanceSignalInformationGain.lean,
+                            // Joint.combined_signal_strictly_informative.
+                            const value_type contrib = iv * cw_orig;
+                            ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                             quant += damp_by_importance
                                 ? (-effective_lr * g * S) / (std::sqrt(ci) + eps)
                                 : (-effective_lr * g * S);
@@ -745,6 +803,11 @@ void disldo_backward(
                                 const value_type val_scale_k = weights.get_value_scale_k(r, k);
                                 scale_grad_sum_rank[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * g;
                                 mcol_at(col, k) += quant_floor * val_scale_k * g;
+                                // Parallel forward-contribution accumulation
+                                // -- see scale_grad_sum_contrib's own
+                                // comment above.
+                                scale_grad_sum_rank_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * contrib;
+                                mcol_at_contrib(col, k) += quant_floor * val_scale_k * contrib;
                             }
                         }
                         mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
@@ -776,13 +839,15 @@ void disldo_backward(
                 if constexpr (!DeferredScaleWrite) {
                     for (std::size_t k = 0; k < rank; ++k) {
                         const value_type g_agg_k = static_cast<value_type>(scale_grad_sum_rank[k]);
+                        const value_type contrib_agg_k = static_cast<value_type>(scale_grad_sum_rank_contrib[k]);
                         ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
-                                            g_agg_k, scale_eff_lr, beta2, eps);
+                                            g_agg_k, scale_eff_lr, beta2, eps, contrib_agg_k);
                     }
                 } else {
                     const value_type g_agg = static_cast<value_type>(scale_grad_sum);
+                    const value_type contrib_agg = static_cast<value_type>(scale_grad_sum_contrib);
                     ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
-                                        g_agg, scale_eff_lr, beta2, eps);
+                                        g_agg, scale_eff_lr, beta2, eps, contrib_agg);
                 }
             }
         }
@@ -863,6 +928,11 @@ void disldo_backward(
 
         std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
         t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in * rank, 0.0);
+        // Parallel forward-contribution accumulator, same shape/layout as
+        // t_row_grad -- mirrors t_col_grad_contrib's own rationale
+        // (additive combination, one level up from per-synapse ci; see
+        // that array's own comment above this function).
+        std::vector<double> t_row_grad_contrib(static_cast<std::size_t>(num_cpus) * n_in * rank, 0.0);
 
         #pragma omp parallel num_threads(num_cpus)
         {
@@ -879,6 +949,10 @@ void disldo_backward(
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
             double* mrow_base = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank;
             auto mrow_at = [&](std::size_t row, std::size_t k) -> double& { return mrow_base[row * rank + k]; };
+            value_type* mcol_contrib_base = t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
+            auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_contrib_base[col * rank + k]; };
+            double* mrow_contrib_base = t_row_grad_contrib.data() + static_cast<std::size_t>(tid) * n_in * rank;
+            auto mrow_at_contrib = [&](std::size_t row, std::size_t k) -> double& { return mrow_contrib_base[row * rank + k]; };
 
             // Partitioned BY BLOCK-ROW, not by flat tile index -- each
             // thread exclusively owns every tile in the rows it's
@@ -1093,6 +1167,8 @@ void disldo_backward(
 
                             value_type mcol4_8[BLOCK4_TILE] = {0};
                             double     mrow_local8 = 0.0;
+                            value_type mcol4_8_contrib[BLOCK4_TILE] = {0};
+                            double     mrow_local8_contrib = 0.0;
                             const std::size_t col_base8 = std::size_t(bc) * BLOCK4_TILE;
                             const bool full_tile_cols8 = (col_base8 + BLOCK4_TILE <= n_out);
 
@@ -1107,6 +1183,7 @@ void disldo_backward(
                                 const Block4Vec cw_orig_v   = block4_vec_load(cw_orig4_8);
                                 const Block4Vec out_scale_v = block4_vec_load(out_scale4_8);
                                 Block4Vec mcol_acc_v = block4_vec_broadcast(0.0f);
+                                Block4Vec mcol_acc_v_contrib = block4_vec_broadcast(0.0f);
                                 const bool training = (learning_rate != value_type(0));
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
@@ -1115,7 +1192,13 @@ void disldo_backward(
                                         output_grad + static_cast<std::size_t>(b) * n_out + col_base8);
                                     const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
                                     if (training) {
-                                        ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v);
+                                        // Additive forward-contribution
+                                        // combination -- see the scattered
+                                        // path's identical fix for the full
+                                        // rationale and the proved theorem
+                                        // (Joint.combined_signal_strictly_informative).
+                                        const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
+                                        ci_v = beta2_v * ci_v + one_minus_beta2_v * ((g_v + contrib_v) * (g_v + contrib_v));
                                         const Block4Vec neg_lr_g_v = -(effective_lr_v * g_v);
                                         const Block4Vec delta_v = damp_by_importance
                                             ? neg_lr_g_v / (block4_vec_sqrt(ci_v) + eps_v)
@@ -1123,12 +1206,15 @@ void disldo_backward(
                                         cw_v += delta_v;
                                         mrow_local8 += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * g_v));
                                         mcol_acc_v += cw_orig_v * val_scale_v * g_v;
+                                        mrow_local8_contrib += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * contrib_v));
+                                        mcol_acc_v_contrib += cw_orig_v * val_scale_v * contrib_v;
                                     }
                                     *mdx_row += block4_vec_hsum(cw_v * dyv_v);
                                 }
                                 block4_vec_store(cw4_8, cw_v);
                                 block4_vec_store(ci4_8, ci_v);
                                 block4_vec_store(mcol4_8, mcol_acc_v);
+                                block4_vec_store(mcol4_8_contrib, mcol_acc_v_contrib);
                             } else {
                                 // Boundary tile-column: scalar bounds-checked
                                 // fallback, matching the FP4 branch's own.
@@ -1140,12 +1226,19 @@ void disldo_backward(
                                         const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4_8[lj]];
                                         const value_type g   = dyv * iv;
                                         if (learning_rate != value_type(0)) {
-                                            ci4_8[lj] = beta2 * ci4_8[lj] + (value_type(1) - beta2) * g * g;
+                                            // Additive forward-contribution
+                                            // combination -- see the
+                                            // scattered path's identical fix
+                                            // (Joint.combined_signal_strictly_informative).
+                                            const value_type contrib = iv * cw_orig4_8[lj];
+                                            ci4_8[lj] = beta2 * ci4_8[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                                             cw4_8[lj] += damp_by_importance
                                                 ? (-effective_lr * g) / (std::sqrt(ci4_8[lj]) + eps)
                                                 : (-effective_lr * g);
                                             mrow_local8 += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * g;
                                             mcol4_8[lj] += cw_orig4_8[lj] * val_scale * g;
+                                            mrow_local8_contrib += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * contrib;
+                                            mcol4_8_contrib[lj] += cw_orig4_8[lj] * val_scale * contrib;
                                         }
                                         *mdx_row += cw4_8[lj] * dyv;
                                     }
@@ -1154,6 +1247,7 @@ void disldo_backward(
 
                             if (learning_rate != value_type(0)) {
                                 mrow_at(row, 0) += mrow_local8;
+                                mrow_at_contrib(row, 0) += mrow_local8_contrib;
                                 if (full_tile_cols8) {
                                     // Scalar fp8_quantize_stochastic, not
                                     // block4_vec_quantize_stochastic_fp8
@@ -1163,6 +1257,7 @@ void disldo_backward(
                                     // to encode).
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         mcol_at(col4_8[lj], 0) += mcol4_8[lj];
+                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
                                         tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
                                         tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
@@ -1172,6 +1267,7 @@ void disldo_backward(
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         if (!col_valid4_8[lj]) continue;
                                         mcol_at(col4_8[lj], 0) += mcol4_8[lj];
+                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
                                         tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
                                         tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
@@ -1202,24 +1298,35 @@ void disldo_backward(
 
                                 value_type mcol_local = value_type(0);
                                 double     mrow_local  = 0.0;
+                                value_type mcol_local_contrib = value_type(0);
+                                double     mrow_local_contrib = 0.0;
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
                                     value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
                                     const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
                                     const value_type g   = dyv * iv;
                                     if (learning_rate != value_type(0)) {
-                                        ci = beta2 * ci + (value_type(1) - beta2) * g * g;
+                                        // Additive forward-contribution
+                                        // combination -- see the scattered
+                                        // path's identical fix
+                                        // (Joint.combined_signal_strictly_informative).
+                                        const value_type contrib = iv * cw_orig;
+                                        ci = beta2 * ci + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                                         cw += damp_by_importance
                                             ? (-effective_lr * g) / (std::sqrt(ci) + eps)
                                             : (-effective_lr * g);
                                         mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                                         mcol_local  += cw_orig * val_scale * g;
+                                        mrow_local_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
+                                        mcol_local_contrib += cw_orig * val_scale * contrib;
                                     }
                                     *mdx_row += cw * dyv;
                                 }
                                 if (learning_rate != value_type(0)) {
                                     mrow_at(row, 0) += mrow_local;
                                     mcol_at(col, 0) += mcol_local;
+                                    mrow_at_contrib(row, 0) += mrow_local_contrib;
+                                    mcol_at_contrib(col, 0) += mcol_local_contrib;
                                     tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
                                     tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
                                     tile_dirty = true;
@@ -1247,8 +1354,12 @@ void disldo_backward(
                     // quant4: the stored CODE itself -- now the primary
                     // optimized quantity (see the batch loop below), NOT
                     // true units like the old cw4 was. ci4 stays in true
-                    // (importance) units, unrelated to this fix.
-                    value_type  quant4[BLOCK4_TILE], ci4[BLOCK4_TILE];
+                    // (importance) units, unrelated to this fix. quant_orig4
+                    // is an immutable snapshot of quant4's call-entry value
+                    // (quant4 itself mutates across the batch loop below),
+                    // used for the forward-contribution signal
+                    // (contrib = x*quant_orig) -- mirrors FP8's cw_orig4_8.
+                    value_type  quant4[BLOCK4_TILE], ci4[BLOCK4_TILE], quant_orig4[BLOCK4_TILE];
                     // out_scale_k4[k][lj]: per-rank-component output_scale,
                     // needed for value_scale_k's own gradient below.
                     value_type  out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE];
@@ -1258,7 +1369,7 @@ void disldo_backward(
                         if (!col_valid4[lj]) {
                             col4[lj] = 0;
                             combined_scale4[lj] = combined_imp_scale4[lj] = value_type(0);
-                            quant4[lj] = ci4[lj] = value_type(0);
+                            quant4[lj] = ci4[lj] = quant_orig4[lj] = value_type(0);
                             for (std::size_t k = 0; k < rank; ++k) out_scale_k4[k][lj] = value_type(0);
                             continue;
                         }
@@ -1273,7 +1384,7 @@ void disldo_backward(
                         // mirrors (get_scale already sums over rank).
                         combined_scale4[lj]     = weights.get_scale(row, col);
                         combined_imp_scale4[lj] = imp_scale * out_imp_scale;
-                        quant4[lj] = w_decoded_arr[lj];
+                        quant4[lj] = quant_orig4[lj] = w_decoded_arr[lj];
                         ci4[lj] = imp_decoded_arr[lj] * combined_imp_scale4[lj];
                         for (std::size_t k = 0; k < rank; ++k) out_scale_k4[k][lj] = weights.get_output_scale_k(col, k);
                     }
@@ -1294,6 +1405,8 @@ void disldo_backward(
                     // consistency and to keep it out of the hot loop too.
                     value_type mcol4_rank[SCALE_RANK_MAX][BLOCK4_TILE] = {};
                     double     mrow_local_k[SCALE_RANK_MAX] = {};
+                    value_type mcol4_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
+                    double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
                     // col4[lj] is really just col_base+lj (contiguous), but
                     // reading it back OUT of the array hides that from GCC
                     // -- confirmed via -fopt-info-vec: it correctly proved
@@ -1330,6 +1443,7 @@ void disldo_backward(
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
                             Block4Vec quant_v = block4_vec_load(quant4);
                             Block4Vec ci_v    = block4_vec_load(ci4);
+                            const Block4Vec quant_orig_v = block4_vec_load(quant_orig4);
                             // Per-rank-component vectors -- rank is small
                             // (1-2 in practice, capped at SCALE_RANK_MAX),
                             // kept as real Block4Vec accumulators so the
@@ -1339,10 +1453,12 @@ void disldo_backward(
                             Block4Vec value_scale_k_v[SCALE_RANK_MAX];
                             Block4Vec out_scale_k_v[SCALE_RANK_MAX];
                             Block4Vec mcol_acc_v_k[SCALE_RANK_MAX];
+                            Block4Vec mcol_acc_v_k_contrib[SCALE_RANK_MAX];
                             for (std::size_t k = 0; k < rank; ++k) {
                                 value_scale_k_v[k] = block4_vec_broadcast(value_scale_k[k]);
                                 out_scale_k_v[k]   = block4_vec_load(out_scale_k4[k]);
                                 mcol_acc_v_k[k]    = block4_vec_broadcast(0.0f);
+                                mcol_acc_v_k_contrib[k] = block4_vec_broadcast(0.0f);
                             }
                             const bool training = (learning_rate != value_type(0));
                             for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -1356,7 +1472,17 @@ void disldo_backward(
                                     // sqrt(ci)+eps -- see disldo_backward's own
                                     // docstring for why (matches the scattered
                                     // per-synapse path above exactly).
-                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * (g_v * g_v);
+                                    //
+                                    // Additive forward-contribution
+                                    // combination (contrib = x*quant_orig) --
+                                    // see the scattered path's identical fix
+                                    // for the full rationale and the proved
+                                    // theorem
+                                    // (Joint.combined_signal_strictly_informative,
+                                    // sili__new/lean_proofs/importance_signal_information_gain/
+                                    // SiliImportanceProof/ImportanceSignalInformationGain.lean).
+                                    const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
+                                    ci_v = beta2_v * ci_v + one_minus_beta2_v * ((g_v + contrib_v) * (g_v + contrib_v));
                                     // dL/d(quant) = g*S -- proper chain rule
                                     // on true_w=quant*S (multiply, not
                                     // divide -- see disldo_backward's
@@ -1405,6 +1531,8 @@ void disldo_backward(
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v));
                                         mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v;
+                                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * contrib_v));
+                                        mcol_acc_v_k_contrib[k] += quant_floor_v * value_scale_k_v[k] * contrib_v;
                                     }
                                 }
                                 // w = quant*S, in true units, for dx --
@@ -1417,8 +1545,10 @@ void disldo_backward(
                             }
                             block4_vec_store(quant4, quant_v);
                             block4_vec_store(ci4, ci_v);
-                            for (std::size_t k = 0; k < rank; ++k)
+                            for (std::size_t k = 0; k < rank; ++k) {
                                 block4_vec_store(mcol4_rank[k], mcol_acc_v_k[k]);
+                                block4_vec_store(mcol4_rank_contrib[k], mcol_acc_v_k_contrib[k]);
+                            }
                         } else {
                             // Boundary tile-column (rare -- only the last
                             // one, when n_out isn't a multiple of
@@ -1434,7 +1564,12 @@ void disldo_backward(
                                     const value_type g   = dyv * iv;
                                     const value_type S   = combined_scale4[lj];
                                     if (learning_rate != value_type(0)) {
-                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * g * g;
+                                        // Additive forward-contribution
+                                        // combination -- see the scattered
+                                        // path's identical fix
+                                        // (Joint.combined_signal_strictly_informative).
+                                        const value_type contrib = iv * quant_orig4[lj];
+                                        ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                                         quant4[lj] += damp_by_importance
                                             ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                             : (-effective_lr * g * S);
@@ -1448,6 +1583,8 @@ void disldo_backward(
                                         for (std::size_t k = 0; k < rank; ++k) {
                                             mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
                                             mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
+                                            mcol4_rank_contrib[k][lj] += quant_floor * value_scale_k[k] * contrib;
                                         }
                                     }
                                     *mdx_row += quant4[lj] * S * dyv;
@@ -1471,7 +1608,12 @@ void disldo_backward(
                                 const value_type g   = dyv * iv;
                                 const value_type S   = combined_scale4[lj];
                                 if (learning_rate != value_type(0)) {
-                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * g * g;
+                                    // Additive forward-contribution
+                                    // combination -- see the scattered
+                                    // path's identical fix
+                                    // (Joint.combined_signal_strictly_informative).
+                                    const value_type contrib = iv * quant_orig4[lj];
+                                    ci4[lj] = beta2 * ci4[lj] + (value_type(1) - beta2) * ((g + contrib) * (g + contrib));
                                     quant4[lj] += damp_by_importance
                                         ? (-effective_lr * g * S) / (std::sqrt(ci4[lj]) + eps)
                                         : (-effective_lr * g * S);
@@ -1481,6 +1623,8 @@ void disldo_backward(
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
                                         mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;
+                                        mrow_local_k_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
+                                        mcol4_rank_contrib[k][lj] += quant_floor * value_scale_k[k] * contrib;
                                     }
                                 }
                                 *mdx_row += quant4[lj] * S * dyv;
@@ -1488,7 +1632,10 @@ void disldo_backward(
                         }
                     }
                     if (learning_rate != value_type(0)) {
-                        for (std::size_t k = 0; k < rank; ++k) mrow_at(row, k) += mrow_local_k[k];
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            mrow_at(row, k) += mrow_local_k[k];
+                            mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                        }
                         if constexpr (!StochasticRounding) {
                             // Deterministic: NOT gated by the SIMD fast path above --
                             // no deterministic block4_vec_quantize_fp4 SIMD kernel
@@ -1516,7 +1663,10 @@ void disldo_backward(
                             // unaffected by this fix.
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 if (!col_valid4[lj]) continue;
-                                for (std::size_t k = 0; k < rank; ++k) mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
+                                }
                                 const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
                                 const uint8_t new_w   = fp4_quantize(quant4[lj]);
                                 const uint8_t new_imp = fp4_quantize(imp_ratio);
@@ -1545,14 +1695,20 @@ void disldo_backward(
                                 const Block4VecU new_w_codes   = block4_vec_quantize_stochastic_fp4(w_to_encode);
                                 const Block4VecU new_imp_codes = block4_vec_quantize_stochastic_fp4(imp_to_encode);
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                    for (std::size_t k = 0; k < rank; ++k) mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
+                                }
                                     tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_codes[lj] << 4) | new_w_codes[lj]);
                                 }
                                 tile_dirty = true;
                             } else {
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     if (!col_valid4[lj]) continue;
-                                    for (std::size_t k = 0; k < rank; ++k) mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
+                                }
                                     const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
                                     const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
                                     tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
@@ -1562,7 +1718,10 @@ void disldo_backward(
                         } else {
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 if (!col_valid4[lj]) continue;
-                                for (std::size_t k = 0; k < rank; ++k) mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
+                                }
                                 const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
                                 const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
@@ -1658,11 +1817,20 @@ void disldo_backward(
                 // above, matching t_col_grad's own layout). rank=1
                 // reproduces the exact original single-sum formula.
                 for (std::size_t k = 0; k < rank; ++k) {
-                    double sum = 0.0;
-                    for (int t = 0; t < num_cpus; ++t)
+                    double sum = 0.0, sum_contrib = 0.0;
+                    for (int t = 0; t < num_cpus; ++t) {
                         sum += t_row_grad[(static_cast<std::size_t>(t) * n_in + row) * rank + k];
-                    if (sum == 0.0) continue;
+                        sum_contrib += t_row_grad_contrib[(static_cast<std::size_t>(t) * n_in + row) * rank + k];
+                    }
+                    // Only skip when BOTH are zero -- a zero real gradient
+                    // (sum==0) with nonzero forward-contribution signal
+                    // still needs to update vs_imp (same zero-escape
+                    // property as per-synapse ci, see linear_disldo.hpp's
+                    // additive combination -- a dy=0 backward call should
+                    // still move importance from activity alone).
+                    if (sum == 0.0 && sum_contrib == 0.0) continue;
                     const value_type g_agg = static_cast<value_type>(sum);
+                    const value_type contrib_agg = static_cast<value_type>(sum_contrib);
                     // Hand-inlined here rather than routed through ScalePolicy
                     // (block4 path predates that abstraction) -- same NaN/Inf
                     // guard as ScalePolicy::update and for the same reason:
@@ -1673,10 +1841,16 @@ void disldo_backward(
                     // becomes permanent corruption. See delta_csr_types.hpp's
                     // RMSpropScalePolicy::update docstring for the full trace
                     // (sili_peridot, JOURNAL.md 2026-08-10).
-                    if (!std::isfinite(g_agg)) continue;
+                    if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) continue;
                     const std::size_t idx = row * rank + k;
                     value_type& vs_imp = weights.value_scale_importance[idx];
-                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
+                    // Sum-then-square (g_agg+contrib_agg)^2, matching
+                    // RMSpropScalePolicy::update's own combination -- see
+                    // its docstring for why sum-of-squares is wrong here
+                    // (would let disagreeing signals both inflate the
+                    // estimate instead of letting them cancel).
+                    const value_type combined = g_agg + contrib_agg;
+                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
                     if (!std::isfinite(new_vs_imp)) continue;
                     const value_type new_vs = weights.value_scale[idx] - scale_eff_lr * g_agg / (std::sqrt(new_vs_imp) + eps);
                     if (!std::isfinite(new_vs)) continue;
@@ -1800,13 +1974,17 @@ void disldo_backward(
             const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
             for (std::size_t k = 0; k < rank; ++k) {
                 double col_grad_sum = 0.0;
-                for (int t = 0; t < num_cpus; ++t)
+                double col_grad_sum_contrib = 0.0;
+                for (int t = 0; t < num_cpus; ++t) {
                     col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * n_out * rank + c * rank + k];
+                    col_grad_sum_contrib += t_col_grad_contrib[static_cast<std::size_t>(t) * n_out * rank + c * rank + k];
+                }
                 // Scale update via the swappable policy -- same as
                 // value_scale's own update above.
                 const value_type g_agg = static_cast<value_type>(col_grad_sum);
+                const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
                 ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
-                                    g_agg, col_eff_lr, beta2, eps);
+                                    g_agg, col_eff_lr, beta2, eps, contrib_agg);
             }
         }
     }

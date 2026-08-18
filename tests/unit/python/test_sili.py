@@ -284,7 +284,7 @@ class TestForward:
 
     def test_importance_updated_by_lr_specific_value(self):
         # w=1.5, x=0.4, lr=0.5.
-        # Hebbian: new_imp = 0 + (1.5 × 0.4) × 0.5 / (1 + 0) = 0.3
+        # ADSP-style: new_imp = 0 + (1.5 × 0.4) × 0.5 / (1 + 0) = 0.3
         # FP4 nearest to 0.3 is 0.5 (table: 0.0, 0.5, 1.0 …).
         layer = make_layer(4, 4, bw=0)
         layer.buffer.neuron[0].synapse[0].weight = 1.5
