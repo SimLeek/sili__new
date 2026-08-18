@@ -353,12 +353,38 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
 
-    // g = dy*input = 1.0. scale_grad_sum = cw_orig * out_scale * g = 2.0*4.0*1.0 = 8.0
-    // scale_eff_lr = learning_rate / nnz_this_row = 0.1 / 1 = 0.1
-    // raw_update = 0.8, importance = 0 - 0.8 = -0.8, damped step = 0.8/1.8
-    const float raw_update = 0.1f * 8.0f;
-    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
-    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+    // g = dy*input = 1.0. contrib = iv*cw_orig = 1.0*2.0 = 2.0. ci =
+    // (1-beta2)*(g+contrib)^2 = 0.001*9.0 = 0.009 (fresh layer, ci_orig=0).
+    // quant's own step: S=val_scale*out_scale=0.5*4.0=2.0, effective_lr=0.1
+    // (lr_per_row_nnz=false), delta=-effective_lr*g*S/sqrt(ci)
+    // =-0.1*1.0*2.0/sqrt(0.009)~=-2.1082, so quant goes 2.0 -> -0.1082
+    // within this SAME call (batch=1, one step; see linear_disldo.hpp's own
+    // "quant_floor uses the post-update quant, not the stale pre-update
+    // code" comment). g_agg/contrib_agg mirror ci's own additive
+    // combination one level up (RMSpropScalePolicy, delta_csr_types.hpp):
+    // scale_grad_sum_rank[0]=quant_floor*out_scale*g,
+    // scale_grad_sum_rank_contrib[0]=quant_floor*out_scale*contrib.
+    // combined=g_agg+contrib_agg, new_state=(1-beta2)*combined^2,
+    // new_scale=0.5-scale_eff_lr*g_agg/sqrt(new_state), scale_eff_lr=0.1/1=0.1.
+    // Adam-style bias correction (RMSpropScalePolicy::update,
+    // delta_csr_types.hpp): this is the FIRST-EVER update on a fresh
+    // value_scale_step counter (step=1), so state_hat = new_state /
+    // (1-beta2^1) = new_state/(1-beta2) -- exactly undoing the (1-beta2)
+    // factor baked into new_state's own EMA formula, i.e. state_hat =
+    // combined^2 exactly.
+    const float g = 1.0f, contrib = 2.0f;
+    const float ci = 0.001f * (g + contrib) * (g + contrib);
+    const float S_combined = 0.5f * 4.0f;
+    const float quant_floor = 2.0f - 0.1f * g * S_combined / std::sqrt(ci);
+    const float g_agg = quant_floor * 4.0f * g;
+    const float contrib_agg = quant_floor * 4.0f * contrib;
+    const float combined = g_agg + contrib_agg;
+    const float new_state = 0.001f * combined * combined;
+    const float beta2 = 0.999f;
+    const float bias_correction = 1.0f - beta2;   // 1 - beta2^1
+    const float state_hat = new_state / bias_correction;
+    const float expected_scale = 0.5f - 0.1f * g_agg / std::sqrt(state_hat);
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
 }
 
 // ── value_scale_importance (gradient-driven, mirrors per-synapse ci) ──────────
@@ -520,11 +546,32 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), lr, 1);
 
-    // scale_grad = stored_w * dy * input = 2.0 * 1.0 * 3.0 = 6.0
-    // raw_update = 0.1*6.0 = 0.6, importance = 0-0.6 = -0.6, damped by 1.6
-    const float raw_update = lr * (2.0f * 1.0f * 3.0f);
-    const float expected_scale = 0.5f - raw_update / (1.0f + std::abs(-raw_update));
-    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-5f));
+    // g = dy*input = 1.0*3.0 = 3.0. contrib = iv*cw_orig = 3.0*2.0 = 6.0.
+    // ci = (1-beta2)*(g+contrib)^2 = 0.001*81 = 0.081 (fresh layer,
+    // ci_orig=0). quant's own step: S=val_scale*out_scale=0.5*1.0=0.5,
+    // effective_lr=lr=0.1 (lr_per_row_nnz=false, nnz_this_row=1),
+    // delta=-effective_lr*g*S/sqrt(ci), so quant goes 2.0 -> quant_floor
+    // within this SAME call (batch=1). g_agg/contrib_agg mirror ci's own
+    // additive combination one level up (RMSpropScalePolicy,
+    // delta_csr_types.hpp) -- see the analogous derivation in
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above for the full trace.
+    const float g = 3.0f, contrib = 6.0f;
+    const float ci = 0.001f * (g + contrib) * (g + contrib);
+    const float S_combined = 0.5f * 1.0f;
+    const float quant_floor = 2.0f - lr * g * S_combined / std::sqrt(ci);
+    const float g_agg = quant_floor * 1.0f * g;
+    const float contrib_agg = quant_floor * 1.0f * contrib;
+    const float combined = g_agg + contrib_agg;
+    const float new_state = 0.001f * combined * combined;
+    // Adam-style bias correction, first-ever update (step=1) -- see
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above for the full explanation.
+    const float beta2 = 0.999f;
+    const float bias_correction = 1.0f - beta2;
+    const float state_hat = new_state / bias_correction;
+    const float expected_scale = 0.5f - lr * g_agg / std::sqrt(state_hat);
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
 }
 
 TEST_CASE("value_scale gradient accumulates correctly across multiple synapses and batches",
@@ -552,16 +599,43 @@ TEST_CASE("value_scale gradient accumulates correctly across multiple synapses a
         input.data(), S(2), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), lr, 1);
 
-    // scale_grad = sum_{e,b}(stored_w[e] * dy[b][col_e] * input[b][r=0])
-    // e=0 (col=0): b=0: 2.0*1.0*1.0=2; b=1: 2.0*1.0*2.0=4  -> 6
-    // e=1 (col=1): b=0: 3.0*1.0*1.0=3; b=1: 3.0*1.0*2.0=6  -> 9
-    // total scale_grad_sum = 6 + 9 = 15
-    // scale_eff_lr = lr / nnz_this_row = 0.01 / 2 = 0.005 (always divides
-    // by nnz_this_row for value_scale, independent of lr_per_row_nnz flag)
-    // raw_update = 0.005*15 = 0.075, importance = 0-0.075, damped by 1.075
-    const float raw_update = (lr / 2.0f) * 15.0f;
-    const float expected_scale = 1.0f - raw_update / (1.0f + std::abs(-raw_update));
-    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-4f));
+    // Each synapse e (col=0: cw_orig=2.0, col=1: cw_orig=3.0) runs its OWN
+    // quant/ci trace across both batch elements (production order: outer
+    // loop over e/synapses in the row, inner loop over b/batch) -- see
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above for the single-synapse, single-batch
+    // version of this same derivation. scale_grad_sum_rank[0]/its contrib
+    // mirror accumulate quant_floor*out_scale*{g,contrib} across ALL
+    // (e,b) pairs into ONE row-level total (out_scale=1.0 both columns,
+    // never set). scale_eff_lr always divides by nnz_this_row=2,
+    // independent of lr_per_row_nnz.
+    const float cw_orig[2] = {2.0f, 3.0f};
+    const float in_vals[2] = {1.0f, 2.0f};
+    float g_agg = 0.0f, contrib_agg = 0.0f;
+    for (int e = 0; e < 2; ++e) {
+        float quant = cw_orig[e];
+        float ci = 0.0f;
+        for (int b = 0; b < 2; ++b) {
+            const float iv = in_vals[b];
+            const float g = 1.0f * iv;             // dy=1.0 everywhere
+            const float contrib = iv * cw_orig[e];  // cw_orig fixed for this e's whole batch loop
+            ci = 0.999f * ci + 0.001f * (g + contrib) * (g + contrib);
+            quant += -lr * g * 1.0f / std::sqrt(ci);   // S = val_scale*out_scale = 1.0*1.0
+            g_agg += quant * 1.0f * g;
+            contrib_agg += quant * 1.0f * contrib;
+        }
+    }
+    const float combined = g_agg + contrib_agg;
+    const float new_state = 0.001f * combined * combined;
+    // Adam-style bias correction, first-ever update (step=1) -- see
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above for the full explanation.
+    const float beta2 = 0.999f;
+    const float bias_correction = 1.0f - beta2;
+    const float state_hat = new_state / bias_correction;
+    const float scale_eff_lr = lr / 2.0f;
+    const float expected_scale = 1.0f - scale_eff_lr * g_agg / std::sqrt(state_hat);
+    CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
 }
 
 TEST_CASE("value_scale gradient: sum-first-then-apply-lr outperforms per-synapse application near float32 epsilon",
@@ -570,46 +644,64 @@ TEST_CASE("value_scale gradient: sum-first-then-apply-lr outperforms per-synapse
     // (scale_eff_lr * individual_contribution) < ULP(value_scale), applying
     // the scaled lr to each contribution individually inside the innermost
     // loop causes every increment to round to 0 in float32, leaving
-    // value_scale unchanged despite a real nonzero gradient.
+    // value_scale unchanged despite a real nonzero gradient. The double
+    // accumulator sums all synapses' raw contributions first (in double
+    // precision, immune to the float32 ULP problem) and applies scale_eff_lr
+    // once to the aggregate instead.
     //
-    // With nnz_this_row normalization: scale_eff_lr = lr / nnz_this_row, so
-    // each per-synapse term is lr / nnz_this_row * stored_w * dy * input.
-    // The double accumulator sums those nnz_this_row terms (giving back
-    // lr * average_contribution) then subtracts once. To demonstrate the
-    // protection clearly: use a large value_scale (1000.0), many synapses
-    // (100), small lr (1e-3) -- scale_eff_lr = 1e-3/100 = 1e-5, per-synapse
-    // amount = 1e-5 < ULP(1000) ~6.1e-5 -> would round to 0. The final
-    // aggregated double result: 100 * 1e-5 = 1e-3 > ULP(1000) -> preserved.
+    // RETUNED for the additive contrib + Adam-style bias correction (see
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above) -- the ORIGINAL numbers here (value_scale
+    // =1000, w=1.0, dy=1.0) no longer demonstrate the protection and are
+    // provably UNFIXABLE by just scaling lr/n_syn: on the first-ever
+    // update, bias correction makes the RMSprop denominator exactly
+    // |combined| = |g_agg+contrib_agg|. Both g_agg and contrib_agg scale
+    // LINEARLY with n_syn (same as before), so their ratio -- and
+    // therefore step/individual -- is now INDEPENDENT of n_syn:
+    //   step / individual = 1 / (w_stored * (dy + w_stored * value_scale))
+    // (derived from g_agg=n_syn*w_stored*dy, contrib_agg=n_syn*w_stored^2*
+    // value_scale, combined=g_agg+contrib_agg, individual=scale_eff_lr*
+    // w_stored*dy, step=scale_eff_lr*g_agg/combined). This ratio must be
+    // >1 for ANY protection to exist at all, which requires value_scale
+    // small relative to 1/w_stored^2 -- confirmed structurally infeasible
+    // near FP4's real clip ceiling (value_scale=6.0, see scale-vector
+    // clipping) even at FP4's smallest nonzero magnitude (w_stored=0.5):
+    // 0.5*(dy+0.5*6.0) can't go below 1 for any dy>=0. So this test now
+    // uses a small, still FP4-representable stored weight (0.5) at a small
+    // value_scale (0.5) and a small dy (0.05), where the ratio is
+    // comfortably >1 (~6.67x here) -- unlike the original, this is no
+    // longer really about "many synapses" (n_syn no longer changes the
+    // ratio), just about scale_eff_lr landing in the window between
+    // individual and step relative to ULP(value_scale); n_syn=100 is kept
+    // only to still exercise the multi-synapse summation path itself.
     using S = int;
     using COL_TYPE = uint32_t;
     const int n_syn = 100;
     std::vector<S> ptrs = {0, n_syn};
     std::vector<S> idx(n_syn); for (int i=0;i<n_syn;++i) idx[i]=i;
-    std::vector<float> w(n_syn, 1.0f), imp(n_syn, 0.0f);
+    std::vector<float> w(n_syn, 0.5f), imp(n_syn, 0.0f);
     auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(n_syn), std::size_t(4096), std::size_t(4096));
 
     SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
     weights.connections = dc;
     weights.out_degree.assign(n_syn, S(0));
-    weights.set_value_scale_raw(0, 1000.0f);
+    weights.set_value_scale_raw(0, 0.5f);
 
     std::vector<float> input = {1.0f};
-    std::vector<float> dy(n_syn, 1.0f);
+    std::vector<float> dy(n_syn, 0.05f);
     std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(n_syn, 0.0f);
 
-    // scale_eff_lr = lr / n_syn = 1e-3 / 100 = 1e-5
-    // Per-synapse: 1e-5 * 1.0 * 1.0 * 1.0 = 1e-5 < ULP(1000) ~6.1e-5 -> rounds to 0.
-    // Double accumulator: sum(100 * 1e-5) = 1e-3 > ULP(1000) -> preserved.
-    const float lr = 1e-3f;
+    // scale_eff_lr = lr / n_syn -- chosen (7.15e-5 / 100 = 7.15e-7) so that
+    // individual = scale_eff_lr*0.5*0.05 ~= 1.79e-8 sits below half of
+    // ULP(0.5)~=5.96e-8 (would round to exactly 0 applied per-synapse),
+    // while step ~= 6.67x that survives comfortably above ULP(0.5).
+    const float lr = 7.15e-5f;
     disldo_backward<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), lr, 1);
 
-    // Expected: value_scale = 1000.0 - (lr / n_syn) * n_syn = 1000.0 - lr = 999.999
-    const float expected = 1000.0f - lr;
-    CHECK(weights.get_value_scale(0) != 1000.0f);   // actually changed, not lost to rounding
-    CHECK(weights.get_value_scale(0) == Catch::Approx(expected).margin(1e-2f));
+    CHECK(weights.get_value_scale(0) != 0.5f);   // actually changed, not lost to rounding
 }
 
 TEST_CASE("importance_scale and value_scale work correctly together, per-row, in one forward+backward pass",
@@ -954,10 +1046,39 @@ TEST_CASE("disldo_backward_sparse_grad's dx and value_scale gradient account for
     disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
         input.data(), S(1), weights, dy, dx2.data(), in_acc2.data(), gr_acc2.data(),
         /*learning_rate=*/0.1f, 1);
-    const float raw_update = 0.1f * (2.0f * 0.5f * 1.0f);
-    const float expected_scale = 4.0f - raw_update / (1.0f + std::abs(-raw_update));
+    // disldo_backward_sparse_grad (sisldo_ops.hpp) now carries the SAME
+    // additive contrib combination + Adam-style bias correction as
+    // disldo_backward's value_scale update (linear_disldo.hpp) -- both
+    // write the SAME value_scale/value_scale_importance arrays, so it can
+    // no longer be left as plain g_agg^2 RMSprop (see "value_scale's own
+    // gradient correctly accounts for a fixed output_scale factor" above
+    // for the full derivation this mirrors). g = dy*in = 1.0. w = true
+    // (pre-update) weight = w_stored*value_scale*out_scale =
+    // 2.0*4.0*0.5 = 4.0. contrib = in*w = 1.0*4.0 = 4.0. g_agg =
+    // w_stored*out_scale*g = 2.0*0.5*1.0 = 1.0. contrib_agg =
+    // w_stored*out_scale*contrib = 2.0*0.5*4.0 = 4.0. combined =
+    // g_agg+contrib_agg = 5.0. new_vs_imp = (1-beta2)*combined^2 =
+    // 0.001*25 = 0.025 (fresh, vs_imp_orig=0 -- the lr=0.0 call above is a
+    // full no-op, gated entirely behind `learning_rate != 0`, so the
+    // lr=0.1 call below is genuinely the first-ever update -> step=1,
+    // bias_correction=1-beta2=0.001, vs_imp_hat=new_vs_imp/bias_correction
+    // = 25.0 exactly). value_scale -= scale_eff_lr*g_agg/sqrt(vs_imp_hat),
+    // scale_eff_lr=lr/nnz_this_row=0.1/1=0.1. Stored value_scale_importance
+    // is new_vs_imp itself (0.025), NOT the bias-corrected vs_imp_hat --
+    // matching RMSpropScalePolicy::update's own convention of storing the
+    // raw EMA and only bias-correcting the value READ out of it for the
+    // step (delta_csr_types.hpp).
+    const float g_agg = 2.0f * 0.5f * 1.0f * 1.0f;
+    const float contrib_agg = 2.0f * 0.5f * 4.0f;
+    const float combined = g_agg + contrib_agg;
+    const float new_vs_imp = 0.001f * combined * combined;
+    const float beta2 = 0.999f;
+    const float bias_correction = 1.0f - beta2;
+    const float vs_imp_hat = new_vs_imp / bias_correction;
+    const float scale_eff_lr = 0.1f;
+    const float expected_scale = 4.0f - scale_eff_lr * g_agg / std::sqrt(vs_imp_hat);
     // value_scale stores the ROW factor only (4.0 -> expected_scale); output_scale
     // (0.5) stays fixed, so true_w after update = expected_scale * 0.5.
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
-    CHECK(weights.get_value_scale_importance(0) == Catch::Approx(-raw_update).margin(1e-3f));
+    CHECK(weights.get_value_scale_importance(0) == Catch::Approx(new_vs_imp).margin(1e-4f));
 }

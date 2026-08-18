@@ -841,13 +841,15 @@ void disldo_backward(
                         const value_type g_agg_k = static_cast<value_type>(scale_grad_sum_rank[k]);
                         const value_type contrib_agg_k = static_cast<value_type>(scale_grad_sum_rank_contrib[k]);
                         ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
-                                            g_agg_k, scale_eff_lr, beta2, eps, contrib_agg_k);
+                                            g_agg_k, scale_eff_lr, beta2, eps, contrib_agg_k,
+                                            &weights.get_value_scale_step_k(r, k));
                     }
                 } else {
                     const value_type g_agg = static_cast<value_type>(scale_grad_sum);
                     const value_type contrib_agg = static_cast<value_type>(scale_grad_sum_contrib);
                     ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
-                                        g_agg, scale_eff_lr, beta2, eps, contrib_agg);
+                                        g_agg, scale_eff_lr, beta2, eps, contrib_agg,
+                                        &weights.get_value_scale_step_k(r, 0));
                 }
             }
         }
@@ -1852,7 +1854,19 @@ void disldo_backward(
                     const value_type combined = g_agg + contrib_agg;
                     const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
                     if (!std::isfinite(new_vs_imp)) continue;
-                    const value_type new_vs = weights.value_scale[idx] - scale_eff_lr * g_agg / (std::sqrt(new_vs_imp) + eps);
+                    // Same Adam-style bias correction as
+                    // RMSpropScalePolicy::update (delta_csr_types.hpp) --
+                    // this path updates the SAME value_scale_importance
+                    // array via a separately hand-inlined formula (block4
+                    // predates the ScalePolicy abstraction), so it needs
+                    // the identical fix or it reintroduces the exact
+                    // cold-start bug this whole change exists to close.
+                    uint32_t& step = weights.get_value_scale_step_k(row, k);
+                    ++step;
+                    const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
+                    const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
+                    if (!std::isfinite(vs_imp_hat)) continue;
+                    const value_type new_vs = weights.value_scale[idx] - scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
                     if (!std::isfinite(new_vs)) continue;
                     vs_imp = new_vs_imp;
                     weights.value_scale[idx] = new_vs;
@@ -1984,7 +1998,8 @@ void disldo_backward(
                 const value_type g_agg = static_cast<value_type>(col_grad_sum);
                 const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
                 ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
-                                    g_agg, col_eff_lr, beta2, eps, contrib_agg);
+                                    g_agg, col_eff_lr, beta2, eps, contrib_agg,
+                                    &weights.get_output_scale_step_k(c, k));
             }
         }
     }

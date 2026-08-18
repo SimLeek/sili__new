@@ -647,6 +647,12 @@ void disldo_backward_sparse_grad(
     // outer loop is serial, so also race-free). Applied once after all
     // batches -- "sum first, then apply lr" per conversation.
     std::vector<double> scale_grad_sums(n_inputs, 0.0);
+    // Parallel forward-contribution accumulator, mirroring
+    // disldo_backward's scale_grad_sum_contrib (linear_disldo.hpp) --
+    // same additive sum-then-square combination, now applied here too
+    // since this function shares the same value_scale/value_scale_importance
+    // arrays and was previously the one path left using plain g^2.
+    std::vector<double> scale_grad_sums_contrib(n_inputs, 0.0);
 
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
@@ -712,9 +718,14 @@ void disldo_backward_sparse_grad(
                     const value_type grad = dy_val * in_val;   // scales with true input value
                     const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     value_type imp = stored_imp * combined_imp_scale;   // -> true units
-                    // RMSprop-style: decayed EMA of g^2 -- see disldo_backward's
-                    // own docstring in linear_disldo.hpp for the full rationale.
-                    imp = beta2 * imp + (value_type(1) - beta2) * grad * grad;
+                    // Additive contrib combination, mirroring disldo_backward's
+                    // own `ci` update (linear_disldo.hpp) -- see its docstring
+                    // for the full rationale (sum-then-square lets g and
+                    // contrib cancel on disagreement instead of both always
+                    // inflating imp). w here is the true (pre-update) weight,
+                    // same role as cw_orig there.
+                    const value_type contrib = in_val * w;
+                    imp = beta2 * imp + (value_type(1) - beta2) * ((grad + contrib) * (grad + contrib));
                     const value_type new_w = w + (damp_by_importance
                         ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                         : (-effective_lr * grad));
@@ -734,6 +745,8 @@ void disldo_backward_sparse_grad(
                     // (lr*g)^2 (see disldo_backward's identical convention).
                     scale_grad_sums[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
                                           * (dy_val * in_val);
+                    scale_grad_sums_contrib[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
+                                          * static_cast<double>(contrib);
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
@@ -755,14 +768,25 @@ void disldo_backward_sparse_grad(
         // and applied once, same RMSprop pattern as disldo_backward's
         // matching update in linear_disldo.hpp.
         for (std::size_t r = 0; r < n_inputs; ++r) {
-            if (scale_grad_sums[r] == 0.0) continue;
+            if (scale_grad_sums[r] == 0.0 && scale_grad_sums_contrib[r] == 0.0) continue;
             const std::size_t nnz_this_row = L.row_nnz(r);
             if (nnz_this_row == 0) continue;
             const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_this_row);
             const value_type g_agg = static_cast<value_type>(scale_grad_sums[r]);
+            const value_type contrib_agg = static_cast<value_type>(scale_grad_sums_contrib[r]);
             value_type& vs_imp = weights.value_scale_importance[r];
-            vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
-            weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
+            const value_type combined = g_agg + contrib_agg;
+            const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
+            // Same Adam-style bias correction as RMSpropScalePolicy::update
+            // (delta_csr_types.hpp) -- shares the SAME value_scale_importance
+            // array as disldo_backward's scattered/block4 paths, so it needs
+            // the same fix for the same cold-start reason.
+            uint32_t& step = weights.get_value_scale_step_k(r, 0);
+            ++step;
+            const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
+            const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
+            vs_imp = new_vs_imp;
+            weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
         }
     }
     } // closes if (!dc.empty())
@@ -814,6 +838,9 @@ void disldo_backward_sparse_grad(
             // never overlap in time (each is fully joined before the
             // next begins) -- see comment above.
             std::vector<double> row_scale_grad_sums(n_inputs, 0.0);
+            // Parallel forward-contribution accumulator -- see the scattered
+            // path's scale_grad_sums_contrib above for the full rationale.
+            std::vector<double> row_scale_grad_sums_contrib(n_inputs, 0.0);
 
             double b4_total_sum_abs_new = 0.0, b4_total_sum_abs_old = 0.0;
             double b4_total_sum_sq_new  = 0.0, b4_total_sum_sq_old  = 0.0;
@@ -840,8 +867,9 @@ void disldo_backward_sparse_grad(
                     // row_live_count.
                     const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
 
-                    value_type dx_accum[BLOCK4_TILE]       = {0, 0, 0, 0};
-                    double     row_grad_local[BLOCK4_TILE] = {0, 0, 0, 0};
+                    value_type dx_accum[BLOCK4_TILE]                = {0, 0, 0, 0};
+                    double     row_grad_local[BLOCK4_TILE]          = {0, 0, 0, 0};
+                    double     row_grad_local_contrib[BLOCK4_TILE]  = {0, 0, 0, 0};
 
                     if (learning_rate == value_type(0)) {
                         // Read-only: no writes anywhere in this row, so no
@@ -965,9 +993,13 @@ void disldo_backward_sparse_grad(
                                         const value_type imp_decoded = FP4_TABLE[(byte >> 4) & 0xFu];
                                         const value_type grad = dy_val * in_val;
                                         value_type imp = imp_decoded * combined_imp_scale;
-                                        // RMSprop-style, matching the scattered
-                                        // path above and disldo_backward.
-                                        imp = beta2 * imp + (value_type(1) - beta2) * grad * grad;
+                                        // Additive contrib combination, matching
+                                        // the scattered path above -- see its
+                                        // comment for the full rationale. w is
+                                        // the true (pre-update) weight decoded
+                                        // just above.
+                                        const value_type contrib = in_val * w;
+                                        imp = beta2 * imp + (value_type(1) - beta2) * ((grad + contrib) * (grad + contrib));
                                         const value_type new_w = w + (damp_by_importance
                                             ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                                             : (-effective_lr * grad));
@@ -986,6 +1018,8 @@ void disldo_backward_sparse_grad(
 
                                         row_grad_local[li] += static_cast<double>(w_decoded)
                                             * static_cast<double>(out_scale) * (dy_val * in_val);
+                                        row_grad_local_contrib[li] += static_cast<double>(w_decoded)
+                                            * static_cast<double>(out_scale) * static_cast<double>(contrib);
                                     }
                                 }
                                 if (dirty)
@@ -1014,8 +1048,10 @@ void disldo_backward_sparse_grad(
                         const std::size_t row = br * BLOCK4_TILE + li;
                         if (row >= n_inputs) continue;
                         input_gradients[static_cast<std::size_t>(b) * n_inputs + row] += dx_accum[li];
-                        if (learning_rate != value_type(0))
+                        if (learning_rate != value_type(0)) {
                             row_scale_grad_sums[row] += row_grad_local[li];
+                            row_scale_grad_sums_contrib[row] += row_grad_local_contrib[li];
+                        }
                     }
                 } // br
 
@@ -1030,7 +1066,7 @@ void disldo_backward_sparse_grad(
                     b4_total_sum_sq_new,  b4_total_sum_sq_old, b4_total_max_new);
 
                 for (std::size_t row = 0; row < n_inputs; ++row) {
-                    if (row_scale_grad_sums[row] == 0.0) continue;
+                    if (row_scale_grad_sums[row] == 0.0 && row_scale_grad_sums_contrib[row] == 0.0) continue;
                     // nnz_row for this row's block-row -- same derivation as
                     // the accumulation loop above (row_nnz_b4 * BLOCK4_TILE).
                     const std::size_t br = row / BLOCK4_TILE;
@@ -1038,9 +1074,20 @@ void disldo_backward_sparse_grad(
                     if (nnz_row == 0) continue;
                     const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
                     const value_type g_agg = static_cast<value_type>(row_scale_grad_sums[row]);
+                    const value_type contrib_agg = static_cast<value_type>(row_scale_grad_sums_contrib[row]);
                     value_type& vs_imp = weights.value_scale_importance[row];
-                    vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * g_agg * g_agg;
-                    weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp) + eps);
+                    const value_type combined = g_agg + contrib_agg;
+                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (combined * combined);
+                    // Same bias correction as the scattered path's identical
+                    // update above -- SAME value_scale_step counter (shared
+                    // per-row across scattered and block4, matching
+                    // disldo_backward's own shared value_scale/importance).
+                    uint32_t& step = weights.get_value_scale_step_k(row, 0);
+                    ++step;
+                    const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
+                    const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
+                    vs_imp = new_vs_imp;
+                    weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
                 }
             }
         }

@@ -417,16 +417,46 @@ struct RMSpropScalePolicy {
     // magnitude ESTIMATE gets the extra signal). Defaults to 0 for
     // callers that don't have one (e.g. NoScalePolicy siblings, or a
     // caller not yet updated), reproducing plain RMSprop exactly.
+    //
+    // step: Adam-style bias correction counter (Kingma & Ba 2015, sec 3).
+    // scale_state starts at 0, so on step 1 it's (1-beta2)*combined^2 --
+    // badly SHRUNK toward zero, not combined^2 itself. Dividing by
+    // (1-beta2^step) undoes exactly that shrinkage: on step 1,
+    // state_hat = (1-beta2)*combined^2/(1-beta2) = combined^2 exactly, so
+    // the step size becomes -eff_lr*g/(|combined|+eps) instead of
+    // -eff_lr*g/(sqrt(1-beta2)*|combined|+eps) -- ~1/sqrt(1-beta2)
+    // (~31.6x at the default beta2=0.999) SMALLER, i.e. normal-sized
+    // instead of wildly inflated. This is purely an optimizer-internal
+    // correction (nothing to do with a model's own +b bias term) --
+    // confirmed as the real root cause of a genuine bug: value_scale
+    // swinging sign in a single first update (1.0 -> -3.1, lr=0.5),
+    // corrupting every synapse sharing that row (both scattered and
+    // block4-owned, since they share the same value_scale[row]) -- see
+    // test_disldo_block4_backward.cpp's regression test. Applied ONLY to
+    // value_scale_importance/output_scale_importance (row/column-level,
+    // one uint32_t counter each -- cheap), NOT to per-synapse `ci`
+    // (would need a counter the same size as ci itself, doubling memory
+    // for an FP4/FP8 format where every byte counts, for a
+    // self-limiting problem that doesn't compound across a whole row the
+    // way value_scale's does).
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
-                        VALUE_TYPE contrib_agg = VALUE_TYPE(0)) {
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
+                        uint32_t* step = nullptr) {
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
         const VALUE_TYPE combined = g_agg + contrib_agg;
         const VALUE_TYPE new_state = beta2 * scale_state
             + (VALUE_TYPE(1) - beta2) * (combined * combined);
         if (!std::isfinite(new_state)) return;
-        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(new_state) + eps);
+        VALUE_TYPE state_hat = new_state;
+        if (step != nullptr) {
+            ++(*step);
+            const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+            if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+        }
+        if (!std::isfinite(state_hat)) return;
+        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(state_hat) + eps);
         if (!std::isfinite(new_scale)) return;
         scale_state = new_state;
         scale = new_scale;
@@ -455,10 +485,18 @@ struct AdaMaxScalePolicy {
     // running max, not sqrt(g_agg^2+contrib_agg^2), so two signals
     // pointing opposite ways partially or fully cancel instead of both
     // inflating the tracked ceiling regardless of sign.
+    // step: accepted only for call-site signature compatibility with
+    // RMSpropScalePolicy::update -- unused here. Per Kingma & Ba 2015
+    // sec 7, AdaMax's running-MAX state doesn't have RMSprop's EMA
+    // cold-start shrinkage problem (max(0, |combined|) on step 1 is
+    // already the true value, not a shrunk fraction of it), so there's
+    // nothing for bias correction to fix.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
-                        VALUE_TYPE contrib_agg = VALUE_TYPE(0)) {
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
+                        uint32_t* step = nullptr) {
+        (void)step;
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
         const VALUE_TYPE combined_mag = std::abs(g_agg + contrib_agg);
         const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
@@ -484,7 +522,8 @@ struct NoScalePolicy {
     static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
                         VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
                         VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
-                        VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0)) {
+                        VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0),
+                        uint32_t* /*step*/ = nullptr) {
         // Intentionally does nothing.
     }
 };
@@ -806,6 +845,26 @@ struct SparseLinearWeightsDelta {
         return get_value_scale_importance_k(row, 0);
     }
 
+    // Step counter for value_scale_importance's Adam-style bias correction
+    // (RMSpropScalePolicy::update) -- see its own docstring for why this
+    // is needed: on the FIRST update, an EMA started at 0 is badly
+    // shrunk toward zero (state = (1-beta2)*g^2, not g^2), which makes
+    // the very first RMSprop step ~1/sqrt(1-beta2) (~31.6x at the
+    // default beta2=0.999) larger than intended -- confirmed as the real
+    // cause of a genuine bug (value_scale swinging sign in one step,
+    // corrupting every synapse sharing that row, both scattered and
+    // block4-owned -- see test_disldo_block4_backward.cpp's regression
+    // test). uint32_t, one per row*rank slot -- cheap (unlike a
+    // per-synapse counter, which would double memory for an FP4/FP8
+    // format where every byte counts; per-synapse `ci` does NOT get this
+    // treatment for that reason, see linear_disldo.hpp's own note).
+    std::vector<uint32_t> value_scale_step;
+    inline uint32_t& get_value_scale_step_k(std::size_t row, std::size_t k) {
+        const std::size_t idx = row * scale_rank + k;
+        if (value_scale_step.size() <= idx) value_scale_step.resize(idx + 1, 0);
+        return value_scale_step[idx];
+    }
+
     // Adam-style FIRST moment (signed EMA of g_agg) for value_scale,
     // companion to value_scale_importance's SECOND moment (EMA of
     // g_agg^2, unsigned). Used only by the dead-row (nnz_row==0) path in
@@ -855,6 +914,15 @@ struct SparseLinearWeightsDelta {
     inline value_type get_output_scale_importance_k(std::size_t col, std::size_t k) const {
         const std::size_t idx = col * scale_rank + k;
         return idx < output_scale_importance.size() ? output_scale_importance[idx] : value_type(0);
+    }
+    // Step counter for output_scale_importance's bias correction -- see
+    // value_scale_step's own docstring for the full rationale (same
+    // mechanism, one level over from row to column).
+    std::vector<uint32_t> output_scale_step;
+    inline uint32_t& get_output_scale_step_k(std::size_t col, std::size_t k) {
+        const std::size_t idx = col * scale_rank + k;
+        if (output_scale_step.size() <= idx) output_scale_step.resize(idx + 1, 0);
+        return output_scale_step[idx];
     }
     inline value_type get_output_scale_importance(std::size_t col) const {
         return get_output_scale_importance_k(col, 0);
