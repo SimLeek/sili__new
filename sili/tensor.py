@@ -259,6 +259,30 @@ def transpose(a: Tensor, axes=None) -> Tensor:
     return out
 
 
+def concat(tensors, axis: int = 0) -> Tensor:
+    """Concatenate 2+ Tensors along `axis` (default 0, the leading/token
+    dimension for the usual [T, hidden] convention), differentiably --
+    backward slices the incoming gradient back into each operand's own
+    extent along that axis (a plain np.split on the concat point offsets),
+    matching each operand's original shape exactly. All operands must
+    share every OTHER axis's size (numpy's own concatenate enforces this,
+    raising ValueError otherwise -- not re-checked here)."""
+    tensors = list(tensors)
+    arrays = [np.asarray(t.data, dtype=np.float32) for t in tensors]
+    out_np = np.concatenate(arrays, axis=axis)
+    out = Tensor(out_np, tuple(tensors), "concat", tensors[0].backend)
+    sizes = [a.shape[axis] for a in arrays]
+    split_points = np.cumsum(sizes)[:-1]
+
+    def _bwd():
+        g = np.asarray(out.grad, dtype=np.float32)
+        for t, part in zip(tensors, np.split(g, split_points, axis=axis)):
+            _acc(t, part)
+
+    out._backward = _bwd
+    return out
+
+
 def gather(a: Tensor, indices) -> Tensor:
     """out[i] = a.flat[indices[i]], differentiably. Gradient scatters back
     to a's original shape; repeated indices correctly accumulate
