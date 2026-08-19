@@ -578,6 +578,20 @@ void disldo_backward(
         weights.output_scale_importance.resize(n_out * rank, value_type(0));
     if (weights.value_scale_momentum.size() < n_in * rank)
         weights.value_scale_momentum.resize(n_in * rank, value_type(0));
+    // value_scale_step was missing from this pre-sizing list -- a real,
+    // confirmed bug (found via AddressSanitizer, not guessed): get_value_
+    // scale_step_k's own lazy .resize() runs completely unguarded (no
+    // lock at all, unlike block4's tile_data), called directly from every
+    // row inside the #pragma omp parallel region below. Two threads
+    // touching a not-yet-grown index at the same time race on the SAME
+    // vector's resize/reallocation -- confirmed as a genuine heap-use-
+    // after-free (ASan: thread reading value_scale_step[idx] while
+    // another thread's resize() had already freed the old buffer).
+    // Pre-sizing here, same as value_scale_importance right above (same
+    // n_in*rank shape, same reason), makes the lazy-resize branch in
+    // get_value_scale_step_k dead in the normal case.
+    if (weights.value_scale_step.size() < n_in * rank)
+        weights.value_scale_step.resize(n_in * rank, 0);
 
     if (!dc.empty()) {
     #pragma omp parallel num_threads(num_cpus)

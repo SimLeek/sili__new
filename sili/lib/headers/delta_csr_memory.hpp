@@ -609,15 +609,26 @@ void block4_maybe_promote(
         // SparseLinearLayer8's own identical constructor-time sizing).
 	if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
-            if constexpr (is_fp8) {
-                weights.block4.set_limits(
-                    dc.max_indices_bytes,
-                    std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS8_BYTES);
-            } else {
-                weights.block4.set_limits(
-                    dc.max_indices_bytes,
-                    std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
-            }
+            // If the caller never set a real CSR-side budget either
+            // (dc.max_values_bytes still at its own SIZE_MAX-ish
+            // default), the derived byte budget below is still
+            // enormous after the /BLOCK4_TILE_SLOTS*BLOCK4_TILE_SLOTS
+            // rounding -- confirmed directly: this used to silently
+            // fail inside set_limits()'s own reserve() call (a real
+            // std::length_error, "vector::reserve", exceeding
+            // std::vector<uint8_t>::max_size()), previously masked by
+            // a try/catch that's since been removed (see set_limits'
+            // own docstring for why silently swallowing that isn't
+          // safe to do anymore). Pass the block4 sentinel through
+            // unchanged instead of computing a derived-but-nonsensical
+            // near-max value -- "no CSR budget set" should mean "no
+            // block4 budget set" too, not "compute something that
+            // happens to overflow vector::reserve()."
+            constexpr std::size_t kNoLimit = std::numeric_limits<std::size_t>::max();
+            const std::size_t tile_budget = (dc.max_values_bytes == kNoLimit) ? kNoLimit :
+                (std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) *
+                 (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS));
+            weights.block4.set_limits(dc.max_indices_bytes, tile_budget);
         }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
         const uint32_t bc = uint32_t(col / BLOCK4_TILE);

@@ -846,6 +846,63 @@ inline bool block4_row_remove_tile(
     return false;
 }
 
+// True if growing a tile in `row` from old_len to new_len would exceed
+// the row's own pre-allocated headroom and therefore require growing
+// the SHARED tile_data vector itself (a real std::vector::resize(),
+// which can reallocate and move the entire buffer to a new address).
+// Read-only (no shared mutation), safe to call concurrently from any
+// number of threads.
+//
+// Exists because of a real, confirmed concurrency bug (see
+// conversation): commit_dirty_sparse_tile used to call
+// block4_resize_tile_in_row directly from inside disldo_backward's
+// #pragma omp parallel region, guarded only by an atomic CAS lock
+// (tile_data_grow_lock) that serialized GROWING threads against each
+// other -- but did nothing to protect any OTHER thread concurrently
+// processing a different row, which never touches that lock at all and
+// keeps using a tile_data.data()+offset pointer obtained before the
+// grower's resize() moved the whole buffer. That's a genuine
+// use-after-free: reproduced directly as an intermittent heap
+// corruption ("free(): unaligned chunk detected in tcache" / "free():
+// too many chunks detected in tcache"), non-deterministic (1/3
+// identical runs crashed), only at num_cpus>1.
+//
+// IMPORTANT (found the hard way -- a first version of this check tested
+// the wrong threshold and broke ~19 previously-passing tests): the
+// row's own PRE-ALLOCATED headroom running out does NOT, by itself,
+// mean tile_data.resize() will move the buffer -- block4_resize_tile_
+// in_row only calls tile_data.resize() (potentially reallocating) when
+// growth ALSO exceeds tile_data's own reserved CAPACITY (set_limits()
+// already calls tile_data.reserve(max_tile_bytes) up front specifically
+// so ordinary in-row growth, even past a row's own small headroom,
+// stays within already-reserved memory and never moves the buffer at
+// all -- "resize should rarely if ever need to actually move memory,
+// since we reserve real capacity upfront" per direct instruction).
+// Checking row-headroom alone (the old, wrong version of this function)
+// treated every ordinary, harmless in-buffer shift as if it were a
+// dangerous reallocation, silently dropping the vast majority of real
+// growth events. The correct, narrow check is whether tile_data.size()
+// would need to exceed tile_data.capacity() -- that's the only case
+// that can actually move the buffer's address out from under another
+// thread's pointer, and (given set_limits()'s own upfront reservation)
+// should be rare in practice, exactly matching that "caps on massive
+// buffers" design intent.
+inline bool block4_row_grow_needs_realloc(
+    const std::vector<uint8_t>& tile_data,
+    const std::vector<std::size_t>& tbyte_start,
+    const std::vector<std::size_t>& tbyte_end,
+    std::size_t row, std::size_t old_len, std::size_t new_len)
+{
+    if (new_len <= old_len) return false;
+    const std::size_t delta    = new_len - old_len;
+    const std::size_t alloc    = tbyte_start[row + 1] - tbyte_start[row];
+    const std::size_t used     = tbyte_end[row] - tbyte_start[row];
+    const std::size_t headroom = alloc - used;
+    if (delta <= headroom) return false;  // pure in-row shift, tile_data.resize() never called
+    const std::size_t shortfall = delta - headroom;
+    return tile_data.size() + shortfall > tile_data.capacity();
+}
+
 inline void block4_resize_tile_in_row(
     DeltaCSRLayout& L,
     std::vector<std::size_t>& tbyte_start,
@@ -984,18 +1041,36 @@ struct Block4Store {
      */
     void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
-        max_tile_bytes    = tile_limit_bytes;   
-	if (tile_limit_bytes != std::numeric_limits<std::size_t>::max()) {
-            try {
-                tile_data.reserve(tile_limit_bytes);
-            } catch (const std::length_error&) {
-            } catch (const std::bad_alloc&) {
-            }
+        max_tile_bytes    = tile_limit_bytes;
+        // Reserve capacity up front, for real, to the SAME bound
+        // max_tile_bytes enforces everywhere else -- deliberately no
+        // try/catch here (previously silently swallowed bad_alloc/
+        // length_error): a failure to reserve the budget we're about to
+        // promise/enforce is a genuine, real construction-time error
+        // (out of memory, or a nonsensical limit), not something to
+        // paper over. This is what makes block4_row_grow_needs_realloc's
+        // own "would this growth exceed capacity" check trustworthy --
+        // if reservation here silently failed while max_tile_bytes still
+        // let ordinary growth proceed, normal (bounded, expected) growth
+        // could still trigger a real tile_data reallocation mid-training,
+        // exactly the race this whole mechanism exists to prevent.
+        // Nothing in this codebase's memory budgets is meant to grow
+        // unbounded -- a reservation failure here means the budget
+        // itself can't be honored, which should fail loudly at
+        // construction time, not be discovered later as a silent
+        // dropped-growth-event or (before this fix) a heap corruption.
+        if (tile_limit_bytes != std::numeric_limits<std::size_t>::max()) {
+            tile_data.reserve(tile_limit_bytes);
         }
     }
 
     std::uint64_t dropped_growth_events = 0;
 
+    // Fallback-path grower-vs-grower serialization only -- see
+    // commit_dirty_sparse_tile's own "slow/fallback path" comment. Does
+    // NOT by itself make growth safe against other threads reading/
+    // writing other rows; the fast path (growth within already-reserved
+    // capacity, never touches this lock) is what actually fixes that.
     std::uint32_t tile_data_grow_lock = 0;
 
     // merge_row_workspace's own drop counters -- distinct from
@@ -1166,18 +1241,16 @@ struct Block4Store {
             now_sparse = false;
         }
         const std::size_t cur_len = tile_len_at(elem_pos, fresh_byte_pos);
-        // threading/size growth issues simply fail to grow rather than throwing
-	// since that allows the neural net to continue online learning at high speed
-	if (new_len > cur_len) {
-            std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
-            std::uint32_t expected = 0;
-            if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
-                // Another thread is currently in this same growing branch
-                // (for any row) -- decline rather than risk two
-                // concurrent reallocations of the same shared buffer.
-                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+        // Fast/safe path: growth that fits within tile_data's already-
+        // reserved CAPACITY (see block4_row_grow_needs_realloc's own
+        // docstring) can never move the buffer's address, so it's always
+        // safe to do inline, unlocked, even from inside disldo_backward's
+        // #pragma omp parallel region -- this is the common case for any
+        // real caller (cpu_backend.cpp's own construction sites always
+        // call set_limits() with a genuine budget, reserving full
+        // capacity up front, exactly so ordinary growth never needs to
+        // fall through to the slow path below).
+        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len, new_len)) {
             try {
                 block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
                                            br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
@@ -1185,7 +1258,23 @@ struct Block4Store {
             } catch (const std::bad_alloc&) {
                 std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
             }
-            grow_lock.store(0, std::memory_order_release);
+            return;
+        }
+        // Slow/fallback path: growth that WOULD move the buffer -- only
+        // reachable if no real cap was ever set via set_limits() (a
+        // genuine budget's own capacity reservation makes this
+        // unreachable in practice, see set_limits' own docstring) or the
+        // reserved capacity was somehow undersized. Serializes concurrent
+        // GROWERS against each other via the atomic lock -- this does
+        // NOT protect other threads reading/writing OTHER rows against
+        // this reallocation (the original, confirmed bug), so it's only
+        // actually safe under single-threaded (num_cpus=1) use, matching
+        // every real caller that legitimately hits this path today (test
+        // fixtures that never call set_limits() at all).
+        std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
+        std::uint32_t expected = 0;
+        if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
             return;
         }
         try {
@@ -1195,6 +1284,7 @@ struct Block4Store {
         } catch (const std::bad_alloc&) {
             std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
         }
+        grow_lock.store(0, std::memory_order_release);
     }
 
     // Row-local workspace (concurrency-safe growth path)
@@ -1501,12 +1591,10 @@ struct Block4Store8 {
     void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
         max_tile_bytes    = tile_limit_bytes;
+        // See Block4Store::set_limits's identical comment -- no
+        // try/catch here (previously silently swallowed), same reason.
         if (tile_limit_bytes != std::numeric_limits<std::size_t>::max()) {
-            try {
-                tile_data.reserve(tile_limit_bytes);
-            } catch (const std::length_error&) {
-            } catch (const std::bad_alloc&) {
-            }
+            tile_data.reserve(tile_limit_bytes);
         }
     }
 
@@ -1655,13 +1743,10 @@ struct Block4Store8 {
             now_sparse = false;
         }
         const std::size_t cur_len = tile_len_at(elem_pos, fresh_byte_pos);
-        if (new_len > cur_len) {
-            std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
-            std::uint32_t expected = 0;
-            if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
-                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+        // See Block4Store::commit_dirty_sparse_tile's identical fast/
+        // fallback-path comment -- same fix, same reason, FP8's own
+        // tile_data.
+        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len, new_len)) {
             try {
                 block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
                                            br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
@@ -1669,7 +1754,12 @@ struct Block4Store8 {
             } catch (const std::bad_alloc&) {
                 std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
             }
-            grow_lock.store(0, std::memory_order_release);
+            return;
+        }
+        std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
+        std::uint32_t expected = 0;
+        if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
             return;
         }
         try {
@@ -1679,6 +1769,7 @@ struct Block4Store8 {
         } catch (const std::bad_alloc&) {
             std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
         }
+        grow_lock.store(0, std::memory_order_release);
     }
 
     struct RowWorkspace {
