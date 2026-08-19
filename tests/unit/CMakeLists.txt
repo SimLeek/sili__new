@@ -154,6 +154,7 @@ set(SILI_STANDALONE_TESTS
     test_synapse_policy_dispatch
     test_synapse_policy_long_horizon
     sweep_synapse_policy_min_decay_frac
+    sweep_synapse_policy_stochastic
     probe_unstable_pocket_growth
     test_disldo_block4_combined_absolute
     test_block4_sparse_tile

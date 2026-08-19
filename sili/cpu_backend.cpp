@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -15,6 +16,29 @@
 #include "attention.hpp"
 
 namespace py = pybind11;
+
+// One-time (per-process) stderr warning when a caller uses a learning_rate
+// well outside BoundedRMSpropSynapsePolicy's validated-safe range for its
+// default max_abs_delta=2.0 (raw-space). See update_cw's own docstring
+// (delta_csr_types.hpp) and tests/unit/sweep_synapse_policy_stochastic.cpp
+// Round 2 for the measurements this threshold is based on: excellent at
+// lr<=0.05, visibly degraded by lr=0.2, diverging in absolute terms by
+// lr=0.5, genuinely unsafe by lr=1.0. Warns once, not every call, since
+// backward() runs every training step and would otherwise spam stderr.
+inline void warn_if_lr_exceeds_bounded_synapse_policy_safe_range(float learning_rate) {
+    static bool warned = false;
+    if (!warned && learning_rate > 0.2f) {
+        warned = true;
+        std::fprintf(stderr,
+            "sili: WARNING -- backward() called with learning_rate=%.4f, above the "
+            "~0.2 ceiling BoundedRMSpropSynapsePolicy's default max_abs_delta=2.0 was "
+            "validated safe for (see delta_csr_types.hpp's update_cw docstring and "
+            "tests/unit/sweep_synapse_policy_stochastic.cpp). At this lr the effective "
+            "clip (lr*max_abs_delta) may re-enter unstable territory -- if this lr is "
+            "intentional, a caller-tuned max_abs_delta for this regime is recommended "
+            "over trusting the default.\n", learning_rate);
+    }
+}
 
 // ── Block4View ───────────────────────────────────────────────────────────────
 // Thin, non-owning wrapper exposing a layer's Block4Store to Python as
@@ -471,6 +495,7 @@ public:
 
     py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         // beta1=0.9 (function default), min_decay_frac left at its own true
@@ -1057,6 +1082,7 @@ public:
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         // See SparseLinearLayer::backward_dense's identical comment on these
@@ -1275,6 +1301,7 @@ public:
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
         // See SparseLinearLayer::backward_dense's identical comment on these

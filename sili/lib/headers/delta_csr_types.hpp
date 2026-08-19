@@ -647,11 +647,27 @@ struct BoundedRMSpropSynapsePolicy {
     // with the delta clip disabled entirely and found ZERO measurable
     // protective effect against the late-training resonance this policy
     // exists to fix -- max_abs_delta's hard clip (below) is doing the ENTIRE
-    // protective job on its own. Keeping the ci floor "on" at some value in
-    // (beta2,1) anyway would add an unproven mechanism and an extra,
-    // untested interaction surface with max_abs_delta for no demonstrated
-    // benefit -- if a future task finds a failure mode where the floor
-    // DOES help independently, revisit this default then, with evidence.
+    // protective job on its own, UNDER DETERMINISTIC ROUNDING. Keeping the
+    // ci floor "on" at some value in (beta2,1) anyway would add an unproven
+    // mechanism and an extra, untested interaction surface with
+    // max_abs_delta for no demonstrated benefit -- if a future task finds a
+    // failure mode where the floor DOES help independently, revisit this
+    // default then, with evidence.
+    //
+    // UPDATE (see tests/unit/sweep_synapse_policy_stochastic.cpp, and
+    // conversation): under STOCHASTIC rounding (the actual production
+    // rounding mode -- the deterministic sweep above turned out to get
+    // permanently stuck at this exact config, an unrelated finding, see
+    // that file), min_decay_frac is NOT provably inert -- it showed a real,
+    // if single-seed/unconfirmed, benefit at the riskier end of the
+    // max_abs_delta range (e.g. max_abs_delta=16: 0.9995 measurably beat
+    // 0.999). BUT that benefit vanishes by lr~0.2 and is bit-identical
+    // between tested values by lr=1.0 -- min_decay_frac does NOT extend
+    // the safe lr range, so it doesn't change the production default
+    // decision (still true-no-op, since production operates at lr<=0.05
+    // where the clip alone is already deep-safe regardless). Revisit if a
+    // real need for min_decay_frac at the risky max_abs_delta/lr combo
+    // ever arises, with proper multi-seed confirmation first.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
                                  VALUE_TYPE beta2, VALUE_TYPE min_decay_frac) {
         const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
@@ -678,6 +694,21 @@ struct BoundedRMSpropSynapsePolicy {
     // header comment for the raw-space value that reproduces the
     // already-validated lr=0.05 tuning exactly (0.1 final-space / 0.05 =
     // 2.0 raw-space).
+    //
+    // WARNING -- this does NOT make one fixed max_abs_delta safe for
+    // UNLIMITED lr (see tests/unit/sweep_synapse_policy_stochastic.cpp
+    // Round 2, and conversation): the effective final-space clip is
+    // eff_lr*max_abs_delta, so a large enough lr eventually pushes it back
+    // into the same large-step territory that's always been risky (the
+    // underlying resonance risk is about the ABSOLUTE step size, not the
+    // raw/lr split -- this redesign fixes the split, not the ceiling).
+    // Measured at the production default (max_abs_delta=2.0): excellent
+    // at lr<=0.05, visibly degraded by lr=0.2, diverging in absolute terms
+    // by lr=0.5, genuinely unsafe by lr=1.0. cpu_backend.cpp's
+    // backward_dense/backward wrappers print a one-time stderr warning if
+    // called with learning_rate > 0.2 for exactly this reason -- a caller
+    // that genuinely needs a much larger lr needs its own max_abs_delta
+    // tuned for that regime, not this default.
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
                                  bool damp_by_importance, VALUE_TYPE max_abs_delta) {
