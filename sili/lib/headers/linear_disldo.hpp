@@ -461,7 +461,7 @@ void disldo_forward(
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
           typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
           bool DeferredScaleWrite = false, bool StochasticRounding = true,
-          template <typename> class SynapsePolicyT = PlainRMSpropSynapsePolicy>
+          template <typename> class SynapsePolicyT = BoundedRMSpropSynapsePolicy>
 void disldo_backward(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,
     SIZE_TYPE    batch,

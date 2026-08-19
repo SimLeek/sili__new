@@ -109,15 +109,22 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw matches plain RMSprop delta wh
 
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's clip actually engages on a real large step",
          "[synapse_policy][bounded]") {
+    // update_cw clips the LR-INDEPENDENT raw update, THEN multiplies by
+    // eff_lr (see its own docstring, delta_csr_types.hpp, for why -- clip
+    // AFTER the lr multiply made max_abs_delta an absolute cap regardless
+    // of lr, silently crushing every step for callers using a much bigger
+    // lr than whatever this policy was tuned against). So the final
+    // clipped-and-scaled result is eff_lr*max_abs_delta, not max_abs_delta
+    // itself.
     using P = BoundedRMSpropSynapsePolicy<float>;
     const float g = 1.0f, ci = 1e-6f, S = 1.0f, eff_lr = 0.05f, eps = 1e-8f;
     const float max_abs_delta = 0.01f;
 
-    const float unclipped_would_be = (-eff_lr * g * S) / (std::sqrt(ci) + eps);
-    REQUIRE(std::abs(unclipped_would_be) > max_abs_delta);  // sanity: this really would overshoot without the clip
+    const float unclipped_raw_would_be = (-g * S) / (std::sqrt(ci) + eps);
+    REQUIRE(std::abs(unclipped_raw_would_be) > max_abs_delta);  // sanity: this really would overshoot without the clip
 
     const float delta = P::update_cw(g, ci, S, eff_lr, eps, true, max_abs_delta);
-    CHECK(std::abs(delta) == Catch::Approx(max_abs_delta));
+    CHECK(std::abs(delta) == Catch::Approx(eff_lr * max_abs_delta));
 }
 
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's clip preserves sign",
@@ -126,8 +133,8 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's clip preserves sign",
     const float ci = 1e-6f, S = 1.0f, eff_lr = 0.05f, eps = 1e-8f, max_abs_delta = 0.01f;
     const float delta_pos_g = P::update_cw(1.0f, ci, S, eff_lr, eps, true, max_abs_delta);
     const float delta_neg_g = P::update_cw(-1.0f, ci, S, eff_lr, eps, true, max_abs_delta);
-    CHECK(delta_pos_g == Catch::Approx(-max_abs_delta));  // positive g -> negative (descent) delta
-    CHECK(delta_neg_g == Catch::Approx(max_abs_delta));
+    CHECK(delta_pos_g == Catch::Approx(-eff_lr * max_abs_delta));  // positive g -> negative (descent) delta
+    CHECK(delta_neg_g == Catch::Approx(eff_lr * max_abs_delta));
 }
 
 TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula exactly",

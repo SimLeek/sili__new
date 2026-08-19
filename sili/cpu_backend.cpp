@@ -473,13 +473,20 @@ public:
                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // beta1=0.9 (function default), min_decay_frac left at its own true
+        // no-op default (0.0), max_abs_delta=2.0 -- BoundedRMSpropSynapsePolicy's
+        // now-tuned production default, in RAW (pre-lr-multiply) units (see
+        // update_cw's own docstring, delta_csr_types.hpp, for why it's
+        // raw-space; 2.0 reproduces the exact validated behavior at the
+        // tuning sweep's own lr=0.05 and generalizes correctly to other lr).
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1052,13 +1059,16 @@ public:
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // See SparseLinearLayer::backward_dense's identical comment on these
+        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1267,13 +1277,16 @@ public:
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // See SparseLinearLayer::backward_dense's identical comment on these
+        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
