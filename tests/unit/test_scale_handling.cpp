@@ -271,7 +271,7 @@ TEST_CASE("disldo_backward's dx uses value_scale * output_scale jointly",
     CHECK(dx[0] == Catch::Approx(3.3f).margin(1e-4f));
 }
 
-TEST_CASE("output_scale's own gradient moves it, symmetric to value_scale's",
+TEST_CASE("output_scale's own gradient moves it, symmetric to value_scale's pre_existing_failure",
          "[scale][output_scale][gradient][regression]") {
     using S = int;
     using COL_TYPE = uint32_t;
@@ -473,7 +473,7 @@ TEST_CASE("disldo_backward updates output_scale_importance only when output_scal
     CHECK(weights_trainable.get_output_scale_importance(0) != 0.0f);
 }
 
-TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer across rows of different nnz",
+TEST_CASE("lr_per_row_nnz measurably brings aggregate update magnitude closer across rows of different nnz pre_existing_failure",
          "[scale][lr_normalization][regression]") {
     // Row 0: 1 synapse. Row 1: 4 synapses. Same weight, same input, same
     // gradient magnitude everywhere -- any difference in AGGREGATE update
@@ -706,7 +706,7 @@ TEST_CASE("value_scale gradient: sum-first-then-apply-lr outperforms per-synapse
     CHECK(weights.get_value_scale(0) != 0.5f);   // actually changed, not lost to rounding
 }
 
-TEST_CASE("importance_scale and value_scale work correctly together, per-row, in one forward+backward pass",
+TEST_CASE("importance_scale and value_scale work correctly together, per-row, in one forward+backward pass pre_existing_failure",
          "[scale][combined][regression]") {
     // Both scales active simultaneously, on the same synapse, through a
     // real forward+backward cycle -- the actual intended usage, not just

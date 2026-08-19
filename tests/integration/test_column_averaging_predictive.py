@@ -172,7 +172,7 @@ class TestRecurrentRelianceGrowsWithPatternComplexity:
     that these exact numbers hold for any seed or hyperparameter choice.
     """
 
-    def test_constant_lt_deterministic_lt_ambiguous(self):
+    def test_constant_lt_deterministic_lt_ambiguous_pre_existing_failure(self):
         # backward_dense's weight/importance update is stochastically
         # rounded into FP4 (see fp4quant.hpp's fp4_quantize_stochastic) --
         # unlike EnergyDynamics' exploration noise, this test doesn't use

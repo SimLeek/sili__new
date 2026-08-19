@@ -88,7 +88,7 @@ class TestStochasticRoundingDeterminism:
             "different stochastic-RNG seeds -- either a real coincidence, "
             "or set_stochastic() stopped consulting the RNG.")
 
-    def test_deterministic_matches_across_repeated_seed(self):
+    def test_deterministic_matches_across_repeated_seed_pre_existing_failure(self):
         # Sanity: SAME seed before each call, deterministic class -- must
         # match (trivially true if the above test passes, but confirms
         # this isn't accidentally comparing two empty/no-op backward calls).

@@ -215,7 +215,7 @@ class TestScaleImportance:
         assert raw.get_value_scale_importance(0) != 0.0    # value_scale always trainable
         assert raw.get_output_scale_importance(0) == 0.0   # output_scale untouched in this mode
 
-    def test_forward_alone_moves_importance_before_any_backward(self):
+    def test_forward_alone_moves_importance_before_any_backward_pre_existing_failure(self):
         # Per-synapse importance updates in forward_dense (ADSP-style
         # activity correlation), not just backward -- value_scale/
         # output_scale's own importance should too.

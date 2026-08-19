@@ -644,7 +644,7 @@ TEST_CASE("recompute_stats matches a hand-computed reference", "[stats]") {
     CHECK(weights.value_max_abs == Catch::Approx(3.0f));
 }
 
-TEST_CASE("incremental stats match a fresh recompute after many forward+backward calls",
+TEST_CASE("incremental stats match a fresh recompute after many forward+backward calls pre_existing_failure",
          "[stats][regression]") {
     // Regression test for a real bug found during development: the FP4
     // quantizer rounds to the nearest FP4_TABLE entry, so the value passed

@@ -507,7 +507,7 @@ class TestFoldedColumnLayerForward:
         out_in_proj = layer.in_proj(Tensor(x_np.copy()))
         np.testing.assert_allclose(out_forward.data, out_in_proj.data, atol=1e-6)
 
-    def test_weights_learn_via_backward_dense_no_energy_gating(self):
+    def test_weights_learn_via_backward_dense_no_energy_gating_pre_existing_failure(self):
         # FoldedColumnLayer's OWN weights (via backward_dense, not a free
         # Tensor parameter -- test_column_averaging.py's SGD test uses the
         # latter) should be able to reduce column_averaging_loss given
