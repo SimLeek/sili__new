@@ -504,6 +504,17 @@ public:
         // update_cw's own docstring, delta_csr_types.hpp, for why it's
         // raw-space; 2.0 reproduces the exact validated behavior at the
         // tuning sweep's own lr=0.05 and generalizes correctly to other lr).
+        // max_ci=100.0 -- verified ceiling on ci itself (tests/unit/
+        // test_ci_ceiling.cpp): healthy production-default operation
+        // plateaus at ci~0.5, so this is a mathematically guaranteed no-op
+        // for the normal case, while giving ci's own separate unbounded-
+        // growth failure mode (confirmed directly this session, see
+        // delta_csr_types.hpp's update_ci docstring) an actual hard stop.
+        // NOTE: capping ci alone does NOT rescue an out-of-safe-zone
+        // max_abs_delta/lr config from its own weight-level divergence
+        // (verified in test_ci_ceiling.cpp -- the known unsafe pocket still
+        // diverges with ci capped) -- stay inside the validated safe range,
+        // don't rely on this ceiling for that.
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
@@ -511,7 +522,7 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f);
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1094,7 +1105,7 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f);
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1313,7 +1324,7 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f);
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;

@@ -610,7 +610,8 @@ struct PlainRMSpropSynapsePolicy {
     // No floor, no clip -- matches RMSpropScalePolicy's own "must stay
     // bit-identical to today's behavior" convention.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
-                                 VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/) {
+                                 VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/,
+                                 VALUE_TYPE /*max_ci*/) {
         return beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
     }
 
@@ -668,11 +669,47 @@ struct BoundedRMSpropSynapsePolicy {
     // where the clip alone is already deep-safe regardless). Revisit if a
     // real need for min_decay_frac at the risky max_abs_delta/lr combo
     // ever arises, with proper multi-seed confirmation first.
+    //
+    // max_ci: hard ceiling on ci itself. Confirmed directly (see
+    // conversation): ci has NO ceiling anywhere else in this design --
+    // min_decay_frac's floor only slows how fast ci can DECAY, it does
+    // nothing to stop ci from GROWING. In the unsafe-pocket failure mode
+    // (probe_unstable_pocket_growth.cpp), ci was directly measured
+    // climbing continuously and unboundedly the entire 30000-step run
+    // (0.0005 -> 163+, still setting a new max at literally every
+    // checkpoint, never plateauing) -- ci chases g^2 upward with no cap
+    // as long as the underlying divergence keeps the gradient growing.
+    // Healthy production-default operation plateaus at ci~0.5, so a
+    // ceiling with generous margin above that costs nothing in the normal
+    // regime while giving ci's own growth an actual stopping point.
+    // max_ci=1e30 (the function's own default) is a true no-op, matching
+    // every other new parameter's own convention; the CHOSEN PRODUCTION
+    // DEFAULT is max_ci=100.0 (set in cpu_backend.cpp's 3 real call
+    // sites), verified directly in tests/unit/test_ci_ceiling.cpp: ci
+    // never exceeds 100.0 across the full 30000-step unsafe-pocket run
+    // (15.36M update_ci calls checked), and is a mathematically guaranteed
+    // no-op at the healthy ~0.5 plateau.
+    //
+    // IMPORTANT CORRECTION vs an earlier hypothesis in this same
+    // conversation: capping ci does NOT rescue an out-of-safe-zone
+    // max_abs_delta/lr pocket's own SSE/weight-level divergence -- with
+    // max_ci=100.0 applied, the SAME unsafe pocket's SSE still climbs
+    // continuously (up to ~313544 by step 29950, matching the uncapped
+    // run almost exactly) and STILL collapses to an all-zero output in the
+    // final ~50 steps. So ci overflowing to non-finite was NOT the (sole)
+    // root cause of that collapse-to-zero masking after all -- the
+    // weight/cw accumulator has its own SEPARATE unbounded-growth
+    // mechanism, untouched by this ceiling. max_ci is still worth
+    // defaulting on as a genuine, free structural safety property for ci
+    // itself, but it is NOT a substitute for staying inside the validated
+    // safe max_abs_delta/lr range (sweep_synapse_policy_stochastic.cpp,
+    // the lr-ceiling warning in cpu_backend.cpp).
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
-                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac) {
+                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac,
+                                 VALUE_TYPE max_ci) {
         const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
         const VALUE_TYPE floor = min_decay_frac * ci;
-        return std::max(ema, floor);
+        return std::min(std::max(ema, floor), max_ci);
     }
 
     // Clips the LR-INDEPENDENT raw update, THEN multiplies by eff_lr --
@@ -816,7 +853,8 @@ struct DeltaCSRRowCursor {
 template <>
 struct PlainRMSpropSynapsePolicy<Block4Vec> {
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
-                                Block4Vec beta2, Block4Vec /*min_decay_frac*/) {
+                                Block4Vec beta2, Block4Vec /*min_decay_frac*/,
+                                Block4Vec /*max_ci*/) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         return beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
     }
@@ -834,11 +872,12 @@ struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
     // for the full min_decay_frac semantics (must exceed beta2 to bind).
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
-                                Block4Vec beta2, Block4Vec min_decay_frac) {
+                                Block4Vec beta2, Block4Vec min_decay_frac,
+                                Block4Vec max_ci) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
         const Block4Vec floor = min_decay_frac * ci;
-        return block4_vec_max(ema, floor);
+        return block4_vec_min(block4_vec_max(ema, floor), max_ci);
     }
 
     // Clips the lr-independent raw update before the eff_lr multiply --

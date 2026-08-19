@@ -19,9 +19,10 @@ TEST_CASE("PlainRMSpropSynapsePolicy::update_ci reproduces plain unbounded EMA e
     using P = PlainRMSpropSynapsePolicy<float>;
     const float ci_old = 0.5f, g = 0.1f, contrib = 0.05f, beta2 = 0.999f;
     const float expected = beta2 * ci_old + (1.0f - beta2) * (g * g + contrib * contrib);
-    // min_decay_frac is accepted but ignored -- no floor at all.
-    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.99f) == Catch::Approx(expected));
-    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f) == Catch::Approx(expected));
+    // min_decay_frac and max_ci are both accepted but ignored -- no floor,
+    // no ceiling at all.
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.99f, 1e30f) == Catch::Approx(expected));
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f, 1e30f) == Catch::Approx(expected));
 }
 
 TEST_CASE("PlainRMSpropSynapsePolicy::update_cw reproduces plain RMSprop delta exactly",
@@ -55,7 +56,7 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci matches plain EMA when ci is G
     // irrelevant here, should match plain EMA exactly.
     const float ci_old = 0.01f, g = 1.0f, contrib = 0.0f, beta2 = 0.999f;
     const float plain_ema = beta2 * ci_old + (1.0f - beta2) * (g * g + contrib * contrib);
-    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.99f) == Catch::Approx(plain_ema));
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.99f, 1e30f) == Catch::Approx(plain_ema));
 }
 
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci clamps a fast-decaying ci to the floor",
@@ -70,7 +71,7 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci clamps a fast-decaying ci to t
     const float ci_old = 1.0f, g = 0.0f, contrib = 0.0f, beta2 = 0.999f;
     const float min_decay_frac = 0.9999f;
     const float plain_ema = beta2 * ci_old;  // g=contrib=0, EMA decays toward 0
-    const float floored = P::update_ci(ci_old, g, contrib, beta2, min_decay_frac);
+    const float floored = P::update_ci(ci_old, g, contrib, beta2, min_decay_frac, 1e30f);
     CHECK(plain_ema < min_decay_frac * ci_old);          // confirms the floor is actually binding here
     CHECK(floored == Catch::Approx(min_decay_frac * ci_old));
 }
@@ -80,7 +81,7 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci with min_decay_frac=0 reproduc
     using P = BoundedRMSpropSynapsePolicy<float>;
     const float ci_old = 1.0f, g = 0.0f, contrib = 0.0f, beta2 = 0.999f;
     const float plain_ema = beta2 * ci_old;
-    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f) == Catch::Approx(plain_ema));
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f, 1e30f) == Catch::Approx(plain_ema));
 }
 
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci with min_decay_frac=1 never decays",
@@ -92,9 +93,47 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci with min_decay_frac=1 never de
     const float ci_old = 1.0f;
     float ci = ci_old;
     for (int i = 0; i < 50; ++i) {
-        ci = P::update_ci(ci, 0.0f, 0.0f, 0.999f, 1.0f);
+        ci = P::update_ci(ci, 0.0f, 0.0f, 0.999f, 1.0f, 1e30f);
     }
     CHECK(ci == Catch::Approx(ci_old));
+}
+
+TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci's max_ci clamps a growing ci",
+         "[synapse_policy][bounded][max_ci]") {
+    // ci has no ceiling anywhere else in this design -- min_decay_frac's
+    // floor only bounds how fast ci can DECAY, never how fast it can grow
+    // (confirmed directly this session: ci was measured climbing
+    // continuously and unboundedly, 0.0005 -> 163+, across a 30000-step
+    // unsafe-pocket run with no max_ci applied). A huge gradient should
+    // push the EMA well past a small max_ci, and the result must be
+    // clamped exactly at max_ci.
+    using P = BoundedRMSpropSynapsePolicy<float>;
+    const float ci_old = 0.1f, g = 100.0f, contrib = 0.0f, beta2 = 0.999f;
+    const float max_ci = 0.5f;
+    const float unclipped_ema = beta2 * ci_old + (1.0f - beta2) * (g * g + contrib * contrib);
+    REQUIRE(unclipped_ema > max_ci);  // sanity: this really would overshoot without the clip
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f, max_ci) == Catch::Approx(max_ci));
+}
+
+TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci's max_ci does nothing when ci stays under it",
+         "[synapse_policy][bounded][max_ci]") {
+    using P = BoundedRMSpropSynapsePolicy<float>;
+    const float ci_old = 0.1f, g = 0.05f, contrib = 0.02f, beta2 = 0.999f;
+    const float plain_ema = beta2 * ci_old + (1.0f - beta2) * (g * g + contrib * contrib);
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f, 1e30f) == Catch::Approx(plain_ema));
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, 0.0f, 5.0f) == Catch::Approx(plain_ema));
+}
+
+TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci's max_ci and min_decay_frac floor compose correctly",
+         "[synapse_policy][bounded][max_ci]") {
+    // max_ci must win even when the floor alone would also want to push ci
+    // upward relative to a shrinking EMA -- std::min(std::max(ema,floor),max_ci)
+    // ordering: floor first, then ceiling, so max_ci always has final say.
+    using P = BoundedRMSpropSynapsePolicy<float>;
+    const float ci_old = 10.0f, g = 0.0f, contrib = 0.0f, beta2 = 0.999f;
+    const float min_decay_frac = 0.9999f;  // floor would keep ci near ci_old
+    const float max_ci = 1.0f;             // but ceiling is well below ci_old
+    CHECK(P::update_ci(ci_old, g, contrib, beta2, min_decay_frac, max_ci) == Catch::Approx(max_ci));
 }
 
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw matches plain RMSprop delta when under the clip",
@@ -152,7 +191,7 @@ TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula
     ci_direct = beta2 * ci_direct + (1.0f - beta2) * (g * g + contrib * contrib);
     const float delta_direct = (-eff_lr * g) / (std::sqrt(ci_direct) + eps);
 
-    const float ci_policy = P::update_ci(0.2f, g, contrib, beta2, /*min_decay_frac=*/0.0f);
+    const float ci_policy = P::update_ci(0.2f, g, contrib, beta2, /*min_decay_frac=*/0.0f, /*max_ci=*/1e30f);
     const float delta_policy = P::update_cw(g, ci_policy, /*S=*/1.0f, eff_lr, eps,
                                              /*damp_by_importance=*/true, /*max_abs_delta=*/1e30f);
 

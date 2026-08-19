@@ -436,12 +436,13 @@ void disldo_forward(
 // trace on DISLDOLayer32; an lr-decay schedule "fixes" it by eventually
 // freezing the whole network, incompatible with this project's lifelong-
 // learning goal, hence a stationary per-synapse floor+clip instead).
-// Defaults to PlainRMSpropSynapsePolicy (today's exact formula,
-// bit-identical on finite inputs) so every existing caller is unaffected
-// without any changes on their part -- same convention as ScalePolicy
-// above. min_decay_frac/max_abs_delta are inert (ignored) under the
-// default Plain policy; only meaningful once a caller opts into
-// BoundedRMSpropSynapsePolicy.
+// Defaults to BoundedRMSpropSynapsePolicy (see its own docstring,
+// delta_csr_types.hpp, for the tuned production defaults: max_abs_delta,
+// max_ci real; min_decay_frac a true no-op). PlainRMSpropSynapsePolicy
+// remains available for explicit opt-in and as the bit-identical
+// reference the fix was checked against. min_decay_frac/max_abs_delta/
+// max_ci are all inert (ignored) under Plain; all three only matter once
+// a caller is on BoundedRMSpropSynapsePolicy.
 //
 // Template-TEMPLATE parameter (not a fully-instantiated `typename
 // SynapsePolicy = Policy<value_type>` like ScalePolicy above), because
@@ -480,6 +481,7 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  beta1 = 0.9f,
     typename ValueAccessor<VALUES_TYPE>::value_type  min_decay_frac = 0.0f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_abs_delta = 1e30f,
+    typename ValueAccessor<VALUES_TYPE>::value_type  max_ci = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
@@ -739,7 +741,7 @@ void disldo_backward(
                             // abstract, it does not prescribe sum-before-
                             // square as the numeric encoding.
                             const value_type contrib = iv * cw_orig;
-                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                             cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
                                                             damp_by_importance, max_abs_delta);
                             scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
@@ -809,7 +811,7 @@ void disldo_backward(
                             // SiliImportanceProof/ImportanceSignalInformationGain.lean,
                             // Joint.combined_signal_strictly_informative.
                             const value_type contrib = iv * cw_orig;
-                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                             quant += SynapsePolicy::update_cw(g, ci, S, effective_lr, eps,
                                                                damp_by_importance, max_abs_delta);
                             cw = quant * S;
@@ -1235,6 +1237,7 @@ void disldo_backward(
                                 const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
                                 const Block4Vec eps_v          = block4_vec_broadcast(eps);
                                 const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
+                                const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
                                 const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
                                 Block4Vec cw_v = block4_vec_load(cw4_8);
                                 Block4Vec ci_v = block4_vec_load(ci4_8);
@@ -1256,7 +1259,7 @@ void disldo_backward(
                                         // rationale and the proved theorem
                                         // (Joint.combined_signal_strictly_informative).
                                         const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
-                                        ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v);
+                                        ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
                                         const Block4Vec delta_v = SynapsePolicyVec::update_cw(
                                             g_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
                                             damp_by_importance, max_abs_delta_v);
@@ -1288,7 +1291,7 @@ void disldo_backward(
                                             // scattered path's identical fix
                                             // (Joint.combined_signal_strictly_informative).
                                             const value_type contrib = iv * cw_orig4_8[lj];
-                                            ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g, contrib, beta2, min_decay_frac);
+                                            ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                             cw4_8[lj] += SynapsePolicy::update_cw(g, ci4_8[lj], value_type(1), effective_lr, eps,
                                                                                   damp_by_importance, max_abs_delta);
                                             mrow_local8 += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * g;
@@ -1367,7 +1370,7 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * cw_orig;
-                                        ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac);
+                                        ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                                         cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
                                                                         damp_by_importance, max_abs_delta);
                                         mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
@@ -1495,6 +1498,7 @@ void disldo_backward(
                             const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
                             const Block4Vec eps_v          = block4_vec_broadcast(eps);
                             const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
+                                const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
                             const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
                             Block4Vec quant_v = block4_vec_load(quant4);
@@ -1538,7 +1542,7 @@ void disldo_backward(
                                     // sili__new/lean_proofs/importance_signal_information_gain/
                                     // SiliImportanceProof/ImportanceSignalInformationGain.lean).
                                     const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
-                                    ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v);
+                                    ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
                                     // dL/d(quant) = g*S -- proper chain rule
                                     // on true_w=quant*S (multiply, not
                                     // divide -- see disldo_backward's
@@ -1624,7 +1628,7 @@ void disldo_backward(
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
                                         const value_type contrib = iv * quant_orig4[lj];
-                                        ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac);
+                                        ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                         quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
                                                                                 damp_by_importance, max_abs_delta);
                                         // Gated on quant4[lj]==0 -- see the
@@ -1667,7 +1671,7 @@ void disldo_backward(
                                     // path's identical fix
                                     // (Joint.combined_signal_strictly_informative).
                                     const value_type contrib = iv * quant_orig4[lj];
-                                    ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac);
+                                    ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                     quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
                                                                             damp_by_importance, max_abs_delta);
                                     // Gated on quant4[lj]==0 -- see the

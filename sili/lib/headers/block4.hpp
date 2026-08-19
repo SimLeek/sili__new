@@ -97,6 +97,16 @@ inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
     return result;
 }
 
+// Elementwise min -- same rationale as block4_vec_max above. Used by
+// BoundedRMSpropSynapsePolicy<Block4Vec>::update_ci (delta_csr_types.hpp)
+// to cap `ci` at max_ci, since ci has no other ceiling in this design
+// (only a floor, which bounds how fast it can shrink, not grow).
+inline Block4Vec block4_vec_min(Block4Vec a, Block4Vec b) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::min(a[i], b[i]);
+    return result;
+}
+
 // Elementwise clip to [-max_abs, max_abs], per-lane -- same "no built-in
 // compare-and-select" reason as block4_vec_max above. Used by
 // BoundedRMSpropSynapsePolicy<Block4Vec>::clip_delta (delta_csr_types.hpp)
