@@ -1656,11 +1656,21 @@ public:
             }
         }
 
+        // true_weight = stored_w * S[row,col], where S[row,col] =
+        // sum_{ki<scale_rank} value_scale_k(row,ki)*output_scale_k(col,ki)
+        // (get_scale's own formula). Dividing EVERY rank component's
+        // output_scale_k(col,ki) by the SAME column-level k[c] divides
+        // the whole sum by k[c] exactly (S/k[c] = sum_ki(vs_ki*(os_ki/
+        // k[c])) = (sum_ki vs_ki*os_ki)/k[c]), so this generalizes
+        // cleanly to any scale_rank -- at scale_rank==1 it's identical
+        // to the original single-component form.
         for (std::size_t c = 0; c < n_out; ++c) {
             if (k[c] == value_type(1)) continue;
-            const value_type new_os = get_output_scale(c) / k[c];
-            if (!std::isfinite(new_os)) continue;
-            set_output_scale_raw(c, new_os);
+            for (std::size_t ki = 0; ki < scale_rank; ++ki) {
+                const value_type new_os = get_output_scale_k(c, ki) / k[c];
+                if (!std::isfinite(new_os)) continue;
+                set_output_scale_raw_k(c, ki, new_os);
+            }
         }
     }
 

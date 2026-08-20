@@ -267,6 +267,54 @@ TEST_CASE("magnitude_rescale_output leaves ci untouched when scale_invariant=tru
     }
 }
 
+TEST_CASE("magnitude_rescale_output applies the SAME rescale factor to every "
+         "rank-2 output_scale basis vector, preserving true_weight",
+         "[scale][magnitude_rescale][rank2]") {
+    // true_weight = stored_w * S[row,col], S[row,col] = sum_k(value_scale_k
+    // * output_scale_k). With scale_rank=2, both components trained
+    // (value_scale_k defaults to 0.0 for k>=1 -- must set it explicitly to
+    // actually exercise the second basis vector, not just a no-op rank-1
+    // layer in disguise): value_scale_0=1.0, value_scale_1=1.0,
+    // output_scale_0=2.0, output_scale_1=3.0 -> S=1*2+1*3=5.0.
+    // w=6.0 (grid point) -> true_weight=6.0*5.0=30.0.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {6.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.scale_rank = 2;
+    weights.set_value_scale_raw_k(0, 0, 1.0f);
+    weights.set_value_scale_raw_k(0, 1, 1.0f);
+    weights.set_output_scale_raw_k(0, 0, 2.0f);
+    weights.set_output_scale_raw_k(0, 1, 3.0f);
+
+    REQUIRE(weights.get_scale(0, 0) == Catch::Approx(5.0f));
+    const float true_before = ValueAccessor<FP4BiPacked>::get_w(weights.connections.values, 0)
+                             * weights.get_scale(0, 0);
+    REQUIRE(true_before == Catch::Approx(30.0f));
+
+    // Column RMS is exactly 6.0 (one row, stored_w=6.0). Full jump
+    // toward target=3.0 -> k=0.5, new stored_w=3.0 (grid point).
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/false);
+
+    const float stored_after = ValueAccessor<FP4BiPacked>::get_w(weights.connections.values, 0);
+    CHECK(stored_after == Catch::Approx(3.0f));
+
+    // BOTH rank components divided by the same k=0.5.
+    CHECK(weights.get_output_scale_k(0, 0) == Catch::Approx(4.0f));
+    CHECK(weights.get_output_scale_k(0, 1) == Catch::Approx(6.0f));
+
+    // New S = 1*4 + 1*6 = 10.0; true_weight = 3.0*10.0 = 30.0 -- unchanged.
+    const float true_after = stored_after * weights.get_scale(0, 0);
+    CHECK(true_after == Catch::Approx(30.0f));
+}
+
 // ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
 //
 // Per-COLUMN counterpart to value_scale: true_w = stored_w * value_scale[row]
