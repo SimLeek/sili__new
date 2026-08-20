@@ -141,24 +141,32 @@ int main() {
     std::printf("plain:   max SSE after step 200 = %.4f\n", plain_max_after_200);
     std::printf("bounded: max SSE after step 200 = %.4f\n", bounded_max_after_200);
 
-    // The property this test verifies is narrower than "Bounded converges
-    // well" -- it's specifically "Bounded doesn't suffer Plain's
-    // CATASTROPHIC late-onset blowup." Confirmed directly (see conversation):
-    // an earlier version of this assertion used an arbitrary absolute bound
-    // (<5.0) and failed, because Bounded genuinely settles at a real,
-    // non-trivial elevated steady-state SSE (~109, vs Plain's brief pre-
-    // explosion value of ~1.1) -- min_decay_frac=0.9995 prevents the
-    // resonance but also permanently over-damps the step even once the
-    // "danger zone" (ci decaying to match the residual) has passed. That's
-    // a real tuning tradeoff worth revisiting, not a bug in the fix itself
-    // -- it does NOT explode, it converges to a worse-but-STABLE plateau.
-    // A relative comparison against Plain's own catastrophic magnitude is
-    // the honest way to state the property actually being verified.
-    CHECK(bounded_max_after_200 < plain_max_after_200 / 100.0f,
-          "BoundedRMSpropSynapsePolicy's max SSE (%.4f) isn't dramatically smaller than "
-          "Plain's catastrophic blowup (%.4f) -- the floor+clip fix should prevent this "
-          "class of divergence, not just delay or shrink it slightly",
-          bounded_max_after_200, plain_max_after_200);
+    // UPDATED (see conversation): the root cause of Plain's own
+    // catastrophic late-onset blowup was traced to disldo_backward's
+    // per-synapse ci/cw update being applied SEQUENTIALLY, once per
+    // batch row, mutating the weight mid-batch instead of aggregating
+    // g/contrib across the whole batch and applying exactly ONE update
+    // (matching how every real mini-batch optimizer, including the
+    // torch reference this project compares against, actually works).
+    // Once that batch-inconsistency was fixed (all 8 real call sites),
+    // PlainRMSpropSynapsePolicy -- NO floor, NO clip, the exact
+    // no-op-parameters case -- no longer diverges AT ALL over this same
+    // 3000-step horizon (confirmed directly: max SSE after step 200 was
+    // 0.0004, vs the pre-fix ~285736). So this test's original property
+    // ("Bounded must be dramatically better than Plain's catastrophic
+    // blowup") is now moot -- there's no blowup for EITHER arm to be
+    // better than. The property worth checking now is simply that
+    // NEITHER arm exceeds a real convergence-scale bound (the healthy
+    // baseline SSE elsewhere in this suite is ~1.0952) by orders of
+    // magnitude, i.e. that the fix didn't just relocate the instability.
+    CHECK(plain_max_after_200 < 10.0f,
+          "PlainRMSpropSynapsePolicy's max SSE (%.4f) is unexpectedly large -- the "
+          "batch-consistency fix (see conversation) was expected to keep even the "
+          "no-op-parameters case stable on this scenario now",
+          plain_max_after_200);
+    CHECK(bounded_max_after_200 < 10.0f,
+          "BoundedRMSpropSynapsePolicy's max SSE (%.4f) is unexpectedly large",
+          bounded_max_after_200);
 
     // Bounded's own trajectory should PLATEAU, not keep growing -- the last
     // checkpoint shouldn't be dramatically larger than the middle of the
