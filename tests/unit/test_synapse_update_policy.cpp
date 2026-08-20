@@ -261,3 +261,58 @@ TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula
     CHECK(ci_policy == Catch::Approx(ci_direct));
     CHECK(delta_policy == Catch::Approx(delta_direct));
 }
+
+TEST_CASE("RMSpropScalePolicy::update's log_space flag makes the RELATIVE "
+         "(percentage) step size independent of scale's own magnitude",
+         "[scale_policy][log_space]") {
+    // Ported from sili_peridot's torch prototype (_scale_update,
+    // scale_invariant_chain_rule branch): the additive update assumes
+    // scale stays near 1.0 -- a fixed eff_lr step is huge relative to a
+    // scale that's shrunk well below 1 (magnitude-scale reparametrization
+    // deliberately does this) and negligible once scale has grown large.
+    // log_space instead normalizes in log-space: on a fresh (scale_state=0)
+    // first step, state_hat = scale^2*(g_agg^2+contrib_agg^2) EXACTLY (no
+    // beta2 dependence at step 1), so log_step = eff_lr*g_agg*scale /
+    // (scale*sqrt(g_agg^2+contrib_agg^2)+eps) is independent of scale up
+    // to the eps term -- new_scale/scale (the RELATIVE change) is the same
+    // regardless of scale's starting magnitude.
+    using P = RMSpropScalePolicy<float>;
+    const float g_agg = 0.3f, contrib_agg = 0.1f, eff_lr = 0.05f, beta2 = 0.999f, eps = 1e-8f;
+
+    float scale_a = 1.0f, state_a = 0.0f;
+    uint32_t step_a = 0;
+    P::update(scale_a, state_a, g_agg, eff_lr, beta2, eps, contrib_agg, &step_a, /*log_space=*/true);
+    const float rel_change_a = scale_a / 1.0f;
+
+    float scale_b = 0.01f, state_b = 0.0f;
+    uint32_t step_b = 0;
+    P::update(scale_b, state_b, g_agg, eff_lr, beta2, eps, contrib_agg, &step_b, /*log_space=*/true);
+    const float rel_change_b = scale_b / 0.01f;
+
+    CHECK(rel_change_a == Catch::Approx(rel_change_b).margin(1e-4f));
+    // scale can never cross zero under the multiplicative update.
+    CHECK(scale_a > 0.0f);
+    CHECK(scale_b > 0.0f);
+
+    // Confirm the additive (default/false) path does NOT have this
+    // property -- a fixed eff_lr step is a wildly different PERCENTAGE
+    // change depending on scale's starting magnitude.
+    float scale_c = 1.0f, state_c = 0.0f;
+    uint32_t step_c = 0;
+    P::update(scale_c, state_c, g_agg, eff_lr, beta2, eps, contrib_agg, &step_c, /*log_space=*/false);
+    const float rel_change_c = scale_c / 1.0f;
+
+    float scale_d = 0.01f, state_d = 0.0f;
+    uint32_t step_d = 0;
+    P::update(scale_d, state_d, g_agg, eff_lr, beta2, eps, contrib_agg, &step_d, /*log_space=*/false);
+    const float rel_change_d = scale_d / 0.01f;
+
+    CHECK(std::abs(rel_change_c - rel_change_d) > 0.5f);
+
+    // Omitting log_space entirely defaults to the old (additive) behavior,
+    // bit-identical to every existing call site.
+    float scale_e = 1.0f, state_e = 0.0f;
+    uint32_t step_e = 0;
+    P::update(scale_e, state_e, g_agg, eff_lr, beta2, eps, contrib_agg, &step_e);
+    CHECK(scale_e == Catch::Approx(scale_c));
+}

@@ -442,12 +442,47 @@ struct RMSpropScalePolicy {
     // same size as ci itself, doubling memory for an FP4/FP8 format
     // where every byte counts, for a self-limiting problem that doesn't
     // compound across a whole row the way value_scale's does).
+    // log_space (default false): additive step assumes scale stays near
+    // 1.0 -- a fixed-size eff_lr step is a huge RELATIVE change once scale
+    // has shrunk far below 1 (which magnitude-scale reparametrization
+    // deliberately does) and negligible once scale has grown large. This
+    // mirrors update_cw's own scale_invariant fix, just applied to scale's
+    // OWN update instead of the per-synapse weight update: d(loss)/
+    // d(log(scale)) = d(loss)/d(scale)*scale = g_agg*scale (chain rule
+    // through scale=exp(log_scale)), RMSprop-normalizing THAT keeps the
+    // step a fixed RELATIVE (percentage) size regardless of scale's own
+    // magnitude, and scale can never cross zero (exp()>0), unlike the
+    // additive step. Ported verbatim from sili_peridot's torch prototype
+    // (toy_tile_recurrence_rmt_torch.py's _scale_update,
+    // scale_invariant_chain_rule branch) -- see that module for the
+    // validated-in-torch derivation this is a direct port of.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
                         VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr) {
+                        uint32_t* step = nullptr,
+                        bool log_space = false) {
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        if (log_space) {
+            const VALUE_TYPE log_grad = g_agg * scale;
+            const VALUE_TYPE log_contrib = contrib_agg * scale;
+            const VALUE_TYPE new_state = beta2 * scale_state
+                + (VALUE_TYPE(1) - beta2) * (log_grad * log_grad + log_contrib * log_contrib);
+            if (!std::isfinite(new_state)) return;
+            VALUE_TYPE state_hat = new_state;
+            if (step != nullptr) {
+                ++(*step);
+                const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+                if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+            }
+            if (!std::isfinite(state_hat)) return;
+            const VALUE_TYPE log_step = eff_lr * log_grad / (std::sqrt(state_hat) + eps);
+            const VALUE_TYPE new_scale = scale * std::exp(-log_step);
+            if (!std::isfinite(new_scale)) return;
+            scale_state = new_state;
+            scale = new_scale;
+            return;
+        }
         const VALUE_TYPE new_state = beta2 * scale_state
             + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
         if (!std::isfinite(new_state)) return;
@@ -502,8 +537,10 @@ struct AdaMaxScalePolicy {
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
                         VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr) {
+                        uint32_t* step = nullptr,
+                        bool log_space = false) {
         (void)step;
+        (void)log_space;  // AdaMax's L-infinity tracker has no log-space variant (yet) -- accepted for call-site signature compatibility with RMSpropScalePolicy only.
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
         const VALUE_TYPE combined_mag = std::max(std::abs(g_agg), std::abs(contrib_agg));
         const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
@@ -530,7 +567,8 @@ struct NoScalePolicy {
                         VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
                         VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
                         VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0),
-                        uint32_t* /*step*/ = nullptr) {
+                        uint32_t* /*step*/ = nullptr,
+                        bool /*log_space*/ = false) {
         // Intentionally does nothing.
     }
 };

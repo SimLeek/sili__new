@@ -965,14 +965,14 @@ void disldo_backward(
                         const value_type contrib_agg_k = static_cast<value_type>(scale_grad_sum_rank_contrib[k]);
                         ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
                                             g_agg_k, scale_eff_lr, beta2, eps, contrib_agg_k,
-                                            &weights.get_value_scale_step_k(r, k));
+                                            &weights.get_value_scale_step_k(r, k), scale_invariant);
                     }
                 } else {
                     const value_type g_agg = static_cast<value_type>(scale_grad_sum);
                     const value_type contrib_agg = static_cast<value_type>(scale_grad_sum_contrib);
                     ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
                                         g_agg, scale_eff_lr, beta2, eps, contrib_agg,
-                                        &weights.get_value_scale_step_k(r, 0));
+                                        &weights.get_value_scale_step_k(r, 0), scale_invariant);
                 }
             }
         }
@@ -2220,7 +2220,7 @@ void disldo_backward(
                 const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
                 ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
                                     g_agg, col_eff_lr, beta2, eps, contrib_agg,
-                                    &weights.get_output_scale_step_k(c, k));
+                                    &weights.get_output_scale_step_k(c, k), scale_invariant);
             }
         }
     }
