@@ -754,7 +754,7 @@ void disldo_backward(
                             // informative than either alone in the
                             // abstract, it does not prescribe sum-before-
                             // square as the numeric encoding.
-                            const value_type contrib = iv * cw_orig;
+                            const value_type contrib = iv * cw;
                             ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                             cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
                                                             damp_by_importance, max_abs_delta);
@@ -824,7 +824,7 @@ void disldo_backward(
                             // sili__new/lean_proofs/importance_signal_information_gain/
                             // SiliImportanceProof/ImportanceSignalInformationGain.lean,
                             // Joint.combined_signal_strictly_informative.
-                            const value_type contrib = iv * cw_orig;
+                            const value_type contrib = iv * cw;
                             ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                             quant += SynapsePolicy::update_cw(g, ci, S, effective_lr, eps,
                                                                damp_by_importance, max_abs_delta);
@@ -1272,7 +1272,7 @@ void disldo_backward(
                                         // path's identical fix for the full
                                         // rationale and the proved theorem
                                         // (Joint.combined_signal_strictly_informative).
-                                        const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
+                                        const Block4Vec contrib_v = cw_v * block4_vec_broadcast(iv);
                                         ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
                                         const Block4Vec delta_v = SynapsePolicyVec::update_cw(
                                             g_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
@@ -1304,7 +1304,7 @@ void disldo_backward(
                                             // combination -- see the
                                             // scattered path's identical fix
                                             // (Joint.combined_signal_strictly_informative).
-                                            const value_type contrib = iv * cw_orig4_8[lj];
+                                            const value_type contrib = iv * cw4_8[lj];
                                             ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                             cw4_8[lj] += SynapsePolicy::update_cw(g, ci4_8[lj], value_type(1), effective_lr, eps,
                                                                                   damp_by_importance, max_abs_delta);
@@ -1383,7 +1383,7 @@ void disldo_backward(
                                         // combination -- see the scattered
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
-                                        const value_type contrib = iv * cw_orig;
+                                        const value_type contrib = iv * cw;
                                         ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
                                         cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
                                                                         damp_by_importance, max_abs_delta);
@@ -1517,7 +1517,6 @@ void disldo_backward(
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
                             Block4Vec quant_v = block4_vec_load(quant4);
                             Block4Vec ci_v    = block4_vec_load(ci4);
-                            const Block4Vec quant_orig_v = block4_vec_load(quant_orig4);
                             // Per-rank-component vectors -- rank is small
                             // (1-2 in practice, capped at SCALE_RANK_MAX),
                             // kept as real Block4Vec accumulators so the
@@ -1555,7 +1554,11 @@ void disldo_backward(
                                     // (Joint.combined_signal_strictly_informative,
                                     // sili__new/lean_proofs/importance_signal_information_gain/
                                     // SiliImportanceProof/ImportanceSignalInformationGain.lean).
-                                    const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
+                                    // Current (not original-at-tile-load) scaled weight, reflecting
+                                    // any prior b's own update within this same call -- matches
+                                    // the scattered path's own "cw, refreshed after any update"
+                                    // convention (see disldo_backward's scattered-path comment).
+                                    const Block4Vec contrib_v = (quant_v * combined_scale_v) * block4_vec_broadcast(iv);
                                     ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
                                     // dL/d(quant) = g*S -- proper chain rule
                                     // on true_w=quant*S (multiply, not
@@ -1641,7 +1644,7 @@ void disldo_backward(
                                         // combination -- see the scattered
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
-                                        const value_type contrib = iv * quant_orig4[lj];
+                                        const value_type contrib = iv * (quant4[lj] * S);
                                         ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                         quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
                                                                                 damp_by_importance, max_abs_delta);
@@ -1684,7 +1687,7 @@ void disldo_backward(
                                     // combination -- see the scattered
                                     // path's identical fix
                                     // (Joint.combined_signal_strictly_informative).
-                                    const value_type contrib = iv * quant_orig4[lj];
+                                    const value_type contrib = iv * (quant4[lj] * S);
                                     ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
                                     quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
                                                                             damp_by_importance, max_abs_delta);

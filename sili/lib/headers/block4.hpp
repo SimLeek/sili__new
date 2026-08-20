@@ -120,6 +120,23 @@ inline Block4Vec block4_vec_clip_abs(Block4Vec x, Block4Vec max_abs) {
     return result;
 }
 
+// Per-lane "keep new_val if finite, else keep fallback" -- same "no
+// built-in compare-and-select" reason as block4_vec_max above. Used by
+// PlainRMSpropSynapsePolicy<Block4Vec>/BoundedRMSpropSynapsePolicy<Block4Vec>
+// (delta_csr_types.hpp) to make ci/cw's own per-synapse update immune to a
+// non-finite g/contrib the same way RMSpropScalePolicy::update already
+// guards value_scale/output_scale (see that struct's own docstring) --
+// a coverage gap fixed together with the contrib-formula bug in
+// linear_disldo.hpp (see conversation): the per-synapse update had NO
+// NaN/Inf guard anywhere despite value_scale/output_scale getting one.
+inline Block4Vec block4_vec_select_finite(Block4Vec new_val, Block4Vec fallback) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        result[i] = std::isfinite(new_val[i]) ? new_val[i] : fallback[i];
+    }
+    return result;
+}
+
 // 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes 4 codes in one
 // shot instead of 4 separate FP4_TABLE[code] lookups. 
 // Verified bit-exact against fp4_decode_bits()

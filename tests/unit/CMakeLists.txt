@@ -156,6 +156,7 @@ set(SILI_STANDALONE_TESTS
     sweep_synapse_policy_min_decay_frac
     sweep_synapse_policy_stochastic
     probe_unstable_pocket_growth
+    probe_unclipped_after_nan_fix
     test_ci_ceiling
     test_production_default_long_horizon
     test_disldo_block4_combined_absolute

@@ -608,19 +608,36 @@ struct PlainRMSpropSynapsePolicy {
     // the normal regime, real protection against the late-training
     // resonance Plain has no defense against at all).
     // No floor, no clip -- matches RMSpropScalePolicy's own "must stay
-    // bit-identical to today's behavior" convention.
+    // bit-identical to today's behavior" convention (on finite inputs),
+    // PLUS the same NaN/Inf guard RMSpropScalePolicy::update already has
+    // (delta_csr_types.hpp above): a non-finite g/contrib (e.g. from an
+    // upstream weight that's already diverging) must not be allowed to
+    // corrupt ci -- ci has no other bound in this policy, so a stray NaN
+    // here is permanent (beta2*NaN+... stays NaN forever). Skip the
+    // update (return the OLD ci unchanged) rather than writing NaN --
+    // this is the fix for the coverage gap ba4af42 left: that commit
+    // guarded value_scale/output_scale's own update but never extended
+    // the same guard to the per-synapse ci/cw path (see conversation).
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
                                  VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/,
                                  VALUE_TYPE /*max_ci*/) {
-        return beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
+        const VALUE_TYPE new_ci = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        return std::isfinite(new_ci) ? new_ci : ci;
     }
 
+    // Returns a DELTA (caller does `cw += update_cw(...)`), so "skip the
+    // update" here means return 0 (a true no-op delta), matching
+    // update_ci's own "keep old value" semantics -- same NaN/Inf guard
+    // rationale as update_ci above and RMSpropScalePolicy::update.
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
                                  bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/) {
-        return damp_by_importance
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
+        const VALUE_TYPE delta = damp_by_importance
             ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
             : (-eff_lr * g * S);
+        return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
 
@@ -704,10 +721,17 @@ struct BoundedRMSpropSynapsePolicy {
     // itself, but it is NOT a substitute for staying inside the validated
     // safe max_abs_delta/lr range (sweep_synapse_policy_stochastic.cpp,
     // the lr-ceiling warning in cpu_backend.cpp).
+    // Same NaN/Inf guard as PlainRMSpropSynapsePolicy::update_ci above
+    // (and for the same reason -- see that struct's own docstring): a
+    // non-finite g/contrib must not corrupt ci. Checked BEFORE the
+    // floor/max_ci clamps since std::min/std::max's behavior on NaN is
+    // comparison-order-dependent (not a reliable NaN-filter on its own).
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
                                  VALUE_TYPE beta2, VALUE_TYPE min_decay_frac,
                                  VALUE_TYPE max_ci) {
+        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
         const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        if (!std::isfinite(ema)) return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
         return std::min(std::max(ema, floor), max_ci);
     }
@@ -746,15 +770,22 @@ struct BoundedRMSpropSynapsePolicy {
     // called with learning_rate > 0.2 for exactly this reason -- a caller
     // that genuinely needs a much larger lr needs its own max_abs_delta
     // tuned for that regime, not this default.
+    // Same "return 0 delta on non-finite input/result" guard as
+    // PlainRMSpropSynapsePolicy::update_cw above, checked before the
+    // max_abs_delta clip (clamping NaN against a finite bound is not a
+    // reliable way to neutralize it).
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
                                  bool damp_by_importance, VALUE_TYPE max_abs_delta) {
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
         VALUE_TYPE raw = damp_by_importance
             ? (-g * S) / (std::sqrt(ci) + eps)
             : (-g * S);
+        if (!std::isfinite(raw)) return VALUE_TYPE(0);
         if (raw > max_abs_delta) raw = max_abs_delta;
         if (raw < -max_abs_delta) raw = -max_abs_delta;
-        return eff_lr * raw;
+        const VALUE_TYPE delta = eff_lr * raw;
+        return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
 
@@ -852,18 +883,25 @@ struct DeltaCSRRowCursor {
 // eliminate the scalar/SIMD math split itself).
 template <>
 struct PlainRMSpropSynapsePolicy<Block4Vec> {
+    // Same NaN/Inf guard as the scalar PlainRMSpropSynapsePolicy::update_ci
+    // above (see its docstring) -- per-lane, via block4_vec_select_finite
+    // (block4.hpp), since Block4Vec has no whole-vector isfinite/select.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
                                 Block4Vec beta2, Block4Vec /*min_decay_frac*/,
                                 Block4Vec /*max_ci*/) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        return beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        return block4_vec_select_finite(new_ci, ci);
     }
 
+    // Same "0 delta on non-finite" guard as the scalar
+    // PlainRMSpropSynapsePolicy::update_cw above.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
                                 bool damp_by_importance, Block4Vec /*max_abs_delta*/) {
         const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
-        return damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+        const Block4Vec delta = damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+        return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };
 
@@ -871,25 +909,31 @@ template <>
 struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
     // for the full min_decay_frac semantics (must exceed beta2 to bind).
+    // Same NaN/Inf guard as the scalar BoundedRMSpropSynapsePolicy::update_ci
+    // above (checked before the floor/max_ci clamps, same rationale).
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
                                 Block4Vec beta2, Block4Vec min_decay_frac,
                                 Block4Vec max_ci) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
         const Block4Vec floor = min_decay_frac * ci;
-        return block4_vec_min(block4_vec_max(ema, floor), max_ci);
+        return block4_vec_min(block4_vec_max(ema_safe, floor), max_ci);
     }
 
     // Clips the lr-independent raw update before the eff_lr multiply --
     // see the scalar BoundedRMSpropSynapsePolicy::update_cw docstring above
     // for why (must match it exactly, or SIMD full-tile vs scalar-boundary
-    // results would diverge for the same synapse).
+    // results would diverge for the same synapse). Same NaN/Inf guard as
+    // the scalar version, checked before the clip.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
                                 bool damp_by_importance, Block4Vec max_abs_delta) {
         const Block4Vec neg_g_S = -(g * S);
         const Block4Vec raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
-        return eff_lr * block4_vec_clip_abs(raw, max_abs_delta);
+        const Block4Vec raw_safe = block4_vec_select_finite(raw, block4_vec_broadcast(0.0f));
+        const Block4Vec delta = eff_lr * block4_vec_clip_abs(raw_safe, max_abs_delta);
+        return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };
 

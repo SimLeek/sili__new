@@ -353,11 +353,18 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), /*learning_rate=*/0.1f, 1);
 
-    // g = dy*input = 1.0. contrib = iv*cw_orig = 1.0*2.0 = 2.0. ci =
-    // (1-beta2)*(g^2+contrib^2) = 0.001*5.0 = 0.005 (square-then-sum, not
-    // sum-then-square -- see linear_disldo.hpp's own docstring: sum-then-
-    // square lets a large g/contrib disagreement collapse ci toward zero
-    // and explode the step; fresh layer, ci_orig=0).
+    // g = dy*input = 1.0. contrib = iv*cw, where cw is the FULLY SCALED
+    // weight (cw_orig*val_scale*out_scale = 2.0*0.5*4.0 = 4.0), NOT the
+    // raw stored code cw_orig=2.0 -- linear_disldo.hpp's contrib formula
+    // was a real bug (used cw_orig everywhere) fixed this session (see
+    // conversation): contrib's whole point is a forward-CONTRIBUTION
+    // signal, which has to be the actual true-units weight the input
+    // multiplied against, not an arbitrary FP4-code-only quantity that
+    // ignores the row/column scale entirely. So contrib = 1.0*4.0 = 4.0.
+    // ci = (1-beta2)*(g^2+contrib^2) = 0.001*(1+16) = 0.017 (square-then-
+    // sum, not sum-then-square -- see linear_disldo.hpp's own docstring:
+    // sum-then-square lets a large g/contrib disagreement collapse ci
+    // toward zero and explode the step; fresh layer, ci_orig=0).
     // quant's own step: S=val_scale*out_scale=0.5*4.0=2.0, effective_lr=0.1
     // (lr_per_row_nnz=false), delta=-effective_lr*g*S/sqrt(ci), so quant
     // goes 2.0 -> quant_floor within this SAME call (batch=1, one step;
@@ -376,10 +383,11 @@ TEST_CASE("value_scale's own gradient correctly accounts for a fixed output_scal
     // (1-beta2^1) = new_state/(1-beta2) -- exactly undoing the (1-beta2)
     // factor baked into new_state's own EMA formula, i.e. state_hat =
     // g_agg^2+contrib_agg^2 exactly.
-    const float g = 1.0f, contrib = 2.0f;
-    const float ci = 0.001f * (g * g + contrib * contrib);
+    const float cw_orig = 2.0f;
     const float S_combined = 0.5f * 4.0f;
-    const float quant_floor = 2.0f - 0.1f * g * S_combined / std::sqrt(ci);
+    const float g = 1.0f, contrib = 1.0f * (cw_orig * S_combined);
+    const float ci = 0.001f * (g * g + contrib * contrib);
+    const float quant_floor = cw_orig - 0.1f * g * S_combined / std::sqrt(ci);
     const float g_agg = quant_floor * 4.0f * g;
     const float contrib_agg = quant_floor * 4.0f * contrib;
     const float new_state = 0.001f * (g_agg * g_agg + contrib_agg * contrib_agg);
@@ -549,8 +557,12 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
         input.data(), S(1), S(1), dy.data(), weights, dx.data(),
         in_acc.data(), gr_acc.data(), lr, 1);
 
-    // g = dy*input = 1.0*3.0 = 3.0. contrib = iv*cw_orig = 3.0*2.0 = 6.0.
-    // ci = (1-beta2)*(g^2+contrib^2) = 0.001*45 = 0.045 (square-then-sum,
+    // g = dy*input = 1.0*3.0 = 3.0. contrib = iv*cw, where cw is the
+    // FULLY SCALED weight (cw_orig*S_combined = 2.0*0.5 = 1.0), NOT the
+    // raw stored code cw_orig=2.0 -- see the analogous fix/explanation in
+    // "value_scale's own gradient correctly accounts for a fixed
+    // output_scale factor" above. So contrib = 3.0*1.0 = 3.0.
+    // ci = (1-beta2)*(g^2+contrib^2) = 0.001*18 = 0.018 (square-then-sum,
     // fresh layer, ci_orig=0). quant's own step: S=val_scale*out_scale=0.5*1.0=0.5,
     // effective_lr=lr=0.1 (lr_per_row_nnz=false, nnz_this_row=1),
     // delta=-effective_lr*g*S/sqrt(ci), so quant goes 2.0 -> quant_floor
@@ -559,10 +571,11 @@ TEST_CASE("disldo_backward updates value_scale via gradient (sum first, apply lr
     // delta_csr_types.hpp) -- see the analogous derivation in
     // "value_scale's own gradient correctly accounts for a fixed
     // output_scale factor" above for the full trace.
-    const float g = 3.0f, contrib = 6.0f;
-    const float ci = 0.001f * (g * g + contrib * contrib);
+    const float cw_orig = 2.0f;
     const float S_combined = 0.5f * 1.0f;
-    const float quant_floor = 2.0f - lr * g * S_combined / std::sqrt(ci);
+    const float g = 3.0f, contrib = 3.0f * (cw_orig * S_combined);
+    const float ci = 0.001f * (g * g + contrib * contrib);
+    const float quant_floor = cw_orig - lr * g * S_combined / std::sqrt(ci);
     const float g_agg = quant_floor * 1.0f * g;
     const float contrib_agg = quant_floor * 1.0f * contrib;
     const float new_state = 0.001f * (g_agg * g_agg + contrib_agg * contrib_agg);
