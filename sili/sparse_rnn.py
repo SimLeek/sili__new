@@ -501,7 +501,17 @@ class DISLDOLayer(_SparseLayerBase):
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None) -> Tensor:
+        # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
+        # the C++ side's own tuned production defaults" -- kept as
+        # Optional here rather than hardcoding the production floats a
+        # second time in Python, so there is still exactly one source of
+        # truth (cpu_backend.cpp's kSynapsePolicy* constants) even though
+        # this wrapper now exposes them for quick per-call experiments
+        # (e.g. testing max_abs_delta=huge to effectively disable the
+        # clip) without a C++ rebuild.
+        #
         # forward_dense/backward_dense always return [batch, cols] --
         # even for a bare 1-D [cols] input, batch is implicitly 1, but
         # the OUTPUT shape stays 2-D regardless. Squeeze that back out
@@ -538,8 +548,12 @@ class DISLDOLayer(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
                 dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                             damp_by_importance=damp_by_importance)
+                                             damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -653,7 +667,8 @@ class DISLDOLayer32(_SparseLayerBase):
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -666,8 +681,12 @@ class DISLDOLayer32(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
                 dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance)
+                                       damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
