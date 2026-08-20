@@ -711,18 +711,27 @@ class DISLDOLayer8(_SparseLayerBase):
     ten configs, never lost to native FP4) -- see sili_peridot's
     JOURNAL.md for the full writeup this class is built from.
 
-    SCOPE, current: scattered CSR path only, same as DISLDOLayer32 --
-    no block4 dense-tile SIMD promotion yet (real follow-up, not a
-    template swap: block4.hpp's tile storage is hardcoded to FP4's
-    1-byte nibble-packed layout, E4M3 needs 2 full bytes/slot)."""
+    dense=True uses the block4 dense-tile SIMD path (Block4Tile8/Store8,
+    task #94/#96) via the same load_dense_codes/block4_load_dense
+    machinery DISLDOLayer's own dense=True already uses -- this class's
+    own docstring previously said "no block4 dense-tile SIMD promotion
+    yet" because the PYTHON wrapper never called it, even though the
+    C++/pybind side (SparseLinearLayer8.load_dense_codes) has been
+    ready since #123."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
+                                                    quantize_fn=_cpu.fp8_quantize_array)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -735,8 +744,12 @@ class DISLDOLayer8(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
                 dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance)
+                                       damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
