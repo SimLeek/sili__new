@@ -218,6 +218,20 @@ class _SparseLayerBase(Module):
                            importance_eps=importance_eps)
         self._c.equalizer_step()
 
+    def magnitude_rescale_output(self, target: float, correction_rate: float,
+                                 scale_invariant: bool = False) -> None:
+        """Passthrough to the real C++ magnitude_rescale_output (see
+        delta_csr_types.hpp's own docstring). Not every backend has
+        this bound -- e.g. the fp32 DISLDOLayerV backend has no scale
+        concept to rescale -- so callers sweeping this on/off across
+        mixed precisions should guard with
+        `hasattr(layer._c, "magnitude_rescale_output")` (the wrapped
+        C++ object, NOT this Python wrapper -- this method itself
+        exists on every _SparseLayerBase subclass via inheritance and
+        would raise AttributeError from self._c if the backend lacks
+        it, rather than silently no-op)."""
+        self._c.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
     def state_dict(self) -> dict:
         return {
             "ptrs":       np.array(self.ptrs),
@@ -721,13 +735,19 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False):
+                 dense: bool = False, scale_rank: int = 1):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
                                                     quantize_fn=_cpu.fp8_quantize_array)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        # scale_rank was never threaded here before -- confirmed missing
+        # (unlike DISLDOLayer/DISLDOLayerDeterministic's own
+        # _seed_scale_rank call) while wiring up a real-engine rank1/rank2
+        # sweep across fp4/fp4_dual/fp8 (sili_peridot task #247); a rank2
+        # FP8 arm would otherwise TypeError immediately.
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,

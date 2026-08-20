@@ -480,10 +480,11 @@ public:
     // (original behavior); set BEFORE any training call touches
     // value_scale/output_scale, since changing rank after synapses
     // already have per-component scale data stored would silently
-    // reinterpret that data under a different row-major stride. Only
-    // meaningful for disldo_forward/disldo_backward's SCATTERED-CSR
-    // path -- block4's own forward/backward remain rank-1-only (see
-    // scale_rank's own docstring for the tracked gap this implies).
+    // reinterpret that data under a different row-major stride.
+    // Meaningful for BOTH disldo_forward/disldo_backward's scattered-CSR
+    // path AND block4's own forward/backward (FP4 and FP8 both fixed and
+    // verified rank-N this session -- the "block4 remains rank-1-only"
+    // note that used to be here was stale).
     std::size_t get_scale_rank() const { return weights.scale_rank; }
     void set_scale_rank(std::size_t rank) {
         if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
@@ -1317,6 +1318,25 @@ public:
     void magnitude_rescale_output(V target, V correction_rate, bool scale_invariant) {
         weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
     }
+    // Rank-N scale envelope accessors -- mirrors SparseLinearLayerImpl's
+    // (FP4) identical methods exactly. Genuinely missing here before now
+    // (not a documented limitation, a plain oversight): weights.scale_rank
+    // and get/set_value_scale_k/output_scale_k are already VALUES_TYPE
+    // -agnostic on SparseLinearWeightsDelta (confirmed directly -- the
+    // FP8 block4 backward path is itself already full rank-N, see
+    // process_tile's FP8 branch in linear_disldo.hpp), so this was purely
+    // a missing pybind-facing wrapper, not missing engine support.
+    std::size_t get_scale_rank() const { return weights.scale_rank; }
+    void set_scale_rank(std::size_t rank) {
+        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        if (rank > decltype(weights)::SCALE_RANK_MAX)
+            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
+        weights.scale_rank = rank;
+    }
+    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
+    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
+    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
+    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
 
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
@@ -3055,7 +3075,19 @@ PYBIND11_MODULE(_cpu, m)
              "(`correction_rate`) multiplicative step. scale_invariant must match\n"
              "whatever backward(scale_invariant=...) is using -- see\n"
              "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
-             "SCATTERED CSR ONLY (block4 support is a follow-up).")
+             "Covers BOTH scattered CSR and block4 (fixed and verified this session --\n"
+             "the \"SCATTERED CSR ONLY\" note that used to be here was stale).")
+        .def("get_scale_rank",       &SparseLinearLayer8::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
+        .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer8::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"),
+             "Rank-N scale envelope (see SparseLinearLayer's identical\n"
+             "get_scale_rank/set_scale_rank/*_k accessors) -- was missing here\n"
+             "entirely until now (a plain oversight, not a real engine gap: the\n"
+             "underlying SparseLinearWeightsDelta storage and FP8 block4 backward\n"
+             "were already full rank-N).")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
             return py::array_t<SparseLinearLayer8::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
