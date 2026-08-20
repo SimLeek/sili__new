@@ -1314,6 +1314,9 @@ public:
     V get_output_scale(S col) const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
     void set_value_scale_raw(S row, V scale)  { weights.set_value_scale_raw(static_cast<std::size_t>(row), scale); }
     void set_output_scale_raw(S col, V scale) { weights.set_output_scale_raw(static_cast<std::size_t>(col), scale); }
+    void magnitude_rescale_output(V target, V correction_rate, bool scale_invariant) {
+        weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+    }
 
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
@@ -1659,6 +1662,19 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayer& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
+             "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
+             "lives moves, from output_scale into the stored per-synapse weight code.\n"
+             "Drives each column's stored-weight RMS toward `target` via a damped\n"
+             "(`correction_rate`) multiplicative step. scale_invariant must match\n"
+             "whatever backward_dense(scale_invariant=...) is using -- see\n"
+             "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
+             "SCATTERED CSR ONLY (block4 support is a follow-up).")
         .def("get_value_scale_importance",  &SparseLinearLayer::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -1893,6 +1909,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerResync& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerResync::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2116,6 +2138,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerNoScale& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerNoScale::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2348,6 +2376,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2578,6 +2612,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerResyncDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerResyncDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2799,6 +2839,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerNoScaleDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerNoScaleDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2993,6 +3039,16 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
+             "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
+             "lives moves, from output_scale into the stored per-synapse weight code.\n"
+             "Drives each column's stored-weight RMS toward `target` via a damped\n"
+             "(`correction_rate`) multiplicative step. scale_invariant must match\n"
+             "whatever backward(scale_invariant=...) is using -- see\n"
+             "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
+             "SCATTERED CSR ONLY (block4 support is a follow-up).")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
             return py::array_t<SparseLinearLayer8::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -3056,6 +3112,9 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8Resync::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8Resync& self) {
             return py::array_t<SparseLinearLayer8Resync::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -3120,6 +3179,9 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8AdaMax::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8AdaMax& self) {
             return py::array_t<SparseLinearLayer8AdaMax::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},

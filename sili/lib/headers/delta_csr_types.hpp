@@ -1570,6 +1570,100 @@ public:
         for (std::size_t r = 0; r < L.rows; ++r) rescale_value_row(r, new_scale);
     }
 
+    // Gradient-free reparametrization: true_weight = stored_w *
+    // value_scale[row] * output_scale[col] is algebraically UNCHANGED by
+    // this -- only WHERE the magnitude lives moves, from output_scale
+    // into the stored per-synapse weight code. Drives each column's
+    // stored-weight RMS (across all n_in rows, including rows with no
+    // synapse in that column -- matches a dense parameter's zero-padded
+    // mean, see below) toward `target` via a DAMPED (correction_rate)
+    // multiplicative step per call rather than jumping there in one shot.
+    // Ported from sili_peridot's torch-validated prototype
+    // (toy_tile_recurrence_rmt_torch.py's _magnitude_rescale) -- see that
+    // module for the full derivation and the empirical finding that
+    // column-only (not also row/value_scale -- "both axes" was tested and
+    // found to consistently HURT) is the winning configuration.
+    //
+    // scale_invariant: when true, per-synapse `ci` already tracks the RAW
+    // gradient g (decoupled from S=value_scale*output_scale via
+    // update_cw's own scale_invariant flag) so it does NOT need rescaling
+    // here. When false, ci is calibrated to (g*S)^2 -- shrinking
+    // output_scale by k without correspondingly rescaling ci silently
+    // changes every touched synapse's effective RMSprop step size. See
+    // update_cw's own docstring for the matching root cause on the
+    // per-synapse weight update side.
+    //
+    // Column RMS is measured over n_in (the row COUNT), not nnz_in_col --
+    // a column with zero active synapses is skipped entirely (k=1, no-op)
+    // rather than treated as a real all-zero column, since "no synapse"
+    // (sparse) and "synapse present but currently zero" (torch's dense
+    // w_stored) are genuinely different things the sparse engine has no
+    // reason to conflate; a torch all-zero-but-present column would
+    // otherwise also degenerate toward the eps floor.
+    //
+    // SCATTERED CSR ONLY -- block4 support is a follow-up (see the
+    // rank-2/block4 extension task this mechanism is queued behind).
+    inline void magnitude_rescale_output(value_type target, value_type correction_rate,
+                                          bool scale_invariant, value_type eps = value_type(1e-8)) {
+        auto& dc = connections;
+        auto& L = dc.layout;
+        const std::size_t n_out = L.cols;
+        const std::size_t n_in  = L.rows;
+        if (n_out == 0 || n_in == 0) return;
+
+        std::vector<double> sum_sq(n_out, 0.0);
+        std::vector<std::size_t> col_count(n_out, 0);
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            if (n == 0) continue;
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const COL_TYPE col = cursor.advance();
+                const std::size_t vb = L.elem_start[r] + e;
+                const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
+                ++col_count[col];
+            }
+        }
+
+        std::vector<value_type> k(n_out, value_type(1));
+        for (std::size_t c = 0; c < n_out; ++c) {
+            if (col_count[c] == 0) continue;  // nothing to rescale here
+            const double mean_sq = sum_sq[c] / static_cast<double>(n_in);
+            const value_type col_rms = static_cast<value_type>(std::sqrt(mean_sq + static_cast<double>(eps)));
+            if (!std::isfinite(col_rms) || col_rms <= value_type(0)) continue;
+            value_type kc = target / col_rms;
+            if (kc < value_type(1e-6)) kc = value_type(1e-6);
+            kc = std::pow(kc, correction_rate);
+            if (!std::isfinite(kc) || kc <= value_type(0)) continue;
+            k[c] = kc;
+        }
+
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            if (n == 0) continue;
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const COL_TYPE col = cursor.advance();
+                if (k[col] == value_type(1)) continue;
+                const std::size_t vb = L.elem_start[r] + e;
+                const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                const value_type new_w   = w * k[col];
+                const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, new_imp);
+            }
+        }
+
+        for (std::size_t c = 0; c < n_out; ++c) {
+            if (k[c] == value_type(1)) continue;
+            const value_type new_os = get_output_scale(c) / k[c];
+            if (!std::isfinite(new_os)) continue;
+            set_output_scale_raw(c, new_os);
+        }
+    }
+
     inline void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {
         connections.set_limits(indices_limit_bytes, values_limit_bytes);
     }

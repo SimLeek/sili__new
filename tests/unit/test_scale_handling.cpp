@@ -180,6 +180,92 @@ TEST_CASE("rescale_value_row preserves the true weight value across a scale chan
     CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved
 }
 
+TEST_CASE("magnitude_rescale_output moves w_stored toward the target column RMS "
+         "while leaving true_weight algebraically unchanged",
+         "[scale][magnitude_rescale]") {
+    // 4 rows x 2 cols -- column 0 has all 4 rows connected (uniform
+    // magnitude, easy to predict the exact resulting RMS/k), column 1 has
+    // NO connections at all (must be left untouched: k=1, output_scale
+    // stays at its default 1.0 -- "no synapse" must not be treated like a
+    // torch dense zero). w=6.0 and imp=4.0 (both exact FP4_TABLE grid
+    // points) with target=3.0 keep every intermediate value ON the grid
+    // (k=0.5, new_w=3.0, new_output_scale=2.0, new_imp=1.0 -- all exact),
+    // so this isolates the RESCALE MATH from FP4's own quantization noise.
+    //
+    // NOTE: physical storage position for row r is NOT r itself -- each
+    // row gets blank/headroom slots reserved after its live elements (see
+    // delta_csr_from_absolute's elem_blank), so the real index is
+    // weights.connections.layout.elem_start[r] (this row's single live
+    // element is at offset 0 within that row's own span).
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1, 2, 3, 4};
+    std::vector<S> idx  = {0, 0, 0, 0};
+    std::vector<float> w = {6.0f, 6.0f, 6.0f, 6.0f}, imp = {4.0f, 4.0f, 4.0f, 4.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(4), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    const auto& L = weights.connections.layout;
+
+    // Column 0's stored-weight RMS is exactly 6.0. Full jump
+    // (correction_rate=1.0) toward target=3.0 -> k = target/rms = 0.5.
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/false);
+
+    // true_weight = stored_w * value_scale * output_scale must be
+    // preserved for every touched synapse in column 0.
+    for (std::size_t r = 0; r < 4; ++r) {
+        const std::size_t vb = L.elem_start[r];
+        const float stored = ValueAccessor<FP4BiPacked>::get_w(weights.connections.values, vb);
+        CHECK(stored == Catch::Approx(3.0f));
+        const float true_w = stored * weights.get_value_scale(r) * weights.get_output_scale(0);
+        CHECK(true_w == Catch::Approx(6.0f));
+    }
+
+    // output_scale[0] moved to 1/k = 2.0.
+    CHECK(weights.get_output_scale(0) == Catch::Approx(2.0f));
+
+    // Column 1 (no synapses at all) must be a complete no-op.
+    CHECK(weights.get_output_scale(1) == Catch::Approx(1.0f));
+
+    // ci (importance) for touched synapses scales by k^2 = 0.25 when
+    // scale_invariant=false (started at imp=4.0 -> 4.0*0.25=1.0).
+    for (std::size_t r = 0; r < 4; ++r) {
+        const std::size_t vb = L.elem_start[r];
+        const float imp_after = ValueAccessor<FP4BiPacked>::get_imp(weights.connections.values, vb);
+        CHECK(imp_after == Catch::Approx(1.0f));
+    }
+}
+
+TEST_CASE("magnitude_rescale_output leaves ci untouched when scale_invariant=true",
+         "[scale][magnitude_rescale][scale_invariant]") {
+    // Same setup as the previous test, but scale_invariant=true --
+    // update_cw's own scale_invariant flag already decouples ci from S,
+    // so rescaling ci here too would double-correct.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1, 2, 3, 4};
+    std::vector<S> idx  = {0, 0, 0, 0};
+    std::vector<float> w = {6.0f, 6.0f, 6.0f, 6.0f}, imp = {4.0f, 4.0f, 4.0f, 4.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(4), std::size_t(2), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    const auto& L = weights.connections.layout;
+
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/true);
+
+    for (std::size_t r = 0; r < 4; ++r) {
+        const std::size_t vb = L.elem_start[r];
+        const float imp_after = ValueAccessor<FP4BiPacked>::get_imp(weights.connections.values, vb);
+        CHECK(imp_after == Catch::Approx(4.0f));
+    }
+}
+
 // ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
 //
 // Per-COLUMN counterpart to value_scale: true_w = stored_w * value_scale[row]
