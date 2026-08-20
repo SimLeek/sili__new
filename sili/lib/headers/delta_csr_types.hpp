@@ -630,13 +630,33 @@ struct PlainRMSpropSynapsePolicy {
     // update" here means return 0 (a true no-op delta), matching
     // update_ci's own "keep old value" semantics -- same NaN/Inf guard
     // rationale as update_ci above and RMSpropScalePolicy::update.
+    // scale_invariant: default false (bit-identical to every existing
+    // result). ci above is calibrated to the RAW gradient g^2, unaffected
+    // by S -- but the historical formula below folds S into the
+    // numerator anyway, so raw isn't self-normalized w.r.t. S, and
+    // Delta(true_weight) = S*Delta(cw) ends up scaling QUADRATICALLY
+    // with S once S deviates from ~1.0 (found this session: fp32
+    // accuracy 1.0->0.18 once a mechanism deliberately moved S away
+    // from 1.0, despite true_weight = cw*S being algebraically
+    // unchanged by that move). scale_invariant=true computes raw from
+    // the RAW g (properly self-normalized by ci) and divides by S once
+    // at the very end instead, giving Delta(true_weight) = eff_lr*raw,
+    // independent of S. See BoundedRMSpropSynapsePolicy::update_cw's
+    // own copy of this same fix for the max_abs_delta-clip interaction.
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/) {
+                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/,
+                                 bool scale_invariant = false) {
         if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
-        const VALUE_TYPE delta = damp_by_importance
-            ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
-            : (-eff_lr * g * S);
+        VALUE_TYPE delta;
+        if (scale_invariant) {
+            const VALUE_TYPE raw = damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g);
+            delta = std::isfinite(raw) ? (eff_lr * raw / S) : VALUE_TYPE(0);
+        } else {
+            delta = damp_by_importance
+                ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
+                : (-eff_lr * g * S);
+        }
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
@@ -774,17 +794,29 @@ struct BoundedRMSpropSynapsePolicy {
     // PlainRMSpropSynapsePolicy::update_cw above, checked before the
     // max_abs_delta clip (clamping NaN against a finite bound is not a
     // reliable way to neutralize it).
+    //
+    // scale_invariant: default false (bit-identical to every existing
+    // result) -- see PlainRMSpropSynapsePolicy::update_cw's own copy of
+    // this docstring for the full derivation of why the historical
+    // g*S-in-numerator formula makes Delta(true_weight) scale
+    // quadratically with S. When true, the max_abs_delta clip is
+    // applied to `raw` (computed from raw g, before the /S division) --
+    // i.e. it bounds the properly S-normalized true-weight-space step,
+    // the task-relevant quantity, not the internal w_stored-space one
+    // (which is what's actually being deliberately resized by
+    // magnitude-scale reparametrization).
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE max_abs_delta) {
+                                 bool damp_by_importance, VALUE_TYPE max_abs_delta,
+                                 bool scale_invariant = false) {
         if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
-        VALUE_TYPE raw = damp_by_importance
-            ? (-g * S) / (std::sqrt(ci) + eps)
-            : (-g * S);
+        VALUE_TYPE raw = scale_invariant
+            ? (damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g))
+            : (damp_by_importance ? (-g * S) / (std::sqrt(ci) + eps) : (-g * S));
         if (!std::isfinite(raw)) return VALUE_TYPE(0);
         if (raw > max_abs_delta) raw = max_abs_delta;
         if (raw < -max_abs_delta) raw = -max_abs_delta;
-        const VALUE_TYPE delta = eff_lr * raw;
+        const VALUE_TYPE delta = scale_invariant ? (eff_lr * raw / S) : (eff_lr * raw);
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
@@ -895,12 +927,23 @@ struct PlainRMSpropSynapsePolicy<Block4Vec> {
     }
 
     // Same "0 delta on non-finite" guard as the scalar
-    // PlainRMSpropSynapsePolicy::update_cw above.
+    // PlainRMSpropSynapsePolicy::update_cw above. scale_invariant: see
+    // the scalar version's own docstring for the full derivation --
+    // host-side bool (like damp_by_importance), selects which SIMD
+    // formula runs, not a per-lane value.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec /*max_abs_delta*/) {
-        const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
-        const Block4Vec delta = damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+                                bool damp_by_importance, Block4Vec /*max_abs_delta*/,
+                                bool scale_invariant = false) {
+        Block4Vec delta;
+        if (scale_invariant) {
+            const Block4Vec neg_g = -g;
+            const Block4Vec raw = damp_by_importance ? neg_g / (block4_vec_sqrt(ci) + eps) : neg_g;
+            delta = (eff_lr * raw) / S;
+        } else {
+            const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
+            delta = damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+        }
         return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };
@@ -926,13 +969,24 @@ struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // for why (must match it exactly, or SIMD full-tile vs scalar-boundary
     // results would diverge for the same synapse). Same NaN/Inf guard as
     // the scalar version, checked before the clip.
+    // scale_invariant: see the scalar BoundedRMSpropSynapsePolicy::
+    // update_cw docstring above for the full derivation -- host-side
+    // bool (like damp_by_importance), selects which SIMD formula runs.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec max_abs_delta) {
-        const Block4Vec neg_g_S = -(g * S);
-        const Block4Vec raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
+                                bool damp_by_importance, Block4Vec max_abs_delta,
+                                bool scale_invariant = false) {
+        Block4Vec raw;
+        if (scale_invariant) {
+            const Block4Vec neg_g = -g;
+            raw = damp_by_importance ? neg_g / (block4_vec_sqrt(ci) + eps) : neg_g;
+        } else {
+            const Block4Vec neg_g_S = -(g * S);
+            raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
+        }
         const Block4Vec raw_safe = block4_vec_select_finite(raw, block4_vec_broadcast(0.0f));
-        const Block4Vec delta = eff_lr * block4_vec_clip_abs(raw_safe, max_abs_delta);
+        const Block4Vec clipped = block4_vec_clip_abs(raw_safe, max_abs_delta);
+        const Block4Vec delta = scale_invariant ? (eff_lr * clipped) / S : (eff_lr * clipped);
         return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };

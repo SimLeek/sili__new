@@ -36,6 +36,8 @@ constexpr float kSynapsePolicyBeta1         = 0.9f;
 constexpr float kSynapsePolicyMinDecayFrac  = 0.0f;   // true no-op (<=beta2)
 constexpr float kSynapsePolicyMaxAbsDelta   = 2.0f;   // raw-space (pre-lr-multiply)
 constexpr float kSynapsePolicyMaxCi         = 100.0f;
+constexpr float kSynapsePolicyZeroEscapeEps = 0.1f;
+constexpr bool  kSynapsePolicyScaleInvariant = false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
 
 // One-time (per-process) stderr warning when a caller uses a learning_rate
 // well outside BoundedRMSpropSynapsePolicy's validated-safe range for its
@@ -524,7 +526,8 @@ public:
                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                                  V max_ci = kSynapsePolicyMaxCi) {
+                                  V max_ci = kSynapsePolicyMaxCi,
+                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
@@ -535,7 +538,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1110,7 +1114,8 @@ public:
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                             V max_ci = kSynapsePolicyMaxCi) {
+                             V max_ci = kSynapsePolicyMaxCi,
+                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
@@ -1121,7 +1126,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1332,7 +1338,8 @@ public:
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                             V max_ci = kSynapsePolicyMaxCi) {
+                             V max_ci = kSynapsePolicyMaxCi,
+                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
@@ -1343,7 +1350,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1536,6 +1544,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -1776,6 +1785,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -1998,6 +2008,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2222,6 +2233,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2458,6 +2470,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2678,6 +2691,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2898,7 +2912,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
-             py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
@@ -2937,7 +2952,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
-             py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
@@ -3004,7 +3020,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
-             py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8Resync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8Resync::synap_row_step,
@@ -3067,7 +3084,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
-             py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8AdaMax::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8AdaMax::synap_row_step,

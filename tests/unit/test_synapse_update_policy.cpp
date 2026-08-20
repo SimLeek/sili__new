@@ -49,6 +49,36 @@ TEST_CASE("PlainRMSpropSynapsePolicy::update_cw applies S correctly",
     CHECK(with_S2 == Catch::Approx(2.0f * with_S1));
 }
 
+TEST_CASE("PlainRMSpropSynapsePolicy::update_cw's scale_invariant flag makes the "
+         "TRUE-WEIGHT delta (S*update_cw) independent of S",
+         "[synapse_policy][plain][scale_invariant]") {
+    // Root cause this flag fixes (see sili_peridot's scale_invariant_chain_rule
+    // torch prototype): the historical formula computes raw from g*S, so
+    // Δtrue_weight = S*update_cw(...) scales QUADRATICALLY with S once S
+    // deviates from 1.0 (S²-collapse). scale_invariant=true instead computes
+    // raw from the bare g and divides by S at apply time, so Δtrue_weight is
+    // exactly S*(eff_lr*raw/S) = eff_lr*raw -- flat in S.
+    using P = PlainRMSpropSynapsePolicy<float>;
+    const float g = 0.5f, ci = 0.1f, eff_lr = 0.01f, eps = 1e-8f;
+    const float dcw_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/true);
+    const float dcw_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/true);
+    const float true_delta_S1 = 1.0f * dcw_S1;
+    const float true_delta_S4 = 4.0f * dcw_S4;
+    CHECK(true_delta_S1 == Catch::Approx(true_delta_S4));
+
+    // Confirm the OLD (default/false) formula does NOT have this property --
+    // it reproduces the quadratic-in-S collapse the flag exists to fix.
+    const float dcw_S1_old = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/false);
+    const float dcw_S4_old = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/false);
+    const float true_delta_S1_old = 1.0f * dcw_S1_old;
+    const float true_delta_S4_old = 4.0f * dcw_S4_old;
+    CHECK(true_delta_S4_old == Catch::Approx(16.0f * true_delta_S1_old));
+
+    // Omitting the argument entirely must default to the old behavior --
+    // exact bit-for-bit backward compatibility for every existing call site.
+    CHECK(P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f) == Catch::Approx(dcw_S1_old));
+}
+
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci matches plain EMA when ci is GROWING",
          "[synapse_policy][bounded]") {
     using P = BoundedRMSpropSynapsePolicy<float>;
@@ -174,6 +204,39 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's clip preserves sign",
     const float delta_neg_g = P::update_cw(-1.0f, ci, S, eff_lr, eps, true, max_abs_delta);
     CHECK(delta_pos_g == Catch::Approx(-eff_lr * max_abs_delta));  // positive g -> negative (descent) delta
     CHECK(delta_neg_g == Catch::Approx(eff_lr * max_abs_delta));
+}
+
+TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's scale_invariant flag makes the "
+         "TRUE-WEIGHT delta (S*update_cw) independent of S, clip included",
+         "[synapse_policy][bounded][scale_invariant]") {
+    // Same property as the Plain-policy version of this test, but also
+    // confirms the clip (max_abs_delta) is applied to the S-INDEPENDENT raw
+    // value before the eff_lr*raw/S division -- clipping the raw gradient
+    // step, not the final S-scaled delta, is what makes the clip threshold
+    // mean the same thing regardless of a synapse's current output_scale.
+    using P = BoundedRMSpropSynapsePolicy<float>;
+    const float g = 0.5f, ci = 0.1f, eff_lr = 0.01f, eps = 1e-8f;
+    const float max_abs_delta = 1e30f;  // huge -- clip must not engage here
+    const float dcw_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/true);
+    const float dcw_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/true);
+    CHECK(1.0f * dcw_S1 == Catch::Approx(4.0f * dcw_S4));
+
+    // Old (default/false) formula: quadratic-in-S collapse still present.
+    const float dcw_S1_old = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/false);
+    const float dcw_S4_old = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/false);
+    CHECK(4.0f * dcw_S4_old == Catch::Approx(16.0f * (1.0f * dcw_S1_old)));
+
+    // Omitting the argument defaults to the old (false) behavior exactly.
+    CHECK(P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta) == Catch::Approx(dcw_S1_old));
+
+    // Clip engages on the raw (pre-division) value: with a tiny max_abs_delta,
+    // both S=1 and S=4 must clip to the SAME true-weight delta magnitude,
+    // proving the clip threshold is S-independent under scale_invariant=true.
+    const float tight_clip = 0.001f;
+    const float clipped_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, tight_clip, /*scale_invariant=*/true);
+    const float clipped_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, tight_clip, /*scale_invariant=*/true);
+    CHECK(1.0f * clipped_S1 == Catch::Approx(4.0f * clipped_S4));
+    CHECK(std::abs(clipped_S1) == Catch::Approx(eff_lr * tight_clip));
 }
 
 TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula exactly",

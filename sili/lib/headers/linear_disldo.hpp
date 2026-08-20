@@ -482,7 +482,8 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  min_decay_frac = 0.0f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_abs_delta = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_ci = 1e30f,
-    typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f)
+    typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f,
+    bool         scale_invariant = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     // Same chosen policy (SynapsePolicyT), instantiated at both widths --
@@ -792,7 +793,8 @@ void disldo_backward(
                                                       static_cast<value_type>(contrib_agg),
                                                       beta2, min_decay_frac, max_ci);
                         cw += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, value_type(1),
-                                                       effective_lr, eps, damp_by_importance, max_abs_delta);
+                                                       effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                       scale_invariant);
                         // Defer the store until value_scale[r] AND
                         // output_scale[col] are BOTH finalized for this
                         // call -- storing now would use the stale
@@ -931,7 +933,8 @@ void disldo_backward(
                                                       static_cast<value_type>(contrib_agg),
                                                       beta2, min_decay_frac, max_ci);
                         quant += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, S,
-                                                          effective_lr, eps, damp_by_importance, max_abs_delta);
+                                                          effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                          scale_invariant);
                         cw = quant * S;
                         if constexpr (StochasticRounding) {
                             ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, quant, ci / combined_imp_scale);
@@ -1347,7 +1350,7 @@ void disldo_backward(
                                     ci_v = SynapsePolicyVec::update_ci(ci_v, g_agg_v, contrib_agg_v, beta2_v, min_decay_frac_v, max_ci_v);
                                     const Block4Vec delta_v = SynapsePolicyVec::update_cw(
                                         g_agg_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
-                                        damp_by_importance, max_abs_delta_v);
+                                        damp_by_importance, max_abs_delta_v, scale_invariant);
                                     cw_v += delta_v;
                                 }
                                 block4_vec_store(cw4_8, cw_v);
@@ -1398,7 +1401,8 @@ void disldo_backward(
                                         const value_type contrib_agg = static_cast<value_type>(contrib_agg4_8[lj]);
                                         ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
                                         cw4_8[lj] = cw_start4_8[lj] + SynapsePolicy::update_cw(
-                                            g_agg, ci4_8[lj], value_type(1), effective_lr, eps, damp_by_importance, max_abs_delta);
+                                            g_agg, ci4_8[lj], value_type(1), effective_lr, eps, damp_by_importance, max_abs_delta,
+                                            scale_invariant);
                                     }
                                 }
                             }
@@ -1486,7 +1490,8 @@ void disldo_backward(
                                                                   static_cast<value_type>(contrib_agg),
                                                                   beta2, min_decay_frac, max_ci);
                                     cw += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, value_type(1),
-                                                                   effective_lr, eps, damp_by_importance, max_abs_delta);
+                                                                   effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                                   scale_invariant);
                                     mrow_at(row, 0) += mrow_local;
                                     mcol_at(col, 0) += mcol_local;
                                     mrow_at_contrib(row, 0) += mrow_local_contrib;
@@ -1720,7 +1725,7 @@ void disldo_backward(
                                 // 2 blocks up).
                                 const Block4Vec delta_v = SynapsePolicyVec::update_cw(
                                     g_agg_v, ci_v, combined_scale_v, effective_lr_v, eps_v,
-                                    damp_by_importance, max_abs_delta_v);
+                                    damp_by_importance, max_abs_delta_v, scale_invariant);
                                 quant_v += delta_v;
                             }
                             block4_vec_store(quant4, quant_v);
@@ -1780,7 +1785,8 @@ void disldo_backward(
                                     const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
                                     ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
                                     quant4[lj] = quant_start4[lj] + SynapsePolicy::update_cw(
-                                        g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta);
+                                        g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta,
+                                        scale_invariant);
                                 }
                             }
                         }
@@ -1837,7 +1843,8 @@ void disldo_backward(
                                 const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
                                 ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
                                 quant4[lj] = quant_start4[lj] + SynapsePolicy::update_cw(
-                                    g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta);
+                                    g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta,
+                                    scale_invariant);
                             }
                         }
                     }

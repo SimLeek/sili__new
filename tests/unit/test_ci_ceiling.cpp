@@ -86,8 +86,9 @@ struct DebugBoundedPolicy {
     }
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE max_abs_delta) {
-        return BoundedRMSpropSynapsePolicy<VALUE_TYPE>::update_cw(g, ci, S, eff_lr, eps, damp_by_importance, max_abs_delta);
+                                 bool damp_by_importance, VALUE_TYPE max_abs_delta,
+                                 bool scale_invariant = false) {
+        return BoundedRMSpropSynapsePolicy<VALUE_TYPE>::update_cw(g, ci, S, eff_lr, eps, damp_by_importance, max_abs_delta, scale_invariant);
     }
 };
 
@@ -113,8 +114,9 @@ struct DebugBoundedPolicy<Block4Vec> {
     }
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec max_abs_delta) {
-        return BoundedRMSpropSynapsePolicy<Block4Vec>::update_cw(g, ci, S, eff_lr, eps, damp_by_importance, max_abs_delta);
+                                bool damp_by_importance, Block4Vec max_abs_delta,
+                                bool scale_invariant = false) {
+        return BoundedRMSpropSynapsePolicy<Block4Vec>::update_cw(g, ci, S, eff_lr, eps, damp_by_importance, max_abs_delta, scale_invariant);
     }
 };
 

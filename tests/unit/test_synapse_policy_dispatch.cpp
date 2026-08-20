@@ -49,7 +49,8 @@ struct SentinelSynapsePolicy {
     }
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE /*ci*/, VALUE_TYPE /*S*/,
                                  VALUE_TYPE /*eff_lr*/, VALUE_TYPE /*eps*/,
-                                 bool /*damp_by_importance*/, VALUE_TYPE /*max_abs_delta*/) {
+                                 bool /*damp_by_importance*/, VALUE_TYPE /*max_abs_delta*/,
+                                 bool /*scale_invariant*/ = false) {
         return g >= VALUE_TYPE(0) ? VALUE_TYPE(-1e6) : VALUE_TYPE(1e6);
     }
 };
@@ -62,7 +63,8 @@ struct SentinelSynapsePolicy<Block4Vec> {
     }
     static Block4Vec update_cw(Block4Vec g, Block4Vec /*ci*/, Block4Vec /*S*/,
                                 Block4Vec /*eff_lr*/, Block4Vec /*eps*/,
-                                bool /*damp_by_importance*/, Block4Vec /*max_abs_delta*/) {
+                                bool /*damp_by_importance*/, Block4Vec /*max_abs_delta*/,
+                                bool /*scale_invariant*/ = false) {
         Block4Vec result;
         for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = g[i] >= 0.0f ? -1e6f : 1e6f;
         return result;
