@@ -1517,3 +1517,153 @@ TEST_CASE("disldo_backward's scattered FP8 write path uses stochastic rounding "
     }
     CHECK(distinct_results.size() > 1);
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Near-autapse tiny-magnitude test: can ORDINARY backprop alone (no
+// magnitude_rescale_output) drive a single synapse's true output down to
+// ~1e-5, the kind of per-synapse contribution 1000+-way superposition
+// (MQAR's real need) would require? true_weight = stored_w * value_scale *
+// output_scale -- stored_w is floor-limited (FP4's smallest nonzero
+// magnitude is 0.5; FP8's is far finer but still floored), so reaching a
+// tiny TRUE weight requires value_scale/output_scale to shrink, not
+// stored_w. Minimal 1x1 layer (one input, one output, ONE synapse -- as
+// close to a literal autapse as this feedforward class permits) isolates
+// that mechanism with nothing else to hide behind. Loss = (out-target)^2
+// penalizes BOTH overshoot and undershoot, so this tests genuine
+// convergence to a small value, not just "decay toward zero."
+//
+// Calibrated directly (Python, DISLDOLayer/DISLDOLayer8 at the same
+// target/lr/step count) before writing these assertions -- see
+// conversation. Found along the way, not asserted on here (separate
+// follow-up): FP4's stored_w genuinely goes to the literal ZERO code for
+// a transient stretch (~500-1500 steps) whenever the target needs a
+// smaller true weight than the current value_scale/stored_w combination
+// can produce, recovering once value_scale (via disldo_backward's
+// separate dead-row bootstrap path) has shrunk enough on its own --  a
+// real, observed instance of "backprop pushing stored_w toward the dead
+// code," not merely a theoretical risk. FP8 does not show this pattern in
+// the same calibration run and converges more smoothly, though noisier
+// (larger relative jitter) once deep in its own subnormal-adjacent
+// region -- averaging over the tail of training, not reading a single
+// final step, is required to see through that noise, hence the
+// mean-of-last-N-steps check below rather than a single final-step check.
+TEST_CASE("near-autapse: ordinary backprop alone can drive FP4's true output "
+         "down to ~1e-5 (no magnitude_rescale_output)",
+         "[scale][magnitude][regression][tiny_target]") {
+    fp4_seed_stochastic_rng(0);  // determinism -- matches the Python calibration this test's tolerance was set from
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(1));
+    weights.set_output_scale_raw(0, 1.0f);  // makes output_scale gradient-trainable
+
+    const float target = 1e-5f;
+    const float lr = 0.02f;
+    const int   total_steps = 10000;
+    const int   tail_window = 200;  // average the last N steps, not one snapshot -- see note above
+
+    std::vector<float> input = {1.0f};
+    double tail_sum_abs = 0.0;
+    for (int step = 0; step < total_steps; ++step) {
+        std::vector<float> output(1, 0.0f);
+        disldo_forward<S, FP4BiPacked, COL_TYPE>(input.data(), S(1), S(1), weights, output.data(), 1);
+        REQUIRE(std::isfinite(output[0]));
+
+        const float diff = output[0] - target;
+        std::vector<float> dy = {2.0f * diff};
+        std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+        disldo_backward<S, FP4BiPacked, COL_TYPE>(
+            input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+            in_acc.data(), gr_acc.data(), lr, 1,
+            /*lr_per_row_nnz=*/false, /*damp_by_importance=*/true,
+            /*beta2=*/0.999f, /*eps=*/1e-8f, /*beta1=*/0.9f, /*min_decay_frac=*/0.0f,
+            /*max_abs_delta=*/2.0f, /*max_ci=*/100.0f);  // production defaults (kSynapsePolicy*)
+
+        if (step >= total_steps - tail_window) tail_sum_abs += std::abs(double(output[0]));
+    }
+    const double tail_mean_abs = tail_sum_abs / double(tail_window);
+
+    // Within one order of magnitude of the target -- not exact (FP4's own
+    // quantization floor makes exact convergence to an arbitrary target
+    // unrealistic), but genuinely reached the right REGIME, confirming
+    // ordinary backprop alone (via value_scale/output_scale, not
+    // magnitude_rescale_output) can get a real FP4 synapse down to ~1e-5.
+    // Within 1.5 orders of magnitude either side -- deliberately not
+    // tight (this test's specific numeric trajectory depends on RNG
+    // stream POSITION, not just seed: this test's fixed w=1.0 start
+    // consumes no preseed draws, unlike the DISLDOLayer Python
+    // calibration this tolerance was informed by, which does -- same
+    // seed, different position, different specific numbers even though
+    // both land consistently in the tens-of-target range). The real
+    // claim under test is "reached the small-value REGIME via ordinary
+    // backprop alone" (~1e-5, not stuck near the ~1.0 starting output),
+    // not an exact convergence point.
+    CHECK(tail_mean_abs > target / 30.0);
+    CHECK(tail_mean_abs < target * 30.0);
+    CHECK(std::isfinite(tail_mean_abs));
+}
+
+TEST_CASE("near-autapse: ordinary backprop alone can drive FP8's true output "
+         "down to ~1e-5 (no magnitude_rescale_output)",
+         "[scale][magnitude][regression][tiny_target]") {
+    fp4_seed_stochastic_rng(0);  // same thread-local RNG FP8 stochastic rounding shares with FP4
+    using S = int;
+    using COL_TYPE = uint32_t;
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {1.0f}, imp = {0.0f};
+    auto dc = delta_csr_from_absolute<S, FP8BiValues, COL_TYPE>(
+        ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+
+    SparseLinearWeightsDelta<S, FP8BiValues, COL_TYPE> weights;
+    weights.connections = dc;
+    weights.out_degree.assign(1, S(1));
+    weights.set_output_scale_raw(0, 1.0f);
+
+    const float target = 1e-5f;
+    const float lr = 0.02f;
+    const int   total_steps = 10000;
+    const int   tail_window = 200;
+
+    std::vector<float> input = {1.0f};
+    double tail_sum_abs = 0.0;
+    for (int step = 0; step < total_steps; ++step) {
+        std::vector<float> output(1, 0.0f);
+        disldo_forward<S, FP8BiValues, COL_TYPE>(input.data(), S(1), S(1), weights, output.data(), 1);
+        REQUIRE(std::isfinite(output[0]));
+
+        const float diff = output[0] - target;
+        std::vector<float> dy = {2.0f * diff};
+        std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+        disldo_backward<S, FP8BiValues, COL_TYPE>(
+            input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+            in_acc.data(), gr_acc.data(), lr, 1,
+            /*lr_per_row_nnz=*/false, /*damp_by_importance=*/true,
+            /*beta2=*/0.999f, /*eps=*/1e-8f, /*beta1=*/0.9f, /*min_decay_frac=*/0.0f,
+            /*max_abs_delta=*/2.0f, /*max_ci=*/100.0f);
+
+        if (step >= total_steps - tail_window) tail_sum_abs += std::abs(double(output[0]));
+    }
+    const double tail_mean_abs = tail_sum_abs / double(tail_window);
+
+    // Within 1.5 orders of magnitude either side -- deliberately not
+    // tight (this test's specific numeric trajectory depends on RNG
+    // stream POSITION, not just seed: this test's fixed w=1.0 start
+    // consumes no preseed draws, unlike the DISLDOLayer Python
+    // calibration this tolerance was informed by, which does -- same
+    // seed, different position, different specific numbers even though
+    // both land consistently in the tens-of-target range). The real
+    // claim under test is "reached the small-value REGIME via ordinary
+    // backprop alone" (~1e-5, not stuck near the ~1.0 starting output),
+    // not an exact convergence point.
+    CHECK(tail_mean_abs > target / 30.0);
+    CHECK(tail_mean_abs < target * 30.0);
+    CHECK(std::isfinite(tail_mean_abs));
+}
