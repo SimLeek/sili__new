@@ -3,6 +3,7 @@
 #include "../../sili/lib/headers/sisldo_ops.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
+#include <set>
 
 // ── Per-row importance_scale ──────────────────────────────────────────────────
 //
@@ -1187,4 +1188,51 @@ TEST_CASE("disldo_backward_sparse_grad's dx and value_scale gradient account for
     // (0.5) stays fixed, so true_w after update = expected_scale * 0.5.
     CHECK(weights.get_value_scale(0) == Catch::Approx(expected_scale).margin(1e-3f));
     CHECK(weights.get_value_scale_importance(0) == Catch::Approx(new_vs_imp).margin(1e-4f));
+}
+
+// ── FP8 stochastic rounding (task: verify it's active, not just FP4) ──────────
+//
+// disldo_backward's StochasticRounding template parameter defaults to true
+// and every caller in cpu_backend.cpp that builds an FP8-backed layer
+// (SparseLinearLayer8Impl) omits this template argument entirely, so it
+// gets that same default -- this test proves that default is genuinely
+// EXERCISED for FP8's scattered write path (ValueAccessor<FP8BiValues>::
+// set_stochastic, not the deterministic set()), not just theoretically
+// available at the fp8quant.hpp codec level (already covered by
+// test_fp8_bitshift.cpp's own unbiasedness check).
+TEST_CASE("disldo_backward's scattered FP8 write path uses stochastic rounding "
+         "by default (StochasticRounding's true default is actually reached)",
+         "[fp8][stochastic][regression]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    // A tiny learning-rate update lands the new stored weight strictly
+    // between two adjacent representable FP8 codes -- deterministic
+    // rounding would pick the SAME nearest code every single call;
+    // stochastic (dithered) rounding must disagree across repeated,
+    // otherwise-identical calls often enough that 200 repeats see both.
+    std::vector<S> ptrs = {0, 1};
+    std::vector<S> idx  = {0};
+    std::vector<float> w = {0.1234f}, imp = {0.0f};
+
+    std::set<float> distinct_results;
+    for (int trial = 0; trial < 200; ++trial) {
+        auto dc = delta_csr_from_absolute<S, FP8BiValues, COL_TYPE>(
+            ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
+        SparseLinearWeightsDelta<S, FP8BiValues, COL_TYPE> weights;
+        weights.connections = dc;
+        weights.out_degree.assign(1, S(0));
+
+        std::vector<float> input = {1.0f}, dy = {0.0173f};
+        std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
+        // Default template args (no explicit StochasticRounding=...) --
+        // this IS the exact call shape SparseLinearLayer8Impl::backward
+        // uses (see cpu_backend.cpp), so this reaches the real default.
+        disldo_backward<S, FP8BiValues, COL_TYPE>(
+            input.data(), S(1), S(1), dy.data(), weights, dx.data(),
+            in_acc.data(), gr_acc.data(), /*learning_rate=*/0.001f, 1);
+
+        const float stored = ValueAccessor<FP8BiValues>::get_w(weights.connections.values, 0);
+        distinct_results.insert(stored);
+    }
+    CHECK(distinct_results.size() > 1);
 }
