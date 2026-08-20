@@ -1601,8 +1601,22 @@ public:
     // reason to conflate; a torch all-zero-but-present column would
     // otherwise also degenerate toward the eps floor.
     //
-    // SCATTERED CSR ONLY -- block4 support is a follow-up (see the
-    // rank-2/block4 extension task this mechanism is queued behind).
+    // Covers BOTH storages -- scattered CSR (`connections`) AND block4
+    // (`block4`) -- not scattered-only. A real training layer promotes
+    // synapses between the two continuously (synaptogenesis/pruning), so
+    // a column's live weight can live in either storage, or split across
+    // both, at any given moment; rescaling only one side would silently
+    // leave the other side's synapses un-rescaled while still dividing
+    // the SHARED output_scale[col] they both read, corrupting their true
+    // weight. Both FP4 (Block4Store, nibble-packed weight|imp<<4) and
+    // FP8 (Block4Store8, separate weight/importance byte planes) are
+    // handled via the same `if constexpr` dispatch process_tile-style
+    // code elsewhere in this codebase already uses -- see delta_csr_
+    // memory.hpp's own scattered+block4 combined-export loop for the
+    // read-side precedent this mirrors. Re-quantization here is
+    // DETERMINISTIC (fp4_quantize/fp8_quantize), matching rescale_
+    // value_row's own convention for this class of scale-bookkeeping
+    // rewrite (not the gradient-driven stochastic set_stochastic()).
     inline void magnitude_rescale_output(value_type target, value_type correction_rate,
                                           bool scale_invariant, value_type eps = value_type(1e-8)) {
         auto& dc = connections;
@@ -1623,6 +1637,37 @@ public:
                 const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
                 ++col_count[col];
+            }
+        }
+        const auto& BL = block4.block_layout;
+        for (std::size_t br = 0; br < BL.rows; ++br) {
+            const std::size_t n_bc = BL.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = block4.row_cursor(uint32_t(br));
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+                const uint32_t bc = bc_cursor.advance();
+                const auto tile = block4.find(uint32_t(br), bc);
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= n_out) continue;
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        if (row >= n_in) continue;
+                        value_type w;
+                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                            const uint8_t w_byte = tile.at_weight(li, lj);
+                            const uint8_t i_byte = tile.at_importance(li, lj);
+                            if (w_byte == 0 && i_byte == 0) continue;  // empty slot
+                            w = fp8_decode_bits(w_byte);
+                        } else {
+                            const uint8_t byte = tile.at(li, lj);
+                            if (byte == 0) continue;  // empty slot
+                            w = FP4_TABLE[byte & 0xFu];
+                        }
+                        sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
+                        ++col_count[col];
+                    }
+                }
             }
         }
 
@@ -1653,6 +1698,52 @@ public:
                 const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
                 if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
                 ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, new_imp);
+            }
+        }
+        for (std::size_t br = 0; br < BL.rows; ++br) {
+            const std::size_t n_bc = BL.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = block4.row_cursor(uint32_t(br));
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+                const uint32_t bc = bc_cursor.advance();
+                // Any column in this tile need rescaling? Skip the whole
+                // tile (no mutable handle, no dirty/re-pack cost) if not.
+                bool any_col_touched = false;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col < n_out && k[col] != value_type(1)) { any_col_touched = true; break; }
+                }
+                if (!any_col_touched) continue;
+                auto tile = block4.find(uint32_t(br), bc);
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= n_out || k[col] == value_type(1)) continue;
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        if (row >= n_in) continue;
+                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                            const uint8_t w_byte = tile.at_weight(li, lj);
+                            const uint8_t i_byte = tile.at_importance(li, lj);
+                            if (w_byte == 0 && i_byte == 0) continue;
+                            const value_type w   = fp8_decode_bits(w_byte);
+                            const value_type imp = fp8_decode_bits(i_byte);
+                            const value_type new_w   = w * k[col];
+                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                            tile.at_weight(li, lj)     = fp8_quantize(new_w);
+                            tile.at_importance(li, lj) = fp8_quantize(new_imp);
+                        } else {
+                            const uint8_t byte = tile.at(li, lj);
+                            if (byte == 0) continue;
+                            const value_type w   = FP4_TABLE[byte & 0xFu];
+                            const value_type imp = FP4_TABLE[(byte >> 4) & 0xFu];
+                            const value_type new_w   = w * k[col];
+                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                            tile.at(li, lj) = uint8_t(fp4_quantize(new_w) | (fp4_quantize(new_imp) << 4));
+                        }
+                    }
+                }
             }
         }
 

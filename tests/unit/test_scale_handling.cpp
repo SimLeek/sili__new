@@ -1,6 +1,7 @@
 #include "../../sili/lib/headers/sparse_struct.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
 #include "../../sili/lib/headers/sisldo_ops.hpp"
+#include "../../sili/lib/headers/delta_csr_memory.hpp"
 #include "tests_main.hpp"
 #include <catch2/catch_all.hpp>
 #include <set>
@@ -313,6 +314,175 @@ TEST_CASE("magnitude_rescale_output applies the SAME rescale factor to every "
     // New S = 1*4 + 1*6 = 10.0; true_weight = 3.0*10.0 = 30.0 -- unchanged.
     const float true_after = stored_after * weights.get_scale(0, 0);
     CHECK(true_after == Catch::Approx(30.0f));
+}
+
+TEST_CASE("magnitude_rescale_output rescales BLOCK4-resident FP4 synapses too, "
+         "not just scattered CSR ones",
+         "[scale][magnitude_rescale][block4][fp4]") {
+    // A real training layer promotes/demotes synapses between scattered
+    // CSR and block4 continuously -- if magnitude_rescale_output only
+    // touched scattered entries, block4-resident synapses in the SAME
+    // column would be left un-rescaled while the column's SHARED
+    // output_scale still gets divided by k, silently corrupting their
+    // true weight. This loads a layer ENTIRELY into block4 (via
+    // block4_load_dense, scattered side stays empty) and checks the
+    // exact same invariant the scattered-only tests above check.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    const std::size_t n_in = 4, n_out = 4;  // exactly one block4 tile, no boundary clipping
+
+    std::vector<uint8_t> weight_codes(n_in * n_out, fp4_quantize(6.0f));
+    std::vector<uint8_t> importance_codes(n_in * n_out, fp4_quantize(4.0f));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    // Real layer construction (matches every actual class's constructor)
+    // always initializes connections via delta_csr_from_absolute -- even
+    // an EMPTY scattered side needs its row_nnz()-backing arrays properly
+    // sized (rows+1/rows), not just .layout.rows/.cols poked by hand, or
+    // magnitude_rescale_output's own scattered-side pass (which every
+    // real layer's connections DOES support, unconditionally) reads
+    // out-of-bounds.
+    std::vector<S> empty_ptrs(n_in + 1, S(0));
+    std::vector<S> empty_idx;
+    std::vector<float> empty_w, empty_imp;
+    weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        empty_ptrs, empty_idx, empty_w, empty_imp, n_in, n_out, std::size_t(64), std::size_t(64));
+    block4_load_dense<S, FP4BiPacked, COL_TYPE>(
+        weights, weight_codes.data(), importance_codes.data(), n_in, n_out);
+
+    REQUIRE(weights.block4.live_synapses() == n_in * n_out);
+    REQUIRE(weights.connections.nnz() == 0);  // scattered side untouched by the loader
+
+    // Every column's stored-weight RMS is exactly 6.0 (4 rows, all 6.0).
+    // Full jump toward target=3.0 -> k=0.5.
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/false);
+
+    for (uint32_t li = 0; li < 4; ++li) {
+        for (uint32_t lj = 0; lj < 4; ++lj) {
+            const auto tile = weights.block4.find(0, 0);
+            const uint8_t byte = tile.at(li, lj);
+            REQUIRE(byte != 0);
+            const float stored = FP4_TABLE[byte & 0xFu];
+            const float imp    = FP4_TABLE[(byte >> 4) & 0xFu];
+            CHECK(stored == Catch::Approx(3.0f));
+            CHECK(imp == Catch::Approx(1.0f));  // 4.0 * k^2 = 4.0*0.25
+            const float true_w = stored * weights.get_scale(li, lj);
+            CHECK(true_w == Catch::Approx(6.0f));
+        }
+    }
+    for (std::size_t c = 0; c < n_out; ++c)
+        CHECK(weights.get_output_scale(c) == Catch::Approx(2.0f));  // 1/k
+}
+
+TEST_CASE("magnitude_rescale_output rescales BLOCK4-resident FP8 synapses too",
+         "[scale][magnitude_rescale][block4][fp8]") {
+    using S = int;
+    using COL_TYPE = uint32_t;
+    const std::size_t n_in = 4, n_out = 4;
+
+    std::vector<uint8_t> weight_codes(n_in * n_out, fp8_quantize(6.0f));
+    std::vector<uint8_t> importance_codes(n_in * n_out, fp8_quantize(4.0f));
+
+    SparseLinearWeightsDelta<S, FP8BiValues, COL_TYPE> weights;
+    std::vector<S> empty_ptrs(n_in + 1, S(0));
+    std::vector<S> empty_idx;
+    std::vector<float> empty_w, empty_imp;
+    weights.connections = delta_csr_from_absolute<S, FP8BiValues, COL_TYPE>(
+        empty_ptrs, empty_idx, empty_w, empty_imp, n_in, n_out, std::size_t(64), std::size_t(64));
+    block4_load_dense<S, FP8BiValues, COL_TYPE>(
+        weights, weight_codes.data(), importance_codes.data(), n_in, n_out);
+
+    REQUIRE(weights.block4.live_synapses() == n_in * n_out);
+    REQUIRE(weights.connections.nnz() == 0);
+
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/false);
+
+    for (uint32_t li = 0; li < 4; ++li) {
+        for (uint32_t lj = 0; lj < 4; ++lj) {
+            const auto tile = weights.block4.find(0, 0);
+            const uint8_t w_byte = tile.at_weight(li, lj);
+            const uint8_t i_byte = tile.at_importance(li, lj);
+            REQUIRE(w_byte != 0);
+            const float stored = fp8_decode_bits(w_byte);
+            const float imp    = fp8_decode_bits(i_byte);
+            CHECK(stored == Catch::Approx(3.0f).margin(0.05f));
+            CHECK(imp == Catch::Approx(1.0f).margin(0.05f));
+            const float true_w = stored * weights.get_scale(li, lj);
+            CHECK(true_w == Catch::Approx(6.0f).margin(0.1f));
+        }
+    }
+    for (std::size_t c = 0; c < n_out; ++c)
+        CHECK(weights.get_output_scale(c) == Catch::Approx(2.0f).margin(0.05f));
+}
+
+TEST_CASE("magnitude_rescale_output rescales a MIXED scattered+block4 column consistently",
+         "[scale][magnitude_rescale][block4][mixed]") {
+    // The exact scenario the user flagged: a column with SOME synapses in
+    // scattered CSR and SOME in block4 (promotion/demotion leaves layers
+    // in this mixed state routinely). Both sides must be measured into
+    // the SAME column RMS and rescaled by the SAME k, since they share
+    // one output_scale[col].
+    using S = int;
+    using COL_TYPE = uint32_t;
+    const std::size_t n_in = 8, n_out = 4;  // 2 block-rows x 1 block-col
+
+    // Block4: rows 0-3, all four columns, weight=6.0/imp=4.0 (same as above).
+    std::vector<uint8_t> weight_codes(4 * n_out, fp4_quantize(6.0f));
+    std::vector<uint8_t> importance_codes(4 * n_out, fp4_quantize(0.0f));
+
+    SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
+    weights.connections.layout.rows = n_in;
+    weights.connections.layout.cols = n_out;
+    block4_load_dense<S, FP4BiPacked, COL_TYPE>(
+        weights, weight_codes.data(), importance_codes.data(), 4, n_out);
+
+    // Scattered: rows 4-7, column 0 only, weight=6.0 (same magnitude as
+    // the block4 side, so the combined column-0 RMS is still exactly 6.0
+    // whether measured from 8 rows of 6.0 or a mix of block4+scattered).
+    // Absolute-CSR construction covering ALL n_in rows (empty for 0-3,
+    // one entry at col 0 for 4-7) -- matches how synaptogenesis leaves
+    // rows split between the two stores in practice (different rows can
+    // be scattered-only, block4-only, or both, independently).
+    std::vector<S> full_ptrs(n_in + 1, S(0));
+    std::vector<S> full_idx;
+    std::vector<float> full_w, full_imp;
+    for (std::size_t r = 0; r < n_in; ++r) {
+        if (r >= 4) { full_idx.push_back(0); full_w.push_back(6.0f); full_imp.push_back(0.0f); }
+        full_ptrs[r + 1] = static_cast<S>(full_idx.size());
+    }
+    auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
+        full_ptrs, full_idx, full_w, full_imp, n_in, n_out, std::size_t(64), std::size_t(64));
+    weights.connections = dc;
+
+    REQUIRE(weights.block4.live_synapses() == 4 * n_out);
+    REQUIRE(weights.connections.nnz() == 4);  // rows 4-7, col 0 only
+
+    // Column 0: 8 rows total, 4 in block4 (6.0 each) + 4 scattered (6.0
+    // each) -> RMS = 6.0 exactly, same as the pure-block4 case.
+    // Columns 1-3: only the 4 block4 rows are live, rows 4-7 are absent
+    // (0 contribution) -> mean_sq = 4*36/8 = 18, rms = sqrt(18) ~ 4.243.
+    weights.magnitude_rescale_output(/*target=*/3.0f, /*correction_rate=*/1.0f,
+                                     /*scale_invariant=*/false);
+
+    CHECK(weights.get_output_scale(0) == Catch::Approx(2.0f));  // k=0.5 -> 1/k=2.0
+
+    // Every column-0 synapse (both storages) must now read 3.0 stored.
+    for (uint32_t li = 0; li < 4; ++li) {
+        const auto tile = weights.block4.find(0, 0);
+        const uint8_t byte = tile.at(li, 0);
+        REQUIRE(byte != 0);
+        CHECK(FP4_TABLE[byte & 0xFu] == Catch::Approx(3.0f));
+    }
+    for (std::size_t r = 4; r < n_in; ++r) {
+        const std::size_t vb = weights.connections.layout.elem_start[r];
+        const float stored = ValueAccessor<FP4BiPacked>::get_w(weights.connections.values, vb);
+        CHECK(stored == Catch::Approx(3.0f));
+    }
+    // true_weight preserved for a representative synapse in each storage.
+    CHECK(3.0f * weights.get_scale(0, 0) == Catch::Approx(6.0f));
+    CHECK(3.0f * weights.get_scale(4, 0) == Catch::Approx(6.0f));
 }
 
 // ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
