@@ -1064,12 +1064,12 @@ void disldo_backward(
             const int tid = omp_get_thread_num();
             value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
             // t_col_grad/t_row_grad are laid out [thread][col or row][k]
-            // (see their sizing above/at this function's top). The FP8
-            // branch below is still rank-1-only (see scale_rank's
-            // docstring's scope note) and always addresses component 0
-            // through these same accessors -- there is no separate
-            // rank-1-strided pointer; that would alias incorrectly against
-            // this same buffer once rank>1.
+            // (see their sizing above/at this function's top). Both the
+            // FP4 and FP8 block4 branches below are full rank-N -- they
+            // loop k<rank and write every component through these same
+            // accessors; there is no separate rank-1-strided pointer,
+            // which would alias incorrectly against this same buffer once
+            // rank>1.
             value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
             double* mrow_base = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank;
@@ -1266,9 +1266,19 @@ void disldo_backward(
                                 fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 0)]), fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 1)]),
                                 fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 2)]), fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 3)])};
 
+                            // value_scale_k(row,k) -- see FP4 branch's
+                            // identical comment above (mirrors it exactly,
+                            // now generalized over rank instead of the
+                            // single rank-1-only val_scale local).
+                            value_type value_scale_k8[SCALE_RANK_MAX];
+                            for (std::size_t k = 0; k < rank; ++k) value_scale_k8[k] = weights.get_value_scale_k(row, k);
+
                             std::size_t col4_8[BLOCK4_TILE];
                             bool        col_valid4_8[BLOCK4_TILE];
-                            value_type  out_scale4_8[BLOCK4_TILE];
+                            // out_scale_k4_8[k][lj]: per-rank-component
+                            // output_scale, needed for value_scale_k's own
+                            // gradient below (mirrors FP4's out_scale_k4).
+                            value_type  out_scale_k4_8[SCALE_RANK_MAX][BLOCK4_TILE];
                             value_type  combined_scale4_8[BLOCK4_TILE], combined_imp_scale4_8[BLOCK4_TILE];
                             value_type  cw4_8[BLOCK4_TILE], ci4_8[BLOCK4_TILE], cw_orig4_8[BLOCK4_TILE];
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
@@ -1276,30 +1286,45 @@ void disldo_backward(
                                 col_valid4_8[lj] = col < n_out;
                                 if (!col_valid4_8[lj]) {
                                     col4_8[lj] = 0;
-                                    out_scale4_8[lj] = combined_scale4_8[lj] = combined_imp_scale4_8[lj] = value_type(0);
+                                    combined_scale4_8[lj] = combined_imp_scale4_8[lj] = value_type(0);
                                     cw4_8[lj] = ci4_8[lj] = cw_orig4_8[lj] = value_type(0);
+                                    for (std::size_t k = 0; k < rank; ++k) out_scale_k4_8[k][lj] = value_type(0);
                                     continue;
                                 }
                                 col4_8[lj] = col;
-                                out_scale4_8[lj] = weights.get_output_scale(col);
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
-                                combined_scale4_8[lj]     = val_scale * out_scale4_8[lj];
+                                // S(row,col) = sum_k value_scale_k*output_scale_k
+                                // -- see FP4 branch's identical get_scale
+                                // comment (mirrors it exactly). FP8's block4
+                                // path stores cw in TRUE units (not the
+                                // quant-code-factored representation FP4
+                                // uses), so this is a drop-in replacement:
+                                // combined_scale4_8 is consumed symmetrically
+                                // at decode (cw_orig*combined_scale) and
+                                // encode (cw/combined_scale) below, so any
+                                // correct S formula round-trips correctly
+                                // regardless of rank.
+                                combined_scale4_8[lj]     = weights.get_scale(row, col);
                                 combined_imp_scale4_8[lj] = imp_scale * out_imp_scale;
                                 cw_orig4_8[lj] = w_decoded_arr8[lj];
                                 cw4_8[lj] = cw_orig4_8[lj] * combined_scale4_8[lj];
                                 ci4_8[lj] = imp_decoded_arr8[lj] * combined_imp_scale4_8[lj];
+                                for (std::size_t k = 0; k < rank; ++k) out_scale_k4_8[k][lj] = weights.get_output_scale_k(col, k);
                             }
 
-                            value_type mcol4_8[BLOCK4_TILE] = {0};
-                            double     mrow_local8 = 0.0;
-                            value_type mcol4_8_contrib[BLOCK4_TILE] = {0};
-                            double     mrow_local8_contrib = 0.0;
+                            // Per-rank versions of mcol4_8/mrow_local8 (see
+                            // FP4's identical mcol4_rank/mrow_local_k) --
+                            // needed to train EVERY rank component, not
+                            // just component 0.
+                            value_type mcol4_8_rank[SCALE_RANK_MAX][BLOCK4_TILE] = {};
+                            double     mrow_local8_k[SCALE_RANK_MAX] = {};
+                            value_type mcol4_8_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
+                            double     mrow_local8_k_contrib[SCALE_RANK_MAX] = {};
                             const std::size_t col_base8 = std::size_t(bc) * BLOCK4_TILE;
                             const bool full_tile_cols8 = (col_base8 + BLOCK4_TILE <= n_out);
 
                             if (full_tile_cols8) {
                                 const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
-                                const Block4Vec val_scale_v    = block4_vec_broadcast(val_scale);
                                 const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
                                 const Block4Vec eps_v          = block4_vec_broadcast(eps);
                                 const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
@@ -1316,9 +1341,18 @@ void disldo_backward(
                                 const Block4Vec cw_start_v = block4_vec_load(cw4_8);
                                 Block4Vec ci_v = block4_vec_load(ci4_8);
                                 const Block4Vec cw_orig_v   = block4_vec_load(cw_orig4_8);
-                                const Block4Vec out_scale_v = block4_vec_load(out_scale4_8);
-                                Block4Vec mcol_acc_v = block4_vec_broadcast(0.0f);
-                                Block4Vec mcol_acc_v_contrib = block4_vec_broadcast(0.0f);
+                                // Per-rank-component vectors -- see FP4's
+                                // identical value_scale_k_v/out_scale_k_v.
+                                Block4Vec value_scale_k_v8[SCALE_RANK_MAX];
+                                Block4Vec out_scale_k_v8[SCALE_RANK_MAX];
+                                Block4Vec mcol_acc_v_k8[SCALE_RANK_MAX];
+                                Block4Vec mcol_acc_v_k8_contrib[SCALE_RANK_MAX];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    value_scale_k_v8[k] = block4_vec_broadcast(value_scale_k8[k]);
+                                    out_scale_k_v8[k]   = block4_vec_load(out_scale_k4_8[k]);
+                                    mcol_acc_v_k8[k]    = block4_vec_broadcast(0.0f);
+                                    mcol_acc_v_k8_contrib[k] = block4_vec_broadcast(0.0f);
+                                }
                                 Block4Vec g_agg_v = block4_vec_broadcast(0.0f);
                                 Block4Vec contrib_agg_v = block4_vec_broadcast(0.0f);
                                 const bool training = (learning_rate != value_type(0));
@@ -1337,10 +1371,12 @@ void disldo_backward(
                                         const Block4Vec contrib_v = cw_start_v * block4_vec_broadcast(iv);
                                         g_agg_v += g_v;
                                         contrib_agg_v += contrib_v;
-                                        mrow_local8 += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * g_v));
-                                        mcol_acc_v += cw_orig_v * val_scale_v * g_v;
-                                        mrow_local8_contrib += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * contrib_v));
-                                        mcol_acc_v_contrib += cw_orig_v * val_scale_v * contrib_v;
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * g_v));
+                                            mcol_acc_v_k8[k] += cw_orig_v * value_scale_k_v8[k] * g_v;
+                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * contrib_v));
+                                            mcol_acc_v_k8_contrib[k] += cw_orig_v * value_scale_k_v8[k] * contrib_v;
+                                        }
                                     }
                                     *mdx_row += block4_vec_hsum(cw_start_v * dyv_v);
                                 }
@@ -1355,8 +1391,10 @@ void disldo_backward(
                                 }
                                 block4_vec_store(cw4_8, cw_v);
                                 block4_vec_store(ci4_8, ci_v);
-                                block4_vec_store(mcol4_8, mcol_acc_v);
-                                block4_vec_store(mcol4_8_contrib, mcol_acc_v_contrib);
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    block4_vec_store(mcol4_8_rank[k], mcol_acc_v_k8[k]);
+                                    block4_vec_store(mcol4_8_rank_contrib[k], mcol_acc_v_k8_contrib[k]);
+                                }
                             } else {
                                 // Boundary tile-column: scalar bounds-checked
                                 // fallback, matching the FP4 branch's own.
@@ -1385,10 +1423,12 @@ void disldo_backward(
                                             const value_type contrib = iv * cw_start4_8[lj];
                                             g_agg4_8[lj] += static_cast<double>(g);
                                             contrib_agg4_8[lj] += static_cast<double>(contrib);
-                                            mrow_local8 += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * g;
-                                            mcol4_8[lj] += cw_orig4_8[lj] * val_scale * g;
-                                            mrow_local8_contrib += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * contrib;
-                                            mcol4_8_contrib[lj] += cw_orig4_8[lj] * val_scale * contrib;
+                                            for (std::size_t k = 0; k < rank; ++k) {
+                                                mrow_local8_k[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * g;
+                                                mcol4_8_rank[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * g;
+                                                mrow_local8_k_contrib[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * contrib;
+                                                mcol4_8_rank_contrib[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * contrib;
+                                            }
                                         }
                                         *mdx_row += cw_start4_8[lj] * dyv;
                                     }
@@ -1408,8 +1448,10 @@ void disldo_backward(
                             }
 
                             if (learning_rate != value_type(0)) {
-                                mrow_at(row, 0) += mrow_local8;
-                                mrow_at_contrib(row, 0) += mrow_local8_contrib;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mrow_at(row, k) += mrow_local8_k[k];
+                                    mrow_at_contrib(row, k) += mrow_local8_k_contrib[k];
+                                }
                                 if (full_tile_cols8) {
                                     // Scalar fp8_quantize_stochastic, not
                                     // block4_vec_quantize_stochastic_fp8
@@ -1418,8 +1460,10 @@ void disldo_backward(
                                     // reasoning (same conclusion applies
                                     // to encode).
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                        mcol_at(col4_8[lj], 0) += mcol4_8[lj];
-                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mcol_at(col4_8[lj], k) += mcol4_8_rank[k][lj];
+                                            mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
+                                        }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
                                         tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
                                         tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
@@ -1428,8 +1472,10 @@ void disldo_backward(
                                 } else {
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         if (!col_valid4_8[lj]) continue;
-                                        mcol_at(col4_8[lj], 0) += mcol4_8[lj];
-                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mcol_at(col4_8[lj], k) += mcol4_8_rank[k][lj];
+                                            mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
+                                        }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
                                         tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
                                         tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
@@ -1446,22 +1492,25 @@ void disldo_backward(
                             // implementation before this SIMD pass -- kept
                             // here rather than deleted, matching FP4's own
                             // precedent for this exact fallback slot.
+                            value_type value_scale_k8_fb[SCALE_RANK_MAX];
+                            for (std::size_t k = 0; k < rank; ++k) value_scale_k8_fb[k] = weights.get_value_scale_k(row, k);
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                                 if (col >= n_out) continue;
                                 const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                const value_type out_scale     = weights.get_output_scale(col);
+                                value_type out_scale_k8_fb[SCALE_RANK_MAX];
+                                for (std::size_t k = 0; k < rank; ++k) out_scale_k8_fb[k] = weights.get_output_scale_k(col, k);
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
-                                const value_type combined_scale     = val_scale * out_scale;
+                                const value_type combined_scale     = weights.get_scale(row, col);
                                 const value_type combined_imp_scale = imp_scale * out_imp_scale;
                                 const value_type cw_orig = fp8_decode_bits(tdata[slot]);
                                 const value_type cw_start = cw_orig * combined_scale;
                                 value_type ci = fp8_decode_bits(tdata[BLOCK4_TILE + slot]) * combined_imp_scale;
 
-                                value_type mcol_local = value_type(0);
-                                double     mrow_local  = 0.0;
-                                value_type mcol_local_contrib = value_type(0);
-                                double     mrow_local_contrib = 0.0;
+                                value_type mcol_local_k[SCALE_RANK_MAX] = {};
+                                double     mrow_local_k[SCALE_RANK_MAX] = {};
+                                value_type mcol_local_k_contrib[SCALE_RANK_MAX] = {};
+                                double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
                                 double     g_agg = 0.0, contrib_agg = 0.0;
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
@@ -1476,10 +1525,12 @@ void disldo_backward(
                                         const value_type contrib = iv * cw_start;
                                         g_agg += static_cast<double>(g);
                                         contrib_agg += static_cast<double>(contrib);
-                                        mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
-                                        mcol_local  += cw_orig * val_scale * g;
-                                        mrow_local_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
-                                        mcol_local_contrib += cw_orig * val_scale * contrib;
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mrow_local_k[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * g;
+                                            mcol_local_k[k] += cw_orig * value_scale_k8_fb[k] * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * contrib;
+                                            mcol_local_k_contrib[k] += cw_orig * value_scale_k8_fb[k] * contrib;
+                                        }
                                     }
                                     *mdx_row += cw_start * dyv;
                                 }
@@ -1492,10 +1543,12 @@ void disldo_backward(
                                     cw += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, value_type(1),
                                                                    effective_lr, eps, damp_by_importance, max_abs_delta,
                                                                    scale_invariant);
-                                    mrow_at(row, 0) += mrow_local;
-                                    mcol_at(col, 0) += mcol_local;
-                                    mrow_at_contrib(row, 0) += mrow_local_contrib;
-                                    mcol_at_contrib(col, 0) += mcol_local_contrib;
+                                    for (std::size_t k = 0; k < rank; ++k) {
+                                        mrow_at(row, k) += mrow_local_k[k];
+                                        mcol_at(col, k) += mcol_local_k[k];
+                                        mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                        mcol_at_contrib(col, k) += mcol_local_k_contrib[k];
+                                    }
                                     tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
                                     tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
                                     tile_dirty = true;

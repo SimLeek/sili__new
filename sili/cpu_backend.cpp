@@ -1403,6 +1403,13 @@ public:
         const std::size_t cols = weights.connections.layout.cols;
         block4_load_dense<S, VT, COL_TYPE>(
             weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        // Every row connects to every column -- out_degree[c] = rows for
+        // every c, matching the FP4 load_dense_codes' own precedent above
+        // (needed for output_scale's gradient, see disldo_backward's
+        // out_degree normalization). Missing here was a real bug: any FP8
+        // layer built via this loader trained output_scale nowhere at all
+        // (deg==0 gate silently skipped every column, forever).
+        weights.out_degree.assign(cols, S(rows));
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────

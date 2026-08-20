@@ -485,6 +485,69 @@ TEST_CASE("magnitude_rescale_output rescales a MIXED scattered+block4 column con
     CHECK(3.0f * weights.get_scale(4, 0) == Catch::Approx(6.0f));
 }
 
+TEST_CASE("disldo_backward trains EVERY rank component for BLOCK4-resident FP8 "
+         "synapses, not just component 0",
+         "[scale][block4][fp8][rank2][regression]") {
+    // Before this fix, FP8's block4 backward path only ever wrote gradient
+    // into output_scale/value_scale component 0 (mcol_at(col, 0) hardcoded)
+    // -- component 1 of a rank-2 layer would sit frozen at whatever it was
+    // initialized to forever, even though the true-weight READ (via
+    // get_scale) already correctly counted its contribution. This proves
+    // component 1 actually receives a real gradient and moves.
+    using S = int;
+    using COL_TYPE = uint32_t;
+    const std::size_t n_in = 4, n_out = 4;
+
+    std::vector<uint8_t> weight_codes(n_in * n_out, fp8_quantize(2.0f));
+    std::vector<uint8_t> importance_codes(n_in * n_out, fp8_quantize(0.0f));
+
+    SparseLinearWeightsDelta<S, FP8BiValues, COL_TYPE> weights;
+    std::vector<S> empty_ptrs(n_in + 1, S(0));
+    std::vector<S> empty_idx;
+    std::vector<float> empty_w, empty_imp;
+    weights.connections = delta_csr_from_absolute<S, FP8BiValues, COL_TYPE>(
+        empty_ptrs, empty_idx, empty_w, empty_imp, n_in, n_out, std::size_t(64), std::size_t(64));
+    block4_load_dense<S, FP8BiValues, COL_TYPE>(
+        weights, weight_codes.data(), importance_codes.data(), n_in, n_out);
+    REQUIRE(weights.block4.live_synapses() == n_in * n_out);
+    // KNOWN SEPARATE GAP (pre-existing, not this fix's scope):
+    // block4_load_dense never touches out_degree (only synaptogenesis's
+    // real add/remove path does, delta_csr_memory.hpp's delta_csr_synap_
+    // row_step) -- output_scale's own gradient loop skips any column with
+    // out_degree==0, so a layer built via the bulk loader would otherwise
+    // train output_scale never, masking this test's actual target (rank-N
+    // block4 backward). Set it directly here to isolate that.
+    weights.out_degree.assign(n_out, S(n_in));
+
+    weights.scale_rank = 2;
+    for (std::size_t r = 0; r < n_in; ++r) {
+        weights.set_value_scale_raw_k(r, 0, 1.0f);
+        weights.set_value_scale_raw_k(r, 1, 1.0f);  // defaults to 0.0 otherwise
+    }
+    for (std::size_t c = 0; c < n_out; ++c) {
+        weights.set_output_scale_raw_k(c, 0, 1.0f);
+        weights.set_output_scale_raw_k(c, 1, 1.0f);
+    }
+    const float out_scale1_before = weights.get_output_scale_k(0, 1);
+    REQUIRE(out_scale1_before == Catch::Approx(1.0f));
+
+    std::vector<float> input(n_in, 1.0f);
+    std::vector<float> output_grad(n_in * n_out, 0.5f);  // nonzero, non-symmetric-cancelling
+    std::vector<float> dx(n_in, 0.0f), in_acc(n_in, 0.0f), gr_acc(n_out, 0.0f);
+    disldo_backward<S, FP8BiValues, COL_TYPE>(
+        input.data(), S(1), S(n_in), output_grad.data(), weights, dx.data(),
+        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.01f, 1);
+
+    const float out_scale1_after = weights.get_output_scale_k(0, 1);
+    CHECK(out_scale1_after != Catch::Approx(out_scale1_before));
+    CHECK(std::isfinite(out_scale1_after));
+
+    // Same for value_scale's own component 1 (row side).
+    const float val_scale1_after = weights.get_value_scale_k(0, 1);
+    CHECK(val_scale1_after != Catch::Approx(1.0f));
+    CHECK(std::isfinite(val_scale1_after));
+}
+
 // ── output_scale (per-column, rank-1/outer-product quantization) ──────────────
 //
 // Per-COLUMN counterpart to value_scale: true_w = stored_w * value_scale[row]
