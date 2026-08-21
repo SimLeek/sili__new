@@ -173,6 +173,7 @@ set(SILI_STANDALONE_TESTS
     test_fp8_block4_store
     test_disldo_block4_fp8
     test_disldo_block4_promotion_fp8
+    test_never_zero_live_quantize
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

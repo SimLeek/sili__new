@@ -937,9 +937,9 @@ void disldo_backward(
                                                           scale_invariant);
                         cw = quant * S;
                         if constexpr (StochasticRounding) {
-                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, quant, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set_stochastic_live(dc.values, vb, quant, ci / combined_imp_scale);
                         } else {
-                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, quant, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant, ci / combined_imp_scale);
                         }
                         const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
@@ -1281,6 +1281,27 @@ void disldo_backward(
                             value_type  out_scale_k4_8[SCALE_RANK_MAX][BLOCK4_TILE];
                             value_type  combined_scale4_8[BLOCK4_TILE], combined_imp_scale4_8[BLOCK4_TILE];
                             value_type  cw4_8[BLOCK4_TILE], ci4_8[BLOCK4_TILE], cw_orig4_8[BLOCK4_TILE];
+                            // was_live4_8[lj]: TRUE only if this cell already
+                            // held a genuine synapse (weight OR importance
+                            // byte nonzero) BEFORE this backward call.
+                            // col_valid4_8 is just col<n_out -- block4 tiles
+                            // are DENSE 4x4 blocks touched at every in-bounds
+                            // (li,lj), including cells that were never a real
+                            // synapse (block4's own "no synapse here" IS
+                            // weight==importance==0, unlike scattered CSR's
+                            // structural absence -- see block4_count_live/
+                            // block4_sparse_pack's identical `dense[i]!=0`
+                            // criterion). The never-zero live quantizer must
+                            // ONLY protect an ALREADY-established synapse
+                            // from rounding back to the dead code -- applying
+                            // it unconditionally to every col_valid4_8 cell
+                            // would force every touched-but-never-connected
+                            // cell permanently "live", corrupting block4's
+                            // own sparse/dense repacking (confirmed directly:
+                            // caused test_disldo_block4_backward's whole tile
+                            // to zero out via a corrupted live-count/repack --
+                            // see conversation).
+                            bool was_live4_8[BLOCK4_TILE];
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                                 col_valid4_8[lj] = col < n_out;
@@ -1288,9 +1309,11 @@ void disldo_backward(
                                     col4_8[lj] = 0;
                                     combined_scale4_8[lj] = combined_imp_scale4_8[lj] = value_type(0);
                                     cw4_8[lj] = ci4_8[lj] = cw_orig4_8[lj] = value_type(0);
+                                    was_live4_8[lj] = false;
                                     for (std::size_t k = 0; k < rank; ++k) out_scale_k4_8[k][lj] = value_type(0);
                                     continue;
                                 }
+                                was_live4_8[lj] = (w_decoded_arr8[lj] != value_type(0)) || (imp_decoded_arr8[lj] != value_type(0));
                                 col4_8[lj] = col;
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
                                 // S(row,col) = sum_k value_scale_k*output_scale_k
@@ -1465,8 +1488,17 @@ void disldo_backward(
                                             mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
                                         }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                        tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
-                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        // was_live4_8[lj] gate -- see its own
+                                        // declaration comment above: a cell
+                                        // that was never a real synapse must
+                                        // stay allowed to round to 0.
+                                        if (was_live4_8[lj]) {
+                                            tdata[slot]               = fp8_quantize_stochastic_live(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        } else {
+                                            tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        }
                                     }
                                     tile_dirty = true;
                                 } else {
@@ -1477,8 +1509,13 @@ void disldo_backward(
                                             mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
                                         }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                        tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
-                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        if (was_live4_8[lj]) {
+                                            tdata[slot]               = fp8_quantize_stochastic_live(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        } else {
+                                            tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        }
                                         tile_dirty = true;
                                     }
                                 }
@@ -1549,8 +1586,19 @@ void disldo_backward(
                                         mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
                                         mcol_at_contrib(col, k) += mcol_local_k_contrib[k];
                                     }
-                                    tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
-                                    tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
+                                    // was_live gate -- see was_live4_8's
+                                    // declaration comment (SIMD branch
+                                    // above) for the full rationale. tdata
+                                    // still holds the PRE-update bytes here.
+                                    const bool was_live = (cw_orig != value_type(0)) ||
+                                        (fp8_decode_bits(tdata[BLOCK4_TILE + slot]) != value_type(0));
+                                    if (was_live) {
+                                        tdata[slot]               = fp8_quantize_stochastic_live(cw / combined_scale);
+                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci / combined_imp_scale);
+                                    } else {
+                                        tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
+                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
+                                    }
                                     tile_dirty = true;
                                 }
                             }
@@ -1585,6 +1633,20 @@ void disldo_backward(
                     // out_scale_k4[k][lj]: per-rank-component output_scale,
                     // needed for value_scale_k's own gradient below.
                     value_type  out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE];
+                    // was_live4[lj]: see was_live4_8's declaration comment
+                    // (FP8 branch above) for the full rationale -- CORRECTED
+                    // from this loop's own former comment ("every slot is a
+                    // real synapse... no liveness check"), which was true
+                    // and harmless under the OLD quantizer (an untouched
+                    // slot's delta is 0, and plain fp4_quantize(0)==0
+                    // preserved blank status) but is NOT harmless once the
+                    // WRITE uses the never-zero live quantizer -- that would
+                    // permanently "birth" a synapse at every col_valid4
+                    // position regardless of whether gradient signal ever
+                    // touched it, corrupting block4's own sparse/dense
+                    // repacking (confirmed directly via
+                    // test_disldo_block4_backward -- see conversation).
+                    bool was_live4[BLOCK4_TILE];
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         col_valid4[lj] = col < n_out;
@@ -1592,13 +1654,12 @@ void disldo_backward(
                             col4[lj] = 0;
                             combined_scale4[lj] = combined_imp_scale4[lj] = value_type(0);
                             quant4[lj] = ci4[lj] = quant_orig4[lj] = value_type(0);
+                            was_live4[lj] = false;
                             for (std::size_t k = 0; k < rank; ++k) out_scale_k4[k][lj] = value_type(0);
                             continue;
                         }
                         col4[lj] = col;
-                        // Every slot is a real synapse, weight=0.0 included
-                        // -- see block4.hpp -- so every slot gets a real
-                        // gradient update every call, no liveness check.
+                        was_live4[lj] = (w_decoded_arr[lj] != value_type(0)) || (imp_decoded_arr[lj] != value_type(0));
                         const value_type out_imp_scale = weights.get_output_importance_scale(col);
                         // S(row,col) = sum_k value_scale_k(row,k)*
                         // output_scale_k(col,k) -- see disldo_backward's
@@ -1938,32 +1999,47 @@ void disldo_backward(
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
                                 const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
-                                const uint8_t new_w   = fp4_quantize(quant4[lj]);
-                                const uint8_t new_imp = fp4_quantize(imp_ratio);
+                                // was_live4[lj] gate -- see its own
+                                // declaration comment above for the full
+                                // rationale.
+                                const uint8_t new_w   = was_live4[lj] ? fp4_quantize_live(quant4[lj])  : fp4_quantize(quant4[lj]);
+                                const uint8_t new_imp = was_live4[lj] ? fp4_quantize_live(imp_ratio)   : fp4_quantize(imp_ratio);
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                 tile_dirty = true;
                             }
                         } else if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
                             if (full_tile_cols) {
-                                // 2 SIMD stochastic-quantize calls (4 lanes
-                                // each) instead of 8 scalar
-                                // fp4_quantize_stochastic() calls. quant4 is
-                                // already the code to encode (no division --
-                                // see the chain-rule fix above); importance
-                                // still needs its own ratio, unaffected.
-                                // Safe to divide combined_imp_scale4
+                                // Per-lane scalar quantize gated on
+                                // was_live4[lj] (see its declaration comment
+                                // above) -- NOT the SIMD
+                                // block4_vec_quantize_stochastic_fp4_live
+                                // kernel here, since that applies the same
+                                // choice uniformly to all 4 lanes and can't
+                                // express "some lanes live, some not" without
+                                // a mask-blend this correctness fix doesn't
+                                // need yet (accumulation above stays fully
+                                // vectorized; only the encode step is
+                                // scalarized). quant4 is already the code to
+                                // encode (no division -- see the chain-rule
+                                // fix above); importance still needs its own
+                                // ratio. Safe to divide combined_imp_scale4
                                 // unconditionally here (unlike the scalar
                                 // fallback's per-lj guard) -- full_tile_cols
                                 // means every lane is valid, so
                                 // combined_imp_scale4 is never the
                                 // invalid-lane 0 that would make this a 0/0
                                 // division.
-                                const Block4Vec w_to_encode = block4_vec_load(quant4);
-                                const Block4Vec imp_to_encode = {
-                                    ci4[0] / combined_imp_scale4[0], ci4[1] / combined_imp_scale4[1],
-                                    ci4[2] / combined_imp_scale4[2], ci4[3] / combined_imp_scale4[3]};
-                                const Block4VecU new_w_codes   = block4_vec_quantize_stochastic_fp4(w_to_encode);
-                                const Block4VecU new_imp_codes = block4_vec_quantize_stochastic_fp4(imp_to_encode);
+                                uint8_t new_w_codes[BLOCK4_TILE], new_imp_codes[BLOCK4_TILE];
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                    if (was_live4[lj]) {
+                                        new_w_codes[lj]   = fp4_quantize_stochastic_live(quant4[lj]);
+                                        new_imp_codes[lj] = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                    } else {
+                                        new_w_codes[lj]   = fp4_quantize_stochastic(quant4[lj]);
+                                        new_imp_codes[lj] = fp4_quantize_stochastic(imp_ratio);
+                                    }
+                                }
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     for (std::size_t k = 0; k < rank; ++k) {
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
@@ -1979,8 +2055,15 @@ void disldo_backward(
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
-                                    const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
-                                    const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                    const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                    uint8_t new_w, new_imp;
+                                    if (was_live4[lj]) {
+                                        new_w   = fp4_quantize_stochastic_live(quant4[lj]);
+                                        new_imp = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                    } else {
+                                        new_w   = fp4_quantize_stochastic(quant4[lj]);
+                                        new_imp = fp4_quantize_stochastic(imp_ratio);
+                                    }
                                     tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                     tile_dirty = true;
                                 }
@@ -1992,8 +2075,15 @@ void disldo_backward(
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
-                                const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
-                                const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                uint8_t new_w, new_imp;
+                                if (was_live4[lj]) {
+                                    new_w   = fp4_quantize_stochastic_live(quant4[lj]);
+                                    new_imp = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                } else {
+                                    new_w   = fp4_quantize_stochastic(quant4[lj]);
+                                    new_imp = fp4_quantize_stochastic(imp_ratio);
+                                }
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                 tile_dirty = true;
                             }
@@ -2297,11 +2387,11 @@ void disldo_backward(
                     const value_type final_combined_scale = final_val_scale * final_out_scale;
                     const value_type final_combined_imp_scale = final_imp_scale * final_out_imp_scale;
                     if constexpr (StochasticRounding) {
-                        ValueAccessor<VALUES_TYPE>::set_stochastic(
+                        ValueAccessor<VALUES_TYPE>::set_stochastic_live(
                             dc.values, entry.vb,
                             entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
                     } else {
-                        ValueAccessor<VALUES_TYPE>::set(
+                        ValueAccessor<VALUES_TYPE>::set_live(
                             dc.values, entry.vb,
                             entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
                     }

@@ -258,6 +258,17 @@ struct ValueAccessor<FP4BiPacked> {
     static void set_stochastic(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
         v.set_stochastic(i, w, imp);
     }
+    /// Same as set() but for a LIVE synapse -- see fp4_encode_bits_live's
+    /// docstring (fp4quant.hpp) for the never-0 rationale. Applies to
+    /// BOTH weight and importance -- see FP4BiPacked::set_live's own
+    /// docstring for why importance gets the same treatment.
+    static void set_live(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v.set_live(i, w, imp);
+    }
+    /// Same as set_stochastic() but for a LIVE synapse (weight+importance).
+    static void set_stochastic_live(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v.set_stochastic_live(i, w, imp);
+    }
     static void reserve(FP4BiPacked& v, std::size_t n) {
         v.reserve(n); 
     }
@@ -294,6 +305,26 @@ struct ValueAccessor<FP8BiValues> {
     static void set_stochastic(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
         v.weights[i] = fp8_quantize_stochastic(w);
         v.importance[i] = fp8_quantize_stochastic(imp);
+    }
+    /// Same as set() but for a LIVE synapse -- see fp8_encode_bits_live's
+    /// docstring (fp8quant.hpp) for the never-0 (+0 AND -0) rationale.
+    /// Applies to BOTH weight and importance: a live synapse's importance
+    /// quantizing to the blank-slot sentinel is the same failure mode as
+    /// weight doing so (nnz_row==0-style dead-row checks, and pruning
+    /// decisions that read importance as the significance signal), not a
+    /// separate concern -- see conversation.
+    static void set_live(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_live(w);
+        v.importance[i] = fp8_quantize_live(imp);
+    }
+    /// Same as set_stochastic() but for a LIVE synapse. Importance uses
+    /// the _nonneg variant -- see fp4_quantize_stochastic_live_nonneg's
+    /// docstring (fp4quant.hpp) for the full rationale (importance is
+    /// always >= 0, fed into sqrt(ci); weight's cross-sign redirect would
+    /// NaN it near zero).
+    static void set_stochastic_live(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_stochastic_live(w);
+        v.importance[i] = fp8_quantize_stochastic_live_nonneg(imp);
     }
     static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) {
         v.weights.resize(n, fp8_quantize(val));
@@ -337,6 +368,18 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     /// so callers that always use set_stochastic() for gradient-driven
     /// updates work identically against either VALUES_TYPE.
     static void set_stochastic(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        set(v, i, w, imp);
+    }
+    /// No quantization happens for this (float32 fallback) storage, so
+    /// the never-0 live-quantize invariant (fp4quant.hpp's
+    /// fp4_encode_bits_live docstring) is meaningless here too -- an
+    /// exact 0.0f float is a legitimate stored value, not a byte-0
+    /// storage sentinel. Passthrough to set(), same rationale as
+    /// set_stochastic() above.
+    static void set_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        set(v, i, w, imp);
+    }
+    static void set_stochastic_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
         set(v, i, w, imp);
     }
     static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0), value_type imp = value_type(0)) {
@@ -1535,6 +1578,15 @@ public:
             const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
             const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
             const value_type true_i   = stored_i * old_scale;
+            // Plain set(), not live -- this re-encodes whatever value the
+            // row ALREADY had under a new scale (reparametrization, same
+            // as block4_maybe_promote), not a training update. A row can
+            // contain a freshly-grown, never-yet-trained synapse whose
+            // weight/importance is deliberately 0 (insert_col's own
+            // convention); redirecting that to a nonzero live code here
+            // would be the same corruption class the block4_maybe_promote
+            // regression already caught -- see its comment in
+            // delta_csr_memory.hpp for the full incident.
             ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, true_i / new_scale);
         }
         set_importance_scale_raw(row, new_scale);
@@ -1698,7 +1750,7 @@ public:
                 const value_type new_w   = w * k[col];
                 const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
                 if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
-                ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w, new_imp);
+                ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w, new_imp);
             }
         }
         for (std::size_t br = 0; br < BL.rows; ++br) {
@@ -1731,8 +1783,8 @@ public:
                             const value_type new_w   = w * k[col];
                             const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
                             if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
-                            tile.at_weight(li, lj)     = fp8_quantize(new_w);
-                            tile.at_importance(li, lj) = fp8_quantize(new_imp);
+                            tile.at_weight(li, lj)     = fp8_quantize_live(new_w);
+                            tile.at_importance(li, lj) = fp8_quantize_live(new_imp);
                         } else {
                             const uint8_t byte = tile.at(li, lj);
                             if (byte == 0) continue;
@@ -1741,7 +1793,7 @@ public:
                             const value_type new_w   = w * k[col];
                             const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
                             if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
-                            tile.at(li, lj) = uint8_t(fp4_quantize(new_w) | (fp4_quantize(new_imp) << 4));
+                            tile.at(li, lj) = uint8_t(fp4_quantize_live(new_w) | (fp4_quantize_live(new_imp) << 4));
                         }
                     }
                 }

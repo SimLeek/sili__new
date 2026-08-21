@@ -107,6 +107,50 @@ inline uint8_t fp8_quantize(float v) {
     return fp8_encode_bits(v);
 }
 
+// ── Never-zero ("live") variants ─────────────────────────────────────────────
+// See fp4quant.hpp's identical block comment above fp4_encode_bits_live for
+// the full rationale (dead-synapse-collapse bug, deliberate near-zero bias,
+// empirical validation) -- same invariant here, applied to E4M3's own
+// subnormal region. Unlike FP4_TABLE (a single shared zero code regardless
+// of sign), E4M3 is a real floating-point format with DISTINCT +0 (byte
+// 0x00, the actual block4/scattered blank-slot sentinel) and -0 (byte 0x80,
+// decodes to the same 0.0f value but is a different byte) codes -- both
+// must become unreachable for a live weight, not just 0x00, or a synapse
+// could still silently collapse to a zero CONTRIBUTION via -0 even though
+// it wouldn't trip the byte==0 liveness check.
+inline uint8_t fp8_encode_bits_live(float v) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+    const uint32_t s     = sign ? 1u : 0u;
+
+    if (abits > 0x7F800000u) {
+        return 0x7Fu;  // NaN input -- already nonzero, no change needed
+    }
+    if (abits < FP8_MIN_NORMAL_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        uint32_t m = uint32_t(av * 512.0f + 0.5f);
+        if (m > 7u) {
+            return uint8_t((s << 7) | 0x08u);
+        }
+        if (m == 0u) m = 1u;  // live: never round to +0 (0x00) or -0 (0x80)
+        return uint8_t((s << 7) | m);
+    }
+    uint32_t rounded = abits + (1u << 19);
+    if (rounded >= FP8_NAN_SLOT_BITS) rounded = FP8_MAX_BITS;
+    const uint32_t exp_field_f32 = (rounded >> 23) & 0xFFu;
+    const uint32_t m3            = (rounded >> 20) & 0x7u;
+    const uint32_t e4 = exp_field_f32 - 120u;
+    return uint8_t((s << 7) | (e4 << 3) | m3);
+}
+
+/// Never-zero deterministic quantize for a LIVE synapse's weight.
+inline uint8_t fp8_quantize_live(float v) {
+    return fp8_encode_bits_live(v);
+}
+
 /// Stochastic quantize -- unbiased (E[result] == v within [-448,448]),
 /// same dithered-rounding technique as fp4_quantize_stochastic() (see
 /// fp4quant.hpp for the full derivation of why this is exact in the
@@ -137,6 +181,99 @@ inline uint8_t fp8_quantize_stochastic(float v) {
         const float frac   = pos - float(m_lo);
         const uint32_t m = (fp4_stochastic_uniform01() < frac) ? (m_lo + 1u) : m_lo;
         if (m > 7u) return uint8_t((s << 7) | 0x08u);  // carried into first normal code, see fp8_encode_bits
+        return uint8_t((s << 7) | m);
+    }
+    const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0xFFFFFu);  // uniform in [0, 2^20)
+    uint32_t rounded = abits + dither;
+    if (rounded >= FP8_NAN_SLOT_BITS) rounded = FP8_MAX_BITS;
+    const uint32_t exp_field_f32 = (rounded >> 23) & 0xFFu;
+    const uint32_t m3            = (rounded >> 20) & 0x7u;
+    const uint32_t e4 = exp_field_f32 - 120u;
+    return uint8_t((s << 7) | (e4 << 3) | m3);
+}
+
+/// Never-zero STOCHASTIC quantize for a LIVE synapse's weight -- see
+/// fp8_encode_bits_live's block comment for the +0/-0 rationale and
+/// fp4_quantize_stochastic_live's docstring for the probability-weighted
+/// redirect this mirrors. Only the m_lo==0 sub-bracket of the subnormal
+/// region (the one that could otherwise produce +0 or -0) is widened to a
+/// full-signed-bracket probability-weighted choice between +2^-9 and
+/// -2^-9; every other bracket (including the rest of the subnormal region
+/// and the whole normal region) is untouched and stays exactly as
+/// unbiased as fp8_quantize_stochastic's own.
+inline uint8_t fp8_quantize_stochastic_live(float v) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+    const uint32_t s     = sign ? 1u : 0u;
+
+    if (abits > 0x7F800000u) return 0x7Fu;  // NaN input, already nonzero
+
+    if (abits >= FP8_NAN_SLOT_BITS) {
+        return uint8_t((s << 7) | 0x7Eu);  // deterministic saturate at 448
+    }
+    if (abits < FP8_MIN_NORMAL_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float pos      = av * 512.0f;              // continuous position in [0,8)
+        const uint32_t m_lo  = uint32_t(pos);
+        if (m_lo == 0u) {
+            // Full signed bracket [-2^-9,+2^-9) -- see this function's own
+            // docstring above.
+            const float signed_pos = sign ? -pos : pos;  // pos in [0,1) here
+            const float p_pos = (signed_pos + 1.0f) * 0.5f;  // (v-(-1))/((+1)-(-1)), units of 2^-9
+            const bool pick_pos = fp4_stochastic_uniform01() < p_pos;
+            return uint8_t(((pick_pos ? 0u : 1u) << 7) | 1u);
+        }
+        const float frac = pos - float(m_lo);
+        const uint32_t m = (fp4_stochastic_uniform01() < frac) ? (m_lo + 1u) : m_lo;
+        if (m > 7u) return uint8_t((s << 7) | 0x08u);  // carried into first normal code
+        return uint8_t((s << 7) | m);
+    }
+    const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0xFFFFFu);  // uniform in [0, 2^20)
+    uint32_t rounded = abits + dither;
+    if (rounded >= FP8_NAN_SLOT_BITS) rounded = FP8_MAX_BITS;
+    const uint32_t exp_field_f32 = (rounded >> 23) & 0xFFu;
+    const uint32_t m3            = (rounded >> 20) & 0x7u;
+    const uint32_t e4 = exp_field_f32 - 120u;
+    return uint8_t((s << 7) | (e4 << 3) | m3);
+}
+
+/// Never-zero STOCHASTIC quantize for a LIVE synapse's IMPORTANCE -- see
+/// fp4_quantize_stochastic_live_nonneg's docstring (fp4quant.hpp) for the
+/// full rationale (same bug, same fix, mirrored for E4M3): the m_lo==0
+/// cross-sign redirect in fp8_quantize_stochastic_live is correct for
+/// weight but would let a nonnegative quantity like importance land on a
+/// NEGATIVE code near zero, and a negative decoded ci makes every
+/// downstream sqrt(ci) call NaN. Sign is never flipped here; the m_lo==0
+/// bracket is deterministic (always m=1, matching fp8_encode_bits_live's
+/// own safe behavior) since there's no legal nonzero code below 2^-9 to
+/// interpolate toward besides 2^-9 itself. Every other bracket
+/// (m_lo>0 subnormal region, and the whole normal region) is untouched.
+inline uint8_t fp8_quantize_stochastic_live_nonneg(float v) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+    const uint32_t s     = sign ? 1u : 0u;
+
+    if (abits > 0x7F800000u) return 0x7Fu;  // NaN input, already nonzero
+
+    if (abits >= FP8_NAN_SLOT_BITS) {
+        return uint8_t((s << 7) | 0x7Eu);  // deterministic saturate at 448
+    }
+    if (abits < FP8_MIN_NORMAL_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float pos      = av * 512.0f;              // continuous position in [0,8)
+        const uint32_t m_lo  = uint32_t(pos);
+        if (m_lo == 0u) {
+            return uint8_t((s << 7) | 1u);  // deterministic -- see docstring above
+        }
+        const float frac = pos - float(m_lo);
+        const uint32_t m = (fp4_stochastic_uniform01() < frac) ? (m_lo + 1u) : m_lo;
+        if (m > 7u) return uint8_t((s << 7) | 0x08u);  // carried into first normal code
         return uint8_t((s << 7) | m);
     }
     const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0xFFFFFu);  // uniform in [0, 2^20)
