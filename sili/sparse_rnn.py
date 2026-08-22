@@ -42,7 +42,7 @@ exist rather than updating a value. It's cheap and O(1)-ish by design —
 SparseRNNAgent.step() calls it every online step, not on an "every N steps"
 cadence (a periodic throttle would reintroduce the lag spikes this stepwise
 design exists to avoid). There is no importance-decay call in this API
-generation — importance already settles via the Hebbian/activity-correlation
+generation — importance already settles via the ADSP-style activity-correlation
 tracking inside forward/backward, and a separate periodic decay interacting
 correctly with FP4-quantized stored values would need more care than a simple
 multiply (values only resolve to FP4 granularity, and large-error entries
@@ -183,15 +183,39 @@ class _SparseLayerBase(Module):
     @property
     def neuron_grad_accum(self)  -> np.ndarray: return self._c.neuron_grad_accum
 
-    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int):
+    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int,
+                       importance_eps: float = 1e-3, max_prune_per_step: int = 8):
         """Structural growth + memory rebalancing -- the only call here
         that ISN'T inline with forward/backward, since it changes which
         synapses exist rather than updating a value. No learning_rate:
         growth isn't a value update. Meant to be called every online
         step (cheap, O(1)-ish by design) -- see module docstring for why
-        an "every N steps" cadence would be wrong here."""
+        an "every N steps" cadence would be wrong here.
+
+        importance_eps is a READ-time-only "ghost" floor -- NEVER
+        written to storage anywhere. It floors an EXISTING synapse's
+        stored importance ONLY for synap_step's importance_cutoff
+        comparison -- a synapse whose real, ongoing-training importance
+        has decayed to exactly the FP4 zero code (a real, discrete
+        quantization bucket many independently-decaying synapses can
+        land on simultaneously -- FP4's smallest nonzero magnitude is
+        0.5, so 0 is a wide, common landing bucket) isn't automatically
+        "below cutoff" the instant it gets there. Does NOT affect
+        removal-priority sort order or capacity-driven
+        (keep > max_row_weights) pruning, and does NOT affect
+        build_probes at all -- a freshly-grown synapse is stored with
+        whatever its REAL probe score is (input_accum*grad_accum,
+        often exactly 0 for a row with no activity yet); this floor
+        just stops it being evicted purely for reading as 0 on its
+        first subsequent visit, giving real backprop time to move it.
+
+        max_prune_per_step: caps how many connections THIS row's call
+        may remove at once, regardless of why they tied for lowest
+        importance -- a safety ceiling (default rarely binds), not a
+        throttle on ordinary capacity trimming."""
         self._c.build_probes(k)
-        self._c.synap_step(importance_cutoff, max_row_weights)
+        self._c.synap_step(importance_cutoff, max_row_weights, max_prune_per_step=max_prune_per_step,
+                           importance_eps=importance_eps)
         self._c.equalizer_step()
 
     def state_dict(self) -> dict:
@@ -296,6 +320,164 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
+                     rng: Optional[np.random.Generator] = None,
+                     scale: float = 0.05) -> None:
+    """Sets scale_rank on the C++ layer and seeds components k>=1 (both
+    value_scale_k and output_scale_k) with small random values. Required:
+    per scale_rank's own docstring (delta_csr_types.hpp), k>=1 defaults to
+    0.0 on BOTH sides -- a genuine chicken-and-egg deadlock where neither
+    factor can ever get a nonzero gradient on its own unless at least one
+    side starts nonzero. rank=1 is a no-op (nothing to seed, matches the
+    original single-component behavior exactly).
+
+    Loop order matters here, not just cosmetically: set_value_scale_raw_k/
+    set_output_scale_raw_k lazily resize+fill new slots with 1.0 (the
+    correct default for component 0), so as long as every row's k=0 slot
+    gets touched by that fill BEFORE this function's own k>=1 writes land
+    (true here: row-major, k ascending from 1, one index at a time --
+    each row's k=0 slot is always filled-by-resize immediately before this
+    row's own k=1 write), every component-0 slot ends up correctly at 1.0
+    without ever being written explicitly. Do not reorder these loops
+    (e.g. column-major, or k descending) without re-verifying that still
+    holds.
+    """
+    if rank <= 1:
+        return
+    if rng is None:
+        rng = np.random.default_rng()
+    c.set_scale_rank(rank)
+    for r in range(n_inputs):
+        for k in range(1, rank):
+            c.set_value_scale_raw_k(r, k, float(rng.normal(0.0, scale)))
+    for col in range(n_outputs):
+        for k in range(1, rank):
+            c.set_output_scale_raw_k(col, k, float(rng.normal(0.0, scale)))
+
+
+def _preseed_dense(c, n_inputs: int, n_outputs: int,
+                   rng: Optional[np.random.Generator] = None,
+                   quantize_fn=None) -> int:
+    """Fully dense counterpart to `_preseed_random_sparse` -- every
+    (input, output) pair connected, loaded straight into block4 via
+    `load_dense_codes` (sili__new's `block4_load_dense`, see its own
+    docstring for the loading-vs-quantization design split). Added per
+    direct request to test whether this project's usual random-SPARSE
+    "echo network" preseed is itself a significant source of seed
+    -to-seed accuracy variance in toy comparisons (reservoir-computing
+    -style connectivity-draw sensitivity), independent of whatever else
+    is being compared (base, bits, etc.).
+
+    `quantize_fn`: defaults to `_cpu.fp4_quantize_array` (this class's
+    VALUES_TYPE). Kept as a parameter, not hardcoded, so a caller can
+    swap in a different quantization scheme (rank-1 scale fit, etc.)
+    without this function needing to change -- matches
+    block4_load_dense's own loading/quantization separation.
+
+    IMPORTANT, found directly while verifying this (two real bugs, both
+    fixed, in order):
+
+    1. Init scale can NOT just be `_preseed_random_sparse`'s own
+       `1/sqrt(k)` fan-in scaling carried over naively into the RAW
+       quantized value. FP4 (E2M1) has a FIXED absolute zero-rounding
+       floor (~0.25, independent of layer width) -- at typical toy
+       widths (state_width=128, `1/sqrt(128)~=0.09`), nearly EVERY
+       drawn value would quantize to code 0 ("not live"), silently
+       collapsing "dense init" back down to mostly-empty regardless of
+       what was intended. Confirmed empirically: raw scale=0.3 gave
+       only 23/64 live codes on an 8x8 test matrix; scale=1.5-2.0 gave
+       ~90%+ live.
+
+    2. Using a FIXED raw scale (1.5) WITHOUT any compensating fan-in
+       correction elsewhere is ALSO wrong, just in the opposite
+       direction -- confirmed empirically on the real curriculum: every
+       one of base=4/6/12/24 collapsed to pure CHANCE (mean_acc~0.094,
+       std~0.003 across 3 seeds), identically regardless of base. Root
+       cause: `output[c] = sum_r input[r] * weight[r,c]` -- its variance
+       scales with the number of ROWS feeding column `c` (that
+       column's fan-in, i.e. its live-connection count across rows),
+       not the row's own width. Sparse's k=5 connections/row at scale
+       `1/sqrt(5)` keep that sum's variance ~1 (properly normalized);
+       dense's ~128 connections/column at raw scale 1.5 give variance
+       ~128*1.5^2~=288, almost certainly saturating whatever clip/
+       RMSNorm sits downstream and destroying the learning signal the
+       same way no matter what `base` is -- exactly explaining why
+       every dense arm gave identical numbers.
+
+       IMPORTANT CORRECTION (per direct review): the first fix applied
+       this correction via per-ROW `value_scale` scaled by `1/sqrt
+       (n_outputs)` -- the WRONG axis. It only happened to produce a
+       working number in testing because q/k/v/o_proj are square
+       (n_inputs==n_outputs), making the wrong-axis correction
+       numerically coincide with the right one there; it would have
+       been wrong for lm_head (16x10, not square). Also computed from
+       the ASSUMED `n_outputs`/`n_inputs`, not the REAL post
+       -quantization live count -- wrong whenever problem 1's
+       zero-code collisions leave a row/column short of full density
+       (as they do here: confirmed ~87.5% actual density at scale=1.5,
+       not 100%).
+
+    Fix: after loading, compute the REAL per-column live count
+    directly from `weight_codes` (code 0 = not live, same convention
+    `block4_load_dense`/every other block4 path already uses -- no
+    assumption about density), and apply a fan-in-correcting
+    `output_scale` PER COLUMN via `set_output_scale_raw` as METADATA
+    (documented pattern: `true_w = stored_w * value_scale[row] *
+    output_scale[col]`, "set directly WITHOUT re-encoding stored
+    weights") -- output_scale is the per-COLUMN half of that product,
+    matching the axis the variance actually depends on. `output_scale[c]
+    = 1/(raw_scale * sqrt(col_nnz[c]))` reproduces the same
+    effectively-normalized weight distribution `_preseed_random_sparse`
+    already produces for a k-wide row, generalized to each column's
+    OWN real fan-in rather than an assumed uniform width. `value_scale`
+    (per-row) is left at its default 1.0 -- this correction lives
+    entirely on the column axis, matching the math above.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if quantize_fn is None:
+        quantize_fn = _cpu.fp4_quantize_array
+    scale = 1.5  # fixed, not fan-in-scaled -- keeps codes representable, see docstring point 1
+    dense = (rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale)
+    weight_codes = quantize_fn(dense.flatten())
+    importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
+    c.load_dense_codes(weight_codes, importance_codes)
+    # Fan-in correction via output_scale metadata, from REAL per-column
+    # live counts (code 0 = not live) -- see docstring point 2.
+    live = weight_codes.reshape(n_inputs, n_outputs) != 0
+    col_nnz = live.sum(axis=0)
+    output_scale = 1.0 / (scale * np.sqrt(np.maximum(col_nnz, 1)))
+    for col in range(n_outputs):
+        c.set_output_scale_raw(col, float(output_scale[col]))
+    return n_outputs  # every row is already at max capacity -- nothing left to grow into
+
+
+def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
+    """The genuinely-designed zero-weight-init: NO connections at all
+    (nnz=0), not a dense grid pre-loaded with weight=0 (see
+    _preseed_random_sparse's own docstring -- "a freshly-constructed
+    SparseLinearLayer has zero connections... this is purely an
+    optimization for a faster bootstrap, not a requirement"). Real
+    synapses are meant to be created by synaptogenesis()
+    (build_probes/synap_step/equalizer_step), each starting with a real
+    nonzero value the first time it's grown in -- not by gradient
+    -nudging a pre-existing zero. Per direct correction: pre-loading
+    weight=0/importance=1 into every slot (this project's earlier
+    `all_zero_init` mechanism) is a different, synthetic experimental
+    arm, not this one -- it has its own failure mode (an eps-shaped
+    backprop term can decay that seeded importance back toward 0) that
+    doesn't apply here since nothing exists to decay.
+
+    Only reserves per-row growth headroom via equalize_to_capacity --
+    safe to call directly on a fresh, never-load_weights'd layer
+    (unlike after _preseed_random_sparse's load_weights call, which
+    would immediately compact any headroom back away -- see that
+    function's own docstring)."""
+    per_row = max(2, max_weights // max(1, n_inputs))
+    c.equalize_to_capacity(per_row)
+    return per_row
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,9 +489,16 @@ class DISLDOLayer(_SparseLayerBase):
     docstring). No batch dimension required for online (single-sample) use."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if empty_init:
+            self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
+        elif dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True) -> Tensor:
@@ -332,10 +521,11 @@ class DISLDOLayer(_SparseLayerBase):
         # Pass False for a literal, degree-independent learning rate.
         #
         # forward_dense no longer takes learning_rate at all (see
-        # JOURNAL.md) -- it used to run its own gradient-free Hebbian
-        # importance update on every call, independent of whether a
-        # backward() would ever follow. Real weight/importance updates
-        # now happen ONLY in backward_dense, below.
+        # JOURNAL.md) -- it used to run its own gradient-free ADSP-style
+        # (Activity-Dependent Structural Plasticity) importance update on
+        # every call, independent of whether a backward() would ever
+        # follow. Real weight/importance updates now happen ONLY in
+        # backward_dense, below.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -404,9 +594,16 @@ class DISLDOLayerDeterministic(DISLDOLayer):
     linear_disldo.hpp."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if empty_init:
+            self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
+        elif dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
@@ -589,8 +786,9 @@ class SISLDOLayer(_SparseLayerBase):
         `learning_rate` kept in this wrapper's own signature (matches
         every other layer's forward() call convention throughout this
         project) but no longer forwarded to forward_sparse -- it used to
-        run its own gradient-free Hebbian importance update on every
-        call, independent of whether backward() would ever follow. Real
+        run its own gradient-free ADSP-style (Activity-Dependent
+        Structural Plasticity) importance update on every call,
+        independent of whether backward() would ever follow. Real
         weight/importance updates now happen ONLY in backward_sparse."""
         csr    = x.data
         out_np = self._c.forward_sparse(

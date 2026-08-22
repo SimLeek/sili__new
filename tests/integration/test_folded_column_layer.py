@@ -507,7 +507,7 @@ class TestFoldedColumnLayerForward:
         out_in_proj = layer.in_proj(Tensor(x_np.copy()))
         np.testing.assert_allclose(out_forward.data, out_in_proj.data, atol=1e-6)
 
-    def test_weights_learn_via_backward_dense_no_energy_gating(self):
+    def test_weights_learn_via_backward_dense_no_energy_gating_pre_existing_failure(self):
         # FoldedColumnLayer's OWN weights (via backward_dense, not a free
         # Tensor parameter -- test_column_averaging.py's SGD test uses the
         # latter) should be able to reduce column_averaging_loss given
@@ -518,6 +518,20 @@ class TestFoldedColumnLayerForward:
         # asserts stability rather than convergence).
         from sili.energy import column_averaging_loss
 
+        # NOTE (see conversation): confirmed pre-existing/unrelated to
+        # BoundedRMSpropSynapsePolicy -- fails identically under Plain and
+        # Bounded (early=0.2531 late=0.2316 vs early=0.2531 late=0.2317).
+        # Separately, ALSO worth knowing: learning_rate=1.0 below is well
+        # outside BoundedRMSpropSynapsePolicy's own validated-safe lr range
+        # for its default max_abs_delta=2.0 (raw-space) -- see update_cw's
+        # docstring in delta_csr_types.hpp and
+        # tests/unit/sweep_synapse_policy_stochastic.cpp Round 2 (excellent
+        # at lr<=0.05, genuinely unsafe by lr=1.0). backward_dense() now
+        # prints a one-time stderr warning for exactly this. Not changed
+        # here since the failure itself was already confirmed unrelated to
+        # SynapsePolicy choice -- but if this test is ever revisited, the
+        # lr itself is a real candidate to reconsider, independent of
+        # whatever its own original bug turns out to be.
         n_folds, hidden = 6, 16
         desc = _toy_square_descriptor(n_folds, hidden, density=0.3, seed=3)
         layer = FoldedColumnLayer.from_descriptor(desc, learning_rate=1.0, num_cpus=1)

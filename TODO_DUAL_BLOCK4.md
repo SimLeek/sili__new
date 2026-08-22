@@ -661,7 +661,7 @@ into the format.
       **A real, worth-documenting finding about `switch_point` itself:**
       once a tile is promoted into block4 it is treated as a dense 4x4
       micro-block for forward/backward purposes -- `disldo_backward`'s
-      Hebbian update touches all 16 local `(li,lj)` slots on every call
+      backward's importance (ci) update touches all 16 local `(li,lj)` slots on every call
       it processes that tile, not just the synapses that originally
       triggered promotion. So a promoted tile's live count climbs toward
       capacity as ordinary training proceeds, independent of the growth
@@ -1151,7 +1151,7 @@ smaller allocation.
 
   Verified: full ctest suite clean (same pre-existing flaky set:
   #19/#35/#51 -- one additional test, `test_scale_handling.cpp`'s
-  per-row `importance_scale` Hebbian test, was observed to fail
+  per-row `importance_scale` ADSP-style importance test, was observed to fail
   intermittently across repeated runs with NO code changes between
   runs and doesn't touch block4/backward at all, confirming it's a
   pre-existing RNG-order dependency in the shared Catch2 binary, not

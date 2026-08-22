@@ -47,12 +47,13 @@ int main() {
     std::vector<float> x(n_in, 0.f);
     x[0] = 3.0f;   // feeds block4's (row=0,col=1)
     x[1] = 1.0f;   // feeds scattered row=1
-    x[2] = 2.0f;   // feeds scattered row=0? no -- feeds block4's (row=2,col=3) AND scattered row=2(none)
-    // Recompute expected by hand:
-    // scattered: row0->col5 w=2.0, contributes x[0]*2.0=3.0*2.0=6.0 to output[5]
-    //            row1->col2 w=-1.5, contributes x[1]*-1.5=1.0*-1.5=-1.5 to output[2]
-    // block4: (row0,col1) w=1.0 -> x[0]*1.0=3.0*1.0=3.0 to output[1]
-    //         (row2,col3) w=0.5 -> x[2]*0.5=2.0*0.5=1.0 to output[3]
+    x[2] = 2.0f;   // feeds block4's (row=2,col=3) AND scattered row=2(none)
+
+    // Expected output computed by hand:
+    // scattered: row0->col5 w=2.0, contributes x[0]*2.0 = 3.0*2.0 = 6.0 to output[5]
+    //            row1->col2 w=-1.5, contributes x[1]*-1.5 = 1.0*-1.5 = -1.5 to output[2]
+    // block4: (row0,col1) w=1.0 -> x[0]*1.0 = 3.0 to output[1]
+    //         (row2,col3) w=0.5 -> x[2]*0.5 = 2.0*0.5 = 1.0 to output[3]
     std::vector<float> y_ref(n_out, 0.f);
     y_ref[5] = 6.0f;
     y_ref[2] = -1.5f;
@@ -60,7 +61,7 @@ int main() {
     y_ref[3] = 1.0f;
 
     std::vector<float> y(n_out, 0.f);
-    disldo_forward<int, FP4BiPacked, uint32_t>(x.data(), 1, n_in, weights, y.data(), 0.0f, 1);
+    disldo_forward<int, FP4BiPacked, uint32_t>(x.data(), 1, n_in, weights, y.data(), 1);
 
     for (int c = 0; c < n_out; ++c)
         CHECK(std::abs(y[c] - y_ref[c]) < 1e-4f, "output[%d]: got %.4f expected %.4f", c, y[c], y_ref[c]);
@@ -75,7 +76,8 @@ int main() {
         w2.recompute_stats();
 
         std::vector<float> y2(n_out, 0.f);
-        disldo_forward<int, FP4BiPacked, uint32_t>(x.data(), 1, n_in, w2, y2.data(), 0.0f, 1);
+        // FIXED: same correction here
+        disldo_forward<int, FP4BiPacked, uint32_t>(x.data(), 1, n_in, w2, y2.data(), 1);
 
         std::vector<float> y2_ref(n_out, 0.f);
         y2_ref[5] = 6.0f;

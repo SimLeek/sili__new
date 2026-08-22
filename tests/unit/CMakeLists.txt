@@ -66,6 +66,7 @@ add_executable(
     test_hoyer_sparsify.cpp
     test_stats_thread_safety.cpp
     test_scale_handling.cpp
+    test_synapse_update_policy.cpp
     test_attention.cpp
     test_csr_union.cpp
 
@@ -148,6 +149,15 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_forward
     test_disldo_block4_backward
     test_disldo_block4_promotion
+    test_block4_load_dense
+    test_block4_scattered_divergence
+    test_synapse_policy_dispatch
+    test_synapse_policy_long_horizon
+    sweep_synapse_policy_min_decay_frac
+    sweep_synapse_policy_stochastic
+    probe_unstable_pocket_growth
+    test_ci_ceiling
+    test_production_default_long_horizon
     test_disldo_block4_combined_absolute
     test_block4_sparse_tile
     test_block4_memory_cap_and_compression

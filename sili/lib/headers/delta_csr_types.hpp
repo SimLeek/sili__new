@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -378,13 +379,89 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
 template <typename VALUE_TYPE>
 struct RMSpropScalePolicy {
     // Extracted verbatim from disldo_backward's existing inline formula --
-    // must stay bit-identical to today's behavior (this is the default,
-    // used by every existing caller).
+    // must stay bit-identical to today's behavior on finite inputs (this
+    // is the default, used by every existing caller) -- PLUS a NaN/Inf
+    // guard. scale/scale_state update INLINE every step and are never
+    // touched by any external gradient clip (unlike an optimizer-managed
+    // parameter) -- a single overflowed g_agg (e.g. dense connectivity's
+    // much larger fan-in summing far more per-column gradient terms than
+    // sparse ever does, narrowed from a double accumulator to VALUE_TYPE
+    // with no range check upstream) turns scale_state permanently Inf
+    // (beta2*Inf never decays back down), then sqrt(Inf)+eps -> Inf,
+    // g_agg/Inf -> Inf or Inf/Inf -> NaN, and once scale is NaN every
+    // future beta2*NaN+... stays NaN forever. Confirmed via direct
+    // diagnostic in sili_peridot (dense connectivity, JOURNAL.md
+    // 2026-08-10): output_scale went NaN in lockstep with the whole
+    // model while the raw stored weight code itself stayed correctly
+    // bounded. Skip the update entirely on a non-finite input/result
+    // rather than letting it corrupt scale/scale_state -- makes NaN
+    // structurally unreachable through this path, not just unlikely.
+    // contrib_agg: row/column-aggregated forward-contribution signal
+    // (Σ x*w, mirroring per-synapse ci's own contrib=x*w term -- see
+    // linear_disldo.hpp's additive combination and
+    // sili__new/lean_proofs/importance_signal_information_gain/
+    // SiliImportanceProof/ImportanceSignalInformationGain.lean,
+    // Joint.combined_signal_strictly_informative). value_scale_importance/
+    // output_scale_importance are the SAME kind of RMSprop second-moment
+    // accumulator as ci, just aggregated over a row/column instead of a
+    // single synapse -- combined here the same way ci does: SQUARE first,
+    // THEN sum (g_agg^2+contrib_agg^2), not (g_agg+contrib_agg)^2. This
+    // value is the DIVISOR of the step below, so its job is safety, not
+    // just importance-ranking: sum-then-square lets a large-magnitude
+    // disagreement between g_agg and contrib_agg collapse the denominator
+    // toward zero even though both signals are individually large,
+    // exploding the step -- the same class of instability the bias-
+    // correction fix below closes, just triggered by cancellation instead
+    // of cold start (see conversation). Square-then-sum is bounded below
+    // by max(g_agg,contrib_agg)^2 regardless of sign, so a large
+    // disagreement still damps the step instead of amplifying it. The
+    // actual STEP below still uses g_agg alone (unbiased: E[step]=0 under
+    // zero-mean noise, only the magnitude ESTIMATE gets the extra
+    // signal). Defaults to 0 for callers that don't have one (e.g.
+    // NoScalePolicy siblings, or a caller not yet updated), reproducing
+    // plain RMSprop exactly.
+    //
+    // step: Adam-style bias correction counter (Kingma & Ba 2015, sec 3).
+    // scale_state starts at 0, so on step 1 it's (1-beta2)*(g_agg^2+
+    // contrib_agg^2) -- badly SHRUNK toward zero, not the true magnitude
+    // itself. Dividing by (1-beta2^step) undoes exactly that shrinkage:
+    // on step 1, state_hat = new_state/(1-beta2) = g_agg^2+contrib_agg^2
+    // exactly, so the step size becomes -eff_lr*g/(sqrt(g_agg^2+
+    // contrib_agg^2)+eps) instead of -eff_lr*g/(sqrt(1-beta2)*sqrt(...)+
+    // eps) -- ~1/sqrt(1-beta2) (~31.6x at the default beta2=0.999)
+    // SMALLER, i.e. normal-sized instead of wildly inflated. This is
+    // purely an optimizer-internal correction (nothing to do with a
+    // model's own +b bias term) -- confirmed as the real root cause of a
+    // genuine bug: value_scale swinging sign in a single first update
+    // (1.0 -> -3.1, lr=0.5), corrupting every synapse sharing that row
+    // (both scattered and block4-owned, since they share the same
+    // value_scale[row]) -- see test_disldo_block4_backward.cpp's
+    // regression test. Applied ONLY to value_scale_importance/
+    // output_scale_importance (row/column-level, one uint32_t counter
+    // each -- cheap), NOT to per-synapse `ci` (would need a counter the
+    // same size as ci itself, doubling memory for an FP4/FP8 format
+    // where every byte counts, for a self-limiting problem that doesn't
+    // compound across a whole row the way value_scale's does).
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps) {
-        scale_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * g_agg * g_agg;
-        scale -= eff_lr * g_agg / (std::sqrt(scale_state) + eps);
+                        VALUE_TYPE beta2, VALUE_TYPE eps,
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
+                        uint32_t* step = nullptr) {
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        const VALUE_TYPE new_state = beta2 * scale_state
+            + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
+        if (!std::isfinite(new_state)) return;
+        VALUE_TYPE state_hat = new_state;
+        if (step != nullptr) {
+            ++(*step);
+            const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+            if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+        }
+        if (!std::isfinite(state_hat)) return;
+        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(state_hat) + eps);
+        if (!std::isfinite(new_scale)) return;
+        scale_state = new_state;
+        scale = new_scale;
     }
 };
 
@@ -400,11 +477,41 @@ struct AdaMaxScalePolicy {
     // shrink is gradual (only the decay term reduces it, when nothing
     // larger has been seen recently). No sqrt needed -- scale_state is
     // already in the same units as |g_agg|, unlike RMSprop's g^2 EMA.
+    // Same NaN/Inf guard as RMSpropScalePolicy::update above, and for the
+    // same reason -- scale_state's std::max never lets a stray Inf decay
+    // back down either, so an overflowed g_agg is just as permanently
+    // corrupting here without this check.
+    // contrib_agg: same safety rationale as RMSpropScalePolicy's own
+    // square-then-sum fix (see its docstring above) -- here the natural
+    // analog is max(|g_agg|,|contrib_agg|), NOT |g_agg+contrib_agg|.
+    // AdaMax's own state IS an L-infinity (max) norm tracker already
+    // (that's what distinguishes it from Adam's L2/RMSprop), so combining
+    // two signals via max is the same combine rule the policy already
+    // uses for combining across TIME (max(beta2*scale_state, ...)) --
+    // just applied across the two SIGNALS too. Summing before taking the
+    // magnitude would have the identical cancellation hole as sum-then-
+    // square did for RMSprop: two large, opposite-signed signals could
+    // net near zero and fail to register as a large ceiling at all.
+    // step: accepted only for call-site signature compatibility with
+    // RMSpropScalePolicy::update -- unused here. Per Kingma & Ba 2015
+    // sec 7, AdaMax's running-MAX state doesn't have RMSprop's EMA
+    // cold-start shrinkage problem (max(0, combined_mag) on step 1 is
+    // already the true value, not a shrunk fraction of it), so there's
+    // nothing for bias correction to fix.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps) {
-        scale_state = std::max(beta2 * scale_state, std::abs(g_agg));
-        scale -= eff_lr * g_agg / (scale_state + eps);
+                        VALUE_TYPE beta2, VALUE_TYPE eps,
+                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
+                        uint32_t* step = nullptr) {
+        (void)step;
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        const VALUE_TYPE combined_mag = std::max(std::abs(g_agg), std::abs(contrib_agg));
+        const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
+        if (!std::isfinite(new_state)) return;
+        const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (new_state + eps);
+        if (!std::isfinite(new_scale)) return;
+        scale_state = new_state;
+        scale = new_scale;
     }
 };
 
@@ -421,8 +528,233 @@ template <typename VALUE_TYPE>
 struct NoScalePolicy {
     static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
                         VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
-                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/) {
+                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
+                        VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0),
+                        uint32_t* /*step*/ = nullptr) {
         // Intentionally does nothing.
+    }
+};
+
+// ── Per-synapse ci-update policy (floor + clip) ───────────────────────────────
+//
+// Distinct from the ScalePolicy family above: those operate on value_scale/
+// output_scale (one scalar per ROW/COLUMN). This operates on per-synapse `ci`
+// (one scalar per SYNAPSE, linear_disldo.hpp's own RMSprop second-moment
+// accumulator) -- historically hand-duplicated at ~8 call sites (6 scalar +
+// 2 SIMD) rather than templated. Any future change to this formula should go
+// through ONE template parameter, not shotgun surgery across every site again
+// (this session already missed 2 SIMD sites once during an earlier revert,
+// caught only by test_block4_scattered_divergence.cpp).
+//
+// Root cause this exists to fix (see conversation): a plain RMSprop `ci` EMA
+// (beta2=0.999, no bias correction -- see RMSpropScalePolicy's own docstring
+// for why bias correction isn't applied to per-synapse ci, unlike
+// value_scale_importance/output_scale_importance) LAGS the true local
+// gradient scale near a converged solution. That lag is what keeps the step
+// naturally small during a long stable plateau (ci stays elevated relative to
+// the now-tiny residual gradient). But ci eventually decays down to match the
+// small residual too -- once it does, g/sqrt(ci) stops shrinking with the
+// error and returns to ~full lr-sized steps regardless of how small the
+// actual error is, causing overshoot, a larger resulting gradient, ci
+// ratcheting back up, and the cycle repeating/compounding. Confirmed
+// directly: a DISLDOLayer32 permutation-regression run stayed rock-stable at
+// SSE=3.0000 for 300+ steps then diverged past SSE=180 by step ~405, at a
+// CONSTANT lr, with `ci` visibly decaying from ~0.9 to ~0.66 right before
+// the spike.
+//
+// An lr-decay schedule (any monotonic-to-zero form, including 1/(1+step))
+// "fixes" this by eventually freezing the whole network -- incompatible with
+// this project's lifelong-learning goal. Both policies below are STATIONARY
+// (no dependency on step count / wall clock), so they stay compatible with
+// an infinite training horizon.
+//
+// Exactly two entry points per policy, each owning its full formula
+// end-to-end -- no math left inline at the call site, no third "combine"
+// wrapper, per direct correction (an earlier draft split the RMSprop
+// division/damp-branch out into the call site while only the floor and
+// clip lived in the policy -- half-templated, still shotgun-surgery-prone
+// for the actual optimizer math, the opposite of the point):
+//   - update_ci: the complete per-synapse second-moment update. Bounded's
+//     version additionally floors how fast ci is allowed to DECAY per step
+//     (`max(ema, min_decay_frac * ci_old)`), closing the lag directly.
+//     Explicitly NOT an AMSGrad-style permanent max: min_decay_frac<1 still
+//     lets ci decay, just not fast enough to resonate, so a synapse can
+//     still eventually "forget" a stale large-gradient event and re-adapt
+//     -- AMSGrad's true max was considered and rejected for this reason
+//     (would permanently suppress step size for any synapse that ever saw
+//     one large gradient, the opposite of what a lifelong learner needs,
+//     and would likely compound this project's own stuck-weights findings
+//     rather than fix them).
+//   - update_cw: the complete per-synapse weight delta -- the
+//     damp_by_importance branch, the division, and (Bounded only) a hard
+//     cap on |delta| independent of ci entirely, all in one place. The
+//     clip is the standard safety net non-episodic/continual training
+//     already uses everywhere else (e.g. PPO-style per-step update
+//     clipping), bounding worst-case overshoot unconditionally regardless
+//     of how update_ci behaves. `S` is the combined value_scale*out_scale
+//     factor some call sites multiply into the delta (pass VALUE_TYPE(1)
+//     for sites that don't scale) -- note `ci` itself never sees S, only
+//     the delta does (matches every existing call site's own convention).
+template <typename VALUE_TYPE>
+struct PlainRMSpropSynapsePolicy {
+    // Reproduces linear_disldo.hpp's original (pre-fix) inline formula
+    // exactly, bit-for-bit, on finite inputs -- kept for explicit opt-in
+    // and as the reference this whole fix was checked against, but NO
+    // LONGER disldo_backward's own default (BoundedRMSpropSynapsePolicy,
+    // below, is -- see the tuning sweep in
+    // tests/unit/sweep_synapse_policy_min_decay_frac.cpp for why: with
+    // min_decay_frac left at its own true-no-op default and max_abs_delta
+    // tuned to 0.1, Bounded strictly dominates Plain -- same behavior in
+    // the normal regime, real protection against the late-training
+    // resonance Plain has no defense against at all).
+    // No floor, no clip -- matches RMSpropScalePolicy's own "must stay
+    // bit-identical to today's behavior" convention.
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
+                                 VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/,
+                                 VALUE_TYPE /*max_ci*/) {
+        return beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+    }
+
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
+                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
+                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/) {
+        return damp_by_importance
+            ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
+            : (-eff_lr * g * S);
+    }
+};
+
+template <typename VALUE_TYPE>
+struct BoundedRMSpropSynapsePolicy {
+    // Never let ci decay below `min_decay_frac * ci_old` in a single step,
+    // regardless of how small the current (g,contrib) is.
+    //
+    // IMPORTANT for choosing a value: plain EMA's own WORST-CASE per-step
+    // retention (g=contrib=0) is already exactly `beta2` -- `ci_new =
+    // beta2*ci_old` in that case, nothing decays faster than that. So
+    // min_decay_frac only has any effect at all when min_decay_frac > beta2
+    // (retain MORE than the natural EMA floor would); min_decay_frac <=
+    // beta2 is a silent no-op (the `max()` below always picks the ema
+    // branch). min_decay_frac=1.0 would freeze ci forever (never decays at
+    // all, AMSGrad-style, rejected -- see file-level docstring above);
+    // min_decay_frac=0.0 (or any value <= beta2) reproduces plain unbounded
+    // EMA decay (identical to PlainRMSpropSynapsePolicy). The intended use
+    // is a value strictly between beta2 and 1 -- bounds the DECAY RATE
+    // (slower than natural), not the decay itself.
+    //
+    // CHOSEN PRODUCTION DEFAULT (see tests/unit/sweep_synapse_policy_min_decay_frac.cpp
+    // for the full sweep): min_decay_frac left at its own true-no-op value
+    // (<=beta2), NOT a value in (beta2,1). Tested up to min_decay_frac=0.99995
+    // with the delta clip disabled entirely and found ZERO measurable
+    // protective effect against the late-training resonance this policy
+    // exists to fix -- max_abs_delta's hard clip (below) is doing the ENTIRE
+    // protective job on its own, UNDER DETERMINISTIC ROUNDING. Keeping the
+    // ci floor "on" at some value in (beta2,1) anyway would add an unproven
+    // mechanism and an extra, untested interaction surface with
+    // max_abs_delta for no demonstrated benefit -- if a future task finds a
+    // failure mode where the floor DOES help independently, revisit this
+    // default then, with evidence.
+    //
+    // UPDATE (see tests/unit/sweep_synapse_policy_stochastic.cpp, and
+    // conversation): under STOCHASTIC rounding (the actual production
+    // rounding mode -- the deterministic sweep above turned out to get
+    // permanently stuck at this exact config, an unrelated finding, see
+    // that file), min_decay_frac is NOT provably inert -- it showed a real,
+    // if single-seed/unconfirmed, benefit at the riskier end of the
+    // max_abs_delta range (e.g. max_abs_delta=16: 0.9995 measurably beat
+    // 0.999). BUT that benefit vanishes by lr~0.2 and is bit-identical
+    // between tested values by lr=1.0 -- min_decay_frac does NOT extend
+    // the safe lr range, so it doesn't change the production default
+    // decision (still true-no-op, since production operates at lr<=0.05
+    // where the clip alone is already deep-safe regardless). Revisit if a
+    // real need for min_decay_frac at the risky max_abs_delta/lr combo
+    // ever arises, with proper multi-seed confirmation first.
+    //
+    // max_ci: hard ceiling on ci itself. Confirmed directly (see
+    // conversation): ci has NO ceiling anywhere else in this design --
+    // min_decay_frac's floor only slows how fast ci can DECAY, it does
+    // nothing to stop ci from GROWING. In the unsafe-pocket failure mode
+    // (probe_unstable_pocket_growth.cpp), ci was directly measured
+    // climbing continuously and unboundedly the entire 30000-step run
+    // (0.0005 -> 163+, still setting a new max at literally every
+    // checkpoint, never plateauing) -- ci chases g^2 upward with no cap
+    // as long as the underlying divergence keeps the gradient growing.
+    // Healthy production-default operation plateaus at ci~0.5, so a
+    // ceiling with generous margin above that costs nothing in the normal
+    // regime while giving ci's own growth an actual stopping point.
+    // max_ci=1e30 (the function's own default) is a true no-op, matching
+    // every other new parameter's own convention; the CHOSEN PRODUCTION
+    // DEFAULT is max_ci=100.0 (set in cpu_backend.cpp's 3 real call
+    // sites), verified directly in tests/unit/test_ci_ceiling.cpp: ci
+    // never exceeds 100.0 across the full 30000-step unsafe-pocket run
+    // (15.36M update_ci calls checked), and is a mathematically guaranteed
+    // no-op at the healthy ~0.5 plateau.
+    //
+    // IMPORTANT CORRECTION vs an earlier hypothesis in this same
+    // conversation: capping ci does NOT rescue an out-of-safe-zone
+    // max_abs_delta/lr pocket's own SSE/weight-level divergence -- with
+    // max_ci=100.0 applied, the SAME unsafe pocket's SSE still climbs
+    // continuously (up to ~313544 by step 29950, matching the uncapped
+    // run almost exactly) and STILL collapses to an all-zero output in the
+    // final ~50 steps. So ci overflowing to non-finite was NOT the (sole)
+    // root cause of that collapse-to-zero masking after all -- the
+    // weight/cw accumulator has its own SEPARATE unbounded-growth
+    // mechanism, untouched by this ceiling. max_ci is still worth
+    // defaulting on as a genuine, free structural safety property for ci
+    // itself, but it is NOT a substitute for staying inside the validated
+    // safe max_abs_delta/lr range (sweep_synapse_policy_stochastic.cpp,
+    // the lr-ceiling warning in cpu_backend.cpp).
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
+                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac,
+                                 VALUE_TYPE max_ci) {
+        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        const VALUE_TYPE floor = min_decay_frac * ci;
+        return std::min(std::max(ema, floor), max_ci);
+    }
+
+    // Clips the LR-INDEPENDENT raw update, THEN multiplies by eff_lr --
+    // NOT the other way around. Confirmed directly (see conversation): an
+    // earlier version clipped the already-lr-scaled delta, making
+    // max_abs_delta an ABSOLUTE cap regardless of lr -- fine at the lr=0.05
+    // this policy was tuned against, but silently crushed every real step
+    // for callers using a much larger lr (FoldedColumnLayer's lr=1.0
+    // couldn't converge in its own test's step budget anymore, since any
+    // step that would have exceeded the flat cap got clamped down to it no
+    // matter how much bigger lr was set). Clipping BEFORE the lr multiply
+    // (matching standard gradient-clipping convention, e.g. clip_grad_norm_
+    // in this project's own Python code) makes the EFFECTIVE final-delta
+    // clip naturally proportional to eff_lr (== eff_lr * max_abs_delta)
+    // without needing a separate multiply -- lr keeps its intended meaning,
+    // and the SAME max_abs_delta value now generalizes across callers using
+    // different lr instead of only being valid at the one lr it was tuned
+    // against. See tests/unit/sweep_synapse_policy_min_decay_frac.cpp's own
+    // header comment for the raw-space value that reproduces the
+    // already-validated lr=0.05 tuning exactly (0.1 final-space / 0.05 =
+    // 2.0 raw-space).
+    //
+    // WARNING -- this does NOT make one fixed max_abs_delta safe for
+    // UNLIMITED lr (see tests/unit/sweep_synapse_policy_stochastic.cpp
+    // Round 2, and conversation): the effective final-space clip is
+    // eff_lr*max_abs_delta, so a large enough lr eventually pushes it back
+    // into the same large-step territory that's always been risky (the
+    // underlying resonance risk is about the ABSOLUTE step size, not the
+    // raw/lr split -- this redesign fixes the split, not the ceiling).
+    // Measured at the production default (max_abs_delta=2.0): excellent
+    // at lr<=0.05, visibly degraded by lr=0.2, diverging in absolute terms
+    // by lr=0.5, genuinely unsafe by lr=1.0. cpu_backend.cpp's
+    // backward_dense/backward wrappers print a one-time stderr warning if
+    // called with learning_rate > 0.2 for exactly this reason -- a caller
+    // that genuinely needs a much larger lr needs its own max_abs_delta
+    // tuned for that regime, not this default.
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
+                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
+                                 bool damp_by_importance, VALUE_TYPE max_abs_delta) {
+        VALUE_TYPE raw = damp_by_importance
+            ? (-g * S) / (std::sqrt(ci) + eps)
+            : (-g * S);
+        if (raw > max_abs_delta) raw = max_abs_delta;
+        if (raw < -max_abs_delta) raw = -max_abs_delta;
+        return eff_lr * raw;
     }
 };
 
@@ -503,6 +835,63 @@ struct DeltaCSRRowCursor {
 // reuses both directly (both are already value-type-agnostic, no changes
 // needed to either). See conversation (ULEB128 block4 tile indexing).
 #include "block4.hpp"
+
+// ── Per-synapse ci-update policy: Block4Vec (SIMD) specializations ────────────
+//
+// The primary templates above (PlainRMSpropSynapsePolicy<VALUE_TYPE>/
+// BoundedRMSpropSynapsePolicy<VALUE_TYPE>) use std::max, which does not
+// compile for Block4Vec (GCC vector-extension `<` produces a vector of
+// comparison results, not a single bool -- same reason block4_vec_sqrt/
+// block4_vec_max/block4_vec_clip_abs above are hand-written per-lane loops
+// rather than calling std:: equivalents). Full explicit specializations,
+// not just a VALUE_TYPE=Block4Vec instantiation of the generic template --
+// mirrors this file's own scalar-vs-SIMD math duplication precedent
+// (disldo_backward's scattered scalar sites vs its Block4Vec SIMD sites
+// already hand-code the same formula twice; this policy abstraction
+// unifies the 8 CALL SITES onto one template parameter, it doesn't
+// eliminate the scalar/SIMD math split itself).
+template <>
+struct PlainRMSpropSynapsePolicy<Block4Vec> {
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
+                                Block4Vec beta2, Block4Vec /*min_decay_frac*/,
+                                Block4Vec /*max_ci*/) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        return beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+    }
+
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
+                                Block4Vec eff_lr, Block4Vec eps,
+                                bool damp_by_importance, Block4Vec /*max_abs_delta*/) {
+        const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
+        return damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+    }
+};
+
+template <>
+struct BoundedRMSpropSynapsePolicy<Block4Vec> {
+    // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
+    // for the full min_decay_frac semantics (must exceed beta2 to bind).
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
+                                Block4Vec beta2, Block4Vec min_decay_frac,
+                                Block4Vec max_ci) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec floor = min_decay_frac * ci;
+        return block4_vec_min(block4_vec_max(ema, floor), max_ci);
+    }
+
+    // Clips the lr-independent raw update before the eff_lr multiply --
+    // see the scalar BoundedRMSpropSynapsePolicy::update_cw docstring above
+    // for why (must match it exactly, or SIMD full-tile vs scalar-boundary
+    // results would diverge for the same synapse).
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
+                                Block4Vec eff_lr, Block4Vec eps,
+                                bool damp_by_importance, Block4Vec max_abs_delta) {
+        const Block4Vec neg_g_S = -(g * S);
+        const Block4Vec raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
+        return eff_lr * block4_vec_clip_abs(raw, max_abs_delta);
+    }
+};
 
 // ── DeltaCSRWeights ──────────────────────────────────────────────────────────
 
@@ -641,50 +1030,213 @@ struct SparseLinearWeightsDelta {
         output_importance_scale[col] = v;
     }
 
+    // Compile-time cap on scale_rank, used by block4's SIMD backward path
+    // (linear_disldo.hpp's process_tile) to size fixed stack arrays of
+    // per-rank-component Block4Vec accumulators instead of heap-allocating
+    // a std::vector on every tile-row visited (that loop runs extremely
+    // often -- once per (block-row, block-col, li) triple touched by
+    // backward -- so a heap alloc there would be a real, not hypothetical,
+    // regression). 4 is generous headroom over the rank=2 this was built
+    // for; raise it if a real use case needs more, but keep it small --
+    // it directly sizes stack buffers in the hot path.
+    static constexpr std::size_t SCALE_RANK_MAX = 4;
+
+    // RANK of the value_scale/output_scale factorization. true_w =
+    // quant * S[row,col], where S used to be a plain rank-1 outer product
+    // value_scale[row]*output_scale[col] -- now generalized to
+    // S[row,col] = sum_{k<scale_rank} value_scale_k(row,k) *
+    // output_scale_k(col,k), a sum of `scale_rank` outer products.
+    // Runtime-parameterized (not a C++ template per rank) so no new
+    // class/pybind binding is needed per rank value tried -- rank=1 is
+    // the default and reproduces the exact original behavior; storage
+    // for k>=1 defaults to 0.0 (see get_value_scale_k), so an
+    // unconfigured extra component contributes nothing until trained,
+    // and every existing call site (single-component get_value_scale/
+    // get_output_scale, meaning component 0) keeps working unmodified.
+    //
+    // WHY rank>1 at all: a single shared row-scalar (rank-1) can't serve
+    // a row whose columns have genuinely conflicting persistent gradient
+    // demand (column A wants the scale positive, column B wants it
+    // negative) -- the row-aggregate gradient driving value_scale sums
+    // g*quant across every column in the row, and opposite-signed real
+    // signal cancels there exactly like noise would, even though neither
+    // column's own signal is actually noisy. A second (u2,v2) component
+    // gives a second, independently-signed channel to absorb the
+    // opposite-signed column instead of cancelling against the first.
+    //
+    // SCOPE NOTE: disldo_forward, and disldo_backward's scattered-CSR path
+    // AND block4's FP4 path (process_tile in linear_disldo.hpp) are all
+    // rank-aware, using weights.get_scale(row,col). The SIMD fast path
+    // keeps its 4-wide column vectorization regardless of rank by looping
+    // the (small, SCALE_RANK_MAX-capped) rank dimension outside the lane
+    // dimension with real Block4Vec accumulators per component, rather
+    // than falling back to scalar for rank>1.
+    //
+    // Still rank-1-only (component 0 of a rank>1 layer): block4's FP8
+    // branch (a separate, near-duplicate code path within the same
+    // process_tile lambda -- the real toy/test model uses FP4, not FP8,
+    // so this wasn't hit yet) and every DeferredScaleWrite class (e.g.
+    // SparseLinearLayerResync) on both scattered and block4 paths (see
+    // disldo_backward's own DeferredScaleWrite branch comment for why
+    // rank>1 doesn't apply there without more work: eager multiply-by-
+    // not-yet-finalized-scale would reintroduce the staleness
+    // DeferredScaleWrite exists to avoid). If a rank>1 layer ever uses
+    // FP8 block4 or a DeferredScaleWrite class, its effective scale
+    // silently drops every component beyond 0 there -- tracked as a
+    // follow-up, not fixed here.
+    std::size_t scale_rank = 1;
+
     // Same per-row design, for STORED weight values instead of importance.
     // Same motivation, same lazy-sizing/default-1.0 pattern, same
-    // read/write convention (true_w = stored_w * scale).
+    // read/write convention (true_w = stored_w * scale). Storage is now
+    // row-major per-component: value_scale[row*scale_rank + k].
     std::vector<value_type> value_scale;
 
+    // Per-component accessor. Component 0 default-value 1.0 matches the
+    // original single-component convention (unset row => pass-through
+    // scale of 1); component k>=1 defaults to 0.0 so an untrained extra
+    // rank component is a pure no-op (S[row,col] reduces to exactly the
+    // rank-1 formula until that component is actually trained).
+    inline value_type get_value_scale_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        if (idx < value_scale.size()) return value_scale[idx];
+        return k == 0 ? value_type(1) : value_type(0);
+    }
+    inline void set_value_scale_raw_k(std::size_t row, std::size_t k, value_type v) {
+        const std::size_t idx = row * scale_rank + k;
+        if (idx >= value_scale.size())
+            value_scale.resize(idx + 1, value_type(1));  // grows lazily; see backfill note below
+        value_scale[idx] = v;
+    }
+    // Backward-compat single-component accessors -- component 0 only,
+    // exact original meaning/behavior at scale_rank==1.
     inline value_type get_value_scale(std::size_t row) const {
-        return row < value_scale.size() ? value_scale[row] : value_type(1);
+        return get_value_scale_k(row, 0);
     }
     inline void set_value_scale_raw(std::size_t row, value_type v) {
-        if (row >= value_scale.size()) value_scale.resize(row + 1, value_type(1));
-        value_scale[row] = v;
+        set_value_scale_raw_k(row, 0, v);
     }
 
     // value_scale/output_scale are themselves gradient-updated parameters
     // (disldo_backward), so -- like every per-synapse weight -- each gets
     // its own importance value damping its update step
     // (new = old - lr*grad / (1 + |importance|)). Default 0, same
-    // convention as per-synapse importance.
+    // convention as per-synapse importance. Same per-component,
+    // row-major layout as value_scale.
     std::vector<value_type> value_scale_importance;
+    inline value_type get_value_scale_importance_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        return idx < value_scale_importance.size() ? value_scale_importance[idx] : value_type(0);
+    }
     inline value_type get_value_scale_importance(std::size_t row) const {
-        return row < value_scale_importance.size() ? value_scale_importance[row] : value_type(0);
+        return get_value_scale_importance_k(row, 0);
+    }
+
+    // Step counter for value_scale_importance's Adam-style bias correction
+    // (RMSpropScalePolicy::update) -- see its own docstring for why this
+    // is needed: on the FIRST update, an EMA started at 0 is badly
+    // shrunk toward zero (state = (1-beta2)*g^2, not g^2), which makes
+    // the very first RMSprop step ~1/sqrt(1-beta2) (~31.6x at the
+    // default beta2=0.999) larger than intended -- confirmed as the real
+    // cause of a genuine bug (value_scale swinging sign in one step,
+    // corrupting every synapse sharing that row, both scattered and
+    // block4-owned -- see test_disldo_block4_backward.cpp's regression
+    // test). uint32_t, one per row*rank slot -- cheap (unlike a
+    // per-synapse counter, which would double memory for an FP4/FP8
+    // format where every byte counts; per-synapse `ci` does NOT get this
+    // treatment for that reason, see linear_disldo.hpp's own note).
+    std::vector<uint32_t> value_scale_step;
+    inline uint32_t& get_value_scale_step_k(std::size_t row, std::size_t k) {
+        const std::size_t idx = row * scale_rank + k;
+        if (value_scale_step.size() <= idx) value_scale_step.resize(idx + 1, 0);
+        return value_scale_step[idx];
+    }
+
+    // Adam-style FIRST moment (signed EMA of g_agg) for value_scale,
+    // companion to value_scale_importance's SECOND moment (EMA of
+    // g_agg^2, unsigned). Used only by the dead-row (nnz_row==0) path in
+    // disldo_backward -- the existing live-synapse value_scale update
+    // uses the instantaneous g_agg directly (RMSprop-style, unchanged).
+    // A dead row has no per-synapse importance (no synapse exists to
+    // hold one), so it needs its own signed accumulator to know which
+    // direction to nudge value_scale; value_scale_importance doubles as
+    // its second moment too (provably untouched by anything else while
+    // nnz_row==0, since the live-synapse loop skips the row entirely).
+    // Linear in g_agg (not g_agg^2) so E[update]=0 under zero-mean noise
+    // regardless of variance -- squaring the pretend/reactive direction
+    // (an earlier, rejected design) would have made an occasional large
+    // -magnitude gradient dominate the accumulated direction even under
+    // otherwise-cancelling noise. Same per-component, row-major layout.
+    std::vector<value_type> value_scale_momentum;
+    inline value_type get_value_scale_momentum_k(std::size_t row, std::size_t k) const {
+        const std::size_t idx = row * scale_rank + k;
+        return idx < value_scale_momentum.size() ? value_scale_momentum[idx] : value_type(0);
+    }
+    inline value_type get_value_scale_momentum(std::size_t row) const {
+        return get_value_scale_momentum_k(row, 0);
     }
 
     // Per-COLUMN counterpart to value_scale: true_w = stored_w *
-    // value_scale[row] * output_scale[col]. Same lazy-sizing/default-1.0
-    // convention. Gradient-updated by disldo_backward like value_scale is,
-    // but ONLY once a caller has explicitly called set_output_scale_raw at
-    // least once -- output_scale_is_trainable tracks that (not
-    // output_scale.empty(), which disldo_backward's own internal resize
-    // would otherwise flip after the first call regardless of intent).
+    // S[row,col], S = sum_k value_scale_k(row,k)*output_scale_k(col,k).
+    // Same lazy-sizing/default convention (component 0 -> 1.0, k>=1 ->
+    // 0.0), same row-major-per-component layout: output_scale[col*
+    // scale_rank+k]. Gradient-updated by disldo_backward like value_scale
+    // is, but ONLY once a caller has explicitly called
+    // set_output_scale_raw{,_k} at least once -- output_scale_is_trainable
+    // tracks that (not output_scale.empty(), which disldo_backward's own
+    // internal resize would otherwise flip after the first call
+    // regardless of intent).
     std::vector<value_type> output_scale;
     std::vector<value_type> output_scale_importance;
     bool output_scale_is_trainable = false;
 
+    inline value_type get_output_scale_k(std::size_t col, std::size_t k) const {
+        const std::size_t idx = col * scale_rank + k;
+        if (idx < output_scale.size()) return output_scale[idx];
+        return k == 0 ? value_type(1) : value_type(0);
+    }
     inline value_type get_output_scale(std::size_t col) const {
-        return col < output_scale.size() ? output_scale[col] : value_type(1);
+        return get_output_scale_k(col, 0);
+    }
+    inline value_type get_output_scale_importance_k(std::size_t col, std::size_t k) const {
+        const std::size_t idx = col * scale_rank + k;
+        return idx < output_scale_importance.size() ? output_scale_importance[idx] : value_type(0);
+    }
+    // Step counter for output_scale_importance's bias correction -- see
+    // value_scale_step's own docstring for the full rationale (same
+    // mechanism, one level over from row to column).
+    std::vector<uint32_t> output_scale_step;
+    inline uint32_t& get_output_scale_step_k(std::size_t col, std::size_t k) {
+        const std::size_t idx = col * scale_rank + k;
+        if (output_scale_step.size() <= idx) output_scale_step.resize(idx + 1, 0);
+        return output_scale_step[idx];
     }
     inline value_type get_output_scale_importance(std::size_t col) const {
-        return col < output_scale_importance.size() ? output_scale_importance[col] : value_type(0);
+        return get_output_scale_importance_k(col, 0);
+    }
+    inline void set_output_scale_raw_k(std::size_t col, std::size_t k, value_type v) {
+        const std::size_t idx = col * scale_rank + k;
+        if (idx >= output_scale.size()) output_scale.resize(idx + 1, value_type(1));
+        output_scale[idx] = v;
+        output_scale_is_trainable = true;
     }
     inline void set_output_scale_raw(std::size_t col, value_type v) {
-        if (col >= output_scale.size()) output_scale.resize(col + 1, value_type(1));
-        output_scale[col] = v;
-        output_scale_is_trainable = true;
+        set_output_scale_raw_k(col, 0, v);
+    }
+
+    // Combined rank-N scale: S[row,col] = sum_{k<scale_rank}
+    // value_scale_k(row,k) * output_scale_k(col,k). THE quantity
+    // Hadamard-multiplied against quant in both disldo_forward and
+    // disldo_backward's quant-update -- replaces the old
+    // get_value_scale(row)*get_output_scale(col) two-call pattern
+    // wherever the caller wants full rank-N behavior (scattered-CSR
+    // forward/backward; block4's paths still use the two-call rank-1
+    // -only form, see scale_rank's own docstring).
+    inline value_type get_scale(std::size_t row, std::size_t col) const {
+        value_type s = value_type(0);
+        for (std::size_t k = 0; k < scale_rank; ++k)
+            s += get_value_scale_k(row, k) * get_output_scale_k(col, k);
+        return s;
     }
 
     // Running L1 / L2^2 / max|.| for STORED (quantized) importance and

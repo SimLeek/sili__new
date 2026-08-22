@@ -42,6 +42,17 @@ cpu_ext = Extension(
         "-march=native",
         "-fopenmp",
         "-ffast-math",
+        # -ffast-math implies -ffinite-math-only, which lets the compiler
+        # assume isnan/isinf/isfinite are always false/false/true and
+        # constant-fold accordingly -- silently defeating every NaN/Inf
+        # guard in this file (ScalePolicy's real production guards
+        # included, not just debug instrumentation). Re-enable real IEEE
+        # semantics for those checks specifically; keeps -ffast-math's
+        # other optimizations (reciprocal approximations, reassociation,
+        # etc.) intact. Found directly: a debug fprintf gated on
+        # `!std::isfinite(x)` had its format string completely absent
+        # from the compiled .so under plain -ffast-math.
+        "-fno-finite-math-only",
     ],
     extra_link_args=["-lgomp"],
     language="c++",

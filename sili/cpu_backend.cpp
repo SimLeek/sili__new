@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -15,6 +16,29 @@
 #include "attention.hpp"
 
 namespace py = pybind11;
+
+// One-time (per-process) stderr warning when a caller uses a learning_rate
+// well outside BoundedRMSpropSynapsePolicy's validated-safe range for its
+// default max_abs_delta=2.0 (raw-space). See update_cw's own docstring
+// (delta_csr_types.hpp) and tests/unit/sweep_synapse_policy_stochastic.cpp
+// Round 2 for the measurements this threshold is based on: excellent at
+// lr<=0.05, visibly degraded by lr=0.2, diverging in absolute terms by
+// lr=0.5, genuinely unsafe by lr=1.0. Warns once, not every call, since
+// backward() runs every training step and would otherwise spam stderr.
+inline void warn_if_lr_exceeds_bounded_synapse_policy_safe_range(float learning_rate) {
+    static bool warned = false;
+    if (!warned && learning_rate > 0.2f) {
+        warned = true;
+        std::fprintf(stderr,
+            "sili: WARNING -- backward() called with learning_rate=%.4f, above the "
+            "~0.2 ceiling BoundedRMSpropSynapsePolicy's default max_abs_delta=2.0 was "
+            "validated safe for (see delta_csr_types.hpp's update_cw docstring and "
+            "tests/unit/sweep_synapse_policy_stochastic.cpp). At this lr the effective "
+            "clip (lr*max_abs_delta) may re-enter unstable territory -- if this lr is "
+            "intentional, a caller-tuned max_abs_delta for this regime is recommended "
+            "over trusting the default.\n", learning_rate);
+    }
+}
 
 // ── Block4View ───────────────────────────────────────────────────────────────
 // Thin, non-owning wrapper exposing a layer's Block4Store to Python as
@@ -57,6 +81,18 @@ public:
     // genuinely needs expand_headroom_to() with a bigger budget.
     std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
     std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
+    // Real, live memory accounting -- see block4.hpp's
+    // total_tile_used_bytes()/total_tile_alloc_bytes(): used_bytes sums
+    // each row's ACTUAL packed content (sparse-vs-dense per tile, exactly
+    // what merge_row_workspace itself would compute), alloc_bytes is the
+    // tile_data buffer's current capacity (used_bytes plus whatever
+    // per-row headroom slack -- e.g. block4_expand_headroom's
+    // blank_fraction -- is currently reserved but not yet live). The gap
+    // between them is the real cost of allowing rows room to grow; watch
+    // it to confirm that cost stays small relative to a fully-dense
+    // layer's n_in*n_out bytes, not silently approaching it.
+    std::size_t used_bytes()  const { return store->total_tile_used_bytes(); }
+    std::size_t alloc_bytes() const { return store->total_tile_alloc_bytes(); }
 private:
     Block4Store* store;
 };
@@ -417,6 +453,23 @@ public:
     // callers otherwise) -- see Block4View, bound as layer.block4.
     Block4View block4() { return Block4View(weights.block4); }
 
+    // Rank of the value_scale/output_scale factorization -- see
+    // scale_rank's own docstring, delta_csr_types.hpp. Default 1
+    // (original behavior); set BEFORE any training call touches
+    // value_scale/output_scale, since changing rank after synapses
+    // already have per-component scale data stored would silently
+    // reinterpret that data under a different row-major stride. Only
+    // meaningful for disldo_forward/disldo_backward's SCATTERED-CSR
+    // path -- block4's own forward/backward remain rank-1-only (see
+    // scale_rank's own docstring for the tracked gap this implies).
+    std::size_t get_scale_rank() const { return weights.scale_rank; }
+    void set_scale_rank(std::size_t rank) {
+        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        if (rank > decltype(weights)::SCALE_RANK_MAX)
+            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
+        weights.scale_rank = rank;
+    }
+
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
     py::array_t<V> forward_dense(py::array_t<V> x) {
@@ -442,15 +495,34 @@ public:
 
     py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // beta1=0.9 (function default), min_decay_frac left at its own true
+        // no-op default (0.0), max_abs_delta=2.0 -- BoundedRMSpropSynapsePolicy's
+        // now-tuned production default, in RAW (pre-lr-multiply) units (see
+        // update_cw's own docstring, delta_csr_types.hpp, for why it's
+        // raw-space; 2.0 reproduces the exact validated behavior at the
+        // tuning sweep's own lr=0.05 and generalizes correctly to other lr).
+        // max_ci=100.0 -- verified ceiling on ci itself (tests/unit/
+        // test_ci_ceiling.cpp): healthy production-default operation
+        // plateaus at ci~0.5, so this is a mathematically guaranteed no-op
+        // for the normal case, while giving ci's own separate unbounded-
+        // growth failure mode (confirmed directly this session, see
+        // delta_csr_types.hpp's update_ci docstring) an actual hard stop.
+        // NOTE: capping ci alone does NOT rescue an out-of-safe-zone
+        // max_abs_delta/lr config from its own weight-level divergence
+        // (verified in test_ci_ceiling.cpp -- the known unsafe pocket still
+        // diverges with ci capped) -- stay inside the validated safe range,
+        // don't rely on this ceiling for that.
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -536,10 +608,11 @@ public:
         delta_csr_build_probes<S, FP4BiPacked, COL_TYPE>(
             weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
     }
-    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
+                        V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(current_row);
         return delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+            weights, row, importance_cutoff, max_row_weights, max_prune_per_step, importance_eps);
     }
 
     // Stateful convenience wrapper around synap_row_step: advances an
@@ -552,10 +625,11 @@ public:
     // (synaptogenesis vs. memory rebalancing) and may reasonably progress
     // at different paces.
     S      _synap_row = 0;
-    bool synap_step(V importance_cutoff, S max_row_weights) {
+    bool synap_step(V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
+                    V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(_synap_row);
         const bool did = delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+            weights, row, importance_cutoff, max_row_weights, max_prune_per_step, importance_eps);
         _synap_row = static_cast<S>(row);
         return did;
     }
@@ -722,6 +796,15 @@ public:
     V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
     V get_output_importance_scale(S col) const { return weights.get_output_importance_scale(static_cast<std::size_t>(col)); }
 
+    // Per-component (rank>1) accessors -- see scale_rank's own docstring.
+    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
+    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
+    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
+    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Combined rank-N scale S(row,col) -- THE quantity Hadamard-multiplied
+    // against quant in both forward and backward.
+    V get_scale(S row, S col) const { return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col)); }
+
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
     // rescale_importance_row/rescale_value_row for what this actually does
@@ -815,6 +898,48 @@ public:
         // would silently stay at the constructor's all-zero value.
         weights.out_degree.assign(cols, S(0));
         for (S c : idx) ++weights.out_degree[c];
+    }
+
+    // Bulk LOADING (not quantization) of already-quantized dense weight/
+    // importance codes directly into block4 -- see block4_load_dense's own
+    // docstring (delta_csr_memory.hpp) for the full loading-vs-quantization
+    // design rationale. weight_codes/importance_codes are row-major n_in x
+    // n_out uint8 arrays (already-decided FP4 codes 0-15) -- produce them
+    // via fp4_quantize_array() for simple deterministic rounding, or any
+    // other scheme; this method does no quantization itself.
+    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+        auto wb = weight_codes.request(), ib = importance_codes.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        block4_load_dense<S, FP4BiPacked, COL_TYPE>(
+            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        // Every row connects to every column -- out_degree[c] = rows for
+        // every c, matching load_weights()'s own "rebuild from what was
+        // just loaded" precedent (needed for output_scale's gradient, see
+        // disldo_backward's out_degree normalization).
+        weights.out_degree.assign(cols, S(rows));
+    }
+
+    // block4-side counterpart to expand_headroom()/compact() above (which
+    // only ever touch weights.connections/scattered CSR -- see
+    // block4_expand_headroom's own docstring, delta_csr_memory.hpp, for
+    // why block4 needed its own separate pair). expand_block4_headroom
+    // gives every block4 row blank_fraction slack to grow into (called
+    // automatically by load_dense_codes' underlying block4_load_dense, but
+    // exposed directly too for a layer whose block4 content changed some
+    // other way, e.g. after compact_block4()). FP4-only, matching
+    // block4_expand_headroom's own scope.
+    void expand_block4_headroom(float blank_fraction = 0.2f) {
+        block4_expand_headroom<S, FP4BiPacked, COL_TYPE>(weights, blank_fraction);
+    }
+    // Opposite: shrinks every block4 row's tile-byte headroom back down to
+    // exactly its current live content, zero slack -- call once a layer's
+    // block4 content is done growing (e.g. post-pruning, or a plateaued
+    // layer) to reclaim the blank_fraction slack. Call
+    // expand_block4_headroom() again afterward before resuming training
+    // that needs block4 rows to grow further.
+    void compact_block4() {
+        block4_compact<S, FP4BiPacked, COL_TYPE>(weights);
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -968,15 +1093,19 @@ public:
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // See SparseLinearLayer::backward_dense's identical comment on these
+        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1183,15 +1312,19 @@ public:
 
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // See SparseLinearLayer::backward_dense's identical comment on these
+        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps);
+            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            0.9f, 0.0f, 2.0f, 100.0f);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1230,6 +1363,16 @@ public:
             _idx_budget_bytes,
             ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
+    }
+
+    // See SparseLinearLayerImpl::load_dense_codes' docstring (this file) --
+    // same loading-only contract, FP8 (E4M3) codes instead of FP4 nibbles.
+    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+        auto wb = weight_codes.request(), ib = importance_codes.request();
+        const std::size_t rows = weights.connections.layout.rows;
+        const std::size_t cols = weights.connections.layout.cols;
+        block4_load_dense<S, VT, COL_TYPE>(
+            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -1312,7 +1455,18 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("row_merge_overflow_bytes_dropped",
              &Block4View::row_merge_overflow_bytes_dropped,
              "Cumulative bytes of intended row content dropped by"
-             " row_merge_overflow_events, across every occurrence.");
+             " row_merge_overflow_events, across every occurrence.")
+        .def_property_readonly("used_bytes", &Block4View::used_bytes,
+             "Real bytes of ACTUAL tile content currently live (sparse-vs-dense"
+             " per tile, exactly what merge_row_workspace itself would compute)."
+             " Compare against n_in*n_out to see the real compression ratio at"
+             " the current sparsity level.")
+        .def_property_readonly("alloc_bytes", &Block4View::alloc_bytes,
+             "Current capacity of the tile_data buffer -- used_bytes plus"
+             " whatever per-row growth headroom is currently reserved but not"
+             " yet live (e.g. block4_expand_headroom's blank_fraction slack)."
+             " The gap (alloc_bytes - used_bytes) is the real memory cost of"
+             " allowing rows room to grow.");
 
     // ── Block4View8 (FP8 counterpart, real bug found+fixed: this class was
     //    never registered here, so SparseLinearLayer8.block4 raised
@@ -1353,6 +1507,8 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
+        .def("get_scale_rank",       &SparseLinearLayer::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayer::set_scale_rank, py::arg("rank"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -1377,9 +1533,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayer::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -1427,6 +1585,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale",      &SparseLinearLayer::get_value_scale,
              py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
+        .def("get_value_scale_k",    &SparseLinearLayer::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayer::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_scale",            &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
+             "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
+             "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
         .def("set_value_scale_raw",
              [](SparseLinearLayer& self, int row, float scale) {
                  self.weights.set_value_scale_raw(
@@ -1526,6 +1691,20 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer::get_ptrs)
         .def("load_weights",        &SparseLinearLayer::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayer::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"),
+             "Bulk-load already-quantized dense FP4 codes directly into block4,\n"
+             "bypassing scattered CSR entirely. See block4_load_dense's docstring\n"
+             "(delta_csr_memory.hpp) -- loading only, no quantization performed\n"
+             "here; produce codes via fp4_quantize_array() or any other scheme.")
+        .def("expand_block4_headroom", &SparseLinearLayer::expand_block4_headroom,
+             py::arg("blank_fraction") = 0.2f,
+             "block4-side counterpart to expand_headroom() -- that only ever\n"
+             "touches scattered CSR. Gives every block4 row blank_fraction slack\n"
+             "to grow into.")
+        .def("compact_block4", &SparseLinearLayer::compact_block4,
+             "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
+             "headroom back down to exactly its current live content.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer& self) {
             return py::array_t<SparseLinearLayer::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -1591,9 +1770,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerResync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResync::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerResync::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -1740,6 +1921,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerResync::get_ptrs)
         .def("load_weights",        &SparseLinearLayerResync::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerResync::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerResync& self) {
             return py::array_t<SparseLinearLayerResync::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -1806,9 +1989,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerNoScale::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScale::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerNoScale::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -1955,6 +2140,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerNoScale::get_ptrs)
         .def("load_weights",        &SparseLinearLayerNoScale::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerNoScale::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerNoScale& self) {
             return py::array_t<SparseLinearLayerNoScale::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -1997,6 +2184,8 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
+        .def("get_scale_rank",       &SparseLinearLayerDeterministic::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -2021,9 +2210,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2071,6 +2262,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale",      &SparseLinearLayerDeterministic::get_value_scale,
              py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
+        .def("get_value_scale_k",    &SparseLinearLayerDeterministic::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayerDeterministic::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayerDeterministic::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_scale",            &SparseLinearLayerDeterministic::get_scale, py::arg("row"), py::arg("col"),
+             "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
+             "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
         .def("set_value_scale_raw",
              [](SparseLinearLayerDeterministic& self, int row, float scale) {
                  self.weights.set_value_scale_raw(
@@ -2170,6 +2368,16 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
+        .def("expand_block4_headroom", &SparseLinearLayerDeterministic::expand_block4_headroom,
+             py::arg("blank_fraction") = 0.2f,
+             "block4-side counterpart to expand_headroom() -- that only ever\n"
+             "touches scattered CSR. Gives every block4 row blank_fraction slack\n"
+             "to grow into.")
+        .def("compact_block4", &SparseLinearLayerDeterministic::compact_block4,
+             "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
+             "headroom back down to exactly its current live content.")
         .def_property_readonly("out_degree", [](const SparseLinearLayerDeterministic& self) {
             return py::array_t<SparseLinearLayerDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2235,9 +2443,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerResyncDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResyncDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerResyncDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2384,6 +2594,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerResyncDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerResyncDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerResyncDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerResyncDeterministic& self) {
             return py::array_t<SparseLinearLayerResyncDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2448,9 +2660,11 @@ PYBIND11_MODULE(_cpu, m)
         .def("build_probes",         &SparseLinearLayerNoScaleDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScaleDeterministic::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
+             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
         .def("synap_step",           &SparseLinearLayerNoScaleDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+             py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
@@ -2597,6 +2811,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayerNoScaleDeterministic::get_ptrs)
         .def("load_weights",        &SparseLinearLayerNoScaleDeterministic::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes",    &SparseLinearLayerNoScaleDeterministic::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def_property_readonly("out_degree", [](const SparseLinearLayerNoScaleDeterministic& self) {
             return py::array_t<SparseLinearLayerNoScaleDeterministic::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2692,6 +2908,13 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"),
+             "Bulk-load already-quantized dense FP8 (E4M3) codes directly into\n"
+             "block4, bypassing scattered CSR entirely. See block4_load_dense's\n"
+             "docstring (delta_csr_memory.hpp) -- loading only, no quantization\n"
+             "performed here; produce codes via fp8_quantize_array() or any other\n"
+             "scheme.")
         .def("get_value_scale",      &SparseLinearLayer8::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2749,6 +2972,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8Resync::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8Resync::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8Resync::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def("get_value_scale",      &SparseLinearLayer8Resync::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2807,6 +3032,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("ptrs",               &SparseLinearLayer8AdaMax::get_ptrs)
         .def("load_weights",        &SparseLinearLayer8AdaMax::load_weights,
              py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes",    &SparseLinearLayer8AdaMax::load_dense_codes,
+             py::arg("weight_codes"), py::arg("importance_codes"))
         .def("get_value_scale",      &SparseLinearLayer8AdaMax::get_value_scale,
              py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
@@ -2914,6 +3141,48 @@ PYBIND11_MODULE(_cpu, m)
         py::arg("x"), py::arg("k"), py::arg("num_threads") = 4,
         "Exact top-k sparsity conversion for forward and backward passes."
     );
+
+    // ── Bulk quantize-array utilities ───────────────────────────────────────
+    //
+    // Standalone, layer-independent elementwise float32->code conversion --
+    // deliberately kept SEPARATE from block4_load_dense (delta_csr_memory.hpp)
+    // and its "load_dense_codes" pybind bindings below: loading (placing
+    // already-decided codes into storage) and quantization (deciding what
+    // code represents a float) are different concerns. This is the simple
+    // deterministic round-to-nearest scheme (reuses the existing scalar
+    // fp4_quantize/fp8_quantize codecs, unchanged); a caller wanting a
+    // smarter scheme (rank-1 scale fit, residual decomposition, etc.) can
+    // produce codes some other way and hand them directly to
+    // load_dense_codes instead of calling these.
+    m.def("fp4_quantize_array",
+        [](py::array_t<float> vals) -> py::array_t<uint8_t> {
+            auto buf = vals.request();
+            py::array_t<uint8_t> out(buf.size);
+            const float* src = (const float*)buf.ptr;
+            uint8_t* dst = (uint8_t*)out.request().ptr;
+            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp4_quantize(src[i]);
+            return out;
+        },
+        py::arg("vals"),
+        "Deterministic FP4 (E2M1) quantize, elementwise -- same scalar\n"
+        "fp4_quantize() semantics every insertion path in this codebase\n"
+        "already uses, just applied over a whole array at once. Output\n"
+        "codes (0-15) are the RAW magnitude+sign code, not scaled by any\n"
+        "row/col value_scale -- pre-divide by scale yourself before calling\n"
+        "this if you want one, same convention as load_weights().");
+
+    m.def("fp8_quantize_array",
+        [](py::array_t<float> vals) -> py::array_t<uint8_t> {
+            auto buf = vals.request();
+            py::array_t<uint8_t> out(buf.size);
+            const float* src = (const float*)buf.ptr;
+            uint8_t* dst = (uint8_t*)out.request().ptr;
+            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp8_quantize(src[i]);
+            return out;
+        },
+        py::arg("vals"),
+        "Deterministic FP8 (E4M3) quantize, elementwise -- FP8 counterpart\n"
+        "to fp4_quantize_array(), same scale convention (pre-divide yourself).");
 
     m.def("seed_fp4_stochastic_rng", &fp4_seed_stochastic_rng, py::arg("seed"),
         "Reseed the CALLING thread's FP4 stochastic-rounding RNG (see "

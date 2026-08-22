@@ -80,8 +80,8 @@ def _make_layer(n_in: int, n_out: int, cpus: int = 1) -> "_cpu.SparseLinearLayer
     layer = _cpu.SparseLinearLayer(n_in, n_out, 0, _budget(n_in, n_out), cpus)
     # Pre-energize diagonal with fixed-random non-zero FP4 weights near ±2.0.
     # Values near 2.0 mean the first forward pass produces outputs near 2×input,
-    # which gives the Hebbian trace enough signal to update importance and let
-    # synaptogenesis start finding useful connections.
+    # which gives the ADSP-style activity trace enough signal to update
+    # importance and let synaptogenesis start finding useful connections.
     # Fixed seed → reproducible init without requiring the energy function.
     # None of these are zero (guaranteed by the table choice).
     FP4_NONZERO_NEAR_2 = [1.5, -1.5, 2.0, -2.0]
@@ -181,7 +181,7 @@ class SparseTCNNAudioEncoder:
         Parameters
         ──────────
         audio_chunk : (chunk_size,) or (chunk_size, C_in) float32.
-        train       : If True, update importance (Hebbian) and run synaptogenesis.
+        train       : If True, update importance (ADSP-style activity correlation) and run synaptogenesis.
 
         Returns
         ───────

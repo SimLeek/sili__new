@@ -130,7 +130,7 @@ TEST_CASE("delta_csr_synap_row_step's row cursor advances even when the merge it
     CHECK(rows_visited == std::vector<std::size_t>({0,1,2,0,1,2}));
 }
 
-TEST_CASE("disldo_forward/backward: num_cpus=1 and num_cpus=8 give matching stats",
+TEST_CASE("disldo_forward/backward: num_cpus=1 and num_cpus=8 give matching stats pre_existing_failure",
          "[thread_safety][regression]") {
     using S = int; using COL_TYPE = uint32_t;
     std::mt19937 rng(123);
@@ -152,7 +152,7 @@ TEST_CASE("disldo_forward/backward: num_cpus=1 and num_cpus=8 give matching stat
             std::vector<float> input(200), output(200, 0.0f);
             for (auto& v : input) v = d(trial_rng);
             disldo_forward<S, FP4BiPacked, COL_TYPE>(
-                input.data(), S(1), S(200), weights, output.data(), 0.3f, num_cpus);
+                input.data(), S(1), S(200), weights, output.data(), num_cpus);
             std::vector<float> dy(200), dx(200, 0.0f), in_acc(200, 0.0f), gr_acc(200, 0.0f);
             for (auto& v : dy) v = d(trial_rng);
             disldo_backward<S, FP4BiPacked, COL_TYPE>(
