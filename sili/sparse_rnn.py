@@ -218,6 +218,20 @@ class _SparseLayerBase(Module):
                            importance_eps=importance_eps)
         self._c.equalizer_step()
 
+    def magnitude_rescale_output(self, target: float, correction_rate: float,
+                                 scale_invariant: bool = False) -> None:
+        """Passthrough to the real C++ magnitude_rescale_output (see
+        delta_csr_types.hpp's own docstring). Not every backend has
+        this bound -- e.g. the fp32 DISLDOLayerV backend has no scale
+        concept to rescale -- so callers sweeping this on/off across
+        mixed precisions should guard with
+        `hasattr(layer._c, "magnitude_rescale_output")` (the wrapped
+        C++ object, NOT this Python wrapper -- this method itself
+        exists on every _SparseLayerBase subclass via inheritance and
+        would raise AttributeError from self._c if the backend lacks
+        it, rather than silently no-op)."""
+        self._c.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
     def state_dict(self) -> dict:
         return {
             "ptrs":       np.array(self.ptrs),
@@ -452,6 +466,32 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
+def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int,
+                             rng: Optional[np.random.Generator] = None) -> int:
+    """Fully dense counterpart to `_preseed_random_sparse`, for storage
+    types with no block4 support (DeltaCSRBiValues<float>/DISLDOLayerV
+    -- `_preseed_dense`'s own `load_dense_codes`/block4 path doesn't
+    exist for this VALUES_TYPE). Every (input, output) pair connected
+    via plain scattered CSR instead -- no quantization floor to correct
+    for (unlike `_preseed_dense`'s FP4-specific scale-correction dance,
+    see its own docstring), so this is just standard fan-in-normalized
+    (1/sqrt(n_inputs)) Gaussian init, matching ordinary Xavier/Kaiming
+    convention for a fully-connected linear layer. Caller MUST have
+    constructed `c` with max_weights >= n_inputs*n_outputs -- unlike
+    block4's dense path (a separate allocation, unbounded by the
+    scattered-CSR max_weights budget), this genuinely needs that much
+    scattered-CSR storage since there's no other place to put it."""
+    if rng is None:
+        rng = np.random.default_rng()
+    scale = 1.0 / np.sqrt(max(1, n_inputs))
+    ptrs = np.arange(0, n_inputs * n_outputs + 1, n_outputs, dtype=np.int32)
+    indices = np.tile(np.arange(n_outputs, dtype=np.int32), n_inputs)
+    values = (rng.standard_normal(n_inputs * n_outputs).astype(np.float32) * scale)
+    importance = np.zeros(n_inputs * n_outputs, dtype=np.float32)
+    c.load_weights(ptrs, indices, values, importance)
+    return n_outputs  # every row is already at max capacity -- nothing left to grow into
+
+
 def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     """The genuinely-designed zero-weight-init: NO connections at all
     (nnz=0), not a dense grid pre-loaded with weight=0 (see
@@ -501,7 +541,18 @@ class DISLDOLayer(_SparseLayerBase):
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
+                scale_invariant: bool = False) -> Tensor:
+        # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
+        # the C++ side's own tuned production defaults" -- kept as
+        # Optional here rather than hardcoding the production floats a
+        # second time in Python, so there is still exactly one source of
+        # truth (cpu_backend.cpp's kSynapsePolicy* constants) even though
+        # this wrapper now exposes them for quick per-call experiments
+        # (e.g. testing max_abs_delta=huge to effectively disable the
+        # clip) without a C++ rebuild.
+        #
         # forward_dense/backward_dense always return [batch, cols] --
         # even for a bare 1-D [cols] input, batch is implicitly 1, but
         # the OUTPUT shape stays 2-D regardless. Squeeze that back out
@@ -538,8 +589,13 @@ class DISLDOLayer(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
+                if scale_invariant: extra["scale_invariant"] = True
                 dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                             damp_by_importance=damp_by_importance)
+                                             damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -645,15 +701,37 @@ class DISLDOLayer32(_SparseLayerBase):
     NOT a general-purpose production layer: no equalize_to_capacity (no
     growth-headroom use case here), no block4 promotion. Pure diagnostic
     -- same math, no quantization, to isolate what FP4's coarseness
-    specifically contributes vs. the update-rule math itself."""
+    specifically contributes vs. the update-rule math itself.
+
+    dense=True: fully-connected init via `_preseed_dense_scattered` (see
+    its own docstring) -- this VALUES_TYPE (DeltaCSRBiValues<float>) has
+    no block4 support, so unlike DISLDOLayer/DISLDOLayer8's own
+    dense=True (a separate block4 allocation, unbounded by max_weights),
+    this genuinely needs max_weights expanded to cover every
+    (input, output) pair -- done automatically here, caller doesn't need
+    to size max_weights for it. Added because the DEFAULT
+    (_preseed_random_sparse, ~k=max_weights//(2*n_inputs) connections
+    per row) silently gives this class far fewer trainable parameters
+    than a dense=True FP4/FP8 arm or a fully-connected torch reference
+    at the same max_weights budget -- a genuine capacity gap, not a
+    precision or optimizer difference, confirmed as a real contributor
+    to fp32's poor MQAR results before this existed (see conversation)."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False):
+        if dense:
+            max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if dense:
+            self._max_row_weights = _preseed_dense_scattered(self._c, in_features, out_features, rng)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
+                scale_invariant: bool = False) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -666,8 +744,13 @@ class DISLDOLayer32(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
+                if scale_invariant: extra["scale_invariant"] = True
                 dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance)
+                                       damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -692,18 +775,34 @@ class DISLDOLayer8(_SparseLayerBase):
     ten configs, never lost to native FP4) -- see sili_peridot's
     JOURNAL.md for the full writeup this class is built from.
 
-    SCOPE, current: scattered CSR path only, same as DISLDOLayer32 --
-    no block4 dense-tile SIMD promotion yet (real follow-up, not a
-    template swap: block4.hpp's tile storage is hardcoded to FP4's
-    1-byte nibble-packed layout, E4M3 needs 2 full bytes/slot)."""
+    dense=True uses the block4 dense-tile SIMD path (Block4Tile8/Store8,
+    task #94/#96) via the same load_dense_codes/block4_load_dense
+    machinery DISLDOLayer's own dense=True already uses -- this class's
+    own docstring previously said "no block4 dense-tile SIMD promotion
+    yet" because the PYTHON wrapper never called it, even though the
+    C++/pybind side (SparseLinearLayer8.load_dense_codes) has been
+    ready since #123."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
+                 dense: bool = False, scale_rank: int = 1):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
-        self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        if dense:
+            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
+                                                    quantize_fn=_cpu.fp8_quantize_array)
+        else:
+            self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        # scale_rank was never threaded here before -- confirmed missing
+        # (unlike DISLDOLayer/DISLDOLayerDeterministic's own
+        # _seed_scale_rank call) while wiring up a real-engine rank1/rank2
+        # sweep across fp4/fp4_dual/fp8 (sili_peridot task #247); a rank2
+        # FP8 arm would otherwise TypeError immediately.
+        _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True) -> Tensor:
+                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
+                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
+                scale_invariant: bool = False) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -716,8 +815,13 @@ class DISLDOLayer8(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                extra = {}
+                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None: extra["max_ci"] = max_ci
+                if scale_invariant: extra["scale_invariant"] = True
                 dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance)
+                                       damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)

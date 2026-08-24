@@ -49,6 +49,36 @@ TEST_CASE("PlainRMSpropSynapsePolicy::update_cw applies S correctly",
     CHECK(with_S2 == Catch::Approx(2.0f * with_S1));
 }
 
+TEST_CASE("PlainRMSpropSynapsePolicy::update_cw's scale_invariant flag makes the "
+         "TRUE-WEIGHT delta (S*update_cw) independent of S",
+         "[synapse_policy][plain][scale_invariant]") {
+    // Root cause this flag fixes (see sili_peridot's scale_invariant_chain_rule
+    // torch prototype): the historical formula computes raw from g*S, so
+    // Δtrue_weight = S*update_cw(...) scales QUADRATICALLY with S once S
+    // deviates from 1.0 (S²-collapse). scale_invariant=true instead computes
+    // raw from the bare g and divides by S at apply time, so Δtrue_weight is
+    // exactly S*(eff_lr*raw/S) = eff_lr*raw -- flat in S.
+    using P = PlainRMSpropSynapsePolicy<float>;
+    const float g = 0.5f, ci = 0.1f, eff_lr = 0.01f, eps = 1e-8f;
+    const float dcw_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/true);
+    const float dcw_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/true);
+    const float true_delta_S1 = 1.0f * dcw_S1;
+    const float true_delta_S4 = 4.0f * dcw_S4;
+    CHECK(true_delta_S1 == Catch::Approx(true_delta_S4));
+
+    // Confirm the OLD (default/false) formula does NOT have this property --
+    // it reproduces the quadratic-in-S collapse the flag exists to fix.
+    const float dcw_S1_old = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/false);
+    const float dcw_S4_old = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, 1e30f, /*scale_invariant=*/false);
+    const float true_delta_S1_old = 1.0f * dcw_S1_old;
+    const float true_delta_S4_old = 4.0f * dcw_S4_old;
+    CHECK(true_delta_S4_old == Catch::Approx(16.0f * true_delta_S1_old));
+
+    // Omitting the argument entirely must default to the old behavior --
+    // exact bit-for-bit backward compatibility for every existing call site.
+    CHECK(P::update_cw(g, ci, 1.0f, eff_lr, eps, true, 1e30f) == Catch::Approx(dcw_S1_old));
+}
+
 TEST_CASE("BoundedRMSpropSynapsePolicy::update_ci matches plain EMA when ci is GROWING",
          "[synapse_policy][bounded]") {
     using P = BoundedRMSpropSynapsePolicy<float>;
@@ -176,6 +206,39 @@ TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's clip preserves sign",
     CHECK(delta_neg_g == Catch::Approx(eff_lr * max_abs_delta));
 }
 
+TEST_CASE("BoundedRMSpropSynapsePolicy::update_cw's scale_invariant flag makes the "
+         "TRUE-WEIGHT delta (S*update_cw) independent of S, clip included",
+         "[synapse_policy][bounded][scale_invariant]") {
+    // Same property as the Plain-policy version of this test, but also
+    // confirms the clip (max_abs_delta) is applied to the S-INDEPENDENT raw
+    // value before the eff_lr*raw/S division -- clipping the raw gradient
+    // step, not the final S-scaled delta, is what makes the clip threshold
+    // mean the same thing regardless of a synapse's current output_scale.
+    using P = BoundedRMSpropSynapsePolicy<float>;
+    const float g = 0.5f, ci = 0.1f, eff_lr = 0.01f, eps = 1e-8f;
+    const float max_abs_delta = 1e30f;  // huge -- clip must not engage here
+    const float dcw_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/true);
+    const float dcw_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/true);
+    CHECK(1.0f * dcw_S1 == Catch::Approx(4.0f * dcw_S4));
+
+    // Old (default/false) formula: quadratic-in-S collapse still present.
+    const float dcw_S1_old = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/false);
+    const float dcw_S4_old = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, max_abs_delta, /*scale_invariant=*/false);
+    CHECK(4.0f * dcw_S4_old == Catch::Approx(16.0f * (1.0f * dcw_S1_old)));
+
+    // Omitting the argument defaults to the old (false) behavior exactly.
+    CHECK(P::update_cw(g, ci, 1.0f, eff_lr, eps, true, max_abs_delta) == Catch::Approx(dcw_S1_old));
+
+    // Clip engages on the raw (pre-division) value: with a tiny max_abs_delta,
+    // both S=1 and S=4 must clip to the SAME true-weight delta magnitude,
+    // proving the clip threshold is S-independent under scale_invariant=true.
+    const float tight_clip = 0.001f;
+    const float clipped_S1 = P::update_cw(g, ci, 1.0f, eff_lr, eps, true, tight_clip, /*scale_invariant=*/true);
+    const float clipped_S4 = P::update_cw(g, ci, 4.0f, eff_lr, eps, true, tight_clip, /*scale_invariant=*/true);
+    CHECK(1.0f * clipped_S1 == Catch::Approx(4.0f * clipped_S4));
+    CHECK(std::abs(clipped_S1) == Catch::Approx(eff_lr * tight_clip));
+}
+
 TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula exactly",
          "[synapse_policy][plain][regression]") {
     // Extracted verbatim from linear_disldo.hpp's own inline math (see e.g.
@@ -197,4 +260,59 @@ TEST_CASE("update_ci/update_cw match linear_disldo.hpp's existing inline formula
 
     CHECK(ci_policy == Catch::Approx(ci_direct));
     CHECK(delta_policy == Catch::Approx(delta_direct));
+}
+
+TEST_CASE("RMSpropScalePolicy::update's log_space flag makes the RELATIVE "
+         "(percentage) step size independent of scale's own magnitude",
+         "[scale_policy][log_space]") {
+    // Ported from sili_peridot's torch prototype (_scale_update,
+    // scale_invariant_chain_rule branch): the additive update assumes
+    // scale stays near 1.0 -- a fixed eff_lr step is huge relative to a
+    // scale that's shrunk well below 1 (magnitude-scale reparametrization
+    // deliberately does this) and negligible once scale has grown large.
+    // log_space instead normalizes in log-space: on a fresh (scale_state=0)
+    // first step, state_hat = scale^2*(g_agg^2+contrib_agg^2) EXACTLY (no
+    // beta2 dependence at step 1), so log_step = eff_lr*g_agg*scale /
+    // (scale*sqrt(g_agg^2+contrib_agg^2)+eps) is independent of scale up
+    // to the eps term -- new_scale/scale (the RELATIVE change) is the same
+    // regardless of scale's starting magnitude.
+    using P = RMSpropScalePolicy<float>;
+    const float g_agg = 0.3f, contrib_agg = 0.1f, eff_lr = 0.05f, beta2 = 0.999f, eps = 1e-8f;
+
+    float scale_a = 1.0f, state_a = 0.0f;
+    uint32_t step_a = 0;
+    P::update(scale_a, state_a, g_agg, eff_lr, beta2, eps, contrib_agg, &step_a, /*log_space=*/true);
+    const float rel_change_a = scale_a / 1.0f;
+
+    float scale_b = 0.01f, state_b = 0.0f;
+    uint32_t step_b = 0;
+    P::update(scale_b, state_b, g_agg, eff_lr, beta2, eps, contrib_agg, &step_b, /*log_space=*/true);
+    const float rel_change_b = scale_b / 0.01f;
+
+    CHECK(rel_change_a == Catch::Approx(rel_change_b).margin(1e-4f));
+    // scale can never cross zero under the multiplicative update.
+    CHECK(scale_a > 0.0f);
+    CHECK(scale_b > 0.0f);
+
+    // Confirm the additive (default/false) path does NOT have this
+    // property -- a fixed eff_lr step is a wildly different PERCENTAGE
+    // change depending on scale's starting magnitude.
+    float scale_c = 1.0f, state_c = 0.0f;
+    uint32_t step_c = 0;
+    P::update(scale_c, state_c, g_agg, eff_lr, beta2, eps, contrib_agg, &step_c, /*log_space=*/false);
+    const float rel_change_c = scale_c / 1.0f;
+
+    float scale_d = 0.01f, state_d = 0.0f;
+    uint32_t step_d = 0;
+    P::update(scale_d, state_d, g_agg, eff_lr, beta2, eps, contrib_agg, &step_d, /*log_space=*/false);
+    const float rel_change_d = scale_d / 0.01f;
+
+    CHECK(std::abs(rel_change_c - rel_change_d) > 0.5f);
+
+    // Omitting log_space entirely defaults to the old (additive) behavior,
+    // bit-identical to every existing call site.
+    float scale_e = 1.0f, state_e = 0.0f;
+    uint32_t step_e = 0;
+    P::update(scale_e, state_e, g_agg, eff_lr, beta2, eps, contrib_agg, &step_e);
+    CHECK(scale_e == Catch::Approx(scale_c));
 }

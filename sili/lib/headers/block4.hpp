@@ -120,6 +120,23 @@ inline Block4Vec block4_vec_clip_abs(Block4Vec x, Block4Vec max_abs) {
     return result;
 }
 
+// Per-lane "keep new_val if finite, else keep fallback" -- same "no
+// built-in compare-and-select" reason as block4_vec_max above. Used by
+// PlainRMSpropSynapsePolicy<Block4Vec>/BoundedRMSpropSynapsePolicy<Block4Vec>
+// (delta_csr_types.hpp) to make ci/cw's own per-synapse update immune to a
+// non-finite g/contrib the same way RMSpropScalePolicy::update already
+// guards value_scale/output_scale (see that struct's own docstring) --
+// a coverage gap fixed together with the contrib-formula bug in
+// linear_disldo.hpp (see conversation): the per-synapse update had NO
+// NaN/Inf guard anywhere despite value_scale/output_scale getting one.
+inline Block4Vec block4_vec_select_finite(Block4Vec new_val, Block4Vec fallback) {
+    Block4Vec result;
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        result[i] = std::isfinite(new_val[i]) ? new_val[i] : fallback[i];
+    }
+    return result;
+}
+
 // 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes 4 codes in one
 // shot instead of 4 separate FP4_TABLE[code] lookups. 
 // Verified bit-exact against fp4_decode_bits()
@@ -213,6 +230,43 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
     // sign is bit 31 (0x80000000) or 0; >>28 moves it to bit 3 (0x8 or 0),
     const Block4VecU sign_bit = sign >> 28;
     return (sign_bit | mag_code) & ~zero_mag_mask;
+}
+
+/// Never-zero variant for a LIVE synapse's weight -- see
+/// fp4_encode_bits_live's block comment (fp4quant.hpp) for the full
+/// dead-synapse-collapse rationale this exists to close.
+///
+/// A thin post-hoc wrapper, NOT a reimplementation of the kernel's own
+/// randomness: calls the existing kernel unchanged, then for any lane
+/// that landed on code 0 (this kernel's own `up_low_mask` draw already
+/// decided "round toward 0" based on |v|'s magnitude alone, discarding
+/// sign in that case -- see `zero_mag_mask`/`return` above), recovers
+/// v's ORIGINAL sign from the pre-quantization Block4Vec bits (still
+/// available here, unlike inside the kernel where it's already
+/// discarded) and redirects to that SAME sign's code 1.
+///
+/// NARROWER than fp4_quantize_stochastic_live's scalar cross-sign
+/// design (see that function's own docstring, fp4quant.hpp): the scalar
+/// version computes a genuine probability of landing on the OPPOSITE
+/// sign near v=0 (a real coin-flip at v=0, weighted otherwise), because
+/// it derives the redirect from v's signed position across the whole
+/// [-0.5,+0.5) bracket. This SIMD wrapper cannot do that without
+/// reworking the kernel's own `up_low_mask` computation (a magnitude-
+/// only draw, sign discarded by construction) -- it only ever redirects
+/// to v's OWN sign, never the opposite one. This still fully satisfies
+/// the primary invariant (never code 0), just with less near-zero
+/// dithering richness than the scalar path -- accepted as a deliberate
+/// scope boundary (zero touches to the hot, hand-tuned kernel above) per
+/// the design conversation, not an oversight.
+inline Block4VecU block4_vec_quantize_stochastic_fp4_live(Block4Vec v) {
+    const Block4VecU codes = block4_vec_quantize_stochastic_fp4(v);
+    Block4VecU vbits;
+    std::memcpy(&vbits, &v, sizeof(vbits));
+    const Block4VecU sign      = vbits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU sign_bit  = sign >> 28;
+    const Block4VecU zero_mask = (codes == block4_vecu_broadcast(0u));
+    const Block4VecU redirect  = sign_bit | block4_vecu_broadcast(1u);
+    return (codes & ~zero_mask) | (redirect & zero_mask);
 }
 
 // 4-wide fp8_decode_bits (fp8quant.hpp) -- decodes 4 E4M3 codes in one

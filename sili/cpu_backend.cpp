@@ -17,6 +17,28 @@
 
 namespace py = pybind11;
 
+// BoundedRMSpropSynapsePolicy's tuned production defaults (see
+// delta_csr_types.hpp's own docstring for the full tuning history) --
+// named here ONCE and referenced by every backward()/backward_dense()
+// pybind method below (SparseLinearLayerImpl, DISLDOLayerV,
+// SparseLinearLayer8Impl) instead of repeating bare literals at each of
+// the 3 (soon more, if a 4th VALUES_TYPE variant is added) call sites.
+// Direct motivation: the contrib-formula bug fixed this session lived
+// undetected partly because these same "trailing 4 args" were hand-
+// duplicated at all 8 real disldo_backward call sites in
+// linear_disldo.hpp with no single source of truth -- named constants
+// here at least remove THIS layer's own duplication risk, even though
+// linear_disldo.hpp's own 8 call sites still need touching by hand if
+// the underlying policy's call signature itself changes (they dispatch
+// on different VALUES_TYPE/SIMD paths, not unifiable into one function
+// without a much larger template restructuring than this warrants).
+constexpr float kSynapsePolicyBeta1         = 0.9f;
+constexpr float kSynapsePolicyMinDecayFrac  = 0.0f;   // true no-op (<=beta2)
+constexpr float kSynapsePolicyMaxAbsDelta   = 2.0f;   // raw-space (pre-lr-multiply)
+constexpr float kSynapsePolicyMaxCi         = 100.0f;
+constexpr float kSynapsePolicyZeroEscapeEps = 0.1f;
+constexpr bool  kSynapsePolicyScaleInvariant = false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
+
 // One-time (per-process) stderr warning when a caller uses a learning_rate
 // well outside BoundedRMSpropSynapsePolicy's validated-safe range for its
 // default max_abs_delta=2.0 (raw-space). See update_cw's own docstring
@@ -458,10 +480,11 @@ public:
     // (original behavior); set BEFORE any training call touches
     // value_scale/output_scale, since changing rank after synapses
     // already have per-component scale data stored would silently
-    // reinterpret that data under a different row-major stride. Only
-    // meaningful for disldo_forward/disldo_backward's SCATTERED-CSR
-    // path -- block4's own forward/backward remain rank-1-only (see
-    // scale_rank's own docstring for the tracked gap this implies).
+    // reinterpret that data under a different row-major stride.
+    // Meaningful for BOTH disldo_forward/disldo_backward's scattered-CSR
+    // path AND block4's own forward/backward (FP4 and FP8 both fixed and
+    // verified rank-N this session -- the "block4 remains rank-1-only"
+    // note that used to be here was stale).
     std::size_t get_scale_rank() const { return weights.scale_rank; }
     void set_scale_rank(std::size_t rank) {
         if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
@@ -493,28 +516,22 @@ public:
 
     // ── Backward (dense input — DISLDO) ─────────────────────────────────────────
 
+    // min_decay_frac/max_abs_delta/max_ci default to the tuned production
+    // values (see delta_csr_types.hpp's BoundedRMSpropSynapsePolicy
+    // docstring for the full tuning history) but are now real, per-call
+    // Python-settable parameters -- previously hardcoded literals, which
+    // meant testing a different max_abs_delta required a C++ rebuild.
+    // max_abs_delta is in RAW (pre-lr-multiply) units (see update_cw's
+    // own docstring for why).
     py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
-                                  bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+                                  bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+                                  V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                                  V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                                  V max_ci = kSynapsePolicyMaxCi,
+                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        // beta1=0.9 (function default), min_decay_frac left at its own true
-        // no-op default (0.0), max_abs_delta=2.0 -- BoundedRMSpropSynapsePolicy's
-        // now-tuned production default, in RAW (pre-lr-multiply) units (see
-        // update_cw's own docstring, delta_csr_types.hpp, for why it's
-        // raw-space; 2.0 reproduces the exact validated behavior at the
-        // tuning sweep's own lr=0.05 and generalizes correctly to other lr).
-        // max_ci=100.0 -- verified ceiling on ci itself (tests/unit/
-        // test_ci_ceiling.cpp): healthy production-default operation
-        // plateaus at ci~0.5, so this is a mathematically guaranteed no-op
-        // for the normal case, while giving ci's own separate unbounded-
-        // growth failure mode (confirmed directly this session, see
-        // delta_csr_types.hpp's update_ci docstring) an actual hard stop.
-        // NOTE: capping ci alone does NOT rescue an out-of-safe-zone
-        // max_abs_delta/lr config from its own weight-level divergence
-        // (verified in test_ci_ceiling.cpp -- the known unsafe pocket still
-        // diverges with ci capped) -- stay inside the validated safe range,
-        // don't rely on this ceiling for that.
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
@@ -522,7 +539,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f, 100.0f);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1091,13 +1109,17 @@ public:
         return result;
     }
 
+    // See SparseLinearLayerImpl::backward_dense's identical comment on
+    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above).
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
-                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                             V max_ci = kSynapsePolicyMaxCi,
+                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        // See SparseLinearLayer::backward_dense's identical comment on these
-        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
@@ -1105,7 +1127,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f, 100.0f);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1292,6 +1315,28 @@ public:
     V get_output_scale(S col) const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
     void set_value_scale_raw(S row, V scale)  { weights.set_value_scale_raw(static_cast<std::size_t>(row), scale); }
     void set_output_scale_raw(S col, V scale) { weights.set_output_scale_raw(static_cast<std::size_t>(col), scale); }
+    void magnitude_rescale_output(V target, V correction_rate, bool scale_invariant) {
+        weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+    }
+    // Rank-N scale envelope accessors -- mirrors SparseLinearLayerImpl's
+    // (FP4) identical methods exactly. Genuinely missing here before now
+    // (not a documented limitation, a plain oversight): weights.scale_rank
+    // and get/set_value_scale_k/output_scale_k are already VALUES_TYPE
+    // -agnostic on SparseLinearWeightsDelta (confirmed directly -- the
+    // FP8 block4 backward path is itself already full rank-N, see
+    // process_tile's FP8 branch in linear_disldo.hpp), so this was purely
+    // a missing pybind-facing wrapper, not missing engine support.
+    std::size_t get_scale_rank() const { return weights.scale_rank; }
+    void set_scale_rank(std::size_t rank) {
+        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        if (rank > decltype(weights)::SCALE_RANK_MAX)
+            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
+        weights.scale_rank = rank;
+    }
+    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
+    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
+    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
+    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
 
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
@@ -1310,13 +1355,17 @@ public:
         return result;
     }
 
+    // See SparseLinearLayerImpl::backward_dense's identical comment on
+    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above).
     py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
-                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f) {
+                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                             V max_ci = kSynapsePolicyMaxCi,
+                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
         std::vector<V> dx(_last_batch * _last_cols, V(0));
-        // See SparseLinearLayer::backward_dense's identical comment on these
-        // trailing 3 args (BoundedRMSpropSynapsePolicy's tuned production default).
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
             _last_input.data(), _last_batch, _last_cols,
             (V*)dybuf.ptr, weights,
@@ -1324,7 +1373,8 @@ public:
             neuron_input_accum.data(), neuron_grad_accum.data(),
             learning_rate,
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            0.9f, 0.0f, 2.0f, 100.0f);
+            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1373,6 +1423,13 @@ public:
         const std::size_t cols = weights.connections.layout.cols;
         block4_load_dense<S, VT, COL_TYPE>(
             weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        // Every row connects to every column -- out_degree[c] = rows for
+        // every c, matching the FP4 load_dense_codes' own precedent above
+        // (needed for output_scale's gradient, see disldo_backward's
+        // out_degree normalization). Missing here was a real bug: any FP8
+        // layer built via this loader trained output_scale nowhere at all
+        // (deg==0 gate silently skipped every column, forever).
+        weights.out_degree.assign(cols, S(rows));
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
@@ -1514,6 +1571,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -1628,6 +1689,19 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayer& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
+             "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
+             "lives moves, from output_scale into the stored per-synapse weight code.\n"
+             "Drives each column's stored-weight RMS toward `target` via a damped\n"
+             "(`correction_rate`) multiplicative step. scale_invariant must match\n"
+             "whatever backward_dense(scale_invariant=...) is using -- see\n"
+             "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
+             "SCATTERED CSR ONLY (block4 support is a follow-up).")
         .def("get_value_scale_importance",  &SparseLinearLayer::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -1751,6 +1825,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayerResync::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -1858,6 +1936,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerResync& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerResync::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -1970,6 +2054,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayerNoScale::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2077,6 +2165,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerNoScale& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerNoScale::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2191,6 +2285,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2305,6 +2403,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2424,6 +2528,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayerResyncDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2531,6 +2639,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerResyncDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerResyncDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2641,6 +2755,10 @@ PYBIND11_MODULE(_cpu, m)
         .def("backward_dense",       &SparseLinearLayerNoScaleDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2748,6 +2866,12 @@ PYBIND11_MODULE(_cpu, m)
              "same convention as set_value_scale_raw(), but per-output instead of\n"
              "per-input. Calling this at least once makes output_scale\n"
              "gradient-trainable in backward_dense(), like value_scale.")
+        .def("magnitude_rescale_output",
+             [](SparseLinearLayerNoScaleDeterministic& self, float target, float correction_rate, bool scale_invariant) {
+                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+             },
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
         .def("get_value_scale_importance",  &SparseLinearLayerNoScaleDeterministic::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
@@ -2858,7 +2982,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward",             &DISLDOLayerV::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
@@ -2894,7 +3022,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
@@ -2934,6 +3066,28 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
+             "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
+             "lives moves, from output_scale into the stored per-synapse weight code.\n"
+             "Drives each column's stored-weight RMS toward `target` via a damped\n"
+             "(`correction_rate`) multiplicative step. scale_invariant must match\n"
+             "whatever backward(scale_invariant=...) is using -- see\n"
+             "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
+             "Covers BOTH scattered CSR and block4 (fixed and verified this session --\n"
+             "the \"SCATTERED CSR ONLY\" note that used to be here was stale).")
+        .def("get_scale_rank",       &SparseLinearLayer8::get_scale_rank)
+        .def("set_scale_rank",       &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
+        .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer8::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"),
+             "Rank-N scale envelope (see SparseLinearLayer's identical\n"
+             "get_scale_rank/set_scale_rank/*_k accessors) -- was missing here\n"
+             "entirely until now (a plain oversight, not a real engine gap: the\n"
+             "underlying SparseLinearWeightsDelta storage and FP8 block4 backward\n"
+             "were already full rank-N).")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
             return py::array_t<SparseLinearLayer8::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -2958,7 +3112,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8Resync::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8Resync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8Resync::synap_row_step,
@@ -2993,6 +3151,9 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8Resync::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8Resync& self) {
             return py::array_t<SparseLinearLayer8Resync::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -3018,7 +3179,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8AdaMax::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer8AdaMax::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8AdaMax::synap_row_step,
@@ -3053,6 +3218,9 @@ PYBIND11_MODULE(_cpu, m)
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
              "scheme validated in sili_peridot's toy-model quantization sweep.")
+        .def("magnitude_rescale_output", &SparseLinearLayer8AdaMax::magnitude_rescale_output,
+             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+             "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8AdaMax& self) {
             return py::array_t<SparseLinearLayer8AdaMax::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},

@@ -482,7 +482,8 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  min_decay_frac = 0.0f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_abs_delta = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_ci = 1e30f,
-    typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f)
+    typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f,
+    bool         scale_invariant = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     // Same chosen policy (SynapsePolicyT), instantiated at both widths --
@@ -699,7 +700,25 @@ void disldo_backward(
                     // get deterministic-rounding zero-escape; only the
                     // default (non-deferred) SparseLinearLayer/
                     // SparseLinearLayerDeterministic do.
-                    value_type cw = cw_orig * combined_scale;
+                    // cw_start: FIXED for the whole batch loop below --
+                    // matches a real mini-batch optimizer's own contract
+                    // (gradient computed against ONE parameter snapshot,
+                    // exactly one step taken after). Confirmed as a real
+                    // bug this session (see conversation): the previous
+                    // version mutated `cw`/`ci` INSIDE this loop, once per
+                    // batch row, so row b's own contrib/dx used row
+                    // (b-1)'s already-applied update instead of a
+                    // consistent snapshot -- b sequential mini-steps
+                    // instead of one real step, and even dx (the
+                    // gradient flowing to the PREVIOUS layer) was computed
+                    // against a moving target. g_agg/contrib_agg are
+                    // per-synapse scalar locals (stack, not a matrix-sized
+                    // buffer) summed across the batch, mirroring the
+                    // torch reference's own `x_sum = x.sum(dim=0)`
+                    // aggregation exactly (by linearity, sum_b(iv_b*cw) ==
+                    // cw*sum_b(iv_b) since cw_start is constant here).
+                    const value_type cw_start = cw_orig * combined_scale;
+                    double g_agg = 0.0, contrib_agg = 0.0;
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
                         const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
@@ -754,10 +773,9 @@ void disldo_backward(
                             // informative than either alone in the
                             // abstract, it does not prescribe sum-before-
                             // square as the numeric encoding.
-                            const value_type contrib = iv * cw_orig;
-                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
-                            cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
-                                                            damp_by_importance, max_abs_delta);
+                            const value_type contrib = iv * cw_start;
+                            g_agg += static_cast<double>(g);
+                            contrib_agg += static_cast<double>(contrib);
                             scale_grad_sum += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
                             mcol_at(col, 0) += cw_orig * val_scale * g;
                             // Parallel forward-contribution accumulation --
@@ -765,9 +783,18 @@ void disldo_backward(
                             scale_grad_sum_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
                             mcol_at_contrib(col, 0) += cw_orig * val_scale * contrib;
                         }
-                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
+                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw_start * dyv;
                     }
+                    value_type cw = cw_start;
                     if (learning_rate != value_type(0)) {
+                        // ONE update, using the batch-aggregated g/contrib
+                        // -- see cw_start's own comment above for why.
+                        ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
+                                                      static_cast<value_type>(contrib_agg),
+                                                      beta2, min_decay_frac, max_ci);
+                        cw += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, value_type(1),
+                                                       effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                       scale_invariant);
                         // Defer the store until value_scale[r] AND
                         // output_scale[col] are BOTH finalized for this
                         // call -- storing now would use the stale
@@ -806,8 +833,23 @@ void disldo_backward(
                     // outer-product components (rank=1 reproduces the
                     // exact original val_scale*out_scale).
                     const value_type S = weights.get_scale(r, col);
-                    value_type quant = cw_orig;
-                    value_type cw = quant * S;  // true units, for dx -- refreshed after any update
+                    // cw_start: FIXED for the whole batch loop -- see the
+                    // DeferredScaleWrite branch's identical cw_start
+                    // comment above for the full rationale (real bug this
+                    // session: quant/ci/cw were mutated mid-loop, once per
+                    // batch row, so g_agg/contrib_agg replace that with
+                    // the standard "aggregate over the batch, take ONE
+                    // step" contract every real optimizer expects).
+                    // quant_floor is likewise computed ONCE from cw_orig
+                    // (not the live-updating quant) for the same reason --
+                    // still exact/signed for every already-escaped
+                    // synapse, matching the zero_escape_eps rationale just
+                    // below, now evaluated against the TRUE pre-call state
+                    // instead of a value some earlier batch row already
+                    // perturbed.
+                    const value_type cw_start = cw_orig * S;
+                    const value_type quant_floor = (cw_orig == value_type(0)) ? zero_escape_eps : cw_orig;
+                    double g_agg = 0.0, contrib_agg = 0.0;
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type iv  = input[static_cast<std::size_t>(b) * in_cols + r];
                         const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col];
@@ -824,11 +866,9 @@ void disldo_backward(
                             // sili__new/lean_proofs/importance_signal_information_gain/
                             // SiliImportanceProof/ImportanceSignalInformationGain.lean,
                             // Joint.combined_signal_strictly_informative.
-                            const value_type contrib = iv * cw_orig;
-                            ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
-                            quant += SynapsePolicy::update_cw(g, ci, S, effective_lr, eps,
-                                                               damp_by_importance, max_abs_delta);
-                            cw = quant * S;
+                            const value_type contrib = iv * cw_start;
+                            g_agg += static_cast<double>(g);
+                            contrib_agg += static_cast<double>(contrib);
                             // dL/d(value_scale_k(r,k)) = g * quant *
                             // output_scale_k(col,k), for EACH component k
                             // (out_scale_k held fixed within its own term,
@@ -867,8 +907,9 @@ void disldo_backward(
                             // part of the original reasoning was correct,
                             // just applied too broadly) substitutes the
                             // small positive epsilon; every other quant
-                            // value uses itself directly, exact and signed.
-                            const value_type quant_floor = (quant == value_type(0)) ? zero_escape_eps : quant;
+                            // value uses itself directly, exact and signed
+                            // (quant_floor itself now computed once, fixed,
+                            // before this loop -- see its own comment above).
                             for (std::size_t k = 0; k < rank; ++k) {
                                 const value_type out_scale_k = weights.get_output_scale_k(col, k);
                                 const value_type val_scale_k = weights.get_value_scale_k(r, k);
@@ -881,13 +922,24 @@ void disldo_backward(
                                 mcol_at_contrib(col, k) += quant_floor * val_scale_k * contrib;
                             }
                         }
-                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw * dyv;
+                        mdx[static_cast<std::size_t>(b) * in_cols + r] += cw_start * dyv;
                     }
+                    // ONE update, using the batch-aggregated g/contrib --
+                    // see cw_start's own comment above for why.
+                    value_type quant = cw_orig;
+                    value_type cw = cw_start;
                     if (learning_rate != value_type(0)) {
+                        ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
+                                                      static_cast<value_type>(contrib_agg),
+                                                      beta2, min_decay_frac, max_ci);
+                        quant += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, S,
+                                                          effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                          scale_invariant);
+                        cw = quant * S;
                         if constexpr (StochasticRounding) {
-                            ValueAccessor<VALUES_TYPE>::set_stochastic(dc.values, vb, quant, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set_stochastic_live(dc.values, vb, quant, ci / combined_imp_scale);
                         } else {
-                            ValueAccessor<VALUES_TYPE>::set(dc.values, vb, quant, ci / combined_imp_scale);
+                            ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant, ci / combined_imp_scale);
                         }
                         const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         local_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
@@ -913,14 +965,14 @@ void disldo_backward(
                         const value_type contrib_agg_k = static_cast<value_type>(scale_grad_sum_rank_contrib[k]);
                         ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
                                             g_agg_k, scale_eff_lr, beta2, eps, contrib_agg_k,
-                                            &weights.get_value_scale_step_k(r, k));
+                                            &weights.get_value_scale_step_k(r, k), scale_invariant);
                     }
                 } else {
                     const value_type g_agg = static_cast<value_type>(scale_grad_sum);
                     const value_type contrib_agg = static_cast<value_type>(scale_grad_sum_contrib);
                     ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
                                         g_agg, scale_eff_lr, beta2, eps, contrib_agg,
-                                        &weights.get_value_scale_step_k(r, 0));
+                                        &weights.get_value_scale_step_k(r, 0), scale_invariant);
                 }
             }
         }
@@ -1012,12 +1064,12 @@ void disldo_backward(
             const int tid = omp_get_thread_num();
             value_type* mdx  = t_dx.data() + static_cast<std::size_t>(tid) * dst;
             // t_col_grad/t_row_grad are laid out [thread][col or row][k]
-            // (see their sizing above/at this function's top). The FP8
-            // branch below is still rank-1-only (see scale_rank's
-            // docstring's scope note) and always addresses component 0
-            // through these same accessors -- there is no separate
-            // rank-1-strided pointer; that would alias incorrectly against
-            // this same buffer once rank>1.
+            // (see their sizing above/at this function's top). Both the
+            // FP4 and FP8 block4 branches below are full rank-N -- they
+            // loop k<rank and write every component through these same
+            // accessors; there is no separate rank-1-strided pointer,
+            // which would alias incorrectly against this same buffer once
+            // rank>1.
             value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
             double* mrow_base = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank;
@@ -1214,51 +1266,118 @@ void disldo_backward(
                                 fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 0)]), fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 1)]),
                                 fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 2)]), fp8_decode_bits(tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 3)])};
 
+                            // value_scale_k(row,k) -- see FP4 branch's
+                            // identical comment above (mirrors it exactly,
+                            // now generalized over rank instead of the
+                            // single rank-1-only val_scale local).
+                            value_type value_scale_k8[SCALE_RANK_MAX];
+                            for (std::size_t k = 0; k < rank; ++k) value_scale_k8[k] = weights.get_value_scale_k(row, k);
+
                             std::size_t col4_8[BLOCK4_TILE];
                             bool        col_valid4_8[BLOCK4_TILE];
-                            value_type  out_scale4_8[BLOCK4_TILE];
+                            // out_scale_k4_8[k][lj]: per-rank-component
+                            // output_scale, needed for value_scale_k's own
+                            // gradient below (mirrors FP4's out_scale_k4).
+                            value_type  out_scale_k4_8[SCALE_RANK_MAX][BLOCK4_TILE];
                             value_type  combined_scale4_8[BLOCK4_TILE], combined_imp_scale4_8[BLOCK4_TILE];
                             value_type  cw4_8[BLOCK4_TILE], ci4_8[BLOCK4_TILE], cw_orig4_8[BLOCK4_TILE];
+                            // was_live4_8[lj]: TRUE only if this cell already
+                            // held a genuine synapse (weight OR importance
+                            // byte nonzero) BEFORE this backward call.
+                            // col_valid4_8 is just col<n_out -- block4 tiles
+                            // are DENSE 4x4 blocks touched at every in-bounds
+                            // (li,lj), including cells that were never a real
+                            // synapse (block4's own "no synapse here" IS
+                            // weight==importance==0, unlike scattered CSR's
+                            // structural absence -- see block4_count_live/
+                            // block4_sparse_pack's identical `dense[i]!=0`
+                            // criterion). The never-zero live quantizer must
+                            // ONLY protect an ALREADY-established synapse
+                            // from rounding back to the dead code -- applying
+                            // it unconditionally to every col_valid4_8 cell
+                            // would force every touched-but-never-connected
+                            // cell permanently "live", corrupting block4's
+                            // own sparse/dense repacking (confirmed directly:
+                            // caused test_disldo_block4_backward's whole tile
+                            // to zero out via a corrupted live-count/repack --
+                            // see conversation).
+                            bool was_live4_8[BLOCK4_TILE];
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                                 col_valid4_8[lj] = col < n_out;
                                 if (!col_valid4_8[lj]) {
                                     col4_8[lj] = 0;
-                                    out_scale4_8[lj] = combined_scale4_8[lj] = combined_imp_scale4_8[lj] = value_type(0);
+                                    combined_scale4_8[lj] = combined_imp_scale4_8[lj] = value_type(0);
                                     cw4_8[lj] = ci4_8[lj] = cw_orig4_8[lj] = value_type(0);
+                                    was_live4_8[lj] = false;
+                                    for (std::size_t k = 0; k < rank; ++k) out_scale_k4_8[k][lj] = value_type(0);
                                     continue;
                                 }
+                                was_live4_8[lj] = (w_decoded_arr8[lj] != value_type(0)) || (imp_decoded_arr8[lj] != value_type(0));
                                 col4_8[lj] = col;
-                                out_scale4_8[lj] = weights.get_output_scale(col);
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
-                                combined_scale4_8[lj]     = val_scale * out_scale4_8[lj];
+                                // S(row,col) = sum_k value_scale_k*output_scale_k
+                                // -- see FP4 branch's identical get_scale
+                                // comment (mirrors it exactly). FP8's block4
+                                // path stores cw in TRUE units (not the
+                                // quant-code-factored representation FP4
+                                // uses), so this is a drop-in replacement:
+                                // combined_scale4_8 is consumed symmetrically
+                                // at decode (cw_orig*combined_scale) and
+                                // encode (cw/combined_scale) below, so any
+                                // correct S formula round-trips correctly
+                                // regardless of rank.
+                                combined_scale4_8[lj]     = weights.get_scale(row, col);
                                 combined_imp_scale4_8[lj] = imp_scale * out_imp_scale;
                                 cw_orig4_8[lj] = w_decoded_arr8[lj];
                                 cw4_8[lj] = cw_orig4_8[lj] * combined_scale4_8[lj];
                                 ci4_8[lj] = imp_decoded_arr8[lj] * combined_imp_scale4_8[lj];
+                                for (std::size_t k = 0; k < rank; ++k) out_scale_k4_8[k][lj] = weights.get_output_scale_k(col, k);
                             }
 
-                            value_type mcol4_8[BLOCK4_TILE] = {0};
-                            double     mrow_local8 = 0.0;
-                            value_type mcol4_8_contrib[BLOCK4_TILE] = {0};
-                            double     mrow_local8_contrib = 0.0;
+                            // Per-rank versions of mcol4_8/mrow_local8 (see
+                            // FP4's identical mcol4_rank/mrow_local_k) --
+                            // needed to train EVERY rank component, not
+                            // just component 0.
+                            value_type mcol4_8_rank[SCALE_RANK_MAX][BLOCK4_TILE] = {};
+                            double     mrow_local8_k[SCALE_RANK_MAX] = {};
+                            value_type mcol4_8_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
+                            double     mrow_local8_k_contrib[SCALE_RANK_MAX] = {};
                             const std::size_t col_base8 = std::size_t(bc) * BLOCK4_TILE;
                             const bool full_tile_cols8 = (col_base8 + BLOCK4_TILE <= n_out);
 
                             if (full_tile_cols8) {
                                 const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
-                                const Block4Vec val_scale_v    = block4_vec_broadcast(val_scale);
                                 const Block4Vec beta2_v        = block4_vec_broadcast(beta2);
                                 const Block4Vec eps_v          = block4_vec_broadcast(eps);
                                 const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
                                 const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
                                 const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
-                                Block4Vec cw_v = block4_vec_load(cw4_8);
+                                // cw_start_v: FIXED for the whole batch loop
+                                // -- see the scattered path's identical
+                                // cw_start comment for the full rationale
+                                // (real bug this session: cw_v/ci_v were
+                                // mutated mid-loop, once per batch row).
+                                // g_agg_v/contrib_agg_v are Block4Vec
+                                // (16-byte) stack locals, not a matrix
+                                // -sized buffer.
+                                const Block4Vec cw_start_v = block4_vec_load(cw4_8);
                                 Block4Vec ci_v = block4_vec_load(ci4_8);
                                 const Block4Vec cw_orig_v   = block4_vec_load(cw_orig4_8);
-                                const Block4Vec out_scale_v = block4_vec_load(out_scale4_8);
-                                Block4Vec mcol_acc_v = block4_vec_broadcast(0.0f);
-                                Block4Vec mcol_acc_v_contrib = block4_vec_broadcast(0.0f);
+                                // Per-rank-component vectors -- see FP4's
+                                // identical value_scale_k_v/out_scale_k_v.
+                                Block4Vec value_scale_k_v8[SCALE_RANK_MAX];
+                                Block4Vec out_scale_k_v8[SCALE_RANK_MAX];
+                                Block4Vec mcol_acc_v_k8[SCALE_RANK_MAX];
+                                Block4Vec mcol_acc_v_k8_contrib[SCALE_RANK_MAX];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    value_scale_k_v8[k] = block4_vec_broadcast(value_scale_k8[k]);
+                                    out_scale_k_v8[k]   = block4_vec_load(out_scale_k4_8[k]);
+                                    mcol_acc_v_k8[k]    = block4_vec_broadcast(0.0f);
+                                    mcol_acc_v_k8_contrib[k] = block4_vec_broadcast(0.0f);
+                                }
+                                Block4Vec g_agg_v = block4_vec_broadcast(0.0f);
+                                Block4Vec contrib_agg_v = block4_vec_broadcast(0.0f);
                                 const bool training = (learning_rate != value_type(0));
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
@@ -1272,26 +1391,46 @@ void disldo_backward(
                                         // path's identical fix for the full
                                         // rationale and the proved theorem
                                         // (Joint.combined_signal_strictly_informative).
-                                        const Block4Vec contrib_v = cw_orig_v * block4_vec_broadcast(iv);
-                                        ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
-                                        const Block4Vec delta_v = SynapsePolicyVec::update_cw(
-                                            g_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
-                                            damp_by_importance, max_abs_delta_v);
-                                        cw_v += delta_v;
-                                        mrow_local8 += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * g_v));
-                                        mcol_acc_v += cw_orig_v * val_scale_v * g_v;
-                                        mrow_local8_contrib += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_v * contrib_v));
-                                        mcol_acc_v_contrib += cw_orig_v * val_scale_v * contrib_v;
+                                        const Block4Vec contrib_v = cw_start_v * block4_vec_broadcast(iv);
+                                        g_agg_v += g_v;
+                                        contrib_agg_v += contrib_v;
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * g_v));
+                                            mcol_acc_v_k8[k] += cw_orig_v * value_scale_k_v8[k] * g_v;
+                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * contrib_v));
+                                            mcol_acc_v_k8_contrib[k] += cw_orig_v * value_scale_k_v8[k] * contrib_v;
+                                        }
                                     }
-                                    *mdx_row += block4_vec_hsum(cw_v * dyv_v);
+                                    *mdx_row += block4_vec_hsum(cw_start_v * dyv_v);
+                                }
+                                // ONE update, using the batch-aggregated g/contrib.
+                                Block4Vec cw_v = cw_start_v;
+                                if (training) {
+                                    ci_v = SynapsePolicyVec::update_ci(ci_v, g_agg_v, contrib_agg_v, beta2_v, min_decay_frac_v, max_ci_v);
+                                    const Block4Vec delta_v = SynapsePolicyVec::update_cw(
+                                        g_agg_v, ci_v, block4_vec_broadcast(1.0f), effective_lr_v, eps_v,
+                                        damp_by_importance, max_abs_delta_v, scale_invariant);
+                                    cw_v += delta_v;
                                 }
                                 block4_vec_store(cw4_8, cw_v);
                                 block4_vec_store(ci4_8, ci_v);
-                                block4_vec_store(mcol4_8, mcol_acc_v);
-                                block4_vec_store(mcol4_8_contrib, mcol_acc_v_contrib);
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    block4_vec_store(mcol4_8_rank[k], mcol_acc_v_k8[k]);
+                                    block4_vec_store(mcol4_8_rank_contrib[k], mcol_acc_v_k8_contrib[k]);
+                                }
                             } else {
                                 // Boundary tile-column: scalar bounds-checked
                                 // fallback, matching the FP4 branch's own.
+                                // cw_start4_8/g_agg4_8/contrib_agg4_8: FIXED
+                                // per-lj snapshot + aggregators for the
+                                // whole batch loop -- see the scattered
+                                // path's identical cw_start comment for the
+                                // full rationale. 3 small (BLOCK4_TILE=4
+                                // element) stack arrays, not matrix-sized.
+                                value_type cw_start4_8[BLOCK4_TILE];
+                                double g_agg4_8[BLOCK4_TILE] = {0.0};
+                                double contrib_agg4_8[BLOCK4_TILE] = {0.0};
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) cw_start4_8[lj] = cw4_8[lj];
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
                                     value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
@@ -1304,23 +1443,38 @@ void disldo_backward(
                                             // combination -- see the
                                             // scattered path's identical fix
                                             // (Joint.combined_signal_strictly_informative).
-                                            const value_type contrib = iv * cw_orig4_8[lj];
-                                            ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g, contrib, beta2, min_decay_frac, max_ci);
-                                            cw4_8[lj] += SynapsePolicy::update_cw(g, ci4_8[lj], value_type(1), effective_lr, eps,
-                                                                                  damp_by_importance, max_abs_delta);
-                                            mrow_local8 += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * g;
-                                            mcol4_8[lj] += cw_orig4_8[lj] * val_scale * g;
-                                            mrow_local8_contrib += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale4_8[lj]) * contrib;
-                                            mcol4_8_contrib[lj] += cw_orig4_8[lj] * val_scale * contrib;
+                                            const value_type contrib = iv * cw_start4_8[lj];
+                                            g_agg4_8[lj] += static_cast<double>(g);
+                                            contrib_agg4_8[lj] += static_cast<double>(contrib);
+                                            for (std::size_t k = 0; k < rank; ++k) {
+                                                mrow_local8_k[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * g;
+                                                mcol4_8_rank[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * g;
+                                                mrow_local8_k_contrib[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * contrib;
+                                                mcol4_8_rank_contrib[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * contrib;
+                                            }
                                         }
-                                        *mdx_row += cw4_8[lj] * dyv;
+                                        *mdx_row += cw_start4_8[lj] * dyv;
+                                    }
+                                }
+                                // ONE update per lj, using the batch-aggregated g/contrib.
+                                if (learning_rate != value_type(0)) {
+                                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                        if (!col_valid4_8[lj]) continue;
+                                        const value_type g_agg = static_cast<value_type>(g_agg4_8[lj]);
+                                        const value_type contrib_agg = static_cast<value_type>(contrib_agg4_8[lj]);
+                                        ci4_8[lj] = SynapsePolicy::update_ci(ci4_8[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
+                                        cw4_8[lj] = cw_start4_8[lj] + SynapsePolicy::update_cw(
+                                            g_agg, ci4_8[lj], value_type(1), effective_lr, eps, damp_by_importance, max_abs_delta,
+                                            scale_invariant);
                                     }
                                 }
                             }
 
                             if (learning_rate != value_type(0)) {
-                                mrow_at(row, 0) += mrow_local8;
-                                mrow_at_contrib(row, 0) += mrow_local8_contrib;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mrow_at(row, k) += mrow_local8_k[k];
+                                    mrow_at_contrib(row, k) += mrow_local8_k_contrib[k];
+                                }
                                 if (full_tile_cols8) {
                                     // Scalar fp8_quantize_stochastic, not
                                     // block4_vec_quantize_stochastic_fp8
@@ -1329,21 +1483,39 @@ void disldo_backward(
                                     // reasoning (same conclusion applies
                                     // to encode).
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                        mcol_at(col4_8[lj], 0) += mcol4_8[lj];
-                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mcol_at(col4_8[lj], k) += mcol4_8_rank[k][lj];
+                                            mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
+                                        }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                        tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
-                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        // was_live4_8[lj] gate -- see its own
+                                        // declaration comment above: a cell
+                                        // that was never a real synapse must
+                                        // stay allowed to round to 0.
+                                        if (was_live4_8[lj]) {
+                                            tdata[slot]               = fp8_quantize_stochastic_live(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        } else {
+                                            tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        }
                                     }
                                     tile_dirty = true;
                                 } else {
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         if (!col_valid4_8[lj]) continue;
-                                        mcol_at(col4_8[lj], 0) += mcol4_8[lj];
-                                        mcol_at_contrib(col4_8[lj], 0) += mcol4_8_contrib[lj];
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mcol_at(col4_8[lj], k) += mcol4_8_rank[k][lj];
+                                            mcol_at_contrib(col4_8[lj], k) += mcol4_8_rank_contrib[k][lj];
+                                        }
                                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                        tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
-                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        if (was_live4_8[lj]) {
+                                            tdata[slot]               = fp8_quantize_stochastic_live(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        } else {
+                                            tdata[slot]               = fp8_quantize_stochastic(cw4_8[lj] / combined_scale4_8[lj]);
+                                            tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                        }
                                         tile_dirty = true;
                                     }
                                 }
@@ -1357,22 +1529,26 @@ void disldo_backward(
                             // implementation before this SIMD pass -- kept
                             // here rather than deleted, matching FP4's own
                             // precedent for this exact fallback slot.
+                            value_type value_scale_k8_fb[SCALE_RANK_MAX];
+                            for (std::size_t k = 0; k < rank; ++k) value_scale_k8_fb[k] = weights.get_value_scale_k(row, k);
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                                 if (col >= n_out) continue;
                                 const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                const value_type out_scale     = weights.get_output_scale(col);
+                                value_type out_scale_k8_fb[SCALE_RANK_MAX];
+                                for (std::size_t k = 0; k < rank; ++k) out_scale_k8_fb[k] = weights.get_output_scale_k(col, k);
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
-                                const value_type combined_scale     = val_scale * out_scale;
+                                const value_type combined_scale     = weights.get_scale(row, col);
                                 const value_type combined_imp_scale = imp_scale * out_imp_scale;
                                 const value_type cw_orig = fp8_decode_bits(tdata[slot]);
-                                value_type cw = cw_orig * combined_scale;
+                                const value_type cw_start = cw_orig * combined_scale;
                                 value_type ci = fp8_decode_bits(tdata[BLOCK4_TILE + slot]) * combined_imp_scale;
 
-                                value_type mcol_local = value_type(0);
-                                double     mrow_local  = 0.0;
-                                value_type mcol_local_contrib = value_type(0);
-                                double     mrow_local_contrib = 0.0;
+                                value_type mcol_local_k[SCALE_RANK_MAX] = {};
+                                double     mrow_local_k[SCALE_RANK_MAX] = {};
+                                value_type mcol_local_k_contrib[SCALE_RANK_MAX] = {};
+                                double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
+                                double     g_agg = 0.0, contrib_agg = 0.0;
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
                                     value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
@@ -1383,24 +1559,46 @@ void disldo_backward(
                                         // combination -- see the scattered
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
-                                        const value_type contrib = iv * cw_orig;
-                                        ci = SynapsePolicy::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
-                                        cw += SynapsePolicy::update_cw(g, ci, value_type(1), effective_lr, eps,
-                                                                        damp_by_importance, max_abs_delta);
-                                        mrow_local  += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * g;
-                                        mcol_local  += cw_orig * val_scale * g;
-                                        mrow_local_contrib += static_cast<double>(cw_orig) * static_cast<double>(out_scale) * contrib;
-                                        mcol_local_contrib += cw_orig * val_scale * contrib;
+                                        const value_type contrib = iv * cw_start;
+                                        g_agg += static_cast<double>(g);
+                                        contrib_agg += static_cast<double>(contrib);
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            mrow_local_k[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * g;
+                                            mcol_local_k[k] += cw_orig * value_scale_k8_fb[k] * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * contrib;
+                                            mcol_local_k_contrib[k] += cw_orig * value_scale_k8_fb[k] * contrib;
+                                        }
                                     }
-                                    *mdx_row += cw * dyv;
+                                    *mdx_row += cw_start * dyv;
                                 }
+                                // ONE update, using the batch-aggregated g/contrib.
+                                value_type cw = cw_start;
                                 if (learning_rate != value_type(0)) {
-                                    mrow_at(row, 0) += mrow_local;
-                                    mcol_at(col, 0) += mcol_local;
-                                    mrow_at_contrib(row, 0) += mrow_local_contrib;
-                                    mcol_at_contrib(col, 0) += mcol_local_contrib;
-                                    tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
-                                    tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
+                                    ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
+                                                                  static_cast<value_type>(contrib_agg),
+                                                                  beta2, min_decay_frac, max_ci);
+                                    cw += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, value_type(1),
+                                                                   effective_lr, eps, damp_by_importance, max_abs_delta,
+                                                                   scale_invariant);
+                                    for (std::size_t k = 0; k < rank; ++k) {
+                                        mrow_at(row, k) += mrow_local_k[k];
+                                        mcol_at(col, k) += mcol_local_k[k];
+                                        mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                        mcol_at_contrib(col, k) += mcol_local_k_contrib[k];
+                                    }
+                                    // was_live gate -- see was_live4_8's
+                                    // declaration comment (SIMD branch
+                                    // above) for the full rationale. tdata
+                                    // still holds the PRE-update bytes here.
+                                    const bool was_live = (cw_orig != value_type(0)) ||
+                                        (fp8_decode_bits(tdata[BLOCK4_TILE + slot]) != value_type(0));
+                                    if (was_live) {
+                                        tdata[slot]               = fp8_quantize_stochastic_live(cw / combined_scale);
+                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic_live_nonneg(ci / combined_imp_scale);
+                                    } else {
+                                        tdata[slot]               = fp8_quantize_stochastic(cw / combined_scale);
+                                        tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(ci / combined_imp_scale);
+                                    }
                                     tile_dirty = true;
                                 }
                             }
@@ -1435,6 +1633,20 @@ void disldo_backward(
                     // out_scale_k4[k][lj]: per-rank-component output_scale,
                     // needed for value_scale_k's own gradient below.
                     value_type  out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE];
+                    // was_live4[lj]: see was_live4_8's declaration comment
+                    // (FP8 branch above) for the full rationale -- CORRECTED
+                    // from this loop's own former comment ("every slot is a
+                    // real synapse... no liveness check"), which was true
+                    // and harmless under the OLD quantizer (an untouched
+                    // slot's delta is 0, and plain fp4_quantize(0)==0
+                    // preserved blank status) but is NOT harmless once the
+                    // WRITE uses the never-zero live quantizer -- that would
+                    // permanently "birth" a synapse at every col_valid4
+                    // position regardless of whether gradient signal ever
+                    // touched it, corrupting block4's own sparse/dense
+                    // repacking (confirmed directly via
+                    // test_disldo_block4_backward -- see conversation).
+                    bool was_live4[BLOCK4_TILE];
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                         col_valid4[lj] = col < n_out;
@@ -1442,13 +1654,12 @@ void disldo_backward(
                             col4[lj] = 0;
                             combined_scale4[lj] = combined_imp_scale4[lj] = value_type(0);
                             quant4[lj] = ci4[lj] = quant_orig4[lj] = value_type(0);
+                            was_live4[lj] = false;
                             for (std::size_t k = 0; k < rank; ++k) out_scale_k4[k][lj] = value_type(0);
                             continue;
                         }
                         col4[lj] = col;
-                        // Every slot is a real synapse, weight=0.0 included
-                        // -- see block4.hpp -- so every slot gets a real
-                        // gradient update every call, no liveness check.
+                        was_live4[lj] = (w_decoded_arr[lj] != value_type(0)) || (imp_decoded_arr[lj] != value_type(0));
                         const value_type out_imp_scale = weights.get_output_importance_scale(col);
                         // S(row,col) = sum_k value_scale_k(row,k)*
                         // output_scale_k(col,k) -- see disldo_backward's
@@ -1515,9 +1726,20 @@ void disldo_backward(
                                 const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
                             const Block4Vec max_abs_delta_v  = block4_vec_broadcast(max_abs_delta);
                             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
-                            Block4Vec quant_v = block4_vec_load(quant4);
+                            // quant_start_v: FIXED for the whole batch loop
+                            // -- see the scattered path's identical
+                            // cw_start comment for the full rationale.
+                            // quant_floor_v computed once from this fixed
+                            // snapshot too (still exact/signed for every
+                            // already-escaped synapse, see its own comment
+                            // below).
+                            const Block4Vec quant_start_v = block4_vec_load(quant4);
                             Block4Vec ci_v    = block4_vec_load(ci4);
-                            const Block4Vec quant_orig_v = block4_vec_load(quant_orig4);
+                            Block4Vec quant_floor_v;
+                            for (int lane = 0; lane < BLOCK4_TILE; ++lane)
+                                quant_floor_v[lane] = (quant_start_v[lane] == 0.0f) ? zero_escape_eps : quant_start_v[lane];
+                            Block4Vec g_agg_v = block4_vec_broadcast(0.0f);
+                            Block4Vec contrib_agg_v = block4_vec_broadcast(0.0f);
                             // Per-rank-component vectors -- rank is small
                             // (1-2 in practice, capped at SCALE_RANK_MAX),
                             // kept as real Block4Vec accumulators so the
@@ -1555,18 +1777,11 @@ void disldo_backward(
                                     // (Joint.combined_signal_strictly_informative,
                                     // sili__new/lean_proofs/importance_signal_information_gain/
                                     // SiliImportanceProof/ImportanceSignalInformationGain.lean).
-                                    const Block4Vec contrib_v = quant_orig_v * block4_vec_broadcast(iv);
-                                    ci_v = SynapsePolicyVec::update_ci(ci_v, g_v, contrib_v, beta2_v, min_decay_frac_v, max_ci_v);
-                                    // dL/d(quant) = g*S -- proper chain rule
-                                    // on true_w=quant*S (multiply, not
-                                    // divide -- see disldo_backward's
-                                    // scattered-path comment this mirrors
-                                    // exactly, and mcol_acc_v's own comment
-                                    // 2 blocks up).
-                                    const Block4Vec delta_v = SynapsePolicyVec::update_cw(
-                                        g_v, ci_v, combined_scale_v, effective_lr_v, eps_v,
-                                        damp_by_importance, max_abs_delta_v);
-                                    quant_v += delta_v;
+                                    // FIXED snapshot for the whole batch --
+                                    // see quant_start_v's own comment above.
+                                    const Block4Vec contrib_v = (quant_start_v * combined_scale_v) * block4_vec_broadcast(iv);
+                                    g_agg_v += g_v;
+                                    contrib_agg_v += contrib_v;
                                     // quant_floor: real signed quant for
                                     // value_scale_k/output_scale_k's own
                                     // gradient, EXCEPT exactly at quant==0
@@ -1597,10 +1812,9 @@ void disldo_backward(
                                     // accumulation exactly (unlike mcol,
                                     // which is float-precision, matching the
                                     // original scalar code -- see this
-                                    // block's own precision note below).
-                                    Block4Vec quant_floor_v;
-                                    for (int lane = 0; lane < BLOCK4_TILE; ++lane)
-                                        quant_floor_v[lane] = (quant_v[lane] == 0.0f) ? zero_escape_eps : quant_v[lane];
+                                    // block's own precision note below;
+                                    // quant_floor_v itself now computed once,
+                                    // fixed, before this loop.
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v));
                                         mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v;
@@ -1608,13 +1822,25 @@ void disldo_backward(
                                         mcol_acc_v_k_contrib[k] += quant_floor_v * value_scale_k_v[k] * contrib_v;
                                     }
                                 }
-                                // w = quant*S, in true units, for dx --
-                                // recomputed every b from the just-updated
-                                // quant_v (post-update, matching the
-                                // scattered path's own "cw = quant*S,
-                                // refreshed after any update" ordering).
-                                const Block4Vec w_v = quant_v * combined_scale_v;
+                                // w = quant*S, FIXED for the whole batch --
+                                // see quant_start_v's own comment above.
+                                const Block4Vec w_v = quant_start_v * combined_scale_v;
                                 *mdx_row += block4_vec_hsum(w_v * dyv_v);
+                            }
+                            // ONE update, using the batch-aggregated g/contrib.
+                            Block4Vec quant_v = quant_start_v;
+                            if (training) {
+                                ci_v = SynapsePolicyVec::update_ci(ci_v, g_agg_v, contrib_agg_v, beta2_v, min_decay_frac_v, max_ci_v);
+                                // dL/d(quant) = g*S -- proper chain rule
+                                // on true_w=quant*S (multiply, not
+                                // divide -- see disldo_backward's
+                                // scattered-path comment this mirrors
+                                // exactly, and mcol_acc_v's own comment
+                                // 2 blocks up).
+                                const Block4Vec delta_v = SynapsePolicyVec::update_cw(
+                                    g_agg_v, ci_v, combined_scale_v, effective_lr_v, eps_v,
+                                    damp_by_importance, max_abs_delta_v, scale_invariant);
+                                quant_v += delta_v;
                             }
                             block4_vec_store(quant4, quant_v);
                             block4_vec_store(ci4, ci_v);
@@ -1628,6 +1854,12 @@ void disldo_backward(
                             // BLOCK4_TILE): scalar bounds-checked fallback,
                             // not on the fast path, doesn't need SIMD. Same
                             // math as the SIMD path above.
+                            value_type quant_start4[BLOCK4_TILE], quant_floor4[BLOCK4_TILE];
+                            double g_agg4[BLOCK4_TILE] = {0.0}, contrib_agg4[BLOCK4_TILE] = {0.0};
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                quant_start4[lj] = quant4[lj];
+                                quant_floor4[lj] = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
+                            }
                             for (SIZE_TYPE b = 0; b < batch; ++b) {
                                 const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
                                 value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
@@ -1641,25 +1873,34 @@ void disldo_backward(
                                         // combination -- see the scattered
                                         // path's identical fix
                                         // (Joint.combined_signal_strictly_informative).
-                                        const value_type contrib = iv * quant_orig4[lj];
-                                        ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
-                                        quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
-                                                                                damp_by_importance, max_abs_delta);
-                                        // Gated on quant4[lj]==0 -- see the
-                                        // scattered-CSR path's identical fix
-                                        // for the full correctness trace
-                                        // (unconditional eps+|quant| was
-                                        // discarding sign on every nonzero
-                                        // synapse, not just stuck ones).
-                                        const value_type quant_floor = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
+                                        // contrib/quant_floor use FIXED
+                                        // batch-start snapshots -- see the
+                                        // scattered path's cw_start comment
+                                        // for the full rationale.
+                                        const value_type contrib = iv * (quant_start4[lj] * S);
+                                        g_agg4[lj] += static_cast<double>(g);
+                                        contrib_agg4[lj] += static_cast<double>(contrib);
                                         for (std::size_t k = 0; k < rank; ++k) {
-                                            mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
-                                            mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;
-                                            mrow_local_k_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
-                                            mcol4_rank_contrib[k][lj] += quant_floor * value_scale_k[k] * contrib;
+                                            mrow_local_k[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * g;
+                                            mcol4_rank[k][lj] += quant_floor4[lj] * value_scale_k[k] * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
+                                            mcol4_rank_contrib[k][lj] += quant_floor4[lj] * value_scale_k[k] * contrib;
                                         }
                                     }
-                                    *mdx_row += quant4[lj] * S * dyv;
+                                    *mdx_row += quant_start4[lj] * S * dyv;
+                                }
+                            }
+                            // ONE update per lj, using the batch-aggregated g/contrib.
+                            if (learning_rate != value_type(0)) {
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    if (!col_valid4[lj]) continue;
+                                    const value_type S = combined_scale4[lj];
+                                    const value_type g_agg = static_cast<value_type>(g_agg4[lj]);
+                                    const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
+                                    ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
+                                    quant4[lj] = quant_start4[lj] + SynapsePolicy::update_cw(
+                                        g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta,
+                                        scale_invariant);
                                 }
                             }
                         }
@@ -1671,6 +1912,12 @@ void disldo_backward(
                         // col_valid4 either way, so no full_tile_cols split
                         // needed here at all. Identical math to the
                         // boundary branch above.
+                        value_type quant_start4[BLOCK4_TILE], quant_floor4[BLOCK4_TILE];
+                        double g_agg4[BLOCK4_TILE] = {0.0}, contrib_agg4[BLOCK4_TILE] = {0.0};
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            quant_start4[lj] = quant4[lj];
+                            quant_floor4[lj] = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
+                        }
                         for (SIZE_TYPE b = 0; b < batch; ++b) {
                             const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
                             value_type* mdx_row = mdx + static_cast<std::size_t>(b) * in_cols + row;
@@ -1684,21 +1931,34 @@ void disldo_backward(
                                     // combination -- see the scattered
                                     // path's identical fix
                                     // (Joint.combined_signal_strictly_informative).
-                                    const value_type contrib = iv * quant_orig4[lj];
-                                    ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g, contrib, beta2, min_decay_frac, max_ci);
-                                    quant4[lj] += SynapsePolicy::update_cw(g, ci4[lj], S, effective_lr, eps,
-                                                                            damp_by_importance, max_abs_delta);
-                                    // Gated on quant4[lj]==0 -- see the
-                                    // scattered-CSR path's identical fix.
-                                    const value_type quant_floor = (quant4[lj] == value_type(0)) ? zero_escape_eps : quant4[lj];
+                                    // contrib/quant_floor use FIXED
+                                    // batch-start snapshots -- see the
+                                    // scattered path's cw_start comment
+                                    // for the full rationale.
+                                    const value_type contrib = iv * (quant_start4[lj] * S);
+                                    g_agg4[lj] += static_cast<double>(g);
+                                    contrib_agg4[lj] += static_cast<double>(contrib);
                                     for (std::size_t k = 0; k < rank; ++k) {
-                                        mrow_local_k[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * g;
-                                        mcol4_rank[k][lj] += quant_floor * value_scale_k[k] * g;
-                                        mrow_local_k_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
-                                        mcol4_rank_contrib[k][lj] += quant_floor * value_scale_k[k] * contrib;
+                                        mrow_local_k[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * g;
+                                        mcol4_rank[k][lj] += quant_floor4[lj] * value_scale_k[k] * g;
+                                        mrow_local_k_contrib[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
+                                        mcol4_rank_contrib[k][lj] += quant_floor4[lj] * value_scale_k[k] * contrib;
                                     }
                                 }
-                                *mdx_row += quant4[lj] * S * dyv;
+                                *mdx_row += quant_start4[lj] * S * dyv;
+                            }
+                        }
+                        // ONE update per lj, using the batch-aggregated g/contrib.
+                        if (learning_rate != value_type(0)) {
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (!col_valid4[lj]) continue;
+                                const value_type S = combined_scale4[lj];
+                                const value_type g_agg = static_cast<value_type>(g_agg4[lj]);
+                                const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
+                                ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2, min_decay_frac, max_ci);
+                                quant4[lj] = quant_start4[lj] + SynapsePolicy::update_cw(
+                                    g_agg, ci4[lj], S, effective_lr, eps, damp_by_importance, max_abs_delta,
+                                    scale_invariant);
                             }
                         }
                     }
@@ -1739,32 +1999,47 @@ void disldo_backward(
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
                                 const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
-                                const uint8_t new_w   = fp4_quantize(quant4[lj]);
-                                const uint8_t new_imp = fp4_quantize(imp_ratio);
+                                // was_live4[lj] gate -- see its own
+                                // declaration comment above for the full
+                                // rationale.
+                                const uint8_t new_w   = was_live4[lj] ? fp4_quantize_live(quant4[lj])  : fp4_quantize(quant4[lj]);
+                                const uint8_t new_imp = was_live4[lj] ? fp4_quantize_live(imp_ratio)   : fp4_quantize(imp_ratio);
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                 tile_dirty = true;
                             }
                         } else if constexpr (std::is_same_v<value_type, float> && !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
                             if (full_tile_cols) {
-                                // 2 SIMD stochastic-quantize calls (4 lanes
-                                // each) instead of 8 scalar
-                                // fp4_quantize_stochastic() calls. quant4 is
-                                // already the code to encode (no division --
-                                // see the chain-rule fix above); importance
-                                // still needs its own ratio, unaffected.
-                                // Safe to divide combined_imp_scale4
+                                // Per-lane scalar quantize gated on
+                                // was_live4[lj] (see its declaration comment
+                                // above) -- NOT the SIMD
+                                // block4_vec_quantize_stochastic_fp4_live
+                                // kernel here, since that applies the same
+                                // choice uniformly to all 4 lanes and can't
+                                // express "some lanes live, some not" without
+                                // a mask-blend this correctness fix doesn't
+                                // need yet (accumulation above stays fully
+                                // vectorized; only the encode step is
+                                // scalarized). quant4 is already the code to
+                                // encode (no division -- see the chain-rule
+                                // fix above); importance still needs its own
+                                // ratio. Safe to divide combined_imp_scale4
                                 // unconditionally here (unlike the scalar
                                 // fallback's per-lj guard) -- full_tile_cols
                                 // means every lane is valid, so
                                 // combined_imp_scale4 is never the
                                 // invalid-lane 0 that would make this a 0/0
                                 // division.
-                                const Block4Vec w_to_encode = block4_vec_load(quant4);
-                                const Block4Vec imp_to_encode = {
-                                    ci4[0] / combined_imp_scale4[0], ci4[1] / combined_imp_scale4[1],
-                                    ci4[2] / combined_imp_scale4[2], ci4[3] / combined_imp_scale4[3]};
-                                const Block4VecU new_w_codes   = block4_vec_quantize_stochastic_fp4(w_to_encode);
-                                const Block4VecU new_imp_codes = block4_vec_quantize_stochastic_fp4(imp_to_encode);
+                                uint8_t new_w_codes[BLOCK4_TILE], new_imp_codes[BLOCK4_TILE];
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                    if (was_live4[lj]) {
+                                        new_w_codes[lj]   = fp4_quantize_stochastic_live(quant4[lj]);
+                                        new_imp_codes[lj] = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                    } else {
+                                        new_w_codes[lj]   = fp4_quantize_stochastic(quant4[lj]);
+                                        new_imp_codes[lj] = fp4_quantize_stochastic(imp_ratio);
+                                    }
+                                }
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     for (std::size_t k = 0; k < rank; ++k) {
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
@@ -1780,8 +2055,15 @@ void disldo_backward(
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
-                                    const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
-                                    const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                    const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                    uint8_t new_w, new_imp;
+                                    if (was_live4[lj]) {
+                                        new_w   = fp4_quantize_stochastic_live(quant4[lj]);
+                                        new_imp = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                    } else {
+                                        new_w   = fp4_quantize_stochastic(quant4[lj]);
+                                        new_imp = fp4_quantize_stochastic(imp_ratio);
+                                    }
                                     tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                     tile_dirty = true;
                                 }
@@ -1793,8 +2075,15 @@ void disldo_backward(
                                     mcol_at(col4[lj], k) += mcol4_rank[k][lj];
                                     mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
                                 }
-                                const uint8_t new_w   = fp4_quantize_stochastic(quant4[lj]);
-                                const uint8_t new_imp = fp4_quantize_stochastic(ci4[lj] / combined_imp_scale4[lj]);
+                                const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
+                                uint8_t new_w, new_imp;
+                                if (was_live4[lj]) {
+                                    new_w   = fp4_quantize_stochastic_live(quant4[lj]);
+                                    new_imp = fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                } else {
+                                    new_w   = fp4_quantize_stochastic(quant4[lj]);
+                                    new_imp = fp4_quantize_stochastic(imp_ratio);
+                                }
                                 tdata[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp << 4) | new_w);
                                 tile_dirty = true;
                             }
@@ -2074,7 +2363,7 @@ void disldo_backward(
                 const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
                 ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
                                     g_agg, col_eff_lr, beta2, eps, contrib_agg,
-                                    &weights.get_output_scale_step_k(c, k));
+                                    &weights.get_output_scale_step_k(c, k), scale_invariant);
             }
         }
     }
@@ -2098,11 +2387,11 @@ void disldo_backward(
                     const value_type final_combined_scale = final_val_scale * final_out_scale;
                     const value_type final_combined_imp_scale = final_imp_scale * final_out_imp_scale;
                     if constexpr (StochasticRounding) {
-                        ValueAccessor<VALUES_TYPE>::set_stochastic(
+                        ValueAccessor<VALUES_TYPE>::set_stochastic_live(
                             dc.values, entry.vb,
                             entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
                     } else {
-                        ValueAccessor<VALUES_TYPE>::set(
+                        ValueAccessor<VALUES_TYPE>::set_live(
                             dc.values, entry.vb,
                             entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
                     }

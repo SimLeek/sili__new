@@ -125,6 +125,76 @@ inline uint8_t fp4_quantize(float v) {
     return fp4_encode_bits(v);
 }
 
+// ── Never-zero ("live") variants ─────────────────────────────────────────────
+//
+// A LIVE synapse's weight (never importance, never a genuinely blank/
+// unallocated storage slot -- see block4.hpp/delta_csr_memory.hpp's own
+// "byte==0 means blank" convention, which these functions must never be
+// used to write) must never quantize to code 0: once a synapse's weight
+// AND importance both land on 0, disldo_backward treats the whole row/
+// tile as having zero live connections and excludes it from the normal
+// per-synapse gradient path entirely, recoverable only via a much slower
+// separate dead-row bootstrap fallback -- confirmed directly via
+// tests/unit/test_scale_handling.cpp's "near-autapse" tests (see
+// conversation). These variants redirect the near-zero region to the
+// smallest nonzero magnitude (code 1 = 0.5) instead, skipping code 0
+// entirely -- codes go directly from -0.5 to +0.5 with nothing between.
+//
+// DELIBERATELY BIASED near zero: true values very close to 0 no longer
+// average to 0 (E[quantized] != v in that region, unlike fp4_quantize's
+// own unbiased-elsewhere convention). This is an intentional tradeoff,
+// not an oversight -- confirmed empirically (see conversation: a
+// near-autapse harness across 6 seeds x 4 targets including exactly 0.0)
+// that the resulting sign settles quickly and stays put rather than
+// thrashing, and that overall accuracy is comparable to or better than
+// allowing code 0, because the baseline's occasional multi-hundred-step
+// "stuck dead synapse" episodes cost far more than this variant's small
+// steady-state discretization floor.
+inline uint8_t fp4_encode_bits_live(float v) {
+    static constexpr uint32_t TH_025 = 0x3E800000u;  // bits_of(0.25f)
+    static constexpr uint32_t TH_075 = 0x3F400000u;  // bits_of(0.75f)
+    static constexpr uint32_t TH_1   = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX    = 0x40C00000u;  // bits_of(6.0f)
+
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+
+    uint32_t mag_code;
+    if (abits > 0x7F800000u) {
+        // NaN input: a NaN weight reaching quantization is itself a distinct
+        // bug class (upstream gradient corruption) -- the never-0 invariant
+        // shouldn't carve out an exception for it, so redirect to a signed
+        // code 1 rather than fp4_quantize's own code-0 convention.
+        return uint8_t(((sign ? 1u : 0u) << 3) | 1u);
+    } else if (abits < TH_025) {
+        mag_code = 1;  // was 0 in fp4_encode_bits -- the whole point of "live"
+    } else if (abits < TH_075) {
+        mag_code = 1;
+    } else if (abits < TH_1) {
+        mag_code = 2;
+    } else {
+        uint32_t rounded = abits + (1u << 21);
+        if (rounded > SIX) rounded = SIX;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
+    }
+    // Defensive fallback -- every branch above already guarantees mag_code
+    // >= 1, this should be unreachable; kept cheap in case a future edit to
+    // the carry-propagation path above reintroduces a 0.
+    if (mag_code == 0) mag_code = 1;
+    const uint32_t s = sign ? 1u : 0u;
+    return uint8_t((s << 3) | mag_code);
+}
+
+/// Never-zero deterministic quantize for a LIVE synapse's weight -- see the
+/// block comment above fp4_encode_bits_live for the full rationale.
+inline uint8_t fp4_quantize_live(float v) {
+    return fp4_encode_bits_live(v);
+}
+
 // ── Stochastic rounding ───────────────────────────────────────────────────────
 //
 // fp4_quantize() above is deterministic nearest-neighbour: a gradient-driven
@@ -270,6 +340,128 @@ inline uint8_t fp4_quantize_stochastic(float v) {
     }
     if (mag_code == 0) return 0;  // never the repurposed NaN slot, see fp4_encode_bits
     return uint8_t(((sign ? 1u : 0u) << 3) | mag_code);
+}
+
+/// Never-zero STOCHASTIC quantize for a LIVE synapse's weight -- see the
+/// block comment above fp4_encode_bits_live for the never-0 rationale.
+///
+/// NOT a collapse to a fixed "always code 1" outcome (an earlier draft of
+/// this design got this wrong -- see conversation): the existing
+/// fp4_quantize_stochastic's `abits < HALF_BITS` bracket ([0,0.5)) already
+/// does genuine probability-weighted rounding for v>=0 (draws p_up=v*2,
+/// picks code 0 vs 1 with probability continuously varying by where v
+/// sits in the bracket). The live version generalizes that SAME mechanism
+/// across the full SIGNED bracket [-0.5,+0.5) instead of collapsing it:
+/// picks -0.5 vs +0.5 with probability proportional to where the signed v
+/// falls across the doubled range (p_pos = (v+0.5)/1.0) -- near v=0 this
+/// is close to a fair coin flip between signs; near +0.5 almost always
+/// +0.5; near -0.5 almost always -0.5. Every bracket further from zero is
+/// untouched and stays exactly as unbiased as fp4_quantize_stochastic's
+/// own.
+inline uint8_t fp4_quantize_stochastic_live(float v) {
+    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+
+    if (abits > 0x7F800000u) {
+        // NaN input -- see fp4_encode_bits_live's identical rationale.
+        return uint8_t(((sign ? 1u : 0u) << 3) | 1u);
+    }
+
+    uint32_t mag_code;
+    uint32_t s_out = sign ? 1u : 0u;
+    if (abits >= SIX_BITS) {
+        mag_code = 7;  // deterministic saturate, matches fp4_quantize_stochastic
+    } else if (abits < HALF_BITS) {
+        // Full signed bracket [-0.5,+0.5) -- see this function's own
+        // docstring above for the probability-weighted redirect.
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float signed_v = sign ? -av : av;
+        const float p_pos = signed_v + 0.5f;  // (v - (-0.5)) / ((+0.5) - (-0.5))
+        const bool pick_pos = fp4_stochastic_uniform01() < p_pos;
+        mag_code = 1u;
+        s_out = pick_pos ? 0u : 1u;
+    } else if (abits < ONE_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float p_up = av * 2.0f - 1.0f;   // (v - 0.5) / (1.0 - 0.5)
+        mag_code = (fp4_stochastic_uniform01() < p_up) ? 2u : 1u;
+    } else {
+        const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);  // uniform in [0, 2^22)
+        uint32_t rounded = abits + dither;
+        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
+    }
+    // Defensive fallback, should be unreachable -- see fp4_encode_bits_live.
+    if (mag_code == 0) mag_code = 1u;
+    return uint8_t((s_out << 3) | mag_code);
+}
+
+/// Never-zero STOCHASTIC quantize for a LIVE synapse's IMPORTANCE (or any
+/// other quantity that is mathematically always >= 0, e.g. the ci
+/// accumulator fed into sqrt(ci)+eps damping throughout disldo_backward/
+/// sisldo_ops.hpp). fp4_quantize_stochastic_live's cross-sign redirect
+/// (see its own docstring) is correct for WEIGHT, which can legitimately
+/// be positive or negative -- but applying that SAME redirect to
+/// importance is a bug: importance near 0 would then have up to a 50%
+/// chance of landing on the NEGATIVE code, and a negative decoded
+/// importance makes every downstream sqrt(ci) call return NaN, silently
+/// poisoning training. Found via direct question/regression during this
+/// session -- see conversation.
+///
+/// Sign is NEVER flipped here (matches fp4_encode_bits_live's own
+/// deterministic behavior, which never had this bug). In the [0,0.5)
+/// bracket there is no legal nonzero magnitude to interpolate toward
+/// besides 0.5 itself (0 is forbidden, negative is forbidden), so that
+/// bracket is deterministic: always mag_code=1 -- the same deliberate
+/// near-zero bias already accepted for the live design as a whole, just
+/// without weight's cross-sign freedom that a nonnegative quantity must
+/// not have. Every bracket above HALF_BITS is untouched, identical to
+/// fp4_quantize_stochastic_live's own (those never touch sign or produce
+/// mag_code 0 anyway).
+inline uint8_t fp4_quantize_stochastic_live_nonneg(float v) {
+    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t abits = bits & 0x7FFFFFFFu;
+    const uint32_t s_out = sign ? 1u : 0u;
+
+    if (abits > 0x7F800000u) {
+        return uint8_t((s_out << 3) | 1u);  // NaN input
+    }
+
+    uint32_t mag_code;
+    if (abits >= SIX_BITS) {
+        mag_code = 7;
+    } else if (abits < HALF_BITS) {
+        mag_code = 1u;  // deterministic -- see docstring above
+    } else if (abits < ONE_BITS) {
+        float av;
+        std::memcpy(&av, &abits, sizeof(av));
+        const float p_up = av * 2.0f - 1.0f;
+        mag_code = (fp4_stochastic_uniform01() < p_up) ? 2u : 1u;
+    } else {
+        const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);
+        uint32_t rounded = abits + dither;
+        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        const uint32_t exp_field = (rounded >> 23) & 0xFFu;
+        const uint32_t m         = (rounded >> 22) & 1u;
+        mag_code = ((exp_field - 126u) << 1) | m;
+    }
+    if (mag_code == 0) mag_code = 1u;
+    return uint8_t((s_out << 3) | mag_code);
 }
 
 // ── FP4BiPacked ───────────────────────────────────────────────────────────────
@@ -441,6 +633,32 @@ struct FP4BiPacked {
         if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
         (*_data)[i] = uint8_t((fp4_quantize_stochastic(weight) << 4)
                              |  fp4_quantize_stochastic(importance));
+    }
+
+    /// Same as set() but for a LIVE synapse -- see fp4_encode_bits_live's
+    /// own docstring for the never-0 rationale. Applies to BOTH weight
+    /// and importance: a live synapse's importance quantizing to the
+    /// blank-slot sentinel is the same failure mode as weight doing so
+    /// (nnz_row==0-style dead-row checks, and pruning decisions that
+    /// read importance as the significance signal), not a separate
+    /// concern -- see conversation.
+    void set_live(std::size_t i, float weight, float importance) {
+        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] = uint8_t((fp4_quantize_live(weight) << 4)
+                             |  fp4_quantize_live(importance));
+    }
+
+    /// Same as set_stochastic() but for a LIVE synapse. Importance uses
+    /// the _nonneg variant, NOT fp4_quantize_stochastic_live -- see
+    /// fp4_quantize_stochastic_live_nonneg's own docstring: importance is
+    /// mathematically always >= 0 (fed into sqrt(ci) throughout
+    /// disldo_backward), and weight's cross-sign redirect would let it
+    /// land on a negative code near zero, NaN-ing every downstream
+    /// sqrt(ci) call.
+    void set_stochastic_live(std::size_t i, float weight, float importance) {
+        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] = uint8_t((fp4_quantize_stochastic_live(weight) << 4)
+                             |  fp4_quantize_stochastic_live_nonneg(importance));
     }
 
     void clear() { if (_data) _data->clear(); }

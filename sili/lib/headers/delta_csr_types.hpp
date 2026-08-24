@@ -258,6 +258,17 @@ struct ValueAccessor<FP4BiPacked> {
     static void set_stochastic(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
         v.set_stochastic(i, w, imp);
     }
+    /// Same as set() but for a LIVE synapse -- see fp4_encode_bits_live's
+    /// docstring (fp4quant.hpp) for the never-0 rationale. Applies to
+    /// BOTH weight and importance -- see FP4BiPacked::set_live's own
+    /// docstring for why importance gets the same treatment.
+    static void set_live(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v.set_live(i, w, imp);
+    }
+    /// Same as set_stochastic() but for a LIVE synapse (weight+importance).
+    static void set_stochastic_live(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
+        v.set_stochastic_live(i, w, imp);
+    }
     static void reserve(FP4BiPacked& v, std::size_t n) {
         v.reserve(n); 
     }
@@ -294,6 +305,26 @@ struct ValueAccessor<FP8BiValues> {
     static void set_stochastic(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
         v.weights[i] = fp8_quantize_stochastic(w);
         v.importance[i] = fp8_quantize_stochastic(imp);
+    }
+    /// Same as set() but for a LIVE synapse -- see fp8_encode_bits_live's
+    /// docstring (fp8quant.hpp) for the never-0 (+0 AND -0) rationale.
+    /// Applies to BOTH weight and importance: a live synapse's importance
+    /// quantizing to the blank-slot sentinel is the same failure mode as
+    /// weight doing so (nnz_row==0-style dead-row checks, and pruning
+    /// decisions that read importance as the significance signal), not a
+    /// separate concern -- see conversation.
+    static void set_live(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_live(w);
+        v.importance[i] = fp8_quantize_live(imp);
+    }
+    /// Same as set_stochastic() but for a LIVE synapse. Importance uses
+    /// the _nonneg variant -- see fp4_quantize_stochastic_live_nonneg's
+    /// docstring (fp4quant.hpp) for the full rationale (importance is
+    /// always >= 0, fed into sqrt(ci); weight's cross-sign redirect would
+    /// NaN it near zero).
+    static void set_stochastic_live(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
+        v.weights[i] = fp8_quantize_stochastic_live(w);
+        v.importance[i] = fp8_quantize_stochastic_live_nonneg(imp);
     }
     static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) {
         v.weights.resize(n, fp8_quantize(val));
@@ -337,6 +368,18 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     /// so callers that always use set_stochastic() for gradient-driven
     /// updates work identically against either VALUES_TYPE.
     static void set_stochastic(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        set(v, i, w, imp);
+    }
+    /// No quantization happens for this (float32 fallback) storage, so
+    /// the never-0 live-quantize invariant (fp4quant.hpp's
+    /// fp4_encode_bits_live docstring) is meaningless here too -- an
+    /// exact 0.0f float is a legitimate stored value, not a byte-0
+    /// storage sentinel. Passthrough to set(), same rationale as
+    /// set_stochastic() above.
+    static void set_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+        set(v, i, w, imp);
+    }
+    static void set_stochastic_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
         set(v, i, w, imp);
     }
     static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0), value_type imp = value_type(0)) {
@@ -442,12 +485,47 @@ struct RMSpropScalePolicy {
     // same size as ci itself, doubling memory for an FP4/FP8 format
     // where every byte counts, for a self-limiting problem that doesn't
     // compound across a whole row the way value_scale's does).
+    // log_space (default false): additive step assumes scale stays near
+    // 1.0 -- a fixed-size eff_lr step is a huge RELATIVE change once scale
+    // has shrunk far below 1 (which magnitude-scale reparametrization
+    // deliberately does) and negligible once scale has grown large. This
+    // mirrors update_cw's own scale_invariant fix, just applied to scale's
+    // OWN update instead of the per-synapse weight update: d(loss)/
+    // d(log(scale)) = d(loss)/d(scale)*scale = g_agg*scale (chain rule
+    // through scale=exp(log_scale)), RMSprop-normalizing THAT keeps the
+    // step a fixed RELATIVE (percentage) size regardless of scale's own
+    // magnitude, and scale can never cross zero (exp()>0), unlike the
+    // additive step. Ported verbatim from sili_peridot's torch prototype
+    // (toy_tile_recurrence_rmt_torch.py's _scale_update,
+    // scale_invariant_chain_rule branch) -- see that module for the
+    // validated-in-torch derivation this is a direct port of.
     static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
                         VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr) {
+                        uint32_t* step = nullptr,
+                        bool log_space = false) {
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        if (log_space) {
+            const VALUE_TYPE log_grad = g_agg * scale;
+            const VALUE_TYPE log_contrib = contrib_agg * scale;
+            const VALUE_TYPE new_state = beta2 * scale_state
+                + (VALUE_TYPE(1) - beta2) * (log_grad * log_grad + log_contrib * log_contrib);
+            if (!std::isfinite(new_state)) return;
+            VALUE_TYPE state_hat = new_state;
+            if (step != nullptr) {
+                ++(*step);
+                const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+                if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+            }
+            if (!std::isfinite(state_hat)) return;
+            const VALUE_TYPE log_step = eff_lr * log_grad / (std::sqrt(state_hat) + eps);
+            const VALUE_TYPE new_scale = scale * std::exp(-log_step);
+            if (!std::isfinite(new_scale)) return;
+            scale_state = new_state;
+            scale = new_scale;
+            return;
+        }
         const VALUE_TYPE new_state = beta2 * scale_state
             + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
         if (!std::isfinite(new_state)) return;
@@ -502,8 +580,10 @@ struct AdaMaxScalePolicy {
                         VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
                         VALUE_TYPE beta2, VALUE_TYPE eps,
                         VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr) {
+                        uint32_t* step = nullptr,
+                        bool log_space = false) {
         (void)step;
+        (void)log_space;  // AdaMax's L-infinity tracker has no log-space variant (yet) -- accepted for call-site signature compatibility with RMSpropScalePolicy only.
         if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
         const VALUE_TYPE combined_mag = std::max(std::abs(g_agg), std::abs(contrib_agg));
         const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
@@ -530,7 +610,8 @@ struct NoScalePolicy {
                         VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
                         VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
                         VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0),
-                        uint32_t* /*step*/ = nullptr) {
+                        uint32_t* /*step*/ = nullptr,
+                        bool /*log_space*/ = false) {
         // Intentionally does nothing.
     }
 };
@@ -608,19 +689,56 @@ struct PlainRMSpropSynapsePolicy {
     // the normal regime, real protection against the late-training
     // resonance Plain has no defense against at all).
     // No floor, no clip -- matches RMSpropScalePolicy's own "must stay
-    // bit-identical to today's behavior" convention.
+    // bit-identical to today's behavior" convention (on finite inputs),
+    // PLUS the same NaN/Inf guard RMSpropScalePolicy::update already has
+    // (delta_csr_types.hpp above): a non-finite g/contrib (e.g. from an
+    // upstream weight that's already diverging) must not be allowed to
+    // corrupt ci -- ci has no other bound in this policy, so a stray NaN
+    // here is permanent (beta2*NaN+... stays NaN forever). Skip the
+    // update (return the OLD ci unchanged) rather than writing NaN --
+    // this is the fix for the coverage gap ba4af42 left: that commit
+    // guarded value_scale/output_scale's own update but never extended
+    // the same guard to the per-synapse ci/cw path (see conversation).
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
                                  VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/,
                                  VALUE_TYPE /*max_ci*/) {
-        return beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
+        const VALUE_TYPE new_ci = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        return std::isfinite(new_ci) ? new_ci : ci;
     }
 
+    // Returns a DELTA (caller does `cw += update_cw(...)`), so "skip the
+    // update" here means return 0 (a true no-op delta), matching
+    // update_ci's own "keep old value" semantics -- same NaN/Inf guard
+    // rationale as update_ci above and RMSpropScalePolicy::update.
+    // scale_invariant: default false (bit-identical to every existing
+    // result). ci above is calibrated to the RAW gradient g^2, unaffected
+    // by S -- but the historical formula below folds S into the
+    // numerator anyway, so raw isn't self-normalized w.r.t. S, and
+    // Delta(true_weight) = S*Delta(cw) ends up scaling QUADRATICALLY
+    // with S once S deviates from ~1.0 (found this session: fp32
+    // accuracy 1.0->0.18 once a mechanism deliberately moved S away
+    // from 1.0, despite true_weight = cw*S being algebraically
+    // unchanged by that move). scale_invariant=true computes raw from
+    // the RAW g (properly self-normalized by ci) and divides by S once
+    // at the very end instead, giving Delta(true_weight) = eff_lr*raw,
+    // independent of S. See BoundedRMSpropSynapsePolicy::update_cw's
+    // own copy of this same fix for the max_abs_delta-clip interaction.
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/) {
-        return damp_by_importance
-            ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
-            : (-eff_lr * g * S);
+                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/,
+                                 bool scale_invariant = false) {
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
+        VALUE_TYPE delta;
+        if (scale_invariant) {
+            const VALUE_TYPE raw = damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g);
+            delta = std::isfinite(raw) ? (eff_lr * raw / S) : VALUE_TYPE(0);
+        } else {
+            delta = damp_by_importance
+                ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
+                : (-eff_lr * g * S);
+        }
+        return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
 
@@ -704,10 +822,17 @@ struct BoundedRMSpropSynapsePolicy {
     // itself, but it is NOT a substitute for staying inside the validated
     // safe max_abs_delta/lr range (sweep_synapse_policy_stochastic.cpp,
     // the lr-ceiling warning in cpu_backend.cpp).
+    // Same NaN/Inf guard as PlainRMSpropSynapsePolicy::update_ci above
+    // (and for the same reason -- see that struct's own docstring): a
+    // non-finite g/contrib must not corrupt ci. Checked BEFORE the
+    // floor/max_ci clamps since std::min/std::max's behavior on NaN is
+    // comparison-order-dependent (not a reliable NaN-filter on its own).
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
                                  VALUE_TYPE beta2, VALUE_TYPE min_decay_frac,
                                  VALUE_TYPE max_ci) {
+        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
         const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        if (!std::isfinite(ema)) return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
         return std::min(std::max(ema, floor), max_ci);
     }
@@ -746,15 +871,34 @@ struct BoundedRMSpropSynapsePolicy {
     // called with learning_rate > 0.2 for exactly this reason -- a caller
     // that genuinely needs a much larger lr needs its own max_abs_delta
     // tuned for that regime, not this default.
+    // Same "return 0 delta on non-finite input/result" guard as
+    // PlainRMSpropSynapsePolicy::update_cw above, checked before the
+    // max_abs_delta clip (clamping NaN against a finite bound is not a
+    // reliable way to neutralize it).
+    //
+    // scale_invariant: default false (bit-identical to every existing
+    // result) -- see PlainRMSpropSynapsePolicy::update_cw's own copy of
+    // this docstring for the full derivation of why the historical
+    // g*S-in-numerator formula makes Delta(true_weight) scale
+    // quadratically with S. When true, the max_abs_delta clip is
+    // applied to `raw` (computed from raw g, before the /S division) --
+    // i.e. it bounds the properly S-normalized true-weight-space step,
+    // the task-relevant quantity, not the internal w_stored-space one
+    // (which is what's actually being deliberately resized by
+    // magnitude-scale reparametrization).
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
                                  VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE max_abs_delta) {
-        VALUE_TYPE raw = damp_by_importance
-            ? (-g * S) / (std::sqrt(ci) + eps)
-            : (-g * S);
+                                 bool damp_by_importance, VALUE_TYPE max_abs_delta,
+                                 bool scale_invariant = false) {
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
+        VALUE_TYPE raw = scale_invariant
+            ? (damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g))
+            : (damp_by_importance ? (-g * S) / (std::sqrt(ci) + eps) : (-g * S));
+        if (!std::isfinite(raw)) return VALUE_TYPE(0);
         if (raw > max_abs_delta) raw = max_abs_delta;
         if (raw < -max_abs_delta) raw = -max_abs_delta;
-        return eff_lr * raw;
+        const VALUE_TYPE delta = scale_invariant ? (eff_lr * raw / S) : (eff_lr * raw);
+        return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
 
@@ -852,18 +996,36 @@ struct DeltaCSRRowCursor {
 // eliminate the scalar/SIMD math split itself).
 template <>
 struct PlainRMSpropSynapsePolicy<Block4Vec> {
+    // Same NaN/Inf guard as the scalar PlainRMSpropSynapsePolicy::update_ci
+    // above (see its docstring) -- per-lane, via block4_vec_select_finite
+    // (block4.hpp), since Block4Vec has no whole-vector isfinite/select.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
                                 Block4Vec beta2, Block4Vec /*min_decay_frac*/,
                                 Block4Vec /*max_ci*/) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        return beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        return block4_vec_select_finite(new_ci, ci);
     }
 
+    // Same "0 delta on non-finite" guard as the scalar
+    // PlainRMSpropSynapsePolicy::update_cw above. scale_invariant: see
+    // the scalar version's own docstring for the full derivation --
+    // host-side bool (like damp_by_importance), selects which SIMD
+    // formula runs, not a per-lane value.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec /*max_abs_delta*/) {
-        const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
-        return damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+                                bool damp_by_importance, Block4Vec /*max_abs_delta*/,
+                                bool scale_invariant = false) {
+        Block4Vec delta;
+        if (scale_invariant) {
+            const Block4Vec neg_g = -g;
+            const Block4Vec raw = damp_by_importance ? neg_g / (block4_vec_sqrt(ci) + eps) : neg_g;
+            delta = (eff_lr * raw) / S;
+        } else {
+            const Block4Vec neg_lr_g_S = -(eff_lr * g * S);
+            delta = damp_by_importance ? neg_lr_g_S / (block4_vec_sqrt(ci) + eps) : neg_lr_g_S;
+        }
+        return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };
 
@@ -871,25 +1033,42 @@ template <>
 struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
     // for the full min_decay_frac semantics (must exceed beta2 to bind).
+    // Same NaN/Inf guard as the scalar BoundedRMSpropSynapsePolicy::update_ci
+    // above (checked before the floor/max_ci clamps, same rationale).
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
                                 Block4Vec beta2, Block4Vec min_decay_frac,
                                 Block4Vec max_ci) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
         const Block4Vec floor = min_decay_frac * ci;
-        return block4_vec_min(block4_vec_max(ema, floor), max_ci);
+        return block4_vec_min(block4_vec_max(ema_safe, floor), max_ci);
     }
 
     // Clips the lr-independent raw update before the eff_lr multiply --
     // see the scalar BoundedRMSpropSynapsePolicy::update_cw docstring above
     // for why (must match it exactly, or SIMD full-tile vs scalar-boundary
-    // results would diverge for the same synapse).
+    // results would diverge for the same synapse). Same NaN/Inf guard as
+    // the scalar version, checked before the clip.
+    // scale_invariant: see the scalar BoundedRMSpropSynapsePolicy::
+    // update_cw docstring above for the full derivation -- host-side
+    // bool (like damp_by_importance), selects which SIMD formula runs.
     static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
                                 Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec max_abs_delta) {
-        const Block4Vec neg_g_S = -(g * S);
-        const Block4Vec raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
-        return eff_lr * block4_vec_clip_abs(raw, max_abs_delta);
+                                bool damp_by_importance, Block4Vec max_abs_delta,
+                                bool scale_invariant = false) {
+        Block4Vec raw;
+        if (scale_invariant) {
+            const Block4Vec neg_g = -g;
+            raw = damp_by_importance ? neg_g / (block4_vec_sqrt(ci) + eps) : neg_g;
+        } else {
+            const Block4Vec neg_g_S = -(g * S);
+            raw = damp_by_importance ? neg_g_S / (block4_vec_sqrt(ci) + eps) : neg_g_S;
+        }
+        const Block4Vec raw_safe = block4_vec_select_finite(raw, block4_vec_broadcast(0.0f));
+        const Block4Vec clipped = block4_vec_clip_abs(raw_safe, max_abs_delta);
+        const Block4Vec delta = scale_invariant ? (eff_lr * clipped) / S : (eff_lr * clipped);
+        return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
     }
 };
 
@@ -1065,25 +1244,26 @@ struct SparseLinearWeightsDelta {
     // opposite-signed column instead of cancelling against the first.
     //
     // SCOPE NOTE: disldo_forward, and disldo_backward's scattered-CSR path
-    // AND block4's FP4 path (process_tile in linear_disldo.hpp) are all
-    // rank-aware, using weights.get_scale(row,col). The SIMD fast path
+    // AND BOTH block4 paths -- FP4 and FP8 (process_tile in
+    // linear_disldo.hpp) -- are all rank-aware, using
+    // weights.get_scale(row,col). The SIMD fast path (both FP4 and FP8)
     // keeps its 4-wide column vectorization regardless of rank by looping
     // the (small, SCALE_RANK_MAX-capped) rank dimension outside the lane
     // dimension with real Block4Vec accumulators per component, rather
-    // than falling back to scalar for rank>1.
+    // than falling back to scalar for rank>1. Scattered and block4 must
+    // both be correct here, not just one: real training layers hold a
+    // MIX of both storages simultaneously via synaptogenesis promotion/
+    // demotion, sharing the same value_scale/output_scale arrays.
     //
-    // Still rank-1-only (component 0 of a rank>1 layer): block4's FP8
-    // branch (a separate, near-duplicate code path within the same
-    // process_tile lambda -- the real toy/test model uses FP4, not FP8,
-    // so this wasn't hit yet) and every DeferredScaleWrite class (e.g.
-    // SparseLinearLayerResync) on both scattered and block4 paths (see
-    // disldo_backward's own DeferredScaleWrite branch comment for why
-    // rank>1 doesn't apply there without more work: eager multiply-by-
-    // not-yet-finalized-scale would reintroduce the staleness
-    // DeferredScaleWrite exists to avoid). If a rank>1 layer ever uses
-    // FP8 block4 or a DeferredScaleWrite class, its effective scale
-    // silently drops every component beyond 0 there -- tracked as a
-    // follow-up, not fixed here.
+    // Still rank-1-only (component 0 of a rank>1 layer): every
+    // DeferredScaleWrite class (e.g. SparseLinearLayerResync) on both
+    // scattered and block4 paths (see disldo_backward's own
+    // DeferredScaleWrite branch comment for why rank>1 doesn't apply
+    // there without more work: eager multiply-by-not-yet-finalized-scale
+    // would reintroduce the staleness DeferredScaleWrite exists to
+    // avoid). If a rank>1 layer ever uses a DeferredScaleWrite class, its
+    // effective scale silently drops every component beyond 0 there --
+    // tracked as a follow-up, not fixed here.
     std::size_t scale_rank = 1;
 
     // Same per-row design, for STORED weight values instead of importance.
@@ -1398,6 +1578,15 @@ public:
             const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
             const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
             const value_type true_i   = stored_i * old_scale;
+            // Plain set(), not live -- this re-encodes whatever value the
+            // row ALREADY had under a new scale (reparametrization, same
+            // as block4_maybe_promote), not a training update. A row can
+            // contain a freshly-grown, never-yet-trained synapse whose
+            // weight/importance is deliberately 0 (insert_col's own
+            // convention); redirecting that to a nonzero live code here
+            // would be the same corruption class the block4_maybe_promote
+            // regression already caught -- see its comment in
+            // delta_csr_memory.hpp for the full incident.
             ValueAccessor<VALUES_TYPE>::set(dc.values, vb, w, true_i / new_scale);
         }
         set_importance_scale_raw(row, new_scale);
@@ -1432,6 +1621,201 @@ public:
     inline void rescale_value(value_type new_scale) {
         auto& L = connections.layout;
         for (std::size_t r = 0; r < L.rows; ++r) rescale_value_row(r, new_scale);
+    }
+
+    // Gradient-free reparametrization: true_weight = stored_w *
+    // value_scale[row] * output_scale[col] is algebraically UNCHANGED by
+    // this -- only WHERE the magnitude lives moves, from output_scale
+    // into the stored per-synapse weight code. Drives each column's
+    // stored-weight RMS (across all n_in rows, including rows with no
+    // synapse in that column -- matches a dense parameter's zero-padded
+    // mean, see below) toward `target` via a DAMPED (correction_rate)
+    // multiplicative step per call rather than jumping there in one shot.
+    // Ported from sili_peridot's torch-validated prototype
+    // (toy_tile_recurrence_rmt_torch.py's _magnitude_rescale) -- see that
+    // module for the full derivation and the empirical finding that
+    // column-only (not also row/value_scale -- "both axes" was tested and
+    // found to consistently HURT) is the winning configuration.
+    //
+    // scale_invariant: when true, per-synapse `ci` already tracks the RAW
+    // gradient g (decoupled from S=value_scale*output_scale via
+    // update_cw's own scale_invariant flag) so it does NOT need rescaling
+    // here. When false, ci is calibrated to (g*S)^2 -- shrinking
+    // output_scale by k without correspondingly rescaling ci silently
+    // changes every touched synapse's effective RMSprop step size. See
+    // update_cw's own docstring for the matching root cause on the
+    // per-synapse weight update side.
+    //
+    // Column RMS is measured over n_in (the row COUNT), not nnz_in_col --
+    // a column with zero active synapses is skipped entirely (k=1, no-op)
+    // rather than treated as a real all-zero column, since "no synapse"
+    // (sparse) and "synapse present but currently zero" (torch's dense
+    // w_stored) are genuinely different things the sparse engine has no
+    // reason to conflate; a torch all-zero-but-present column would
+    // otherwise also degenerate toward the eps floor.
+    //
+    // Covers BOTH storages -- scattered CSR (`connections`) AND block4
+    // (`block4`) -- not scattered-only. A real training layer promotes
+    // synapses between the two continuously (synaptogenesis/pruning), so
+    // a column's live weight can live in either storage, or split across
+    // both, at any given moment; rescaling only one side would silently
+    // leave the other side's synapses un-rescaled while still dividing
+    // the SHARED output_scale[col] they both read, corrupting their true
+    // weight. Both FP4 (Block4Store, nibble-packed weight|imp<<4) and
+    // FP8 (Block4Store8, separate weight/importance byte planes) are
+    // handled via the same `if constexpr` dispatch process_tile-style
+    // code elsewhere in this codebase already uses -- see delta_csr_
+    // memory.hpp's own scattered+block4 combined-export loop for the
+    // read-side precedent this mirrors. Re-quantization here is
+    // DETERMINISTIC (fp4_quantize/fp8_quantize), matching rescale_
+    // value_row's own convention for this class of scale-bookkeeping
+    // rewrite (not the gradient-driven stochastic set_stochastic()).
+    inline void magnitude_rescale_output(value_type target, value_type correction_rate,
+                                          bool scale_invariant, value_type eps = value_type(1e-8)) {
+        auto& dc = connections;
+        auto& L = dc.layout;
+        const std::size_t n_out = L.cols;
+        const std::size_t n_in  = L.rows;
+        if (n_out == 0 || n_in == 0) return;
+
+        std::vector<double> sum_sq(n_out, 0.0);
+        std::vector<std::size_t> col_count(n_out, 0);
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            if (n == 0) continue;
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const COL_TYPE col = cursor.advance();
+                const std::size_t vb = L.elem_start[r] + e;
+                const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
+                ++col_count[col];
+            }
+        }
+        const auto& BL = block4.block_layout;
+        for (std::size_t br = 0; br < BL.rows; ++br) {
+            const std::size_t n_bc = BL.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = block4.row_cursor(uint32_t(br));
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+                const uint32_t bc = bc_cursor.advance();
+                const auto tile = block4.find(uint32_t(br), bc);
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= n_out) continue;
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        if (row >= n_in) continue;
+                        value_type w;
+                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                            const uint8_t w_byte = tile.at_weight(li, lj);
+                            const uint8_t i_byte = tile.at_importance(li, lj);
+                            if (w_byte == 0 && i_byte == 0) continue;  // empty slot
+                            w = fp8_decode_bits(w_byte);
+                        } else {
+                            const uint8_t byte = tile.at(li, lj);
+                            if (byte == 0) continue;  // empty slot
+                            w = FP4_TABLE[byte & 0xFu];
+                        }
+                        sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
+                        ++col_count[col];
+                    }
+                }
+            }
+        }
+
+        std::vector<value_type> k(n_out, value_type(1));
+        for (std::size_t c = 0; c < n_out; ++c) {
+            if (col_count[c] == 0) continue;  // nothing to rescale here
+            const double mean_sq = sum_sq[c] / static_cast<double>(n_in);
+            const value_type col_rms = static_cast<value_type>(std::sqrt(mean_sq + static_cast<double>(eps)));
+            if (!std::isfinite(col_rms) || col_rms <= value_type(0)) continue;
+            value_type kc = target / col_rms;
+            if (kc < value_type(1e-6)) kc = value_type(1e-6);
+            kc = std::pow(kc, correction_rate);
+            if (!std::isfinite(kc) || kc <= value_type(0)) continue;
+            k[c] = kc;
+        }
+
+        for (std::size_t r = 0; r < n_in; ++r) {
+            const std::size_t n = L.row_nnz(r);
+            if (n == 0) continue;
+            auto cursor = dc.row_cursor(r);
+            for (std::size_t e = 0; e < n; ++e) {
+                const COL_TYPE col = cursor.advance();
+                if (k[col] == value_type(1)) continue;
+                const std::size_t vb = L.elem_start[r] + e;
+                const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                const value_type new_w   = w * k[col];
+                const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w, new_imp);
+            }
+        }
+        for (std::size_t br = 0; br < BL.rows; ++br) {
+            const std::size_t n_bc = BL.row_nnz(br);
+            if (n_bc == 0) continue;
+            auto bc_cursor = block4.row_cursor(uint32_t(br));
+            for (std::size_t bk = 0; bk < n_bc; ++bk) {
+                const uint32_t bc = bc_cursor.advance();
+                // Any column in this tile need rescaling? Skip the whole
+                // tile (no mutable handle, no dirty/re-pack cost) if not.
+                bool any_col_touched = false;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col < n_out && k[col] != value_type(1)) { any_col_touched = true; break; }
+                }
+                if (!any_col_touched) continue;
+                auto tile = block4.find(uint32_t(br), bc);
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                    if (col >= n_out || k[col] == value_type(1)) continue;
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = br * BLOCK4_TILE + li;
+                        if (row >= n_in) continue;
+                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                            const uint8_t w_byte = tile.at_weight(li, lj);
+                            const uint8_t i_byte = tile.at_importance(li, lj);
+                            if (w_byte == 0 && i_byte == 0) continue;
+                            const value_type w   = fp8_decode_bits(w_byte);
+                            const value_type imp = fp8_decode_bits(i_byte);
+                            const value_type new_w   = w * k[col];
+                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                            tile.at_weight(li, lj)     = fp8_quantize_live(new_w);
+                            tile.at_importance(li, lj) = fp8_quantize_live(new_imp);
+                        } else {
+                            const uint8_t byte = tile.at(li, lj);
+                            if (byte == 0) continue;
+                            const value_type w   = FP4_TABLE[byte & 0xFu];
+                            const value_type imp = FP4_TABLE[(byte >> 4) & 0xFu];
+                            const value_type new_w   = w * k[col];
+                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                            tile.at(li, lj) = uint8_t(fp4_quantize_live(new_w) | (fp4_quantize_live(new_imp) << 4));
+                        }
+                    }
+                }
+            }
+        }
+
+        // true_weight = stored_w * S[row,col], where S[row,col] =
+        // sum_{ki<scale_rank} value_scale_k(row,ki)*output_scale_k(col,ki)
+        // (get_scale's own formula). Dividing EVERY rank component's
+        // output_scale_k(col,ki) by the SAME column-level k[c] divides
+        // the whole sum by k[c] exactly (S/k[c] = sum_ki(vs_ki*(os_ki/
+        // k[c])) = (sum_ki vs_ki*os_ki)/k[c]), so this generalizes
+        // cleanly to any scale_rank -- at scale_rank==1 it's identical
+        // to the original single-component form.
+        for (std::size_t c = 0; c < n_out; ++c) {
+            if (k[c] == value_type(1)) continue;
+            for (std::size_t ki = 0; ki < scale_rank; ++ki) {
+                const value_type new_os = get_output_scale_k(c, ki) / k[c];
+                if (!std::isfinite(new_os)) continue;
+                set_output_scale_raw_k(c, ki, new_os);
+            }
+        }
     }
 
     inline void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {

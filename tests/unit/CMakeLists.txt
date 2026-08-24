@@ -156,6 +156,7 @@ set(SILI_STANDALONE_TESTS
     sweep_synapse_policy_min_decay_frac
     sweep_synapse_policy_stochastic
     probe_unstable_pocket_growth
+    probe_unclipped_after_nan_fix
     test_ci_ceiling
     test_production_default_long_horizon
     test_disldo_block4_combined_absolute
@@ -172,6 +173,7 @@ set(SILI_STANDALONE_TESTS
     test_fp8_block4_store
     test_disldo_block4_fp8
     test_disldo_block4_promotion_fp8
+    test_never_zero_live_quantize
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

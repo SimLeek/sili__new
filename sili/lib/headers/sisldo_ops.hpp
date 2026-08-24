@@ -731,7 +731,7 @@ void disldo_backward_sparse_grad(
                     const value_type new_w = w + (damp_by_importance
                         ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                         : (-effective_lr * grad));
-                    ValueAccessor<VALUES_TYPE>::set(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
+                    ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
                     batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
@@ -1010,8 +1010,25 @@ void disldo_backward_sparse_grad(
                                         const value_type new_w = w + (damp_by_importance
                                             ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
                                             : (-effective_lr * grad));
-                                        const uint8_t new_w_code   = fp4_quantize_stochastic(new_w / combined_scale);
-                                        const uint8_t new_imp_code = fp4_quantize_stochastic(imp / combined_imp_scale);
+                                        // was_live gate -- see
+                                        // linear_disldo.hpp's was_live4/
+                                        // was_live4_8 declaration comments for
+                                        // the full rationale: `byte` here is
+                                        // the PRE-update packed byte, still
+                                        // untouched at this point -- a cell
+                                        // that was never a real synapse
+                                        // (byte==0) must stay allowed to
+                                        // round back to 0, not be forced
+                                        // permanently live just because this
+                                        // column happened to have gradient
+                                        // signal this step.
+                                        const bool was_live = (byte != 0);
+                                        const uint8_t new_w_code   = was_live
+                                            ? fp4_quantize_stochastic_live(new_w / combined_scale)
+                                            : fp4_quantize_stochastic(new_w / combined_scale);
+                                        const uint8_t new_imp_code = was_live
+                                            ? fp4_quantize_stochastic_live_nonneg(imp / combined_imp_scale)
+                                            : fp4_quantize_stochastic(imp / combined_imp_scale);
                                         scratch[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
                                         dirty = true;
 

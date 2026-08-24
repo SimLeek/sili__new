@@ -646,6 +646,18 @@ void block4_maybe_promote(
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     {
                         auto tile = weights.block4.find(br, bc);
+                        // NOT the live variant, deliberately: this re-encodes
+                        // whatever value the scattered side ALREADY had,
+                        // including a genuinely fresh, never-yet-trained
+                        // synapse's deliberate weight=0.0 (see synaptogenesis's
+                        // own insert_col convention) -- format migration, not
+                        // a training update. Confirmed directly: using the
+                        // live variant here broke test_disldo_block4_promotion's
+                        // own documented round-trip check (a fresh synapse's
+                        // 0.0 must survive promotion/demotion exactly). The
+                        // actual never-0 protection belongs at the POST-
+                        // promotion training sites (disldo_backward's block4
+                        // branches, magnitude_rescale_output), not here.
                         if constexpr (is_fp8) {
                             tile.at_weight(li, lj)     = fp8_quantize(w);
                             tile.at_importance(li, lj) = fp8_quantize(imp);
@@ -687,6 +699,8 @@ void block4_maybe_promote(
                 const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
                 const uint32_t fli = uint32_t(f.row - row_lo);
                 const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
+                // Not the live variant -- see the single-synapse promote
+                // branch's identical comment above.
                 if constexpr (is_fp8) {
                     tile.at_weight(fli, flj)     = fp8_quantize(w);
                     tile.at_importance(fli, flj) = fp8_quantize(imp);

@@ -1,6 +1,6 @@
 import numpy as np
 
-from sili.tensor import Tensor, add, mul, log, reduce_sum
+from sili.tensor import Tensor, add, mul, log, reduce_sum, concat
 
 
 class TestBroadcastingBackward:
@@ -110,3 +110,65 @@ class TestLog:
         out._backward()
         e._backward()
         np.testing.assert_allclose(x.grad, np.ones(3, dtype=np.float32), rtol=1e-4)
+
+
+class TestConcat:
+    def test_forward_matches_numpy_axis0(self):
+        a_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        b_data = np.arange(9, dtype=np.float32).reshape(3, 3) + 100.0
+        out = concat([Tensor(a_data), Tensor(b_data)], axis=0)
+        np.testing.assert_array_equal(out.data, np.concatenate([a_data, b_data], axis=0))
+
+    def test_three_tensors_forward(self):
+        parts = [np.full((1, 4), v, dtype=np.float32) for v in (1.0, 2.0, 3.0)]
+        out = concat([Tensor(p) for p in parts], axis=0)
+        np.testing.assert_array_equal(out.data, np.concatenate(parts, axis=0))
+
+    def test_backward_splits_gradient_back_to_each_operand_unchanged_shape(self):
+        # Regression-style check: each operand's grad must come back with
+        # ITS OWN original shape (not the concatenated shape), and must
+        # equal exactly the corresponding row-slice of the incoming
+        # gradient -- concat's whole point is a memory/content-token
+        # split where each side needs its own correctly-shaped gradient
+        # to flow back into (e.g. a separate memory-carry Tensor vs a
+        # separate fresh-input Tensor).
+        a = Tensor(np.zeros((2, 3), dtype=np.float32))
+        b = Tensor(np.zeros((4, 3), dtype=np.float32))
+        out = concat([a, b], axis=0)
+        assert out.data.shape == (6, 3)
+
+        incoming = np.arange(18, dtype=np.float32).reshape(6, 3)
+        out.grad = incoming
+        out._backward()
+
+        assert a.grad.shape == (2, 3)
+        assert b.grad.shape == (4, 3)
+        np.testing.assert_array_equal(a.grad, incoming[:2])
+        np.testing.assert_array_equal(b.grad, incoming[2:])
+
+    def test_backward_matches_finite_difference(self):
+        rng = np.random.RandomState(0)
+        a_data = rng.randn(2, 3).astype(np.float32)
+        b_data = rng.randn(3, 3).astype(np.float32)
+        eps = 1e-3
+
+        a, b = Tensor(a_data.copy()), Tensor(b_data.copy())
+        out = concat([a, b], axis=0)
+        weights = rng.randn(*out.data.shape).astype(np.float32)
+        out.grad = weights
+        out._backward()
+
+        def f(a_p, b_p):
+            return float((np.concatenate([a_p, b_p], axis=0) * weights).sum())
+
+        for name, data, grad in [("a", a_data, a.grad), ("b", b_data, b.grad)]:
+            for idx in np.ndindex(data.shape):
+                plus, minus = data.copy(), data.copy()
+                plus[idx] += eps
+                minus[idx] -= eps
+                if name == "a":
+                    numeric = (f(plus, b_data) - f(minus, b_data)) / (2 * eps)
+                else:
+                    numeric = (f(a_data, plus) - f(a_data, minus)) / (2 * eps)
+                assert abs(grad[idx] - numeric) < 1e-2, (
+                    f"{name}{idx}: analytic {grad[idx]} vs finite-diff {numeric}")
