@@ -405,6 +405,44 @@ def _seed_additive_rank(c, rank: int, n_inputs: int, n_outputs: int,
             c.set_additive_v_raw_k(col, k, float(rng.normal(0.0, scale)))
 
 
+def _activate_gamma_tracking(c, additive_rank: int) -> None:
+    """Turns on EMA tracking for BOTH branches' gamma (task #292), which
+    is what makes apply_dynamic_rank_control/apply_additive_dynamic_rank_
+    control's Theorem 10 triggers actually evaluate against real,
+    updating signal instead of permanently-zero EMA state.
+
+    Gamma's own EMA only updates inside disldo_backward's gamma-update
+    block, itself gated on scale_gamma_is_trainable/additive_gamma_is_
+    trainable (opt-in flags, see get_scale_gamma_k's own docstring,
+    sili__new's delta_csr_types.hpp) -- set true only once set_scale_
+    gamma_raw_k/set_additive_gamma_raw_k has been called at least once.
+    Neither _seed_scale_rank nor _seed_additive_rank above ever touches
+    gamma, so a layer constructed via those alone has gamma tracking
+    permanently OFF regardless of scale_rank/additive_rank -- this is
+    the explicit "opt in" step, matching test_aqrs_dynamic_rank_control_
+    integration.cpp's own convention (see get_scale_gamma_k's docstring:
+    "explicitly touch gamma at k=0 BEFORE growing -- this is what puts
+    gamma into active use").
+
+    Writes gamma_k(0)=1.0 for BOTH branches -- the exact same value
+    get_scale_gamma_k's own lazy default already returns (transparent,
+    zero behavior change), and additive_gamma_k(0) likewise defaults
+    transparently to 1.0 (see that function's own corrected-default
+    docstring) -- so this call activates tracking WITHOUT perturbing
+    anything the layer was already computing. additive branch only gets
+    activated if additive_rank>0 (a rank-0 additive branch has no
+    channel 0 to touch, and apply_additive_dynamic_rank_control's own
+    neurogenesis trigger structurally can't fire from rank 0 anyway --
+    see GammaEMATracker::should_neurogenesis's own rank==0 guard -- so a
+    caller wanting the additive branch to ever grow under dynamic
+    control must seed it at rank>=1 up front, same as scale_rank).
+    """
+    if hasattr(c, "set_scale_gamma_raw_k"):
+        c.set_scale_gamma_raw_k(0, 1.0)
+    if additive_rank > 0 and hasattr(c, "set_additive_gamma_raw_k"):
+        c.set_additive_gamma_raw_k(0, 1.0)
+
+
 def _preseed_dense(c, n_inputs: int, n_outputs: int,
                    rng: Optional[np.random.Generator] = None,
                    quantize_fn=None) -> int:
@@ -567,7 +605,7 @@ class DISLDOLayer(_SparseLayerBase):
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
                  dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0):
+                 additive_rank: int = 0, dynamic_rank_control: bool = False):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -577,6 +615,8 @@ class DISLDOLayer(_SparseLayerBase):
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
@@ -709,7 +749,7 @@ class DISLDOLayerDeterministic(DISLDOLayer):
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
                  dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0):
+                 additive_rank: int = 0, dynamic_rank_control: bool = False):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -719,6 +759,8 @@ class DISLDOLayerDeterministic(DISLDOLayer):
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
@@ -844,7 +886,8 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, additive_rank: int = 0):
+                 dense: bool = False, scale_rank: int = 1, additive_rank: int = 0,
+                 dynamic_rank_control: bool = False):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
@@ -864,6 +907,8 @@ class DISLDOLayer8(_SparseLayerBase):
         # input-independent) is exactly the scenario this branch exists
         # to structurally fix.
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
