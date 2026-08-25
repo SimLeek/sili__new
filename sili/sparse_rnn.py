@@ -369,6 +369,42 @@ def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
             c.set_output_scale_raw_k(col, k, float(rng.normal(0.0, scale)))
 
 
+def _seed_additive_rank(c, rank: int, n_inputs: int, n_outputs: int,
+                        rng: Optional[np.random.Generator] = None,
+                        scale: float = 0.05) -> None:
+    """Sets additive_rank on the C++ layer and seeds EVERY component
+    (k=0..rank-1, unlike _seed_scale_rank's k>=1) with small independent
+    random values on BOTH additive_u and additive_v.
+
+    Same chicken-and-egg deadlock as _seed_scale_rank, just additive
+    instead of multiplicative: disldo_backward's dU_rk depends on dP,
+    which is zero whenever every additive_v_k is zero (dP[b,k] = sum_c
+    dy*V[c,k]); symmetrically dV_ck depends on P, which is zero whenever
+    every additive_u_k is zero. additive_rank's own default (0.0 for both
+    U and V, see set_additive_rank's reshuffle in delta_csr_types.hpp) is
+    correct for k that's never been grown, but a caller growing rank at
+    construction time needs at least one side nonzero on every new
+    channel, same reasoning as scale_rank's k>=1 case -- seeding BOTH
+    sides independently is simplest and mirrors _seed_scale_rank exactly.
+
+    Unlike scale_rank, there's no k==0 "always on baseline channel" to
+    preserve -- additive_rank==0 is a true, fully transparent no-op (see
+    disldo_forward's own `if (weights.additive_rank > 0)` guard), so
+    every channel from k=0 gets seeded here, not just k>=1.
+    """
+    if rank <= 0:
+        return
+    if rng is None:
+        rng = np.random.default_rng()
+    c.set_additive_rank(rank)
+    for r in range(n_inputs):
+        for k in range(rank):
+            c.set_additive_u_raw_k(r, k, float(rng.normal(0.0, scale)))
+    for col in range(n_outputs):
+        for k in range(rank):
+            c.set_additive_v_raw_k(col, k, float(rng.normal(0.0, scale)))
+
+
 def _preseed_dense(c, n_inputs: int, n_outputs: int,
                    rng: Optional[np.random.Generator] = None,
                    quantize_fn=None) -> int:
@@ -530,7 +566,8 @@ class DISLDOLayer(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
+                 additive_rank: int = 0):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -539,6 +576,7 @@ class DISLDOLayer(_SparseLayerBase):
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
@@ -651,7 +689,8 @@ class DISLDOLayerDeterministic(DISLDOLayer):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
+                 additive_rank: int = 0):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -660,6 +699,7 @@ class DISLDOLayerDeterministic(DISLDOLayer):
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
@@ -785,7 +825,7 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1):
+                 dense: bool = False, scale_rank: int = 1, additive_rank: int = 0):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
@@ -798,6 +838,13 @@ class DISLDOLayer8(_SparseLayerBase):
         # sweep across fp4/fp4_dual/fp8 (sili_peridot task #247); a rank2
         # FP8 arm would otherwise TypeError immediately.
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        # additive_rank: this is the branch task #280 re-validates against
+        # the fp8 MQAR input-independent-collapse ("mumbling") case -- see
+        # AQRS_DESIGN.md Theorem 3/4 and _seed_additive_rank's own
+        # docstring for why FP8's real-engine collapse (readout going
+        # input-independent) is exactly the scenario this branch exists
+        # to structurally fix.
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
