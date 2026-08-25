@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -519,6 +520,38 @@ public:
     }
     void set_additive_v_raw_k(S col, S k, V v) {
         weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
+    }
+
+    // AQRS dynamic rank control (task #291): thin Python-facing wrappers
+    // over weights.apply_dynamic_rank_control/apply_additive_dynamic_
+    // rank_control (delta_csr_types.hpp), which are C++ templates taking
+    // a caller-supplied seed callback -- not directly bindable to pybind.
+    // A per-instance RNG (not a Python callback) supplies the new
+    // channel's seed, matching the SAME "small deterministic-ish nonzero
+    // value just to break the symmetric zero-init deadlock" convention
+    // this codebase's own Python _seed_scale_rank/_seed_additive_rank
+    // helpers already use (Theorem 9's real residual-aligned seeding is
+    // still an open research question, not implemented anywhere yet --
+    // see apply_dynamic_rank_control's own docstring). Returns true if a
+    // mutation (apoptosis or neurogenesis) actually happened this call.
+    std::mt19937 _dynamic_rank_rng{std::random_device{}()};
+    void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+    bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
     }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
@@ -1386,6 +1419,28 @@ public:
         weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
     }
 
+    // AQRS dynamic rank control (task #291) -- same as SparseLinearLayer
+    // (FP4)'s own copy above, see its docstring for the full rationale.
+    std::mt19937 _dynamic_rank_rng{std::random_device{}()};
+    void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+    bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1625,6 +1680,21 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("seed_dynamic_rank_rng", &SparseLinearLayer::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayer::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             "AQRS Theorem 10 dynamic rank control for the multiplicative (scale) branch --\n"
+             "evaluates apoptosis/neurogenesis triggers against the EMA state (updated\n"
+             "automatically every backward call) and performs at most one mutation.\n"
+             "Returns True if a mutation happened this call.")
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             "Additive-branch counterpart to apply_dynamic_rank_control -- same Theorem\n"
+             "10 machinery, additive_gamma/additive_u/additive_v instead of scale_gamma/\n"
+             "value_scale/output_scale. min_rank=0 (the additive branch can legitimately\n"
+             "shrink itself back to fully off, unlike scale_rank's floor of 1).")
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -2345,6 +2415,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -3157,6 +3234,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("seed_dynamic_rank_rng", &SparseLinearLayer8::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayer8::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer8::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
         .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
         .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))

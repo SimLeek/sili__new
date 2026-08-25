@@ -641,6 +641,25 @@ class DISLDOLayer(_SparseLayerBase):
         out._backward = _bwd
         return out
 
+    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
+                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   grace_period_steps: int = 50) -> bool:
+        """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
+        BOTH branches' apoptosis/neurogenesis triggers against their own
+        EMA state (updated automatically inside backward_dense/backward,
+        see disldo_backward's own gamma update block) and performs at
+        most one mutation PER BRANCH this call (so up to two total: one
+        multiplicative, one additive). Call once per training step, after
+        backward -- matches test_aqrs_dynamic_rank_control_integration.cpp's
+        own "breathing" integration test convention exactly, just from
+        Python. Returns True if either branch actually mutated.
+        """
+        mutated_scale = self._c.apply_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        mutated_additive = self._c.apply_additive_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        return mutated_scale or mutated_additive
+
 
 class DISLDOLayerResync(DISLDOLayer):
     """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
@@ -875,6 +894,19 @@ class DISLDOLayer8(_SparseLayerBase):
 
         out._backward = _bwd
         return out
+
+    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
+                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   grace_period_steps: int = 50) -> bool:
+        """Same as DISLDOLayer's own apply_dynamic_rank_control (task
+        #292) -- duplicated here rather than shared via inheritance since
+        DISLDOLayer8 doesn't subclass DISLDOLayer (separate VALUES_TYPE
+        entirely), see this class's own docstring."""
+        mutated_scale = self._c.apply_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        mutated_additive = self._c.apply_additive_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        return mutated_scale or mutated_additive
 
 
 class DISLDOLayer8Resync(DISLDOLayer8):
