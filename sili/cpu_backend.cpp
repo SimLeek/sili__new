@@ -493,6 +493,34 @@ public:
     // not duplicated here (see conversation, task #275).
     void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
 
+    // AQRS additive branch (task #278, see sili_peridot/AQRS_DESIGN.md):
+    // A[row,col] = sum_k additive_u_k(row,k)*additive_v_k(col,k), ADDED
+    // (not Hadamard-multiplied like value_scale/output_scale above) to
+    // the effective weight -- structurally necessary whenever a
+    // quantized weight lands on the zero sentinel code (Theorem 3/4),
+    // where the multiplicative branch's own gradient is exactly zero at
+    // any rank. Default additive_rank=0 (branch fully off, matches
+    // set_additive_rank's own docstring) -- every existing caller is
+    // unaffected until this is explicitly engaged. disldo_forward/
+    // disldo_backward already pick it up automatically whenever
+    // additive_rank>0, same transparent pattern as scale_rank above; no
+    // separate function call needed to "activate" it beyond growing the
+    // rank past 0.
+    std::size_t get_additive_rank() const { return weights.additive_rank; }
+    void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    V get_additive_u_k(S row, S k) const {
+        return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
+    }
+    void set_additive_u_raw_k(S row, S k, V v) {
+        weights.set_additive_u_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v);
+    }
+    V get_additive_v_k(S col, S k) const {
+        return weights.get_additive_v_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k));
+    }
+    void set_additive_v_raw_k(S col, S k, V v) {
+        weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
+    }
+
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
     py::array_t<V> forward_dense(py::array_t<V> x) {
@@ -1338,6 +1366,26 @@ public:
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
     void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
 
+    // AQRS additive branch -- see SparseLinearLayerImpl's own (FP4)
+    // identical block for the full rationale. This is what task #280
+    // actually re-validates against (the fp8 MQAR "mumbling"/input-
+    // independent-collapse case), so FP8 needs this every bit as much as
+    // FP4's own copy above.
+    std::size_t get_additive_rank() const { return weights.additive_rank; }
+    void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    V get_additive_u_k(S row, S k) const {
+        return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
+    }
+    void set_additive_u_raw_k(S row, S k, V v) {
+        weights.set_additive_u_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v);
+    }
+    V get_additive_v_k(S col, S k) const {
+        return weights.get_additive_v_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k));
+    }
+    void set_additive_v_raw_k(S col, S k, V v) {
+        weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
+    }
+
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1566,6 +1614,17 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("num_cpus") = 4)
         .def("get_scale_rank",       &SparseLinearLayer::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayer::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayer::get_additive_rank,
+             "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
+             "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
+             "necessary whenever a quantized weight lands on the zero sentinel\n"
+             "code, where the multiplicative rank-N scale's own gradient is\n"
+             "exactly zero at any rank. additive_rank defaults to 0 (fully off).")
+        .def("set_additive_rank",    &SparseLinearLayer::set_additive_rank, py::arg("rank"))
+        .def("get_additive_u_k",     &SparseLinearLayer::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -1790,8 +1849,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2018,8 +2077,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerResync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResync::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerResync::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerResync::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResync::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2247,8 +2306,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerNoScale::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScale::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerNoScale::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerNoScale::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScale::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2280,6 +2339,12 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("num_cpus") = 4)
         .def("get_scale_rank",       &SparseLinearLayerDeterministic::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayerDeterministic::get_additive_rank)
+        .def("set_additive_rank",    &SparseLinearLayerDeterministic::set_additive_rank, py::arg("rank"))
+        .def("get_additive_u_k",     &SparseLinearLayerDeterministic::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -2493,8 +2558,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2721,8 +2786,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerResyncDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResyncDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerResyncDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerResyncDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResyncDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2948,8 +3013,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerNoScaleDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScaleDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerNoScaleDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerNoScaleDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScaleDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -3011,7 +3076,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
-        .def_property_readonly("block4",    &DISLDOLayerV::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 
     // ── SparseLinearLayer8 ───────────────────────────────────────────────────
     py::class_<SparseLinearLayer8>(m, "SparseLinearLayer8")
@@ -3079,6 +3144,19 @@ PYBIND11_MODULE(_cpu, m)
              "the \"SCATTERED CSR ONLY\" note that used to be here was stale).")
         .def("get_scale_rank",       &SparseLinearLayer8::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayer8::get_additive_rank,
+             "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
+             "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
+             "necessary whenever a quantized weight lands on the zero sentinel\n"
+             "code, where the multiplicative rank-N scale's own gradient is\n"
+             "exactly zero at any rank. additive_rank defaults to 0 (fully off).\n"
+             "This is the branch task #280 re-validates against the fp8 MQAR\n"
+             "input-independent-collapse case.")
+        .def("set_additive_rank",    &SparseLinearLayer8::set_additive_rank, py::arg("rank"))
+        .def("get_additive_u_k",     &SparseLinearLayer8::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
         .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
         .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
@@ -3099,7 +3177,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8Resync: exact SparseLinearLayer8 API, but the real
     // DeferredScaleWrite fix (value_scale/output_scale stay consistent with
@@ -3165,7 +3243,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8Resync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8Resync::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8Resync::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8AdaMax: exact SparseLinearLayer8 API, but with the
     // AdaMax-style decayed-running-max scale update (also with the
@@ -3232,7 +3310,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8AdaMax::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8AdaMax::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8AdaMax::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>()));
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //
