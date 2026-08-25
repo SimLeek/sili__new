@@ -486,12 +486,12 @@ public:
     // verified rank-N this session -- the "block4 remains rank-1-only"
     // note that used to be here was stale).
     std::size_t get_scale_rank() const { return weights.scale_rank; }
-    void set_scale_rank(std::size_t rank) {
-        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
-        if (rank > decltype(weights)::SCALE_RANK_MAX)
-            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
-        weights.scale_rank = rank;
-    }
+    // Forwards to the struct's own set_scale_rank (delta_csr_types.hpp) --
+    // that method now does a SAFE reshuffle of existing multi-row scale
+    // data, not just a bare field assignment; validation lives there too
+    // so it's shared by every caller (struct-direct C++ callers included),
+    // not duplicated here (see conversation, task #275).
+    void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -1327,12 +1327,12 @@ public:
     // process_tile's FP8 branch in linear_disldo.hpp), so this was purely
     // a missing pybind-facing wrapper, not missing engine support.
     std::size_t get_scale_rank() const { return weights.scale_rank; }
-    void set_scale_rank(std::size_t rank) {
-        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
-        if (rank > decltype(weights)::SCALE_RANK_MAX)
-            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
-        weights.scale_rank = rank;
-    }
+    // Forwards to the struct's own set_scale_rank (delta_csr_types.hpp) --
+    // that method now does a SAFE reshuffle of existing multi-row scale
+    // data, not just a bare field assignment; validation lives there too
+    // so it's shared by every caller (struct-direct C++ callers included),
+    // not duplicated here (see conversation, task #275).
+    void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
     V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }

@@ -342,6 +342,44 @@ void disldo_forward(
     // see this function's own docstring: forward is pure now, importance
     // updates only ever happen in disldo_backward, coupled to a real
     // gradient.
+
+    // ── AQRS additive branch (task #276, see sili_peridot/AQRS_DESIGN.md) ──
+    // A[row,col] = sum_k additive_u_k(row,k)*additive_v_k(col,k), ADDED
+    // (not Hadamard-multiplied against quant like the scale_rank branch
+    // above) to the effective weight. Genuinely independent of the
+    // sparse/block4 structure above -- it's a dense low-rank correction
+    // that touches every output regardless of which synapses happen to
+    // be live, so it's computed as its own small pass rather than woven
+    // into either per-synapse loop. Fused per Theorem 11 (never
+    // materializes the n_in x n_out A matrix): project the input down to
+    // additive_rank dimensions via additive_u, then back up to n_out via
+    // additive_v -- O(batch * additive_rank * (n_in + n_out)), cheap as
+    // long as additive_rank << min(n_in, n_out). No-op (skipped entirely)
+    // at the default additive_rank==0, matching value_scale/output_scale's
+    // own "unconfigured component contributes nothing" convention.
+    if (weights.additive_rank > 0) {
+        std::vector<value_type> proj(static_cast<std::size_t>(batch) * weights.additive_rank, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
+            value_type* p_row = proj.data() + static_cast<std::size_t>(b) * weights.additive_rank;
+            for (std::size_t r = 0; r < n_in; ++r) {
+                const value_type iv = in_row[r];
+                if (iv == value_type(0)) continue;
+                for (std::size_t k = 0; k < weights.additive_rank; ++k)
+                    p_row[k] += weights.get_additive_u_k(r, k) * iv;
+            }
+        }
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* p_row = proj.data() + static_cast<std::size_t>(b) * weights.additive_rank;
+            value_type* out_row = output + static_cast<std::size_t>(b) * n_out;
+            for (std::size_t c = 0; c < n_out; ++c) {
+                value_type acc = value_type(0);
+                for (std::size_t k = 0; k < weights.additive_rank; ++k)
+                    acc += weights.get_additive_v_k(c, k) * p_row[k];
+                out_row[c] += acc;
+            }
+        }
+    }
 }
 
 // ── backward ─────────────────────────────────────────────────────────────────
@@ -483,7 +521,14 @@ void disldo_backward(
     typename ValueAccessor<VALUES_TYPE>::value_type  max_abs_delta = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  max_ci = 1e30f,
     typename ValueAccessor<VALUES_TYPE>::value_type  zero_escape_eps = 0.1f,
-    bool         scale_invariant = false)
+    bool         scale_invariant = false,
+    // AQRS gamma's L1 penalty coefficient (task #273/#283, Theorem 8) --
+    // 0 (default) disables it entirely, matching every existing call
+    // site's behavior unchanged. Appended LAST, after scale_invariant, so
+    // no existing positional call site anywhere in the codebase shifts --
+    // see this function's own template-parameter docstring above for why
+    // that ordering discipline matters here specifically.
+    typename ValueAccessor<VALUES_TYPE>::value_type  l1_coef = 0.0f)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     // Same chosen policy (SynapsePolicyT), instantiated at both widths --
@@ -551,6 +596,21 @@ void disldo_backward(
     // not the primary guard.
     constexpr std::size_t SCALE_RANK_MAX = SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>::SCALE_RANK_MAX;
     assert(rank <= SCALE_RANK_MAX);
+    // AQRS gamma (task #273/#283): layer-wide, doesn't vary by row/col/
+    // tile, so fetched ONCE here rather than per-row like value_scale_k/
+    // output_scale_k -- shared by the scattered loop below AND every
+    // block4 sub-path (FP4 SIMD/scalar, FP8 SIMD/scalar) further down.
+    // Deliberately NOT baked into value_scale_k8/out_scale_k4 (etc.)'s own
+    // local caches -- gamma's OWN gradient needs the PURE (un-multiplied)
+    // value_direction_k*output_direction_k product, and baking gamma into
+    // either side would make recovering that require dividing by gamma_k,
+    // fragile exactly at gamma_k=0 (the most common case, since gamma
+    // defaults to 0 for any channel beyond the always-on k=0). Applied as
+    // an explicit extra factor at each of value_scale's/output_scale's own
+    // gradient accumulation sites instead, matching the scattered path's
+    // own style exactly (see its identical comment above).
+    value_type gamma_k_arr[SCALE_RANK_MAX];
+    for (std::size_t k = 0; k < rank; ++k) gamma_k_arr[k] = weights.get_scale_gamma_k(k);
     std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
     // Parallel forward-contribution accumulator, same shape/layout as
     // t_col_grad -- mirrors the per-synapse ci fix (contrib=x*w combined
@@ -565,14 +625,48 @@ void disldo_backward(
     std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
+    // AQRS gamma's own gradient (task #273/#283): dL/d(gamma_k) = sum over
+    // every (row,col) touched this call of quant_floor * value_direction_k
+    // (row) * output_direction_k(col) * g -- a LAYER-WIDE scalar per k, not
+    // per-row/col like value_scale/output_scale's own gradients, so this is
+    // sized num_cpus*rank (not num_cpus*n_out*rank like t_col_grad above).
+    std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
+    // Same combined-signal (g + contrib=x*w) treatment as value_scale/
+    // output_scale's own importance above -- see t_col_grad_contrib's own
+    // comment for the full rationale.
+    std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
+
     // Pre-size value_scale/output_scale (now n_in*rank / n_out*rank, see
     // scale_rank's own docstring) so that direct indexed writes from
     // within the parallel region are safe (resize would race if called
     // per-thread).
-    if (weights.value_scale.size() < n_in * rank)
-        weights.value_scale.resize(n_in * rank, value_type(1));
-    if (weights.output_scale.size() < n_out * rank)
-        weights.output_scale.resize(n_out * rank, value_type(1));
+    //
+    // CORRECTED (real bug, found via writing test_aqrs_rank_growth_shrink.cpp
+    // -- see conversation): a uniform `resize(..., value_type(1))` fill
+    // backfills EVERY newly-appended slot with 1.0, not just the k==0 ones
+    // -- but get_value_scale_k/get_output_scale_k's own documented default
+    // is k==0 -> 1.0, k>=1 -> 0.0 (an untrained extra rank component must
+    // be a pure no-op). Confirmed via direct probe: growing scale_rank from
+    // 1 to 2 mid-training made the new k=1 channel start IDENTICAL to k=0
+    // (both 1.0), so it received identical gradients every step by
+    // symmetry and stayed in permanent lockstep with k=0 -- effectively a
+    // scaled rank-1, not real rank-2 capacity. Fix: resize with a neutral
+    // 0 fill, then explicitly set only the k==0 slots in the newly-added
+    // range to 1.0 -- matches reshuffle_rank_array's own scale_default
+    // lambda (set_scale_rank, delta_csr_types.hpp), just applied to a
+    // straight append instead of a rank-changing reshuffle.
+    if (weights.value_scale.size() < n_in * rank) {
+        const std::size_t old_size = weights.value_scale.size();
+        weights.value_scale.resize(n_in * rank, value_type(0));
+        for (std::size_t idx = old_size; idx < weights.value_scale.size(); ++idx)
+            if (idx % rank == 0) weights.value_scale[idx] = value_type(1);
+    }
+    if (weights.output_scale.size() < n_out * rank) {
+        const std::size_t old_size = weights.output_scale.size();
+        weights.output_scale.resize(n_out * rank, value_type(0));
+        for (std::size_t idx = old_size; idx < weights.output_scale.size(); ++idx)
+            if (idx % rank == 0) weights.output_scale[idx] = value_type(1);
+    }
     if (weights.value_scale_importance.size() < n_in * rank)
         weights.value_scale_importance.resize(n_in * rank, value_type(0));
     if (weights.output_scale_importance.size() < n_out * rank)
@@ -605,6 +699,10 @@ void disldo_backward(
         auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_base[col * rank + k]; };
         value_type* mcol_contrib_base = t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
         auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_contrib_base[col * rank + k]; };
+        value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+        auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+        value_type* mgamma_contrib_base = t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+        auto mgamma_at_contrib = [&](std::size_t k) -> value_type& { return mgamma_contrib_base[k]; };
         [[maybe_unused]] std::vector<DeferredScaleWriteEntry>* mdeferred = nullptr;
         if constexpr (DeferredScaleWrite) mdeferred = &t_deferred[static_cast<std::size_t>(tid)];
 
@@ -911,15 +1009,34 @@ void disldo_backward(
                             // (quant_floor itself now computed once, fixed,
                             // before this loop -- see its own comment above).
                             for (std::size_t k = 0; k < rank; ++k) {
+                                // AQRS gamma (task #273/#283): out_scale_k/
+                                // val_scale_k above are pure DIRECTION
+                                // (value_scale_k/output_scale_k's getters
+                                // are never gamma-baked -- only get_scale()
+                                // combines direction*gamma, for the S/
+                                // weight-update math elsewhere). Each of
+                                // value_scale's and output_scale's OWN
+                                // gradient needs an explicit gamma_k factor
+                                // (dS/d(value_direction_k)=gamma_k*
+                                // output_direction_k, and symmetrically for
+                                // output_direction_k) since neither
+                                // scale_grad_sum_rank[k] nor mcol_at(col,k)
+                                // otherwise sees gamma at all. gamma_k's
+                                // OWN gradient (dS/d(gamma_k)=value_
+                                // direction_k*output_direction_k) is a NEW,
+                                // layer-wide (not per-row/col) accumulator.
                                 const value_type out_scale_k = weights.get_output_scale_k(col, k);
                                 const value_type val_scale_k = weights.get_value_scale_k(r, k);
-                                scale_grad_sum_rank[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * g;
-                                mcol_at(col, k) += quant_floor * val_scale_k * g;
+                                const value_type gamma_k = weights.get_scale_gamma_k(k);
+                                scale_grad_sum_rank[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * static_cast<double>(gamma_k) * g;
+                                mcol_at(col, k) += quant_floor * val_scale_k * gamma_k * g;
+                                mgamma_at(k) += quant_floor * val_scale_k * out_scale_k * g;
                                 // Parallel forward-contribution accumulation
                                 // -- see scale_grad_sum_contrib's own
                                 // comment above.
-                                scale_grad_sum_rank_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * contrib;
-                                mcol_at_contrib(col, k) += quant_floor * val_scale_k * contrib;
+                                scale_grad_sum_rank_contrib[k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k) * static_cast<double>(gamma_k) * contrib;
+                                mcol_at_contrib(col, k) += quant_floor * val_scale_k * gamma_k * contrib;
+                                mgamma_at_contrib(k) += quant_floor * val_scale_k * out_scale_k * contrib;
                             }
                         }
                         mdx[static_cast<std::size_t>(b) * in_cols + r] += cw_start * dyv;
@@ -1078,6 +1195,19 @@ void disldo_backward(
             auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& { return mcol_contrib_base[col * rank + k]; };
             double* mrow_contrib_base = t_row_grad_contrib.data() + static_cast<std::size_t>(tid) * n_in * rank;
             auto mrow_at_contrib = [&](std::size_t row, std::size_t k) -> double& { return mrow_contrib_base[row * rank + k]; };
+            // AQRS gamma (task #273/#283) -- block4 gets its OWN parallel
+            // region (separate from the scattered path's, above), so
+            // mgamma_at/mgamma_at_contrib need their own tid-scoped
+            // closures here too, reading from the SAME t_gamma_grad/
+            // t_gamma_grad_contrib buffers (declared once, outside both
+            // parallel regions, at this function's top) that the scattered
+            // path's own mgamma_at uses -- both regions' threads
+            // accumulate into the same shared array, reduced together once
+            // after both parallel regions close.
+            value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+            value_type* mgamma_contrib_base = t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at_contrib = [&](std::size_t k) -> value_type& { return mgamma_contrib_base[k]; };
 
             // Partitioned BY BLOCK-ROW, not by flat tile index -- each
             // thread exclusively owns every tile in the rows it's
@@ -1343,6 +1473,14 @@ void disldo_backward(
                             double     mrow_local8_k[SCALE_RANK_MAX] = {};
                             value_type mcol4_8_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
                             double     mrow_local8_k_contrib[SCALE_RANK_MAX] = {};
+                            // AQRS gamma's own gradient (task #273/#283) --
+                            // per-tile-row local accumulator, folded into
+                            // the shared mgamma_at/mgamma_at_contrib (same
+                            // ones the scattered path uses) once this row
+                            // finishes, matching mrow_local8_k's own
+                            // fold-into-mrow_at pattern below.
+                            double     mgamma_local8_k[SCALE_RANK_MAX] = {};
+                            double     mgamma_local8_k_contrib[SCALE_RANK_MAX] = {};
                             const std::size_t col_base8 = std::size_t(bc) * BLOCK4_TILE;
                             const bool full_tile_cols8 = (col_base8 + BLOCK4_TILE <= n_out);
 
@@ -1395,10 +1533,19 @@ void disldo_backward(
                                         g_agg_v += g_v;
                                         contrib_agg_v += contrib_v;
                                         for (std::size_t k = 0; k < rank; ++k) {
-                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * g_v));
-                                            mcol_acc_v_k8[k] += cw_orig_v * value_scale_k_v8[k] * g_v;
-                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * contrib_v));
-                                            mcol_acc_v_k8_contrib[k] += cw_orig_v * value_scale_k_v8[k] * contrib_v;
+                                            // AQRS gamma (task #273/#283): out_scale_k_v8/value_scale_k_v8
+                                            // are pure DIRECTION (never gamma-baked -- see gamma_k_arr's
+                                            // own docstring above for why). value_scale's own gradient
+                                            // (mrow_local8_k) and output_scale's own gradient
+                                            // (mcol_acc_v_k8) each need an explicit gamma_k factor;
+                                            // gamma's own gradient (mgamma_local8_k) uses the PURE
+                                            // direction product, no gamma factor.
+                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * g_v)) * static_cast<double>(gamma_k_arr[k]);
+                                            mcol_acc_v_k8[k] += cw_orig_v * value_scale_k_v8[k] * g_v * block4_vec_broadcast(gamma_k_arr[k]);
+                                            mgamma_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * value_scale_k_v8[k] * g_v));
+                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
+                                            mcol_acc_v_k8_contrib[k] += cw_orig_v * value_scale_k_v8[k] * contrib_v * block4_vec_broadcast(gamma_k_arr[k]);
+                                            mgamma_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * value_scale_k_v8[k] * contrib_v));
                                         }
                                     }
                                     *mdx_row += block4_vec_hsum(cw_start_v * dyv_v);
@@ -1447,10 +1594,14 @@ void disldo_backward(
                                             g_agg4_8[lj] += static_cast<double>(g);
                                             contrib_agg4_8[lj] += static_cast<double>(contrib);
                                             for (std::size_t k = 0; k < rank; ++k) {
-                                                mrow_local8_k[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * g;
-                                                mcol4_8_rank[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * g;
-                                                mrow_local8_k_contrib[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * contrib;
-                                                mcol4_8_rank_contrib[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * contrib;
+                                                // AQRS gamma (task #273/#283) -- see the SIMD branch's
+                                                // identical comment above for the full rationale.
+                                                mrow_local8_k[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * static_cast<double>(gamma_k_arr[k]) * g;
+                                                mcol4_8_rank[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * gamma_k_arr[k] * g;
+                                                mgamma_local8_k[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * static_cast<double>(value_scale_k8[k]) * g;
+                                                mrow_local8_k_contrib[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * static_cast<double>(gamma_k_arr[k]) * contrib;
+                                                mcol4_8_rank_contrib[k][lj] += cw_orig4_8[lj] * value_scale_k8[k] * gamma_k_arr[k] * contrib;
+                                                mgamma_local8_k_contrib[k] += static_cast<double>(cw_orig4_8[lj]) * static_cast<double>(out_scale_k4_8[k][lj]) * static_cast<double>(value_scale_k8[k]) * contrib;
                                             }
                                         }
                                         *mdx_row += cw_start4_8[lj] * dyv;
@@ -1474,6 +1625,8 @@ void disldo_backward(
                                 for (std::size_t k = 0; k < rank; ++k) {
                                     mrow_at(row, k) += mrow_local8_k[k];
                                     mrow_at_contrib(row, k) += mrow_local8_k_contrib[k];
+                                    mgamma_at(k) += static_cast<value_type>(mgamma_local8_k[k]);
+                                    mgamma_at_contrib(k) += static_cast<value_type>(mgamma_local8_k_contrib[k]);
                                 }
                                 if (full_tile_cols8) {
                                     // Scalar fp8_quantize_stochastic, not
@@ -1548,6 +1701,8 @@ void disldo_backward(
                                 double     mrow_local_k[SCALE_RANK_MAX] = {};
                                 value_type mcol_local_k_contrib[SCALE_RANK_MAX] = {};
                                 double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
+                                double     mgamma_local_k[SCALE_RANK_MAX] = {};
+                                double     mgamma_local_k_contrib[SCALE_RANK_MAX] = {};
                                 double     g_agg = 0.0, contrib_agg = 0.0;
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
@@ -1563,10 +1718,13 @@ void disldo_backward(
                                         g_agg += static_cast<double>(g);
                                         contrib_agg += static_cast<double>(contrib);
                                         for (std::size_t k = 0; k < rank; ++k) {
-                                            mrow_local_k[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * g;
-                                            mcol_local_k[k] += cw_orig * value_scale_k8_fb[k] * g;
-                                            mrow_local_k_contrib[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * contrib;
-                                            mcol_local_k_contrib[k] += cw_orig * value_scale_k8_fb[k] * contrib;
+                                            // AQRS gamma -- see the SIMD branch's identical comment above.
+                                            mrow_local_k[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * static_cast<double>(gamma_k_arr[k]) * g;
+                                            mcol_local_k[k] += cw_orig * value_scale_k8_fb[k] * gamma_k_arr[k] * g;
+                                            mgamma_local_k[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * static_cast<double>(value_scale_k8_fb[k]) * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * static_cast<double>(gamma_k_arr[k]) * contrib;
+                                            mcol_local_k_contrib[k] += cw_orig * value_scale_k8_fb[k] * gamma_k_arr[k] * contrib;
+                                            mgamma_local_k_contrib[k] += static_cast<double>(cw_orig) * static_cast<double>(out_scale_k8_fb[k]) * static_cast<double>(value_scale_k8_fb[k]) * contrib;
                                         }
                                     }
                                     *mdx_row += cw_start * dyv;
@@ -1585,6 +1743,8 @@ void disldo_backward(
                                         mcol_at(col, k) += mcol_local_k[k];
                                         mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
                                         mcol_at_contrib(col, k) += mcol_local_k_contrib[k];
+                                        mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                        mgamma_at_contrib(k) += static_cast<value_type>(mgamma_local_k_contrib[k]);
                                     }
                                     // was_live gate -- see was_live4_8's
                                     // declaration comment (SIMD branch
@@ -1690,6 +1850,12 @@ void disldo_backward(
                     double     mrow_local_k[SCALE_RANK_MAX] = {};
                     value_type mcol4_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
                     double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
+                    // AQRS gamma's own gradient (task #273/#283) -- folded
+                    // into the shared mgamma_at/mgamma_at_contrib once this
+                    // row finishes, matching mrow_local_k's own
+                    // fold-into-mrow_at pattern below.
+                    double     mgamma_local_k[SCALE_RANK_MAX] = {};
+                    double     mgamma_local_k_contrib[SCALE_RANK_MAX] = {};
                     // col4[lj] is really just col_base+lj (contiguous), but
                     // reading it back OUT of the array hides that from GCC
                     // -- confirmed via -fopt-info-vec: it correctly proved
@@ -1816,10 +1982,14 @@ void disldo_backward(
                                     // quant_floor_v itself now computed once,
                                     // fixed, before this loop.
                                     for (std::size_t k = 0; k < rank; ++k) {
-                                        mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v));
-                                        mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v;
-                                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * contrib_v));
-                                        mcol_acc_v_k_contrib[k] += quant_floor_v * value_scale_k_v[k] * contrib_v;
+                                        // AQRS gamma -- see the scattered path's identical comment (near
+                                        // gamma_k_arr's own declaration) for the full rationale.
+                                        mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v)) * static_cast<double>(gamma_k_arr[k]);
+                                        mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v * block4_vec_broadcast(gamma_k_arr[k]);
+                                        mgamma_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * value_scale_k_v[k] * g_v));
+                                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
+                                        mcol_acc_v_k_contrib[k] += quant_floor_v * value_scale_k_v[k] * contrib_v * block4_vec_broadcast(gamma_k_arr[k]);
+                                        mgamma_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * value_scale_k_v[k] * contrib_v));
                                     }
                                 }
                                 // w = quant*S, FIXED for the whole batch --
@@ -1881,10 +2051,13 @@ void disldo_backward(
                                         g_agg4[lj] += static_cast<double>(g);
                                         contrib_agg4[lj] += static_cast<double>(contrib);
                                         for (std::size_t k = 0; k < rank; ++k) {
-                                            mrow_local_k[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * g;
-                                            mcol4_rank[k][lj] += quant_floor4[lj] * value_scale_k[k] * g;
-                                            mrow_local_k_contrib[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * contrib;
-                                            mcol4_rank_contrib[k][lj] += quant_floor4[lj] * value_scale_k[k] * contrib;
+                                            // AQRS gamma -- see the SIMD branch's identical comment above.
+                                            mrow_local_k[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * static_cast<double>(gamma_k_arr[k]) * g;
+                                            mcol4_rank[k][lj] += quant_floor4[lj] * value_scale_k[k] * gamma_k_arr[k] * g;
+                                            mgamma_local_k[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * static_cast<double>(value_scale_k[k]) * g;
+                                            mrow_local_k_contrib[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * static_cast<double>(gamma_k_arr[k]) * contrib;
+                                            mcol4_rank_contrib[k][lj] += quant_floor4[lj] * value_scale_k[k] * gamma_k_arr[k] * contrib;
+                                            mgamma_local_k_contrib[k] += static_cast<double>(quant_floor4[lj]) * static_cast<double>(out_scale_k4[k][lj]) * static_cast<double>(value_scale_k[k]) * contrib;
                                         }
                                     }
                                     *mdx_row += quant_start4[lj] * S * dyv;
@@ -1966,6 +2139,8 @@ void disldo_backward(
                         for (std::size_t k = 0; k < rank; ++k) {
                             mrow_at(row, k) += mrow_local_k[k];
                             mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                            mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                            mgamma_at_contrib(k) += static_cast<value_type>(mgamma_local_k_contrib[k]);
                         }
                         if constexpr (!StochasticRounding) {
                             // Deterministic: NOT gated by the SIMD fast path above --
@@ -2368,6 +2543,84 @@ void disldo_backward(
         }
     }
 
+    if (learning_rate != value_type(0) && weights.scale_gamma_is_trainable) {
+        // AQRS gamma's own update (task #273/#283, see sili_peridot/
+        // AQRS_DESIGN.md Theorem 8): reduced across threads once per
+        // channel k (gamma is layer-wide, no per-row/col normalization
+        // needed, unlike value_scale/output_scale's deg-scaled eff_lr).
+        // Gated on scale_gamma_is_trainable (same opt-in pattern as
+        // output_scale_is_trainable) -- see scale_gamma_is_trainable's own
+        // docstring, delta_csr_types.hpp, for why this gate is required,
+        // not optional: without it every existing rank>=1 layer, including
+        // ones that have never heard of gamma, would get an unsolicited
+        // gradient-driven perturbation to gamma_s_k(0) every step.
+        // Same ScalePolicy convention (RMSprop default) for the gradient
+        // step, THEN a proximal L1 soft-threshold shrinkage on top --
+        // that second step is what creates a genuine attracting fixed
+        // point at exactly gamma=0 (soft-thresholding zeroes anything
+        // within l1_coef*learning_rate of zero after the gradient step;
+        // plain RMSprop/L2-style decay only asymptotically approaches
+        // zero, never reaches it exactly, which is why L1 needs its own
+        // explicit step here rather than folding into ScalePolicy's own
+        // gradient-only update).
+        // g_agg_by_k captured here for the EMA pass below (task #284) --
+        // that pass needs every channel's raw gradient AND every
+        // channel's just-updated |gamma| value simultaneously (C_k needs
+        // ||gamma||_1 over ALL k), so it can't be folded into this same
+        // loop; SCALE_RANK_MAX-sized stack array, not a heap allocation.
+        value_type g_agg_by_k[SCALE_RANK_MAX];
+        for (std::size_t k = 0; k < rank; ++k) {
+            double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
+            for (int t = 0; t < num_cpus; ++t) {
+                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * rank + k];
+                gamma_grad_sum_contrib += t_gamma_grad_contrib[static_cast<std::size_t>(t) * rank + k];
+            }
+            const value_type g_agg = static_cast<value_type>(gamma_grad_sum);
+            const value_type contrib_agg = static_cast<value_type>(gamma_grad_sum_contrib);
+            g_agg_by_k[k] = g_agg;
+            // Force-size scale_gamma up to k (lazy default preserved) so a
+            // direct reference is safe to hand to ScalePolicy::update,
+            // matching value_scale/output_scale's own direct-array-access
+            // convention above.
+            weights.set_scale_gamma_raw_k(k, weights.get_scale_gamma_k(k));
+            ScalePolicy::update(weights.scale_gamma[k], weights.get_scale_gamma_state_k(k),
+                                g_agg, learning_rate, beta2, eps, contrib_agg,
+                                &weights.get_scale_gamma_step_k(k), scale_invariant);
+            // L1 only applies to k>=1 -- channel 0 is the always-on
+            // baseline (set_scale_rank rejects rank==0, so channel 0 can
+            // NEVER actually be pruned regardless of how small its gamma
+            // gets); penalizing it anyway just fights the fit with no
+            // possible payoff. Matches the k==0-is-special convention
+            // already used everywhere else in this rank-N mechanism
+            // (value_scale/output_scale's own default, gamma's own
+            // lazy-transparent default).
+            if (l1_coef > value_type(0) && k > 0) {
+                const value_type shrink = l1_coef * learning_rate;
+                value_type& gm = weights.scale_gamma[k];
+                if (gm > shrink) gm -= shrink;
+                else if (gm < -shrink) gm += shrink;
+                else gm = value_type(0);
+            }
+        }
+
+        // AQRS dynamic rank control (task #273/#284): EMA-smoothed
+        // |gamma_k|/C_k/|grad_k| tracking, updated EVERY step -- see
+        // AQRS_DESIGN.md's corrected noise-mitigation design (EMA every
+        // step is the actual noise filter, periodic N-step checking is
+        // rejected as a "luck filter"). Second pass, after every
+        // channel's gamma value is finalized above -- C_k = |gamma_k| /
+        // sum_j|gamma_j| needs every channel's CURRENT value first.
+        {
+            value_type gamma_l1_sum = value_type(0);
+            for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
+            for (std::size_t k = 0; k < rank; ++k) {
+                const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
+                const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+                weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(g_agg_by_k[k]));
+            }
+        }
+    }
+
     // Deferred-store replay: only the scattered-path entries buffered
     // above (block4 stays untouched by DeferredScaleWrite, see this
     // function's own docstring) -- now that value_scale[row] AND
@@ -2396,6 +2649,97 @@ void disldo_backward(
                             entry.cw / final_combined_scale, entry.ci / final_combined_imp_scale);
                     }
                 }
+            }
+        }
+    }
+
+    // ── AQRS additive branch backward (task #277, see sili_peridot/
+    // AQRS_DESIGN.md) -- differentiates disldo_forward's own additive
+    // -branch block. Genuinely independent of the sparse/block4 structure
+    // above (same reasoning as forward), computed as its own self
+    // -contained pass. No-op at the default additive_rank==0.
+    //
+    // Forward recap: P[b,k] = sum_r U[r,k]*X[b,r]; Y[b,c] += sum_k
+    // V[c,k]*P[b,k]. Standard backprop through that:
+    //   dV[c,k]  = sum_b dY[b,c]*P[b,k]
+    //   dP[b,k]  = sum_c dY[b,c]*V[c,k]
+    //   dU[r,k]  = sum_b dP[b,k]*X[b,r]
+    //   dX[b,r] += sum_k dP[b,k]*U[r,k]
+    // P is NOT cached from forward (this function has no access to
+    // forward's locals, and this codebase's own convention elsewhere is
+    // to recompute from `input` rather than carry hidden state across the
+    // forward/backward call boundary) -- recomputed here from `input`
+    // directly, cheap given additive_rank is small.
+    //
+    // Adam-style default (AdamScalePolicy, delta_csr_types.hpp) applied
+    // per component AFTER the whole-batch gradient is aggregated (dU_rk/
+    // dV_ck below sum over every sample in the batch first) -- matches
+    // how every other per-scale update in this function works (one
+    // update per call, not once per batch sample).
+    if (weights.additive_rank > 0) {
+        const std::size_t r_o = weights.additive_rank;
+        std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
+            value_type* p_row = P.data() + static_cast<std::size_t>(b) * r_o;
+            for (std::size_t r = 0; r < n_in; ++r) {
+                const value_type iv = in_row[r];
+                if (iv == value_type(0)) continue;
+                for (std::size_t k = 0; k < r_o; ++k)
+                    p_row[k] += weights.get_additive_u_k(r, k) * iv;
+            }
+        }
+        std::vector<value_type> dP(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* dy_row = output_grad + static_cast<std::size_t>(b) * n_out;
+            value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            for (std::size_t c = 0; c < n_out; ++c) {
+                const value_type dy = dy_row[c];
+                if (dy == value_type(0)) continue;
+                for (std::size_t k = 0; k < r_o; ++k)
+                    dp_row[k] += weights.get_additive_v_k(c, k) * dy;
+            }
+        }
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            value_type* dx_row = input_grad + static_cast<std::size_t>(b) * in_cols;
+            for (std::size_t r = 0; r < n_in; ++r) {
+                value_type acc = value_type(0);
+                for (std::size_t k = 0; k < r_o; ++k)
+                    acc += weights.get_additive_u_k(r, k) * dp_row[k];
+                dx_row[r] += acc;
+            }
+        }
+        for (std::size_t r = 0; r < n_in; ++r) {
+            for (std::size_t k = 0; k < r_o; ++k) {
+                value_type dU_rk = value_type(0);
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
+                    if (iv == value_type(0)) continue;
+                    dU_rk += dP[static_cast<std::size_t>(b) * r_o + k] * iv;
+                }
+                if (dU_rk == value_type(0)) continue;
+                value_type u_val = weights.get_additive_u_k(r, k);
+                AdamScalePolicy<value_type>::update(
+                    u_val, weights.get_additive_u_state_k(r, k), weights.get_additive_u_momentum_k(r, k),
+                    dU_rk, learning_rate, beta1, beta2, eps, &weights.get_additive_u_step_k(r, k));
+                weights.set_additive_u_raw_k(r, k, u_val);
+            }
+        }
+        for (std::size_t c = 0; c < n_out; ++c) {
+            for (std::size_t k = 0; k < r_o; ++k) {
+                value_type dV_ck = value_type(0);
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type dy = output_grad[static_cast<std::size_t>(b) * n_out + c];
+                    if (dy == value_type(0)) continue;
+                    dV_ck += dy * P[static_cast<std::size_t>(b) * r_o + k];
+                }
+                if (dV_ck == value_type(0)) continue;
+                value_type v_val = weights.get_additive_v_k(c, k);
+                AdamScalePolicy<value_type>::update(
+                    v_val, weights.get_additive_v_state_k(c, k), weights.get_additive_v_momentum_k(c, k),
+                    dV_ck, learning_rate, beta1, beta2, eps, &weights.get_additive_v_step_k(c, k));
+                weights.set_additive_v_raw_k(c, k, v_val);
             }
         }
     }
