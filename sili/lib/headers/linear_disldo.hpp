@@ -343,20 +343,24 @@ void disldo_forward(
     // updates only ever happen in disldo_backward, coupled to a real
     // gradient.
 
-    // ── AQRS additive branch (task #276, see sili_peridot/AQRS_DESIGN.md) ──
-    // A[row,col] = sum_k additive_u_k(row,k)*additive_v_k(col,k), ADDED
-    // (not Hadamard-multiplied against quant like the scale_rank branch
-    // above) to the effective weight. Genuinely independent of the
-    // sparse/block4 structure above -- it's a dense low-rank correction
-    // that touches every output regardless of which synapses happen to
-    // be live, so it's computed as its own small pass rather than woven
-    // into either per-synapse loop. Fused per Theorem 11 (never
-    // materializes the n_in x n_out A matrix): project the input down to
-    // additive_rank dimensions via additive_u, then back up to n_out via
-    // additive_v -- O(batch * additive_rank * (n_in + n_out)), cheap as
-    // long as additive_rank << min(n_in, n_out). No-op (skipped entirely)
-    // at the default additive_rank==0, matching value_scale/output_scale's
-    // own "unconfigured component contributes nothing" convention.
+    // ── AQRS additive branch (task #276, gamma wired in at task #289,
+    // see sili_peridot/AQRS_DESIGN.md) ── A[row,col] = sum_k gamma_k *
+    // additive_u_k(row,k)*additive_v_k(col,k), ADDED (not Hadamard
+    // -multiplied against quant like the scale_rank branch above) to
+    // the effective weight. Genuinely independent of the sparse/block4
+    // structure above -- it's a dense low-rank correction that touches
+    // every output regardless of which synapses happen to be live, so
+    // it's computed as its own small pass rather than woven into either
+    // per-synapse loop. Fused per Theorem 11 (never materializes the
+    // n_in x n_out A matrix): project the input down to additive_rank
+    // dimensions via additive_u, then back up to n_out via additive_v --
+    // O(batch * additive_rank * (n_in + n_out)), cheap as long as
+    // additive_rank << min(n_in, n_out). No-op (skipped entirely) at the
+    // default additive_rank==0, matching value_scale/output_scale's own
+    // "unconfigured component contributes nothing" convention. gamma_k
+    // itself defaults to 1.0 (see get_additive_gamma_k's own docstring)
+    // so this multiply is transparent for every caller that's never
+    // touched gamma.
     if (weights.additive_rank > 0) {
         std::vector<value_type> proj(static_cast<std::size_t>(batch) * weights.additive_rank, value_type(0));
         for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -375,7 +379,7 @@ void disldo_forward(
             for (std::size_t c = 0; c < n_out; ++c) {
                 value_type acc = value_type(0);
                 for (std::size_t k = 0; k < weights.additive_rank; ++k)
-                    acc += weights.get_additive_v_k(c, k) * p_row[k];
+                    acc += weights.get_additive_gamma_k(k) * weights.get_additive_v_k(c, k) * p_row[k];
                 out_row[c] += acc;
             }
         }
@@ -2700,13 +2704,22 @@ void disldo_backward(
                     dp_row[k] += weights.get_additive_v_k(c, k) * dy;
             }
         }
+        // dP/P above are the RAW (un-gamma'd) projections -- real dL/dP_k
+        // = gamma_k * dP_raw[b,k] (see task #289's derivation, sili_peridot/
+        // conversation): Y_k[b,c] = gamma_k*V[c,k]*P_k[b], so
+        //   dX          = sum_k U[r,k] * gamma_k * dP_raw[b,k]
+        //   dU[r,k]     = gamma_k * sum_b dP_raw[b,k]*X[b,r]
+        //   dV[c,k]     = gamma_k * sum_b dY[b,c]*P[b,k]
+        //   dgamma_k    = sum_b P[b,k] * dP_raw[b,k]   (reuses P/dP as-is,
+        //                 cheap -- no gamma factor here, gamma_k IS the
+        //                 thing being differentiated)
         for (SIZE_TYPE b = 0; b < batch; ++b) {
             const value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
             value_type* dx_row = input_grad + static_cast<std::size_t>(b) * in_cols;
             for (std::size_t r = 0; r < n_in; ++r) {
                 value_type acc = value_type(0);
                 for (std::size_t k = 0; k < r_o; ++k)
-                    acc += weights.get_additive_u_k(r, k) * dp_row[k];
+                    acc += weights.get_additive_gamma_k(k) * weights.get_additive_u_k(r, k) * dp_row[k];
                 dx_row[r] += acc;
             }
         }
@@ -2718,6 +2731,7 @@ void disldo_backward(
                     if (iv == value_type(0)) continue;
                     dU_rk += dP[static_cast<std::size_t>(b) * r_o + k] * iv;
                 }
+                dU_rk *= weights.get_additive_gamma_k(k);
                 if (dU_rk == value_type(0)) continue;
                 value_type u_val = weights.get_additive_u_k(r, k);
                 AdamScalePolicy<value_type>::update(
@@ -2734,12 +2748,70 @@ void disldo_backward(
                     if (dy == value_type(0)) continue;
                     dV_ck += dy * P[static_cast<std::size_t>(b) * r_o + k];
                 }
+                dV_ck *= weights.get_additive_gamma_k(k);
                 if (dV_ck == value_type(0)) continue;
                 value_type v_val = weights.get_additive_v_k(c, k);
                 AdamScalePolicy<value_type>::update(
                     v_val, weights.get_additive_v_state_k(c, k), weights.get_additive_v_momentum_k(c, k),
                     dV_ck, learning_rate, beta1, beta2, eps, &weights.get_additive_v_step_k(c, k));
                 weights.set_additive_v_raw_k(c, k, v_val);
+            }
+        }
+
+        // AQRS additive_gamma's own update (task #289, mirrors scale_
+        // gamma's own update block above exactly -- same ScalePolicy
+        // -then-L1-then-EMA structure, same reasoning throughout, see
+        // that block's own comments for the full rationale). Gated on
+        // additive_gamma_is_trainable (same opt-in pattern as scale_
+        // gamma_is_trainable) so a caller that's never touched gamma
+        // never gets an unsolicited perturbation to the transparent 1.0
+        // default. Uses the function's generic `ScalePolicy` template
+        // param (same RMSprop-style, momentum-free policy scale_gamma
+        // itself uses) -- NOT AdamScalePolicy, despite additive_u/v using
+        // Adam. Found via a real test failure (see conversation): Adam's
+        // momentum overshoots the L1-created zero fixed point (Theorem
+        // 8), driving gamma persistently negative instead of settling
+        // exactly at 0. gamma needs the SAME exact-zero-fixed-point
+        // property in both branches, so it uses the SAME policy in both;
+        // only the direction vectors get their own independent optimizer
+        // choice. log_space=false unconditionally (not threading this
+        // function's own `scale_invariant` parameter here -- that flag's
+        // meaning is specifically about the multiplicative branch's
+        // coupling with the quantized weight, which the additive branch
+        // doesn't have).
+        //
+        // UNLIKE scale_gamma's k>0 L1 exemption: additive_rank has NO
+        // legacy always-on channel to protect (min_rank=0 in apply_
+        // additive_dynamic_rank_control -- the branch can legitimately
+        // shrink itself back to fully off), so L1 applies to every k
+        // here, including k==0.
+        if (learning_rate != value_type(0) && weights.additive_gamma_is_trainable) {
+            value_type dgamma_by_k[SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>::ADDITIVE_RANK_MAX];
+            for (std::size_t k = 0; k < r_o; ++k) {
+                double dgamma_sum = 0.0;
+                for (SIZE_TYPE b = 0; b < batch; ++b)
+                    dgamma_sum += static_cast<double>(P[static_cast<std::size_t>(b) * r_o + k]) *
+                                  static_cast<double>(dP[static_cast<std::size_t>(b) * r_o + k]);
+                const value_type dgamma_k = static_cast<value_type>(dgamma_sum);
+                dgamma_by_k[k] = dgamma_k;
+                weights.set_additive_gamma_raw_k(k, weights.get_additive_gamma_k(k));
+                ScalePolicy::update(weights.additive_gamma[k], weights.get_additive_gamma_state_k(k),
+                                    dgamma_k, learning_rate, beta2, eps, value_type(0),
+                                    &weights.get_additive_gamma_step_k(k), false);
+                if (l1_coef > value_type(0)) {
+                    const value_type shrink = l1_coef * learning_rate;
+                    value_type& gm = weights.additive_gamma[k];
+                    if (gm > shrink) gm -= shrink;
+                    else if (gm < -shrink) gm += shrink;
+                    else gm = value_type(0);
+                }
+            }
+            value_type gamma_l1_sum = value_type(0);
+            for (std::size_t k = 0; k < r_o; ++k) gamma_l1_sum += std::fabs(weights.additive_gamma[k]);
+            for (std::size_t k = 0; k < r_o; ++k) {
+                const value_type abs_gamma_k = std::fabs(weights.additive_gamma[k]);
+                const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+                weights.update_additive_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(dgamma_by_k[k]));
             }
         }
     }

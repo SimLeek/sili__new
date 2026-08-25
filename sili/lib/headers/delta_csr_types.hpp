@@ -1200,6 +1200,116 @@ struct Block4StoreFor { using type = Block4Store; };
 template <>
 struct Block4StoreFor<FP8BiValues> { using type = Block4Store8; };
 
+// Reshuffles `arr` (currently laid out as entity*old_rank+k) to
+// entity*new_rank+k in place, preserving every existing (entity,k) pair
+// with k<min(old_rank,new_rank) and filling any new slots with
+// `default_for_k(k)`. No-op if arr is empty (nothing written yet -- the
+// common case, since most layers never touch scale beyond component 0 of
+// a couple of rows). Free function (not a SparseLinearWeightsDelta member)
+// specifically so GammaEMATracker below can reuse it too, rather than
+// hand-duplicating the same logic -- was a private static member here
+// until AQRS's additive-branch gamma dynamic-rank-control work needed the
+// identical reshuffle for a second, independent set of rank-length arrays.
+template <typename T, typename DefaultFn>
+static void reshuffle_rank_array(std::vector<T>& arr, std::size_t old_rank,
+                                 std::size_t new_rank, DefaultFn default_for_k) {
+    if (arr.empty() || old_rank == new_rank) return;
+    const std::size_t n_entities = (arr.size() + old_rank - 1) / old_rank;
+    std::vector<T> resized(n_entities * new_rank);
+    for (std::size_t e = 0; e < n_entities; ++e) {
+        for (std::size_t k = 0; k < new_rank; ++k) {
+            const std::size_t old_idx = e * old_rank + k;
+            resized[e * new_rank + k] =
+                (k < old_rank && old_idx < arr.size()) ? arr[old_idx] : default_for_k(k);
+        }
+    }
+    arr = std::move(resized);
+}
+
+// Shared EMA-tracking + Theorem 10 trigger-condition machinery for AQRS's
+// per-rank-channel gamma, used by BOTH the multiplicative branch
+// (scale_gamma) and the additive branch (additive_gamma) -- the math here
+// (EMA update formula, apoptosis/neurogenesis trigger conditions, channel
+// swap) is IDENTICAL between the two branches (see AQRS_DESIGN.md's
+// Theorem 10, stated "per branch, per rank channel"); only the raw gamma
+// VALUE's own storage/lazy-default semantics differ between branches
+// (scale_gamma defaults transparently to 1.0, additive_gamma likewise
+// defaults to 1.0 for backward compat with existing rank>0 additive
+// callers that never touch gamma -- see get_additive_gamma_k's own
+// docstring), so only that piece stays branch-specific, living directly
+// on SparseLinearWeightsDelta rather than in here. Extracted specifically
+// per direct instruction not to duplicate scale_gamma's already-proven
+// EMA/trigger logic when adding the equivalent for additive_gamma.
+template <typename value_type>
+struct GammaEMATracker {
+    std::vector<value_type> abs_ema;
+    std::vector<value_type> share_ema;
+    std::vector<value_type> grad_ema;
+
+    inline value_type get_abs_ema_k(std::size_t k) const {
+        return k < abs_ema.size() ? abs_ema[k] : value_type(0);
+    }
+    inline value_type get_share_ema_k(std::size_t k) const {
+        return k < share_ema.size() ? share_ema[k] : value_type(0);
+    }
+    inline value_type get_grad_ema_k(std::size_t k) const {
+        return k < grad_ema.size() ? grad_ema[k] : value_type(0);
+    }
+    // Called once per k, once per backward call, AFTER gamma's own value
+    // update for every channel is finalized (share_k needs every
+    // channel's current |gamma| to compute the group's L1 norm first).
+    inline void update_k(std::size_t k, value_type abs_gamma_k, value_type share_k,
+                         value_type abs_grad_k, value_type decay = value_type(0.98)) {
+        if (abs_ema.size() <= k) abs_ema.resize(k + 1, value_type(0));
+        if (share_ema.size() <= k) share_ema.resize(k + 1, value_type(0));
+        if (grad_ema.size() <= k) grad_ema.resize(k + 1, value_type(0));
+        abs_ema[k]   = decay * abs_ema[k]   + (value_type(1) - decay) * abs_gamma_k;
+        share_ema[k] = decay * share_ema[k] + (value_type(1) - decay) * share_k;
+        grad_ema[k]  = decay * grad_ema[k]  + (value_type(1) - decay) * abs_grad_k;
+    }
+    // Theorem 10's exact apoptosis trigger: A(gamma_i) = (|gamma_i| <
+    // tau_death) AND (C_i < tau_death) -- evaluated against the EMA
+    // values (the noise filter), not the raw instantaneous gamma.
+    inline bool should_apoptose(std::size_t k, value_type tau_death) const {
+        return get_abs_ema_k(k) < tau_death && get_share_ema_k(k) < tau_death;
+    }
+    // Theorem 10's exact neurogenesis trigger: N(gamma,grad) = (min_j
+    // |gamma_j| > tau_active) AND (max_j grad_j > theta) -- takes the
+    // CURRENT rank explicitly (not stored here) since "every existing
+    // channel" means every k<rank, not every k the EMA arrays happen to
+    // have grown to (a channel could have been apoptosed/shrunk away).
+    inline bool should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
+        if (rank == 0) return false;
+        value_type min_abs = get_abs_ema_k(0);
+        value_type max_grad = get_grad_ema_k(0);
+        for (std::size_t k = 1; k < rank; ++k) {
+            min_abs = std::min(min_abs, get_abs_ema_k(k));
+            max_grad = std::max(max_grad, get_grad_ema_k(k));
+        }
+        return min_abs > tau_active && max_grad > theta;
+    }
+    // EMA state travels WITH a relocated channel (see swap_scale_channels'
+    // own docstring for why -- omitting this makes a relocated channel
+    // look freshly-born to the trigger logic).
+    inline void swap_k(std::size_t k1, std::size_t k2) {
+        if (k1 == k2) return;
+        auto swap_one = [&](std::vector<value_type>& arr) {
+            const std::size_t need = std::max(k1, k2) + 1;
+            if (arr.size() < need) arr.resize(need, value_type(0));
+            std::swap(arr[k1], arr[k2]);
+        };
+        swap_one(abs_ema);
+        swap_one(share_ema);
+        swap_one(grad_ema);
+    }
+    inline void reshuffle(std::size_t old_rank, std::size_t new_rank) {
+        auto zero_default = [](std::size_t) { return value_type(0); };
+        reshuffle_rank_array(abs_ema, old_rank, new_rank, zero_default);
+        reshuffle_rank_array(share_ema, old_rank, new_rank, zero_default);
+        reshuffle_rank_array(grad_ema, old_rank, new_rank, zero_default);
+    }
+};
+
 template <class SIZE_TYPE, class VALUES_TYPE = FP4BiPacked, class COL_TYPE = uint32_t>
 struct SparseLinearWeightsDelta {
     using size_type  = SIZE_TYPE;
@@ -1287,6 +1397,16 @@ struct SparseLinearWeightsDelta {
     // for; raise it if a real use case needs more, but keep it small --
     // it directly sizes stack buffers in the hot path.
     static constexpr std::size_t SCALE_RANK_MAX = 4;
+
+    // Compile-time cap on additive_rank -- unlike SCALE_RANK_MAX, the
+    // additive branch has no fixed-size-stack-array SIMD path forcing a
+    // small bound (its own forward/backward pass, linear_disldo.hpp, uses
+    // ordinary std::vector throughout, structure-agnostic w.r.t. block4).
+    // Kept at the same value as SCALE_RANK_MAX anyway: still cheap memory/
+    // compute headroom for a rank this small, and gives dynamic rank
+    // control (task #292) the same growth ceiling on both branches unless
+    // a real use case demands otherwise.
+    static constexpr std::size_t ADDITIVE_RANK_MAX = 4;
 
     // RANK of the value_scale/output_scale factorization. true_w =
     // quant * S[row,col], where S used to be a plain rank-1 outer product
@@ -1573,18 +1693,16 @@ struct SparseLinearWeightsDelta {
     // decay=0.98 matches the same EMA pattern already used for loss_ema/
     // acc_ema in sili_peridot's MQAR curriculum (train_mqar_curriculum.py)
     // -- not a new convention, reused deliberately.
-    std::vector<value_type> scale_gamma_abs_ema;
-    std::vector<value_type> scale_gamma_share_ema;
-    std::vector<value_type> scale_gamma_grad_ema;
-    inline value_type get_scale_gamma_abs_ema_k(std::size_t k) const {
-        return k < scale_gamma_abs_ema.size() ? scale_gamma_abs_ema[k] : value_type(0);
-    }
-    inline value_type get_scale_gamma_share_ema_k(std::size_t k) const {
-        return k < scale_gamma_share_ema.size() ? scale_gamma_share_ema[k] : value_type(0);
-    }
-    inline value_type get_scale_gamma_grad_ema_k(std::size_t k) const {
-        return k < scale_gamma_grad_ema.size() ? scale_gamma_grad_ema[k] : value_type(0);
-    }
+    //
+    // EMA storage + Theorem 10 trigger logic itself now lives in the
+    // shared GammaEMATracker (see its own docstring above) -- the
+    // methods below are thin delegating wrappers, kept under their
+    // original names/signatures so no existing caller (tests, disldo_
+    // backward, apply_dynamic_rank_control) needed to change.
+    GammaEMATracker<value_type> scale_gamma_ema;
+    inline value_type get_scale_gamma_abs_ema_k(std::size_t k) const { return scale_gamma_ema.get_abs_ema_k(k); }
+    inline value_type get_scale_gamma_share_ema_k(std::size_t k) const { return scale_gamma_ema.get_share_ema_k(k); }
+    inline value_type get_scale_gamma_grad_ema_k(std::size_t k) const { return scale_gamma_ema.get_grad_ema_k(k); }
     // Called once per k, once per backward call, AFTER gamma's own value
     // update for every channel is finalized (C_k needs every channel's
     // current |gamma| to compute ||gamma||_1 first -- see disldo_backward's
@@ -1592,43 +1710,13 @@ struct SparseLinearWeightsDelta {
     inline void update_scale_gamma_ema_k(std::size_t k, value_type abs_gamma_k,
                                           value_type share_k, value_type abs_grad_k,
                                           value_type decay = value_type(0.98)) {
-        if (scale_gamma_abs_ema.size() <= k) scale_gamma_abs_ema.resize(k + 1, value_type(0));
-        if (scale_gamma_share_ema.size() <= k) scale_gamma_share_ema.resize(k + 1, value_type(0));
-        if (scale_gamma_grad_ema.size() <= k) scale_gamma_grad_ema.resize(k + 1, value_type(0));
-        scale_gamma_abs_ema[k]   = decay * scale_gamma_abs_ema[k]   + (value_type(1) - decay) * abs_gamma_k;
-        scale_gamma_share_ema[k] = decay * scale_gamma_share_ema[k] + (value_type(1) - decay) * share_k;
-        scale_gamma_grad_ema[k]  = decay * scale_gamma_grad_ema[k]  + (value_type(1) - decay) * abs_grad_k;
+        scale_gamma_ema.update_k(k, abs_gamma_k, share_k, abs_grad_k, decay);
     }
-
-    // Theorem 10's exact apoptosis trigger: A(gamma_i) = (|gamma_i| <
-    // tau_death) AND (C_i < tau_death) -- needs BOTH the channel's
-    // absolute magnitude and its relative share of the group below
-    // threshold, so a channel isn't killed just for being smaller than
-    // its siblings when the whole group is legitimately small (see
-    // AQRS_DESIGN.md's own rationale). Evaluated against the EMA values,
-    // not the raw instantaneous gamma -- the EMA IS the noise filter.
     inline bool scale_gamma_should_apoptose(std::size_t k, value_type tau_death) const {
-        return get_scale_gamma_abs_ema_k(k) < tau_death && get_scale_gamma_share_ema_k(k) < tau_death;
+        return scale_gamma_ema.should_apoptose(k, tau_death);
     }
-    // Theorem 10's exact neurogenesis trigger: N(gamma,grad) = (min_j
-    // |gamma_j| > tau_active) AND (||grad||_F > theta) -- every EXISTING
-    // channel must already be pulling its weight (no idle/redundant
-    // channel already available to absorb the new signal) AND there must
-    // be real leftover gradient pressure (something left to explain).
-    // Takes the CURRENT scale_rank explicitly (not stored on the struct)
-    // since "every existing channel" means every k < scale_rank, not
-    // every k the EMA arrays happen to have grown to (a channel could have
-    // been apoptosed/shrunk away, EMA arrays truncate on shrink like
-    // everything else, min_j check has to match the CURRENT rank).
     inline bool scale_gamma_should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
-        if (rank == 0) return false;
-        value_type min_abs = get_scale_gamma_abs_ema_k(0);
-        value_type max_grad = get_scale_gamma_grad_ema_k(0);
-        for (std::size_t k = 1; k < rank; ++k) {
-            min_abs = std::min(min_abs, get_scale_gamma_abs_ema_k(k));
-            max_grad = std::max(max_grad, get_scale_gamma_grad_ema_k(k));
-        }
-        return min_abs > tau_active && max_grad > theta;
+        return scale_gamma_ema.should_neurogenesis(rank, tau_active, theta);
     }
 
     // Combined rank-N scale: S[row,col] = sum_{k<scale_rank} gamma_s_k *
@@ -1690,22 +1778,61 @@ struct SparseLinearWeightsDelta {
         additive_v[idx] = v;
     }
 
-    // AQRS per-channel gamma for the additive branch (task #273/#282-283),
-    // same role as scale_gamma above but for additive_u/additive_v: ONE
-    // scalar per channel k, decoupling magnitude from direction. Unlike
-    // scale_gamma, defaults to 0.0 for EVERY k including 0 -- the additive
-    // branch has no legacy "always-on" component to preserve (additive_rank
-    // itself already defaults to 0, fully opt-in), so there's no k==0
-    // special case here.
+    // AQRS per-channel gamma for the additive branch (task #273/#282-283,
+    // wired into forward/backward for real at task #289), same role as
+    // scale_gamma above but for additive_u/additive_v: ONE scalar per
+    // channel k, decoupling magnitude from direction --
+    // A[row,col] = sum_k additive_gamma_k * additive_u_k(row,k) *
+    // additive_v_k(col,k), matching AQRS_DESIGN.md's A(theta_o) =
+    // sum_k gamma_o_k*u_k*v_k^T exactly.
+    //
+    // CORRECTED (real backward-compat break, same class of bug as
+    // scale_gamma's own -- see get_scale_gamma_k's docstring above, and
+    // caught here BEFORE landing rather than via a regression this time):
+    // an earlier version of this code defaulted get_additive_gamma_k to
+    // 0.0 on the reasoning "the additive branch has no legacy always-on
+    // component to preserve." That's true of additive_rank itself
+    // (0 = fully off) but NOT of gamma once it's actually multiplied into
+    // the branch's forward/backward math -- every EXISTING caller that
+    // sets additive_rank>0 and populates additive_u/additive_v directly
+    // (task #278's pybind bindings, the fp8/fp4 MQAR curriculum runs
+    // already on record) never touches gamma at all, so a 0.0 lazy
+    // default would silently zero out their entire additive contribution
+    // the moment gamma gets wired in. Lazy default is 1.0 (transparent),
+    // exactly mirroring scale_gamma's own get_scale_gamma_k -- Theorem
+    // 9's "new channel = zero contribution" property lives ONLY in
+    // set_additive_rank's reshuffle below (zero_default), same split as
+    // scale_gamma's.
+    bool additive_gamma_is_trainable = false;
     std::vector<value_type> additive_gamma;
+    // RMSprop-style state (matches scale_gamma's OWN update policy
+    // exactly -- disldo_backward's additive_gamma update block uses the
+    // function's generic `ScalePolicy` template param, same as scale_
+    // gamma, NOT AdamScalePolicy, even though additive_u/additive_v use
+    // AdamScalePolicy). Found via a real, direct test failure (see
+    // conversation): an earlier version used AdamScalePolicy here to
+    // "match additive_u/v's own optimizer choice" -- Adam's momentum
+    // term overshoots a hard L1-created zero fixed point (Theorem 8),
+    // since Adam keeps pushing in its accumulated momentum direction for
+    // a step or two AFTER the raw gradient has already crossed zero,
+    // driving gamma persistently negative instead of settling exactly at
+    // 0 the way scale_gamma's own (momentum-free) L1 test does. gamma is
+    // the SAME kind of shared magnitude-decoupling parameter in both
+    // branches with the SAME Theorem 8 exact-zero-fixed-point
+    // requirement, so it uses the SAME policy in both -- only the
+    // direction vectors (value_scale/output_scale vs additive_u/v) get
+    // to pick their own optimizer independently.
     std::vector<value_type> additive_gamma_state;
     std::vector<uint32_t>   additive_gamma_step;
+    GammaEMATracker<value_type> additive_gamma_ema;
     inline value_type get_additive_gamma_k(std::size_t k) const {
-        return k < additive_gamma.size() ? additive_gamma[k] : value_type(0);
+        if (k < additive_gamma.size()) return additive_gamma[k];
+        return value_type(1);
     }
     inline void set_additive_gamma_raw_k(std::size_t k, value_type v) {
-        if (k >= additive_gamma.size()) additive_gamma.resize(k + 1, value_type(0));
+        if (k >= additive_gamma.size()) additive_gamma.resize(k + 1, value_type(1));
         additive_gamma[k] = v;
+        additive_gamma_is_trainable = true;
     }
     inline value_type& get_additive_gamma_state_k(std::size_t k) {
         if (additive_gamma_state.size() <= k) additive_gamma_state.resize(k + 1, value_type(0));
@@ -1714,6 +1841,20 @@ struct SparseLinearWeightsDelta {
     inline uint32_t& get_additive_gamma_step_k(std::size_t k) {
         if (additive_gamma_step.size() <= k) additive_gamma_step.resize(k + 1, 0);
         return additive_gamma_step[k];
+    }
+    inline value_type get_additive_gamma_abs_ema_k(std::size_t k) const { return additive_gamma_ema.get_abs_ema_k(k); }
+    inline value_type get_additive_gamma_share_ema_k(std::size_t k) const { return additive_gamma_ema.get_share_ema_k(k); }
+    inline value_type get_additive_gamma_grad_ema_k(std::size_t k) const { return additive_gamma_ema.get_grad_ema_k(k); }
+    inline void update_additive_gamma_ema_k(std::size_t k, value_type abs_gamma_k,
+                                            value_type share_k, value_type abs_grad_k,
+                                            value_type decay = value_type(0.98)) {
+        additive_gamma_ema.update_k(k, abs_gamma_k, share_k, abs_grad_k, decay);
+    }
+    inline bool additive_gamma_should_apoptose(std::size_t k, value_type tau_death) const {
+        return additive_gamma_ema.should_apoptose(k, tau_death);
+    }
+    inline bool additive_gamma_should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
+        return additive_gamma_ema.should_neurogenesis(rank, tau_active, theta);
     }
 
     // AdamScalePolicy's own state for additive_u/additive_v (task #277) --
@@ -1787,29 +1928,6 @@ struct SparseLinearWeightsDelta {
     // output_scale_step) and the new additive arrays (additive_u,
     // additive_v) with one shared reshuffle helper rather than
     // hand-duplicating the same logic eight times.
-private:
-    // Reshuffles `arr` (currently laid out as entity*old_rank+k) to
-    // entity*new_rank+k in place, preserving every existing (entity,k)
-    // pair with k<min(old_rank,new_rank) and filling any new slots with
-    // `default_for_k(k)`. No-op if arr is empty (nothing written yet --
-    // the common case, since most layers never touch scale beyond
-    // component 0 of a couple of rows).
-    template <typename T, typename DefaultFn>
-    static void reshuffle_rank_array(std::vector<T>& arr, std::size_t old_rank,
-                                     std::size_t new_rank, DefaultFn default_for_k) {
-        if (arr.empty() || old_rank == new_rank) return;
-        const std::size_t n_entities = (arr.size() + old_rank - 1) / old_rank;
-        std::vector<T> resized(n_entities * new_rank);
-        for (std::size_t e = 0; e < n_entities; ++e) {
-            for (std::size_t k = 0; k < new_rank; ++k) {
-                const std::size_t old_idx = e * old_rank + k;
-                resized[e * new_rank + k] =
-                    (k < old_rank && old_idx < arr.size()) ? arr[old_idx] : default_for_k(k);
-            }
-        }
-        arr = std::move(resized);
-    }
-
 public:
     inline void set_scale_rank(std::size_t new_rank) {
         if (new_rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
@@ -1843,9 +1961,7 @@ public:
         reshuffle_rank_array(scale_gamma, old_rank, new_rank, zero_default);
         reshuffle_rank_array(scale_gamma_state, old_rank, new_rank, zero_default);
         reshuffle_rank_array(scale_gamma_step, old_rank, new_rank, step_default);
-        reshuffle_rank_array(scale_gamma_abs_ema, old_rank, new_rank, zero_default);
-        reshuffle_rank_array(scale_gamma_share_ema, old_rank, new_rank, zero_default);
-        reshuffle_rank_array(scale_gamma_grad_ema, old_rank, new_rank, zero_default);
+        scale_gamma_ema.reshuffle(old_rank, new_rank);
         scale_rank = new_rank;
     }
 
@@ -1884,14 +2000,7 @@ public:
         // without its EMA history would make the (now-relocated) channel
         // look freshly-born to the trigger logic, defeating the whole
         // point of EMA smoothing being a real noise filter.
-        auto swap_ema = [&](std::vector<value_type>& arr) {
-            const std::size_t need = std::max(k1, k2) + 1;
-            if (arr.size() < need) arr.resize(need, value_type(0));
-            std::swap(arr[k1], arr[k2]);
-        };
-        swap_ema(scale_gamma_abs_ema);
-        swap_ema(scale_gamma_share_ema);
-        swap_ema(scale_gamma_grad_ema);
+        scale_gamma_ema.swap_k(k1, k2);
         // scale_gamma_step doubles as the channel's AGE (see
         // apply_dynamic_rank_control's own grace-period comment) -- must
         // travel with the channel too, or a relocated channel keeps its
@@ -1903,6 +2012,74 @@ public:
             if (scale_gamma_step.size() < need) scale_gamma_step.resize(need, 0);
             std::swap(scale_gamma_step[k1], scale_gamma_step[k2]);
         }
+    }
+
+    // Additive-branch counterpart to swap_scale_channels above (task
+    // #289) -- same reasoning throughout, just additive_u/additive_v/
+    // additive_gamma/additive_gamma_ema/additive_gamma_step instead of
+    // value_scale/output_scale/scale_gamma/scale_gamma_ema/
+    // scale_gamma_step. Needed because apply_additive_dynamic_rank_
+    // control's apoptosis can target ANY channel, but set_additive_rank
+    // can only truncate the LAST one.
+    inline void swap_additive_channels(std::size_t k1, std::size_t k2, std::size_t n_rows, std::size_t n_cols) {
+        if (k1 == k2) return;
+        for (std::size_t r = 0; r < n_rows; ++r) {
+            const value_type a = get_additive_u_k(r, k1);
+            const value_type b = get_additive_u_k(r, k2);
+            set_additive_u_raw_k(r, k1, b);
+            set_additive_u_raw_k(r, k2, a);
+        }
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            const value_type a = get_additive_v_k(c, k1);
+            const value_type b = get_additive_v_k(c, k2);
+            set_additive_v_raw_k(c, k1, b);
+            set_additive_v_raw_k(c, k2, a);
+        }
+        const value_type ga = get_additive_gamma_k(k1);
+        const value_type gb = get_additive_gamma_k(k2);
+        set_additive_gamma_raw_k(k1, gb);
+        set_additive_gamma_raw_k(k2, ga);
+        additive_gamma_ema.swap_k(k1, k2);
+        {
+            const std::size_t need = std::max(k1, k2) + 1;
+            if (additive_gamma_step.size() < need) additive_gamma_step.resize(need, 0);
+            std::swap(additive_gamma_step[k1], additive_gamma_step[k2]);
+            if (additive_gamma_state.size() < need) additive_gamma_state.resize(need, value_type(0));
+            std::swap(additive_gamma_state[k1], additive_gamma_state[k2]);
+        }
+    }
+
+    // Shared control-flow for Theorem 10's apoptosis/neurogenesis dynamic
+    // rank control (task #289), used by BOTH apply_dynamic_rank_control
+    // (multiplicative branch) and apply_additive_dynamic_rank_control
+    // (additive branch) below -- the DECISION logic (grace-period-gated
+    // apoptose-else-neurogenesis, at-most-one-mutation-per-call) is
+    // IDENTICAL between branches; only the actual mutation operations
+    // differ (different swap/resize/seed calls per branch, and a
+    // different min_rank floor -- scale_rank can never legally drop
+    // below 1, additive_rank legitimately floors at 0, fully off), so
+    // those are passed in as callbacks rather than duplicating this
+    // control flow a second time. Extracted per direct instruction not
+    // to copy apply_dynamic_rank_control's own logic when adding the
+    // additive-branch equivalent.
+    template <typename AgeFn, typename ApoptoseCheckFn, typename NeurogenesisCheckFn,
+              typename DoApoptoseFn, typename DoNeurogenesisFn>
+    static bool apply_dynamic_rank_control_generic(std::size_t rank, std::size_t min_rank,
+                                                     std::size_t max_rank, uint32_t grace_period_steps,
+                                                     AgeFn age_of, ApoptoseCheckFn should_apoptose,
+                                                     NeurogenesisCheckFn should_neurogenesis,
+                                                     DoApoptoseFn do_apoptose, DoNeurogenesisFn do_neurogenesis) {
+        for (std::size_t k = 0; k < rank; ++k) {
+            if (rank > min_rank && age_of(k) >= grace_period_steps && should_apoptose(k)) {
+                do_apoptose(k);
+                return true;
+            }
+        }
+        if (rank < max_rank && should_neurogenesis()) {
+            do_neurogenesis();
+            return true;
+        }
+        return false;
     }
 
     // Evaluates Theorem 10's triggers against the CURRENT EMA state
@@ -1951,28 +2128,71 @@ public:
                                             value_type tau_death, value_type tau_active,
                                             value_type theta, SeedFn new_channel_seed,
                                             uint32_t grace_period_steps = 50) {
-        for (std::size_t k = 0; k < scale_rank; ++k) {
-            const uint32_t age = k < scale_gamma_step.size() ? scale_gamma_step[k] : 0;
-            if (scale_rank > 1 && age >= grace_period_steps && scale_gamma_should_apoptose(k, tau_death)) {
+        return apply_dynamic_rank_control_generic(
+            scale_rank, /*min_rank=*/std::size_t(1), SCALE_RANK_MAX, grace_period_steps,
+            [&](std::size_t k) { return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0); },
+            [&](std::size_t k) { return scale_gamma_should_apoptose(k, tau_death); },
+            [&]() { return scale_gamma_should_neurogenesis(scale_rank, tau_active, theta); },
+            [&](std::size_t k) {
                 swap_scale_channels(k, scale_rank - 1, n_rows, n_cols);
                 set_scale_rank(scale_rank - 1);
-                return true;
-            }
-        }
-        if (scale_rank < SCALE_RANK_MAX && scale_gamma_should_neurogenesis(scale_rank, tau_active, theta)) {
-            const std::size_t new_k = scale_rank;
-            set_scale_rank(scale_rank + 1);
-            for (std::size_t r = 0; r < n_rows; ++r) set_value_scale_raw_k(r, new_k, new_channel_seed(r));
-            for (std::size_t c = 0; c < n_cols; ++c) set_output_scale_raw_k(c, new_k, value_type(1));
-            return true;
-        }
-        return false;
+            },
+            [&]() {
+                const std::size_t new_k = scale_rank;
+                set_scale_rank(scale_rank + 1);
+                for (std::size_t r = 0; r < n_rows; ++r) set_value_scale_raw_k(r, new_k, new_channel_seed(r));
+                for (std::size_t c = 0; c < n_cols; ++c) set_output_scale_raw_k(c, new_k, value_type(1));
+            });
+    }
+
+    // Additive-branch counterpart to apply_dynamic_rank_control above
+    // (task #289/#292) -- same Theorem 10 trigger machinery (via
+    // apply_dynamic_rank_control_generic), applied to additive_gamma/
+    // additive_u/additive_v instead of scale_gamma/value_scale/
+    // output_scale. Two seed callbacks (not one + a uniform 1.0 like the
+    // multiplicative branch's own output_scale convention) because BOTH
+    // additive_u and additive_v need a real nonzero direction for a new
+    // channel to generate any gradient at all -- see _seed_additive_rank's
+    // own docstring (sili/sparse_rnn.py) for the identical reasoning
+    // applied to construction-time seeding. min_rank=0 (not 1): the
+    // additive branch has no legacy always-on component to preserve
+    // (additive_rank itself already defaults to 0, fully opt-in), so
+    // apoptosis is free to shrink it all the way back off.
+    template <typename SeedUFn, typename SeedVFn>
+    inline bool apply_additive_dynamic_rank_control(std::size_t n_rows, std::size_t n_cols,
+                                                     value_type tau_death, value_type tau_active,
+                                                     value_type theta, SeedUFn new_channel_seed_u,
+                                                     SeedVFn new_channel_seed_v,
+                                                     uint32_t grace_period_steps = 50) {
+        return apply_dynamic_rank_control_generic(
+            additive_rank, /*min_rank=*/std::size_t(0), ADDITIVE_RANK_MAX, grace_period_steps,
+            [&](std::size_t k) { return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0); },
+            [&](std::size_t k) { return additive_gamma_should_apoptose(k, tau_death); },
+            [&]() { return additive_gamma_should_neurogenesis(additive_rank, tau_active, theta); },
+            [&](std::size_t k) {
+                swap_additive_channels(k, additive_rank - 1, n_rows, n_cols);
+                set_additive_rank(additive_rank - 1);
+            },
+            [&]() {
+                const std::size_t new_k = additive_rank;
+                set_additive_rank(additive_rank + 1);
+                for (std::size_t r = 0; r < n_rows; ++r) set_additive_u_raw_k(r, new_k, new_channel_seed_u(r));
+                for (std::size_t c = 0; c < n_cols; ++c) set_additive_v_raw_k(c, new_k, new_channel_seed_v(c));
+            });
     }
 
     inline void set_additive_rank(std::size_t new_rank) {
         // 0 is a valid, meaningful value here (branch fully disabled) --
         // unlike scale_rank, which must stay >= 1 since component 0 IS
         // the original rank-1 behavior every existing caller depends on.
+        // ADDITIVE_RANK_MAX cap added at task #289: disldo_backward's own
+        // additive_gamma update block (linear_disldo.hpp) sizes a fixed
+        // stack array to it, same reasoning as SCALE_RANK_MAX's own
+        // guard in set_scale_rank above -- must be enforced here too, or
+        // a caller growing additive_rank past it silently overflows that
+        // stack buffer instead of failing loudly.
+        if (new_rank > ADDITIVE_RANK_MAX)
+            throw std::invalid_argument("additive_rank exceeds ADDITIVE_RANK_MAX (disldo_backward's gamma update uses a fixed-size stack array sized to it)");
         const std::size_t old_rank = additive_rank;
         auto zero_default = [](std::size_t) { return value_type(0); };
         auto step_default = [](std::size_t)  { return uint32_t(0); };
@@ -1987,6 +2207,7 @@ public:
         reshuffle_rank_array(additive_gamma, old_rank, new_rank, zero_default);
         reshuffle_rank_array(additive_gamma_state, old_rank, new_rank, zero_default);
         reshuffle_rank_array(additive_gamma_step, old_rank, new_rank, step_default);
+        additive_gamma_ema.reshuffle(old_rank, new_rank);
         additive_rank = new_rank;
     }
 
