@@ -593,13 +593,23 @@ void disldo_backward(
     // further down -- both write into the same buffer (per-thread-private
     // slices, indexed by their own tid), summed once at the very end.
     const std::size_t rank = weights.scale_rank;
-    // Compile-time cap, used by block4's SIMD backward path below to size
-    // fixed stack arrays of per-rank-component accumulators (see
-    // SCALE_RANK_MAX's own docstring, delta_csr_types.hpp). set_scale_rank
-    // already rejects rank > this at set-time, so this is defense-in-depth,
-    // not the primary guard.
-    constexpr std::size_t SCALE_RANK_MAX = SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>::SCALE_RANK_MAX;
-    assert(rank <= SCALE_RANK_MAX);
+    // Persistent per-instance heap scratch (task #295) backing block4's
+    // SIMD backward path's per-rank-component accumulators -- grows
+    // (never shrinks automatically) to fit `rank`/`num_cpus`, a cheap
+    // no-op once already large enough. See ScaleRankScratch's own
+    // docstring, delta_csr_types.hpp, for the full rationale (replaces
+    // the old compile-time SCALE_RANK_MAX=4 stack-array cap).
+    weights.scale_rank_scratch.ensure(static_cast<std::size_t>(num_cpus), rank, BLOCK4_TILE);
+    // Thin 2D view over a flat scratch buffer -- op[k] returns a
+    // value_type* row pointer, exactly matching the syntax (and the
+    // block4_vec_load/store call convention) the old fixed-size 2D
+    // stack arrays (out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE] etc.) used,
+    // so every existing use site below is a drop-in replacement (task
+    // #295).
+    struct Flat2DView {
+        value_type* base; std::size_t stride;
+        inline value_type* operator[](std::size_t k) const { return base + k * stride; }
+    };
     // AQRS gamma (task #273/#283): layer-wide, doesn't vary by row/col/
     // tile, so fetched ONCE here rather than per-row like value_scale_k/
     // output_scale_k -- shared by the scattered loop below AND every
@@ -613,7 +623,7 @@ void disldo_backward(
     // an explicit extra factor at each of value_scale's/output_scale's own
     // gradient accumulation sites instead, matching the scattered path's
     // own style exactly (see its identical comment above).
-    value_type gamma_k_arr[SCALE_RANK_MAX];
+    std::vector<value_type> gamma_k_arr(rank);
     for (std::size_t k = 0; k < rank; ++k) gamma_k_arr[k] = weights.get_scale_gamma_k(k);
     std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out * rank, value_type(0));
     // Parallel forward-contribution accumulator, same shape/layout as
@@ -1404,7 +1414,8 @@ void disldo_backward(
                             // identical comment above (mirrors it exactly,
                             // now generalized over rank instead of the
                             // single rank-1-only val_scale local).
-                            value_type value_scale_k8[SCALE_RANK_MAX];
+                            value_type* value_scale_k8 = weights.scale_rank_scratch.value_scale_k.data()
+                                + static_cast<std::size_t>(tid) * rank;
                             for (std::size_t k = 0; k < rank; ++k) value_scale_k8[k] = weights.get_value_scale_k(row, k);
 
                             std::size_t col4_8[BLOCK4_TILE];
@@ -1412,7 +1423,9 @@ void disldo_backward(
                             // out_scale_k4_8[k][lj]: per-rank-component
                             // output_scale, needed for value_scale_k's own
                             // gradient below (mirrors FP4's out_scale_k4).
-                            value_type  out_scale_k4_8[SCALE_RANK_MAX][BLOCK4_TILE];
+                            const Flat2DView out_scale_k4_8{
+                                weights.scale_rank_scratch.out_scale_k.data() + static_cast<std::size_t>(tid) * rank * BLOCK4_TILE,
+                                BLOCK4_TILE};
                             value_type  combined_scale4_8[BLOCK4_TILE], combined_imp_scale4_8[BLOCK4_TILE];
                             value_type  cw4_8[BLOCK4_TILE], ci4_8[BLOCK4_TILE], cw_orig4_8[BLOCK4_TILE];
                             // was_live4_8[lj]: TRUE only if this cell already
@@ -1473,18 +1486,31 @@ void disldo_backward(
                             // FP4's identical mcol4_rank/mrow_local_k) --
                             // needed to train EVERY rank component, not
                             // just component 0.
-                            value_type mcol4_8_rank[SCALE_RANK_MAX][BLOCK4_TILE] = {};
-                            double     mrow_local8_k[SCALE_RANK_MAX] = {};
-                            value_type mcol4_8_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
-                            double     mrow_local8_k_contrib[SCALE_RANK_MAX] = {};
+                            // Reused scratch memory (not fresh stack space
+                            // this iteration) -- must be explicitly zeroed
+                            // each tile visit, unlike the old `= {}`
+                            // stack-array zero-init (task #295).
+                            const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+                            const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+                            auto& srs = weights.scale_rank_scratch;
+                            const Flat2DView mcol4_8_rank{srs.mcol_rank.data() + tid_rank_tile, BLOCK4_TILE};
+                            double* mrow_local8_k = srs.mrow_local_k.data() + tid_rank;
+                            const Flat2DView mcol4_8_rank_contrib{srs.mcol_rank_contrib.data() + tid_rank_tile, BLOCK4_TILE};
+                            double* mrow_local8_k_contrib = srs.mrow_local_k_contrib.data() + tid_rank;
                             // AQRS gamma's own gradient (task #273/#283) --
                             // per-tile-row local accumulator, folded into
                             // the shared mgamma_at/mgamma_at_contrib (same
                             // ones the scattered path uses) once this row
                             // finishes, matching mrow_local8_k's own
                             // fold-into-mrow_at pattern below.
-                            double     mgamma_local8_k[SCALE_RANK_MAX] = {};
-                            double     mgamma_local8_k_contrib[SCALE_RANK_MAX] = {};
+                            double* mgamma_local8_k = srs.mgamma_local_k.data() + tid_rank;
+                            double* mgamma_local8_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+                            std::fill(mcol4_8_rank[0], mcol4_8_rank[0] + rank * BLOCK4_TILE, value_type(0));
+                            std::fill(mrow_local8_k, mrow_local8_k + rank, 0.0);
+                            std::fill(mcol4_8_rank_contrib[0], mcol4_8_rank_contrib[0] + rank * BLOCK4_TILE, value_type(0));
+                            std::fill(mrow_local8_k_contrib, mrow_local8_k_contrib + rank, 0.0);
+                            std::fill(mgamma_local8_k, mgamma_local8_k + rank, 0.0);
+                            std::fill(mgamma_local8_k_contrib, mgamma_local8_k_contrib + rank, 0.0);
                             const std::size_t col_base8 = std::size_t(bc) * BLOCK4_TILE;
                             const bool full_tile_cols8 = (col_base8 + BLOCK4_TILE <= n_out);
 
@@ -1506,17 +1532,23 @@ void disldo_backward(
                                 const Block4Vec cw_start_v = block4_vec_load(cw4_8);
                                 Block4Vec ci_v = block4_vec_load(ci4_8);
                                 const Block4Vec cw_orig_v   = block4_vec_load(cw_orig4_8);
-                                // Per-rank-component vectors -- see FP4's
-                                // identical value_scale_k_v/out_scale_k_v.
-                                Block4Vec value_scale_k_v8[SCALE_RANK_MAX];
-                                Block4Vec out_scale_k_v8[SCALE_RANK_MAX];
-                                Block4Vec mcol_acc_v_k8[SCALE_RANK_MAX];
-                                Block4Vec mcol_acc_v_k8_contrib[SCALE_RANK_MAX];
+                                // mcol_acc_v_k8/mcol_acc_v_k8_contrib are
+                                // the only TRUE cross-batch accumulators
+                                // here (value_scale_k_v8/out_scale_k_v8
+                                // were plain caches of a broadcast/load
+                                // already available from value_scale_k8/
+                                // out_scale_k4_8 -- recomputed inline at
+                                // each use below instead, cheap SIMD ops,
+                                // no need to cache them). Backed by scratch
+                                // (task #295), load-accumulate-store each
+                                // batch iteration instead of a live
+                                // Block4Vec register array across
+                                // iterations.
+                                value_type* mcol_acc_raw8 = srs.mcol_acc_raw.data() + tid_rank_tile;
+                                value_type* mcol_acc_raw8_contrib = srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
                                 for (std::size_t k = 0; k < rank; ++k) {
-                                    value_scale_k_v8[k] = block4_vec_broadcast(value_scale_k8[k]);
-                                    out_scale_k_v8[k]   = block4_vec_load(out_scale_k4_8[k]);
-                                    mcol_acc_v_k8[k]    = block4_vec_broadcast(0.0f);
-                                    mcol_acc_v_k8_contrib[k] = block4_vec_broadcast(0.0f);
+                                    block4_vec_store(mcol_acc_raw8 + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
+                                    block4_vec_store(mcol_acc_raw8_contrib + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
                                 }
                                 Block4Vec g_agg_v = block4_vec_broadcast(0.0f);
                                 Block4Vec contrib_agg_v = block4_vec_broadcast(0.0f);
@@ -1544,12 +1576,16 @@ void disldo_backward(
                                             // (mcol_acc_v_k8) each need an explicit gamma_k factor;
                                             // gamma's own gradient (mgamma_local8_k) uses the PURE
                                             // direction product, no gamma factor.
-                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * g_v)) * static_cast<double>(gamma_k_arr[k]);
-                                            mcol_acc_v_k8[k] += cw_orig_v * value_scale_k_v8[k] * g_v * block4_vec_broadcast(gamma_k_arr[k]);
-                                            mgamma_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * value_scale_k_v8[k] * g_v));
-                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
-                                            mcol_acc_v_k8_contrib[k] += cw_orig_v * value_scale_k_v8[k] * contrib_v * block4_vec_broadcast(gamma_k_arr[k]);
-                                            mgamma_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8[k] * value_scale_k_v8[k] * contrib_v));
+                                            const Block4Vec value_scale_k_v8 = block4_vec_broadcast(value_scale_k8[k]);
+                                            const Block4Vec out_scale_k_v8 = block4_vec_load(out_scale_k4_8[k]);
+                                            mrow_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8 * g_v)) * static_cast<double>(gamma_k_arr[k]);
+                                            mgamma_local8_k[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8 * value_scale_k_v8 * g_v));
+                                            mrow_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8 * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
+                                            mgamma_local8_k_contrib[k] += static_cast<double>(block4_vec_hsum(cw_orig_v * out_scale_k_v8 * value_scale_k_v8 * contrib_v));
+                                            value_type* acc = mcol_acc_raw8 + k * BLOCK4_TILE;
+                                            block4_vec_store(acc, block4_vec_load(acc) + cw_orig_v * value_scale_k_v8 * g_v * block4_vec_broadcast(gamma_k_arr[k]));
+                                            value_type* acc_c = mcol_acc_raw8_contrib + k * BLOCK4_TILE;
+                                            block4_vec_store(acc_c, block4_vec_load(acc_c) + cw_orig_v * value_scale_k_v8 * contrib_v * block4_vec_broadcast(gamma_k_arr[k]));
                                         }
                                     }
                                     *mdx_row += block4_vec_hsum(cw_start_v * dyv_v);
@@ -1566,8 +1602,8 @@ void disldo_backward(
                                 block4_vec_store(cw4_8, cw_v);
                                 block4_vec_store(ci4_8, ci_v);
                                 for (std::size_t k = 0; k < rank; ++k) {
-                                    block4_vec_store(mcol4_8_rank[k], mcol_acc_v_k8[k]);
-                                    block4_vec_store(mcol4_8_rank_contrib[k], mcol_acc_v_k8_contrib[k]);
+                                    block4_vec_store(mcol4_8_rank[k], block4_vec_load(mcol_acc_raw8 + k * BLOCK4_TILE));
+                                    block4_vec_store(mcol4_8_rank_contrib[k], block4_vec_load(mcol_acc_raw8_contrib + k * BLOCK4_TILE));
                                 }
                             } else {
                                 // Boundary tile-column: scalar bounds-checked
@@ -1686,13 +1722,13 @@ void disldo_backward(
                             // implementation before this SIMD pass -- kept
                             // here rather than deleted, matching FP4's own
                             // precedent for this exact fallback slot.
-                            value_type value_scale_k8_fb[SCALE_RANK_MAX];
+                            std::vector<value_type> value_scale_k8_fb(rank);
                             for (std::size_t k = 0; k < rank; ++k) value_scale_k8_fb[k] = weights.get_value_scale_k(row, k);
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
                                 if (col >= n_out) continue;
                                 const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                value_type out_scale_k8_fb[SCALE_RANK_MAX];
+                                std::vector<value_type> out_scale_k8_fb(rank);
                                 for (std::size_t k = 0; k < rank; ++k) out_scale_k8_fb[k] = weights.get_output_scale_k(col, k);
                                 const value_type out_imp_scale = weights.get_output_importance_scale(col);
                                 const value_type combined_scale     = weights.get_scale(row, col);
@@ -1701,12 +1737,12 @@ void disldo_backward(
                                 const value_type cw_start = cw_orig * combined_scale;
                                 value_type ci = fp8_decode_bits(tdata[BLOCK4_TILE + slot]) * combined_imp_scale;
 
-                                value_type mcol_local_k[SCALE_RANK_MAX] = {};
-                                double     mrow_local_k[SCALE_RANK_MAX] = {};
-                                value_type mcol_local_k_contrib[SCALE_RANK_MAX] = {};
-                                double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
-                                double     mgamma_local_k[SCALE_RANK_MAX] = {};
-                                double     mgamma_local_k_contrib[SCALE_RANK_MAX] = {};
+                                std::vector<value_type> mcol_local_k(rank, value_type(0));
+                                std::vector<double>     mrow_local_k(rank, 0.0);
+                                std::vector<value_type> mcol_local_k_contrib(rank, value_type(0));
+                                std::vector<double>     mrow_local_k_contrib(rank, 0.0);
+                                std::vector<double>     mgamma_local_k(rank, 0.0);
+                                std::vector<double>     mgamma_local_k_contrib(rank, 0.0);
                                 double     g_agg = 0.0, contrib_agg = 0.0;
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
@@ -1779,7 +1815,8 @@ void disldo_backward(
                     // value_scale_k(row,k), fetched once per row -- matches
                     // the scattered path's own once-per-row granularity
                     // (see disldo_backward's non-DeferredScaleWrite branch).
-                    value_type value_scale_k[SCALE_RANK_MAX];
+                    value_type* value_scale_k = weights.scale_rank_scratch.value_scale_k.data()
+                        + static_cast<std::size_t>(tid) * rank;
                     for (std::size_t k = 0; k < rank; ++k) value_scale_k[k] = weights.get_value_scale_k(row, k);
 
                     std::size_t col4[BLOCK4_TILE];
@@ -1796,7 +1833,9 @@ void disldo_backward(
                     value_type  quant4[BLOCK4_TILE], ci4[BLOCK4_TILE], quant_orig4[BLOCK4_TILE];
                     // out_scale_k4[k][lj]: per-rank-component output_scale,
                     // needed for value_scale_k's own gradient below.
-                    value_type  out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE];
+                    const Flat2DView out_scale_k4{
+                        weights.scale_rank_scratch.out_scale_k.data() + static_cast<std::size_t>(tid) * rank * BLOCK4_TILE,
+                        BLOCK4_TILE};
                     // was_live4[lj]: see was_live4_8's declaration comment
                     // (FP8 branch above) for the full rationale -- CORRECTED
                     // from this loop's own former comment ("every slot is a
@@ -1850,16 +1889,28 @@ void disldo_backward(
                     // horizontal reduction), but gets the same
                     // local-accumulate-then-flush treatment for
                     // consistency and to keep it out of the hot loop too.
-                    value_type mcol4_rank[SCALE_RANK_MAX][BLOCK4_TILE] = {};
-                    double     mrow_local_k[SCALE_RANK_MAX] = {};
-                    value_type mcol4_rank_contrib[SCALE_RANK_MAX][BLOCK4_TILE] = {};
-                    double     mrow_local_k_contrib[SCALE_RANK_MAX] = {};
+                    // Reused scratch memory -- explicit zero each tile
+                    // visit (task #295, see FP8 branch's identical
+                    // comment above).
+                    const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+                    const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+                    auto& srs = weights.scale_rank_scratch;
+                    const Flat2DView mcol4_rank{srs.mcol_rank.data() + tid_rank_tile, BLOCK4_TILE};
+                    double* mrow_local_k = srs.mrow_local_k.data() + tid_rank;
+                    const Flat2DView mcol4_rank_contrib{srs.mcol_rank_contrib.data() + tid_rank_tile, BLOCK4_TILE};
+                    double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_rank;
                     // AQRS gamma's own gradient (task #273/#283) -- folded
                     // into the shared mgamma_at/mgamma_at_contrib once this
                     // row finishes, matching mrow_local_k's own
                     // fold-into-mrow_at pattern below.
-                    double     mgamma_local_k[SCALE_RANK_MAX] = {};
-                    double     mgamma_local_k_contrib[SCALE_RANK_MAX] = {};
+                    double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
+                    double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+                    std::fill(mcol4_rank[0], mcol4_rank[0] + rank * BLOCK4_TILE, value_type(0));
+                    std::fill(mrow_local_k, mrow_local_k + rank, 0.0);
+                    std::fill(mcol4_rank_contrib[0], mcol4_rank_contrib[0] + rank * BLOCK4_TILE, value_type(0));
+                    std::fill(mrow_local_k_contrib, mrow_local_k_contrib + rank, 0.0);
+                    std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
+                    std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
                     // col4[lj] is really just col_base+lj (contiguous), but
                     // reading it back OUT of the array hides that from GCC
                     // -- confirmed via -fopt-info-vec: it correctly proved
@@ -1916,15 +1967,15 @@ void disldo_backward(
                             // column dimension stays 4-wide SIMD regardless
                             // of rank; only `rank` itself is a small plain
                             // loop, orthogonal to the SIMD lane dimension.
-                            Block4Vec value_scale_k_v[SCALE_RANK_MAX];
-                            Block4Vec out_scale_k_v[SCALE_RANK_MAX];
-                            Block4Vec mcol_acc_v_k[SCALE_RANK_MAX];
-                            Block4Vec mcol_acc_v_k_contrib[SCALE_RANK_MAX];
+                            // mcol_acc_v_k/mcol_acc_v_k_contrib are the only
+                            // TRUE cross-batch accumulators -- see FP8
+                            // branch's identical comment above for the
+                            // full rationale (task #295).
+                            value_type* mcol_acc_raw = srs.mcol_acc_raw.data() + tid_rank_tile;
+                            value_type* mcol_acc_raw_contrib = srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
                             for (std::size_t k = 0; k < rank; ++k) {
-                                value_scale_k_v[k] = block4_vec_broadcast(value_scale_k[k]);
-                                out_scale_k_v[k]   = block4_vec_load(out_scale_k4[k]);
-                                mcol_acc_v_k[k]    = block4_vec_broadcast(0.0f);
-                                mcol_acc_v_k_contrib[k] = block4_vec_broadcast(0.0f);
+                                block4_vec_store(mcol_acc_raw + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
+                                block4_vec_store(mcol_acc_raw_contrib + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
                             }
                             const bool training = (learning_rate != value_type(0));
                             for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -1988,12 +2039,16 @@ void disldo_backward(
                                     for (std::size_t k = 0; k < rank; ++k) {
                                         // AQRS gamma -- see the scattered path's identical comment (near
                                         // gamma_k_arr's own declaration) for the full rationale.
-                                        mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * g_v)) * static_cast<double>(gamma_k_arr[k]);
-                                        mcol_acc_v_k[k] += quant_floor_v * value_scale_k_v[k] * g_v * block4_vec_broadcast(gamma_k_arr[k]);
-                                        mgamma_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * value_scale_k_v[k] * g_v));
-                                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
-                                        mcol_acc_v_k_contrib[k] += quant_floor_v * value_scale_k_v[k] * contrib_v * block4_vec_broadcast(gamma_k_arr[k]);
-                                        mgamma_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v[k] * value_scale_k_v[k] * contrib_v));
+                                        const Block4Vec value_scale_k_v = block4_vec_broadcast(value_scale_k[k]);
+                                        const Block4Vec out_scale_k_v = block4_vec_load(out_scale_k4[k]);
+                                        mrow_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v * g_v)) * static_cast<double>(gamma_k_arr[k]);
+                                        mgamma_local_k[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v * value_scale_k_v * g_v));
+                                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v * contrib_v)) * static_cast<double>(gamma_k_arr[k]);
+                                        mgamma_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(quant_floor_v * out_scale_k_v * value_scale_k_v * contrib_v));
+                                        value_type* acc = mcol_acc_raw + k * BLOCK4_TILE;
+                                        block4_vec_store(acc, block4_vec_load(acc) + quant_floor_v * value_scale_k_v * g_v * block4_vec_broadcast(gamma_k_arr[k]));
+                                        value_type* acc_c = mcol_acc_raw_contrib + k * BLOCK4_TILE;
+                                        block4_vec_store(acc_c, block4_vec_load(acc_c) + quant_floor_v * value_scale_k_v * contrib_v * block4_vec_broadcast(gamma_k_arr[k]));
                                     }
                                 }
                                 // w = quant*S, FIXED for the whole batch --
@@ -2019,8 +2074,8 @@ void disldo_backward(
                             block4_vec_store(quant4, quant_v);
                             block4_vec_store(ci4, ci_v);
                             for (std::size_t k = 0; k < rank; ++k) {
-                                block4_vec_store(mcol4_rank[k], mcol_acc_v_k[k]);
-                                block4_vec_store(mcol4_rank_contrib[k], mcol_acc_v_k_contrib[k]);
+                                block4_vec_store(mcol4_rank[k], block4_vec_load(mcol_acc_raw + k * BLOCK4_TILE));
+                                block4_vec_store(mcol4_rank_contrib[k], block4_vec_load(mcol_acc_raw_contrib + k * BLOCK4_TILE));
                             }
                         } else {
                             // Boundary tile-column (rare -- only the last
@@ -2571,8 +2626,9 @@ void disldo_backward(
         // that pass needs every channel's raw gradient AND every
         // channel's just-updated |gamma| value simultaneously (C_k needs
         // ||gamma||_1 over ALL k), so it can't be folded into this same
-        // loop; SCALE_RANK_MAX-sized stack array, not a heap allocation.
-        value_type g_agg_by_k[SCALE_RANK_MAX];
+        // loop. Plain vector (task #295) -- allocated once per call, same
+        // frequency as t_gamma_grad's own vector above, not a hot-loop cost.
+        std::vector<value_type> g_agg_by_k(rank);
         for (std::size_t k = 0; k < rank; ++k) {
             double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
             for (int t = 0; t < num_cpus; ++t) {
@@ -2794,7 +2850,7 @@ void disldo_backward(
         // shrink itself back to fully off), so L1 applies to every k
         // here, including k==0.
         if (learning_rate != value_type(0) && weights.additive_gamma_is_trainable) {
-            value_type dgamma_by_k[SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>::ADDITIVE_RANK_MAX];
+            std::vector<value_type> dgamma_by_k(r_o);
             for (std::size_t k = 0; k < r_o; ++k) {
                 double dgamma_sum = 0.0;
                 for (SIZE_TYPE b = 0; b < batch; ++b)

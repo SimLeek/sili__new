@@ -493,6 +493,23 @@ public:
     // so it's shared by every caller (struct-direct C++ callers included),
     // not duplicated here (see conversation, task #275).
     void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
+    // Runtime-settable policy cap (task #295) -- replaces the old
+    // compile-time SCALE_RANK_MAX=4 constant. Default 4 (unchanged
+    // behavior for any caller that never touches this); raise it to
+    // allow scale_rank to grow past 4, no hardcoded ceiling anymore --
+    // block4's SIMD backward path now uses persistent heap scratch
+    // (weights.scale_rank_scratch) that grows to fit whatever rank is
+    // actually used.
+    std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
+    void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
+    // Explicit scratch-memory control, independent of the policy cap
+    // above -- reserve ahead of need (preallocate once, no reallocation
+    // during training) or shrink back down (free capacity a layer grew
+    // into early on and no longer needs). rank/threads must not be
+    // smaller than what's currently actually in use.
+    void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank) {
+        weights.reserve_scale_rank_scratch(threads, rank, BLOCK4_TILE);
+    }
 
     // AQRS additive branch (task #278, see sili_peridot/AQRS_DESIGN.md):
     // A[row,col] = sum_k additive_u_k(row,k)*additive_v_k(col,k), ADDED
@@ -509,6 +526,10 @@ public:
     // rank past 0.
     std::size_t get_additive_rank() const { return weights.additive_rank; }
     void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    // Runtime-settable policy cap (task #295), same pattern as
+    // scale_rank_max above.
+    std::size_t get_additive_rank_max() const { return weights.get_additive_rank_max(); }
+    void set_additive_rank_max(std::size_t new_max) { weights.set_additive_rank_max(new_max); }
     V get_additive_u_k(S row, S k) const {
         return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
     }
@@ -1412,6 +1433,14 @@ public:
     // so it's shared by every caller (struct-direct C++ callers included),
     // not duplicated here (see conversation, task #275).
     void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
+    // Runtime-settable policy cap + explicit scratch control -- see
+    // SparseLinearLayerImpl's (FP4) identical block for the full
+    // rationale (task #295).
+    std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
+    void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
+    void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank) {
+        weights.reserve_scale_rank_scratch(threads, rank, BLOCK4_TILE);
+    }
     V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
@@ -1424,6 +1453,10 @@ public:
     // FP4's own copy above.
     std::size_t get_additive_rank() const { return weights.additive_rank; }
     void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    // Runtime-settable policy cap (task #295), same pattern as
+    // scale_rank_max above.
+    std::size_t get_additive_rank_max() const { return weights.get_additive_rank_max(); }
+    void set_additive_rank_max(std::size_t new_max) { weights.set_additive_rank_max(new_max); }
     V get_additive_u_k(S row, S k) const {
         return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
     }
@@ -1707,6 +1740,22 @@ PYBIND11_MODULE(_cpu, m)
              "code, where the multiplicative rank-N scale's own gradient is\n"
              "exactly zero at any rank. additive_rank defaults to 0 (fully off).")
         .def("set_additive_rank",    &SparseLinearLayer::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayer::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayer::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayer::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayer::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayer::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
         .def("get_additive_u_k",     &SparseLinearLayer::get_additive_u_k, py::arg("row"), py::arg("k"))
         .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
@@ -2453,6 +2502,22 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
         .def("get_additive_rank",    &SparseLinearLayerDeterministic::get_additive_rank)
         .def("set_additive_rank",    &SparseLinearLayerDeterministic::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayerDeterministic::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayerDeterministic::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayerDeterministic::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayerDeterministic::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayerDeterministic::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
         .def("get_additive_u_k",     &SparseLinearLayerDeterministic::get_additive_u_k, py::arg("row"), py::arg("k"))
         .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
@@ -3280,6 +3345,22 @@ PYBIND11_MODULE(_cpu, m)
              "This is the branch task #280 re-validates against the fp8 MQAR\n"
              "input-independent-collapse case.")
         .def("set_additive_rank",    &SparseLinearLayer8::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayer8::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayer8::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayer8::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayer8::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayer8::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
         .def("get_additive_u_k",     &SparseLinearLayer8::get_additive_u_k, py::arg("row"), py::arg("k"))
         .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))

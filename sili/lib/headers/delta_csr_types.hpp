@@ -1387,26 +1387,100 @@ struct SparseLinearWeightsDelta {
         output_importance_scale[col] = v;
     }
 
-    // Compile-time cap on scale_rank, used by block4's SIMD backward path
-    // (linear_disldo.hpp's process_tile) to size fixed stack arrays of
-    // per-rank-component Block4Vec accumulators instead of heap-allocating
-    // a std::vector on every tile-row visited (that loop runs extremely
-    // often -- once per (block-row, block-col, li) triple touched by
-    // backward -- so a heap alloc there would be a real, not hypothetical,
-    // regression). 4 is generous headroom over the rank=2 this was built
-    // for; raise it if a real use case needs more, but keep it small --
-    // it directly sizes stack buffers in the hot path.
-    static constexpr std::size_t SCALE_RANK_MAX = 4;
+    // task #295 fix (real user request): block4's SIMD backward path
+    // (linear_disldo.hpp) used to size its per-rank-component accumulators
+    // as FIXED stack arrays capped at a compile-time SCALE_RANK_MAX=4 --
+    // that constant is now GONE. Instead, `scale_rank_scratch` below is a
+    // set of persistent, per-instance HEAP buffers that grow (never
+    // shrink automatically) to fit whatever scale_rank the layer actually
+    // uses, reused across every disldo_backward call rather than
+    // reallocated per call or per tile -- the naive "heap-allocate a
+    // std::vector fresh on every tile visited" approach WOULD be a real
+    // regression (that loop runs once per (block-row, block-col, li)
+    // triple, extremely often); this avoids that by allocating once and
+    // reusing. Explicit shrinking (freeing unused capacity a layer grew
+    // into early on) is available via reserve_scale_rank_scratch below,
+    // separate from the automatic grow-only path disldo_backward uses.
+    //
+    // Deliberately holds ONLY value_type/double vectors, no Block4Vec --
+    // this header doesn't include block4.hpp (Block4Vec's own home), so
+    // linear_disldo.hpp's block4 SIMD code loads/stores Block4Vec values
+    // from/to these plain buffers via block4_vec_load/block4_vec_store
+    // (already its own established pattern, see out_scale_k4/mcol4_rank's
+    // pre-existing use of that exact load/store convention) rather than
+    // this struct storing SIMD-typed data directly.
+    struct ScaleRankScratch {
+        std::vector<value_type> value_scale_k;        // [thread][k]
+        std::vector<value_type> out_scale_k;           // [thread][k][tile_width]
+        std::vector<value_type> mcol_rank;              // [thread][k][tile_width]
+        std::vector<double>     mrow_local_k;           // [thread][k]
+        std::vector<value_type> mcol_rank_contrib;      // [thread][k][tile_width]
+        std::vector<double>     mrow_local_k_contrib;   // [thread][k]
+        std::vector<double>     mgamma_local_k;         // [thread][k]
+        std::vector<double>     mgamma_local_k_contrib; // [thread][k]
+        std::vector<value_type> mcol_acc_raw;           // [thread][k][tile_width] -- Block4Vec accumulator backing
+        std::vector<value_type> mcol_acc_raw_contrib;   // [thread][k][tile_width]
 
-    // Compile-time cap on additive_rank -- unlike SCALE_RANK_MAX, the
-    // additive branch has no fixed-size-stack-array SIMD path forcing a
-    // small bound (its own forward/backward pass, linear_disldo.hpp, uses
-    // ordinary std::vector throughout, structure-agnostic w.r.t. block4).
-    // Kept at the same value as SCALE_RANK_MAX anyway: still cheap memory/
-    // compute headroom for a rank this small, and gives dynamic rank
-    // control (task #292) the same growth ceiling on both branches unless
-    // a real use case demands otherwise.
-    static constexpr std::size_t ADDITIVE_RANK_MAX = 4;
+        std::size_t cap_threads = 0, cap_rank = 0, cap_tile_width = 0;
+
+        // Grow-only (never shrinks) -- called automatically at the top of
+        // disldo_backward every call, a cheap no-op once already large
+        // enough. tile_width is BLOCK4_TILE, passed in rather than
+        // hardcoded (this header has no block4.hpp dependency).
+        void ensure(std::size_t threads, std::size_t rank, std::size_t tile_width) {
+            if (threads <= cap_threads && rank <= cap_rank && tile_width <= cap_tile_width) return;
+            resize_to(std::max(cap_threads, threads), std::max(cap_rank, rank),
+                       std::max(cap_tile_width, tile_width));
+        }
+
+        // Explicit, caller-driven resize -- unlike ensure(), this CAN
+        // shrink (frees capacity a layer grew into early on and no longer
+        // needs). Caller (set_scale_rank_scratch_capacity below) is
+        // responsible for validating threads/rank/tile_width aren't
+        // smaller than what's currently actually in use.
+        void resize_to(std::size_t threads, std::size_t rank, std::size_t tile_width) {
+            cap_threads = threads; cap_rank = rank; cap_tile_width = tile_width;
+            const std::size_t flat = threads * rank;
+            const std::size_t flat_tiled = flat * tile_width;
+            value_scale_k.resize(flat);
+            out_scale_k.resize(flat_tiled);
+            mcol_rank.resize(flat_tiled);
+            mrow_local_k.resize(flat);
+            mcol_rank_contrib.resize(flat_tiled);
+            mrow_local_k_contrib.resize(flat);
+            mgamma_local_k.resize(flat);
+            mgamma_local_k_contrib.resize(flat);
+            mcol_acc_raw.resize(flat_tiled);
+            mcol_acc_raw_contrib.resize(flat_tiled);
+        }
+    };
+    ScaleRankScratch scale_rank_scratch;
+
+    // Explicit, caller-driven scratch memory control (task #295, real
+    // user request) -- separate from scale_rank_max/additive_rank_max
+    // below (which govern the POLICY cap on how far rank may grow, not
+    // memory). Allows shrinking (frees capacity a layer grew into
+    // early on and no longer needs) as well as growing ahead of need
+    // (preallocate once at a known max, avoid any reallocation during
+    // training). threads/rank must not be smaller than what's currently
+    // actually in use -- shrinking below that would corrupt the buffers
+    // disldo_backward is actively reading/writing.
+    inline void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank, std::size_t tile_width) {
+        if (rank < scale_rank)
+            throw std::invalid_argument("reserve_scale_rank_scratch: rank below the layer's current scale_rank would corrupt live scratch data");
+        if (threads < 1) throw std::invalid_argument("reserve_scale_rank_scratch: threads must be >= 1");
+        scale_rank_scratch.resize_to(threads, rank, tile_width);
+    }
+
+    // additive_rank has no fixed-size-stack-array SIMD path (its own
+    // forward/backward pass, linear_disldo.hpp, uses ordinary
+    // std::vector throughout already, structure-agnostic w.r.t. block4)
+    // -- so unlike scale_rank, it never needed a compile-time cap at all;
+    // the one remaining fixed-size array (dgamma_by_k in disldo_backward's
+    // additive gamma update block) is allocated once per call already, at
+    // the same frequency as its own P/dP std::vectors, so a plain
+    // std::vector<value_type>(r_o) there is a trivial, zero-risk swap
+    // (task #295).
 
     // RANK of the value_scale/output_scale factorization. true_w =
     // quant * S[row,col], where S used to be a plain rank-1 outer product
@@ -1950,10 +2024,32 @@ struct SparseLinearWeightsDelta {
     // additive_v) with one shared reshuffle helper rather than
     // hand-duplicating the same logic eight times.
 public:
+    // Runtime-settable policy cap (task #295 -- was a compile-time
+    // SCALE_RANK_MAX=4 constant forced by block4's SIMD backward path's
+    // OWN fixed-size stack arrays; those are gone now, replaced by
+    // scale_rank_scratch's heap buffers above, which grow to fit
+    // whatever rank is actually requested with no hardcoded ceiling).
+    // This field is a separate, independent concern: a POLICY limit on
+    // how far scale_rank is allowed to grow (manually via set_scale_rank,
+    // or automatically via apply_dynamic_rank_control's neurogenesis
+    // trigger), not a memory-safety one. Default 4 matches the old
+    // compile-time constant's value, preserving existing behavior for
+    // any caller that never touches this.
+    std::size_t scale_rank_max = 4;
+    std::size_t additive_rank_max = 4;
+    inline std::size_t get_scale_rank_max() const { return scale_rank_max; }
+    // Lowering scale_rank_max below the CURRENT scale_rank is allowed --
+    // it just means no further growth until scale_rank is manually
+    // shrunk back under the new cap (apply_dynamic_rank_control's own
+    // apoptosis path already handles shrinking independently of this).
+    inline void set_scale_rank_max(std::size_t new_max) { scale_rank_max = new_max; }
+    inline std::size_t get_additive_rank_max() const { return additive_rank_max; }
+    inline void set_additive_rank_max(std::size_t new_max) { additive_rank_max = new_max; }
+
     inline void set_scale_rank(std::size_t new_rank) {
         if (new_rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
-        if (new_rank > SCALE_RANK_MAX)
-            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
+        if (new_rank > scale_rank_max)
+            throw std::invalid_argument("scale_rank exceeds scale_rank_max (the configured policy cap -- raise it via set_scale_rank_max first)");
         const std::size_t old_rank = scale_rank;
         auto scale_default  = [](std::size_t k) { return k == 0 ? value_type(1) : value_type(0); };
         auto zero_default   = [](std::size_t)   { return value_type(0); };
@@ -2176,7 +2272,7 @@ public:
                                             value_type theta, SeedFn new_channel_seed,
                                             uint32_t grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
-            scale_rank, /*min_rank=*/std::size_t(1), SCALE_RANK_MAX, grace_period_steps,
+            scale_rank, /*min_rank=*/std::size_t(1), scale_rank_max, grace_period_steps,
             scale_rank_calls_since_mutation,
             [&](std::size_t k) { return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return scale_gamma_should_apoptose(k, tau_death); },
@@ -2213,7 +2309,7 @@ public:
                                                      SeedVFn new_channel_seed_v,
                                                      uint32_t grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
-            additive_rank, /*min_rank=*/std::size_t(0), ADDITIVE_RANK_MAX, grace_period_steps,
+            additive_rank, /*min_rank=*/std::size_t(0), additive_rank_max, grace_period_steps,
             additive_rank_calls_since_mutation,
             [&](std::size_t k) { return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return additive_gamma_should_apoptose(k, tau_death); },
@@ -2234,14 +2330,13 @@ public:
         // 0 is a valid, meaningful value here (branch fully disabled) --
         // unlike scale_rank, which must stay >= 1 since component 0 IS
         // the original rank-1 behavior every existing caller depends on.
-        // ADDITIVE_RANK_MAX cap added at task #289: disldo_backward's own
-        // additive_gamma update block (linear_disldo.hpp) sizes a fixed
-        // stack array to it, same reasoning as SCALE_RANK_MAX's own
-        // guard in set_scale_rank above -- must be enforced here too, or
-        // a caller growing additive_rank past it silently overflows that
-        // stack buffer instead of failing loudly.
-        if (new_rank > ADDITIVE_RANK_MAX)
-            throw std::invalid_argument("additive_rank exceeds ADDITIVE_RANK_MAX (disldo_backward's gamma update uses a fixed-size stack array sized to it)");
+        // additive_rank_max: runtime policy cap (task #295), same
+        // reasoning as scale_rank_max's own guard in set_scale_rank
+        // above -- no longer about a fixed-size stack array (dgamma_by_k
+        // is a plain std::vector now, see disldo_backward), purely a
+        // configurable growth ceiling.
+        if (new_rank > additive_rank_max)
+            throw std::invalid_argument("additive_rank exceeds additive_rank_max (the configured policy cap -- raise it via set_additive_rank_max first)");
         const std::size_t old_rank = additive_rank;
         auto zero_default = [](std::size_t) { return value_type(0); };
         auto step_default = [](std::size_t)  { return uint32_t(0); };

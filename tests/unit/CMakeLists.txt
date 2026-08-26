@@ -180,6 +180,7 @@ set(SILI_STANDALONE_TESTS
     test_aqrs_dynamic_rank_control
     test_aqrs_dynamic_rank_control_integration
     test_aqrs_additive_gamma
+    test_aqrs_rank_scratch
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)
