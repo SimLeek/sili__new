@@ -132,7 +132,12 @@ static void test_breathing_rank_cycle() {
     // fully transparent, matching pre-gamma behavior.
     w.set_scale_gamma_raw_k(0, 1.0f);
 
-    const float tau_death = 0.05f, tau_active = 0.3f, theta = 0.02f, l1_coef = 0.02f;
+    // theta is compared against a raw gradient normalized by n_in*n_out
+    // (task #294 fix, disldo_backward's gamma-EMA trigger tracking) --
+    // this test's own N=4 layer means n_in*n_out=16, so theta must scale
+    // down by that same factor from its old pre-normalization value
+    // (0.02) to trigger at the same real sensitivity.
+    const float tau_death = 0.05f, tau_active = 0.3f, theta = 0.02f / (float(N) * float(N)), l1_coef = 0.02f;
 
     // ── Phase 1: rank-1-sufficient target -- rank must stay at 1 ────────
     std::vector<std::size_t> rank_trace1;

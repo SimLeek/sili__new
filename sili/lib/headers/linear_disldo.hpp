@@ -2617,10 +2617,18 @@ void disldo_backward(
         {
             value_type gamma_l1_sum = value_type(0);
             for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
+            // g_agg_by_k[k] is a RAW per-synapse-accumulated sum (mgamma_at
+            // above, summed across every touched row/col pair) -- same
+            // layer-width-dependent scaling issue as the additive branch's
+            // own dgamma_by_k (see that block's own comment, task #294
+            // fix); normalize by n_in*n_out here for the SAME reason, same
+            // scope (trigger tracking only, not gamma's own ScalePolicy
+            // step above).
+            const value_type grad_norm_divisor = static_cast<value_type>(n_in) * static_cast<value_type>(n_out);
             for (std::size_t k = 0; k < rank; ++k) {
                 const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
                 const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
-                weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(g_agg_by_k[k]));
+                weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(g_agg_by_k[k]) / grad_norm_divisor);
             }
         }
     }
@@ -2808,10 +2816,24 @@ void disldo_backward(
             }
             value_type gamma_l1_sum = value_type(0);
             for (std::size_t k = 0; k < r_o; ++k) gamma_l1_sum += std::fabs(weights.additive_gamma[k]);
+            // dgamma_by_k[k] = sum_b P[b,k]*dP[b,k] is a RAW, unnormalized
+            // sum (P sums over n_in terms, dP sums over n_out terms) --
+            // its magnitude scales with layer WIDTH, not just "how much
+            // does this channel actually matter." A real MQAR run showed
+            // grad_ema on a 128x128 layer ~9 orders of magnitude larger
+            // than a 16x128 layer's, making theta (a single global
+            // constant) meaningless across differently-shaped layers --
+            // task #294 fix. Normalizing by n_in*n_out here (trigger
+            // tracking ONLY -- gamma's own ScalePolicy step above is left
+            // on the raw dgamma_k, since that update already self
+            // -normalizes via its own second-moment estimate and existing
+            // tests are tuned against it) makes theta comparable across
+            // layer shapes.
+            const value_type grad_norm_divisor = static_cast<value_type>(n_in) * static_cast<value_type>(n_out);
             for (std::size_t k = 0; k < r_o; ++k) {
                 const value_type abs_gamma_k = std::fabs(weights.additive_gamma[k]);
                 const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
-                weights.update_additive_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(dgamma_by_k[k]));
+                weights.update_additive_gamma_ema_k(k, abs_gamma_k, share_k, std::fabs(dgamma_by_k[k]) / grad_norm_divisor);
             }
         }
     }

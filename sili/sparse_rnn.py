@@ -682,7 +682,7 @@ class DISLDOLayer(_SparseLayerBase):
         return out
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
-                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   theta: float = 1e-4, seed_scale: float = 0.05,
                                    grace_period_steps: int = 50) -> bool:
         """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
         BOTH branches' apoptosis/neurogenesis triggers against their own
@@ -693,6 +693,14 @@ class DISLDOLayer(_SparseLayerBase):
         backward -- matches test_aqrs_dynamic_rank_control_integration.cpp's
         own "breathing" integration test convention exactly, just from
         Python. Returns True if either branch actually mutated.
+
+        theta's default (1e-4, task #294 fix) is tuned against the
+        gradient normalized by layer size (n_in*n_out) -- NOT the old
+        pre-normalization raw scale (which used to require theta~0.02
+        and made the trigger meaningless across differently-shaped
+        layers, since a 128x128 layer's raw gradient could be 9 orders
+        of magnitude larger than a 16x128 layer's for the same real
+        signal).
         """
         mutated_scale = self._c.apply_dynamic_rank_control(
             tau_death, tau_active, theta, seed_scale, grace_period_steps)
@@ -941,7 +949,7 @@ class DISLDOLayer8(_SparseLayerBase):
         return out
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
-                                   theta: float = 0.02, seed_scale: float = 0.05,
+                                   theta: float = 1e-4, seed_scale: float = 0.05,
                                    grace_period_steps: int = 50) -> bool:
         """Same as DISLDOLayer's own apply_dynamic_rank_control (task
         #292) -- duplicated here rather than shared via inheritance since
