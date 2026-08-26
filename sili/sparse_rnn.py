@@ -334,6 +334,75 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _overflow_guard_array(arr: np.ndarray, clip: float, near: float, coef: float) -> np.ndarray:
+    """Elementwise, context-free correction for one AQRS scale/additive
+    channel array (value_scale, output_scale, additive_u, additive_v --
+    task #295 follow-up / task #286 "virtual neuron" exposure). Real bug
+    this fixes: get_scale()'s combined envelope S(row,col) = sum_k
+    gamma_k*value_scale_k*output_scale_k is an UNCLAMPED sum
+    (delta_csr_types.hpp) -- raising scale_rank_max/additive_rank_max
+    past the old hardcoded 4 let a real fp8 MQAR curriculum run's
+    per-channel scale values grow unbounded, overflowing S in the
+    forward pass and NaN-collapsing training (confirmed: the NaN onset
+    lined up exactly with a rank mutation on q_proj, see conversation).
+
+    Two parts, deliberately NOT a plain hard clip alone (direct
+    instruction: a hard clip's backward either gives zero gradient or
+    gradient computed from the wrong post-clip value once a channel is
+    pinned at the boundary -- neither tells upstream training "shrink
+    this"):
+
+    1. Auto-correcting shrink: once |value| exceeds `near`, subtract a
+       nudge proportional to the excess, always pointing back toward
+       zero -- exactly the gradient of a 0.5*coef*relu(|x|-near)^2
+       hinge-squared penalty, applied directly as a value-space
+       correction (these channels are C++-internal RMSprop-optimized
+       state, not Python Tensor autograd leaves, so there's no
+       backward pass to inject an extra gradient INTO -- this achieves
+       the same corrective effect one call later, which is sufficient
+       since S is fully rebuilt from these stored values every forward
+       call; nothing is lost by correcting between steps instead of
+       mid-forward).
+    2. Hard clip to `clip` as the final numerical-safety net (and
+       np.nan_to_num first, since a value that's ALREADY NaN/Inf
+       wouldn't be fixed by np.clip alone -- np.clip(nan,...)==nan).
+
+    `near` should sit comfortably below `clip` so the corrective nudge
+    has room to act before the hard clip ever engages. Per-channel, not
+    aggregate-S (direct instruction: chose this over clipping S itself)
+    -- each element is corrected independently with no knowledge of
+    other channels, so applying this as one vectorized numpy pass over
+    the whole array is exactly equivalent to "run the same correction
+    once per channel" (direct instruction) without the GIL/threading
+    cost of a literal per-element callback inside the hot C++ OpenMP
+    forward/backward loops."""
+    x = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=clip, neginf=-clip)
+    excess = np.maximum(np.abs(x) - near, 0.0)
+    corrected = x - coef * excess * np.sign(x)
+    return np.clip(corrected, -clip, clip).astype(np.float32)
+
+
+def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> None:
+    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
+    DISLDOLayer8's apply_scale_overflow_guard -- see
+    _overflow_guard_array's own docstring for the full rationale.
+    Applies to all four AQRS channel arrays (skips additive_u/v when
+    additive_rank==0, matching every other AQRS call site's own "no-op
+    at rank 0" convention)."""
+    vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
+    if vs.size:
+        c.set_value_scale_raw_vector(_overflow_guard_array(vs, clip, near, coef).tolist())
+    os_ = np.asarray(c.get_output_scale_raw_vector(), dtype=np.float32)
+    if os_.size:
+        c.set_output_scale_raw_vector(_overflow_guard_array(os_, clip, near, coef).tolist())
+    au = np.asarray(c.get_additive_u_raw_vector(), dtype=np.float32)
+    if au.size:
+        c.set_additive_u_raw_vector(_overflow_guard_array(au, clip, near, coef).tolist())
+    av = np.asarray(c.get_additive_v_raw_vector(), dtype=np.float32)
+    if av.size:
+        c.set_additive_v_raw_vector(_overflow_guard_array(av, clip, near, coef).tolist())
+
+
 def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
     """Default scale_rank_max/additive_rank_max (task #295): the cap at
     which, if every layer's rank grew all the way to it, the AQRS scale
@@ -733,6 +802,17 @@ class DISLDOLayer(_SparseLayerBase):
             tau_death, tau_active, theta, seed_scale, grace_period_steps)
         return mutated_scale or mutated_additive
 
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
+                                    coef: float = 0.1) -> None:
+        """AQRS scale/additive channel numerical-safety pass (task #295
+        follow-up) -- see _overflow_guard_array's own docstring for the
+        full rationale. Call once per training step, any time after
+        backward (order relative to apply_dynamic_rank_control doesn't
+        matter -- this corrects VALUES, that mutates RANK, independent
+        concerns). Cheap: 4 bulk array round-trips per call, not
+        n*rank individual accessor calls."""
+        _apply_scale_overflow_guard(self._c, clip, near, coef)
+
 
 class DISLDOLayerResync(DISLDOLayer):
     """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
@@ -995,6 +1075,14 @@ class DISLDOLayer8(_SparseLayerBase):
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
             tau_death, tau_active, theta, seed_scale, grace_period_steps)
         return mutated_scale or mutated_additive
+
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
+                                    coef: float = 0.1) -> None:
+        """Same as DISLDOLayer's own apply_scale_overflow_guard (task
+        #295 follow-up) -- duplicated for the same reason
+        apply_dynamic_rank_control above is (DISLDOLayer8 doesn't
+        subclass DISLDOLayer)."""
+        _apply_scale_overflow_guard(self._c, clip, near, coef)
 
 
 class DISLDOLayer8Resync(DISLDOLayer8):

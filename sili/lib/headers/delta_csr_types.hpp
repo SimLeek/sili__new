@@ -1700,6 +1700,35 @@ struct SparseLinearWeightsDelta {
         set_output_scale_raw_k(col, 0, v);
     }
 
+    // Bulk raw-vector accessors (task #295 follow-up: expose AQRS scale
+    // channels as "virtual neurons" a caller can read/correct in one
+    // pass instead of n*scale_rank individual get/set_*_k calls -- see
+    // conversation: raised rank caps let get_scale()'s unclamped sum
+    // overflow in a real fp8 MQAR run, NaN-collapsing it). Deliberately
+    // raw/flat (row-major [n*scale_rank], same layout as the member
+    // itself) -- the caller already knows scale_rank and reshapes.
+    // Size-preserving: the setter refuses a size mismatch -- this is a
+    // correction pass over EXISTING trained values, not a resize/grow
+    // path (that's set_scale_rank's job). Each element is independent
+    // (no cross-element math here), so a caller applying a per-channel,
+    // context-free correction (e.g. clip + auto-correcting shrink) via
+    // one vectorized pass over the returned array is equivalent to
+    // invoking that correction once per channel -- avoids the
+    // GIL/threading cost of a literal per-element callback inside the
+    // hot OpenMP forward/backward loops.
+    inline const std::vector<value_type>& get_value_scale_raw_vector() const { return value_scale; }
+    inline void set_value_scale_raw_vector(const std::vector<value_type>& v) {
+        if (v.size() != value_scale.size())
+            throw std::invalid_argument("set_value_scale_raw_vector: size mismatch (correction pass only, not resize)");
+        value_scale = v;
+    }
+    inline const std::vector<value_type>& get_output_scale_raw_vector() const { return output_scale; }
+    inline void set_output_scale_raw_vector(const std::vector<value_type>& v) {
+        if (v.size() != output_scale.size())
+            throw std::invalid_argument("set_output_scale_raw_vector: size mismatch (correction pass only, not resize)");
+        output_scale = v;
+    }
+
     // AQRS per-channel gamma (task #273/#282-283, see sili_peridot/
     // AQRS_DESIGN.md's gamma section): decouples channel MAGNITUDE from
     // channel DIRECTION. value_scale_k/output_scale_k above hold pure
@@ -1871,6 +1900,22 @@ struct SparseLinearWeightsDelta {
         const std::size_t idx = col * additive_rank + k;
         if (idx >= additive_v.size()) additive_v.resize(idx + 1, value_type(0));
         additive_v[idx] = v;
+    }
+
+    // Bulk raw-vector accessors -- see get/set_value_scale_raw_vector's
+    // docstring above for the full rationale (same "virtual neuron"
+    // exposure, same size-preserving/no-cross-element convention).
+    inline const std::vector<value_type>& get_additive_u_raw_vector() const { return additive_u; }
+    inline void set_additive_u_raw_vector(const std::vector<value_type>& v) {
+        if (v.size() != additive_u.size())
+            throw std::invalid_argument("set_additive_u_raw_vector: size mismatch (correction pass only, not resize)");
+        additive_u = v;
+    }
+    inline const std::vector<value_type>& get_additive_v_raw_vector() const { return additive_v; }
+    inline void set_additive_v_raw_vector(const std::vector<value_type>& v) {
+        if (v.size() != additive_v.size())
+            throw std::invalid_argument("set_additive_v_raw_vector: size mismatch (correction pass only, not resize)");
+        additive_v = v;
     }
 
     // AQRS per-channel gamma for the additive branch (task #273/#282-283,

@@ -542,6 +542,13 @@ public:
     void set_additive_v_raw_k(S col, S k, V v) {
         weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
     }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_additive_u_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
 
     // AQRS dynamic rank control (task #291): thin Python-facing wrappers
     // over weights.apply_dynamic_rank_control/apply_additive_dynamic_
@@ -919,6 +926,13 @@ public:
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
     void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
+    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
+    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
+    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
     // Combined rank-N scale S(row,col) -- THE quantity Hadamard-multiplied
     // against quant in both forward and backward.
     V get_scale(S row, S col) const { return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col)); }
@@ -1445,6 +1459,13 @@ public:
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
     void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
+    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
+    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
+    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
 
     // AQRS additive branch -- see SparseLinearLayerImpl's own (FP4)
     // identical block for the full rationale. This is what task #280
@@ -1469,6 +1490,12 @@ public:
     void set_additive_v_raw_k(S col, S k, V v) {
         weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
     }
+    // Bulk raw-vector accessors -- see weights.get_additive_u_raw_vector's
+    // own docstring, delta_csr_types.hpp.
+    std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
 
     // AQRS dynamic rank control (task #291) -- same as SparseLinearLayer
     // (FP4)'s own copy above, see its docstring for the full rationale.
@@ -1760,6 +1787,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayer::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayer::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
         .def("seed_dynamic_rank_rng", &SparseLinearLayer::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
@@ -1870,6 +1906,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_output_scale_k",   &SparseLinearLayer::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_raw_vector", &SparseLinearLayer::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayer::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayer::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def("get_scale",            &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
@@ -2522,6 +2567,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayerDeterministic::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayerDeterministic::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayerDeterministic::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayerDeterministic::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
         .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
@@ -2621,6 +2675,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_output_scale_k",   &SparseLinearLayerDeterministic::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayerDeterministic::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_raw_vector", &SparseLinearLayerDeterministic::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayerDeterministic::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayerDeterministic::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayerDeterministic::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def("get_scale",            &SparseLinearLayerDeterministic::get_scale, py::arg("row"), py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
@@ -3365,6 +3428,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))
         .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayer8::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer8::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayer8::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer8::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
         .def("seed_dynamic_rank_rng", &SparseLinearLayer8::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer8::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
@@ -3389,6 +3461,15 @@ PYBIND11_MODULE(_cpu, m)
              "entirely until now (a plain oversight, not a real engine gap: the\n"
              "underlying SparseLinearWeightsDelta storage and FP8 block4 backward\n"
              "were already full rank-N).")
+        .def("get_value_scale_raw_vector", &SparseLinearLayer8::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer8::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayer8::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayer8::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
             return py::array_t<SparseLinearLayer8::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
