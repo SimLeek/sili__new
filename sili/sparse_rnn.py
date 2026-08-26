@@ -334,6 +334,21 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
+    """Default scale_rank_max/additive_rank_max (task #295): the cap at
+    which, if every layer's rank grew all the way to it, the AQRS scale
+    envelope's own parameter count would roughly match one dense fp32
+    matrix of the same shape -- direct instruction's own worked example:
+    32x32 -> 1024 fp32-equivalent elements -> 1024/4 (fp4 bytes-per-fp32)
+    = 256 -> 256/32 = 8, so cap = min(n_in, n_out) // 4. Only an exact
+    match for square layers; non-square layers get a smaller,
+    min-dimension-driven cap -- a conservative default, not a precisely
+    derived one (per-layer/per-model tuning is still expected on top,
+    hence scale_rank_max/additive_rank_max being real constructor
+    overrides here rather than a hardcoded formula call)."""
+    return max(1, min(n_inputs, n_outputs) // 4)
+
+
 def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
                      rng: Optional[np.random.Generator] = None,
                      scale: float = 0.05) -> None:
@@ -605,7 +620,9 @@ class DISLDOLayer(_SparseLayerBase):
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
                  dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0, dynamic_rank_control: bool = False):
+                 additive_rank: int = 0, dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -613,6 +630,14 @@ class DISLDOLayer(_SparseLayerBase):
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        # Policy cap raised BEFORE seeding -- set_scale_rank/set_additive_rank
+        # (called inside _seed_scale_rank/_seed_additive_rank below) validate
+        # rank<=scale_rank_max/additive_rank_max (task #295), so a caller
+        # requesting scale_rank/additive_rank above the default cap=4 needs
+        # the cap raised first. None means "use the default formula".
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
         if dynamic_rank_control:
@@ -757,7 +782,9 @@ class DISLDOLayerDeterministic(DISLDOLayer):
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
                  dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0, dynamic_rank_control: bool = False):
+                 additive_rank: int = 0, dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -765,6 +792,9 @@ class DISLDOLayerDeterministic(DISLDOLayer):
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
         if dynamic_rank_control:
@@ -895,13 +925,18 @@ class DISLDOLayer8(_SparseLayerBase):
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
                  dense: bool = False, scale_rank: int = 1, additive_rank: int = 0,
-                 dynamic_rank_control: bool = False):
+                 dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
                                                     quantize_fn=_cpu.fp8_quantize_array)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         # scale_rank was never threaded here before -- confirmed missing
         # (unlike DISLDOLayer/DISLDOLayerDeterministic's own
         # _seed_scale_rank call) while wiring up a real-engine rank1/rank2
