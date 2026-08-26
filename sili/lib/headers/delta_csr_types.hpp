@@ -1454,6 +1454,24 @@ struct SparseLinearWeightsDelta {
     // tracked as a follow-up, not fixed here.
     std::size_t scale_rank = 1;
 
+    // AQRS dynamic rank control (task #292 fix): per-branch cooldown
+    // counter -- calls since the LAST rank mutation of EITHER kind
+    // (apoptosis or neurogenesis), not just a per-channel apoptosis-only
+    // age check. AQRS_DESIGN.md's own Theorem 10 text says the
+    // tau_death/tau_active hysteresis gap is what "stops a channel from
+    // immediately regrowing the instant it's pruned" -- but that only
+    // holds if gamma's own per-step movement is small relative to the
+    // gap; a real MQAR run showed gamma's raw gradient can be large
+    // enough to jump the whole gap in one step, defeating it. This
+    // counter is the belt-and-suspenders fix: BOTH apoptosis and
+    // neurogenesis are additionally gated on grace_period_steps calls
+    // having passed since the last mutation (symmetric, not just
+    // apoptosis-only as before), same interim "age-gate" approach used
+    // instead of a full energy/resource-cost-tied refractory period
+    // (direct instruction: age-gate is fine for now, keep it a real
+    // tunable parameter).
+    uint32_t scale_rank_calls_since_mutation = UINT32_MAX;
+
     // Same per-row design, for STORED weight values instead of importance.
     // Same motivation, same lazy-sizing/default-1.0 pattern, same
     // read/write convention (true_w = stored_w * scale). Storage is now
@@ -1756,6 +1774,9 @@ struct SparseLinearWeightsDelta {
     // guessed-then-duplicated state this project's own "don't duplicate
     // code" instruction was warning against.
     std::size_t additive_rank = 0;
+    // Same cooldown counter as scale_rank_calls_since_mutation above, own
+    // copy since the two branches mutate independently.
+    uint32_t additive_rank_calls_since_mutation = UINT32_MAX;
     std::vector<value_type> additive_u;  // row-major per-component: additive_u[row*additive_rank+k]
     std::vector<value_type> additive_v;  // row-major per-component: additive_v[col*additive_rank+k]
 
@@ -2064,19 +2085,45 @@ public:
     // additive-branch equivalent.
     template <typename AgeFn, typename ApoptoseCheckFn, typename NeurogenesisCheckFn,
               typename DoApoptoseFn, typename DoNeurogenesisFn>
+    // calls_since_mutation: symmetric branch-level cooldown (task #292
+    // fix -- direct user instruction, "age-gate is good for now, expose
+    // the option"). The per-channel age_of() gate below already protects
+    // a freshly-grown channel from being immediately apoptosed (see this
+    // function's callers' own docstrings for the original bug that
+    // fixed), but nothing previously stopped the SYMMETRIC case: a real
+    // 60k-step MQAR run showed gamma's own gradient can be large enough
+    // to jump the tau_death/tau_active hysteresis gap in a single step,
+    // so a channel could apoptose then immediately regrow (or vice
+    // versa) every few calls -- 1464 mutations in 3000 steps, observed
+    // directly. Gating BOTH apoptosis and neurogenesis behind "at least
+    // grace_period_steps calls since the LAST mutation of either kind"
+    // gives every mutation a real minimum window to matter before the
+    // branch can change again, regardless of how large gamma's raw
+    // gradient turns out to be. Passed by reference and owned by the
+    // caller (scale_rank_calls_since_mutation/additive_rank_calls_since_
+    // mutation) since scale and additive branches cool down
+    // independently. Initial value UINT32_MAX (not 0) so a freshly
+    // constructed layer's first-ever qualifying mutation isn't blocked
+    // by a phantom cooldown; guarded against wraparound since a long
+    // idle run would otherwise increment past UINT32_MAX.
     static bool apply_dynamic_rank_control_generic(std::size_t rank, std::size_t min_rank,
                                                      std::size_t max_rank, uint32_t grace_period_steps,
+                                                     uint32_t& calls_since_mutation,
                                                      AgeFn age_of, ApoptoseCheckFn should_apoptose,
                                                      NeurogenesisCheckFn should_neurogenesis,
                                                      DoApoptoseFn do_apoptose, DoNeurogenesisFn do_neurogenesis) {
+        if (calls_since_mutation < UINT32_MAX) ++calls_since_mutation;
+        if (calls_since_mutation < grace_period_steps) return false;
         for (std::size_t k = 0; k < rank; ++k) {
             if (rank > min_rank && age_of(k) >= grace_period_steps && should_apoptose(k)) {
                 do_apoptose(k);
+                calls_since_mutation = 0;
                 return true;
             }
         }
         if (rank < max_rank && should_neurogenesis()) {
             do_neurogenesis();
+            calls_since_mutation = 0;
             return true;
         }
         return false;
@@ -2130,6 +2177,7 @@ public:
                                             uint32_t grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
             scale_rank, /*min_rank=*/std::size_t(1), SCALE_RANK_MAX, grace_period_steps,
+            scale_rank_calls_since_mutation,
             [&](std::size_t k) { return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return scale_gamma_should_apoptose(k, tau_death); },
             [&]() { return scale_gamma_should_neurogenesis(scale_rank, tau_active, theta); },
@@ -2166,6 +2214,7 @@ public:
                                                      uint32_t grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
             additive_rank, /*min_rank=*/std::size_t(0), ADDITIVE_RANK_MAX, grace_period_steps,
+            additive_rank_calls_since_mutation,
             [&](std::size_t k) { return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return additive_gamma_should_apoptose(k, tau_death); },
             [&]() { return additive_gamma_should_neurogenesis(additive_rank, tau_active, theta); },

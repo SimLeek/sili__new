@@ -554,6 +554,24 @@ public:
             [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
     }
 
+    // AQRS gamma raw get/set + EMA diagnostics (task #293 fix): these
+    // were never exposed via pybind despite apply_dynamic_rank_control/
+    // apply_additive_dynamic_rank_control being bound (task #291), so
+    // sparse_rnn.py's _activate_gamma_tracking (which needs
+    // set_scale_gamma_raw_k/set_additive_gamma_raw_k to exist) was
+    // silently a no-op -- gamma tracking never actually turned on, so
+    // the dynamic-rank triggers never had live EMA data to evaluate.
+    // Found via a real 60k-step MQAR curriculum run showing 0 rank
+    // mutations in both fp8 and fp4 the entire run.
+    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
+    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
+    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
     py::array_t<V> forward_dense(py::array_t<V> x) {
@@ -1441,6 +1459,19 @@ public:
             [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
     }
 
+    // AQRS gamma raw get/set + EMA diagnostics -- same as SparseLinearLayer
+    // (FP4)'s own copy above, see its comment for the full rationale
+    // (task #293 fix: these were never exposed via pybind, so gamma
+    // tracking never actually activated).
+    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
+    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
+    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1695,6 +1726,17 @@ PYBIND11_MODULE(_cpu, m)
              "10 machinery, additive_gamma/additive_u/additive_v instead of scale_gamma/\n"
              "value_scale/output_scale. min_rank=0 (the additive branch can legitimately\n"
              "shrink itself back to fully off, unlike scale_rank's floor of 1).")
+        .def("get_scale_gamma_k",              &SparseLinearLayer::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayer::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"),
+             "Also flips scale_gamma_is_trainable=true (see get_scale_gamma_k's own\n"
+             "docstring) -- call this once before relying on apply_dynamic_rank_control,\n"
+             "e.g. set_scale_gamma_raw_k(0, 1.0) activates tracking transparently.")
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayer::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayer::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -2422,6 +2464,14 @@ PYBIND11_MODULE(_cpu, m)
         .def("apply_additive_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
              py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("get_scale_gamma_k",              &SparseLinearLayerDeterministic::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayerDeterministic::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayerDeterministic::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayerDeterministic::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayerDeterministic::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayerDeterministic::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayerDeterministic::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayerDeterministic::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -3241,6 +3291,14 @@ PYBIND11_MODULE(_cpu, m)
         .def("apply_additive_dynamic_rank_control", &SparseLinearLayer8::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
              py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("get_scale_gamma_k",              &SparseLinearLayer8::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayer8::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer8::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer8::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayer8::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayer8::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer8::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer8::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
         .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
