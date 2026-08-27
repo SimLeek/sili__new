@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -486,12 +487,118 @@ public:
     // verified rank-N this session -- the "block4 remains rank-1-only"
     // note that used to be here was stale).
     std::size_t get_scale_rank() const { return weights.scale_rank; }
-    void set_scale_rank(std::size_t rank) {
-        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
-        if (rank > decltype(weights)::SCALE_RANK_MAX)
-            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
-        weights.scale_rank = rank;
+    // Forwards to the struct's own set_scale_rank (delta_csr_types.hpp) --
+    // that method now does a SAFE reshuffle of existing multi-row scale
+    // data, not just a bare field assignment; validation lives there too
+    // so it's shared by every caller (struct-direct C++ callers included),
+    // not duplicated here (see conversation, task #275).
+    void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
+    // Runtime-settable policy cap (task #295) -- replaces the old
+    // compile-time SCALE_RANK_MAX=4 constant. Default 4 (unchanged
+    // behavior for any caller that never touches this); raise it to
+    // allow scale_rank to grow past 4, no hardcoded ceiling anymore --
+    // block4's SIMD backward path now uses persistent heap scratch
+    // (weights.scale_rank_scratch) that grows to fit whatever rank is
+    // actually used.
+    std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
+    void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
+    // Explicit scratch-memory control, independent of the policy cap
+    // above -- reserve ahead of need (preallocate once, no reallocation
+    // during training) or shrink back down (free capacity a layer grew
+    // into early on and no longer needs). rank/threads must not be
+    // smaller than what's currently actually in use.
+    void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank) {
+        weights.reserve_scale_rank_scratch(threads, rank, BLOCK4_TILE);
     }
+
+    // AQRS additive branch (task #278, see sili_peridot/AQRS_DESIGN.md):
+    // A[row,col] = sum_k additive_u_k(row,k)*additive_v_k(col,k), ADDED
+    // (not Hadamard-multiplied like value_scale/output_scale above) to
+    // the effective weight -- structurally necessary whenever a
+    // quantized weight lands on the zero sentinel code (Theorem 3/4),
+    // where the multiplicative branch's own gradient is exactly zero at
+    // any rank. Default additive_rank=0 (branch fully off, matches
+    // set_additive_rank's own docstring) -- every existing caller is
+    // unaffected until this is explicitly engaged. disldo_forward/
+    // disldo_backward already pick it up automatically whenever
+    // additive_rank>0, same transparent pattern as scale_rank above; no
+    // separate function call needed to "activate" it beyond growing the
+    // rank past 0.
+    std::size_t get_additive_rank() const { return weights.additive_rank; }
+    void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    // Runtime-settable policy cap (task #295), same pattern as
+    // scale_rank_max above.
+    std::size_t get_additive_rank_max() const { return weights.get_additive_rank_max(); }
+    void set_additive_rank_max(std::size_t new_max) { weights.set_additive_rank_max(new_max); }
+    V get_additive_u_k(S row, S k) const {
+        return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
+    }
+    void set_additive_u_raw_k(S row, S k, V v) {
+        weights.set_additive_u_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v);
+    }
+    V get_additive_v_k(S col, S k) const {
+        return weights.get_additive_v_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k));
+    }
+    void set_additive_v_raw_k(S col, S k, V v) {
+        weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
+    }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_additive_u_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
+
+    // AQRS dynamic rank control (task #291): thin Python-facing wrappers
+    // over weights.apply_dynamic_rank_control/apply_additive_dynamic_
+    // rank_control (delta_csr_types.hpp), which are C++ templates taking
+    // a caller-supplied seed callback -- not directly bindable to pybind.
+    // A per-instance RNG (not a Python callback) supplies the new
+    // channel's seed, matching the SAME "small deterministic-ish nonzero
+    // value just to break the symmetric zero-init deadlock" convention
+    // this codebase's own Python _seed_scale_rank/_seed_additive_rank
+    // helpers already use (Theorem 9's real residual-aligned seeding is
+    // still an open research question, not implemented anywhere yet --
+    // see apply_dynamic_rank_control's own docstring). Returns true if a
+    // mutation (apoptosis or neurogenesis) actually happened this call.
+    std::mt19937 _dynamic_rank_rng{std::random_device{}()};
+    void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+    bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+
+    // AQRS gamma raw get/set + EMA diagnostics (task #293 fix): these
+    // were never exposed via pybind despite apply_dynamic_rank_control/
+    // apply_additive_dynamic_rank_control being bound (task #291), so
+    // sparse_rnn.py's _activate_gamma_tracking (which needs
+    // set_scale_gamma_raw_k/set_additive_gamma_raw_k to exist) was
+    // silently a no-op -- gamma tracking never actually turned on, so
+    // the dynamic-rank triggers never had live EMA data to evaluate.
+    // Found via a real 60k-step MQAR curriculum run showing 0 rank
+    // mutations in both fp8 and fp4 the entire run.
+    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
+    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
+    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
@@ -819,6 +926,13 @@ public:
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
     void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
+    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
+    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
+    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
     // Combined rank-N scale S(row,col) -- THE quantity Hadamard-multiplied
     // against quant in both forward and backward.
     V get_scale(S row, S col) const { return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col)); }
@@ -1327,16 +1441,96 @@ public:
     // process_tile's FP8 branch in linear_disldo.hpp), so this was purely
     // a missing pybind-facing wrapper, not missing engine support.
     std::size_t get_scale_rank() const { return weights.scale_rank; }
-    void set_scale_rank(std::size_t rank) {
-        if (rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
-        if (rank > decltype(weights)::SCALE_RANK_MAX)
-            throw std::invalid_argument("scale_rank exceeds SCALE_RANK_MAX (block4's SIMD backward path uses fixed-size stack arrays sized to it)");
-        weights.scale_rank = rank;
+    // Forwards to the struct's own set_scale_rank (delta_csr_types.hpp) --
+    // that method now does a SAFE reshuffle of existing multi-row scale
+    // data, not just a bare field assignment; validation lives there too
+    // so it's shared by every caller (struct-direct C++ callers included),
+    // not duplicated here (see conversation, task #275).
+    void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
+    // Runtime-settable policy cap + explicit scratch control -- see
+    // SparseLinearLayerImpl's (FP4) identical block for the full
+    // rationale (task #295).
+    std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
+    void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
+    void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank) {
+        weights.reserve_scale_rank_scratch(threads, rank, BLOCK4_TILE);
     }
     V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
     V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
     void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
     void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
+    // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
+    // docstring, delta_csr_types.hpp.
+    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
+    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
+    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
+    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
+
+    // AQRS additive branch -- see SparseLinearLayerImpl's own (FP4)
+    // identical block for the full rationale. This is what task #280
+    // actually re-validates against (the fp8 MQAR "mumbling"/input-
+    // independent-collapse case), so FP8 needs this every bit as much as
+    // FP4's own copy above.
+    std::size_t get_additive_rank() const { return weights.additive_rank; }
+    void set_additive_rank(std::size_t rank) { weights.set_additive_rank(rank); }
+    // Runtime-settable policy cap (task #295), same pattern as
+    // scale_rank_max above.
+    std::size_t get_additive_rank_max() const { return weights.get_additive_rank_max(); }
+    void set_additive_rank_max(std::size_t new_max) { weights.set_additive_rank_max(new_max); }
+    V get_additive_u_k(S row, S k) const {
+        return weights.get_additive_u_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k));
+    }
+    void set_additive_u_raw_k(S row, S k, V v) {
+        weights.set_additive_u_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v);
+    }
+    V get_additive_v_k(S col, S k) const {
+        return weights.get_additive_v_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k));
+    }
+    void set_additive_v_raw_k(S col, S k, V v) {
+        weights.set_additive_v_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v);
+    }
+    // Bulk raw-vector accessors -- see weights.get_additive_u_raw_vector's
+    // own docstring, delta_csr_types.hpp.
+    std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
+
+    // AQRS dynamic rank control (task #291) -- same as SparseLinearLayer
+    // (FP4)'s own copy above, see its docstring for the full rationale.
+    std::mt19937 _dynamic_rank_rng{std::random_device{}()};
+    void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+    bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
+                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+        std::normal_distribution<V> dist(V(0), seed_scale);
+        const std::size_t n_rows = weights.connections.layout.rows;
+        const std::size_t n_cols = weights.connections.layout.cols;
+        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+    }
+
+    // AQRS gamma raw get/set + EMA diagnostics -- same as SparseLinearLayer
+    // (FP4)'s own copy above, see its comment for the full rationale
+    // (task #293 fix: these were never exposed via pybind, so gamma
+    // tracking never actually activated).
+    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
+    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
+    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
+    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
+    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
 
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
@@ -1566,6 +1760,68 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("num_cpus") = 4)
         .def("get_scale_rank",       &SparseLinearLayer::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayer::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayer::get_additive_rank,
+             "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
+             "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
+             "necessary whenever a quantized weight lands on the zero sentinel\n"
+             "code, where the multiplicative rank-N scale's own gradient is\n"
+             "exactly zero at any rank. additive_rank defaults to 0 (fully off).")
+        .def("set_additive_rank",    &SparseLinearLayer::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayer::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayer::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayer::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayer::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayer::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
+        .def("get_additive_u_k",     &SparseLinearLayer::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayer::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayer::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
+        .def("seed_dynamic_rank_rng", &SparseLinearLayer::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayer::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             "AQRS Theorem 10 dynamic rank control for the multiplicative (scale) branch --\n"
+             "evaluates apoptosis/neurogenesis triggers against the EMA state (updated\n"
+             "automatically every backward call) and performs at most one mutation.\n"
+             "Returns True if a mutation happened this call.")
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             "Additive-branch counterpart to apply_dynamic_rank_control -- same Theorem\n"
+             "10 machinery, additive_gamma/additive_u/additive_v instead of scale_gamma/\n"
+             "value_scale/output_scale. min_rank=0 (the additive branch can legitimately\n"
+             "shrink itself back to fully off, unlike scale_rank's floor of 1).")
+        .def("get_scale_gamma_k",              &SparseLinearLayer::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayer::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"),
+             "Also flips scale_gamma_is_trainable=true (see get_scale_gamma_k's own\n"
+             "docstring) -- call this once before relying on apply_dynamic_rank_control,\n"
+             "e.g. set_scale_gamma_raw_k(0, 1.0) activates tracking transparently.")
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayer::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayer::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
@@ -1650,6 +1906,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_output_scale_k",   &SparseLinearLayer::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_raw_vector", &SparseLinearLayer::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayer::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayer::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def("get_scale",            &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
@@ -1790,8 +2055,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2018,8 +2283,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerResync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResync::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerResync::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerResync::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResync::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2247,8 +2512,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerNoScale::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScale::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerNoScale::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerNoScale::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScale::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2280,6 +2545,52 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("num_cpus") = 4)
         .def("get_scale_rank",       &SparseLinearLayerDeterministic::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayerDeterministic::get_additive_rank)
+        .def("set_additive_rank",    &SparseLinearLayerDeterministic::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayerDeterministic::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayerDeterministic::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayerDeterministic::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayerDeterministic::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayerDeterministic::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
+        .def("get_additive_u_k",     &SparseLinearLayerDeterministic::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayerDeterministic::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayerDeterministic::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayerDeterministic::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayerDeterministic::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
+        .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("get_scale_gamma_k",              &SparseLinearLayerDeterministic::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayerDeterministic::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayerDeterministic::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayerDeterministic::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayerDeterministic::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayerDeterministic::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayerDeterministic::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayerDeterministic::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
@@ -2364,6 +2675,15 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_output_scale_k",   &SparseLinearLayerDeterministic::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayerDeterministic::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
         .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_raw_vector", &SparseLinearLayerDeterministic::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayerDeterministic::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayerDeterministic::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayerDeterministic::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def("get_scale",            &SparseLinearLayerDeterministic::get_scale, py::arg("row"), py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
@@ -2493,8 +2813,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2721,8 +3041,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerResyncDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResyncDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerResyncDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerResyncDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResyncDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -2948,8 +3268,8 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayerNoScaleDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScaleDeterministic::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayerNoScaleDeterministic::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayerNoScaleDeterministic::block4,
-             py::keep_alive<0, 1>(),
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScaleDeterministic::block4,
+             py::keep_alive<0, 1>()),
              "Purely observational view onto this layer's block4 storage --"
              " layer.block4.tiles / layer.block4.synapses.")
         .def_property_readonly("last_input",
@@ -3011,7 +3331,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
-        .def_property_readonly("block4",    &DISLDOLayerV::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 
     // ── SparseLinearLayer8 ───────────────────────────────────────────────────
     py::class_<SparseLinearLayer8>(m, "SparseLinearLayer8")
@@ -3079,6 +3399,59 @@ PYBIND11_MODULE(_cpu, m)
              "the \"SCATTERED CSR ONLY\" note that used to be here was stale).")
         .def("get_scale_rank",       &SparseLinearLayer8::get_scale_rank)
         .def("set_scale_rank",       &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank",    &SparseLinearLayer8::get_additive_rank,
+             "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
+             "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
+             "necessary whenever a quantized weight lands on the zero sentinel\n"
+             "code, where the multiplicative rank-N scale's own gradient is\n"
+             "exactly zero at any rank. additive_rank defaults to 0 (fully off).\n"
+             "This is the branch task #280 re-validates against the fp8 MQAR\n"
+             "input-independent-collapse case.")
+        .def("set_additive_rank",    &SparseLinearLayer8::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max",    &SparseLinearLayer8::get_scale_rank_max)
+        .def("set_scale_rank_max",    &SparseLinearLayer8::set_scale_rank_max, py::arg("new_max"),
+             "Runtime policy cap (task #295) -- replaces the old\n"
+             "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
+             "set_scale_rank/apply_dynamic_rank_control can grow past\n"
+             "the old hardcoded ceiling -- block4's SIMD path now uses\n"
+             "heap scratch that grows to fit whatever rank is used.")
+        .def("get_additive_rank_max", &SparseLinearLayer8::get_additive_rank_max)
+        .def("set_additive_rank_max", &SparseLinearLayer8::set_additive_rank_max, py::arg("new_max"))
+        .def("reserve_scale_rank_scratch", &SparseLinearLayer8::reserve_scale_rank_scratch,
+             py::arg("threads"), py::arg("rank"),
+             "Explicit scratch-memory control, independent of the\n"
+             "policy cap above -- preallocate ahead of need (no\n"
+             "reallocation during training) or shrink back down (free\n"
+             "capacity a layer grew into early on). threads/rank must\n"
+             "not be smaller than what is currently actually in use.")
+        .def("get_additive_u_k",     &SparseLinearLayer8::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector", &SparseLinearLayer8::get_additive_u_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer8::set_additive_u_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("get_additive_v_raw_vector", &SparseLinearLayer8::get_additive_v_raw_vector,
+             "Flat [n_out*additive_rank], row-major.")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer8::set_additive_v_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over additive_v (not a resize).")
+        .def("seed_dynamic_rank_rng", &SparseLinearLayer8::seed_dynamic_rank_rng, py::arg("seed"))
+        .def("apply_dynamic_rank_control", &SparseLinearLayer8::apply_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer8::apply_additive_dynamic_rank_control,
+             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
+             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+        .def("get_scale_gamma_k",              &SparseLinearLayer8::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k",          &SparseLinearLayer8::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer8::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer8::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k",           &SparseLinearLayer8::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k",       &SparseLinearLayer8::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer8::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer8::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
         .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
         .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
@@ -3088,6 +3461,15 @@ PYBIND11_MODULE(_cpu, m)
              "entirely until now (a plain oversight, not a real engine gap: the\n"
              "underlying SparseLinearWeightsDelta storage and FP8 block4 backward\n"
              "were already full rank-N).")
+        .def("get_value_scale_raw_vector", &SparseLinearLayer8::get_value_scale_raw_vector,
+             "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
+             "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer8::set_value_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("get_output_scale_raw_vector", &SparseLinearLayer8::get_output_scale_raw_vector,
+             "Flat [n_out*scale_rank], row-major.")
+        .def("set_output_scale_raw_vector", &SparseLinearLayer8::set_output_scale_raw_vector, py::arg("v"),
+             "Size-preserving correction pass over output_scale (not a resize).")
         .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
             return py::array_t<SparseLinearLayer8::S>(
                 {(py::ssize_t)self.weights.out_degree.size()},
@@ -3099,7 +3481,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8Resync: exact SparseLinearLayer8 API, but the real
     // DeferredScaleWrite fix (value_scale/output_scale stay consistent with
@@ -3165,7 +3547,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8Resync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8Resync::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8Resync::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8AdaMax: exact SparseLinearLayer8 API, but with the
     // AdaMax-style decayed-running-max scale update (also with the
@@ -3232,7 +3614,7 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("n_inputs",  &SparseLinearLayer8AdaMax::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8AdaMax::n_outputs)
         .def_property_readonly("nnz",       &SparseLinearLayer8AdaMax::nnz)
-        .def_property_readonly("block4",    &SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>());
+        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>()));
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //

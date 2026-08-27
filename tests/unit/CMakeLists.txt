@@ -174,6 +174,14 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_fp8
     test_disldo_block4_promotion_fp8
     test_never_zero_live_quantize
+    test_aqrs_additive_branch
+    test_aqrs_rank_growth_shrink
+    test_aqrs_gamma
+    test_aqrs_dynamic_rank_control
+    test_aqrs_dynamic_rank_control_integration
+    test_aqrs_additive_gamma
+    test_aqrs_rank_scratch
+    test_aqrs_scale_overflow_guard
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

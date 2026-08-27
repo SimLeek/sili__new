@@ -334,6 +334,214 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     return per_row
 
 
+def _overflow_guard_array(arr: np.ndarray, clip: float, near: float, coef: float) -> np.ndarray:
+    """Elementwise, context-free correction for one AQRS scale/additive
+    channel array (value_scale, output_scale, additive_u, additive_v --
+    task #295 follow-up / task #286 "virtual neuron" exposure). Real bug
+    this fixes: get_scale()'s combined envelope S(row,col) = sum_k
+    gamma_k*value_scale_k*output_scale_k is an UNCLAMPED sum
+    (delta_csr_types.hpp) -- raising scale_rank_max/additive_rank_max
+    past the old hardcoded 4 let a real fp8 MQAR curriculum run's
+    per-channel scale values grow unbounded, overflowing S in the
+    forward pass and NaN-collapsing training (confirmed: the NaN onset
+    lined up exactly with a rank mutation on q_proj, see conversation).
+
+    Two parts, deliberately NOT a plain hard clip alone (direct
+    instruction: a hard clip's backward either gives zero gradient or
+    gradient computed from the wrong post-clip value once a channel is
+    pinned at the boundary -- neither tells upstream training "shrink
+    this"):
+
+    1. Auto-correcting shrink: once |value| exceeds `near`, subtract a
+       nudge proportional to the excess, always pointing back toward
+       zero -- exactly the gradient of a 0.5*coef*relu(|x|-near)^2
+       hinge-squared penalty, applied directly as a value-space
+       correction (these channels are C++-internal RMSprop-optimized
+       state, not Python Tensor autograd leaves, so there's no
+       backward pass to inject an extra gradient INTO -- this achieves
+       the same corrective effect one call later, which is sufficient
+       since S is fully rebuilt from these stored values every forward
+       call; nothing is lost by correcting between steps instead of
+       mid-forward).
+    2. Hard clip to `clip` as the final numerical-safety net (and
+       np.nan_to_num first, since a value that's ALREADY NaN/Inf
+       wouldn't be fixed by np.clip alone -- np.clip(nan,...)==nan).
+
+    `near` should sit comfortably below `clip` so the corrective nudge
+    has room to act before the hard clip ever engages. Per-channel, not
+    aggregate-S (direct instruction: chose this over clipping S itself)
+    -- each element is corrected independently with no knowledge of
+    other channels, so applying this as one vectorized numpy pass over
+    the whole array is exactly equivalent to "run the same correction
+    once per channel" (direct instruction) without the GIL/threading
+    cost of a literal per-element callback inside the hot C++ OpenMP
+    forward/backward loops."""
+    x = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=clip, neginf=-clip)
+    excess = np.maximum(np.abs(x) - near, 0.0)
+    corrected = x - coef * excess * np.sign(x)
+    return np.clip(corrected, -clip, clip).astype(np.float32)
+
+
+def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np.ndarray:
+    """Ongoing (every-step) diversity penalty for one AQRS channel array
+    (value_scale, output_scale, additive_u, additive_v -- direct
+    instruction: preferred over residual-targeted growth, since an
+    init-time-only fix doesn't stop channels drifting back toward
+    redundancy as training continues, whereas this is a per-step force).
+
+    Real problem this addresses: nothing else in the AQRS design
+    prevents two rank channels from converging to duplicate directions
+    -- neurogenesis's own health check (abs_gamma_k/grad_ema) is purely
+    magnitude-based, so a channel that's redundant with another reads
+    as "healthy" (real gradient, real magnitude) even though it adds no
+    new capacity. l1_sparsity_coef (sili_peridot) doesn't help either --
+    it penalizes the SUMMED output after every channel's already been
+    combined, with no visibility into the per-channel decomposition.
+
+    Standard soft-orthogonality regularizer, applied as a direct
+    gradient-descent step on Σ_{k1≠k2}(cos(M_k1,M_k2))^2 -- correlation
+    of DIRECTION only, magnitude excluded (see the "why not the
+    diagonal identity term" note below).
+
+    Real bug found running this against live training (real MQAR
+    curriculum, see conversation): the FIRST version of this function
+    used raw (non-normalized) columns, computing G=M^T@M and stepping
+    M -= coef*M@G_offdiag directly. For real channel magnitudes in the
+    10s-100s (exactly the range apply_scale_overflow_guard's own near/
+    clip thresholds exist to handle), G entries scale as O(n*mag^2)
+    and the correction scales as O(rank*n*mag^3) -- CUBIC in magnitude.
+    Every synthetic test used near-unit-magnitude vectors, where this
+    is negligible; against real training it exploded, and because
+    apply_channel_orthogonality_penalty was called AFTER apply_scale_
+    overflow_guard in the training loop, nothing sanitized the result
+    before it was stored -- NaN-collapsed a real fp8 run at step 12650,
+    even earlier than the original unguarded-envelope bug this whole
+    mechanism exists downstream of (task #295's own NaN, at step
+    38166). Confirmed by direct calculation before touching the fix:
+    n=128, clip=200, rank=32 gives a correction on the order of 1e10,
+    nowhere near "a small per-step nudge."
+
+    Fix: do the whole computation in NORMALIZED (unit-direction) space,
+    which is also the conceptually correct fix, not just a numerical
+    patch -- since the intent was always "penalize direction, not
+    magnitude" (see below), operating on unit vectors makes that
+    literal instead of incidental. u_k = M_k/||M_k||; gram = U^T@U has
+    entries bounded in [-1,1] (cosine similarities); the correction
+    direction u@gram_offdiag is then bounded by O(rank) regardless of
+    M's raw scale; the actual step re-scales that bounded direction by
+    each channel's OWN norm (||M_k||*coef*correction_dir), so the
+    update stays LINEAR in magnitude, not cubic, while still moving
+    faster for a channel that's already larger (a natural,
+    scale-consistent step size, not an arbitrary fixed one). A
+    near-zero-norm channel is guarded by max(norm, 1e-6) in the
+    denominator -- deliberately not a "there's now a NaN so patch it"
+    reflex, this floor makes the whole computation provably finite
+    (Cauchy-Schwarz bounds every normalized component by 1) rather
+    than relying on a defensive nan_to_num to catch what the raw-scale
+    version couldn't.
+
+    Gram's diagonal is zeroed (a channel's own norm isn't penalized,
+    only its correlation with OTHERS) -- this is the off-diagonal part
+    of the classic ||M^T@M - I||^2 soft-orthogonality loss; the
+    diagonal identity term (which would additionally push every
+    channel toward UNIT norm) is deliberately excluded, since AQRS's
+    own gamma_k already exists specifically to control channel
+    magnitude separately from direction -- including it here would
+    fight gamma for the same job.
+
+    Cheap (O(rank^2*n)) since it only depends on the CURRENT parameter
+    values, not on any batch's dy/x -- unlike residual-targeted
+    growth, needs no new C++ state or hot-loop hook, which is why this
+    was chosen over that design (direct instruction: "sounds easier").
+
+    rank<=1 is a natural no-op (single channel, no off-diagonal terms
+    exist), matching every other AQRS mechanism's own "no-op at the
+    degenerate rank" convention -- deliberately not special-cased.
+
+    Known, accepted limitation: if two channels are ever EXACTLY
+    identical (a genuine float tie, not just highly correlated), the
+    correction each receives is identical too (scale-invariant --
+    cosine similarity can't change), so this can only shrink an exact
+    tie uniformly, never truly separate it -- a symmetric fixed point
+    of the pairwise-correlation objective. Not expected to matter in
+    practice: growth already seeds new channels with independent
+    random noise (_seed_scale_rank/_seed_additive_rank's own
+    symmetry-breaking), so real channels essentially never reach an
+    exact float tie; this penalty's actual job is stopping the
+    ONGOING drift of already-distinct channels toward redundancy
+    during training, which it does regardless."""
+    if rank <= 1:
+        return flat
+    n = flat.size // rank
+    m = np.asarray(flat, dtype=np.float32).reshape(n, rank)
+    norms = np.linalg.norm(m, axis=0, keepdims=True)  # [1, rank]
+    u = m / np.maximum(norms, 1e-6)  # unit-direction columns, provably finite
+    gram = u.T @ u  # cosine similarities, entries in [-1, 1]
+    np.fill_diagonal(gram, 0.0)
+    correction_dir = u @ gram  # bounded by ~rank regardless of M's raw scale
+    m_new = m - coef * norms * correction_dir  # step scales linearly with each channel's own magnitude
+    return m_new.reshape(-1).astype(np.float32)
+
+
+def _apply_channel_orthogonality_penalty(c, coef: float) -> None:
+    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
+    DISLDOLayer8's apply_channel_orthogonality_penalty -- see
+    _orthogonality_penalty_array's own docstring for the full
+    rationale. Same "skip when empty" convention as
+    _apply_scale_overflow_guard (additive_u/v are empty at
+    additive_rank==0)."""
+    scale_rank = c.get_scale_rank()
+    vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
+    if vs.size:
+        c.set_value_scale_raw_vector(_orthogonality_penalty_array(vs, scale_rank, coef).tolist())
+    os_ = np.asarray(c.get_output_scale_raw_vector(), dtype=np.float32)
+    if os_.size:
+        c.set_output_scale_raw_vector(_orthogonality_penalty_array(os_, scale_rank, coef).tolist())
+    additive_rank = c.get_additive_rank()
+    au = np.asarray(c.get_additive_u_raw_vector(), dtype=np.float32)
+    if au.size:
+        c.set_additive_u_raw_vector(_orthogonality_penalty_array(au, additive_rank, coef).tolist())
+    av = np.asarray(c.get_additive_v_raw_vector(), dtype=np.float32)
+    if av.size:
+        c.set_additive_v_raw_vector(_orthogonality_penalty_array(av, additive_rank, coef).tolist())
+
+
+def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> None:
+    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
+    DISLDOLayer8's apply_scale_overflow_guard -- see
+    _overflow_guard_array's own docstring for the full rationale.
+    Applies to all four AQRS channel arrays (skips additive_u/v when
+    additive_rank==0, matching every other AQRS call site's own "no-op
+    at rank 0" convention)."""
+    vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
+    if vs.size:
+        c.set_value_scale_raw_vector(_overflow_guard_array(vs, clip, near, coef).tolist())
+    os_ = np.asarray(c.get_output_scale_raw_vector(), dtype=np.float32)
+    if os_.size:
+        c.set_output_scale_raw_vector(_overflow_guard_array(os_, clip, near, coef).tolist())
+    au = np.asarray(c.get_additive_u_raw_vector(), dtype=np.float32)
+    if au.size:
+        c.set_additive_u_raw_vector(_overflow_guard_array(au, clip, near, coef).tolist())
+    av = np.asarray(c.get_additive_v_raw_vector(), dtype=np.float32)
+    if av.size:
+        c.set_additive_v_raw_vector(_overflow_guard_array(av, clip, near, coef).tolist())
+
+
+def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
+    """Default scale_rank_max/additive_rank_max (task #295): the cap at
+    which, if every layer's rank grew all the way to it, the AQRS scale
+    envelope's own parameter count would roughly match one dense fp32
+    matrix of the same shape -- direct instruction's own worked example:
+    32x32 -> 1024 fp32-equivalent elements -> 1024/4 (fp4 bytes-per-fp32)
+    = 256 -> 256/32 = 8, so cap = min(n_in, n_out) // 4. Only an exact
+    match for square layers; non-square layers get a smaller,
+    min-dimension-driven cap -- a conservative default, not a precisely
+    derived one (per-layer/per-model tuning is still expected on top,
+    hence scale_rank_max/additive_rank_max being real constructor
+    overrides here rather than a hardcoded formula call)."""
+    return max(1, min(n_inputs, n_outputs) // 4)
+
+
 def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
                      rng: Optional[np.random.Generator] = None,
                      scale: float = 0.05) -> None:
@@ -367,6 +575,80 @@ def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
     for col in range(n_outputs):
         for k in range(1, rank):
             c.set_output_scale_raw_k(col, k, float(rng.normal(0.0, scale)))
+
+
+def _seed_additive_rank(c, rank: int, n_inputs: int, n_outputs: int,
+                        rng: Optional[np.random.Generator] = None,
+                        scale: float = 0.05) -> None:
+    """Sets additive_rank on the C++ layer and seeds EVERY component
+    (k=0..rank-1, unlike _seed_scale_rank's k>=1) with small independent
+    random values on BOTH additive_u and additive_v.
+
+    Same chicken-and-egg deadlock as _seed_scale_rank, just additive
+    instead of multiplicative: disldo_backward's dU_rk depends on dP,
+    which is zero whenever every additive_v_k is zero (dP[b,k] = sum_c
+    dy*V[c,k]); symmetrically dV_ck depends on P, which is zero whenever
+    every additive_u_k is zero. additive_rank's own default (0.0 for both
+    U and V, see set_additive_rank's reshuffle in delta_csr_types.hpp) is
+    correct for k that's never been grown, but a caller growing rank at
+    construction time needs at least one side nonzero on every new
+    channel, same reasoning as scale_rank's k>=1 case -- seeding BOTH
+    sides independently is simplest and mirrors _seed_scale_rank exactly.
+
+    Unlike scale_rank, there's no k==0 "always on baseline channel" to
+    preserve -- additive_rank==0 is a true, fully transparent no-op (see
+    disldo_forward's own `if (weights.additive_rank > 0)` guard), so
+    every channel from k=0 gets seeded here, not just k>=1.
+    """
+    if rank <= 0:
+        return
+    if rng is None:
+        rng = np.random.default_rng()
+    c.set_additive_rank(rank)
+    for r in range(n_inputs):
+        for k in range(rank):
+            c.set_additive_u_raw_k(r, k, float(rng.normal(0.0, scale)))
+    for col in range(n_outputs):
+        for k in range(rank):
+            c.set_additive_v_raw_k(col, k, float(rng.normal(0.0, scale)))
+
+
+def _activate_gamma_tracking(c, additive_rank: int) -> None:
+    """Turns on EMA tracking for BOTH branches' gamma (task #292), which
+    is what makes apply_dynamic_rank_control/apply_additive_dynamic_rank_
+    control's Theorem 10 triggers actually evaluate against real,
+    updating signal instead of permanently-zero EMA state.
+
+    Gamma's own EMA only updates inside disldo_backward's gamma-update
+    block, itself gated on scale_gamma_is_trainable/additive_gamma_is_
+    trainable (opt-in flags, see get_scale_gamma_k's own docstring,
+    sili__new's delta_csr_types.hpp) -- set true only once set_scale_
+    gamma_raw_k/set_additive_gamma_raw_k has been called at least once.
+    Neither _seed_scale_rank nor _seed_additive_rank above ever touches
+    gamma, so a layer constructed via those alone has gamma tracking
+    permanently OFF regardless of scale_rank/additive_rank -- this is
+    the explicit "opt in" step, matching test_aqrs_dynamic_rank_control_
+    integration.cpp's own convention (see get_scale_gamma_k's docstring:
+    "explicitly touch gamma at k=0 BEFORE growing -- this is what puts
+    gamma into active use").
+
+    Writes gamma_k(0)=1.0 for BOTH branches -- the exact same value
+    get_scale_gamma_k's own lazy default already returns (transparent,
+    zero behavior change), and additive_gamma_k(0) likewise defaults
+    transparently to 1.0 (see that function's own corrected-default
+    docstring) -- so this call activates tracking WITHOUT perturbing
+    anything the layer was already computing. additive branch only gets
+    activated if additive_rank>0 (a rank-0 additive branch has no
+    channel 0 to touch, and apply_additive_dynamic_rank_control's own
+    neurogenesis trigger structurally can't fire from rank 0 anyway --
+    see GammaEMATracker::should_neurogenesis's own rank==0 guard -- so a
+    caller wanting the additive branch to ever grow under dynamic
+    control must seed it at rank>=1 up front, same as scale_rank).
+    """
+    if hasattr(c, "set_scale_gamma_raw_k"):
+        c.set_scale_gamma_raw_k(0, 1.0)
+    if additive_rank > 0 and hasattr(c, "set_additive_gamma_raw_k"):
+        c.set_additive_gamma_raw_k(0, 1.0)
 
 
 def _preseed_dense(c, n_inputs: int, n_outputs: int,
@@ -530,7 +812,10 @@ class DISLDOLayer(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
+                 additive_rank: int = 0, dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -538,7 +823,18 @@ class DISLDOLayer(_SparseLayerBase):
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        # Policy cap raised BEFORE seeding -- set_scale_rank/set_additive_rank
+        # (called inside _seed_scale_rank/_seed_additive_rank below) validate
+        # rank<=scale_rank_max/additive_rank_max (task #295), so a caller
+        # requesting scale_rank/additive_rank above the default cap=4 needs
+        # the cap raised first. None means "use the default formula".
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
@@ -603,6 +899,57 @@ class DISLDOLayer(_SparseLayerBase):
         out._backward = _bwd
         return out
 
+    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
+                                   theta: float = 1e-4, seed_scale: float = 0.05,
+                                   grace_period_steps: int = 50) -> bool:
+        """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
+        BOTH branches' apoptosis/neurogenesis triggers against their own
+        EMA state (updated automatically inside backward_dense/backward,
+        see disldo_backward's own gamma update block) and performs at
+        most one mutation PER BRANCH this call (so up to two total: one
+        multiplicative, one additive). Call once per training step, after
+        backward -- matches test_aqrs_dynamic_rank_control_integration.cpp's
+        own "breathing" integration test convention exactly, just from
+        Python. Returns True if either branch actually mutated.
+
+        theta's default (1e-4, task #294 fix) is tuned against the
+        gradient normalized by layer size (n_in*n_out) -- NOT the old
+        pre-normalization raw scale (which used to require theta~0.02
+        and made the trigger meaningless across differently-shaped
+        layers, since a 128x128 layer's raw gradient could be 9 orders
+        of magnitude larger than a 16x128 layer's for the same real
+        signal).
+        """
+        mutated_scale = self._c.apply_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        mutated_additive = self._c.apply_additive_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        return mutated_scale or mutated_additive
+
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
+                                    coef: float = 0.1) -> None:
+        """AQRS scale/additive channel numerical-safety pass (task #295
+        follow-up) -- see _overflow_guard_array's own docstring for the
+        full rationale. Call once per training step, any time after
+        backward (order relative to apply_dynamic_rank_control doesn't
+        matter -- this corrects VALUES, that mutates RANK, independent
+        concerns). Cheap: 4 bulk array round-trips per call, not
+        n*rank individual accessor calls."""
+        _apply_scale_overflow_guard(self._c, clip, near, coef)
+
+    def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
+        """AQRS channel-diversity pass -- see
+        _orthogonality_penalty_array's own docstring for the full
+        rationale (keeps rank channels from converging to duplicate
+        directions, on an ONGOING per-step basis, chosen over
+        residual-targeted growth since that only affects init and
+        channels can still drift back toward redundancy afterward).
+        Call once per training step, any time after backward
+        (independent of apply_scale_overflow_guard/apply_dynamic_rank_
+        control -- diversity, numerical safety, and rank mutation are
+        three separate concerns)."""
+        _apply_channel_orthogonality_penalty(self._c, coef)
+
 
 class DISLDOLayerResync(DISLDOLayer):
     """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
@@ -651,7 +998,10 @@ class DISLDOLayerDeterministic(DISLDOLayer):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False):
+                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
+                 additive_rank: int = 0, dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -659,7 +1009,13 @@ class DISLDOLayerDeterministic(DISLDOLayer):
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
 
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
@@ -785,19 +1141,34 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1):
+                 dense: bool = False, scale_rank: int = 1, additive_rank: int = 0,
+                 dynamic_rank_control: bool = False,
+                 scale_rank_max: Optional[int] = None,
+                 additive_rank_max: Optional[int] = None):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
                                                     quantize_fn=_cpu.fp8_quantize_array)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+        default_cap = _default_rank_cap(in_features, out_features)
+        self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
+        self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
         # scale_rank was never threaded here before -- confirmed missing
         # (unlike DISLDOLayer/DISLDOLayerDeterministic's own
         # _seed_scale_rank call) while wiring up a real-engine rank1/rank2
         # sweep across fp4/fp4_dual/fp8 (sili_peridot task #247); a rank2
         # FP8 arm would otherwise TypeError immediately.
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
+        # additive_rank: this is the branch task #280 re-validates against
+        # the fp8 MQAR input-independent-collapse ("mumbling") case -- see
+        # AQRS_DESIGN.md Theorem 3/4 and _seed_additive_rank's own
+        # docstring for why FP8's real-engine collapse (readout going
+        # input-independent) is exactly the scenario this branch exists
+        # to structurally fix.
+        _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
+        if dynamic_rank_control:
+            _activate_gamma_tracking(self._c, additive_rank)
 
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
@@ -828,6 +1199,33 @@ class DISLDOLayer8(_SparseLayerBase):
 
         out._backward = _bwd
         return out
+
+    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
+                                   theta: float = 1e-4, seed_scale: float = 0.05,
+                                   grace_period_steps: int = 50) -> bool:
+        """Same as DISLDOLayer's own apply_dynamic_rank_control (task
+        #292) -- duplicated here rather than shared via inheritance since
+        DISLDOLayer8 doesn't subclass DISLDOLayer (separate VALUES_TYPE
+        entirely), see this class's own docstring."""
+        mutated_scale = self._c.apply_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        mutated_additive = self._c.apply_additive_dynamic_rank_control(
+            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+        return mutated_scale or mutated_additive
+
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
+                                    coef: float = 0.1) -> None:
+        """Same as DISLDOLayer's own apply_scale_overflow_guard (task
+        #295 follow-up) -- duplicated for the same reason
+        apply_dynamic_rank_control above is (DISLDOLayer8 doesn't
+        subclass DISLDOLayer)."""
+        _apply_scale_overflow_guard(self._c, clip, near, coef)
+
+    def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
+        """Same as DISLDOLayer's own apply_channel_orthogonality_penalty
+        -- duplicated for the same reason apply_dynamic_rank_control
+        above is (DISLDOLayer8 doesn't subclass DISLDOLayer)."""
+        _apply_channel_orthogonality_penalty(self._c, coef)
 
 
 class DISLDOLayer8Resync(DISLDOLayer8):
