@@ -382,6 +382,84 @@ def _overflow_guard_array(arr: np.ndarray, clip: float, near: float, coef: float
     return np.clip(corrected, -clip, clip).astype(np.float32)
 
 
+def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np.ndarray:
+    """Ongoing (every-step) diversity penalty for one AQRS channel array
+    (value_scale, output_scale, additive_u, additive_v -- direct
+    instruction: preferred over residual-targeted growth, since an
+    init-time-only fix doesn't stop channels drifting back toward
+    redundancy as training continues, whereas this is a per-step force).
+
+    Real problem this addresses: nothing else in the AQRS design
+    prevents two rank channels from converging to duplicate directions
+    -- neurogenesis's own health check (abs_gamma_k/grad_ema) is purely
+    magnitude-based, so a channel that's redundant with another reads
+    as "healthy" (real gradient, real magnitude) even though it adds no
+    new capacity. l1_sparsity_coef (sili_peridot) doesn't help either --
+    it penalizes the SUMMED output after every channel's already been
+    combined, with no visibility into the per-channel decomposition.
+
+    Standard soft-orthogonality regularizer, applied as a direct
+    gradient-descent step on Σ_{k1≠k2}(M_k1·M_k2)^2 where M is the
+    [n, rank] channel matrix (reshaped from the flat row-major storage,
+    idx=row*rank+k -- same layout `_overflow_guard_array` operates on,
+    just needing `rank` to reshape into 2D first): compute the Gram
+    matrix G=M^T@M, zero its diagonal (a channel's own norm isn't
+    penalized, only its correlation with OTHERS), then step
+    M -= coef * M@G_offdiag. Cheap (O(rank^2*n)) since it only depends
+    on the CURRENT parameter values, not on any batch's dy/x -- unlike
+    residual-targeted growth, needs no new C++ state or hot-loop hook,
+    which is why this was chosen over that design (direct instruction:
+    "sounds easier").
+
+    rank<=1 is a natural no-op (single channel, no off-diagonal terms
+    exist), matching every other AQRS mechanism's own "no-op at the
+    degenerate rank" convention -- deliberately not special-cased.
+
+    Known, accepted limitation: if two channels are ever EXACTLY
+    identical (a genuine float tie, not just highly correlated), the
+    correction each receives is identical too (scale-invariant --
+    cosine similarity can't change), so this can only shrink an exact
+    tie uniformly, never truly separate it -- a symmetric fixed point
+    of the pairwise-correlation objective. Not expected to matter in
+    practice: growth already seeds new channels with independent
+    random noise (_seed_scale_rank/_seed_additive_rank's own
+    symmetry-breaking), so real channels essentially never reach an
+    exact float tie; this penalty's actual job is stopping the
+    ONGOING drift of already-distinct channels toward redundancy
+    during training, which it does regardless."""
+    if rank <= 1:
+        return flat
+    n = flat.size // rank
+    m = np.asarray(flat, dtype=np.float32).reshape(n, rank)
+    gram = m.T @ m
+    np.fill_diagonal(gram, 0.0)
+    correction = m @ gram
+    return (m - coef * correction).reshape(-1).astype(np.float32)
+
+
+def _apply_channel_orthogonality_penalty(c, coef: float) -> None:
+    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
+    DISLDOLayer8's apply_channel_orthogonality_penalty -- see
+    _orthogonality_penalty_array's own docstring for the full
+    rationale. Same "skip when empty" convention as
+    _apply_scale_overflow_guard (additive_u/v are empty at
+    additive_rank==0)."""
+    scale_rank = c.get_scale_rank()
+    vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
+    if vs.size:
+        c.set_value_scale_raw_vector(_orthogonality_penalty_array(vs, scale_rank, coef).tolist())
+    os_ = np.asarray(c.get_output_scale_raw_vector(), dtype=np.float32)
+    if os_.size:
+        c.set_output_scale_raw_vector(_orthogonality_penalty_array(os_, scale_rank, coef).tolist())
+    additive_rank = c.get_additive_rank()
+    au = np.asarray(c.get_additive_u_raw_vector(), dtype=np.float32)
+    if au.size:
+        c.set_additive_u_raw_vector(_orthogonality_penalty_array(au, additive_rank, coef).tolist())
+    av = np.asarray(c.get_additive_v_raw_vector(), dtype=np.float32)
+    if av.size:
+        c.set_additive_v_raw_vector(_orthogonality_penalty_array(av, additive_rank, coef).tolist())
+
+
 def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> None:
     """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
     DISLDOLayer8's apply_scale_overflow_guard -- see
@@ -813,6 +891,19 @@ class DISLDOLayer(_SparseLayerBase):
         n*rank individual accessor calls."""
         _apply_scale_overflow_guard(self._c, clip, near, coef)
 
+    def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
+        """AQRS channel-diversity pass -- see
+        _orthogonality_penalty_array's own docstring for the full
+        rationale (keeps rank channels from converging to duplicate
+        directions, on an ONGOING per-step basis, chosen over
+        residual-targeted growth since that only affects init and
+        channels can still drift back toward redundancy afterward).
+        Call once per training step, any time after backward
+        (independent of apply_scale_overflow_guard/apply_dynamic_rank_
+        control -- diversity, numerical safety, and rank mutation are
+        three separate concerns)."""
+        _apply_channel_orthogonality_penalty(self._c, coef)
+
 
 class DISLDOLayerResync(DISLDOLayer):
     """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
@@ -1083,6 +1174,12 @@ class DISLDOLayer8(_SparseLayerBase):
         apply_dynamic_rank_control above is (DISLDOLayer8 doesn't
         subclass DISLDOLayer)."""
         _apply_scale_overflow_guard(self._c, clip, near, coef)
+
+    def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
+        """Same as DISLDOLayer's own apply_channel_orthogonality_penalty
+        -- duplicated for the same reason apply_dynamic_rank_control
+        above is (DISLDOLayer8 doesn't subclass DISLDOLayer)."""
+        _apply_channel_orthogonality_penalty(self._c, coef)
 
 
 class DISLDOLayer8Resync(DISLDOLayer8):
