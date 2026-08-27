@@ -399,17 +399,60 @@ def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np
     combined, with no visibility into the per-channel decomposition.
 
     Standard soft-orthogonality regularizer, applied as a direct
-    gradient-descent step on Σ_{k1≠k2}(M_k1·M_k2)^2 where M is the
-    [n, rank] channel matrix (reshaped from the flat row-major storage,
-    idx=row*rank+k -- same layout `_overflow_guard_array` operates on,
-    just needing `rank` to reshape into 2D first): compute the Gram
-    matrix G=M^T@M, zero its diagonal (a channel's own norm isn't
-    penalized, only its correlation with OTHERS), then step
-    M -= coef * M@G_offdiag. Cheap (O(rank^2*n)) since it only depends
-    on the CURRENT parameter values, not on any batch's dy/x -- unlike
-    residual-targeted growth, needs no new C++ state or hot-loop hook,
-    which is why this was chosen over that design (direct instruction:
-    "sounds easier").
+    gradient-descent step on Σ_{k1≠k2}(cos(M_k1,M_k2))^2 -- correlation
+    of DIRECTION only, magnitude excluded (see the "why not the
+    diagonal identity term" note below).
+
+    Real bug found running this against live training (real MQAR
+    curriculum, see conversation): the FIRST version of this function
+    used raw (non-normalized) columns, computing G=M^T@M and stepping
+    M -= coef*M@G_offdiag directly. For real channel magnitudes in the
+    10s-100s (exactly the range apply_scale_overflow_guard's own near/
+    clip thresholds exist to handle), G entries scale as O(n*mag^2)
+    and the correction scales as O(rank*n*mag^3) -- CUBIC in magnitude.
+    Every synthetic test used near-unit-magnitude vectors, where this
+    is negligible; against real training it exploded, and because
+    apply_channel_orthogonality_penalty was called AFTER apply_scale_
+    overflow_guard in the training loop, nothing sanitized the result
+    before it was stored -- NaN-collapsed a real fp8 run at step 12650,
+    even earlier than the original unguarded-envelope bug this whole
+    mechanism exists downstream of (task #295's own NaN, at step
+    38166). Confirmed by direct calculation before touching the fix:
+    n=128, clip=200, rank=32 gives a correction on the order of 1e10,
+    nowhere near "a small per-step nudge."
+
+    Fix: do the whole computation in NORMALIZED (unit-direction) space,
+    which is also the conceptually correct fix, not just a numerical
+    patch -- since the intent was always "penalize direction, not
+    magnitude" (see below), operating on unit vectors makes that
+    literal instead of incidental. u_k = M_k/||M_k||; gram = U^T@U has
+    entries bounded in [-1,1] (cosine similarities); the correction
+    direction u@gram_offdiag is then bounded by O(rank) regardless of
+    M's raw scale; the actual step re-scales that bounded direction by
+    each channel's OWN norm (||M_k||*coef*correction_dir), so the
+    update stays LINEAR in magnitude, not cubic, while still moving
+    faster for a channel that's already larger (a natural,
+    scale-consistent step size, not an arbitrary fixed one). A
+    near-zero-norm channel is guarded by max(norm, 1e-6) in the
+    denominator -- deliberately not a "there's now a NaN so patch it"
+    reflex, this floor makes the whole computation provably finite
+    (Cauchy-Schwarz bounds every normalized component by 1) rather
+    than relying on a defensive nan_to_num to catch what the raw-scale
+    version couldn't.
+
+    Gram's diagonal is zeroed (a channel's own norm isn't penalized,
+    only its correlation with OTHERS) -- this is the off-diagonal part
+    of the classic ||M^T@M - I||^2 soft-orthogonality loss; the
+    diagonal identity term (which would additionally push every
+    channel toward UNIT norm) is deliberately excluded, since AQRS's
+    own gamma_k already exists specifically to control channel
+    magnitude separately from direction -- including it here would
+    fight gamma for the same job.
+
+    Cheap (O(rank^2*n)) since it only depends on the CURRENT parameter
+    values, not on any batch's dy/x -- unlike residual-targeted
+    growth, needs no new C++ state or hot-loop hook, which is why this
+    was chosen over that design (direct instruction: "sounds easier").
 
     rank<=1 is a natural no-op (single channel, no off-diagonal terms
     exist), matching every other AQRS mechanism's own "no-op at the
@@ -431,10 +474,13 @@ def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np
         return flat
     n = flat.size // rank
     m = np.asarray(flat, dtype=np.float32).reshape(n, rank)
-    gram = m.T @ m
+    norms = np.linalg.norm(m, axis=0, keepdims=True)  # [1, rank]
+    u = m / np.maximum(norms, 1e-6)  # unit-direction columns, provably finite
+    gram = u.T @ u  # cosine similarities, entries in [-1, 1]
     np.fill_diagonal(gram, 0.0)
-    correction = m @ gram
-    return (m - coef * correction).reshape(-1).astype(np.float32)
+    correction_dir = u @ gram  # bounded by ~rank regardless of M's raw scale
+    m_new = m - coef * norms * correction_dir  # step scales linearly with each channel's own magnitude
+    return m_new.reshape(-1).astype(np.float32)
 
 
 def _apply_channel_orthogonality_penalty(c, coef: float) -> None:

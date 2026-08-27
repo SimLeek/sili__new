@@ -125,6 +125,55 @@ class TestOrthogonalityPenaltyArrayMath:
             # -> norm should barely move
             assert abs(norm_after - norm_before) < 0.5
 
+    def test_real_world_magnitude_does_not_blow_up(self):
+        # REGRESSION test for a real bug (see conversation): the first
+        # version of this penalty computed the correction directly in
+        # raw (non-normalized) space, so it scaled CUBICALLY with
+        # channel magnitude (correction ~ M @ (M^T@M), and M^T@M itself
+        # scales with magnitude^2). Every earlier test in this file
+        # used near-unit-magnitude synthetic vectors, where that's
+        # invisible -- but real training pushes AQRS channel magnitudes
+        # into the same 10s-100s range apply_scale_overflow_guard's own
+        # near=20/clip=200 thresholds exist to handle, and there the
+        # cubic term exploded: NaN-collapsed a real fp8 MQAR run at
+        # step 12650 (even earlier than the original unguarded-envelope
+        # bug this whole mechanism is downstream of). Confirms the
+        # normalized-space fix keeps the correction bounded and
+        # reasonable at magnitudes drawn from that exact real range.
+        n, rank = 128, 32  # matches the real q_proj/k_proj/v_proj/o_proj shape
+        rng = np.random.default_rng(5)
+        base_norms = rng.uniform(20.0, 200.0, size=rank).astype(np.float32)
+        m = rng.standard_normal((n, rank)).astype(np.float32)
+        m = m / np.linalg.norm(m, axis=0, keepdims=True) * base_norms  # exact target norms
+        flat = m.reshape(-1)
+
+        out = _orthogonality_penalty_array(flat, rank, coef=0.01).reshape(n, rank)
+        assert np.all(np.isfinite(out))
+        # The whole point: the correction must NOT be wildly larger
+        # than the channels' own starting scale. A cubic blowup would
+        # produce corrections in the millions/billions; the fixed
+        # (normalized-space) version should keep the per-step move
+        # within a small multiple of each channel's own norm.
+        delta = np.linalg.norm(out - m, axis=0)
+        assert np.all(delta < 50.0 * base_norms), (
+            f"correction magnitude blew up relative to channel scale: "
+            f"delta={delta}, base_norms={base_norms}")
+
+    def test_repeated_application_at_real_magnitude_stays_finite(self):
+        # Same real-magnitude setup as above, but applied repeatedly
+        # (as it would be every training step) -- confirms the fix
+        # holds up over many steps, not just one.
+        n, rank = 128, 32
+        rng = np.random.default_rng(6)
+        base_norms = rng.uniform(20.0, 200.0, size=rank).astype(np.float32)
+        m = rng.standard_normal((n, rank)).astype(np.float32)
+        m = m / np.linalg.norm(m, axis=0, keepdims=True) * base_norms
+        flat = m.reshape(-1)
+        for _ in range(200):
+            flat = _orthogonality_penalty_array(flat, rank, coef=0.01)
+            assert np.all(np.isfinite(flat))
+            assert np.max(np.abs(flat)) < 1e5  # nowhere near fp32 overflow
+
 
 def _make_dense_layer(cls, n_in=8, n_out=8, budget=2000, cpus=1, seed=0):
     rng = np.random.default_rng(seed)
