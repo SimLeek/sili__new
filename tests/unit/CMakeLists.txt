@@ -151,6 +151,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_promotion
     test_block4_load_dense
     test_block4_scattered_divergence
+    test_fp8_block4_scattered_divergence
     test_synapse_policy_dispatch
     test_synapse_policy_long_horizon
     sweep_synapse_policy_min_decay_frac
