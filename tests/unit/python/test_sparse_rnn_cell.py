@@ -424,20 +424,25 @@ class TestSparseRNNCellForward:
 
     def test_multi_step_rollout_stays_finite(self):
         cell = _small_cell()
+        # Pure forward-only numerical-stability probe -- backward() is
+        # never called, so this doesn't need (and shouldn't build) a
+        # backward graph at all; requires_grad=False skips DenseInputStack
+        # entirely rather than needing a big-enough cap guessed here.
         state = Tensor(np.zeros(12, dtype=np.float32))
         for _ in range(15):
             obs = Tensor(np.random.randn(6).astype(np.float32))
-            state, aux_loss, actual_p = cell(obs, state)
+            state, aux_loss, actual_p = cell(obs, state, requires_grad=False)
             assert np.all(np.isfinite(state.data))
             assert np.isfinite(float(aux_loss.data))
             state = state.detach()
 
     def test_dynamic_density_opt_in_stays_finite(self):
         cell = _small_cell(dynamic_density_from_branching_ratio=True, branching_window=20)
+        # Same forward-only rationale as test_multi_step_rollout_stays_finite.
         state = Tensor(np.zeros(12, dtype=np.float32))
         for _ in range(10):
             obs = Tensor(np.random.randn(6).astype(np.float32))
-            state, aux_loss, actual_p = cell(obs, state)
+            state, aux_loss, actual_p = cell(obs, state, requires_grad=False)
             assert np.all(np.isfinite(state.data))
             state = state.detach()
         # After enough steps the tracker should have a real estimate.

@@ -63,6 +63,126 @@ inline void warn_if_lr_exceeds_bounded_synapse_policy_safe_range(float learning_
     }
 }
 
+// ── DenseInputStack ──────────────────────────────────────────────────────────
+// Shared by all 3 forward_dense/backward_dense implementations
+// (SparseLinearLayerImpl, DISLDOLayerV, SparseLinearLayer8Impl) -- see the
+// kSynapsePolicy* comment above for this file's own "name once, reuse in
+// all 3" convention.
+//
+// Real bug this replaces (found via a real sequential write-then-read
+// step() design in sili_peridot -- see conversation): forward_dense used
+// to cache the input into a SINGLE slot (_last_input/_last_batch/
+// _last_cols), silently overwritten by every subsequent forward_dense
+// call. backward_dense read that slot directly, with no way to tell it
+// apart from a DIFFERENT forward_dense call that happened to run first.
+// Two live forward_dense calls on the same layer instance before either
+// backward_dense runs (needed whenever a layer's weights get reused
+// sequentially within one step -- e.g. reading a value, then writing an
+// updated one, both through the same trained weight matrix) silently
+// clobbered each other, surfacing as a hard-to-diagnose shape-mismatch
+// crash inside the SECOND call's backward.
+//
+// Fix: a LIFO stack. forward_dense pushes; backward_dense pops from the
+// top. This is correct BY CONSTRUCTION for ordinary reverse-mode
+// autograd on a DAG: a later forward_dense call's output is always
+// closer to the loss in topological order than an earlier one it
+// depends on, so its backward node is always visited FIRST during
+// backward() -- exactly LIFO order, no explicit caller bookkeeping
+// needed. A single forward-then-immediately-backward pair (the
+// overwhelmingly common case) is unaffected: push then immediately pop,
+// byte-identical to the old single-slot behavior.
+//
+// max_size (Python-settable per layer, kMaxDefault below) is a loud
+// FAILURE ceiling, not a silent LRU eviction (direct instruction):
+// exceeding it means some earlier forward_dense call's output was never
+// backpropagated -- almost always a real caller bug (e.g. computing
+// logits for a step that never gets a loss, and forgetting that this
+// layer was touched anyway) -- so it throws immediately at the
+// OFFENDING forward_dense call, the same place PyTorch would surface an
+// analogous autograd misuse, rather than silently discarding state and
+// producing a confidently wrong gradient much later.
+template <typename V, typename S>
+class DenseInputStack {
+public:
+    static constexpr S kMaxDefault = 8;
+
+    struct Entry { std::vector<V> data; S batch; S cols; std::uint64_t token; };
+
+    // Returns this push's token -- normal callers (the overwhelming
+    // majority: one forward() nested inside, or immediately followed by,
+    // its own backward()) can ignore it entirely and just use the
+    // default LIFO pop() below, exactly like ordinary PyTorch-style
+    // autograd. The token exists ONLY for the rare case where the SAME
+    // layer instance is forward()'d multiple times as genuinely PARALLEL
+    // (not nested) branches within one backward() pass -- e.g. a
+    // regularization probe that recomputes a layer's forward on
+    // different input and merges back in via simple addition, rather
+    // than depending on the main path's own output. LIFO pop() assumes
+    // later-pushed entries are always popped first, which reverse-mode
+    // autograd guarantees ONLY for a true dependency chain (a later
+    // forward's output feeding a node closer to the loss) -- a parallel
+    // branch has no such guaranteed ordering relative to the other
+    // pushes, so blind LIFO can hand a closure someone ELSE'S entry
+    // (confirmed via a real shape-mismatch crash: three same-instance
+    // forward() calls at different batch sizes, LIFO pop matched the
+    // wrong one to the wrong backward()). pop_token() is the explicit,
+    // opt-in fix for exactly that case -- see DISLDOLayer.forward's own
+    // use_explicit_token docstring for how a caller opts in.
+    std::uint64_t push(const V* src, S batch, S cols) {
+        if ((S)stack_.size() >= max_size_) {
+            throw std::runtime_error(
+                "DenseInputStack::push: exceeded max_dense_input_stack (" +
+                std::to_string(max_size_) + ") pending forward_dense call(s) "
+                "with no matching backward_dense -- this almost always means "
+                "a forward_dense output was never backpropagated (e.g. a "
+                "step whose logits never got a loss.backward()). If this "
+                "depth is genuinely intentional, raise it via "
+                "set_max_dense_input_stack().");
+        }
+        std::uint64_t token = next_token_++;
+        stack_.push_back(Entry{std::vector<V>(src, src + (std::size_t)batch * cols), batch, cols, token});
+        return token;
+    }
+
+    // Default path -- normal PyTorch-like behavior, unchanged.
+    Entry pop() {
+        if (stack_.empty()) {
+            throw std::runtime_error(
+                "DenseInputStack::pop: backward_dense called with no "
+                "matching forward_dense input on the stack (already popped, "
+                "or forward_dense was never called).");
+        }
+        Entry e = std::move(stack_.back());
+        stack_.pop_back();
+        return e;
+    }
+
+    // Explicit override -- pops the EXACT entry matching `token`,
+    // wherever it sits in the stack, regardless of push/pop order.
+    Entry pop_token(std::uint64_t token) {
+        for (auto it = stack_.begin(); it != stack_.end(); ++it) {
+            if (it->token == token) {
+                Entry e = std::move(*it);
+                stack_.erase(it);
+                return e;
+            }
+        }
+        throw std::runtime_error(
+            "DenseInputStack::pop_token: token " + std::to_string(token) +
+            " not found on the stack (already popped, never pushed, or "
+            "from a different layer instance).");
+    }
+
+    void set_max_size(S n) { max_size_ = n; }
+    S    get_max_size() const { return max_size_; }
+    std::size_t size() const { return stack_.size(); }
+
+private:
+    std::vector<Entry> stack_;
+    S max_size_ = kMaxDefault;
+    std::uint64_t next_token_ = 1;
+};
+
 // ── Block4View ───────────────────────────────────────────────────────────────
 // Thin, non-owning wrapper exposing a layer's Block4Store to Python as
 // `layer.block4.tiles` / `layer.block4.synapses` -- purely observational
@@ -383,10 +503,16 @@ public:
     std::vector<V>            output_buf;
     int                       num_cpus;
 
-    // Last dense input — stored for backward.
+    // Last dense input — stored for backward. Kept as a plain single-slot
+    // mirror purely for the Python-facing `last_input` introspection
+    // property below (always reflects the MOST RECENT forward_dense
+    // call) -- backward_dense itself now reads from _dense_input_stack
+    // instead (see DenseInputStack's own docstring for why).
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
+    DenseInputStack<V, S> _dense_input_stack;
+    std::uint64_t _last_push_token = 0;
     // Budget established at construction -- used by load_weights to avoid
     // allocating a smaller limit that would then be exceeded by the per-row
     // headroom calculation inside delta_csr_from_absolute, which was
@@ -602,13 +728,25 @@ public:
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
-    py::array_t<V> forward_dense(py::array_t<V> x) {
+    // requires_grad=false (direct instruction): inference-only callers
+    // that will NEVER call backward_dense for this specific forward
+    // don't need -- and shouldn't have to guess a big-enough
+    // max_dense_input_stack for -- an entry on the stack at all. Skips
+    // the push entirely, so a long inference-only rollout can never
+    // overflow it regardless of length, matching the ordinary
+    // torch.no_grad()-style opt-out this mirrors. _last_input/_last_
+    // batch/_last_cols (introspection only) are still updated either
+    // way.
+    py::array_t<V> forward_dense(py::array_t<V> x, bool requires_grad = true) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
         const V* src  = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
+        if (requires_grad) {
+            _last_push_token = _dense_input_stack.push(src, _last_batch, _last_cols);
+        }
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, FP4BiPacked, COL_TYPE>(src, _last_batch, _last_cols, weights,
@@ -635,12 +773,18 @@ public:
                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                                   V max_ci = kSynapsePolicyMaxCi,
-                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                                  bool scale_invariant = kSynapsePolicyScaleInvariant,
+                                  long long token = -1) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // token<0 (default): normal LIFO pop, ordinary PyTorch-like
+        // behavior. token>=0: explicit override -- see DenseInputStack::
+        // push's own docstring for when this is needed.
+        auto cached = (token < 0) ? _dense_input_stack.pop()
+                                  : _dense_input_stack.pop_token((std::uint64_t)token);
+        std::vector<V> dx(cached.batch * cached.cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
-            _last_input.data(), _last_batch, _last_cols,
+            cached.data.data(), cached.batch, cached.cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -648,10 +792,17 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)cached.batch, (py::ssize_t)cached.cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
+
+    void set_max_dense_input_stack(S n) { _dense_input_stack.set_max_size(n); }
+    // Opt-in, see DenseInputStack::push's own docstring -- normal
+    // callers never need this. Reads the token from the MOST RECENT
+    // forward_dense/forward call on THIS instance.
+    std::uint64_t get_last_push_token() const { return _last_push_token; }
+    S    get_max_dense_input_stack() const { return _dense_input_stack.get_max_size(); }
 
     // ── forward_sparse / backward_sparse ─────────────────────────────────────────
     // NOT mirror images of each other (see conversation) -- forward's
@@ -1167,6 +1318,8 @@ public:
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
+    DenseInputStack<V, S> _dense_input_stack;
+    std::uint64_t _last_push_token = 0;
     std::size_t    _idx_budget_bytes = 4096;
     std::size_t    _val_budget_nnz   = 64;
 
@@ -1203,13 +1356,17 @@ public:
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
     Block4View block4() { return Block4View(weights.block4); }
 
-    py::array_t<V> forward(py::array_t<V> x) {
+    // See SparseLinearLayer::forward_dense's own requires_grad docstring.
+    py::array_t<V> forward(py::array_t<V> x, bool requires_grad = true) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
         const V* src  = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
+        if (requires_grad) {
+            _last_push_token = _dense_input_stack.push(src, _last_batch, _last_cols);
+        }
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
@@ -1230,12 +1387,18 @@ public:
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                              V max_ci = kSynapsePolicyMaxCi,
-                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                             bool scale_invariant = kSynapsePolicyScaleInvariant,
+                                  long long token = -1) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // token<0 (default): normal LIFO pop, ordinary PyTorch-like
+        // behavior. token>=0: explicit override -- see DenseInputStack::
+        // push's own docstring for when this is needed.
+        auto cached = (token < 0) ? _dense_input_stack.pop()
+                                  : _dense_input_stack.pop_token((std::uint64_t)token);
+        std::vector<V> dx(cached.batch * cached.cols, V(0));
         disldo_backward<S, VT, COL_TYPE>(
-            _last_input.data(), _last_batch, _last_cols,
+            cached.data.data(), cached.batch, cached.cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -1243,10 +1406,17 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)cached.batch, (py::ssize_t)cached.cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
+
+    void set_max_dense_input_stack(S n) { _dense_input_stack.set_max_size(n); }
+    // Opt-in, see DenseInputStack::push's own docstring -- normal
+    // callers never need this. Reads the token from the MOST RECENT
+    // forward_dense/forward call on THIS instance.
+    std::uint64_t get_last_push_token() const { return _last_push_token; }
+    S    get_max_dense_input_stack() const { return _dense_input_stack.get_max_size(); }
 
     void build_probes(S k, bool per_row = false) {
         delta_csr_build_probes<S, VT, COL_TYPE>(
@@ -1371,6 +1541,8 @@ public:
     int                       num_cpus;
 
     std::vector<V> _last_input;
+    DenseInputStack<V, S> _dense_input_stack;
+    std::uint64_t _last_push_token = 0;
     S              _last_batch = 0;
     S              _last_cols  = 0;
     std::size_t    _idx_budget_bytes = 4096;
@@ -1532,13 +1704,17 @@ public:
     V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
     V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
 
-    py::array_t<V> forward(py::array_t<V> x) {
+    // See SparseLinearLayer::forward_dense's own requires_grad docstring.
+    py::array_t<V> forward(py::array_t<V> x, bool requires_grad = true) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
         const V* src  = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
+        if (requires_grad) {
+            _last_push_token = _dense_input_stack.push(src, _last_batch, _last_cols);
+        }
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
@@ -1556,12 +1732,18 @@ public:
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                              V max_ci = kSynapsePolicyMaxCi,
-                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                             bool scale_invariant = kSynapsePolicyScaleInvariant,
+                                  long long token = -1) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        // token<0 (default): normal LIFO pop, ordinary PyTorch-like
+        // behavior. token>=0: explicit override -- see DenseInputStack::
+        // push's own docstring for when this is needed.
+        auto cached = (token < 0) ? _dense_input_stack.pop()
+                                  : _dense_input_stack.pop_token((std::uint64_t)token);
+        std::vector<V> dx(cached.batch * cached.cols, V(0));
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
-            _last_input.data(), _last_batch, _last_cols,
+            cached.data.data(), cached.batch, cached.cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -1569,10 +1751,17 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)cached.batch, (py::ssize_t)cached.cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
+
+    void set_max_dense_input_stack(S n) { _dense_input_stack.set_max_size(n); }
+    // Opt-in, see DenseInputStack::push's own docstring -- normal
+    // callers never need this. Reads the token from the MOST RECENT
+    // forward_dense/forward call on THIS instance.
+    std::uint64_t get_last_push_token() const { return _last_push_token; }
+    S    get_max_dense_input_stack() const { return _dense_input_stack.get_max_size(); }
 
     void build_probes(S k, bool per_row = false) {
         delta_csr_build_probes<S, VT, COL_TYPE>(
@@ -1823,7 +2012,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer::get_additive_gamma_abs_ema_k, py::arg("k"))
         .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayer::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayer::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayer::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -1831,6 +2026,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2086,7 +2282,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward_dense",        &SparseLinearLayerResync::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayerResync::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayerResync::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayerResync::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayerResync::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -2094,6 +2296,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2315,7 +2518,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward_dense",        &SparseLinearLayerNoScale::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayerNoScale::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayerNoScale::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayerNoScale::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayerNoScale::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -2323,6 +2532,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2592,7 +2802,13 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayerDeterministic::get_additive_gamma_abs_ema_k, py::arg("k"))
         .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayerDeterministic::get_additive_gamma_grad_ema_k, py::arg("k"))
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayerDeterministic::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayerDeterministic::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayerDeterministic::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -2600,6 +2816,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -2844,7 +3061,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward_dense",        &SparseLinearLayerResyncDeterministic::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayerResyncDeterministic::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayerResyncDeterministic::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayerResyncDeterministic::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayerResyncDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -2852,6 +3075,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -3071,7 +3295,13 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
         .def("forward_dense",        &SparseLinearLayerNoScaleDeterministic::forward_dense,
-             py::arg("x"))
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayerNoScaleDeterministic::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayerNoScaleDeterministic::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayerNoScaleDeterministic::get_last_push_token)
         .def("backward_dense",       &SparseLinearLayerNoScaleDeterministic::backward_dense,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
@@ -3079,6 +3309,7 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("token") = -1,
              "damp_by_importance=True (default): weight update divided by\n"
              "(sqrt(importance)+eps), where importance is a decayed EMA of\n"
              "g^2 (RMSprop-style) -- a per-synapse adaptive-learning-rate\n"
@@ -3298,15 +3529,21 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &DISLDOLayerV::forward,
-             py::arg("x"))
+        .def("forward",        &DISLDOLayerV::forward,
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &DISLDOLayerV::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &DISLDOLayerV::get_max_dense_input_stack)
+        .def("get_last_push_token", &DISLDOLayerV::get_last_push_token)
         .def("backward",             &DISLDOLayerV::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant, py::arg("token") = -1)
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
@@ -3338,15 +3575,21 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8::forward,
-             py::arg("x"))
+        .def("forward",        &SparseLinearLayer8::forward,
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayer8::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayer8::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayer8::get_last_push_token)
         .def("backward",             &SparseLinearLayer8::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant, py::arg("token") = -1)
         .def("build_probes",         &SparseLinearLayer8::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
@@ -3490,15 +3733,21 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8Resync::forward,
-             py::arg("x"))
+        .def("forward",        &SparseLinearLayer8Resync::forward,
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayer8Resync::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayer8Resync::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayer8Resync::get_last_push_token)
         .def("backward",             &SparseLinearLayer8Resync::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant, py::arg("token") = -1)
         .def("build_probes",         &SparseLinearLayer8Resync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8Resync::synap_row_step,
@@ -3557,15 +3806,21 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8AdaMax::forward,
-             py::arg("x"))
+        .def("forward",        &SparseLinearLayer8AdaMax::forward,
+             py::arg("x"), py::arg("requires_grad") = true)
+        .def("set_max_dense_input_stack", &SparseLinearLayer8AdaMax::set_max_dense_input_stack, py::arg("n"),
+             "Cap on live forward()/forward_dense() calls pending a matching backward "
+             "before this layer throws instead of silently corrupting state -- see "
+             "DenseInputStack's own docstring (cpu_backend.cpp). Default 8.")
+        .def("get_max_dense_input_stack", &SparseLinearLayer8AdaMax::get_max_dense_input_stack)
+        .def("get_last_push_token", &SparseLinearLayer8AdaMax::get_last_push_token)
         .def("backward",             &SparseLinearLayer8AdaMax::backward,
              py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant, py::arg("token") = -1)
         .def("build_probes",         &SparseLinearLayer8AdaMax::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8AdaMax::synap_row_step,
