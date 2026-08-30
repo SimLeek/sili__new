@@ -512,6 +512,31 @@ void sisldo_forward(
                                     static_cast<uint32_t>(br), bc, elem_pos, byte_pos);
                                 const uint8_t* tdata = tile.raw_data();
 
+                                // Zero-skip (task: top_k4 sparsity work):
+                                // `local[]` holds this window's 4 gathered
+                                // input values -- until now, every li was
+                                // decoded and multiplied regardless of
+                                // whether local[li]==0, so sparsifying the
+                                // input (top-k or otherwise) was a silent
+                                // no-op on a block4-resident layer, only
+                                // the OUTER window-admission check (line
+                                // ~439, row_nnz_b4>0) ever skipped work.
+                                // Window-level early-out: if every gathered
+                                // value in this window is exactly zero
+                                // (either because the input was already
+                                // zero there, or a sparsification step
+                                // zeroed all 4), skip the lj/li decode+
+                                // accumulate loops below entirely -- the
+                                // walk bookkeeping above (elem_pos/byte_pos/
+                                // bc_cursor) has already run and must not be
+                                // skipped (later windows' incremental walk
+                                // depends on it), only the real per-slot
+                                // decode work is saved here.
+                                if (local[0] == value_type(0) && local[1] == value_type(0) &&
+                                    local[2] == value_type(0) && local[3] == value_type(0)) {
+                                    continue;
+                                }
+
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     const std::size_t col = static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
                                     if (col >= out_cols) continue;
@@ -522,6 +547,11 @@ void sisldo_forward(
                                         const std::size_t row =
                                             static_cast<std::size_t>(br) * BLOCK4_TILE + li;
                                         if (row >= num_inputs) continue;
+                                        // Per-li skip: a zeroed gathered input
+                                        // contributes nothing regardless of the
+                                        // weight -- skip its decode too, not
+                                        // just the multiply-accumulate.
+                                        if (local[li] == value_type(0)) continue;
                                         const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
                                         if (byte == 0) continue;
                                         const value_type w_decoded = FP4_TABLE[byte & 0xFu];
