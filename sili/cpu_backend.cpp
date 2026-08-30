@@ -2120,9 +2120,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
     // ── SparseLinearLayerResync ──────────────────────────────────────────────────
@@ -2352,9 +2356,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
     // ── SparseLinearLayerNoScale ─────────────────────────────────────────────────
@@ -2585,9 +2593,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
 
@@ -2890,9 +2902,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
 
@@ -3122,9 +3138,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
     // ── SparseLinearLayerNoScaleDeterministic ────────────────────────────────────
@@ -3353,9 +3373,13 @@ PYBIND11_MODULE(_cpu, m)
                     {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
-            "Dense input from the most recent forward_dense/forward_sparse call.\n"
-            "Shape [batch, n_inputs]. None if no forward pass has been run yet.\n"
-            "Used by backward_sparse which requires the explicit forward input.");
+            "Dense input from the most recent forward_dense call ONLY --\n"
+            "forward_sparse does NOT populate this (stays None/stale across a\n"
+            "forward_sparse call). Shape [batch, n_inputs]. None if no\n"
+            "forward_dense call has been made yet. backward_sparse requires an\n"
+            "explicit dense x argument -- callers whose forward pass was\n"
+            "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
+            "CSR.to_dense()) rather than reading this property.");
 
 
     // DISLDOLayerV: identical API surface to SparseLinearLayer, DeltaCSRBiValues<float>

@@ -1288,8 +1288,12 @@ class SISLDOLayer(_SparseLayerBase):
     not a matched forward/backward pair (see its class comment in
     cpu_backend.cpp): dx doesn't depend on the input's own sparsity, only
     on weights and dy, so backward_sparse's required dense `x` argument is
-    exactly what the C++ side already cached as `last_input` during the
-    forward_sparse call above -- not an approximation, just reusing it."""
+    reconstructed from the same CSR forward_sparse was called with
+    (csr.to_dense() -- zeros in the dropped positions), NOT read from
+    `self._c.last_input`. forward_sparse never populates last_input (only
+    forward_dense does, see cpu_backend.cpp) -- an instance that never
+    called forward_dense would otherwise silently compute its weight
+    update against stale/empty data."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, backprop_p: float = 0.03,
@@ -1308,7 +1312,8 @@ class SISLDOLayer(_SparseLayerBase):
         Structural Plasticity) importance update on every call,
         independent of whether backward() would ever follow. Real
         weight/importance updates now happen ONLY in backward_sparse."""
-        csr    = x.data
+        csr      = x.data
+        x_dense  = csr.to_dense()
         out_np = self._c.forward_sparse(
             csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
         out    = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
@@ -1319,7 +1324,7 @@ class SISLDOLayer(_SparseLayerBase):
                 k    = max(1, int(dy.shape[1] * self.backprop_p))
                 dp, di, dv = _cpu.dense_to_top_k_csr(dy, k, self._c.num_cpus)
                 dx = self._c.backward_sparse(
-                    self._c.last_input, dp, di, dv,
+                    x_dense, dp, di, dv,
                     csr.rows, learning_rate, lr_per_row_nnz=True,
                 ).squeeze(0)
                 _acc(x, dx)
