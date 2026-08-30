@@ -733,15 +733,28 @@ public:
         py::array_t<V> x,   // DENSE input -- see class comment for why
         py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
         S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false,
-        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f)
+        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+        V min_decay_frac = kSynapsePolicyMinDecayFrac,
+        V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+        V max_ci = kSynapsePolicyMaxCi,
+        bool scale_invariant = kSynapsePolicyScaleInvariant)
     {
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
-        disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE>(
+        // ScalePolicy/StochasticRounding threaded from THIS class's own
+        // template params (task #100) -- SparseLinearLayerResync/
+        // Deterministic/etc. now get their own configured policy here too,
+        // not always the hardcoded default. DeferredScaleWrite has no
+        // equivalent in disldo_backward_sparse_grad (deliberately scoped
+        // out, see the function's own comment) -- Resync's backward_sparse
+        // does not get the deferred-write fix its backward_dense gets;
+        // this was already the case before this change (the function never
+        // had that concept), so it is a known follow-up, not a regression.
+        disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE, ScalePolicy, StochasticRounding>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz,
-            damp_by_importance, beta2, eps);
+            damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1877,7 +1890,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
@@ -2140,7 +2157,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayerResync::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResync::synap_row_step,
@@ -2369,7 +2390,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayerNoScale::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScale::synap_row_step,
@@ -2646,7 +2671,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayerDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerDeterministic::synap_row_step,
@@ -2898,7 +2927,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayerResyncDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerResyncDeterministic::synap_row_step,
@@ -3125,7 +3158,11 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("x"),
              py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("build_probes",         &SparseLinearLayerNoScaleDeterministic::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayerNoScaleDeterministic::synap_row_step,

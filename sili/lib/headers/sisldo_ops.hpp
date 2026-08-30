@@ -586,7 +586,25 @@ void sisldo_forward(
 // row regardless of its own value) -- sparse input would only ever cover
 // the first.
 
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+// Template-parameter parity with linear_disldo.hpp::disldo_backward (task
+// #100, "[Deferred] Apply same template params to sisldo_ops.hpp backward
+// functions"): ScalePolicy/StochasticRounding/SynapsePolicyT, in the same
+// order disldo_backward uses (DeferredScaleWrite deliberately scoped out --
+// orthogonal to this function's actual callers). This closes two real gaps
+// at once: (1) synapse_kwargs (max_abs_delta/max_ci/min_decay_frac/
+// scale_invariant) previously could not reach backward_sparse at all, no
+// matter what a caller passed; (2) the scattered AND block4 phases below
+// were both keeping their weight-update math in TRUE-WEIGHT space while
+// storing back into CODE space via `new_w / combined_scale` -- the same
+// ~1/S^2-scale-direction bug class found and fixed in FP8's block4
+// backward earlier (see project_fp8_block4_scale_bug). Porting to
+// disldo_backward's own code-space convention (quant += update_cw(...),
+// S properly threaded as a real per-synapse scale rather than implicitly
+// inverted) fixes this identically here.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
+          typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
+          bool StochasticRounding = true,
+          template <typename> class SynapsePolicyT = BoundedRMSpropSynapsePolicy>
 void disldo_backward_sparse_grad(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,   // dense [batch, n_inputs]
     SIZE_TYPE batch,
@@ -600,9 +618,14 @@ void disldo_backward_sparse_grad(
     bool         lr_per_row_nnz = false,
     bool         damp_by_importance = true,
     typename ValueAccessor<VALUES_TYPE>::value_type   beta2 = 0.999f,
-    typename ValueAccessor<VALUES_TYPE>::value_type   eps = 1e-8f)
+    typename ValueAccessor<VALUES_TYPE>::value_type   eps = 1e-8f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   min_decay_frac = 0.0f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   max_abs_delta = 1e30f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   max_ci = 1e30f,
+    bool         scale_invariant = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
     const auto& L = dc.layout;
     const std::size_t n_inputs = L.rows;
@@ -691,13 +714,20 @@ void disldo_backward_sparse_grad(
             for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
-                const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 // BUG FIX: out_scale/output_importance_scale were never read
                 // here, unlike disldo_backward's identical row*col
                 // combination -- see sisldo_forward's matching fix.
                 const value_type  out_scale = weights.get_output_scale(col);
                 const value_type  combined_scale = val_scale * out_scale;
-                const value_type  w        = w_stored * combined_scale;   // -> true units
+                // S: real per-synapse scale, matches disldo_backward's own
+                // `S = weights.get_scale(r, col)` (rank-1 case here; Phase 2
+                // swaps this one line for the rank-N accessor). Threading S
+                // through SynapsePolicy::update_cw (instead of the old
+                // true-weight-space `new_w / combined_scale` store) is what
+                // fixes the ~1/S^2 bug noted above.
+                const value_type  S = combined_scale;
+                const value_type  w = cw_orig * S;   // -> true units, for dx only
 
                 // Merge-advance (both this row's columns and the gradient's
                 // columns are sorted ascending) -- O(nnz_this_row + grad_nnz)
@@ -716,8 +746,8 @@ void disldo_backward_sparse_grad(
                     const value_type out_imp_scale = weights.get_output_importance_scale(col);
                     const value_type combined_imp_scale = imp_scale * out_imp_scale;
                     const value_type grad = dy_val * in_val;   // scales with true input value
-                    const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    value_type imp = stored_imp * combined_imp_scale;   // -> true units
+                    const value_type ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    value_type ci = ci_orig * combined_imp_scale;   // -> true units
                     // Additive contrib combination, mirroring disldo_backward's
                     // own `ci` update (linear_disldo.hpp) -- see its docstring
                     // for the full rationale (square-then-sum, not sum-then-
@@ -727,16 +757,20 @@ void disldo_backward_sparse_grad(
                     // is the true (pre-update) weight, same role as
                     // cw_orig there.
                     const value_type contrib = in_val * w;
-                    imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
-                    const value_type new_w = w + (damp_by_importance
-                        ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
-                        : (-effective_lr * grad));
-                    ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
+                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                    value_type quant = cw_orig;   // code-space accumulator, matches disldo_backward
+                    quant += SynapsePolicy::update_cw(grad, ci, S, effective_lr, eps,
+                                                       damp_by_importance, max_abs_delta, scale_invariant);
+                    if constexpr (StochasticRounding) {
+                        ValueAccessor<VALUES_TYPE>::set_stochastic_live(dc.values, vb, quant, ci / combined_imp_scale);
+                    } else {
+                        ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant, ci / combined_imp_scale);
+                    }
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
-                    batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
+                    batch_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
                     batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
-                    batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
+                    batch_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
                     batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
                     // value_scale gradient: stored_w * out_scale[col] * dy_val * in_val
                     // (true_w = stored_w * val_scale * out_scale, so val_scale's own
@@ -745,9 +779,9 @@ void disldo_backward_sparse_grad(
                     // applied once at the end instead of folded in here, so
                     // the RMSprop importance below tracks true g^2, not
                     // (lr*g)^2 (see disldo_backward's identical convention).
-                    scale_grad_sums[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
+                    scale_grad_sums[r] += static_cast<double>(cw_orig) * static_cast<double>(out_scale)
                                           * (dy_val * in_val);
-                    scale_grad_sums_contrib[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
+                    scale_grad_sums_contrib[r] += static_cast<double>(cw_orig) * static_cast<double>(out_scale)
                                           * static_cast<double>(contrib);
                 }
             }
@@ -776,24 +810,12 @@ void disldo_backward_sparse_grad(
             const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_this_row);
             const value_type g_agg = static_cast<value_type>(scale_grad_sums[r]);
             const value_type contrib_agg = static_cast<value_type>(scale_grad_sums_contrib[r]);
-            value_type& vs_imp = weights.value_scale_importance[r];
-            // Square-then-sum (g_agg^2+contrib_agg^2), matching
-            // RMSpropScalePolicy::update's own combination -- see its
-            // docstring (delta_csr_types.hpp) for why sum-then-square is
-            // unsafe here (a large-magnitude disagreement between g_agg
-            // and contrib_agg could collapse the denominator toward zero
-            // and explode the step).
-            const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
-            // Same Adam-style bias correction as RMSpropScalePolicy::update
-            // (delta_csr_types.hpp) -- shares the SAME value_scale_importance
-            // array as disldo_backward's scattered/block4 paths, so it needs
-            // the same fix for the same cold-start reason.
-            uint32_t& step = weights.get_value_scale_step_k(r, 0);
-            ++step;
-            const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
-            const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
-            vs_imp = new_vs_imp;
-            weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
+            // Routed through the swappable ScalePolicy, matching
+            // disldo_backward's DeferredScaleWrite=true (rank-1) branch
+            // exactly -- see linear_disldo.hpp:1101-1106.
+            ScalePolicy::update(weights.value_scale[r], weights.value_scale_importance[r],
+                                g_agg, scale_eff_lr, beta2, eps, contrib_agg,
+                                &weights.get_value_scale_step_k(r, 0), scale_invariant);
         }
     }
     } // closes if (!dc.empty())
@@ -991,7 +1013,14 @@ void disldo_backward_sparse_grad(
                                         const value_type w_decoded      = FP4_TABLE[byte & 0xFu];
                                         const value_type out_scale      = weights.get_output_scale(col);
                                         const value_type combined_scale = val_scale * out_scale;
-                                        const value_type w               = w_decoded * combined_scale;
+                                        // S: real per-synapse scale (Phase 2 swaps this one line
+                                        // for the rank-N accessor) -- see the scattered path's
+                                        // identical note on why threading S through
+                                        // SynapsePolicy::update_cw (code-space) instead of the old
+                                        // true-weight-space `new_w / combined_scale` store fixes
+                                        // the ~1/S^2 bug here too.
+                                        const value_type S               = combined_scale;
+                                        const value_type w               = w_decoded * S;
                                         const value_type dy_val          = dy_local[lj];
                                         dx_accum[li] += w * dy_val;
 
@@ -999,17 +1028,17 @@ void disldo_backward_sparse_grad(
                                         const value_type combined_imp_scale = imp_scale * out_imp_scale;
                                         const value_type imp_decoded = FP4_TABLE[(byte >> 4) & 0xFu];
                                         const value_type grad = dy_val * in_val;
-                                        value_type imp = imp_decoded * combined_imp_scale;
+                                        value_type ci = imp_decoded * combined_imp_scale;
                                         // Additive contrib combination, matching
                                         // the scattered path above -- see its
                                         // comment for the full rationale. w is
                                         // the true (pre-update) weight decoded
                                         // just above.
                                         const value_type contrib = in_val * w;
-                                        imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
-                                        const value_type new_w = w + (damp_by_importance
-                                            ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
-                                            : (-effective_lr * grad));
+                                        ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                                        value_type quant = w_decoded;   // code-space accumulator, matches disldo_backward
+                                        quant += SynapsePolicy::update_cw(grad, ci, S, effective_lr, eps,
+                                                                           damp_by_importance, max_abs_delta, scale_invariant);
                                         // was_live gate -- see
                                         // linear_disldo.hpp's was_live4/
                                         // was_live4_8 declaration comments for
@@ -1023,12 +1052,17 @@ void disldo_backward_sparse_grad(
                                         // column happened to have gradient
                                         // signal this step.
                                         const bool was_live = (byte != 0);
-                                        const uint8_t new_w_code   = was_live
-                                            ? fp4_quantize_stochastic_live(new_w / combined_scale)
-                                            : fp4_quantize_stochastic(new_w / combined_scale);
-                                        const uint8_t new_imp_code = was_live
-                                            ? fp4_quantize_stochastic_live_nonneg(imp / combined_imp_scale)
-                                            : fp4_quantize_stochastic(imp / combined_imp_scale);
+                                        const value_type imp_ratio = ci / combined_imp_scale;
+                                        uint8_t new_w_code, new_imp_code;
+                                        if constexpr (StochasticRounding) {
+                                            new_w_code   = was_live ? fp4_quantize_stochastic_live(quant)
+                                                                    : fp4_quantize_stochastic(quant);
+                                            new_imp_code = was_live ? fp4_quantize_stochastic_live_nonneg(imp_ratio)
+                                                                    : fp4_quantize_stochastic(imp_ratio);
+                                        } else {
+                                            new_w_code   = was_live ? fp4_quantize_live(quant)     : fp4_quantize(quant);
+                                            new_imp_code = was_live ? fp4_quantize_live(imp_ratio) : fp4_quantize(imp_ratio);
+                                        }
                                         scratch[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
                                         dirty = true;
 
@@ -1099,21 +1133,14 @@ void disldo_backward_sparse_grad(
                     const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
                     const value_type g_agg = static_cast<value_type>(row_scale_grad_sums[row]);
                     const value_type contrib_agg = static_cast<value_type>(row_scale_grad_sums_contrib[row]);
-                    value_type& vs_imp = weights.value_scale_importance[row];
-                    // Square-then-sum -- see the scattered path's identical
-                    // fix above / RMSpropScalePolicy's docstring
-                    // (delta_csr_types.hpp) for why sum-then-square is unsafe.
-                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
-                    // Same bias correction as the scattered path's identical
-                    // update above -- SAME value_scale_step counter (shared
-                    // per-row across scattered and block4, matching
-                    // disldo_backward's own shared value_scale/importance).
-                    uint32_t& step = weights.get_value_scale_step_k(row, 0);
-                    ++step;
-                    const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
-                    const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
-                    vs_imp = new_vs_imp;
-                    weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
+                    // Routed through the swappable ScalePolicy -- see the
+                    // scattered path's identical call above. SAME
+                    // value_scale_step counter (shared per-row across
+                    // scattered and block4, matching disldo_backward's own
+                    // shared value_scale/importance).
+                    ScalePolicy::update(weights.value_scale[row], weights.value_scale_importance[row],
+                                        g_agg, scale_eff_lr, beta2, eps, contrib_agg,
+                                        &weights.get_value_scale_step_k(row, 0), scale_invariant);
                 }
             }
         }
