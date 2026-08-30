@@ -946,72 +946,6 @@ void disldo_backward_sparse_grad(
     }
     } // closes if (!dc.empty())
 
-    // ── output_scale's own gradient reduction ───────────────────────────────
-    //
-    // Direct port of disldo_backward's identical block (linear_disldo.hpp)
-    // -- reduces t_col_grad/t_col_grad_contrib across every thread, once per
-    // (col,k), then applies via the same ScalePolicy. Placed OUTSIDE the
-    // `if (!dc.empty())` guard (like the scaffolding above) since block4
-    // synapses also contribute into t_col_grad, further down.
-    if (learning_rate != value_type(0) && output_scale_trainable) {
-        for (std::size_t c = 0; c < out_cols; ++c) {
-            const std::size_t deg = c < weights.out_degree.size()
-                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
-            if (deg == 0) continue;
-            const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
-            for (std::size_t k = 0; k < rank; ++k) {
-                double col_grad_sum = 0.0, col_grad_sum_contrib = 0.0;
-                for (int t = 0; t < num_cpus; ++t) {
-                    col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
-                    col_grad_sum_contrib += t_col_grad_contrib[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
-                }
-                const value_type g_agg = static_cast<value_type>(col_grad_sum);
-                const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
-                ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
-                                    g_agg, col_eff_lr, beta2, eps, contrib_agg,
-                                    &weights.get_output_scale_step_k(c, k), scale_invariant);
-            }
-        }
-    }
-
-    // ── AQRS scale_gamma's own update ───────────────────────────────────────
-    //
-    // Direct port of disldo_backward's identical block (linear_disldo.hpp),
-    // including the EMA/dynamic-rank-control tracking call
-    // (update_scale_gamma_ema_k) -- that method itself already lives on
-    // `weights` (shared with the dense path), this just needs to feed it
-    // the same per-k inputs disldo_backward does. l1_coef is not yet a
-    // parameter of this function (matches its current scope -- scale_gamma
-    // itself was never previously touched at all here); defaults to 0
-    // (off) until threaded through, same as every other new caller of
-    // this L1 mechanism starts.
-    if (learning_rate != value_type(0) && weights.scale_gamma_is_trainable) {
-        std::vector<value_type> g_agg_by_k(rank);
-        for (std::size_t k = 0; k < rank; ++k) {
-            double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
-            for (int t = 0; t < num_cpus; ++t) {
-                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * rank + k];
-                gamma_grad_sum_contrib += t_gamma_grad_contrib[static_cast<std::size_t>(t) * rank + k];
-            }
-            const value_type g_agg = static_cast<value_type>(gamma_grad_sum);
-            const value_type contrib_agg = static_cast<value_type>(gamma_grad_sum_contrib);
-            g_agg_by_k[k] = g_agg;
-            weights.set_scale_gamma_raw_k(k, weights.get_scale_gamma_k(k));
-            ScalePolicy::update(weights.scale_gamma[k], weights.get_scale_gamma_state_k(k),
-                                g_agg, learning_rate, beta2, eps, contrib_agg,
-                                &weights.get_scale_gamma_step_k(k), false);
-        }
-        value_type gamma_l1_sum = value_type(0);
-        for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
-        const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols);
-        for (std::size_t k = 0; k < rank; ++k) {
-            const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
-            const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
-            weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k,
-                                             std::fabs(g_agg_by_k[k]) / grad_norm_divisor);
-        }
-    }
-
     // ── block4 contribution ─────────────────────────────────────────────────
     //
     // Real, previously-silent bug this closes: same as sisldo_forward's
@@ -1333,6 +1267,194 @@ void disldo_backward_sparse_grad(
                     ScalePolicy::update(weights.value_scale[row], weights.value_scale_importance[row],
                                         g_agg, scale_eff_lr, beta2, eps, contrib_agg,
                                         &weights.get_value_scale_step_k(row, 0), scale_invariant);
+                }
+            }
+        }
+    }
+
+    // ── output_scale's own gradient reduction ───────────────────────────────
+    //
+    // Direct port of disldo_backward's identical block (linear_disldo.hpp)
+    // -- reduces t_col_grad/t_col_grad_contrib across every thread, once per
+    // (col,k), then applies via the same ScalePolicy. Placed AFTER both the
+    // scattered phase above AND the block4 phase just above (both phases'
+    // mcol_at contributions land in the SAME shared t_col_grad buffer,
+    // matching disldo_backward's own placement) -- reducing any earlier
+    // would silently drop block4's own contribution.
+    if (learning_rate != value_type(0) && output_scale_trainable) {
+        for (std::size_t c = 0; c < out_cols; ++c) {
+            const std::size_t deg = c < weights.out_degree.size()
+                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
+            if (deg == 0) continue;
+            const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
+            for (std::size_t k = 0; k < rank; ++k) {
+                double col_grad_sum = 0.0, col_grad_sum_contrib = 0.0;
+                for (int t = 0; t < num_cpus; ++t) {
+                    col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
+                    col_grad_sum_contrib += t_col_grad_contrib[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
+                }
+                const value_type g_agg = static_cast<value_type>(col_grad_sum);
+                const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
+                ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
+                                    g_agg, col_eff_lr, beta2, eps, contrib_agg,
+                                    &weights.get_output_scale_step_k(c, k), scale_invariant);
+            }
+        }
+    }
+
+    // ── AQRS scale_gamma's own update ───────────────────────────────────────
+    //
+    // Direct port of disldo_backward's identical block (linear_disldo.hpp),
+    // including the EMA/dynamic-rank-control tracking call
+    // (update_scale_gamma_ema_k) -- that method itself already lives on
+    // `weights` (shared with the dense path), this just needs to feed it
+    // the same per-k inputs disldo_backward does.
+    if (learning_rate != value_type(0) && weights.scale_gamma_is_trainable) {
+        std::vector<value_type> g_agg_by_k(rank);
+        for (std::size_t k = 0; k < rank; ++k) {
+            double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
+            for (int t = 0; t < num_cpus; ++t) {
+                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * rank + k];
+                gamma_grad_sum_contrib += t_gamma_grad_contrib[static_cast<std::size_t>(t) * rank + k];
+            }
+            const value_type g_agg = static_cast<value_type>(gamma_grad_sum);
+            const value_type contrib_agg = static_cast<value_type>(gamma_grad_sum_contrib);
+            g_agg_by_k[k] = g_agg;
+            weights.set_scale_gamma_raw_k(k, weights.get_scale_gamma_k(k));
+            ScalePolicy::update(weights.scale_gamma[k], weights.get_scale_gamma_state_k(k),
+                                g_agg, learning_rate, beta2, eps, contrib_agg,
+                                &weights.get_scale_gamma_step_k(k), false);
+        }
+        value_type gamma_l1_sum = value_type(0);
+        for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
+        const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols);
+        for (std::size_t k = 0; k < rank; ++k) {
+            const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
+            const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+            weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k,
+                                             std::fabs(g_agg_by_k[k]) / grad_norm_divisor);
+        }
+    }
+
+    // ── AQRS additive branch backward ───────────────────────────────────────
+    //
+    // Direct port of disldo_backward's identical section (linear_disldo.hpp)
+    // -- genuinely independent of the sparse/block4 structure above (same
+    // reasoning as forward's additive branch), computed as its own self-
+    // contained pass. No-op at the default additive_rank==0. `input` is
+    // already dense (this function's own design); `out_grad_sparse` is the
+    // one place this needs real adaptation from disldo_backward's dense
+    // `output_grad` scans -- both the dP projection AND dV's own gradient
+    // walk it once via its CSR instead of a dense scan over n_out (the
+    // dense version already skips zero entries either way, so this is the
+    // same computation, just walking the nonzero set directly).
+    if (weights.additive_rank > 0) {
+        const std::size_t r_o = weights.additive_rank;
+        std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* in_row = input + static_cast<std::size_t>(b) * n_inputs;
+            value_type* p_row = P.data() + static_cast<std::size_t>(b) * r_o;
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                const value_type iv = in_row[r];
+                if (iv == value_type(0)) continue;
+                for (std::size_t k = 0; k < r_o; ++k)
+                    p_row[k] += weights.get_additive_u_k(r, k) * iv;
+            }
+        }
+        // dP[b,k] = sum_c V(c,k)*dy[b,c] -- CSR walk over out_grad_sparse
+        // instead of disldo_backward's dense `for c in n_out` scan.
+        std::vector<value_type> dP(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        // dV_accum[c,k] = sum_b dy[b,c]*P[b,k] -- built in the SAME CSR walk
+        // (both need the same (b,c,dy) triples), avoiding a second O(n_out)
+        // dense scan disldo_backward's own dV loop does.
+        std::vector<value_type> dV_accum(out_cols * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+            const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
+            value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            const value_type* p_row = P.data() + static_cast<std::size_t>(b) * r_o;
+            for (SIZE_TYPE i = og_start; i < og_end; ++i) {
+                const std::size_t c  = static_cast<std::size_t>((*out_grad_sparse.indices[0])[i]);
+                const value_type  dy = (*out_grad_sparse.values[0])[i];
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    dp_row[k] += weights.get_additive_v_k(c, k) * dy;
+                    dV_accum[c * r_o + k] += dy * p_row[k];
+                }
+            }
+        }
+        // dX = sum_k U(r,k) * gamma_k * dP_raw[b,k] -- direct port,
+        // disldo_backward's identical formula (linear_disldo.hpp).
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            value_type* dx_row = input_gradients + static_cast<std::size_t>(b) * n_inputs;
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                value_type acc = value_type(0);
+                for (std::size_t k = 0; k < r_o; ++k)
+                    acc += weights.get_additive_gamma_k(k) * weights.get_additive_u_k(r, k) * dp_row[k];
+                dx_row[r] += acc;
+            }
+        }
+        if (learning_rate != value_type(0)) {
+            // dU[r,k] = gamma_k * sum_b dP_raw[b,k]*X[b,r] -- direct port.
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    value_type dU_rk = value_type(0);
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const value_type iv = input[static_cast<std::size_t>(b) * n_inputs + r];
+                        if (iv == value_type(0)) continue;
+                        dU_rk += dP[static_cast<std::size_t>(b) * r_o + k] * iv;
+                    }
+                    dU_rk *= weights.get_additive_gamma_k(k);
+                    if (dU_rk == value_type(0)) continue;
+                    value_type u_val = weights.get_additive_u_k(r, k);
+                    AdamScalePolicy<value_type>::update(
+                        u_val, weights.get_additive_u_state_k(r, k), weights.get_additive_u_momentum_k(r, k),
+                        dU_rk, learning_rate, value_type(0.9f), beta2, eps, &weights.get_additive_u_step_k(r, k));
+                    weights.set_additive_u_raw_k(r, k, u_val);
+                }
+            }
+            // dV[c,k] = gamma_k * dV_accum[c,k] -- already reduced above via
+            // the CSR walk, no dense scan needed here (unlike
+            // disldo_backward's own dV loop, which re-scans output_grad
+            // densely per (c,k) since it never had a sparse dy to walk).
+            for (std::size_t c = 0; c < out_cols; ++c) {
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    value_type dV_ck = dV_accum[c * r_o + k] * weights.get_additive_gamma_k(k);
+                    if (dV_ck == value_type(0)) continue;
+                    value_type v_val = weights.get_additive_v_k(c, k);
+                    AdamScalePolicy<value_type>::update(
+                        v_val, weights.get_additive_v_state_k(c, k), weights.get_additive_v_momentum_k(c, k),
+                        dV_ck, learning_rate, value_type(0.9f), beta2, eps, &weights.get_additive_v_step_k(c, k));
+                    weights.set_additive_v_raw_k(c, k, v_val);
+                }
+            }
+
+            // additive_gamma's own update -- direct port, including its own
+            // EMA/dynamic-rank-control tracking call
+            // (update_additive_gamma_ema_k), same shared-method pattern as
+            // scale_gamma's above.
+            if (weights.additive_gamma_is_trainable) {
+                std::vector<value_type> dgamma_by_k(r_o);
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    double dgamma_sum = 0.0;
+                    for (SIZE_TYPE b = 0; b < batch; ++b)
+                        dgamma_sum += static_cast<double>(P[static_cast<std::size_t>(b) * r_o + k]) *
+                                      static_cast<double>(dP[static_cast<std::size_t>(b) * r_o + k]);
+                    const value_type dgamma_k = static_cast<value_type>(dgamma_sum);
+                    dgamma_by_k[k] = dgamma_k;
+                    weights.set_additive_gamma_raw_k(k, weights.get_additive_gamma_k(k));
+                    ScalePolicy::update(weights.additive_gamma[k], weights.get_additive_gamma_state_k(k),
+                                        dgamma_k, learning_rate, beta2, eps, value_type(0),
+                                        &weights.get_additive_gamma_step_k(k), false);
+                }
+                value_type gamma_l1_sum = value_type(0);
+                for (std::size_t k = 0; k < r_o; ++k) gamma_l1_sum += std::fabs(weights.additive_gamma[k]);
+                const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols);
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    const value_type abs_gamma_k = std::fabs(weights.additive_gamma[k]);
+                    const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+                    weights.update_additive_gamma_ema_k(k, abs_gamma_k, share_k,
+                                                        std::fabs(dgamma_by_k[k]) / grad_norm_divisor);
                 }
             }
         }
