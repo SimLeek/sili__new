@@ -839,7 +839,8 @@ class DISLDOLayer(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True,
+                dy_sparsity_p: Optional[float] = None) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -872,12 +873,33 @@ class DISLDOLayer(_SparseLayerBase):
         # (Activity-Dependent Structural Plasticity) importance update on
         # every call, independent of whether a backward() would ever
         # follow. Real weight/importance updates now happen ONLY in
-        # backward_dense, below.
+        # backward_dense/backward_sparse, below.
+        #
+        # CSR-typed input (task #334/Phase 5): NOT a new sparse_input bool
+        # -- the caller controls forward-input density entirely by
+        # whether x.data IS a CSR (Tensor.is_csr), matching the EXISTING
+        # precedent at SparseRNNCell.forward() (this same file, ~line
+        # 2453: `if not isinstance(state.data, CSR): ... CSR.from_dense(...)`)
+        # in the opposite direction. A dense np.ndarray/Tensor here is a
+        # completely unchanged code path -- zero behavior change for
+        # every existing caller who never builds a CSR.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)
-        was_1d = x_np.ndim == 1
-        out_np = self._c.forward_dense(x_np)
+        if x.is_csr:
+            csr    = x.data
+            was_1d = csr.rows == 1
+            # backward_sparse's own dense-input design (see its docstring)
+            # needs the real dense x regardless of forward's own path --
+            # reconstruct it here once, thread it through the closure
+            # explicitly (same fix as SISLDOLayer.forward(), task #333 --
+            # never read a cached last_input off the C++ side).
+            x_dense = csr.to_dense()
+            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np    = np.asarray(x.data, dtype=np.float32)
+            was_1d  = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np  = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # requires_grad=False: this output is never meant to be
@@ -896,12 +918,24 @@ class DISLDOLayer(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                # x_np passed straight back in from this closure's own
-                # scope -- same as every other op's _backward, no engine
-                # -side cache/ordering to manage (see backward_dense's
-                # own docstring in cpu_backend.cpp).
-                dx = self._c.backward_dense(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                             damp_by_importance=damp_by_importance, **extra)
+                # dy_sparsity_p (task #334/Phase 5): genuinely independent
+                # axis from x's own type (disldo_backward_sparse_grad's own
+                # signature takes a dense x + sparse dy -- confirmed
+                # distinct from forward's input-sparsity axis). None
+                # (default) keeps today's exact dense-dy behavior via
+                # backward_dense, matching x_dense's own 2-D [batch,cols]
+                # shape either path took above.
+                if dy_sparsity_p is None:
+                    dx = self._c.backward_dense(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
+                                                 learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
+                else:
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _cpu.dense_to_top_k_csr(
+                        dy2d, max(1, int(dy2d.shape[1] * dy_sparsity_p)), self._c.num_cpus)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
