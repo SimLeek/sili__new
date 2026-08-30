@@ -54,11 +54,11 @@ class TestStochasticRoundingDeterminism:
 
         _cpu.seed_fp4_stochastic_rng(11)
         a.forward_dense(x)
-        a.backward_dense(dy, 0.05)
+        a.backward_dense(x, dy, 0.05)
 
         _cpu.seed_fp4_stochastic_rng(999)
         b.forward_dense(x)
-        b.backward_dense(dy, 0.05)
+        b.backward_dense(x, dy, 0.05)
 
         np.testing.assert_array_equal(
             np.asarray(a.weights_vals), np.asarray(b.weights_vals),
@@ -77,11 +77,11 @@ class TestStochasticRoundingDeterminism:
 
         _cpu.seed_fp4_stochastic_rng(11)
         a.forward_dense(x)
-        a.backward_dense(dy, 0.05)
+        a.backward_dense(x, dy, 0.05)
 
         _cpu.seed_fp4_stochastic_rng(999)
         b.forward_dense(x)
-        b.backward_dense(dy, 0.05)
+        b.backward_dense(x, dy, 0.05)
 
         assert not np.array_equal(np.asarray(a.weights_vals), np.asarray(b.weights_vals)), (
             "SparseLinearLayer's stored weights were identical across two "
@@ -100,7 +100,7 @@ class TestStochasticRoundingDeterminism:
         for layer in (a, b):
             _cpu.seed_fp4_stochastic_rng(42)
             layer.forward_dense(x)
-            layer.backward_dense(dy, 0.05)
+            layer.backward_dense(x, dy, 0.05)
 
         assert not np.allclose(np.asarray(a.weights_vals), 0.0), (
             "backward_dense produced an all-zero update -- test setup itself "

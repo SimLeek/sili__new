@@ -183,21 +183,6 @@ class _SparseLayerBase(Module):
     @property
     def neuron_grad_accum(self)  -> np.ndarray: return self._c.neuron_grad_accum
 
-    def set_max_dense_input_stack(self, n: int) -> None:
-        """Raise/lower the cap on live forward_dense/forward calls pending
-        a matching backward_dense/backward before this layer throws
-        (default 8) -- see DenseInputStack's own docstring in
-        cpu_backend.cpp for why this exists (a real bug: the old
-        single-slot input cache silently corrupted state when a second
-        forward call landed before the first's backward). Raise this
-        explicitly for genuinely deep pending-forward patterns, e.g. a
-        multi-step rollout that intentionally never calls backward at
-        all (forward-only numerical-stability checks) or that
-        deliberately batches many steps before one combined backward."""
-        self._c.set_max_dense_input_stack(n)
-    def get_max_dense_input_stack(self) -> int:
-        return self._c.get_max_dense_input_stack()
-
     def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int,
                        importance_eps: float = 1e-3, max_prune_per_step: int = 8):
         """Structural growth + memory rebalancing -- the only call here
@@ -854,8 +839,7 @@ class DISLDOLayer(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True,
-                use_explicit_token: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -893,28 +877,15 @@ class DISLDOLayer(_SparseLayerBase):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
         was_1d = x_np.ndim == 1
-        out_np = self._c.forward_dense(x_np, requires_grad=requires_grad)
+        out_np = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # requires_grad=False: this output is never meant to be
-        # backpropagated (e.g. a pure eval/inference-only rollout) -- the
-        # C++ side already skipped pushing onto its DenseInputStack (see
-        # forward_dense's own docstring), so build a plain leaf Tensor
-        # here too, with no _children/_backward, matching that intent
-        # instead of attaching a hook that would raise if ever walked.
+        # backpropagated (e.g. a pure eval/inference-only rollout) --
+        # skip building the graph node entirely (ordinary torch.no_grad()
+        # -style opt-out), matching every other op's Tensor convention.
         if not requires_grad:
             return Tensor(out_np, backend=x.backend)
-        # use_explicit_token (opt-in, default False -- ordinary PyTorch-
-        # like nested forward/backward doesn't need this): capture THIS
-        # specific push's token right after the C++ forward call, so
-        # THIS closure's own backward pops its OWN entry regardless of
-        # visit order, instead of trusting "top of stack" -- see
-        # DenseInputStack::push's own docstring (cpu_backend.cpp) for
-        # why plain LIFO can be wrong when this SAME layer instance is
-        # also forward()'d elsewhere as a genuinely parallel (not
-        # nested) branch within the same backward() pass, e.g.
-        # _l1_sparsity_split's own probe call.
-        token = self._c.get_last_push_token() if use_explicit_token else None
         out = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
 
         def _bwd():
@@ -925,8 +896,11 @@ class DISLDOLayer(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                if token is not None: extra["token"] = token
-                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                # x_np passed straight back in from this closure's own
+                # scope -- same as every other op's _backward, no engine
+                # -side cache/ordering to manage (see backward_dense's
+                # own docstring in cpu_backend.cpp).
+                dx = self._c.backward_dense(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                              damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -1123,19 +1097,17 @@ class DISLDOLayer32(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True,
-                use_explicit_token: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
         was_1d = x_np.ndim == 1
-        out_np = self._c.forward(x_np, requires_grad=requires_grad)
+        out_np = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
-        # See DISLDOLayer.forward's own requires_grad/use_explicit_token comments.
+        # See DISLDOLayer.forward's own requires_grad comment.
         if not requires_grad:
             return Tensor(out_np, backend=x.backend)
-        token = self._c.get_last_push_token() if use_explicit_token else None
         out = Tensor(out_np, _children=(x,), _op="disldo32", backend=x.backend)
 
         def _bwd():
@@ -1146,8 +1118,7 @@ class DISLDOLayer32(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                if token is not None: extra["token"] = token
-                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                        damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -1215,19 +1186,17 @@ class DISLDOLayer8(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True,
-                use_explicit_token: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
         was_1d = x_np.ndim == 1
-        out_np = self._c.forward(x_np, requires_grad=requires_grad)
+        out_np = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
-        # See DISLDOLayer.forward's own requires_grad/use_explicit_token comments.
+        # See DISLDOLayer.forward's own requires_grad comment.
         if not requires_grad:
             return Tensor(out_np, backend=x.backend)
-        token = self._c.get_last_push_token() if use_explicit_token else None
         out = Tensor(out_np, _children=(x,), _op="disldo8", backend=x.backend)
 
         def _bwd():
@@ -1238,8 +1207,7 @@ class DISLDOLayer8(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                if token is not None: extra["token"] = token
-                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                        damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)

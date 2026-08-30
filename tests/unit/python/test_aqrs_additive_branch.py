@@ -144,7 +144,7 @@ class TestAdditiveBranchBackward:
         x = np.random.RandomState(1).randn(1, 4).astype(np.float32)
         dy = np.random.RandomState(2).randn(1, 4).astype(np.float32)
         layer.forward_dense(x)
-        layer.backward_dense(dy, 0.05)
+        layer.backward_dense(x, dy, 0.05)
 
         u_after = [layer.get_additive_u_k(r, 0) for r in range(4)]
         v_after = [layer.get_additive_v_k(c, 0) for c in range(4)]
@@ -199,6 +199,6 @@ class TestAdditiveBranchFP8:
         x = np.random.RandomState(1).randn(1, 4).astype(np.float32)
         dy = np.random.RandomState(2).randn(1, 4).astype(np.float32)
         layer.forward(x)
-        layer.backward(dy, 0.05)
+        layer.backward(x, dy, 0.05)
         u_after = [layer.get_additive_u_k(r, 0) for r in range(4)]
         assert u_after != u_before
