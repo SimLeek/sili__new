@@ -383,7 +383,14 @@ public:
     std::vector<V>            output_buf;
     int                       num_cpus;
 
-    // Last dense input — stored for backward.
+    // Last dense input — a plain single-slot mirror purely for the
+    // Python-facing `last_input` introspection property below (always
+    // reflects the MOST RECENT forward_dense call). backward_dense no
+    // longer reads this or caches anything itself -- the caller (Python
+    // Tensor autograd) already holds the exact `x` it needs in its own
+    // closure, same as every other op's _backward, and passes it
+    // straight back in as an explicit argument. No engine-side state to
+    // get out of sync with multiple forward() calls per backward pass.
     std::vector<V> _last_input;
     S              _last_batch = 0;
     S              _last_cols  = 0;
@@ -630,17 +637,30 @@ public:
     // meant testing a different max_abs_delta required a C++ rebuild.
     // max_abs_delta is in RAW (pre-lr-multiply) units (see update_cw's
     // own docstring for why).
-    py::array_t<V> backward_dense(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+    //
+    // Takes `x` (the ORIGINAL dense forward input) as an explicit
+    // argument, same as `dy` -- direct instruction: the Python Tensor
+    // autograd side already holds `x` in its own _backward closure
+    // (it's right there in `forward()`'s own scope), matching how every
+    // other op in this codebase's autograd already works, so there is
+    // no need for this engine to cache/stack/token-track it itself.
+    // Simpler and structurally immune to the multi-forward-per-backward
+    // corruption class the old single-slot cache had.
+    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                                  bool lr_per_row_nnz = false,
                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                                   V max_ci = kSynapsePolicyMaxCi,
                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
+        auto xbuf  = x.request();
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        std::vector<V> dx(batch * cols, V(0));
         disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
-            _last_input.data(), _last_batch, _last_cols,
+            (V*)xbuf.ptr, batch, cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -648,7 +668,7 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
@@ -1203,6 +1223,8 @@ public:
     S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
     Block4View block4() { return Block4View(weights.block4); }
 
+    // See SparseLinearLayer::backward_dense's docstring on why `x` is an
+    // explicit backward argument now instead of an engine-side cache.
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1215,27 +1237,29 @@ public:
         disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
                        output_buf.data(), num_cpus);
 
-        // COPY, not a view -- see SparseLinearLayer::forward_dense's own
-        // comment for why (output_buf is reused/overwritten by every
-        // future call on this same object).
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
         std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
         return result;
     }
 
     // See SparseLinearLayerImpl::backward_dense's identical comment on
-    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above).
-    py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above)
+    // and on why `x` is now an explicit argument.
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                             bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                              V max_ci = kSynapsePolicyMaxCi,
                              bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
+        auto xbuf  = x.request();
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        std::vector<V> dx(batch * cols, V(0));
         disldo_backward<S, VT, COL_TYPE>(
-            _last_input.data(), _last_batch, _last_cols,
+            (V*)xbuf.ptr, batch, cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -1243,7 +1267,7 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
@@ -1532,6 +1556,8 @@ public:
     V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
     V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
 
+    // See SparseLinearLayer::backward_dense's docstring on why `x` is an
+    // explicit backward argument now instead of an engine-side cache.
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf     = x.request();
         _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1550,18 +1576,23 @@ public:
     }
 
     // See SparseLinearLayerImpl::backward_dense's identical comment on
-    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above).
-    py::array_t<V> backward(py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+    // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above)
+    // and on why `x` is now an explicit argument.
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                             bool lr_per_row_nnz = false,
                              bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
                              V min_decay_frac = kSynapsePolicyMinDecayFrac,
                              V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                              V max_ci = kSynapsePolicyMaxCi,
                              bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
+        auto xbuf  = x.request();
         auto dybuf = dy.request();
-        std::vector<V> dx(_last_batch * _last_cols, V(0));
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        std::vector<V> dx(batch * cols, V(0));
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
-            _last_input.data(), _last_batch, _last_cols,
+            (V*)xbuf.ptr, batch, cols,
             (V*)dybuf.ptr, weights,
             dx.data(),
             neuron_input_accum.data(), neuron_grad_accum.data(),
@@ -1569,7 +1600,7 @@ public:
             num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
             kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
-        py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)_last_cols});
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
     }
@@ -1825,7 +1856,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayer::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayer::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -2088,7 +2119,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayerResync::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerResync::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -2317,7 +2348,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayerNoScale::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerNoScale::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -2594,7 +2625,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -2846,7 +2877,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayerResyncDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerResyncDeterministic::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3073,7 +3104,7 @@ PYBIND11_MODULE(_cpu, m)
         .def("forward_dense",        &SparseLinearLayerNoScaleDeterministic::forward_dense,
              py::arg("x"))
         .def("backward_dense",       &SparseLinearLayerNoScaleDeterministic::backward_dense,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3298,10 +3329,10 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &DISLDOLayerV::forward,
+        .def("forward",        &DISLDOLayerV::forward,
              py::arg("x"))
         .def("backward",             &DISLDOLayerV::backward,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3338,10 +3369,10 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8::forward,
+        .def("forward",        &SparseLinearLayer8::forward,
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8::backward,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3490,10 +3521,10 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8Resync::forward,
+        .def("forward",        &SparseLinearLayer8Resync::forward,
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8Resync::backward,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3557,10 +3588,10 @@ PYBIND11_MODULE(_cpu, m)
         .def(py::init<int, int, int, int>(),
              py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
              py::arg("num_cpus") = 4)
-        .def("forward",              &SparseLinearLayer8AdaMax::forward,
+        .def("forward",        &SparseLinearLayer8AdaMax::forward,
              py::arg("x"))
         .def("backward",             &SparseLinearLayer8AdaMax::backward,
-             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,

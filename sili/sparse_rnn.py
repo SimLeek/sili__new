@@ -839,7 +839,7 @@ class DISLDOLayer(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -880,6 +880,12 @@ class DISLDOLayer(_SparseLayerBase):
         out_np = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
+        # requires_grad=False: this output is never meant to be
+        # backpropagated (e.g. a pure eval/inference-only rollout) --
+        # skip building the graph node entirely (ordinary torch.no_grad()
+        # -style opt-out), matching every other op's Tensor convention.
+        if not requires_grad:
+            return Tensor(out_np, backend=x.backend)
         out = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
 
         def _bwd():
@@ -890,7 +896,11 @@ class DISLDOLayer(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward_dense(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                # x_np passed straight back in from this closure's own
+                # scope -- same as every other op's _backward, no engine
+                # -side cache/ordering to manage (see backward_dense's
+                # own docstring in cpu_backend.cpp).
+                dx = self._c.backward_dense(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                              damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -1087,7 +1097,7 @@ class DISLDOLayer32(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -1095,6 +1105,9 @@ class DISLDOLayer32(_SparseLayerBase):
         out_np = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
+        # See DISLDOLayer.forward's own requires_grad comment.
+        if not requires_grad:
+            return Tensor(out_np, backend=x.backend)
         out = Tensor(out_np, _children=(x,), _op="disldo32", backend=x.backend)
 
         def _bwd():
@@ -1105,7 +1118,7 @@ class DISLDOLayer32(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                        damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -1173,7 +1186,7 @@ class DISLDOLayer8(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         x_np   = np.asarray(x.data, dtype=np.float32)
@@ -1181,6 +1194,9 @@ class DISLDOLayer8(_SparseLayerBase):
         out_np = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
+        # See DISLDOLayer.forward's own requires_grad comment.
+        if not requires_grad:
+            return Tensor(out_np, backend=x.backend)
         out = Tensor(out_np, _children=(x,), _op="disldo8", backend=x.backend)
 
         def _bwd():
@@ -1191,7 +1207,7 @@ class DISLDOLayer8(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward(dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                        damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -2421,7 +2437,8 @@ class SparseRNNCell(Module):
     def parameters(self) -> list:
         return []
 
-    def forward(self, obs: Tensor, state: Tensor, learning_rate: float = 0.0) -> Tuple[Tensor, Tensor, float]:
+    def forward(self, obs: Tensor, state: Tensor, learning_rate: float = 0.0,
+                requires_grad: bool = True) -> Tuple[Tensor, Tensor, float]:
         # state.data is a CSR only if the caller explicitly handed us one
         # (e.g. warm-starting from a saved CSR); the cell's own output is
         # always dense (see class docstring). Normal path: build the CSR
@@ -2449,7 +2466,7 @@ class SparseRNNCell(Module):
         ))
         self.branching_recurrent.update(recurrent_activity)
 
-        h = self.input_proj(obs, learning_rate) + recurrent_out
+        h = self.input_proj(obs, learning_rate, requires_grad=requires_grad) + recurrent_out
 
         density_override = None
         if self.dynamic_density_from_branching_ratio:
