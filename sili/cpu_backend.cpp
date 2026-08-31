@@ -3784,6 +3784,42 @@ PYBIND11_MODULE(_cpu, m)
         "Exact top-k sparsity conversion for forward and backward passes."
     );
 
+    m.def("dense_to_graded_top_k_csr",
+        [](py::array_t<float> x, py::array_t<int> k_per_row, int num_threads) -> py::tuple {
+            auto buf = x.request();
+            int rows = (buf.ndim == 2) ? buf.shape[0] : 1;
+            int cols = (buf.ndim == 2) ? buf.shape[1] : buf.shape[0];
+            float* src = (float*)buf.ptr;
+
+            auto kbuf = k_per_row.request();
+            if (kbuf.size != rows) {
+                throw std::invalid_argument(
+                    "k_per_row length (" + std::to_string(kbuf.size) +
+                    ") must match number of rows (" + std::to_string(rows) + ")");
+            }
+            int* k_src = (int*)kbuf.ptr;
+
+            auto csr = top_k_csr_graded<int, float>(src, rows, cols, k_src, num_threads);
+
+            int nnz = (int)csr.indices[0]->size();
+
+            py::array_t<int>   out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int>   out_indices({(py::ssize_t)nnz});
+            py::array_t<float> out_values({(py::ssize_t)nnz});
+
+            std::copy(csr.ptrs[0]->begin(), csr.ptrs[0]->end(), (int*)out_ptrs.request().ptr);
+            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(), (int*)out_indices.request().ptr);
+            std::copy(csr.values[0]->begin(), csr.values[0]->end(), (float*)out_values.request().ptr);
+
+            return py::make_tuple(out_ptrs, out_indices, out_values);
+        },
+        py::arg("x"), py::arg("k_per_row"), py::arg("num_threads") = 4,
+        "Genuine per-row top-k sparsity conversion: row r independently keeps its\n"
+        "own top-k_per_row[r] largest-magnitude entries (unlike dense_to_top_k_csr,\n"
+        "whose k is spent GLOBALLY across the whole flattened array). Built for\n"
+        "graded per-row/per-position gradient density schedules."
+    );
+
     // ── Bulk quantize-array utilities ───────────────────────────────────────
     //
     // Standalone, layer-independent elementwise float32->code conversion --

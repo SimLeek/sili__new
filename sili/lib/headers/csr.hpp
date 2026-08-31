@@ -566,6 +566,73 @@ top_k_csr(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
     return to_csr(coo_result, num_threads);
 }
 
+// Genuine per-row top-k: row r independently keeps its own top-k_per_row[r]
+// largest-magnitude entries. NOT equivalent to top_k_csr above (that k is
+// spent GLOBALLY across the whole flattened rows*cols array) -- this is a
+// different selection, needed for graded per-row density schedules (e.g.
+// sili_peridot's step_cached query-step credit assignment, where each row
+// corresponds to a content position and gets its own density). Was
+// previously a pure-Python/numpy per-row argpartition loop
+// (sili/sparse_rnn.py's _graded_top_k_csr) -- moved here because that loop
+// ran on every query/backward step and dominated the step's own cost once
+// measured against a real curriculum run (use_tile_cache=1 measured
+// SLOWER than the plain step() baseline, not the expected speedup).
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr_graded(VALUE_TYPE *values, size_t rows, size_t cols,
+                  const SIZE_TYPE *k_per_row, int num_threads) {
+    std::vector<SIZE_TYPE> row_offset(rows + 1, 0);
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE k = k_per_row[r];
+        if (k < 0) k = 0;
+        if (static_cast<size_t>(k) > cols) k = static_cast<SIZE_TYPE>(cols);
+        row_offset[r + 1] = row_offset[r] + k;
+    }
+    size_t total = static_cast<size_t>(row_offset[rows]);
+
+    std::vector<SIZE_TYPE> indices(total);
+    std::vector<VALUE_TYPE> out_values(total);
+
+    auto by_magnitude = [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+        return std::abs(a.second) > std::abs(b.second);
+    };
+
+    // Same small-region guard as top_k_indices/top_k_csr above -- per-row
+    // work here is O(cols), usually a single layer's own width, so
+    // #pragma omp parallel's fork/join rendezvous can easily exceed the
+    // whole serial cost. Only parallelize once total work justifies it.
+    bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
+
+    #pragma omp parallel for num_threads(num_threads) if(use_omp) schedule(dynamic)
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE k = static_cast<SIZE_TYPE>(row_offset[r + 1] - row_offset[r]);
+        if (k == 0) continue;
+        const VALUE_TYPE* row = values + r * cols;
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> pairs;
+        pairs.reserve(cols);
+        for (size_t c = 0; c < cols; ++c)
+            pairs.emplace_back(static_cast<SIZE_TYPE>(c), row[c]);
+        std::partial_sort(pairs.begin(), pairs.begin() + k, pairs.end(), by_magnitude);
+        // Row-major/ascending-column convention, matching top_k_csr's own
+        // merge_sort_coo step -- the selected k entries need re-sorting by
+        // index since partial_sort above ordered them by magnitude.
+        std::sort(pairs.begin(), pairs.begin() + k,
+                  [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                      return a.first < b.first;
+                  });
+        SIZE_TYPE base = row_offset[r];
+        for (SIZE_TYPE i = 0; i < k; ++i) {
+            indices[base + i] = pairs[i].first;
+            out_values[base + i] = pairs[i].second;
+        }
+    }
+
+    std::vector<SIZE_TYPE> ptrs(row_offset.begin(), row_offset.end());
+    return make_csr_input<SIZE_TYPE, VALUE_TYPE>(
+        static_cast<SIZE_TYPE>(rows), static_cast<SIZE_TYPE>(cols),
+        std::move(ptrs), std::move(indices), std::move(out_values));
+}
+
 // ── csr_union ─────────────────────────────────────────────────────────────
 //
 // Merge two same-shape absolute CSRs into the union of their nonzero

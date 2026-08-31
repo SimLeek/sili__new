@@ -800,17 +800,23 @@ def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     return per_row
 
 
-def _graded_top_k_csr(dy2d: np.ndarray, k_per_row) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _graded_top_k_csr(dy2d: np.ndarray, k_per_row,
+                      num_cpus: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """GENUINELY per-row top-k selection: row r independently keeps its
     own top-k_per_row[r] largest-magnitude entries. Lets a caller grade
     gradient density by row (e.g. by how far back in time a row's
     content is, for step_cached's query-step credit-assignment design;
-    see conversation/JOURNAL.md). Pure Python/numpy, no C++ needed --
-    CSR's `ptrs` array already supports variable nnz per row natively,
-    this just builds one directly instead of going through a C++ call.
-    Only meant for small batches (this only runs on rare query/backward
-    steps, not the hot per-token path) -- no attempt made to parallelize
-    or vectorize across rows.
+    see conversation/JOURNAL.md).
+
+    Was a pure-Python/numpy per-row argpartition loop -- moved to a real
+    C++ kernel (`_cpu.dense_to_graded_top_k_csr`, csr.hpp's
+    `top_k_csr_graded`) after a live 20k-step curriculum comparison
+    showed this loop running on every query/backward step dominated the
+    step's own cost: use_tile_cache=1 (which relies on this function)
+    measured SLOWER (5.1 steps/sec) than the plain step() baseline (6.6
+    steps/sec) instead of the expected speedup from caching. This
+    Python wrapper is kept only so existing callers/tests (that expect
+    this exact name/signature) don't need to change.
 
     IMPORTANT, found the hard way (see JOURNAL.md /
     project_dy_sparsity_p_validated_speedup.md's correction): this is
@@ -823,25 +829,10 @@ def _graded_top_k_csr(dy2d: np.ndarray, k_per_row) -> Tuple[np.ndarray, np.ndarr
     "verify" this function by comparing its output against
     dy_sparsity_p's existing path; they answer different questions."""
     rows, cols = dy2d.shape
-    ptrs = [0]
-    indices = []
-    values = []
-    for r in range(rows):
-        k = min(int(k_per_row[r]), cols)
-        row = dy2d[r]
-        if k <= 0:
-            ptrs.append(ptrs[-1])
-            continue
-        if k >= cols:
-            idx = np.arange(cols)
-        else:
-            idx = np.argpartition(np.abs(row), -k)[-k:]
-            idx.sort()
-        indices.extend(int(i) for i in idx)
-        values.extend(float(v) for v in row[idx])
-        ptrs.append(len(indices))
-    return (np.array(ptrs, dtype=np.int32), np.array(indices, dtype=np.int32),
-            np.array(values, dtype=np.float32))
+    k_arr = np.array([min(int(k), cols) for k in k_per_row], dtype=np.int32)
+    dy2d_f32 = np.ascontiguousarray(dy2d, dtype=np.float32)
+    ptrs, indices, values = _cpu.dense_to_graded_top_k_csr(dy2d_f32, k_arr, num_cpus)
+    return ptrs, indices, values
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -985,7 +976,7 @@ class DISLDOLayer(_SparseLayerBase):
                             f"dy_sparsity_schedule has {len(dy_sparsity_schedule)} entries, "
                             f"but dy has {dy2d.shape[0]} rows")
                     k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
-                    dp, di, dv = _graded_top_k_csr(dy2d, k_per_row)
+                    dp, di, dv = _graded_top_k_csr(dy2d, k_per_row, self._c.num_cpus)
                     dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
                                                   lr_per_row_nnz=lr_per_row_nnz,
                                                   damp_by_importance=damp_by_importance, **extra)
