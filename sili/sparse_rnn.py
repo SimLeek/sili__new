@@ -52,7 +52,7 @@ from the old design, not an oversight.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import sili._cpu as _cpu
@@ -800,6 +800,50 @@ def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     return per_row
 
 
+def _graded_top_k_csr(dy2d: np.ndarray, k_per_row) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """GENUINELY per-row top-k selection: row r independently keeps its
+    own top-k_per_row[r] largest-magnitude entries. Lets a caller grade
+    gradient density by row (e.g. by how far back in time a row's
+    content is, for step_cached's query-step credit-assignment design;
+    see conversation/JOURNAL.md). Pure Python/numpy, no C++ needed --
+    CSR's `ptrs` array already supports variable nnz per row natively,
+    this just builds one directly instead of going through a C++ call.
+    Only meant for small batches (this only runs on rare query/backward
+    steps, not the hot per-token path) -- no attempt made to parallelize
+    or vectorize across rows.
+
+    IMPORTANT, found the hard way (see JOURNAL.md /
+    project_dy_sparsity_p_validated_speedup.md's correction): this is
+    NOT equivalent to `_cpu.dense_to_top_k_csr(dy2d, k, cpus)` with a
+    uniform k, even at matching average density. That function's `k` is
+    spent GLOBALLY across the WHOLE flattened `rows*cols` array (via
+    `top_k_indices(values, rows*cols, k, ...)` in csr.hpp), not per row
+    -- a row can end up with zero surviving entries there, purely by
+    losing the global competition, no matter what k is requested. Don't
+    "verify" this function by comparing its output against
+    dy_sparsity_p's existing path; they answer different questions."""
+    rows, cols = dy2d.shape
+    ptrs = [0]
+    indices = []
+    values = []
+    for r in range(rows):
+        k = min(int(k_per_row[r]), cols)
+        row = dy2d[r]
+        if k <= 0:
+            ptrs.append(ptrs[-1])
+            continue
+        if k >= cols:
+            idx = np.arange(cols)
+        else:
+            idx = np.argpartition(np.abs(row), -k)[-k:]
+            idx.sort()
+        indices.extend(int(i) for i in idx)
+        values.extend(float(v) for v in row[idx])
+        ptrs.append(len(indices))
+    return (np.array(ptrs, dtype=np.int32), np.array(indices, dtype=np.int32),
+            np.array(values, dtype=np.float32))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -840,7 +884,8 @@ class DISLDOLayer(_SparseLayerBase):
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
                 scale_invariant: bool = False, requires_grad: bool = True,
-                dy_sparsity_p: Optional[float] = None) -> Tensor:
+                dy_sparsity_p: Optional[float] = None,
+                dy_sparsity_schedule: Optional[List[float]] = None) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -925,7 +970,26 @@ class DISLDOLayer(_SparseLayerBase):
                 # (default) keeps today's exact dense-dy behavior via
                 # backward_dense, matching x_dense's own 2-D [batch,cols]
                 # shape either path took above.
-                if dy_sparsity_p is None:
+                if dy_sparsity_schedule is not None:
+                    # Per-row graded density (task: query-step credit
+                    # assignment for step_cached, see conversation) --
+                    # overrides the scalar dy_sparsity_p when both are
+                    # given. len(dy_sparsity_schedule) must match the
+                    # batch's row count; each entry is that row's own
+                    # density fraction (same convention as dy_sparsity_p,
+                    # just one value per row instead of one for the
+                    # whole call).
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    if len(dy_sparsity_schedule) != dy2d.shape[0]:
+                        raise ValueError(
+                            f"dy_sparsity_schedule has {len(dy_sparsity_schedule)} entries, "
+                            f"but dy has {dy2d.shape[0]} rows")
+                    k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
+                    dp, di, dv = _graded_top_k_csr(dy2d, k_per_row)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
+                elif dy_sparsity_p is None:
                     dx = self._c.backward_dense(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
                                                  learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                                  damp_by_importance=damp_by_importance, **extra)
