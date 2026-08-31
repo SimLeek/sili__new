@@ -708,6 +708,31 @@ void disldo_backward_sparse_grad(
             neuron_grad_accum[(*out_grad_sparse.indices[0])[j]] +=
                 std::abs((*out_grad_sparse.values[0])[j]);
 
+    // AQRS neurogenesis-trigger normalization fix (direct instruction,
+    // sili_peridot JOURNAL.md 2026-08-31): scale_gamma's own merge-walk
+    // (og_ptr against out_grad_sparse, below) and additive_gamma's dP/
+    // dgamma computation (further down) both only accumulate contributions
+    // from out_grad_sparse's SURVIVING columns -- this function is only
+    // ever called when dy is genuinely sparse (dy_sparsity_p set; see this
+    // function's own "only sparse-gradient backward variant" docstring
+    // above), so those sums are structurally smaller than the dense case by
+    // roughly the surviving fraction. grad_norm_divisor below (both gamma
+    // branches) was n_inputs*out_cols unconditionally, with nothing to
+    // compensate -- confirmed via a real 20k-step run: input_sparsity_p/
+    // dy_sparsity_p=0.5 pinned every layer's AQRS rank at 1 the entire
+    // curriculum (933-mutation isolation run with dy dense again grew ranks
+    // normally, same seed/everything else). Scale grad_norm_divisor by the
+    // ACTUAL observed dy density for this call, not the nominal p -- self-
+    // corrects for graded per-row schedules too, not just a uniform p.
+    const SIZE_TYPE dy_total_nnz = batch > 0
+        ? (*out_grad_sparse.ptrs[0])[batch] - (*out_grad_sparse.ptrs[0])[0]
+        : SIZE_TYPE(0);
+    const value_type dy_density = (batch > 0 && out_cols > 0)
+        ? std::max(static_cast<value_type>(dy_total_nnz) /
+                   (static_cast<value_type>(batch) * static_cast<value_type>(out_cols)),
+                   value_type(1e-6))
+        : value_type(1);
+
     // ── AQRS rank-N scale scaffolding ───────────────────────────────────────
     //
     // Direct port of disldo_backward's identical scaffolding
@@ -1359,7 +1384,7 @@ void disldo_backward_sparse_grad(
         }
         value_type gamma_l1_sum = value_type(0);
         for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
-        const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols);
+        const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols) * dy_density;
         for (std::size_t k = 0; k < rank; ++k) {
             const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
             const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
@@ -1481,7 +1506,7 @@ void disldo_backward_sparse_grad(
                 }
                 value_type gamma_l1_sum = value_type(0);
                 for (std::size_t k = 0; k < r_o; ++k) gamma_l1_sum += std::fabs(weights.additive_gamma[k]);
-                const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols);
+                const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols) * dy_density;
                 for (std::size_t k = 0; k < r_o; ++k) {
                     const value_type abs_gamma_k = std::fabs(weights.additive_gamma[k]);
                     const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
