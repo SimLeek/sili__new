@@ -222,3 +222,129 @@ class TestDISLDOLayerGradedDySparsitySchedule:
         out._backward()
         vs_after = np.array(layer._c.get_value_scale_raw_vector())
         assert np.all(np.isfinite(vs_after))
+
+
+class TestDISLDOLayerDyRTarget:
+    """dy_r_target (task #367, priority 1 per direct instruction): nucleus/
+    energy-threshold grad sparsification -- k is a CONSEQUENCE of
+    dy_r_target and this step's actual gradient energy, not a fixed
+    fraction like dy_sparsity_p. See sili_peridot/JOURNAL.md's nucleus
+    design note and _nucleus_top_k_csr's own docstring for the math."""
+
+    def test_none_default_unaffected(self):
+        # dy_r_target=None must take the exact same dense path as before
+        # this kwarg existed -- same style of check as
+        # test_dy_sparsity_p_none_default_unaffected above.
+        layer_a = _make_layer(seed=40)
+        layer_b = _make_layer(seed=40)
+        backend = get_backend("cpu")
+        x_np = np.random.default_rng(41).normal(size=6).astype(np.float32)
+
+        out_a = layer_a.forward(Tensor(x_np, backend=backend), learning_rate=0.05)
+        out_b = layer_b.forward(Tensor(x_np, backend=backend), learning_rate=0.05, dy_r_target=None)
+        dy = np.array([0.1, 0.2, -0.1, 0.05], dtype=np.float32)
+        out_a.grad = dy.copy()
+        out_b.grad = dy.copy()
+        out_a._backward()
+        out_b._backward()
+
+        np.testing.assert_allclose(
+            np.array(layer_a._c.get_value_scale_raw_vector()),
+            np.array(layer_b._c.get_value_scale_raw_vector()),
+            rtol=1e-6, atol=1e-7)
+
+    def test_takes_priority_over_dy_sparsity_p(self):
+        # Both kwargs set at once -- dy_r_target must win (it's the
+        # smarter, data-driven mechanism dy_sparsity_p is being
+        # superseded by). Checked by spying on which selection function
+        # actually gets called, NOT by comparing floating-point weight
+        # outputs -- backward_sparse's own C++ update has genuine
+        # run-to-run floating-point nondeterminism under threading
+        # (confirmed directly: even calling the SAME dy_r_target-only
+        # path twice with identical inputs gives different value_scale
+        # results), so exact-output comparison is the wrong tool here.
+        import sili.sparse_rnn as sparse_rnn_mod
+        layer = _make_layer(seed=42)
+        backend = get_backend("cpu")
+        x_np = np.random.default_rng(43).normal(size=(2, 6)).astype(np.float32)
+        dy = np.random.default_rng(44).normal(size=(2, 4)).astype(np.float32)
+
+        out = layer.forward(Tensor(x_np, backend=backend), learning_rate=0.05,
+                             dy_r_target=0.7, dy_sparsity_p=0.9)
+
+        calls = {"nucleus": 0, "graded_fixed_p": 0}
+        orig_nucleus = sparse_rnn_mod._nucleus_top_k_csr
+        orig_graded = sparse_rnn_mod._graded_top_k_csr
+        def spy_nucleus(*a, **kw):
+            calls["nucleus"] += 1
+            return orig_nucleus(*a, **kw)
+        def spy_graded(*a, **kw):
+            calls["graded_fixed_p"] += 1
+            return orig_graded(*a, **kw)
+        sparse_rnn_mod._nucleus_top_k_csr = spy_nucleus
+        sparse_rnn_mod._graded_top_k_csr = spy_graded
+        try:
+            out.grad = dy.copy()
+            out._backward()
+        finally:
+            sparse_rnn_mod._nucleus_top_k_csr = orig_nucleus
+            sparse_rnn_mod._graded_top_k_csr = orig_graded
+
+        assert calls == {"nucleus": 1, "graded_fixed_p": 0}, (
+            f"dy_r_target should take priority over dy_sparsity_p when both are set, got {calls}")
+
+    def test_low_energy_row_keeps_fewer_entries_than_high_energy_row(self):
+        # A row with one huge outlier needs few entries to reach a given
+        # R_target; a flat row of similar-magnitude entries needs many --
+        # proves this is genuinely data-driven, not a hidden fixed k.
+        # backward_sparse is a read-only C++/pybind attribute (can't be
+        # monkeypatched directly) -- spy on the Python-level
+        # _nucleus_top_k_csr wrapper instead.
+        import sili.sparse_rnn as sparse_rnn_mod
+        layer = _make_layer(seed=45)
+        backend = get_backend("cpu")
+        x_np = np.random.default_rng(46).normal(size=(2, 6)).astype(np.float32)
+        out = layer.forward(Tensor(x_np, backend=backend), learning_rate=0.05, dy_r_target=0.9)
+
+        recorded = {}
+        orig = sparse_rnn_mod._nucleus_top_k_csr
+        def spy(x2d, r_target, num_cpus=4, k_min=0, k_max=None):
+            ptrs, indices, values = orig(x2d, r_target, num_cpus, k_min=k_min, k_max=k_max)
+            recorded["nnz_per_row"] = np.diff(ptrs)
+            return ptrs, indices, values
+        sparse_rnn_mod._nucleus_top_k_csr = spy
+        try:
+            dy = np.array([[100.0, 1.0, 1.0, 1.0],
+                           [1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+            out.grad = dy
+            out._backward()
+        finally:
+            sparse_rnn_mod._nucleus_top_k_csr = orig
+
+        nnz = recorded["nnz_per_row"]
+        assert nnz[0] < nnz[1], f"dominant-entry row should keep fewer than flat row, got {nnz}"
+
+    def test_k_min_k_max_reach_the_kernel(self):
+        # Confirms the kwargs actually thread through to _nucleus_top_k_csr
+        # (not silently dropped) -- k_min=cols forces full density even at
+        # r_target=0, which would otherwise keep k=0.
+        import sili.sparse_rnn as sparse_rnn_mod
+        layer = _make_layer(seed=47)
+        backend = get_backend("cpu")
+        x_np = np.random.default_rng(48).normal(size=6).astype(np.float32)
+        out = layer.forward(Tensor(x_np, backend=backend), learning_rate=0.05,
+                            dy_r_target=0.0, dy_k_min=4)
+
+        recorded = {}
+        orig = sparse_rnn_mod._nucleus_top_k_csr
+        def spy(x2d, r_target, num_cpus=4, k_min=0, k_max=None):
+            ptrs, indices, values = orig(x2d, r_target, num_cpus, k_min=k_min, k_max=k_max)
+            recorded["nnz"] = np.diff(ptrs)[0]
+            return ptrs, indices, values
+        sparse_rnn_mod._nucleus_top_k_csr = spy
+        try:
+            out.grad = np.array([0.1, 0.2, -0.1, 0.05], dtype=np.float32)
+            out._backward()
+        finally:
+            sparse_rnn_mod._nucleus_top_k_csr = orig
+        assert recorded["nnz"] == 4, f"dy_k_min=4 should force k=4 despite r_target=0, got {recorded['nnz']}"

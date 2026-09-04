@@ -944,7 +944,8 @@ class DISLDOLayer(_SparseLayerBase):
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
                 scale_invariant: bool = False, requires_grad: bool = True,
                 dy_sparsity_p: Optional[float] = None,
-                dy_sparsity_schedule: Optional[List[float]] = None) -> Tensor:
+                dy_sparsity_schedule: Optional[List[float]] = None,
+                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -1045,6 +1046,19 @@ class DISLDOLayer(_SparseLayerBase):
                             f"but dy has {dy2d.shape[0]} rows")
                     k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
                     dp, di, dv = _graded_top_k_csr(dy2d, k_per_row, self._c.num_cpus)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
+                elif dy_r_target is not None:
+                    # Nucleus/energy-threshold grad sparsification (task
+                    # #367, priority 1 per direct instruction -- "grad is
+                    # the one that's definitely required"): k is a
+                    # CONSEQUENCE of dy_r_target and this step's actual
+                    # gradient energy, not a fixed fraction. See
+                    # sili_peridot/JOURNAL.md's nucleus design note.
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _nucleus_top_k_csr(
+                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
                     dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
                                                   lr_per_row_nnz=lr_per_row_nnz,
                                                   damp_by_importance=damp_by_importance, **extra)
@@ -1297,7 +1311,8 @@ class DISLDOLayer32(_SparseLayerBase):
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
                 scale_invariant: bool = False, requires_grad: bool = True,
-                dy_sparsity_p: Optional[float] = None) -> Tensor:
+                dy_sparsity_p: Optional[float] = None,
+                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
         # CSR-typed input / dy_sparsity_p (direct instruction): DISLDOLayerV
         # already uses SparseLinearWeightsDelta with VT=DeltaCSRBiValues<V>,
         # the SAME storage family FP4's SparseLinearLayer uses -- its own
@@ -1338,7 +1353,15 @@ class DISLDOLayer32(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                if dy_sparsity_p is None:
+                if dy_r_target is not None:
+                    # See DISLDOLayer.forward's own dy_r_target comment.
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _nucleus_top_k_csr(
+                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                 lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
+                elif dy_sparsity_p is None:
                     dx = self._c.backward(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
                                           learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                           damp_by_importance=damp_by_importance, **extra)
