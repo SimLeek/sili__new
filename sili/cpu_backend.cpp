@@ -4051,6 +4051,53 @@ PYBIND11_MODULE(_cpu, m)
         "graded per-row/per-position gradient density schedules."
     );
 
+    m.def("dense_to_nucleus_top_k_csr",
+        [](py::array_t<float> x, py::array_t<float> r_target_per_row, int num_threads,
+           int k_min, int k_max) -> py::tuple {
+            auto buf = x.request();
+            int rows = (buf.ndim == 2) ? buf.shape[0] : 1;
+            int cols = (buf.ndim == 2) ? buf.shape[1] : buf.shape[0];
+            float* src = (float*)buf.ptr;
+
+            auto rbuf = r_target_per_row.request();
+            if (rbuf.size != rows) {
+                throw std::invalid_argument(
+                    "r_target_per_row length (" + std::to_string(rbuf.size) +
+                    ") must match number of rows (" + std::to_string(rows) + ")");
+            }
+            float* r_src = (float*)rbuf.ptr;
+
+            size_t k_min_arg = (k_min > 0) ? static_cast<size_t>(k_min) : 0;
+            size_t k_max_arg = (k_max >= 0) ? static_cast<size_t>(k_max) : SIZE_MAX;
+
+            auto csr = top_k_csr_nucleus<int, float>(src, rows, cols, r_src, num_threads,
+                                                       k_min_arg, k_max_arg);
+
+            int nnz = (int)csr.indices[0]->size();
+
+            py::array_t<int>   out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int>   out_indices({(py::ssize_t)nnz});
+            py::array_t<float> out_values({(py::ssize_t)nnz});
+
+            std::copy(csr.ptrs[0]->begin(), csr.ptrs[0]->end(), (int*)out_ptrs.request().ptr);
+            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(), (int*)out_indices.request().ptr);
+            std::copy(csr.values[0]->begin(), csr.values[0]->end(), (float*)out_values.request().ptr);
+
+            return py::make_tuple(out_ptrs, out_indices, out_values);
+        },
+        py::arg("x"), py::arg("r_target_per_row"), py::arg("num_threads") = 4,
+        py::arg("k_min") = 0, py::arg("k_max") = -1,
+        "Nucleus/energy-threshold top-k: row r independently keeps the SMALLEST\n"
+        "set of its own top-|v| entries whose captured squared-magnitude ratio\n"
+        "R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target_per_row[r]. k is a\n"
+        "CONSEQUENCE of r_target and the row's own data, not a fixed constant\n"
+        "-- same math as truncated-SVD captured-variance / LLM nucleus (top-p)\n"
+        "sampling applied to squared magnitude instead of softmax probability.\n"
+        "k_min/k_max (default 0 / -1=unbounded) clamp the R_target-derived k\n"
+        "afterward -- a hardware-driven density floor/ceiling, independent of\n"
+        "how much or little energy R_target says is needed for that row."
+    );
+
     // ── Bulk quantize-array utilities ───────────────────────────────────────
     //
     // Standalone, layer-independent elementwise float32->code conversion --

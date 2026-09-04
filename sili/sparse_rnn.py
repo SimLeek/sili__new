@@ -870,6 +870,39 @@ def _graded_top_k_csr(dy2d: np.ndarray, k_per_row,
     return ptrs, indices, values
 
 
+def _nucleus_top_k_csr(x2d: np.ndarray, r_target, num_cpus: int = 4,
+                        k_min: int = 0, k_max: Optional[int] = None
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Nucleus/energy-threshold top-k: row r independently keeps the
+    SMALLEST set of its own top-|v| entries whose captured squared-
+    magnitude ratio R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target[r].
+    k is a CONSEQUENCE of r_target and the row's own data, not a fixed
+    constant -- see sili_peridot/JOURNAL.md's "nucleus/energy-threshold
+    top-k math" design note for the full derivation (same math as
+    truncated-SVD captured-variance / LLM nucleus (top-p) sampling
+    applied to squared magnitude instead of softmax probability).
+
+    r_target: scalar (applied to every row) or per-row array/list.
+
+    k_min/k_max: hardware-driven density floor/ceiling applied to the
+    R_target-derived k AFTER the fact (direct instruction -- R_target
+    alone can degenerate to k=0, a fully-dead row, or to near-100%
+    density on hardware that wants a bounded ceiling). k_min padding
+    pulls from the same magnitude-sorted order the R_target selection
+    already computed, so a clamped row degrades to plain top-k rather
+    than picking arbitrarily; an all-zero row can't manufacture k_min
+    entries out of nothing and stays at k=0 regardless."""
+    rows, cols = x2d.shape
+    if np.isscalar(r_target):
+        r_arr = np.full(rows, float(r_target), dtype=np.float32)
+    else:
+        r_arr = np.asarray(r_target, dtype=np.float32)
+    x2d_f32 = np.ascontiguousarray(x2d, dtype=np.float32)
+    ptrs, indices, values = _cpu.dense_to_nucleus_top_k_csr(
+        x2d_f32, r_arr, num_cpus, k_min=k_min, k_max=(-1 if k_max is None else int(k_max)))
+    return ptrs, indices, values
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════

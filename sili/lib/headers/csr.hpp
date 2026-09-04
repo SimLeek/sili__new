@@ -633,6 +633,118 @@ top_k_csr_graded(VALUE_TYPE *values, size_t rows, size_t cols,
         std::move(ptrs), std::move(indices), std::move(out_values));
 }
 
+// Nucleus/energy-threshold top-k: row r independently keeps the SMALLEST
+// number of its own largest-magnitude entries whose captured squared-
+// magnitude ratio
+//     R(v, k) = sum(v_topk^2) / sum(v^2)
+// is >= r_target_per_row[r]. k is a CONSEQUENCE of r_target and the row's
+// actual data, not a fixed constant -- same math as Eckart-Young truncated-
+// SVD captured-variance / LLM nucleus (top-p) sampling, applied to squared
+// magnitude instead of softmax probability (see sili_peridot/JOURNAL.md's
+// "nucleus/energy-threshold top-k math" design note). A fully-zero row or
+// r_target<=0 has nothing to capture and keeps k=0; r_target>=1 (or a
+// floating-point rounding shortfall right at the boundary) keeps every
+// entry -- both handled as explicit fallbacks below, not accidents of the
+// loop shape.
+//
+// k_min/k_max (default 0/SIZE_MAX, i.e. no-op) clamp the R_target-derived
+// k AFTER the fact -- direct instruction: R_target alone can degenerate to
+// k=0 (a fully-dead row/synapse-update-starved layer, bad regardless of
+// how little energy that row happened to carry) or to near-100% density
+// (bad on hardware that specifically wants a bounded, e.g. ~10%, density
+// ceiling). Applied per row against that row's own actual entry count
+// (min(k_max,cols)), not globally. k_min padding pulls from the SAME
+// magnitude-sorted order already computed for the R_target selection --
+// still "next largest by magnitude," not arbitrary -- so a clamped row
+// degrades gracefully to plain top-k instead of picking randomly.
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr_nucleus(VALUE_TYPE *values, size_t rows, size_t cols,
+                   const VALUE_TYPE *r_target_per_row, int num_threads,
+                   size_t k_min = 0, size_t k_max = SIZE_MAX) {
+    std::vector<SIZE_TYPE> k_per_row(rows, 0);
+    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> kept_rows(rows);
+
+    bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
+
+    #pragma omp parallel for num_threads(num_threads) if(use_omp) schedule(dynamic)
+    for (size_t r = 0; r < rows; ++r) {
+        const VALUE_TYPE* row = values + r * cols;
+        VALUE_TYPE r_target = r_target_per_row[r];
+
+        double total_sq = 0.0;
+        for (size_t c = 0; c < cols; ++c)
+            total_sq += static_cast<double>(row[c]) * static_cast<double>(row[c]);
+
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> pairs;
+        // Sort whenever there's real data to pick from AND either R_target
+        // or a k_min floor could want some of it -- k_min padding pulls
+        // from this same magnitude-sorted list (see docstring above), so
+        // it must exist even when r_target alone would pick k=0.
+        if (total_sq > 0.0 && (r_target > VALUE_TYPE(0) || k_min > 0)) {
+            pairs.reserve(cols);
+            for (size_t c = 0; c < cols; ++c)
+                pairs.emplace_back(static_cast<SIZE_TYPE>(c), row[c]);
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                          return std::abs(a.second) > std::abs(b.second);
+                      });
+
+            size_t chosen = 0;
+            if (r_target > VALUE_TYPE(0)) {
+                double target_sq = static_cast<double>(r_target) * total_sq;
+                chosen = cols;  // fallback: r_target>=1 or a rounding
+                                // shortfall right at the boundary -- keep
+                                // everything rather than under-shoot.
+                double cum = 0.0;
+                for (size_t i = 0; i < cols; ++i) {
+                    cum += static_cast<double>(pairs[i].second) * static_cast<double>(pairs[i].second);
+                    if (cum >= target_sq) { chosen = i + 1; break; }
+                }
+            }
+
+            // Hardware-driven density floor/ceiling, applied AFTER the
+            // R_target-derived choice, against this row's own actual
+            // entry count -- a totally-informationless row still can't
+            // manufacture k_min nonzero entries beyond what it has.
+            size_t eff_k_min = std::min(k_min, pairs.size());
+            size_t eff_k_max = std::min(k_max, pairs.size());
+            if (chosen < eff_k_min) chosen = eff_k_min;
+            if (chosen > eff_k_max) chosen = eff_k_max;
+
+            pairs.resize(chosen);
+            // Row-major/ascending-column convention, matching top_k_csr_
+            // graded's own re-sort step -- the selected entries need
+            // re-ordering by index since they were chosen by magnitude.
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                          return a.first < b.first;
+                      });
+        }
+        k_per_row[r] = static_cast<SIZE_TYPE>(pairs.size());
+        kept_rows[r] = std::move(pairs);
+    }
+
+    std::vector<SIZE_TYPE> row_offset(rows + 1, 0);
+    for (size_t r = 0; r < rows; ++r) row_offset[r + 1] = row_offset[r] + k_per_row[r];
+    size_t total = static_cast<size_t>(row_offset[rows]);
+
+    std::vector<SIZE_TYPE> indices(total);
+    std::vector<VALUE_TYPE> out_values(total);
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE base = row_offset[r];
+        for (size_t i = 0; i < kept_rows[r].size(); ++i) {
+            indices[base + i] = kept_rows[r][i].first;
+            out_values[base + i] = kept_rows[r][i].second;
+        }
+    }
+
+    std::vector<SIZE_TYPE> ptrs(row_offset.begin(), row_offset.end());
+    return make_csr_input<SIZE_TYPE, VALUE_TYPE>(
+        static_cast<SIZE_TYPE>(rows), static_cast<SIZE_TYPE>(cols),
+        std::move(ptrs), std::move(indices), std::move(out_values));
+}
+
 // ── csr_union ─────────────────────────────────────────────────────────────
 //
 // Merge two same-shape absolute CSRs into the union of their nonzero

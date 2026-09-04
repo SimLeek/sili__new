@@ -188,6 +188,7 @@ set(SILI_STANDALONE_TESTS
     test_top_k_csr_small_array_fast_path
     test_aqrs_grad_norm_dy_density
     test_amortized_decay_stats
+    test_top_k_csr_nucleus
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)
