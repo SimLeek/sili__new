@@ -84,7 +84,8 @@ class CSR(NamedTuple):
     @staticmethod
     def from_dense(x: np.ndarray, p: float = 0.03, num_cpus: int = 4) -> "CSR":
         """
-        Build CSR keeping the top-k entries by magnitude, k = max(1, round(cols * p)).
+        Build CSR keeping the top-k entries by magnitude PER ROW,
+        k = max(1, round(cols * p)).
         x : float32 [cols] or [batch, cols]
 
         Independent top-k -- use ONLY when no prior sparsification decision
@@ -96,7 +97,8 @@ class CSR(NamedTuple):
         x2d = x[np.newaxis, :] if x.ndim == 1 else x
         x2d = np.asarray(x2d, dtype=np.float32)
         k   = max(1, int(x2d.shape[1] * p))
-        ptrs, indices, values = _cpu.dense_to_top_k_csr(x2d, k, num_cpus)
+        ptrs, indices, values = _graded_top_k_csr(
+            x2d, np.full(x2d.shape[0], k, dtype=np.int32), num_cpus)
         return CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
 
     @staticmethod
@@ -1023,8 +1025,9 @@ class DISLDOLayer(_SparseLayerBase):
                 else:
                     _t0 = _diag_time.perf_counter()
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                    dp, di, dv = _cpu.dense_to_top_k_csr(
-                        dy2d, max(1, int(dy2d.shape[1] * dy_sparsity_p)), self._c.num_cpus)
+                    k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
+                    dp, di, dv = _graded_top_k_csr(
+                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
                     _t1 = _diag_time.perf_counter()
                     dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
                                                   lr_per_row_nnz=lr_per_row_nnz,
@@ -1308,8 +1311,9 @@ class DISLDOLayer32(_SparseLayerBase):
                                           damp_by_importance=damp_by_importance, **extra)
                 else:
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                    dp, di, dv = _cpu.dense_to_top_k_csr(
-                        dy2d, max(1, int(dy2d.shape[1] * dy_sparsity_p)), self._c.num_cpus)
+                    k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
+                    dp, di, dv = _graded_top_k_csr(
+                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
                     dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
                                                  lr_per_row_nnz=lr_per_row_nnz,
                                                  damp_by_importance=damp_by_importance, **extra)
