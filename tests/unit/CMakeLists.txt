@@ -152,6 +152,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_load_dense
     test_block4_scattered_divergence
     test_sisldo_disldo_parity
+    test_sisldo_disldo_parity_fp32
     test_fp8_block4_scattered_divergence
     test_synapse_policy_dispatch
     test_synapse_policy_long_horizon
@@ -186,6 +187,7 @@ set(SILI_STANDALONE_TESTS
     test_aqrs_scale_overflow_guard
     test_top_k_csr_small_array_fast_path
     test_aqrs_grad_norm_dy_density
+    test_amortized_decay_stats
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

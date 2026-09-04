@@ -402,6 +402,15 @@ public:
     std::size_t    _idx_budget_bytes = 4096;
     std::size_t    _val_budget_nnz   = 64;
 
+    // ── Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
+    // (cpu_backend.cpp) for the full rationale; same mechanism generalized
+    // across all VALUES_TYPEs via ValueAccessor (delta_csr_types.hpp).
+    std::size_t _decay_cursor  = 0;
+    double      _decay_sum_abs = 0.0;
+    double      _decay_sum_sq  = 0.0;
+    double      _decay_max_abs = 0.0;
+    std::size_t _decay_n       = 0;
+
     SparseLinearLayerImpl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus),
           _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -572,21 +581,25 @@ public:
     std::mt19937 _dynamic_rank_rng{std::random_device{}()};
     void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
     bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+                                    V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 50,
+                                    uint32_t shrink_grace_period_steps = 50) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
         return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
-            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            grow_grace_period_steps, shrink_grace_period_steps);
     }
     bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+                                             V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 5000,
+                                             uint32_t shrink_grace_period_steps = 5000) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
         return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
             [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            grow_grace_period_steps, shrink_grace_period_steps);
     }
 
     // AQRS gamma raw get/set + EMA diagnostics (task #293 fix): these
@@ -758,6 +771,27 @@ public:
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
+    // for the full rationale. Lower marginal decay value here than for
+    // fp32 (FP4 codes are already table-bounded, can't blow up the way a
+    // raw float can -- the real FP4 blow-up path is the SCALE vector via
+    // apply_scale_overflow_guard), but the stats are still useful for
+    // uniform health monitoring, and generalizing costs nothing new
+    // (reuses the same ValueAccessor-generic template DISLDOLayerV uses).
+    py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
+            weights.connections.values, _decay_cursor,
+            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"]       = stats.mean_abs;
+        out["rms"]            = stats.rms;
+        out["max_abs"]        = stats.max_abs;
+        out["n"]              = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
     }
 
     // ── Synaptogenesis (NEW — see class comment) ────────────────────────────────
@@ -1203,6 +1237,23 @@ public:
     std::size_t    _idx_budget_bytes = 4096;
     std::size_t    _val_budget_nnz   = 64;
 
+    // ── Amortized decoupled L2 decay + stats (direct instruction) ───────────
+    // Persistent rolling cursor over the flat weights.connections.values[0]
+    // buffer -- a fixed chunk_size touched per call keeps this O(1)
+    // amortized per training step instead of O(nnz), same pattern as
+    // synap_row_step's own per-row cursor for synaptogenesis. Blank/
+    // unfilled slots (dense=True leaves ~zero headroom, so these are rare
+    // in practice) decay harmlessly (0 * factor == 0). Decoupled from
+    // learning_rate/ci deliberately -- the per-synapse RMSprop step
+    // already has its own adaptive scale, coupling decay through it would
+    // repeat the exact Adam-vs-AdamW mistake (fast-moving synapses would
+    // decay disproportionately faster).
+    std::size_t _decay_cursor  = 0;
+    double      _decay_sum_abs = 0.0;
+    double      _decay_sum_sq  = 0.0;
+    double      _decay_max_abs = 0.0;
+    std::size_t _decay_n       = 0;
+
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus),
           _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1283,6 +1334,94 @@ public:
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // ── forward_sparse / backward_sparse ────────────────────────────────────
+    // Direct instruction: DISLDOLayerV already uses SparseLinearWeightsDelta
+    // with VT=DeltaCSRBiValues<V> -- the SAME storage family FP4's
+    // SparseLinearLayer uses (just FP4BiPacked there instead of
+    // DeltaCSRBiValues<float>), and sisldo_forward/disldo_backward_sparse_
+    // grad are already VALUES_TYPE-generic. This instantiates those SAME
+    // functions for VT, mirroring SparseLinearLayer::forward_sparse/
+    // backward_sparse exactly -- reuses the identical, already-validated
+    // SynapsePolicy-based update math (task #100/#329's own template
+    // parity work), not a new/ported implementation. See that class's own
+    // comment for why forward/backward are NOT mirror images of each
+    // other (sparse input for forward, dense input + sparse gradient for
+    // backward -- a sparse-INPUT backward was explicitly tried and
+    // rejected, see conversation/sisldo_ops.hpp's own removed-code comment).
+    CSRInput<S, V> _numpy_to_csr_input(py::array_t<S> ptrs, py::array_t<S> indices,
+                                       py::array_t<V> values, S batch, S cols) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
+        const S nz = (S)ib.size;
+        CSRInput<S, V> csr;
+        csr.rows = batch; csr.cols = cols;
+        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nz);
+        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
+        return csr;
+    }
+
+    py::array_t<V> forward_sparse(
+        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
+        S batch)
+    {
+        auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
+        output_buf.assign(batch * n_outputs(), V(0));
+        sisldo_forward<S, VT, COL_TYPE>(input, weights, output_buf.data(), num_cpus);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
+        return result;
+    }
+
+    py::array_t<V> backward_sparse(
+        py::array_t<V> x,   // DENSE input -- see class comment for why
+        py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
+        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false,
+        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+        V min_decay_frac = kSynapsePolicyMinDecayFrac,
+        V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+        V max_ci = kSynapsePolicyMaxCi,
+        bool scale_invariant = kSynapsePolicyScaleInvariant)
+    {
+        warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
+        auto xbuf = x.request();
+        auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
+        std::vector<V> dx(batch * n_inputs(), V(0));
+        disldo_backward_sparse_grad<S, VT, COL_TYPE>(
+            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
+            neuron_input_accum.data(), neuron_grad_accum.data(),
+            learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
+            min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    // Amortized decoupled L2 decay + stats -- see member state's own
+    // comment above for the rationale. chunk_size synapses touched per
+    // call (persistent cursor, wraps at the end of the flat value
+    // buffer); decay_factor is the caller's job to derive (see Python
+    // side -- exact formula from a chosen half-life in STEPS and this
+    // layer's own nnz/chunk_size-derived cycle length, since a synapse
+    // is only actually touched once per cycle_length steps, not every
+    // step). Returns a dict with mean_abs/rms/max_abs/n/cycle_complete --
+    // the stats fields only reflect a just-FINISHED cycle (reset after
+    // being read); cycle_complete=False means "still mid-cycle, ignore
+    // these stats" (they're the STALE previous cycle's numbers, kept
+    // around only so the dict always has a valid shape).
+    py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<VT, V>(
+            weights.connections.values, _decay_cursor,
+            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"]       = stats.mean_abs;
+        out["rms"]            = stats.rms;
+        out["max_abs"]        = stats.max_abs;
+        out["n"]              = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
     }
 
     void build_probes(S k, bool per_row = false) {
@@ -1413,6 +1552,15 @@ public:
     std::size_t    _idx_budget_bytes = 4096;
     std::size_t    _val_budget_nnz   = 64;
 
+    // ── Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
+    // (cpu_backend.cpp) for the full rationale; same mechanism generalized
+    // across all VALUES_TYPEs via ValueAccessor (delta_csr_types.hpp).
+    std::size_t _decay_cursor  = 0;
+    double      _decay_sum_abs = 0.0;
+    double      _decay_sum_sq  = 0.0;
+    double      _decay_max_abs = 0.0;
+    std::size_t _decay_n       = 0;
+
     SparseLinearLayer8Impl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus),
           _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1539,21 +1687,25 @@ public:
     std::mt19937 _dynamic_rank_rng{std::random_device{}()};
     void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
     bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                    V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+                                    V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 50,
+                                    uint32_t shrink_grace_period_steps = 50) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
         return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
-            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            grow_grace_period_steps, shrink_grace_period_steps);
     }
     bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                             V seed_scale = 0.05f, uint32_t grace_period_steps = 50) {
+                                             V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 5000,
+                                             uint32_t shrink_grace_period_steps = 5000) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
         return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
             [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); },
+            grow_grace_period_steps, shrink_grace_period_steps);
     }
 
     // AQRS gamma raw get/set + EMA diagnostics -- same as SparseLinearLayer
@@ -1616,6 +1768,27 @@ public:
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
+    // for the full rationale. Lower marginal decay value here than for
+    // fp32 (FP8 codes are already table-bounded, can't blow up the way a
+    // raw float can -- the real FP8 blow-up path is the SCALE vector via
+    // apply_scale_overflow_guard), but the stats are still useful for
+    // uniform health monitoring, and generalizing costs nothing new
+    // (reuses the same ValueAccessor-generic template DISLDOLayerV uses).
+    py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
+            weights.connections.values, _decay_cursor,
+            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"]       = stats.mean_abs;
+        out["rms"]            = stats.rms;
+        out["max_abs"]        = stats.max_abs;
+        out["n"]              = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
     }
 
     void build_probes(S k, bool per_row = false) {
@@ -1843,14 +2016,16 @@ PYBIND11_MODULE(_cpu, m)
         .def("seed_dynamic_rank_rng", &SparseLinearLayer::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 50,
+             py::arg("shrink_grace_period_steps") = 50,
              "AQRS Theorem 10 dynamic rank control for the multiplicative (scale) branch --\n"
              "evaluates apoptosis/neurogenesis triggers against the EMA state (updated\n"
              "automatically every backward call) and performs at most one mutation.\n"
              "Returns True if a mutation happened this call.")
         .def("apply_additive_dynamic_rank_control", &SparseLinearLayer::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50,
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
+             py::arg("shrink_grace_period_steps") = 5000,
              "Additive-branch counterpart to apply_dynamic_rank_control -- same Theorem\n"
              "10 machinery, additive_gamma/additive_u/additive_v instead of scale_gamma/\n"
              "value_scale/output_scale. min_rank=0 (the additive branch can legitimately\n"
@@ -1895,6 +2070,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("apply_amortized_l2_decay", &SparseLinearLayer::apply_amortized_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("build_probes",         &SparseLinearLayer::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
@@ -2647,10 +2824,12 @@ PYBIND11_MODULE(_cpu, m)
         .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 50,
+             py::arg("shrink_grace_period_steps") = 50)
         .def("apply_additive_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
+             py::arg("shrink_grace_period_steps") = 5000)
         .def("get_scale_gamma_k",              &SparseLinearLayerDeterministic::get_scale_gamma_k, py::arg("k"))
         .def("set_scale_gamma_raw_k",          &SparseLinearLayerDeterministic::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
         .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayerDeterministic::get_scale_gamma_abs_ema_k, py::arg("k"))
@@ -3399,6 +3578,18 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("forward_sparse", &DISLDOLayerV::forward_sparse,
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse",      &DISLDOLayerV::backward_sparse,
+             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("apply_amortized_l2_decay", &DISLDOLayerV::apply_amortized_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("build_probes",         &DISLDOLayerV::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
@@ -3425,6 +3616,42 @@ PYBIND11_MODULE(_cpu, m)
         .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
         .def_property_readonly("block4",    py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 
+    // ── SISLDOLayerV ─────────────────────────────────────────────────────────
+    // The class itself predates this pybind registration (source existed,
+    // never exposed to Python -- confirmed via direct instruction; this is
+    // that missing wiring, mirroring DISLDOLayerV's own binding above,
+    // using only the methods SISLDOLayerV actually has (no block4/
+    // synap_row_step/apply_dynamic_rank_control -- no scale concept, same
+    // as DISLDOLayerV, and no per-row growth op exposed on this class).
+    py::class_<SISLDOLayerV>(m, "SISLDOLayerV")
+        .def(py::init<int, int, int, int>(),
+             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
+             py::arg("num_cpus") = 4)
+        .def("forward_sparse",  &SISLDOLayerV::forward_sparse,
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward",        &SISLDOLayerV::backward,
+             py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"), py::arg("dy"),
+             py::arg("dy_sparse_ptrs"), py::arg("dy_sparse_indices"), py::arg("dy_sparse_values"),
+             py::arg("learning_rate"), py::arg("batch"), py::arg("cols"))
+        .def("decay_importance", &SISLDOLayerV::decay_importance, py::arg("rate"))
+        .def("build_probes",     &SISLDOLayerV::build_probes, py::arg("k"))
+        .def("optim_synaptogenesis", &SISLDOLayerV::optim_synaptogenesis,
+             py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
+        .def("zero_accum",       &SISLDOLayerV::zero_accum)
+        .def_property_readonly("neuron_input_accum", &SISLDOLayerV::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",  &SISLDOLayerV::get_neuron_grad_accum)
+        .def_property_readonly("output_buf",         &SISLDOLayerV::get_output_buf)
+        .def_property_readonly("weights_vals",       &SISLDOLayerV::get_weights_vals)
+        .def_property_readonly("importance",         &SISLDOLayerV::get_importance)
+        .def_property_readonly("indices",            &SISLDOLayerV::get_indices)
+        .def_property_readonly("ptrs",                &SISLDOLayerV::get_ptrs)
+        .def("load_weights",     &SISLDOLayerV::load_weights,
+             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def_readonly ("num_cpus",  &SISLDOLayerV::num_cpus)
+        .def_property_readonly("n_inputs",  &SISLDOLayerV::n_inputs)
+        .def_property_readonly("n_outputs", &SISLDOLayerV::n_outputs)
+        .def_property_readonly("nnz",       &SISLDOLayerV::nnz);
+
     // ── SparseLinearLayer8 ───────────────────────────────────────────────────
     py::class_<SparseLinearLayer8>(m, "SparseLinearLayer8")
         .def(py::init<int, int, int, int>(),
@@ -3439,6 +3666,8 @@ PYBIND11_MODULE(_cpu, m)
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("apply_amortized_l2_decay", &SparseLinearLayer8::apply_amortized_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("build_probes",         &SparseLinearLayer8::build_probes,
              py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
@@ -3532,10 +3761,12 @@ PYBIND11_MODULE(_cpu, m)
         .def("seed_dynamic_rank_rng", &SparseLinearLayer8::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer8::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 50,
+             py::arg("shrink_grace_period_steps") = 50)
         .def("apply_additive_dynamic_rank_control", &SparseLinearLayer8::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grace_period_steps") = 50)
+             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
+             py::arg("shrink_grace_period_steps") = 5000)
         .def("get_scale_gamma_k",              &SparseLinearLayer8::get_scale_gamma_k, py::arg("k"))
         .def("set_scale_gamma_raw_k",          &SparseLinearLayer8::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
         .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer8::get_scale_gamma_abs_ema_k, py::arg("k"))

@@ -54,8 +54,11 @@ from __future__ import annotations
 
 from typing import List, NamedTuple, Optional, Tuple
 
+import time as _diag_time
 import numpy as np
 import sili._cpu as _cpu
+
+_DIAG_TIMING: dict = {}
 
 from sili.module import Module
 from sili.tensor import Tensor, _acc
@@ -231,6 +234,18 @@ class _SparseLayerBase(Module):
         would raise AttributeError from self._c if the backend lacks
         it, rather than silently no-op)."""
         self._c.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
+    def apply_amortized_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """Passthrough to the real C++ apply_amortized_l2_decay (see
+        delta_csr_types.hpp's apply_amortized_decay_stats docstring for
+        the full mechanism -- amortized decoupled weight decay + rolling
+        health stats via a persistent per-layer cursor). Unlike
+        magnitude_rescale_output, EVERY backend (fp32/FP4/FP8) has this
+        bound -- it's ValueAccessor-generic, so no hasattr guard is
+        needed here. decay_factor is the caller's job to derive from a
+        target half-life (in real training steps) and this layer's own
+        nnz -- see ToyTileRecurrenceRMT.apply_amortized_l2_decay."""
+        return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
 
     def state_dict(self) -> dict:
         return {
@@ -528,18 +543,36 @@ def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> Non
 
 
 def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
-    """Default scale_rank_max/additive_rank_max (task #295): the cap at
-    which, if every layer's rank grew all the way to it, the AQRS scale
-    envelope's own parameter count would roughly match one dense fp32
-    matrix of the same shape -- direct instruction's own worked example:
-    32x32 -> 1024 fp32-equivalent elements -> 1024/4 (fp4 bytes-per-fp32)
-    = 256 -> 256/32 = 8, so cap = min(n_in, n_out) // 4. Only an exact
-    match for square layers; non-square layers get a smaller,
-    min-dimension-driven cap -- a conservative default, not a precisely
-    derived one (per-layer/per-model tuning is still expected on top,
-    hence scale_rank_max/additive_rank_max being real constructor
-    overrides here rather than a hardcoded formula call)."""
-    return max(1, min(n_inputs, n_outputs) // 4)
+    """Default scale_rank_max/additive_rank_max, derived from actual
+    storage cost (direct instruction, superseding task #295's cruder
+    min(n_in,n_out)//4 heuristic -- that formula wasn't checked against
+    real byte counts and, confirmed via a real 60k-step run, let ranks
+    grow well past the point where the low-rank envelope uses MORE
+    memory than the dense fp32 matrix it exists to avoid).
+
+    value_scale/output_scale/additive_u/additive_v/scale_gamma/
+    additive_gamma are all stored as plain fp32 (no quantization on the
+    rank-N components themselves, confirmed in cpu_backend.cpp/
+    delta_csr_types.hpp) -- each rank-1 channel of the scale branch
+    costs 4*(n_inputs+n_outputs+1) bytes (row vector + col vector +
+    1 gamma scalar), same formula for the additive branch. The base
+    fp4-quantized weight matrix (weight+importance packed 2-per-byte)
+    costs n_inputs*n_outputs*1 byte regardless of rank.
+
+    The cap here is the largest per-branch rank K such that BOTH
+    branches growing to K simultaneously still costs no more, combined
+    with the base weights, than a plain dense fp32 matrix of the same
+    shape (n_inputs*n_outputs*4 bytes) -- i.e. AQRS is only ever
+    memory-neutral-or-cheaper than "why not just use dense fp32",
+    never a net loss. Splits the remaining budget (after the fp4 base)
+    evenly between the scale and additive branches since both draw
+    from the same underlying justification and neither is
+    structurally more important than the other."""
+    base_bytes = n_inputs * n_outputs * 1
+    fp32_dense_bytes = n_inputs * n_outputs * 4
+    remaining_budget = max(0, fp32_dense_bytes - base_bytes)
+    per_channel_bytes = 4 * (n_inputs + n_outputs + 1)
+    return max(1, int((remaining_budget / 2) // per_channel_bytes))
 
 
 def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
@@ -981,16 +1014,27 @@ class DISLDOLayer(_SparseLayerBase):
                                                   lr_per_row_nnz=lr_per_row_nnz,
                                                   damp_by_importance=damp_by_importance, **extra)
                 elif dy_sparsity_p is None:
+                    _t0 = _diag_time.perf_counter()
                     dx = self._c.backward_dense(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
                                                  learning_rate, lr_per_row_nnz=lr_per_row_nnz,
                                                  damp_by_importance=damp_by_importance, **extra)
+                    _DIAG_TIMING["backward_dense"] = _DIAG_TIMING.get("backward_dense", 0.0) + (_diag_time.perf_counter() - _t0)
+                    _DIAG_TIMING["backward_dense_n"] = _DIAG_TIMING.get("backward_dense_n", 0) + 1
                 else:
+                    _t0 = _diag_time.perf_counter()
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _cpu.dense_to_top_k_csr(
                         dy2d, max(1, int(dy2d.shape[1] * dy_sparsity_p)), self._c.num_cpus)
+                    _t1 = _diag_time.perf_counter()
                     dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
                                                   lr_per_row_nnz=lr_per_row_nnz,
                                                   damp_by_importance=damp_by_importance, **extra)
+                    _t2 = _diag_time.perf_counter()
+                    _DIAG_TIMING["topk_csr"] = _DIAG_TIMING.get("topk_csr", 0.0) + (_t1 - _t0)
+                    _DIAG_TIMING["backward_sparse"] = _DIAG_TIMING.get("backward_sparse", 0.0) + (_t2 - _t1)
+                    _DIAG_TIMING["backward_sparse_n"] = _DIAG_TIMING.get("backward_sparse_n", 0) + 1
+                    _DIAG_TIMING["x_dense_shape"] = x_dense.shape
+                    _DIAG_TIMING["dp_shape"] = (len(dp), len(di), len(dv))
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -1000,7 +1044,8 @@ class DISLDOLayer(_SparseLayerBase):
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> bool:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> bool:
         """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
         BOTH branches' apoptosis/neurogenesis triggers against their own
         EMA state (updated automatically inside backward_dense/backward,
@@ -1018,11 +1063,40 @@ class DISLDOLayer(_SparseLayerBase):
         layers, since a 128x128 layer's raw gradient could be 9 orders
         of magnitude larger than a 16x128 layer's for the same real
         signal).
+
+        scale_grace_period_steps/additive_grace_period_steps: separate
+        PER-BRANCH cooldowns (direct instruction, replacing an earlier
+        within-branch grow-vs-shrink asymmetry after a biology
+        literature check -- see apply_dynamic_rank_control_generic's own
+        comment in delta_csr_types.hpp for the full citations). Each
+        branch uses the SAME value for its own grow/shrink internally
+        (symmetric within a branch, matching the roughly comparable
+        formation/elimination rates seen in real dendritic spine
+        turnover -- Holtmaat et al., Neuron 2005; Grutzendler et al.,
+        Nature 2002). The real asymmetry is CROSS-branch: the scale
+        (multiplicative) branch is the per-synapse analog and runs fast
+        (default 50), while the additive branch is a whole-layer
+        correction structurally closer to a neuron integrating its own
+        aggregate state -- the biological analog of homeostatic/
+        intrinsic plasticity, which needs ~24-48h of sustained change to
+        manifest vs. seconds-to-minutes for Hebbian/STDP synaptic change
+        (Turrigiano and colleagues' classic activity-blockade
+        experiments; see also Zenke & Gerstner, "Hebbian plasticity
+        requires compensatory processes on multiple timescales", Phil.
+        Trans. R. Soc. B, 2017) -- roughly a 100x-3000x separation
+        depending which endpoints are compared. additive_grace_period_
+        steps defaults to 5000 (100x scale's 50), the conservative end
+        of that range so the additive branch can still mutate within
+        realistic training budgets; both values are real, independently
+        tunable parameters meant to be swept against real training
+        outcomes, not treated as settled by this docstring.
         """
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            scale_grace_period_steps, scale_grace_period_steps)
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            additive_grace_period_steps, additive_grace_period_steps)
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
@@ -1186,12 +1260,33 @@ class DISLDOLayer32(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True,
+                dy_sparsity_p: Optional[float] = None) -> Tensor:
+        # CSR-typed input / dy_sparsity_p (direct instruction): DISLDOLayerV
+        # already uses SparseLinearWeightsDelta with VT=DeltaCSRBiValues<V>,
+        # the SAME storage family FP4's SparseLinearLayer uses -- its own
+        # forward_sparse/backward_sparse (added alongside this change,
+        # mirroring SparseLinearLayer's own C++ methods exactly, reusing
+        # the identical already-validated SynapsePolicy update math, not a
+        # new/ported implementation) now unify dense+sparse on the SAME
+        # object/weights exactly like DISLDOLayer does. This method
+        # mirrors DISLDOLayer.forward()'s own x.is_csr dispatch +
+        # dy_sparsity_p handling directly (see that method's own comments
+        # for the fuller rationale) -- a dense np.ndarray/Tensor here is a
+        # completely unchanged code path, zero behavior change for every
+        # existing caller who never builds a CSR.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)
-        was_1d = x_np.ndim == 1
-        out_np = self._c.forward(x_np)
+        if x.is_csr:
+            csr    = x.data
+            was_1d = csr.rows == 1
+            x_dense = csr.to_dense()
+            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np    = np.asarray(x.data, dtype=np.float32)
+            was_1d  = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np  = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # See DISLDOLayer.forward's own requires_grad comment.
@@ -1207,8 +1302,17 @@ class DISLDOLayer32(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance, **extra)
+                if dy_sparsity_p is None:
+                    dx = self._c.backward(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
+                                          learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                          damp_by_importance=damp_by_importance, **extra)
+                else:
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _cpu.dense_to_top_k_csr(
+                        dy2d, max(1, int(dy2d.shape[1] * dy_sparsity_p)), self._c.num_cpus)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                 lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -1307,15 +1411,21 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> bool:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> bool:
         """Same as DISLDOLayer's own apply_dynamic_rank_control (task
-        #292) -- duplicated here rather than shared via inheritance since
-        DISLDOLayer8 doesn't subclass DISLDOLayer (separate VALUES_TYPE
-        entirely), see this class's own docstring."""
+        #292; per-branch grace periods + biology citations added per
+        direct instruction, see that method's own docstring for the
+        full rationale) -- duplicated here rather than shared via
+        inheritance since DISLDOLayer8 doesn't subclass DISLDOLayer
+        (separate VALUES_TYPE entirely), see this class's own
+        docstring."""
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            scale_grace_period_steps, scale_grace_period_steps)
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            additive_grace_period_steps, additive_grace_period_steps)
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
