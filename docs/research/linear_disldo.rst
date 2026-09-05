@@ -19,8 +19,12 @@ at all. The dense-input walk is embarrassingly parallel by input row,
 unlike the sparse-input SISLDO path, which needs a work-offset table to
 balance threads across a variable-density CSR batch.
 
+.. _disldo_forward:
+
 ``disldo_forward``
 -------------------
+
+.. _disldo_forward.pure_computation:
 
 Forward is pure computation now -- no importance side effects
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -49,6 +53,8 @@ where ``W_dense[r,c]`` is the weight of synapse ``r->c``. Same reference
 check used for ``sisldo_forward`` and the standalone ``disldo_ops.hpp``
 path -- both pass it.
 
+.. _disldo_forward.dc_empty_check:
+
 ``!dc.empty()`` no longer means "nothing to do"
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -57,12 +63,16 @@ everything in a small/dense layer has been promoted). ``L.rows``/
 ``L.cols`` stay valid either way (set at construction, independent of
 nnz), so skipping just the scattered block when ``dc.empty()`` is safe.
 
+.. _disldo_forward.rank_n_scale:
+
 Rank-N scale
 ~~~~~~~~~~~~
 
 ``w = w_stored * weights.get_scale(r, col)`` -- see ``scale_rank``'s own
 docstring (``delta_csr_types.hpp``). Reduces to the exact original
 ``val_scale*out_scale`` at ``scale_rank==1``.
+
+.. _disldo_forward.tile_coord_collection:
 
 block4 tile-coordinate collection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -104,6 +114,8 @@ regardless of allocation. ``resize()`` is a single capacity check for
 the whole vector; the fill loop then writes through plain indexed
 stores.
 
+.. _disldo_forward.per_thread_output_buffers:
+
 block4 forward compute: per-thread output buffers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -113,6 +125,8 @@ i.e. different input rows feeding the same output columns) write to the
 same output positions, so parallelizing freely over tiles without this
 would race exactly the way the scattered path's own scatter-write would
 without ``t_out``.
+
+.. _disldo_forward.hoisted_tile_count:
 
 Hoisting ``tile_br.size()`` -- measured instruction-count win, no
 wall-clock effect
@@ -135,6 +149,8 @@ anyway: real, harmless, zero-risk, and instruction-count reductions
 aren't guaranteed irrelevant on every CPU/compiler this code will ever
 run on.
 
+.. _disldo_forward.const_handle_at_index:
+
 Per-tile handle: ``const`` and ``at_index()``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -149,6 +165,8 @@ re-scan.
 ``.at()`` call (16 calls/tile otherwise, each re-branching on whether
 the tile is sparse-packed -- a property that can't change mid-tile). See
 ``Block4TileHandle::raw_data()``.
+
+.. _disldo_forward.decode_bitshift_vs_table:
 
 Decode via bit-shift, not table lookup -- and why the scalar-table
 result didn't transfer to backward
@@ -183,6 +201,8 @@ offset, matching the pattern already used for the decode step's own
 4-way unroll. See ``TODO_DUAL_BLOCK4.md``'s Part C for the measured
 effect.
 
+.. _disldo_forward.fp8_dispatch:
+
 FP8 dispatch
 ~~~~~~~~~~~~
 
@@ -192,6 +212,8 @@ table-driven bit-shift codec -- the only thing that differs from the FP4
 branch. Everything past this point (row-scale multiply, batch
 accumulation) is identical float32 math regardless of storage width. The
 FP4 branch is byte-for-byte the pre-existing code, untouched.
+
+.. _disldo_forward.aqrs_additive_branch:
 
 AQRS additive branch
 ~~~~~~~~~~~~~~~~~~~~~
@@ -217,12 +239,16 @@ contributes nothing" convention. ``gamma_k`` itself defaults to 1.0 (see
 ``get_additive_gamma_k``'s own docstring) so this multiply is
 transparent for every caller that's never touched gamma.
 
+.. _disldo_backward:
+
 ``disldo_backward``
 --------------------
 
 Weight/importance update is parallelised over ROWS, not synapses, since
 ``DeltaCSRRowCursor`` decodes sequentially within a row -- each row is an
 independent, unique ``elem_start`` range, so no races.
+
+.. _disldo_backward.rmsprop_floor_rationale:
 
 Why RMSprop-with-a-floor, not plain RMSprop or an lr-decay schedule
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -255,6 +281,8 @@ template, got 'false'").
 LAST, after ``scale_invariant``, for the same positional-argument
 reason. Default 0 disables it, matching every existing call site
 unchanged.
+
+.. _disldo_backward.setup_and_presizing_bugs:
 
 Setup: deferred-write buffering, rank-N pre-sizing, two real bugs fixed
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -294,6 +322,18 @@ fill, then explicitly set only the ``k==0`` slots in the newly added
 range to 1.0 (matches ``reshuffle_rank_array``'s own ``scale_default``
 lambda in ``set_scale_rank``, ``delta_csr_types.hpp``).
 
+.. code-block:: cpp
+
+   // as of PR #45, linear_disldo.hpp:
+   if (weights.value_scale.size() < n_in * rank) {
+       const std::size_t old_size = weights.value_scale.size();
+       weights.value_scale.resize(n_in * rank, value_type(0));
+       for (std::size_t idx = old_size; idx < weights.value_scale.size(); ++idx)
+           if (idx % rank == 0)
+               weights.value_scale[idx] = value_type(1);
+   }
+   // WRONG (the bug): weights.value_scale.resize(n_in * rank, value_type(1));
+
 **Real bug #2** (found via AddressSanitizer): ``value_scale_step`` was
 missing from the pre-sizing list. ``get_value_scale_step_k``'s own lazy
 ``.resize()`` runs completely unguarded, called directly from every row
@@ -304,6 +344,8 @@ one thread reading ``value_scale_step[idx]`` while another thread's
 ``resize()`` had already freed the old buffer). Pre-sizing here (same
 shape/reason as ``value_scale_importance``) makes the lazy-resize branch
 dead in the normal case.
+
+.. _disldo_backward.gamma_fetched_once:
 
 AQRS gamma fetched once per call, not baked into the scale caches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -319,6 +361,8 @@ into either side would make recovering that require dividing by
 gamma defaults to 0 for any channel beyond the always-on ``k=0``).
 Applied as an explicit extra factor at each gradient accumulation site
 instead.
+
+.. _disldo_backward.scattered_lr_and_signal:
 
 Scattered path: per-row learning rate and the additive importance signal
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -391,6 +435,8 @@ establishes -- that proof is about the two signals being jointly more
 informative than either alone in the abstract, it does not prescribe
 sum-before-square as the numeric encoding.
 
+.. _disldo_backward.deferred_vs_direct_quant:
+
 DeferredScaleWrite branch vs. the direct-quant-update formula
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -435,6 +481,13 @@ other value uses itself directly, exact and signed. ``quant_floor`` is
 computed once, fixed, from the pre-call ``cw_orig``/``quant4`` snapshot
 -- same batch-aggregation-bug fix as ``cw_start`` above.
 
+.. code-block:: cpp
+
+   // as of PR #45, linear_disldo.hpp -- scattered non-deferred branch:
+   const value_type quant_floor =
+       (cw_orig == value_type(0)) ? zero_escape_eps : cw_orig;
+   // WRONG (the bug): value_type quant_floor = zero_escape_eps + std::abs(cw_orig);
+
 AQRS gamma's own per-component gradient factor (dS/d(value_direction_k)
 ``= gamma_k * output_direction_k``, symmetrically for output_direction_k)
 is applied explicitly at each rank component's accumulation site, since
@@ -443,6 +496,8 @@ gamma-baked (only ``get_scale()`` combines direction*gamma for the
 weight-update math). gamma's OWN gradient
 (``dS/d(gamma_k) = value_direction_k * output_direction_k``) is a
 separate, layer-wide (not per-row/col) accumulator.
+
+.. _disldo_backward.block4_overview_races:
 
 block4 backward: overview, races, and a documented simplification
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -469,6 +524,8 @@ than one combined step over the true total nnz. Mathematically this is
 just two successive descent steps, not an incorrect one -- acceptable
 for a first working version.
 
+.. _disldo_backward.row_ti_start_workspace:
+
 ``row_ti_start``/``row_live_count`` and the row-workspace rewrite
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -487,6 +544,8 @@ unconditional ``scale_eff_lr`` normalization -- every tile contributes
 exactly ``BLOCK4_TILE`` slots per row it covers (dense; a live tile's
 slots are all real synapses, weight=0.0 included).
 
+.. _disldo_backward.schedule_static_measured:
+
 ``schedule(static)`` measured to beat dynamic/guided
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -504,6 +563,8 @@ thread exclusively owns every tile in the rows it's assigned, so no two
 threads ever touch the same row's ``tile_data`` concurrently -- this is
 what makes it safe for a tile's handle to resize (real sparse<->dense
 transitions) inside the parallel region at all.
+
+.. _disldo_backward.row_workspace_snapshot_fix:
 
 Row-workspace snapshot: fixing a cross-row memmove hazard
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -537,6 +598,8 @@ structurally never writes in that case (every write inside it is gated
 by the same condition), so the plain shared-store ``at_index()`` path
 has no concurrency hazard, and copying the row's bytes in and back out
 unchanged would be measured real overhead for zero benefit.
+
+.. _disldo_backward.fp8_simd_measured:
 
 FP8 block4 backward: measured SIMD results (batch=1 loses, batch=32 wins)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -575,6 +638,8 @@ later ``/ combined_scale4_8`` at write time amplified every step by
 blowing up explosively for any layer with small ``output_scale`` (e.g.
 a wide dense layer's fan-in-corrected scale).
 
+.. _disldo_backward.fp4_table_decode:
+
 FP4 block4 backward: FP4_TABLE beats the bit-shift decode (opposite of forward)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -601,6 +666,8 @@ rejects a gather-looking ``output_grad[...col4[lj]]`` index as
 index as contiguous -- hence the ``full_tile_cols`` split (whole
 tile-column in bounds) checked once per tile, not per batch element.
 
+.. _disldo_backward.was_live_gating:
+
 ``was_live`` gating: a real bug from block4's dense-tile semantics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -619,6 +686,18 @@ held a genuine synapse -- weight OR importance byte nonzero -- BEFORE
 this call, checked against the PRE-update bytes) gates which quantizer
 each cell uses.
 
+.. code-block:: cpp
+
+   // as of PR #45, linear_disldo.hpp -- pattern repeats per FP4/FP8 x
+   // SIMD/scalar branch, this is the FP4 scalar-fallback instance:
+   was_live4[lj] = (w_decoded_arr[lj] != value_type(0)) ||
+                   (imp_decoded_arr[lj] != value_type(0));
+   // ... later, at encode time:
+   const uint8_t new_w = was_live4[lj] ? fp4_quantize_live(quant4[lj])
+                                        : fp4_quantize(quant4[lj]);
+
+.. _disldo_backward.nondeterminism_bug:
+
 Real non-determinism bug in the "Deterministic" layer variant
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -635,6 +714,19 @@ codec -- no deterministic SIMD kernel exists yet
 (``block4_vec_quantize_fp4``), only the stochastic one does, so this
 branch is never SIMD-gated. A SIMD deterministic variant would be a
 reasonable follow-up, not needed for correctness.
+
+.. code-block:: cpp
+
+   // as of PR #45, linear_disldo.hpp:
+   if constexpr (!StochasticRounding) {
+       // always fp4_quantize() (deterministic) here, regardless of block4
+       const uint8_t new_w = was_live4[lj] ? fp4_quantize_live(quant4[lj])
+                                            : fp4_quantize(quant4[lj]);
+   }
+   // WRONG (the bug): block4's own path called fp4_quantize_stochastic()
+   // unconditionally, ignoring the StochasticRounding template parameter.
+
+.. _disldo_backward.value_scale_reduction_dead_row:
 
 block4's hand-inlined value_scale reduction and the dead-row bootstrap
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -680,6 +772,8 @@ dead in both) instead of single-moment RMSprop -- linear in ``g_agg``
 variance, letting a genuinely inconsistent signal cancel out and stay at
 zero (preserving sparsity) while a persistent bias still accumulates.
 
+.. _disldo_backward.output_scale_gamma_rank_control:
+
 output_scale reduction, AQRS gamma update, and dynamic rank control
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -715,6 +809,8 @@ sum scales with layer WIDTH, not "how much does this channel matter" --
 normalized by ``n_in*n_out`` here (trigger tracking only, task #294 fix;
 gamma's own ``ScalePolicy`` step above stays on the raw gradient, since
 that update already self-normalizes via its own second-moment estimate).
+
+.. _disldo_backward.aqrs_additive_backward:
 
 AQRS additive branch backward
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

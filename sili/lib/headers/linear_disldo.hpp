@@ -25,7 +25,7 @@
 // fallback). Dense-input walk is embarrassingly parallel by input row,
 // unlike the sparse-input SISLDO path (sisldo_ops.hpp), which needs a
 // work-offset table to balance threads across a variable-density CSR
-// batch. See docs/research/linear_disldo.rst for background.
+// batch. See docs/research/linear_disldo.rst.
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
@@ -40,8 +40,9 @@
  *
  * No learning_rate parameter -- forward is pure computation, no side
  * effects. Importance updates happen only in disldo_backward(), coupled
- * to a real gradient (see docs/research/linear_disldo.rst for why a
- * gradient-free forward-side importance update was removed).
+ * to a real gradient (see disldo_forward.pure_computation in
+ * docs/research/linear_disldo.rst for why a gradient-free forward-side
+ * importance update was removed).
  *
  * NOTE (test): output must equal the dense matmul input @ W_dense where
  * W_dense[r,c] = weight of synapse (r->c). Same reference check used
@@ -61,7 +62,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     const std::size_t ost = static_cast<std::size_t>(batch) * n_out;
 
     // dc.empty() no longer means "nothing to do" -- block4 below may still
-    // hold live synapses. See docs/research/linear_disldo.rst.
+    // hold live synapses. See disldo_forward.dc_empty_check in
+    // docs/research/linear_disldo.rst.
     if (!dc.empty()) {
         std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
@@ -106,12 +108,13 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // as the scattered path above. No gather: within an active tile,
     // position IS the column (fixed compile-time offset), which is what
     // lets this SIMD where the scattered loop above can't. See
-    // docs/research/linear_disldo.rst.
+    // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
         // Collect (br,bc,elem_pos,byte_pos) tuples once per call before the
         // parallel region -- row-major cursor walk isn't parallel-for
         // friendly, and a Block4Tile handle is move-only/RAII so it can't
-        // be pre-collected across threads. See docs/research/linear_disldo.rst.
+        // be pre-collected across threads. See
+        // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
         std::vector<uint32_t>& tile_br = weights.block4.scratch_tile_br;
         std::vector<uint32_t>& tile_bc = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
@@ -119,7 +122,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back(): push_back's
         // per-call capacity check is measured exclusive cost at this scale.
-        // See docs/research/linear_disldo.rst.
+        // See disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
         tile_br.resize(n_b4);
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
@@ -143,10 +146,12 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         }
         // Per-thread private output buffers -- necessary, not optional:
         // two tiles sharing a block-column write to the same output
-        // positions. See docs/research/linear_disldo.rst.
+        // positions. See disldo_forward.per_thread_output_buffers in
+        // docs/research/linear_disldo.rst.
         std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
         // Hoisted loop bound -- measured instruction-count win (no
-        // wall-clock effect). See docs/research/linear_disldo.rst.
+        // wall-clock effect). See disldo_forward.hoisted_tile_count in
+        // docs/research/linear_disldo.rst.
         const int64_t n_tiles_local = int64_t(n_b4);
 #pragma omp parallel num_threads(num_cpus)
         {
@@ -167,6 +172,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 // FP4_TABLE[code] gathers -- and LJ is templated
                 // (compile-time constant), not a runtime loop, since GCC
                 // could not vectorize the runtime version at all. See
+                // disldo_forward.decode_bitshift_vs_table in
                 // docs/research/linear_disldo.rst for the measured
                 // rationale, including why the scalar-table result that
                 // helped backward's decode did NOT transfer here.
@@ -239,7 +245,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // sum_k gamma_k * additive_u_k(row,k) * additive_v_k(col,k), summed
     // into the effective weight. Fused per Theorem 11 (never materializes
     // the n_in x n_out A matrix). No-op at additive_rank==0. See
-    // docs/research/linear_disldo.rst.
+    // disldo_forward.aqrs_additive_branch in docs/research/linear_disldo.rst.
     if (weights.additive_rank > 0) {
         std::vector<value_type> proj(static_cast<std::size_t>(batch) * weights.additive_rank,
                                      value_type(0));
@@ -289,7 +295,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
  * @param damp_by_importance When true (default): the weight update is
  *        divided by (sqrt(ci)+eps), an RMSprop-style EMA of g^2. When
  *        false: the raw (-effective_lr * g) step is applied, undamped;
- *        ci is still tracked either way. See docs/research/linear_disldo.rst
+ *        ci is still tracked either way. See
+ *        disldo_backward.rmsprop_floor_rationale in docs/research/linear_disldo.rst
  *        for why this replaced an earlier signed-sum formula.
  * @param beta2  Decay rate for ci's g^2 EMA (default 0.999). Only used
  *        when damp_by_importance is true.
@@ -303,8 +310,9 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
  * Template params ScalePolicy/DeferredScaleWrite/StochasticRounding/
  * SynapsePolicyT and the ordering of the trailing scalar params
  * (l1_coef last) are constrained by existing callers' positional template
- * args -- see docs/research/linear_disldo.rst for the full rationale
- * and why SynapsePolicyT specifically must be template-template.
+ * args -- see disldo_backward.rmsprop_floor_rationale in
+ * docs/research/linear_disldo.rst for the full rationale and why
+ * SynapsePolicyT specifically must be template-template.
  */
 template <
     typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
@@ -338,7 +346,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // Only meaningful when DeferredScaleWrite: a touched scattered entry's
     // true-units (cw, ci) get cached here instead of stored immediately,
     // written out only once value_scale/output_scale are finalized for
-    // this whole call. See docs/research/linear_disldo.rst.
+    // this whole call. See disldo_backward.setup_and_presizing_bugs in
+    // docs/research/linear_disldo.rst.
     struct DeferredScaleWriteEntry {
         // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t vb;
@@ -366,7 +375,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
 
     // No early return when both storages are empty: the dead-row
     // value_scale bootstrap pass (near the end) needs to run precisely
-    // in that case. See docs/research/linear_disldo.rst.
+    // in that case. See disldo_backward.setup_and_presizing_bugs in
+    // docs/research/linear_disldo.rst.
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
@@ -385,8 +395,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         inline value_type* operator[](std::size_t k) const { return base + k * stride; }
     };
     // AQRS gamma (task #273/#283): layer-wide, fetched once rather than
-    // per-row. See docs/research/linear_disldo.rst for why it's not baked
-    // into the direction caches.
+    // per-row. See disldo_backward.gamma_fetched_once in
+    // docs/research/linear_disldo.rst for why it's not baked into the
+    // direction caches.
     std::vector<value_type> gamma_k_arr(rank);
     for (std::size_t k = 0; k < rank; ++k)
         gamma_k_arr[k] = weights.get_scale_gamma_k(k);
@@ -396,7 +407,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // t_col_grad -- mirrors the per-synapse ci fix (contrib=x*w combined
     // Additive-signal forward-contribution accumulator, same combination
     // rationale as per-synapse ci (Joint.combined_signal_strictly_informative)
-    // applied one level up. See docs/research/linear_disldo.rst.
+    // applied one level up. See disldo_backward.scattered_lr_and_signal in
+    // docs/research/linear_disldo.rst.
     std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * n_out * rank,
                                                value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
@@ -413,7 +425,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // A uniform resize(..., value_type(1)) fill would backfill EVERY
     // appended slot with 1.0, not just k==0, forcing any grown rank
     // component into permanent lockstep with k==0 instead of real extra
-    // capacity -- see docs/research/linear_disldo.rst. Resize with 0
+    // capacity -- see disldo_backward.setup_and_presizing_bugs in
+    // docs/research/linear_disldo.rst. Resize with 0
     // fill instead, then explicitly set only the k==0 slots to 1.0.
     if (weights.value_scale.size() < n_in * rank) {
         const std::size_t old_size = weights.value_scale.size();
@@ -438,7 +451,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // Bug fix, found via AddressSanitizer: value_scale_step was missing
     // from this pre-sizing list, so get_value_scale_step_k's own lazy
     // unguarded resize() raced across threads (real heap-use-after-free).
-    // See docs/research/linear_disldo.rst.
+    // See disldo_backward.setup_and_presizing_bugs in
+    // docs/research/linear_disldo.rst.
     if (weights.value_scale_step.size() < n_in * rank)
         weights.value_scale_step.resize(n_in * rank, 0);
 
@@ -490,6 +504,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     continue;
                 // lr_per_row_nnz: normalizes the aggregate per-row update
                 // against synaptogenesis-driven nnz variation. See
+                // disldo_backward.scattered_lr_and_signal in
                 // docs/research/linear_disldo.rst.
                 const value_type effective_lr =
                     lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_this_row)
@@ -537,7 +552,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         // either. cw_start: FIXED
                         // snapshot for the whole batch loop, g_agg/contrib_agg
                         // aggregated across it, ONE update applied after --
-                        // see docs/research/linear_disldo.rst for the real
+                        // see disldo_backward.scattered_lr_and_signal in
+                        // docs/research/linear_disldo.rst for the real
                         // batch-aggregation bug this fixes.
                         const value_type cw_start = cw_orig * combined_scale;
                         double g_agg = 0.0, contrib_agg = 0.0;
@@ -548,7 +564,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             const value_type g = dyv * iv;
                             if (learning_rate != value_type(0)) {
                                 // Additive g+contrib combination, square-then-sum
-                                // -- see docs/research/linear_disldo.rst
+                                // -- see disldo_backward.scattered_lr_and_signal in
+                                // docs/research/linear_disldo.rst
                                 // (Joint.combined_signal_strictly_informative).
                                 const value_type contrib = iv * cw_start;
                                 g_agg += static_cast<double>(g);
@@ -573,6 +590,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 eps, damp_by_importance, max_abs_delta, scale_invariant);
                             // Defer the store until value_scale[r] AND
                             // output_scale[col] are both finalized. See
+                            // disldo_backward.deferred_vs_direct_quant in
                             // docs/research/linear_disldo.rst.
                             mdeferred->push_back(DeferredScaleWriteEntry{vb, cw, ci, r, col});
                             local_sum_abs_new_i += std::abs(static_cast<double>(ci));
@@ -586,7 +604,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         // on true_w = quant*S, replacing the old true-units
                         // round-trip that divided by S (backwards). S =
                         // weights.get_scale(r,col), summed over `rank`
-                        // components. See docs/research/linear_disldo.rst.
+                        // components. See disldo_backward.deferred_vs_direct_quant
+                        // in docs/research/linear_disldo.rst.
                         const value_type S = weights.get_scale(r, col);
                         // cw_start/quant_floor: FIXED snapshots for the whole
                         // batch loop -- see the DeferredScaleWrite branch's
@@ -603,7 +622,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             if (learning_rate != value_type(0)) {
                                 // RMSprop-style ci, additive g+contrib
                                 // combination -- see this function's own
-                                // docstring and docs/research/linear_disldo.rst.
+                                // docstring and disldo_backward.deferred_vs_direct_quant
+                                // in docs/research/linear_disldo.rst.
                                 const value_type contrib = iv * cw_start;
                                 g_agg += static_cast<double>(g);
                                 contrib_agg += static_cast<double>(contrib);
@@ -612,6 +632,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 // quant=0. quant_floor gates the zero-escape
                                 // substitution on quant==0 specifically (not
                                 // unconditionally) -- see
+                                // disldo_backward.deferred_vs_direct_quant in
                                 // docs/research/linear_disldo.rst for the real
                                 // sign-corruption bug this fixes.
                                 for (std::size_t k = 0; k < rank; ++k) {
@@ -620,6 +641,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     // gradient site needs an explicit gamma_k
                                     // factor; gamma's own gradient uses the
                                     // pure direction product. See
+                                    // disldo_backward.deferred_vs_direct_quant in
                                     // docs/research/linear_disldo.rst.
                                     const value_type out_scale_k =
                                         weights.get_output_scale_k(col, k);
@@ -721,13 +743,14 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // reduced once after the parallel region. Known, documented
     // simplification: a row live in BOTH representations gets two
     // sequential gradient steps, not a bug. See
-    // docs/research/linear_disldo.rst.
+    // disldo_backward.block4_overview_races in docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
         // row_ti_start: cumulative tile count per block-row, needed to
         // split the row-partitioned parallel loop below. NOT storage
         // offsets -- since the row-workspace rewrite, tile byte/elem
         // positions live entirely within each row's own RowWorkspace,
-        // snapshotted fresh per row. See docs/research/linear_disldo.rst.
+        // snapshotted fresh per row. See disldo_backward.row_ti_start_workspace
+        // in docs/research/linear_disldo.rst.
         std::vector<std::size_t>& row_ti_start = weights.block4.scratch_row_ti_start;
         const auto& BL4 = weights.block4.block_layout;
         row_ti_start.resize(BL4.rows + 1);
@@ -809,7 +832,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
 // tile's handle can safely resize (real sparse<->dense
 // transitions) inside this parallel region. schedule(static)
 // measured to beat dynamic/guided here despite uneven row
-// widths -- see docs/research/linear_disldo.rst.
+// widths -- see disldo_backward.schedule_static_measured in
+// docs/research/linear_disldo.rst.
 #pragma omp for schedule(static)
             for (std::size_t br = 0; br < BL4.rows; ++br) {
                 if (row_ti_start[br] == row_ti_start[br + 1])
@@ -817,6 +841,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // Row-workspace snapshot fixes a real cross-row memmove
                 // hazard (a different row's growth could memmove this
                 // row's bytes mid-read) -- see
+                // disldo_backward.row_workspace_snapshot_fix in
                 // docs/research/linear_disldo.rst. process_tile: shared
                 // between the read-only and writing branches below so
                 // they can't drift apart; every write inside is gated by
@@ -845,6 +870,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         // block4_vec_decode_fp4's SIMD bit-shift formula --
                         // measured ~6% win for backward specifically
                         // (opposite of forward's finding). See
+                        // disldo_backward.fp4_table_decode in
                         // docs/research/linear_disldo.rst.
                         if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                             // FP8 (E4M3) block4 weight+importance update.
@@ -853,6 +879,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             // NaN-lane scalar-correction fallback is real
                             // overhead FP4 never pays), scalar decode/encode
                             // + SIMD accumulate-only WINS at batch=32. See
+                            // disldo_backward.fp8_simd_measured in
                             // docs/research/linear_disldo.rst.
                             if constexpr (std::is_same_v<value_type, float> &&
                                           !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
@@ -898,7 +925,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 // genuine synapse BEFORE this call -- gates the
                                 // never-zero live quantizer so it never
                                 // permanently "births" a never-connected cell.
-                                // See docs/research/linear_disldo.rst.
+                                // See disldo_backward.was_live_gating in
+                                // docs/research/linear_disldo.rst.
                                 bool was_live4_8[BLOCK4_TILE];
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
@@ -923,6 +951,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     // convention) -- keeping it in true units
                                     // instead caused a real 1/S blowup at write
                                     // time for small output_scale. See
+                                    // disldo_backward.fp8_simd_measured in
                                     // docs/research/linear_disldo.rst.
                                     combined_scale4_8[lj] = weights.get_scale(row, col);
                                     combined_imp_scale4_8[lj] = imp_scale * out_imp_scale;
@@ -1381,7 +1410,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 static_cast<std::size_t>(tid) * rank * BLOCK4_TILE,
                             BLOCK4_TILE};
                         // was_live4[lj]: same gating as was_live4_8 (FP8
-                        // branch above). See docs/research/linear_disldo.rst.
+                        // branch above). See disldo_backward.was_live_gating in
+                        // docs/research/linear_disldo.rst.
                         bool was_live4[BLOCK4_TILE];
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                             const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
@@ -1540,6 +1570,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         // RMSprop-style ci, additive g+contrib
                                         // combination -- see disldo_backward's
                                         // own docstring and
+                                        // disldo_backward.deferred_vs_direct_quant in
                                         // docs/research/linear_disldo.rst.
                                         const Block4Vec contrib_v =
                                             (quant_start_v * combined_scale_v) *
@@ -1549,6 +1580,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         // quant_floor: signed quant, except at
                                         // quant==0 where zero_escape_eps
                                         // substitutes -- see
+                                        // disldo_backward.deferred_vs_direct_quant in
                                         // docs/research/linear_disldo.rst.
                                         for (std::size_t k = 0; k < rank; ++k) {
                                             // AQRS gamma -- see above.
@@ -1786,6 +1818,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 // Real non-determinism bug fixed here (block4
                                 // used to always stochastic-round regardless
                                 // of StochasticRounding) -- see
+                                // disldo_backward.nondeterminism_bug in
                                 // docs/research/linear_disldo.rst.
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     if (!col_valid4[lj])
@@ -2341,7 +2374,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // AQRS additive branch backward (task #277): differentiates
     // disldo_forward's additive-branch block, its own self-contained pass.
     // No-op at additive_rank==0. P is NOT cached from forward -- recomputed
-    // from `input` directly. See docs/research/linear_disldo.rst.
+    // from `input` directly. See disldo_backward.aqrs_additive_backward in
+    // docs/research/linear_disldo.rst.
     if (weights.additive_rank > 0) {
         const std::size_t r_o = weights.additive_rank;
         std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
