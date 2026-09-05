@@ -9,21 +9,24 @@
 #include <cmath>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP8BiValues, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP8BiValues, COL_TYPE>;
 
-static void set_probes(Weights& w,
-                        const std::vector<SIZE_TYPE>& rows,
-                        const std::vector<SIZE_TYPE>& cols,
-                        const std::vector<float>& scores) {
+static void set_probes(Weights& w, const std::vector<SIZE_TYPE>& rows,
+                       const std::vector<SIZE_TYPE>& cols, const std::vector<float>& scores) {
     w.probes.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(rows);
     w.probes.indices[1] = std::make_shared<std::vector<SIZE_TYPE>>(cols);
-    w.probes.values[0]  = std::make_shared<std::vector<float>>(scores);
+    w.probes.values[0] = std::make_shared<std::vector<float>>(scores);
     w.probes.ptrs = static_cast<SIZE_TYPE>(rows.size());
 }
 
@@ -43,59 +46,76 @@ int main() {
     std::size_t current_row = 0;
 
     set_probes(weights, {0}, {0}, {1.0f});
-    bool ok1 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(
-        weights, current_row, -1e9f, SIZE_TYPE(10));
+    bool ok1 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row,
+                                                                          -1e9f, SIZE_TYPE(10));
     CHECK(ok1, "first growth step should succeed");
     CHECK(weights.block4.n_tiles() == 0, "tile should NOT promote yet (only 1 live)");
     CHECK(weights.connections.layout.row_nnz(0) == 1, "synapse (0,0) should be scattered so far");
 
     current_row = 1;
     set_probes(weights, {1}, {1}, {1.0f});
-    bool ok2 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(
-        weights, current_row, -1e9f, SIZE_TYPE(10));
+    bool ok2 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row,
+                                                                          -1e9f, SIZE_TYPE(10));
     CHECK(ok2, "second growth step should succeed");
     CHECK(weights.block4.n_tiles() == 1, "tile (0,0) should now be promoted (2 live >= threshold)");
-    CHECK(weights.connections.layout.row_nnz(0) == 0, "row0's synapse should have moved OUT of connections");
-    CHECK(weights.connections.layout.row_nnz(1) == 0, "row1's synapse should have moved OUT of connections");
+    CHECK(weights.connections.layout.row_nnz(0) == 0,
+          "row0's synapse should have moved OUT of connections");
+    CHECK(weights.connections.layout.row_nnz(1) == 0,
+          "row1's synapse should have moved OUT of connections");
 
     auto tile = weights.block4.find(0, 0);
     CHECK(bool(tile), "tile (0,0) must exist after promotion");
-    CHECK(tile.count_live() == 2, "tile count_live() should be 2, got %u", bool(tile) ? tile.count_live() : 999u);
+    CHECK(tile.count_live() == 2, "tile count_live() should be 2, got %u",
+          bool(tile) ? tile.count_live() : 999u);
 
-    CHECK(weights.out_degree[0] == 1, "out_degree[0] should be 1, got %d", (int)weights.out_degree[0]);
-    CHECK(weights.out_degree[1] == 1, "out_degree[1] should be 1, got %d", (int)weights.out_degree[1]);
+    CHECK(weights.out_degree[0] == 1, "out_degree[0] should be 1, got %d",
+          (int)weights.out_degree[0]);
+    CHECK(weights.out_degree[1] == 1, "out_degree[1] should be 1, got %d",
+          (int)weights.out_degree[1]);
 
     // ── Growth into an ALREADY-promoted tile: single-synapse migration ────
     current_row = 2;
     set_probes(weights, {2}, {2}, {1.0f});
-    bool ok3 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(
-        weights, current_row, -1e9f, SIZE_TYPE(10));
+    bool ok3 = delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row,
+                                                                          -1e9f, SIZE_TYPE(10));
     CHECK(ok3, "third growth step should succeed");
-    CHECK(weights.connections.layout.row_nnz(2) == 0, "row2's new synapse should migrate straight into the existing tile");
+    CHECK(weights.connections.layout.row_nnz(2) == 0,
+          "row2's new synapse should migrate straight into the existing tile");
     tile = weights.block4.find(0, 0);
-    CHECK(tile.count_live() == 3, "tile count_live() should be 3 after single-synapse migration, got %u", tile.count_live());
-    CHECK(weights.out_degree[2] == 1, "out_degree[2] should be 1, got %d", (int)weights.out_degree[2]);
+    CHECK(tile.count_live() == 3,
+          "tile count_live() should be 3 after single-synapse migration, got %u",
+          tile.count_live());
+    CHECK(weights.out_degree[2] == 1, "out_degree[2] should be 1, got %d",
+          (int)weights.out_degree[2]);
 
     // ── Pruning: demote by cutting live count back below threshold ────────
     weights.probes.indices[0] = nullptr;
     weights.probes.indices[1] = nullptr;
-    weights.probes.values[0]  = nullptr;
+    weights.probes.values[0] = nullptr;
 
     current_row = 2;
     delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(
         weights, current_row, /*importance_cutoff=*/1e9f, SIZE_TYPE(10));
     tile = weights.block4.find(0, 0);
-    CHECK(bool(tile), "tile should still exist after pruning row2 (2 live left, still >= threshold)");
-    CHECK(tile && tile.count_live() == 2, "tile count_live() should be 2 after pruning row2's synapse");
-    CHECK(weights.out_degree[2] == 0, "out_degree[2] should drop to 0 after real prune, got %d", (int)weights.out_degree[2]);
+    CHECK(bool(tile),
+          "tile should still exist after pruning row2 (2 live left, still >= threshold)");
+    CHECK(tile && tile.count_live() == 2,
+          "tile count_live() should be 2 after pruning row2's synapse");
+    CHECK(weights.out_degree[2] == 0, "out_degree[2] should drop to 0 after real prune, got %d",
+          (int)weights.out_degree[2]);
 
     current_row = 1;
     delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(
         weights, current_row, /*importance_cutoff=*/1e9f, SIZE_TYPE(10));
-    CHECK(weights.block4.n_tiles() == 0, "tile should be DEMOTED after dropping to 1 live (< threshold)");
-    CHECK(weights.connections.layout.row_nnz(0) == 1, "row0's surviving synapse should be back in connections after demotion");
-    CHECK(weights.out_degree[0] == 1, "out_degree[0] should be unchanged by demotion (representation move only), got %d", (int)weights.out_degree[0]);
-    CHECK(weights.out_degree[1] == 0, "out_degree[1] should drop to 0 after real prune, got %d", (int)weights.out_degree[1]);
+    CHECK(weights.block4.n_tiles() == 0,
+          "tile should be DEMOTED after dropping to 1 live (< threshold)");
+    CHECK(weights.connections.layout.row_nnz(0) == 1,
+          "row0's surviving synapse should be back in connections after demotion");
+    CHECK(weights.out_degree[0] == 1,
+          "out_degree[0] should be unchanged by demotion (representation move only), got %d",
+          (int)weights.out_degree[0]);
+    CHECK(weights.out_degree[1] == 0, "out_degree[1] should drop to 0 after real prune, got %d",
+          (int)weights.out_degree[1]);
 
     // Verify the demoted synapse's value round-tripped exactly (weight was
     // never trained -- stored 0.0 via insert_col(..., value_type(0), score)
@@ -106,7 +126,10 @@ int main() {
         std::vector<float> y(n_out, 0.f);
         disldo_forward<SIZE_TYPE, FP8BiValues, COL_TYPE>(x.data(), 1, n_in, weights, y.data(), 1);
         for (int c = 0; c < n_out; ++c)
-            CHECK(std::abs(y[c]) < 1e-4f, "post-demotion forward output[%d] should be 0 (weight was never trained): got %.4f", c, y[c]);
+            CHECK(
+                std::abs(y[c]) < 1e-4f,
+                "post-demotion forward output[%d] should be 0 (weight was never trained): got %.4f",
+                c, y[c]);
     }
 
     // ── delta_csr_combined_to_absolute: block4-resident synapses must be
@@ -118,20 +141,26 @@ int main() {
         // going into the export check.
         current_row = 0;
         set_probes(weights, {0}, {0}, {1.0f});
-        delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row, -1e9f, SIZE_TYPE(10));
+        delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row, -1e9f,
+                                                                   SIZE_TYPE(10));
         current_row = 1;
         set_probes(weights, {1}, {1}, {1.0f});
-        delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row, -1e9f, SIZE_TYPE(10));
+        delta_csr_synap_row_step<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, current_row, -1e9f,
+                                                                   SIZE_TYPE(10));
         CHECK(weights.block4.n_tiles() == 1, "setup: expected a promoted tile before export check");
 
         std::vector<SIZE_TYPE> op, oi;
         std::vector<float> ow, oimp;
         delta_csr_combined_to_absolute<SIZE_TYPE, FP8BiValues, COL_TYPE>(weights, op, oi, ow, oimp);
-        CHECK(op.back() >= 2, "combined export should include the 2 block4-resident synapses, got total nnz=%d", (int)op.back());
+        CHECK(op.back() >= 2,
+              "combined export should include the 2 block4-resident synapses, got total nnz=%d",
+              (int)op.back());
         bool found_col0 = false, found_col1 = false;
         for (std::size_t k = 0; k < oi.size(); ++k) {
-            if (oi[k] == 0) found_col0 = true;
-            if (oi[k] == 1) found_col1 = true;
+            if (oi[k] == 0)
+                found_col0 = true;
+            if (oi[k] == 1)
+                found_col1 = true;
         }
         CHECK(found_col0, "exported indices should include col 0 (block4-resident)");
         CHECK(found_col1, "exported indices should include col 1 (block4-resident)");

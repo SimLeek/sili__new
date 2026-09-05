@@ -22,19 +22,20 @@ Not part of the sili runtime path -- this is a conversion-time
 diagnostic/calibration tool, like sparse_prune.py's calibration
 functions.
 """
+
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
 import torch
 
 from .rnn_fold import _parse_block_key
 from .sparse_prune import calibrate_min_abs_param
 
-EvalFn = Callable[[Dict[str, torch.Tensor]], float]
+EvalFn = Callable[[dict[str, torch.Tensor]], float]
 
 
-def group_tensor_names_by_role(state_dict: Dict[str, torch.Tensor]) -> Dict[str, List[str]]:
+def group_tensor_names_by_role(state_dict: dict[str, torch.Tensor]) -> dict[str, list[str]]:
     """
     Group 2-D tensor names by "role": tensors that recur once per
     repeated block (e.g. every layer's own self_attn.q_proj.weight) are
@@ -51,7 +52,7 @@ def group_tensor_names_by_role(state_dict: Dict[str, torch.Tensor]) -> Dict[str,
     -rank tensors are never threshold-pruned, so grouping them for a
     sensitivity sweep would be meaningless).
     """
-    groups: Dict[str, List[str]] = {}
+    groups: dict[str, list[str]] = {}
     for name, t in state_dict.items():
         if not isinstance(t, torch.Tensor) or t.ndim != 2:
             continue
@@ -62,12 +63,12 @@ def group_tensor_names_by_role(state_dict: Dict[str, torch.Tensor]) -> Dict[str,
 
 
 def sweep_group_sensitivity(
-    state_dict: Dict[str, torch.Tensor],
-    groups: Dict[str, List[str]],
+    state_dict: dict[str, torch.Tensor],
+    groups: dict[str, list[str]],
     eval_fn: EvalFn,
     sparsity_grid: Sequence[float] = (0.0, 0.2, 0.4, 0.6, 0.8),
     max_sample: int = 5_000_000,
-) -> Dict[str, Dict[float, float]]:
+) -> dict[str, dict[float, float]]:
     """
     For each group, sweep `sparsity_grid` pruning ONLY that group's
     tensors (every other tensor stays exactly as given in `state_dict`),
@@ -86,14 +87,14 @@ def sweep_group_sensitivity(
     model with many groups, budget accordingly (see
     examples/prune_sensitivity_example.py for a worked, timed example).
     """
-    results: Dict[str, Dict[float, float]] = {}
+    results: dict[str, dict[float, float]] = {}
     for gname, names in groups.items():
         sub_sd = {n: state_dict[n] for n in names}
-        per_target: Dict[float, float] = {}
+        per_target: dict[float, float] = {}
         for target in sparsity_grid:
-            threshold = (calibrate_min_abs_param(sub_sd, target_sparsity=target,
-                                                 max_sample=max_sample)
-                        if target > 0.0 else 0.0)
+            threshold = (
+                calibrate_min_abs_param(sub_sd, target_sparsity=target, max_sample=max_sample) if target > 0.0 else 0.0
+            )
             trial_sd = dict(state_dict)
             for n in names:
                 t = state_dict[n].detach().float()
@@ -104,11 +105,11 @@ def sweep_group_sensitivity(
 
 
 def apply_group_thresholds(
-    state_dict: Dict[str, torch.Tensor],
-    groups: Dict[str, List[str]],
-    target_sparsity_by_group: Dict[str, float],
+    state_dict: dict[str, torch.Tensor],
+    groups: dict[str, list[str]],
+    target_sparsity_by_group: dict[str, float],
     max_sample: int = 5_000_000,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """
     Prune each group named in `target_sparsity_by_group` at its OWN
     calibrated threshold (calibrated on that group's tensors only, not
@@ -121,9 +122,9 @@ def apply_group_thresholds(
     for gname, target in target_sparsity_by_group.items():
         names = groups[gname]
         sub_sd = {n: state_dict[n] for n in names}
-        threshold = (calibrate_min_abs_param(sub_sd, target_sparsity=target,
-                                             max_sample=max_sample)
-                    if target > 0.0 else 0.0)
+        threshold = (
+            calibrate_min_abs_param(sub_sd, target_sparsity=target, max_sample=max_sample) if target > 0.0 else 0.0
+        )
         for n in names:
             t = state_dict[n].detach().float()
             out[n] = t * (t.abs() >= threshold)
@@ -131,13 +132,13 @@ def apply_group_thresholds(
 
 
 def stepwise_cumulative_eval(
-    state_dict: Dict[str, torch.Tensor],
-    groups: Dict[str, List[str]],
-    target_sparsity_by_group: Dict[str, float],
+    state_dict: dict[str, torch.Tensor],
+    groups: dict[str, list[str]],
+    target_sparsity_by_group: dict[str, float],
     step_order: Sequence[Sequence[str]],
     eval_fn: EvalFn,
     max_sample: int = 5_000_000,
-) -> List[Tuple[Tuple[str, ...], float]]:
+) -> list[tuple[tuple[str, ...], float]]:
     """
     Add groups CUMULATIVELY, one step at a time (each step can add more
     than one group at once -- e.g. a first step of ["q_proj", "k_proj"]
@@ -152,9 +153,9 @@ def stepwise_cumulative_eval(
 
     Returns a list of (groups_added_so_far, score), in step_order.
     """
-    cumulative: List[str] = []
+    cumulative: list[str] = []
     trial_sd = dict(state_dict)
-    out: List[Tuple[Tuple[str, ...], float]] = []
+    out: list[tuple[tuple[str, ...], float]] = []
 
     for step in step_order:
         for gname in step:
@@ -162,9 +163,9 @@ def stepwise_cumulative_eval(
             names = groups[gname]
             sub_sd = {n: state_dict[n] for n in names}
             target = target_sparsity_by_group[gname]
-            threshold = (calibrate_min_abs_param(sub_sd, target_sparsity=target,
-                                                 max_sample=max_sample)
-                        if target > 0.0 else 0.0)
+            threshold = (
+                calibrate_min_abs_param(sub_sd, target_sparsity=target, max_sample=max_sample) if target > 0.0 else 0.0
+            )
             for n in names:
                 t = state_dict[n].detach().float()
                 trial_sd[n] = t * (t.abs() >= threshold)
@@ -173,9 +174,9 @@ def stepwise_cumulative_eval(
 
 
 def iterative_threshold_search(
-    state_dict: Dict[str, torch.Tensor],
-    groups: Dict[str, List[str]],
-    initial_thresholds: Dict[str, float],
+    state_dict: dict[str, torch.Tensor],
+    groups: dict[str, list[str]],
+    initial_thresholds: dict[str, float],
     step_order: Sequence[Sequence[str]],
     eval_fn: EvalFn,
     baseline_score: float,
@@ -184,7 +185,7 @@ def iterative_threshold_search(
     max_iterations: int = 10,
     min_threshold: float = 0.0,
     max_sample: int = 5_000_000,
-) -> Tuple[Dict[str, float], List[dict]]:
+) -> tuple[dict[str, float], list[dict]]:
     """
     Greedy search: run stepwise_cumulative_eval with the CURRENT
     thresholds, find whichever step caused the single worst marginal
@@ -214,14 +215,12 @@ def iterative_threshold_search(
     the whole search trace, not just the final answer.
     """
     thresholds = dict(initial_thresholds)
-    history: List[dict] = []
+    history: list[dict] = []
 
     for _ in range(max_iterations):
-        steps = stepwise_cumulative_eval(state_dict, groups, thresholds,
-                                         step_order, eval_fn, max_sample=max_sample)
+        steps = stepwise_cumulative_eval(state_dict, groups, thresholds, step_order, eval_fn, max_sample=max_sample)
         final_score = steps[-1][1]
-        history.append({"thresholds": dict(thresholds), "final_score": final_score,
-                        "steps": steps})
+        history.append({"thresholds": dict(thresholds), "final_score": final_score, "steps": steps})
         if final_score >= target_score:
             break
 
@@ -244,6 +243,6 @@ def iterative_threshold_search(
                 shrunk_any = True
                 break
         if not shrunk_any:
-            break   # nothing left with room to shrink -- stop rather than loop forever
+            break  # nothing left with room to shrink -- stop rather than loop forever
 
     return thresholds, history

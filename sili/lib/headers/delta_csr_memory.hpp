@@ -1,10 +1,10 @@
 #ifndef __DELTA_CSR_MEMORY_HPP_
 #define __DELTA_CSR_MEMORY_HPP_
 
-// Row-level memory operations on DeltaCSRWeights: 
-//  build from / convert to absolute CSR, blank-space (headroom) management, 
-//  row insert/remove/rebuild, synaptogenesis application (synap_row_step) 
-//  and candidate generation (build_probes) 
+// Row-level memory operations on DeltaCSRWeights:
+//  build from / convert to absolute CSR, blank-space (headroom) management,
+//  row insert/remove/rebuild, synaptogenesis application (synap_row_step)
+//  and candidate generation (build_probes)
 #include "delta_csr_types.hpp"
 #include <unordered_set>
 #include <numeric>
@@ -15,16 +15,13 @@
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
-    const std::vector<SIZE_TYPE>&   csr_ptrs,
-    const std::vector<SIZE_TYPE>&   csr_indices,
+    const std::vector<SIZE_TYPE>& csr_ptrs, const std::vector<SIZE_TYPE>& csr_indices,
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_weights,
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& csr_importance,
-    std::size_t rows, std::size_t cols,
-    std::size_t index_bytes, std::size_t values_bytes,
+    std::size_t rows, std::size_t cols, std::size_t index_bytes, std::size_t values_bytes,
     float blank_fraction = 0.2f,
     std::size_t hard_index_limit_bytes = std::numeric_limits<std::size_t>::max(),
-    std::size_t hard_values_limit_bytes = std::numeric_limits<std::size_t>::max())
-{
+    std::size_t hard_values_limit_bytes = std::numeric_limits<std::size_t>::max()) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> dc;
     dc.set_limits(hard_index_limit_bytes, hard_values_limit_bytes);
@@ -35,9 +32,9 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     L.rows = rows;
     L.cols = cols;
     L.byte_start.resize(rows + 1);
-    L.byte_end  .resize(rows);
+    L.byte_end.resize(rows);
     L.elem_start.resize(rows + 1);
-    L.elem_end  .resize(rows);
+    L.elem_end.resize(rows);
 
     uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
 
@@ -55,14 +52,14 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     L.elem_start[0] = 0;
     for (std::size_t r = 0; r < rows; ++r) {
         const std::size_t n = csr_ptrs[r + 1] - csr_ptrs[r];
-        L.byte_end[r]       = L.byte_start[r] + row_bytes[r];
-        const std::size_t byte_blank = static_cast<std::size_t>(row_bytes[r] * blank_fraction)
-                                       + uleb128_max_bytes<COL_TYPE>(); 
+        L.byte_end[r] = L.byte_start[r] + row_bytes[r];
+        const std::size_t byte_blank =
+            static_cast<std::size_t>(row_bytes[r] * blank_fraction) + uleb128_max_bytes<COL_TYPE>();
         L.byte_start[r + 1] = L.byte_end[r] + byte_blank;
-        
-        L.elem_end[r]       = L.elem_start[r] + n;
-        const std::size_t elem_blank = std::max(std::size_t(1),
-                                                static_cast<std::size_t>(n * blank_fraction) + 1);
+
+        L.elem_end[r] = L.elem_start[r] + n;
+        const std::size_t elem_blank =
+            std::max(std::size_t(1), static_cast<std::size_t>(n * blank_fraction) + 1);
         L.elem_start[r + 1] = L.elem_end[r] + elem_blank;
     }
     L.total_nnz = static_cast<std::size_t>(csr_ptrs[rows]);
@@ -70,8 +67,10 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     dc.indices_buf.assign(L.byte_start[rows], uint8_t(0));
     ValueAccessor<VALUES_TYPE>::resize(dc.values, L.elem_start[rows], value_type(0));
 
-    const std::size_t byte_headroom = static_cast<std::size_t>(L.byte_start[rows] * (1.0f + blank_fraction));
-    const std::size_t elem_headroom = static_cast<std::size_t>(L.elem_start[rows] * (1.0f + blank_fraction));
+    const std::size_t byte_headroom =
+        static_cast<std::size_t>(L.byte_start[rows] * (1.0f + blank_fraction));
+    const std::size_t elem_headroom =
+        static_cast<std::size_t>(L.elem_start[rows] * (1.0f + blank_fraction));
     dc.indices_buf.reserve(byte_headroom);
     ValueAccessor<VALUES_TYPE>::reserve(dc.values, elem_headroom);
 
@@ -83,7 +82,7 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
             COL_TYPE col = static_cast<COL_TYPE>(csr_indices[i]);
             bpos += uleb128_encode<COL_TYPE>(col - prev, dc.indices_buf.data() + bpos);
             prev = col;
-            
+
             ValueAccessor<VALUES_TYPE>::set(dc.values, epos, csr_weights[i], csr_importance[i]);
             ++epos;
         }
@@ -94,18 +93,16 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_to_absolute(
-    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
-    std::vector<SIZE_TYPE>&  out_ptrs,
-    std::vector<SIZE_TYPE>&  out_indices,
+    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::vector<SIZE_TYPE>& out_ptrs,
+    std::vector<SIZE_TYPE>& out_indices,
     std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_weights,
-    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_importance)
-{
-    const auto& L   = dc.layout;
+    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_importance) {
+    const auto& L = dc.layout;
     const std::size_t nnz = L.total_nnz;
 
-    out_ptrs     .resize(L.rows + 1);
-    out_indices  .resize(nnz);
-    out_weights  .resize(nnz);
+    out_ptrs.resize(L.rows + 1);
+    out_indices.resize(nnz);
+    out_weights.resize(nnz);
     out_importance.resize(nnz);
 
     out_ptrs[0] = 0;
@@ -114,9 +111,10 @@ void delta_csr_to_absolute(
         auto cursor = dc.row_cursor(r);
         const std::size_t n = L.row_nnz(r);
         for (std::size_t k = 0; k < n; ++k, ++flat) {
-            out_indices[flat]    = static_cast<SIZE_TYPE>(cursor.advance());
-            out_weights[flat]    = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[r] + k);
-            out_importance[flat] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k);
+            out_indices[flat] = static_cast<SIZE_TYPE>(cursor.advance());
+            out_weights[flat] = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[r] + k);
+            out_importance[flat] =
+                ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k);
         }
         out_ptrs[r + 1] = static_cast<SIZE_TYPE>(flat);
     }
@@ -127,23 +125,22 @@ void delta_csr_to_absolute(
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void delta_csr_combined_to_absolute(
     const SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    std::vector<SIZE_TYPE>&  out_ptrs,
-    std::vector<SIZE_TYPE>&  out_indices,
+    std::vector<SIZE_TYPE>& out_ptrs, std::vector<SIZE_TYPE>& out_indices,
     std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_weights,
-    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_importance)
-{
+    std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& out_importance) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     const auto& dc = weights.connections;
-    const auto& L  = dc.layout;
+    const auto& L = dc.layout;
 
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> &&
+                  !std::is_same_v<VALUES_TYPE, FP8BiValues>) {
         // block4 is FP4/FP8-specific (see block4.hpp) -- always empty otherwise.
-        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
-            dc, out_ptrs, out_indices, out_weights, out_importance);
+        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, out_ptrs, out_indices,
+                                                                out_weights, out_importance);
         return;
     } else if (weights.block4.n_tiles() == 0) {
-        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
-            dc, out_ptrs, out_indices, out_weights, out_importance);
+        delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, out_ptrs, out_indices,
+                                                                out_weights, out_importance);
         return;
     } else {
         out_ptrs.assign(L.rows + 1, SIZE_TYPE(0));
@@ -151,7 +148,10 @@ void delta_csr_combined_to_absolute(
         out_weights.clear();
         out_importance.clear();
 
-        struct Entry { COL_TYPE col; value_type w, imp; };
+        struct Entry {
+            COL_TYPE col;
+            value_type w, imp;
+        };
         std::vector<Entry> row_entries;
 
         for (std::size_t r = 0; r < L.rows; ++r) {
@@ -159,10 +159,10 @@ void delta_csr_combined_to_absolute(
             auto cursor = dc.row_cursor(r);
             const std::size_t n = L.row_nnz(r);
             for (std::size_t k = 0; k < n; ++k) {
-                row_entries.push_back({
-                    cursor.advance(),
-                    ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[r] + k),
-                    ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k)});
+                row_entries.push_back(
+                    {cursor.advance(),
+                     ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[r] + k),
+                     ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[r] + k)});
             }
 
             const uint32_t br = uint32_t(r / BLOCK4_TILE);
@@ -177,24 +177,28 @@ void delta_csr_combined_to_absolute(
                     const auto tile = weights.block4.find(br, bc);
                     if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                            const uint8_t w_byte   = tile.at_weight(li, lj);
+                            const uint8_t w_byte = tile.at_weight(li, lj);
                             const uint8_t imp_byte = tile.at_importance(li, lj);
                             // we consider weight==0 & importance==0 as empty
-                            if (w_byte == 0 && imp_byte == 0) continue;
+                            if (w_byte == 0 && imp_byte == 0)
+                                continue;
                             const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                            if (col >= L.cols) continue;
-                            row_entries.push_back({
-                                COL_TYPE(col), fp8_decode_bits(w_byte), fp8_decode_bits(imp_byte)});
+                            if (col >= L.cols)
+                                continue;
+                            row_entries.push_back({COL_TYPE(col), fp8_decode_bits(w_byte),
+                                                   fp8_decode_bits(imp_byte)});
                         }
                     } else {
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                             const uint8_t byte = tile.at(li, lj);
                             // we consider weight==0 & importance==0 as empty
-                            if (byte == 0) continue;
+                            if (byte == 0)
+                                continue;
                             const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                            if (col >= L.cols) continue;
-                            row_entries.push_back({
-                                COL_TYPE(col), FP4_TABLE[byte & 0xFu], FP4_TABLE[(byte >> 4) & 0xFu]});
+                            if (col >= L.cols)
+                                continue;
+                            row_entries.push_back({COL_TYPE(col), FP4_TABLE[byte & 0xFu],
+                                                   FP4_TABLE[(byte >> 4) & 0xFu]});
                         }
                     }
                 }
@@ -222,25 +226,22 @@ inline std::size_t delta_csr_target_alloc_elems(const DeltaCSRLayout& L) {
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-void delta_csr_shift_row(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
-    std::size_t row,
-    std::size_t target_byte_alloc,
-    std::size_t target_elem_alloc)
-{
-    auto& L    = dc.layout;
+void delta_csr_shift_row(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
+                         std::size_t target_byte_alloc, std::size_t target_elem_alloc) {
+    auto& L = dc.layout;
     auto& ibuf = dc.indices_buf;
 
     // byte side
     const std::size_t cur_byte_alloc = L.row_alloc_bytes(row);
     if (cur_byte_alloc != target_byte_alloc && row + 1 < L.rows) {
-        const std::size_t move_src  = L.byte_start[row + 1];
-        const std::size_t move_len  = L.byte_start[L.rows] - move_src;
+        const std::size_t move_src = L.byte_start[row + 1];
+        const std::size_t move_len = L.byte_start[L.rows] - move_src;
         const std::size_t new_start = L.byte_start[row] + target_byte_alloc;
 
         if (target_byte_alloc > cur_byte_alloc) {
             const std::size_t new_total = ibuf.size() + (target_byte_alloc - cur_byte_alloc);
-            if (new_total > dc.max_indices_bytes) throw std::bad_alloc();
+            if (new_total > dc.max_indices_bytes)
+                throw std::bad_alloc();
             ibuf.resize(new_total);
         }
         if (move_len > 0)
@@ -248,59 +249,59 @@ void delta_csr_shift_row(
         if (target_byte_alloc < cur_byte_alloc)
             ibuf.resize(ibuf.size() - (cur_byte_alloc - target_byte_alloc));
 
-        const std::ptrdiff_t byte_delta =
-            static_cast<std::ptrdiff_t>(target_byte_alloc) -
-            static_cast<std::ptrdiff_t>(cur_byte_alloc);
+        const std::ptrdiff_t byte_delta = static_cast<std::ptrdiff_t>(target_byte_alloc) -
+                                          static_cast<std::ptrdiff_t>(cur_byte_alloc);
         for (std::size_t r = row + 1; r <= L.rows; ++r)
-            L.byte_start[r] = static_cast<std::size_t>(
-                static_cast<std::ptrdiff_t>(L.byte_start[r]) + byte_delta);
+            L.byte_start[r] =
+                static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.byte_start[r]) + byte_delta);
         for (std::size_t r = row + 1; r < L.rows; ++r)
-            L.byte_end[r] = static_cast<std::size_t>(
-                static_cast<std::ptrdiff_t>(L.byte_end[r]) + byte_delta);
+            L.byte_end[r] =
+                static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.byte_end[r]) + byte_delta);
     }
 
     // element side
     const std::size_t cur_elem_alloc = L.row_alloc_elems(row);
     if (cur_elem_alloc != target_elem_alloc && row + 1 < L.rows) {
-        const std::size_t move_src  = L.elem_start[row + 1];
-        const std::size_t move_len  = L.elem_start[L.rows] - move_src;
+        const std::size_t move_src = L.elem_start[row + 1];
+        const std::size_t move_len = L.elem_start[L.rows] - move_src;
         const std::size_t new_start = L.elem_start[row] + target_elem_alloc;
         const std::size_t current_total = L.total_alloc_elems();
 
         if (target_elem_alloc > cur_elem_alloc) {
-            const std::size_t new_total_elems = current_total + (target_elem_alloc - cur_elem_alloc);
-            if (ValueAccessor<VALUES_TYPE>::projected_byte_size(new_total_elems) > dc.max_values_bytes)
+            const std::size_t new_total_elems =
+                current_total + (target_elem_alloc - cur_elem_alloc);
+            if (ValueAccessor<VALUES_TYPE>::projected_byte_size(new_total_elems) >
+                dc.max_values_bytes)
                 throw std::bad_alloc();
             ValueAccessor<VALUES_TYPE>::resize(dc.values, new_total_elems);
         }
-        
+
         ValueAccessor<VALUES_TYPE>::move(dc.values, new_start, move_src, move_len);
-        
+
         if (target_elem_alloc < cur_elem_alloc) {
-            ValueAccessor<VALUES_TYPE>::resize(dc.values, current_total - (cur_elem_alloc - target_elem_alloc));
+            ValueAccessor<VALUES_TYPE>::resize(dc.values, current_total -
+                                                              (cur_elem_alloc - target_elem_alloc));
         }
 
-        const std::ptrdiff_t elem_delta =
-            static_cast<std::ptrdiff_t>(target_elem_alloc) -
-            static_cast<std::ptrdiff_t>(cur_elem_alloc);
+        const std::ptrdiff_t elem_delta = static_cast<std::ptrdiff_t>(target_elem_alloc) -
+                                          static_cast<std::ptrdiff_t>(cur_elem_alloc);
         for (std::size_t r = row + 1; r <= L.rows; ++r)
-            L.elem_start[r] = static_cast<std::size_t>(
-                static_cast<std::ptrdiff_t>(L.elem_start[r]) + elem_delta);
+            L.elem_start[r] =
+                static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.elem_start[r]) + elem_delta);
         for (std::size_t r = row + 1; r < L.rows; ++r)
-            L.elem_end[r] = static_cast<std::size_t>(
-                static_cast<std::ptrdiff_t>(L.elem_end[r]) + elem_delta);
+            L.elem_end[r] =
+                static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.elem_end[r]) + elem_delta);
     }
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-void delta_csr_equalize_step(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
-    std::size_t& current_row)
-{
-    if (dc.layout.rows == 0) return;
-    const std::size_t row        = current_row % dc.layout.rows;
-    const std::size_t target_b   = delta_csr_target_alloc_bytes(dc.layout);
-    const std::size_t target_e   = delta_csr_target_alloc_elems(dc.layout);
+void delta_csr_equalize_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+                             std::size_t& current_row) {
+    if (dc.layout.rows == 0)
+        return;
+    const std::size_t row = current_row % dc.layout.rows;
+    const std::size_t target_b = delta_csr_target_alloc_bytes(dc.layout);
+    const std::size_t target_e = delta_csr_target_alloc_elems(dc.layout);
     delta_csr_shift_row(dc, row, target_b, target_e);
     current_row = (current_row + 1) % dc.layout.rows;
 }
@@ -308,13 +309,14 @@ void delta_csr_equalize_step(
 // Row-level insert / remove (for incremental synaptogenesis)
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-COL_TYPE delta_csr_row_last_col(
-    const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row)
-{
-    if (dc.layout.row_nnz(row) == 0) return 0;
+COL_TYPE delta_csr_row_last_col(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+                                std::size_t row) {
+    if (dc.layout.row_nnz(row) == 0)
+        return 0;
     auto cursor = dc.row_cursor(row);
     const std::size_t n = dc.layout.row_nnz(row);
-    for (std::size_t k = 0; k < n; ++k) cursor.advance();
+    for (std::size_t k = 0; k < n; ++k)
+        cursor.advance();
     return cursor.col();
 }
 
@@ -323,8 +325,7 @@ bool delta_csr_row_rebuild(
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
     const std::vector<COL_TYPE>& cols,
     const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& weights,
-    const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& importance)
-{
+    const std::vector<typename ValueAccessor<VALUES_TYPE>::value_type>& importance) {
     auto& L = dc.layout;
     const std::size_t n = cols.size();
 
@@ -337,8 +338,10 @@ bool delta_csr_row_rebuild(
         needed_bytes += uleb128_encode<COL_TYPE>(cols[k] - prev, tmp);
         prev = cols[k];
     }
-    if (needed_bytes > L.row_alloc_bytes(row)) return false;
-    if (n > L.row_alloc_elems(row))            return false;
+    if (needed_bytes > L.row_alloc_bytes(row))
+        return false;
+    if (n > L.row_alloc_elems(row))
+        return false;
 
     std::size_t bpos = L.byte_start[row];
     prev = 0;
@@ -355,21 +358,16 @@ bool delta_csr_row_rebuild(
     L.elem_end[row] = L.elem_start[row] + n;
 
     const std::ptrdiff_t nnz_delta =
-        static_cast<std::ptrdiff_t>(n) -
-        static_cast<std::ptrdiff_t>(old_row_nnz);
-    L.total_nnz = static_cast<std::size_t>(
-        static_cast<std::ptrdiff_t>(L.total_nnz) + nnz_delta);
+        static_cast<std::ptrdiff_t>(n) - static_cast<std::ptrdiff_t>(old_row_nnz);
+    L.total_nnz = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.total_nnz) + nnz_delta);
 
     return true;
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-bool delta_csr_row_append(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
-    COL_TYPE col, 
-    typename ValueAccessor<VALUES_TYPE>::value_type weight, 
-    typename ValueAccessor<VALUES_TYPE>::value_type imp)
-{
+bool delta_csr_row_append(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
+                          COL_TYPE col, typename ValueAccessor<VALUES_TYPE>::value_type weight,
+                          typename ValueAccessor<VALUES_TYPE>::value_type imp) {
     auto& L = dc.layout;
     const COL_TYPE prev_col = delta_csr_row_last_col(dc, row);
     assert(col >= prev_col && "delta_csr_row_append: column not in sorted order");
@@ -377,8 +375,10 @@ bool delta_csr_row_append(
     uint8_t tmp[uleb128_max_bytes<COL_TYPE>()];
     const std::size_t nbytes = uleb128_encode<COL_TYPE>(col - prev_col, tmp);
 
-    if (nbytes > L.row_blank_bytes(row)) return false;
-    if (L.row_blank_elems(row) == 0)    return false;
+    if (nbytes > L.row_blank_bytes(row))
+        return false;
+    if (L.row_blank_elems(row) == 0)
+        return false;
 
     std::memcpy(dc.indices_buf.data() + L.byte_end[row], tmp, nbytes);
     L.byte_end[row] += nbytes;
@@ -392,31 +392,28 @@ bool delta_csr_row_append(
 }
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
-void delta_csr_row_remove(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
-    std::size_t elem_within_row)
-{
+void delta_csr_row_remove(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc, std::size_t row,
+                          std::size_t elem_within_row) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& L = dc.layout;
     const std::size_t n = L.row_nnz(row);
     assert(elem_within_row < n);
 
-    std::vector<COL_TYPE>   cols(n);
+    std::vector<COL_TYPE> cols(n);
     std::vector<value_type> weights(n), importance(n);
     auto cursor = dc.row_cursor(row);
     for (std::size_t k = 0; k < n; ++k) {
-        cols[k]       = cursor.advance();
-        weights[k]    = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
+        cols[k] = cursor.advance();
+        weights[k] = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
         importance[k] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[row] + k);
     }
 
-    cols      .erase(cols      .begin() + static_cast<std::ptrdiff_t>(elem_within_row));
-    weights   .erase(weights   .begin() + static_cast<std::ptrdiff_t>(elem_within_row));
+    cols.erase(cols.begin() + static_cast<std::ptrdiff_t>(elem_within_row));
+    weights.erase(weights.begin() + static_cast<std::ptrdiff_t>(elem_within_row));
     importance.erase(importance.begin() + static_cast<std::ptrdiff_t>(elem_within_row));
 
     delta_csr_row_rebuild(dc, row, cols, weights, importance);
 }
-
 
 // In-place insert/remove for delta-encoded rows
 //
@@ -424,26 +421,23 @@ void delta_csr_row_remove(
 // Returns false if target_col is not found (no-op).
 //
 // Calling this before adding requires less headroom.
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-bool delta_csr_row_remove_col(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
-    std::size_t row,
-    COL_TYPE target_col)
-{
-    auto& L   = dc.layout;
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+bool delta_csr_row_remove_col(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+                              std::size_t row, COL_TYPE target_col) {
+    auto& L = dc.layout;
     auto& buf = dc.indices_buf;
     const std::size_t n = L.row_nnz(row);
-    if (n == 0) return false;
+    if (n == 0)
+        return false;
 
-    std::size_t byte_pos  = L.byte_start[row];
-    std::size_t elem_pos  = L.elem_start[row];
-    COL_TYPE    prev_col  = 0;
+    std::size_t byte_pos = L.byte_start[row];
+    std::size_t elem_pos = L.elem_start[row];
+    COL_TYPE prev_col = 0;
 
     for (std::size_t e = 0; e < n; ++e) {
         std::size_t delta_len = 0;
-        const COL_TYPE delta  = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, delta_len);
-        const COL_TYPE col    = prev_col + delta;
+        const COL_TYPE delta = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, delta_len);
+        const COL_TYPE col = prev_col + delta;
 
         if (col == target_col) {
             const std::size_t next_byte_pos = byte_pos + delta_len;
@@ -451,7 +445,7 @@ bool delta_csr_row_remove_col(
             if (e + 1 < n) {
                 // Merge this delta with the next one: next_col - prev_col
                 std::size_t next_delta_len = 0;
-                const COL_TYPE next_delta  =
+                const COL_TYPE next_delta =
                     uleb128_decode<COL_TYPE>(buf.data() + next_byte_pos, next_delta_len);
                 const COL_TYPE merged_delta = delta + next_delta;
 
@@ -463,11 +457,11 @@ bool delta_csr_row_remove_col(
 
                 // Shift the remainder of the row left to fill the freed gap
                 const std::size_t shift_from = next_byte_pos + next_delta_len;
-                const std::size_t shift_len  = L.byte_end[row] - shift_from;
-                const std::size_t freed      = delta_len + next_delta_len - merged_len;
+                const std::size_t shift_len = L.byte_end[row] - shift_from;
+                const std::size_t freed = delta_len + next_delta_len - merged_len;
                 if (shift_len > 0)
-                    std::memmove(buf.data() + byte_pos + merged_len,
-                                 buf.data() + shift_from, shift_len);
+                    std::memmove(buf.data() + byte_pos + merged_len, buf.data() + shift_from,
+                                 shift_len);
                 L.byte_end[row] -= freed;
             } else {
                 // Last connection: just remove its delta bytes
@@ -477,14 +471,14 @@ bool delta_csr_row_remove_col(
             // Shift value elements left to fill the removed slot
             const std::size_t row_end = L.elem_end[row];
             if (elem_pos + 1 < row_end)
-                ValueAccessor<VALUES_TYPE>::move(dc.values,
-                    elem_pos, elem_pos + 1, row_end - elem_pos - 1);
+                ValueAccessor<VALUES_TYPE>::move(dc.values, elem_pos, elem_pos + 1,
+                                                 row_end - elem_pos - 1);
             L.elem_end[row]--;
             L.total_nnz--;
             return true;
         }
 
-        prev_col  = col;
+        prev_col = col;
         byte_pos += delta_len;
         elem_pos++;
     }
@@ -495,43 +489,40 @@ bool delta_csr_row_remove_col(
 // Returns true on success, false if the row has insufficient blank space.
 // On false: the row's blank space is exhausted. Call equalizer_step() to
 // redistribute space from adjacent rows, then retry.
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-bool delta_csr_row_insert_col(
-    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
-    std::size_t row,
-    COL_TYPE    new_col,
-    typename ValueAccessor<VALUES_TYPE>::value_type weight,
-    typename ValueAccessor<VALUES_TYPE>::value_type importance)
-{
-    auto& L   = dc.layout;
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+bool delta_csr_row_insert_col(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
+                              std::size_t row, COL_TYPE new_col,
+                              typename ValueAccessor<VALUES_TYPE>::value_type weight,
+                              typename ValueAccessor<VALUES_TYPE>::value_type importance) {
+    auto& L = dc.layout;
     auto& buf = dc.indices_buf;
     const std::size_t n = L.row_nnz(row);
 
     // Walk to find insertion point (first existing column > new_col)
-    std::size_t byte_pos      = L.byte_start[row];
-    std::size_t elem_pos      = L.elem_start[row];
-    COL_TYPE    prev_col      = 0;
-    std::size_t ins_byte_pos  = L.byte_end[row]; // default: append after last
-    std::size_t ins_elem_pos  = L.elem_end[row];
-    bool        has_next      = false;
-    COL_TYPE    next_col      = 0;
-    std::size_t next_dlen     = 0;
+    std::size_t byte_pos = L.byte_start[row];
+    std::size_t elem_pos = L.elem_start[row];
+    COL_TYPE prev_col = 0;
+    std::size_t ins_byte_pos = L.byte_end[row]; // default: append after last
+    std::size_t ins_elem_pos = L.elem_end[row];
+    bool has_next = false;
+    COL_TYPE next_col = 0;
+    std::size_t next_dlen = 0;
 
     for (std::size_t e = 0; e < n; ++e) {
         std::size_t dlen = 0;
         const COL_TYPE delta = uleb128_decode<COL_TYPE>(buf.data() + byte_pos, dlen);
-        const COL_TYPE col   = prev_col + delta;
-        if (col == new_col) return false; // duplicate, skip
+        const COL_TYPE col = prev_col + delta;
+        if (col == new_col)
+            return false; // duplicate, skip
         if (col > new_col) {
             ins_byte_pos = byte_pos;
             ins_elem_pos = elem_pos;
-            has_next     = true;
-            next_col     = col;
-            next_dlen    = dlen;
+            has_next = true;
+            next_col = col;
+            next_dlen = dlen;
             break;
         }
-        prev_col  = col;
+        prev_col = col;
         byte_pos += dlen;
         elem_pos++;
     }
@@ -547,13 +538,11 @@ bool delta_csr_row_insert_col(
         upd_d_len = uleb128_encode<COL_TYPE>(next_col - new_col, upd_d_buf);
 
     const std::ptrdiff_t idx_delta =
-        static_cast<std::ptrdiff_t>(new_d_len + upd_d_len) -
-        static_cast<std::ptrdiff_t>(next_dlen);
+        static_cast<std::ptrdiff_t>(new_d_len + upd_d_len) - static_cast<std::ptrdiff_t>(next_dlen);
 
     // Check headroom (byte and element)
     const std::size_t used_bytes = L.byte_end[row] - L.byte_start[row];
-    if (idx_delta > 0 &&
-        static_cast<std::size_t>(idx_delta) > L.row_alloc_bytes(row) - used_bytes)
+    if (idx_delta > 0 && static_cast<std::size_t>(idx_delta) > L.row_alloc_bytes(row) - used_bytes)
         return false; // not enough index byte headroom
     if (L.row_nnz(row) >= L.row_alloc_elems(row))
         return false; // not enough element headroom
@@ -561,12 +550,11 @@ bool delta_csr_row_insert_col(
     // Shift index bytes to make room (or shrink if idx_delta < 0)
     if (idx_delta != 0) {
         const std::size_t shift_from = ins_byte_pos;
-        const std::size_t shift_len  = L.byte_end[row] - shift_from;
+        const std::size_t shift_len = L.byte_end[row] - shift_from;
         if (shift_len > 0)
-            std::memmove(buf.data() + shift_from + idx_delta,
-                         buf.data() + shift_from, shift_len);
-        L.byte_end[row] = static_cast<std::size_t>(
-            static_cast<std::ptrdiff_t>(L.byte_end[row]) + idx_delta);
+            std::memmove(buf.data() + shift_from + idx_delta, buf.data() + shift_from, shift_len);
+        L.byte_end[row] =
+            static_cast<std::size_t>(static_cast<std::ptrdiff_t>(L.byte_end[row]) + idx_delta);
     }
 
     // Write new delta and (if applicable) the updated next delta
@@ -576,8 +564,8 @@ bool delta_csr_row_insert_col(
 
     // Shift value elements right and write the new one
     if (ins_elem_pos < L.elem_end[row])
-        ValueAccessor<VALUES_TYPE>::move(dc.values,
-            ins_elem_pos + 1, ins_elem_pos, L.elem_end[row] - ins_elem_pos);
+        ValueAccessor<VALUES_TYPE>::move(dc.values, ins_elem_pos + 1, ins_elem_pos,
+                                         L.elem_end[row] - ins_elem_pos);
     ValueAccessor<VALUES_TYPE>::set(dc.values, ins_elem_pos, weight, importance);
     L.elem_end[row]++;
     L.total_nnz++;
@@ -588,26 +576,25 @@ bool delta_csr_row_insert_col(
 //
 // growth (synaptogenesis) can only promote scattered -> block4; pruning can
 // only DEMOTE block4 -> scattered.
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-void block4_maybe_promote(
-    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    std::size_t row, COL_TYPE col)
-{
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+                          std::size_t row, COL_TYPE col) {
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     if constexpr (!is_fp4 && !is_fp8) {
-        (void)weights; (void)row; (void)col; // block4 is FP4/FP8-specific.
+        (void)weights;
+        (void)row;
+        (void)col; // block4 is FP4/FP8-specific.
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
-        auto& L  = dc.layout;
+        auto& L = dc.layout;
         // Lazy self-init. Tile-count budget identical for both formats
         // (max_values_bytes synapses at max fill of BLOCK4_TILE_SLOTS=16/
         // tile); byte budget differs (BLOCK4_TILE_SLOTS8_BYTES=32/tile for
         // FP8 vs BLOCK4_TILE_SLOTS=16 for FP4, matching
         // SparseLinearLayer8's own identical constructor-time sizing).
-	if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
+        if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
             // If the caller never set a real CSR-side budget either
             // (dc.max_values_bytes still at its own SIZE_MAX-ish
@@ -619,15 +606,17 @@ void block4_maybe_promote(
             // std::vector<uint8_t>::max_size()), previously masked by
             // a try/catch that's since been removed (see set_limits'
             // own docstring for why silently swallowing that isn't
-          // safe to do anymore). Pass the block4 sentinel through
+            // safe to do anymore). Pass the block4 sentinel through
             // unchanged instead of computing a derived-but-nonsensical
             // near-max value -- "no CSR budget set" should mean "no
             // block4 budget set" too, not "compute something that
             // happens to overflow vector::reserve()."
             constexpr std::size_t kNoLimit = std::numeric_limits<std::size_t>::max();
-            const std::size_t tile_budget = (dc.max_values_bytes == kNoLimit) ? kNoLimit :
-                (std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) *
-                 (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS));
+            const std::size_t tile_budget =
+                (dc.max_values_bytes == kNoLimit)
+                    ? kNoLimit
+                    : (std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) *
+                       (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS));
             weights.block4.set_limits(dc.max_indices_bytes, tile_budget);
         }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
@@ -642,7 +631,7 @@ void block4_maybe_promote(
                 const COL_TYPE c = cursor.advance();
                 if (c == col) {
                     const std::size_t vb = L.elem_start[row] + k;
-                    const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                    const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                     const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     {
                         auto tile = weights.block4.find(br, bc);
@@ -659,13 +648,13 @@ void block4_maybe_promote(
                         // promotion training sites (disldo_backward's block4
                         // branches, magnitude_rescale_output), not here.
                         if constexpr (is_fp8) {
-                            tile.at_weight(li, lj)     = fp8_quantize(w);
+                            tile.at_weight(li, lj) = fp8_quantize(w);
                             tile.at_importance(li, lj) = fp8_quantize(imp);
                         } else {
                             tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                         }
                     }
-		    weights.block4.maybe_compress(br, bc);
+                    weights.block4.maybe_compress(br, bc);
                     delta_csr_row_remove_col(dc, row, col);
                     return;
                 }
@@ -678,11 +667,16 @@ void block4_maybe_promote(
         const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
         const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, L.cols);
 
-        struct Found { std::size_t row; COL_TYPE col; std::size_t elem_idx; };
+        struct Found {
+            std::size_t row;
+            COL_TYPE col;
+            std::size_t elem_idx;
+        };
         std::vector<Found> found;
         for (std::size_t r = row_lo; r < row_hi; ++r) {
             const std::size_t n = L.row_nnz(r);
-            if (n == 0) continue;
+            if (n == 0)
+                continue;
             auto cursor = dc.row_cursor(r);
             for (std::size_t k = 0; k < n; ++k) {
                 const COL_TYPE c = cursor.advance();
@@ -690,26 +684,27 @@ void block4_maybe_promote(
                     found.push_back({r, c, L.elem_start[r] + k});
             }
         }
-        if (found.size() < BLOCK4_PROMOTE_MIN_LIVE) return;
+        if (found.size() < BLOCK4_PROMOTE_MIN_LIVE)
+            return;
 
         {
             auto tile = weights.block4.get_or_create(br, bc);
             for (const auto& f : found) {
-                const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, f.elem_idx);
+                const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, f.elem_idx);
                 const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, f.elem_idx);
                 const uint32_t fli = uint32_t(f.row - row_lo);
                 const uint32_t flj = uint32_t(std::size_t(f.col) - col_lo);
                 // Not the live variant -- see the single-synapse promote
                 // branch's identical comment above.
                 if constexpr (is_fp8) {
-                    tile.at_weight(fli, flj)     = fp8_quantize(w);
+                    tile.at_weight(fli, flj) = fp8_quantize(w);
                     tile.at_importance(fli, flj) = fp8_quantize(imp);
                 } else {
                     tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                 }
             }
         }
-	weights.block4.maybe_compress(br, bc);
+        weights.block4.maybe_compress(br, bc);
         for (const auto& f : found)
             delta_csr_row_remove_col(dc, f.row, f.col);
     }
@@ -778,61 +773,62 @@ void block4_maybe_promote(
 // block4_compact below, the opposite operation of this function, mirroring
 // compact()/expand_headroom()'s existing pairing on the scattered-CSR
 // side.
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-void block4_expand_headroom(
-    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    float blank_fraction = 0.2f,
-    std::size_t min_slack_bytes = BLOCK4_TILE_SLOTS)
-{
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void block4_expand_headroom(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+                            float blank_fraction = 0.2f,
+                            std::size_t min_slack_bytes = BLOCK4_TILE_SLOTS) {
     if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-        (void)weights; (void)blank_fraction; (void)min_slack_bytes;
+        (void)weights;
+        (void)blank_fraction;
+        (void)min_slack_bytes;
     } else {
-    auto& store = weights.block4;
-    const std::size_t rows = store.block_layout.rows;
-    if (rows == 0) return;
+        auto& store = weights.block4;
+        const std::size_t rows = store.block_layout.rows;
+        if (rows == 0)
+            return;
 
-    // Each row's CURRENT content length -- same per-tile length accessor
-    // merge_row_workspace itself walks (block4_stored_tile_len), so this
-    // is exactly what's live today, no assumption about dense-vs-sparse.
-    std::vector<std::size_t> row_bytes(rows, 0);
-    for (std::size_t br = 0; br < rows; ++br) {
-        std::size_t pos = store.tile_byte_start[br];
-        const std::size_t n_bc = store.block_layout.row_nnz(br);
-        std::size_t elem_pos = store.block_layout.elem_start[br];
-        for (std::size_t k = 0; k < n_bc; ++k, ++elem_pos) {
-            pos += block4_stored_tile_len(store.tile_is_sparse[elem_pos], &store.tile_data[pos]);
+        // Each row's CURRENT content length -- same per-tile length accessor
+        // merge_row_workspace itself walks (block4_stored_tile_len), so this
+        // is exactly what's live today, no assumption about dense-vs-sparse.
+        std::vector<std::size_t> row_bytes(rows, 0);
+        for (std::size_t br = 0; br < rows; ++br) {
+            std::size_t pos = store.tile_byte_start[br];
+            const std::size_t n_bc = store.block_layout.row_nnz(br);
+            std::size_t elem_pos = store.block_layout.elem_start[br];
+            for (std::size_t k = 0; k < n_bc; ++k, ++elem_pos) {
+                pos +=
+                    block4_stored_tile_len(store.tile_is_sparse[elem_pos], &store.tile_data[pos]);
+            }
+            row_bytes[br] = pos - store.tile_byte_start[br];
         }
-        row_bytes[br] = pos - store.tile_byte_start[br];
-    }
 
-    // Lay out new tile_byte_start with blank_fraction slack -- same
-    // byte_blank formula as delta_csr_from_absolute, plus min_slack_bytes.
-    std::vector<std::size_t> new_start(rows + 1, 0);
-    for (std::size_t br = 0; br < rows; ++br) {
-        const std::size_t blank = static_cast<std::size_t>(row_bytes[br] * blank_fraction)
-                                   + min_slack_bytes;
-        new_start[br + 1] = new_start[br] + row_bytes[br] + blank;
-    }
+        // Lay out new tile_byte_start with blank_fraction slack -- same
+        // byte_blank formula as delta_csr_from_absolute, plus min_slack_bytes.
+        std::vector<std::size_t> new_start(rows + 1, 0);
+        for (std::size_t br = 0; br < rows; ++br) {
+            const std::size_t blank =
+                static_cast<std::size_t>(row_bytes[br] * blank_fraction) + min_slack_bytes;
+            new_start[br + 1] = new_start[br] + row_bytes[br] + blank;
+        }
 
-    if (new_start[rows] > store.max_tile_bytes) throw std::bad_alloc();
+        if (new_start[rows] > store.max_tile_bytes)
+            throw std::bad_alloc();
 
-    std::vector<uint8_t> new_data(new_start[rows], uint8_t(0));
-    for (std::size_t br = 0; br < rows; ++br) {
-        std::memcpy(new_data.data() + new_start[br],
-                    store.tile_data.data() + store.tile_byte_start[br],
-                    row_bytes[br]);
-    }
+        std::vector<uint8_t> new_data(new_start[rows], uint8_t(0));
+        for (std::size_t br = 0; br < rows; ++br) {
+            std::memcpy(new_data.data() + new_start[br],
+                        store.tile_data.data() + store.tile_byte_start[br], row_bytes[br]);
+        }
 
-    store.tile_data = std::move(new_data);
-    store.tile_byte_end.resize(rows);
-    for (std::size_t br = 0; br < rows; ++br) {
-        store.tile_byte_start[br] = new_start[br];
-        store.tile_byte_end[br]   = new_start[br] + row_bytes[br];
-    }
-    store.tile_byte_start[rows] = new_start[rows];
-    // tile_is_sparse/block_layout untouched -- per-tile content, sparsity
-    // choice, and which (br,bc) tiles exist are all unchanged.
+        store.tile_data = std::move(new_data);
+        store.tile_byte_end.resize(rows);
+        for (std::size_t br = 0; br < rows; ++br) {
+            store.tile_byte_start[br] = new_start[br];
+            store.tile_byte_end[br] = new_start[br] + row_bytes[br];
+        }
+        store.tile_byte_start[rows] = new_start[rows];
+        // tile_is_sparse/block_layout untouched -- per-tile content, sparsity
+        // choice, and which (br,bc) tiles exist are all unchanged.
     }
 }
 
@@ -846,26 +842,26 @@ void block4_expand_headroom(
 // block4_expand_headroom reserved. A subsequent call needing to grow
 // again should call block4_expand_headroom() again afterward, same as
 // the scattered-CSR compact()->expand_headroom() cycle.
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void block4_compact(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights) {
     block4_expand_headroom(weights, 0.0f, std::size_t(0));
 }
 
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-void block4_load_dense(
-    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    const uint8_t* weight_codes, const uint8_t* importance_codes,
-    std::size_t n_in, std::size_t n_out,
-    float blank_fraction = 0.2f)
-{
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void block4_load_dense(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+                       const uint8_t* weight_codes, const uint8_t* importance_codes,
+                       std::size_t n_in, std::size_t n_out, float blank_fraction = 0.2f) {
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     if constexpr (!is_fp4 && !is_fp8) {
-        (void)weights; (void)weight_codes; (void)importance_codes; (void)n_in; (void)n_out; (void)blank_fraction;
+        (void)weights;
+        (void)weight_codes;
+        (void)importance_codes;
+        (void)n_in;
+        (void)n_out;
+        (void)blank_fraction;
     } else {
-        const uint32_t block_rows = uint32_t((n_in  + BLOCK4_TILE - 1) / BLOCK4_TILE);
+        const uint32_t block_rows = uint32_t((n_in + BLOCK4_TILE - 1) / BLOCK4_TILE);
         const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
 
         weights.block4.init(n_in, n_out);
@@ -898,8 +894,9 @@ void block4_load_dense(
         // block4_expand_headroom() (below, called automatically at the
         // end of this function) is the real block4-side equivalent.
         const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
-        const std::size_t dense_tile_bytes = std::size_t(block_rows) * block_cols
-            * (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS);
+        const std::size_t dense_tile_bytes =
+            std::size_t(block_rows) * block_cols *
+            (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS);
         // + block_rows*BLOCK4_TILE_SLOTS, not a single flat margin --
         // block4_expand_headroom adds its minimum-slack term
         // (BLOCK4_TILE_SLOTS) PER ROW, so the cap needs that same
@@ -908,8 +905,8 @@ void block4_load_dense(
         // (confirmed directly: real regression at frac_live=1.0 in
         // testing, only a single BLOCK4_TILE_SLOTS margin here).
         const std::size_t tile_budget =
-            static_cast<std::size_t>(dense_tile_bytes * (1.0 + blank_fraction))
-            + std::size_t(block_rows) * BLOCK4_TILE_SLOTS;
+            static_cast<std::size_t>(dense_tile_bytes * (1.0 + blank_fraction)) +
+            std::size_t(block_rows) * BLOCK4_TILE_SLOTS;
         weights.block4.set_limits(idx_budget, tile_budget);
 
         for (uint32_t br = 0; br < block_rows; ++br) {
@@ -925,10 +922,11 @@ void block4_load_dense(
                         const uint32_t lj = uint32_t(col - col_lo);
                         const std::size_t idx = row * n_out + col;
                         if constexpr (is_fp8) {
-                            tile.at_weight(li, lj)     = weight_codes[idx];
+                            tile.at_weight(li, lj) = weight_codes[idx];
                             tile.at_importance(li, lj) = importance_codes[idx];
                         } else {
-                            tile.at(li, lj) = uint8_t(weight_codes[idx] | (importance_codes[idx] << 4));
+                            tile.at(li, lj) =
+                                uint8_t(weight_codes[idx] | (importance_codes[idx] << 4));
                         }
                     }
                 }
@@ -954,67 +952,72 @@ void block4_load_dense(
         // empty-sparse tile with otherwise zero headroom to grow back out
         // of once training escapes it from 0). FP4-only for now, matching
         // block4_expand_headroom's own scope.
-        if constexpr (is_fp4) block4_expand_headroom(weights, blank_fraction);
+        if constexpr (is_fp4)
+            block4_expand_headroom(weights, blank_fraction);
     }
 }
 
 // Pruning-only hook.
-// Throws if a target row has run out of blank space 
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-void block4_demote_tile(
-    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    uint32_t br, uint32_t bc)
-{
+// Throws if a target row has run out of blank space
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+void block4_demote_tile(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+                        uint32_t br, uint32_t bc) {
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !is_fp8) {
-        (void)weights; (void)br; (void)bc;
+        (void)weights;
+        (void)br;
+        (void)bc;
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
-        auto& L  = dc.layout;
+        auto& L = dc.layout;
         const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
         const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
         {
             auto tile = weights.block4.find(br, bc);
-            if (!tile) return;
+            if (!tile)
+                return;
             for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                 const std::size_t row = row_lo + li;
-                if (row >= L.rows) continue;
+                if (row >= L.rows)
+                    continue;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     value_type w, imp;
                     if constexpr (is_fp8) {
-                        const uint8_t w_byte   = tile.at_weight(li, lj);
+                        const uint8_t w_byte = tile.at_weight(li, lj);
                         const uint8_t imp_byte = tile.at_importance(li, lj);
-                        if (w_byte == 0 && imp_byte == 0) continue;
-                        w   = fp8_decode_bits(w_byte);
+                        if (w_byte == 0 && imp_byte == 0)
+                            continue;
+                        w = fp8_decode_bits(w_byte);
                         imp = fp8_decode_bits(imp_byte);
                     } else {
                         const uint8_t byte = tile.at(li, lj);
-                        if (byte == 0) continue;
-                        w   = FP4_TABLE[byte & 0xFu];
+                        if (byte == 0)
+                            continue;
+                        w = FP4_TABLE[byte & 0xFu];
                         imp = FP4_TABLE[(byte >> 4) & 0xFu];
                     }
                     const std::size_t col = col_lo + lj;
-                    if (col >= L.cols) continue;
+                    if (col >= L.cols)
+                        continue;
                     if (!delta_csr_row_insert_col(dc, row, COL_TYPE(col), w, imp)) {
-                        throw std::runtime_error(
-                            "block4_demote_tile: row " + std::to_string(row) +
-                            " ran out of blank space while demoting tile (" +
-                            std::to_string(br) + "," + std::to_string(bc) + ")."
-                            " Call equalizer_step() to redistribute space from"
-                            " adjacent rows before retrying.");
+                        throw std::runtime_error("block4_demote_tile: row " + std::to_string(row) +
+                                                 " ran out of blank space while demoting tile (" +
+                                                 std::to_string(br) + "," + std::to_string(bc) +
+                                                 ")."
+                                                 " Call equalizer_step() to redistribute space from"
+                                                 " adjacent rows before retrying.");
                     }
                 }
             }
         }
-	weights.block4.erase(br, bc);
+        weights.block4.erase(br, bc);
     }
 }
 
 // Incremental synaptogenesis step
 //
-// in-place per-connection insert and remove. 
+// in-place per-connection insert and remove.
 //
 // Algorithm per row:
 //   1. Walk row once: collect (col, weight, importance) for all connections.
@@ -1030,56 +1033,54 @@ void block4_demote_tile(
 //      the error by calling equalizer_step() to redistribute blank space from
 //      adjacent rows, then retry. If the total pool is exhausted, the error
 //      message explains what to do (prune more / lower max_row_weights).
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked,
-          typename COL_TYPE = uint32_t>
-bool delta_csr_synap_row_step(
-    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
-    std::size_t& current_row,
-    typename ValueAccessor<VALUES_TYPE>::value_type importance_cutoff,
-    SIZE_TYPE max_row_weights,
-    // Caps how many connections this ONE row-step call may remove --
-    // per direct request: without a cap, a single call can prune an
-    // entire row at once (e.g. importance_cutoff raised mid-training,
-    // or many probes tying at the eps floor above), which is exactly
-    // the kind of large abrupt connectivity loss synaptogenesis is
-    // meant to avoid (it's throttled to O(1)-ish per call by design --
-    // see synap_step's own docstring). Default is generous (rarely
-    // binds in normal operation) rather than tiny, since it's a safety
-    // ceiling, not a throttle on ordinary capacity-driven trimming.
-    SIZE_TYPE max_prune_per_step = SIZE_TYPE(8),
-    // A "ghost" floor: used ONLY for the importance_cutoff comparison
-    // below, NEVER written to storage anywhere. A synapse whose real,
-    // stored importance has decayed to exactly the FP4 zero code (a
-    // real, discrete quantization bucket many independently-decaying
-    // synapses can land on simultaneously -- FP4's smallest nonzero
-    // magnitude is 0.5, so 0 is a wide, common landing bucket) isn't
-    // automatically "below cutoff" the instant it gets there, without
-    // ever inflating what's actually persisted. Does NOT affect
-    // by_imp's sort order (lowest-real-importance-first removal
-    // priority is unchanged -- a floored synapse can still be removed
-    // via the keep>max_rw capacity criterion, just not solely because
-    // its stored value happens to be exactly 0). This also naturally
-    // protects a freshly-grown synapse (which starts with whatever its
-    // REAL probe score is, per delta_csr_build_probes -- often exactly
-    // 0 for a row with no activity yet, and stored as such): on its
-    // first subsequent synap_row_step visit it won't be evicted purely
-    // for reading as 0, giving real backprop time to move it for real.
-    typename ValueAccessor<VALUES_TYPE>::value_type importance_eps = typename ValueAccessor<VALUES_TYPE>::value_type(1e-3))
-{
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
+                              std::size_t& current_row,
+                              typename ValueAccessor<VALUES_TYPE>::value_type importance_cutoff,
+                              SIZE_TYPE max_row_weights,
+                              // Caps how many connections this ONE row-step call may remove --
+                              // per direct request: without a cap, a single call can prune an
+                              // entire row at once (e.g. importance_cutoff raised mid-training,
+                              // or many probes tying at the eps floor above), which is exactly
+                              // the kind of large abrupt connectivity loss synaptogenesis is
+                              // meant to avoid (it's throttled to O(1)-ish per call by design --
+                              // see synap_step's own docstring). Default is generous (rarely
+                              // binds in normal operation) rather than tiny, since it's a safety
+                              // ceiling, not a throttle on ordinary capacity-driven trimming.
+                              SIZE_TYPE max_prune_per_step = SIZE_TYPE(8),
+                              // A "ghost" floor: used ONLY for the importance_cutoff comparison
+                              // below, NEVER written to storage anywhere. A synapse whose real,
+                              // stored importance has decayed to exactly the FP4 zero code (a
+                              // real, discrete quantization bucket many independently-decaying
+                              // synapses can land on simultaneously -- FP4's smallest nonzero
+                              // magnitude is 0.5, so 0 is a wide, common landing bucket) isn't
+                              // automatically "below cutoff" the instant it gets there, without
+                              // ever inflating what's actually persisted. Does NOT affect
+                              // by_imp's sort order (lowest-real-importance-first removal
+                              // priority is unchanged -- a floored synapse can still be removed
+                              // via the keep>max_rw capacity criterion, just not solely because
+                              // its stored value happens to be exactly 0). This also naturally
+                              // protects a freshly-grown synapse (which starts with whatever its
+                              // REAL probe score is, per delta_csr_build_probes -- often exactly
+                              // 0 for a row with no activity yet, and stored as such): on its
+                              // first subsequent synap_row_step visit it won't be evicted purely
+                              // for reading as 0, giving real backprop time to move it for real.
+                              typename ValueAccessor<VALUES_TYPE>::value_type importance_eps =
+                                  typename ValueAccessor<VALUES_TYPE>::value_type(1e-3)) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     constexpr bool has_block4 = is_fp4 || is_fp8;
     auto& dc = weights.connections;
-    auto& L  = dc.layout;
-    if (L.rows == 0) return false;
+    auto& L = dc.layout;
+    if (L.rows == 0)
+        return false;
 
     const std::size_t row = current_row % L.rows;
     current_row = (current_row + 1) % L.rows;
 
     const std::size_t n_scattered = L.row_nnz(row);
-    const bool has_probes = weights.probes.indices[0] &&
-                            !weights.probes.indices[0]->empty();
+    const bool has_probes = weights.probes.indices[0] && !weights.probes.indices[0]->empty();
     const uint32_t br = uint32_t(row / BLOCK4_TILE);
     const uint32_t li = uint32_t(row % BLOCK4_TILE);
     std::vector<uint32_t> b4_bc, b4_lj;
@@ -1091,15 +1092,18 @@ bool delta_csr_synap_row_step(
             for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 const uint32_t bc = bc_cursor.advance();
                 // const: read-only discovery scan
-		const auto tile = weights.block4.find(br, bc);
+                const auto tile = weights.block4.find(br, bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     if constexpr (is_fp8) {
-                        if (tile.at_weight(li, lj) == 0 && tile.at_importance(li, lj) == 0) continue;
+                        if (tile.at_weight(li, lj) == 0 && tile.at_importance(li, lj) == 0)
+                            continue;
                     } else {
-                        if (tile.at(li, lj) == 0) continue;
+                        if (tile.at(li, lj) == 0)
+                            continue;
                     }
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                    if (col >= L.cols) continue;
+                    if (col >= L.cols)
+                        continue;
                     b4_bc.push_back(bc);
                     b4_lj.push_back(lj);
                 }
@@ -1107,20 +1111,19 @@ bool delta_csr_synap_row_step(
         }
     }
     const std::size_t n_exist = n_scattered + b4_bc.size();
-    if (n_exist == 0 && !has_probes) return false;
+    if (n_exist == 0 && !has_probes)
+        return false;
 
     // Step 1: Read existing connections (scattered, then block4)
-    std::vector<COL_TYPE>   exist_cols(n_exist);
+    std::vector<COL_TYPE> exist_cols(n_exist);
     std::vector<value_type> exist_w(n_exist), exist_imp(n_exist);
-    std::vector<bool>       exist_is_b4(n_exist, false);
+    std::vector<bool> exist_is_b4(n_exist, false);
     {
         auto cursor = dc.row_cursor(row);
         for (std::size_t k = 0; k < n_scattered; ++k) {
             exist_cols[k] = cursor.advance();
-            exist_w[k]    = ValueAccessor<VALUES_TYPE>::get_w(
-                dc.values, L.elem_start[row] + k);
-            exist_imp[k]  = ValueAccessor<VALUES_TYPE>::get_imp(
-                dc.values, L.elem_start[row] + k);
+            exist_w[k] = ValueAccessor<VALUES_TYPE>::get_w(dc.values, L.elem_start[row] + k);
+            exist_imp[k] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, L.elem_start[row] + k);
         }
     }
     if constexpr (has_block4) {
@@ -1128,13 +1131,13 @@ bool delta_csr_synap_row_step(
             const std::size_t k = n_scattered + j;
             const uint32_t bc = b4_bc[j], lj = b4_lj[j];
             auto tile = weights.block4.find(br, bc);
-            exist_cols[k]  = COL_TYPE(std::size_t(bc) * BLOCK4_TILE + lj);
+            exist_cols[k] = COL_TYPE(std::size_t(bc) * BLOCK4_TILE + lj);
             if constexpr (is_fp8) {
-                exist_w[k]   = fp8_decode_bits(tile.at_weight(li, lj));
+                exist_w[k] = fp8_decode_bits(tile.at_weight(li, lj));
                 exist_imp[k] = fp8_decode_bits(tile.at_importance(li, lj));
             } else {
                 const uint8_t byte = tile.at(li, lj);
-                exist_w[k]   = FP4_TABLE[byte & 0xFu];
+                exist_w[k] = FP4_TABLE[byte & 0xFu];
                 exist_imp[k] = FP4_TABLE[(byte >> 4) & 0xFu];
             }
             exist_is_b4[k] = true;
@@ -1142,7 +1145,7 @@ bool delta_csr_synap_row_step(
     }
 
     // Step 2: Collect probes for this row
-    std::vector<COL_TYPE>   probe_cols;
+    std::vector<COL_TYPE> probe_cols;
     std::vector<value_type> probe_scores;
     if (has_probes) {
         const auto& prow = *weights.probes.indices[0];
@@ -1161,16 +1164,17 @@ bool delta_csr_synap_row_step(
     std::vector<std::size_t> by_imp(n_exist);
     std::iota(by_imp.begin(), by_imp.end(), 0);
     std::sort(by_imp.begin(), by_imp.end(),
-              [&](std::size_t a, std::size_t b) {
-                  return exist_imp[a] < exist_imp[b];
-              });
+              [&](std::size_t a, std::size_t b) { return exist_imp[a] < exist_imp[b]; });
 
-    struct RemoveEntry { COL_TYPE col; bool is_b4; };
+    struct RemoveEntry {
+        COL_TYPE col;
+        bool is_b4;
+    };
     std::vector<RemoveEntry> to_remove;
     const std::size_t max_rw = static_cast<std::size_t>(max_row_weights);
     const std::size_t max_prune = static_cast<std::size_t>(max_prune_per_step);
     for (std::size_t rank = 0; rank < n_exist && to_remove.size() < max_prune; ++rank) {
-        const std::size_t k    = by_imp[rank];
+        const std::size_t k = by_imp[rank];
         const std::size_t keep = n_exist - to_remove.size();
         if (std::max(exist_imp[k], importance_eps) < importance_cutoff || keep > max_rw)
             to_remove.push_back({exist_cols[k], exist_is_b4[k]});
@@ -1188,21 +1192,21 @@ bool delta_csr_synap_row_step(
         // a just-removed connection. Not strictly necessary but clean.)
         std::unordered_set<COL_TYPE> remove_set;
         remove_set.reserve(to_remove.size());
-        for (const auto& re : to_remove) remove_set.insert(re.col);
+        for (const auto& re : to_remove)
+            remove_set.insert(re.col);
 
         std::vector<std::size_t> pidx(probe_cols.size());
         std::iota(pidx.begin(), pidx.end(), 0);
         // Sort probes by score descending (highest score = best candidate)
         std::sort(pidx.begin(), pidx.end(),
-                  [&](std::size_t a, std::size_t b) {
-                      return probe_scores[a] > probe_scores[b];
-                  });
+                  [&](std::size_t a, std::size_t b) { return probe_scores[a] > probe_scores[b]; });
 
-        std::vector<COL_TYPE>   add_cols;
+        std::vector<COL_TYPE> add_cols;
         std::vector<value_type> add_scores;
         const std::size_t slots = max_rw - (n_exist - to_remove.size());
         for (std::size_t p : pidx) {
-            if (add_cols.size() >= slots) break;
+            if (add_cols.size() >= slots)
+                break;
             const COL_TYPE c = probe_cols[p];
             if (!exist_set.count(c) || remove_set.count(c))
                 if (!exist_set.count(c)) { // truly not present
@@ -1210,7 +1214,7 @@ bool delta_csr_synap_row_step(
                     add_scores.push_back(probe_scores[p]);
                 }
         }
-        probe_cols   = std::move(add_cols);
+        probe_cols = std::move(add_cols);
         probe_scores = std::move(add_scores);
     }
 
@@ -1224,8 +1228,9 @@ bool delta_csr_synap_row_step(
                 {
                     auto tile = weights.block4.find(br, bc);
                     if constexpr (is_fp8) {
-                        if (tile && (tile.at_weight(li, lj) != 0 || tile.at_importance(li, lj) != 0)) {
-                            tile.at_weight(li, lj)     = 0;
+                        if (tile &&
+                            (tile.at_weight(li, lj) != 0 || tile.at_importance(li, lj) != 0)) {
+                            tile.at_weight(li, lj) = 0;
                             tile.at_importance(li, lj) = 0;
                             should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
                         }
@@ -1236,7 +1241,7 @@ bool delta_csr_synap_row_step(
                         }
                     }
                 }
-		if (should_demote)
+                if (should_demote)
                     block4_demote_tile(weights, br, bc);
             }
         } else {
@@ -1250,15 +1255,15 @@ bool delta_csr_synap_row_step(
     for (std::size_t i = 0; i < probe_cols.size(); ++i) {
         const COL_TYPE col = probe_cols[i];
         if (!delta_csr_row_insert_col(dc, row, col, value_type(0), probe_scores[i])) {
-            const std::size_t used  = dc.layout.byte_end[row] - dc.layout.byte_start[row];
+            const std::size_t used = dc.layout.byte_end[row] - dc.layout.byte_start[row];
             const std::size_t alloc = dc.layout.row_alloc_bytes(row);
             // Include the probe index so callers can infer the exact split
             throw std::runtime_error(
                 "delta_csr_synap_row_step: row " + std::to_string(row) +
                 " ran out of blank space at probe_index=" + std::to_string(i) +
-                " col=" + std::to_string(col) +
-                " (used " + std::to_string(used) + " / " + std::to_string(alloc) +
-                " bytes, " + std::to_string(probe_cols.size() - i) + " insertions skipped)."
+                " col=" + std::to_string(col) + " (used " + std::to_string(used) + " / " +
+                std::to_string(alloc) + " bytes, " + std::to_string(probe_cols.size() - i) +
+                " insertions skipped)."
                 " Call equalizer_step() to redistribute space from adjacent rows"
                 " before retrying, or reduce max_row_weights / raise importance_cutoff.");
         }
@@ -1323,10 +1328,8 @@ template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_T
 void delta_csr_build_probes(
     SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
     const typename ValueAccessor<VALUES_TYPE>::value_type* neuron_input_accum,
-    const typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum,
-    SIZE_TYPE k,
-    bool per_row = false)
-{
+    const typename ValueAccessor<VALUES_TYPE>::value_type* neuron_grad_accum, SIZE_TYPE k,
+    bool per_row = false) {
     // Probe scores are the REAL input_accum*grad_accum product, written
     // verbatim as a newly-inserted synapse's stored importance (Step 6
     // of delta_csr_synap_row_step) -- no eps floor here. A cold row/
@@ -1339,28 +1342,28 @@ void delta_csr_build_probes(
     // see that function's own importance_eps parameter.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
-    auto& L  = dc.layout;
-    const std::size_t n_in  = L.rows;
+    auto& L = dc.layout;
+    const std::size_t n_in = L.rows;
     const std::size_t n_out = L.cols;
     if (n_in == 0 || n_out == 0 || k <= 0) {
         weights.probes.ptrs = 0;
         return;
     }
 
-    const std::size_t kk_in  = std::min(static_cast<std::size_t>(k), n_in);
-    const std::size_t kk     = static_cast<std::size_t>(k);
+    const std::size_t kk_in = std::min(static_cast<std::size_t>(k), n_in);
+    const std::size_t kk = static_cast<std::size_t>(k);
 
     // Top-k inputs by accumulated activity (shared by both modes)
     std::vector<std::size_t> in_idx(n_in);
     std::iota(in_idx.begin(), in_idx.end(), 0);
     std::partial_sort(in_idx.begin(), in_idx.begin() + kk_in, in_idx.end(),
-        [&](std::size_t a, std::size_t b) {
-            return neuron_input_accum[a] > neuron_input_accum[b];
-        });
+                      [&](std::size_t a, std::size_t b) {
+                          return neuron_input_accum[a] > neuron_input_accum[b];
+                      });
     in_idx.resize(kk_in);
 
-    std::vector<SIZE_TYPE>   prow, pcol;
-    std::vector<value_type>  pval;
+    std::vector<SIZE_TYPE> prow, pcol;
+    std::vector<value_type> pval;
 
     if (!per_row) {
         // Global mode: one shared top-k output set, outer product, filter after
@@ -1368,9 +1371,9 @@ void delta_csr_build_probes(
         std::vector<std::size_t> out_idx(n_out);
         std::iota(out_idx.begin(), out_idx.end(), 0);
         std::partial_sort(out_idx.begin(), out_idx.begin() + kk_out, out_idx.end(),
-            [&](std::size_t a, std::size_t b) {
-                return neuron_grad_accum[a] > neuron_grad_accum[b];
-            });
+                          [&](std::size_t a, std::size_t b) {
+                              return neuron_grad_accum[a] > neuron_grad_accum[b];
+                          });
         out_idx.resize(kk_out);
 
         prow.reserve(kk_in * kk_out);
@@ -1382,11 +1385,13 @@ void delta_csr_build_probes(
             std::vector<COL_TYPE> exist_cols(n_exist);
             {
                 auto cur = dc.row_cursor(r);
-                for (std::size_t i = 0; i < n_exist; ++i) exist_cols[i] = cur.advance();
+                for (std::size_t i = 0; i < n_exist; ++i)
+                    exist_cols[i] = cur.advance();
             }
             for (std::size_t c : out_idx) {
                 if (std::binary_search(exist_cols.begin(), exist_cols.end(),
-                                       static_cast<COL_TYPE>(c))) continue;
+                                       static_cast<COL_TYPE>(c)))
+                    continue;
                 prow.push_back(static_cast<SIZE_TYPE>(r));
                 pcol.push_back(static_cast<SIZE_TYPE>(c));
                 pval.push_back(neuron_input_accum[r] * neuron_grad_accum[c]);
@@ -1405,7 +1410,8 @@ void delta_csr_build_probes(
             std::vector<COL_TYPE> exist_cols(n_exist);
             {
                 auto cur = dc.row_cursor(r);
-                for (std::size_t i = 0; i < n_exist; ++i) exist_cols[i] = cur.advance();
+                for (std::size_t i = 0; i < n_exist; ++i)
+                    exist_cols[i] = cur.advance();
             }
 
             // Candidates = all outputs not already connected to this row.
@@ -1417,11 +1423,12 @@ void delta_csr_build_probes(
                     cand.push_back(c);
 
             const std::size_t kk_row = std::min(kk, cand.size());
-            if (kk_row == 0) continue;
+            if (kk_row == 0)
+                continue;
             std::partial_sort(cand.begin(), cand.begin() + kk_row, cand.end(),
-                [&](std::size_t a, std::size_t b) {
-                    return neuron_grad_accum[a] > neuron_grad_accum[b];
-                });
+                              [&](std::size_t a, std::size_t b) {
+                                  return neuron_grad_accum[a] > neuron_grad_accum[b];
+                              });
 
             for (std::size_t i = 0; i < kk_row; ++i) {
                 const std::size_t c = cand[i];
@@ -1432,12 +1439,12 @@ void delta_csr_build_probes(
         }
     }
 
-    weights.probes.rows       = static_cast<SIZE_TYPE>(n_in);
-    weights.probes.cols       = static_cast<SIZE_TYPE>(n_out);
-    weights.probes.ptrs       = static_cast<SIZE_TYPE>(prow.size());
+    weights.probes.rows = static_cast<SIZE_TYPE>(n_in);
+    weights.probes.cols = static_cast<SIZE_TYPE>(n_out);
+    weights.probes.ptrs = static_cast<SIZE_TYPE>(prow.size());
     weights.probes.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::move(prow));
     weights.probes.indices[1] = std::make_shared<std::vector<SIZE_TYPE>>(std::move(pcol));
-    weights.probes.values[0]  = std::make_shared<std::vector<value_type>>(std::move(pval));
+    weights.probes.values[0] = std::make_shared<std::vector<value_type>>(std::move(pval));
 }
 
 #endif

@@ -79,15 +79,16 @@ int main(int argc, char** argv) {
             store.maybe_compress(br, bc); // forces a real dense->sparse resize when compressed
         }
     }
-    const double total_s = std::chrono::duration<double>(
-        std::chrono::high_resolution_clock::now() - t0).count();
+    const double total_s =
+        std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
 
     const std::size_t end_used_bytes = store.total_tile_used_bytes();
     const std::size_t dense_equiv_bytes = std::size_t(n_tiles) * BLOCK4_TILE_SLOTS;
 
-    std::printf("mode=%s\n", compressed ? "compressed (switch_point=2)" : "uncompressed (switch_point=0)");
-    std::printf("%d tiles x %d up/down/compress cycles: %.4f s total, %.2f ns/cycle\n",
-                n_tiles, reps, total_s, total_s * 1e9 / (double(n_tiles) * reps));
+    std::printf("mode=%s\n",
+                compressed ? "compressed (switch_point=2)" : "uncompressed (switch_point=0)");
+    std::printf("%d tiles x %d up/down/compress cycles: %.4f s total, %.2f ns/cycle\n", n_tiles,
+                reps, total_s, total_s * 1e9 / (double(n_tiles) * reps));
     std::printf("tile bytes used: start=%zu end=%zu (dense-equivalent=%zu, %.2fx%s)\n",
                 start_used_bytes, end_used_bytes, dense_equiv_bytes,
                 end_used_bytes > 0 ? double(dense_equiv_bytes) / double(end_used_bytes) : 1.0,

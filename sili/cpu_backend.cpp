@@ -33,12 +33,13 @@ namespace py = pybind11;
 // the underlying policy's call signature itself changes (they dispatch
 // on different VALUES_TYPE/SIMD paths, not unifiable into one function
 // without a much larger template restructuring than this warrants).
-constexpr float kSynapsePolicyBeta1         = 0.9f;
-constexpr float kSynapsePolicyMinDecayFrac  = 0.0f;   // true no-op (<=beta2)
-constexpr float kSynapsePolicyMaxAbsDelta   = 2.0f;   // raw-space (pre-lr-multiply)
-constexpr float kSynapsePolicyMaxCi         = 100.0f;
+constexpr float kSynapsePolicyBeta1 = 0.9f;
+constexpr float kSynapsePolicyMinDecayFrac = 0.0f; // true no-op (<=beta2)
+constexpr float kSynapsePolicyMaxAbsDelta = 2.0f;  // raw-space (pre-lr-multiply)
+constexpr float kSynapsePolicyMaxCi = 100.0f;
 constexpr float kSynapsePolicyZeroEscapeEps = 0.1f;
-constexpr bool  kSynapsePolicyScaleInvariant = false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
+constexpr bool kSynapsePolicyScaleInvariant =
+    false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
 
 // One-time (per-process) stderr warning when a caller uses a learning_rate
 // well outside BoundedRMSpropSynapsePolicy's validated-safe range for its
@@ -53,13 +54,14 @@ inline void warn_if_lr_exceeds_bounded_synapse_policy_safe_range(float learning_
     if (!warned && learning_rate > 0.2f) {
         warned = true;
         std::fprintf(stderr,
-            "sili: WARNING -- backward() called with learning_rate=%.4f, above the "
-            "~0.2 ceiling BoundedRMSpropSynapsePolicy's default max_abs_delta=2.0 was "
-            "validated safe for (see delta_csr_types.hpp's update_cw docstring and "
-            "tests/unit/sweep_synapse_policy_stochastic.cpp). At this lr the effective "
-            "clip (lr*max_abs_delta) may re-enter unstable territory -- if this lr is "
-            "intentional, a caller-tuned max_abs_delta for this regime is recommended "
-            "over trusting the default.\n", learning_rate);
+                     "sili: WARNING -- backward() called with learning_rate=%.4f, above the "
+                     "~0.2 ceiling BoundedRMSpropSynapsePolicy's default max_abs_delta=2.0 was "
+                     "validated safe for (see delta_csr_types.hpp's update_cw docstring and "
+                     "tests/unit/sweep_synapse_policy_stochastic.cpp). At this lr the effective "
+                     "clip (lr*max_abs_delta) may re-enter unstable territory -- if this lr is "
+                     "intentional, a caller-tuned max_abs_delta for this regime is recommended "
+                     "over trusting the default.\n",
+                     learning_rate);
     }
 }
 
@@ -72,9 +74,9 @@ inline void warn_if_lr_exceeds_bounded_synapse_policy_safe_range(float learning_
 // py::keep_alive<0, 1>() so the layer can't be freed while a Block4View
 // referencing it is still alive in Python.
 class Block4View {
-public:
+  public:
     explicit Block4View(Block4Store& s) : store(&s) {}
-    std::size_t tiles()    const { return store->n_tiles(); }
+    std::size_t tiles() const { return store->n_tiles(); }
     std::size_t synapses() const { return store->live_synapses(); }
     // Per-store compression parameter (see block4.hpp: Block4Store::switch_point) --
     // the only knob in Block4View that isn't purely observational. A tile with
@@ -103,7 +105,9 @@ public:
     // (and _bytes below) to know when this layer's max_row_weights
     // genuinely needs expand_headroom_to() with a bigger budget.
     std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
-    std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
+    std::uint64_t row_merge_overflow_bytes_dropped() const {
+        return store->row_merge_overflow_bytes_dropped;
+    }
     // Real, live memory accounting -- see block4.hpp's
     // total_tile_used_bytes()/total_tile_alloc_bytes(): used_bytes sums
     // each row's ACTUAL packed content (sparse-vs-dense per tile, exactly
@@ -114,9 +118,10 @@ public:
     // between them is the real cost of allowing rows room to grow; watch
     // it to confirm that cost stays small relative to a fully-dense
     // layer's n_in*n_out bytes, not silently approaching it.
-    std::size_t used_bytes()  const { return store->total_tile_used_bytes(); }
+    std::size_t used_bytes() const { return store->total_tile_used_bytes(); }
     std::size_t alloc_bytes() const { return store->total_tile_alloc_bytes(); }
-private:
+
+  private:
     Block4Store* store;
 };
 
@@ -126,16 +131,19 @@ private:
 // SparseLinearWeightsDelta.block4 is Block4Store8 specifically for
 // FP8BiValues).
 class Block4View8 {
-public:
+  public:
     explicit Block4View8(Block4Store8& s) : store(&s) {}
-    std::size_t tiles()    const { return store->n_tiles(); }
+    std::size_t tiles() const { return store->n_tiles(); }
     std::size_t synapses() const { return store->live_synapses(); }
     uint32_t get_switch_point() const { return store->switch_point; }
     void set_switch_point(uint32_t v) { store->switch_point = v; }
     std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
     std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
-    std::uint64_t row_merge_overflow_bytes_dropped() const { return store->row_merge_overflow_bytes_dropped; }
-private:
+    std::uint64_t row_merge_overflow_bytes_dropped() const {
+        return store->row_merge_overflow_bytes_dropped;
+    }
+
+  private:
     Block4Store8* store;
 };
 
@@ -150,80 +158,69 @@ private:
 //   without a copy — invalidated on the next forward() call.
 
 class SISLDOLayerV {
-public:
+  public:
     using S = int;
     using V = float;
 
     SparseLinearWeightsV<S, V> weights;
-    std::vector<V>            neuron_input_accum;
-    std::vector<V>            neuron_grad_accum;
-    std::vector<V>            output_buf;
-    int                       num_cpus;
+    std::vector<V> neuron_input_accum;
+    std::vector<V> neuron_grad_accum;
+    std::vector<V> output_buf;
+    int num_cpus;
 
-    SISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus)
-    {
-        weights.connections.rows    = n_inputs;
-        weights.connections.cols    = n_outputs;
+    SISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4) : num_cpus(cpus) {
+        weights.connections.rows = n_inputs;
+        weights.connections.cols = n_outputs;
         weights.connections.ptrs[0] = std::make_shared<std::vector<S>>(n_inputs + 1, S(0));
         weights.connections.indices[0] = std::make_shared<std::vector<S>>();
-        weights.connections.values[0]  = std::make_shared<std::vector<V>>();
-        weights.connections.values[1]  = std::make_shared<std::vector<V>>();
+        weights.connections.values[0] = std::make_shared<std::vector<V>>();
+        weights.connections.values[1] = std::make_shared<std::vector<V>>();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
 
         reserve_connections(weights.connections, max_weights);
 
-        neuron_input_accum.assign(n_inputs,  V(0));
-        neuron_grad_accum .assign(n_outputs, V(0));
+        neuron_input_accum.assign(n_inputs, V(0));
+        neuron_grad_accum.assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
     // ── Scalar properties ─────────────────────────────────────────────────────
 
-    S n_inputs()  const { return weights.connections.rows; }
+    S n_inputs() const { return weights.connections.rows; }
     S n_outputs() const { return weights.connections.cols; }
-    S nnz()       const { return weights.connections.nnz(); }
+    S nnz() const { return weights.connections.nnz(); }
 
     // ── Input construction ───────────────────────────────────────────────────
 
-    CSRInput<S, V> numpy_to_sparse_input(
-        py::array_t<S> ptrs,
-        py::array_t<S> indices,
-        py::array_t<V> values,
-        S batch, S cols)
-    {
+    CSRInput<S, V> numpy_to_sparse_input(py::array_t<S> ptrs, py::array_t<S> indices,
+                                         py::array_t<V> values, S batch, S cols) {
         auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
         const S nnz_in = (S)ib.size;
         CSRInput<S, V> csr;
-        csr.rows       = batch;
-        csr.cols       = cols;
-        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.rows = batch;
+        csr.cols = cols;
+        csr.ptrs[0] = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
         csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nnz_in);
-        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nnz_in);
+        csr.values[0] = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nnz_in);
         return csr;
     }
 
-    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                  py::array_t<V> vals, py::array_t<V> imp) {
-        auto pb = ptrs.request(), ib = indices.request(),
-            vb = vals.request(), impb = imp.request();
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> vals,
+                      py::array_t<V> imp) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = vals.request(), impb = imp.request();
         const S rows = weights.connections.rows;
         const S cols = weights.connections.cols;
-        weights = make_weights_v<S, V>(
-            rows, cols,
-            std::vector<S>((S*)pb.ptr,   (S*)pb.ptr   + pb.size),
-            std::vector<S>((S*)ib.ptr,   (S*)ib.ptr   + ib.size),
-            std::vector<V>((V*)vb.ptr,   (V*)vb.ptr   + vb.size),
-            std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
+        weights = make_weights_v<S, V>(rows, cols, std::vector<S>((S*)pb.ptr, (S*)pb.ptr + pb.size),
+                                       std::vector<S>((S*)ib.ptr, (S*)ib.ptr + ib.size),
+                                       std::vector<V>((V*)vb.ptr, (V*)vb.ptr + vb.size),
+                                       std::vector<V>((V*)impb.ptr, (V*)impb.ptr + impb.size));
     }
 
     // ── Forward (use module-level dense_to_csr to prepare input first) ─────────
 
-    py::array_t<V> forward_sparse(
-        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch)
-    {
+    py::array_t<V> forward_sparse(py::array_t<S> ptrs, py::array_t<S> indices,
+                                  py::array_t<V> values, S batch) {
         output_buf.assign(batch * n_outputs(), V(0));
         auto input_csr = numpy_to_sparse_input(ptrs, indices, values, batch, n_inputs());
         sisldo_forward_trivalues(input_csr, weights, output_buf.data(), num_cpus);
@@ -247,29 +244,20 @@ public:
     // dy_sparse_*:  sparse dy — input gradient kernel
     //               if all outputs are active, pass dy converted to a single CSR row
 
-    py::array_t<V> backward(
-        py::array_t<S> x_ptrs,
-        py::array_t<S> x_indices,
-        py::array_t<V> x_values,
-        py::array_t<V> dy,
-        py::array_t<S> dy_sparse_ptrs,
-        py::array_t<S> dy_sparse_indices,
-        py::array_t<V> dy_sparse_values,
-        V learning_rate,
-        S batch, S cols)
-    {
-        auto dybuf    = dy.request();
+    py::array_t<V> backward(py::array_t<S> x_ptrs, py::array_t<S> x_indices,
+                            py::array_t<V> x_values, py::array_t<V> dy,
+                            py::array_t<S> dy_sparse_ptrs, py::array_t<S> dy_sparse_indices,
+                            py::array_t<V> dy_sparse_values, V learning_rate, S batch, S cols) {
+        auto dybuf = dy.request();
 
         std::vector<V> dx(batch * n_inputs(), V(0));
-        auto input_csr    = numpy_to_sparse_input(x_ptrs, x_indices, x_values, batch, cols);
-        auto out_grad_csr = numpy_to_sparse_input(
-            dy_sparse_ptrs, dy_sparse_indices, dy_sparse_values, batch, n_outputs());
+        auto input_csr = numpy_to_sparse_input(x_ptrs, x_indices, x_values, batch, cols);
+        auto out_grad_csr = numpy_to_sparse_input(dy_sparse_ptrs, dy_sparse_indices,
+                                                  dy_sparse_values, batch, n_outputs());
 
-        sisldo_backward_trivalues(
-            input_csr, weights, out_grad_csr,
-            dx.data(), (V*)dybuf.ptr,
-            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate,
-            num_cpus);
+        sisldo_backward_trivalues(input_csr, weights, out_grad_csr, dx.data(), (V*)dybuf.ptr,
+                                  neuron_input_accum.data(), neuron_grad_accum.data(),
+                                  learning_rate, num_cpus);
 
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -278,42 +266,37 @@ public:
 
     // ── Optimization ─────────────────────────────────────────────────────────
 
-    void decay_importance(V rate) {
-        sisldo_decay_importance(weights, rate, num_cpus);
-    }
+    void decay_importance(V rate) { sisldo_decay_importance(weights, rate, num_cpus); }
 
     // ── Neurogenesis ──────────────────────────────────────────────────────────
 
     void build_probes(S k) {
-        genesis_build_probes(
-            weights,
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            n_inputs(), n_outputs(), k, num_cpus);
+        genesis_build_probes(weights, neuron_input_accum.data(), neuron_grad_accum.data(),
+                             n_inputs(), n_outputs(), k, num_cpus);
     }
 
     void optim_synaptogenesis(V learning_rate, V importance_beta, S max_weights) {
-        sisldo_optim_synaptogenesis(
-            weights, learning_rate, importance_beta, max_weights, num_cpus);
+        sisldo_optim_synaptogenesis(weights, learning_rate, importance_beta, max_weights, num_cpus);
     }
 
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
-        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+        std::fill(neuron_grad_accum.begin(), neuron_grad_accum.end(), V(0));
     }
 
     // ── Zero-copy numpy views ─────────────────────────────────────────────────
 
     py::array_t<V> get_neuron_input_accum() {
-        return py::array_t<V>({(py::ssize_t)n_inputs()},  {sizeof(V)},
-                              neuron_input_accum.data(), py::cast(this));
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)}, neuron_input_accum.data(),
+                              py::cast(this));
     }
     py::array_t<V> get_neuron_grad_accum() {
-        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
-                              neuron_grad_accum.data(), py::cast(this));
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)}, neuron_grad_accum.data(),
+                              py::cast(this));
     }
     py::array_t<V> get_output_buf() {
-        return py::array_t<V>({(py::ssize_t)output_buf.size()}, {sizeof(V)},
-                              output_buf.data(), py::cast(this));
+        return py::array_t<V>({(py::ssize_t)output_buf.size()}, {sizeof(V)}, output_buf.data(),
+                              py::cast(this));
     }
     py::array_t<V> get_weights_vals() {
         return py::array_t<V>({(py::ssize_t)nnz()}, {sizeof(V)},
@@ -333,13 +316,9 @@ public:
     }
 };
 
-
-
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Module
 // ─────────────────────────────────────────────────────────────────────────────
-
 
 // ── SparseLinearLayer ───────────────────────────────────────────────────────────────
 // Rewritten (see conversation) to use SparseLinearWeightsDelta<S,FP4BiPacked,
@@ -372,16 +351,16 @@ public:
 template <typename ScalePolicy = RMSpropScalePolicy<float>, bool DeferredScaleWrite = false,
           bool StochasticRounding = true>
 class SparseLinearLayerImpl {
-public:
+  public:
     using S = int;
     using V = float;
     using COL_TYPE = uint32_t;
 
     SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
-    std::vector<V>            neuron_input_accum;
-    std::vector<V>            neuron_grad_accum;
-    std::vector<V>            output_buf;
-    int                       num_cpus;
+    std::vector<V> neuron_input_accum;
+    std::vector<V> neuron_grad_accum;
+    std::vector<V> output_buf;
+    int num_cpus;
 
     // Last dense input — a plain single-slot mirror purely for the
     // Python-facing `last_input` introspection property below (always
@@ -392,39 +371,36 @@ public:
     // straight back in as an explicit argument. No engine-side state to
     // get out of sync with multiple forward() calls per backward pass.
     std::vector<V> _last_input;
-    S              _last_batch = 0;
-    S              _last_cols  = 0;
+    S _last_batch = 0;
+    S _last_cols = 0;
     // Budget established at construction -- used by load_weights to avoid
     // allocating a smaller limit that would then be exceeded by the per-row
     // headroom calculation inside delta_csr_from_absolute, which was
     // corrupting the heap (load_weights was passing idx.size()*8+4096 which
     // could be SMALLER than the actual bytes written by indices_buf.assign).
-    std::size_t    _idx_budget_bytes = 4096;
-    std::size_t    _val_budget_nnz   = 64;
+    std::size_t _idx_budget_bytes = 4096;
+    std::size_t _val_budget_nnz = 64;
 
     // ── Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
     // (cpu_backend.cpp) for the full rationale; same mechanism generalized
     // across all VALUES_TYPEs via ValueAccessor (delta_csr_types.hpp).
-    std::size_t _decay_cursor  = 0;
-    double      _decay_sum_abs = 0.0;
-    double      _decay_sum_sq  = 0.0;
-    double      _decay_max_abs = 0.0;
-    std::size_t _decay_n       = 0;
+    std::size_t _decay_cursor = 0;
+    double _decay_sum_abs = 0.0;
+    double _decay_sum_sq = 0.0;
+    double _decay_max_abs = 0.0;
+    std::size_t _decay_n = 0;
 
     SparseLinearLayerImpl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus),
-          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
-          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
-    {
+        : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz(static_cast<std::size_t>(max_weights) + 64) {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
         std::vector<S> empty_idx;
         std::vector<V> empty_w, empty_imp;
         // Budget is generous headroom (reserve, not allocate-and-init) --
         // 8 bytes/synapse covers worst-case ULEB128 (5) + value byte (1) + margin.
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
-            empty_ptrs, empty_idx, empty_w, empty_imp,
-            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
-            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            empty_ptrs, empty_idx, empty_w, empty_imp, static_cast<std::size_t>(n_inputs),
+            static_cast<std::size_t>(n_outputs), static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
         // Real, enforced cap -- without this, DeltaCSRWeights::
         // max_indices_bytes/max_values_bytes sit at their default
@@ -437,9 +413,9 @@ public:
         // is actually an nnz count despite the name, same units
         // reserve_values() takes).
         weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
-        weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
+            _idx_budget_bytes, ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
+        weights.block4.init(static_cast<std::size_t>(n_inputs),
+                            static_cast<std::size_t>(n_outputs));
         // Real, enforced cap for block4 -- see block4.hpp's
         // block4_row_shift comment for the bug this closes (block4
         // grew unboundedly, confirmed reaching ~1.9x max_weights with
@@ -476,18 +452,21 @@ public:
         // test_disldo_block4_promotion.cpp's single-tile usage).
         weights.block4.set_limits(
             static_cast<std::size_t>(max_weights) * 8 + 4096,
-            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) *
+                BLOCK4_TILE_SLOTS);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
-        neuron_input_accum.assign(n_inputs,  V(0));
-        neuron_grad_accum .assign(n_outputs, V(0));
+        neuron_input_accum.assign(n_inputs, V(0));
+        neuron_grad_accum.assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
-    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_inputs() const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    S nnz() const {
+        return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
+    }
     // Purely observational (block4's whole point is to be invisible to
     // callers otherwise) -- see Block4View, bound as layer.block4.
     Block4View block4() { return Block4View(weights.block4); }
@@ -562,9 +541,13 @@ public:
     // -neuron exposure) -- see weights.get_additive_u_raw_vector's own
     // docstring, delta_csr_types.hpp.
     std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
-    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) {
+        weights.set_additive_u_raw_vector(v);
+    }
     std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
-    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) {
+        weights.set_additive_v_raw_vector(v);
+    }
 
     // AQRS dynamic rank control (task #291): thin Python-facing wrappers
     // over weights.apply_dynamic_rank_control/apply_additive_dynamic_
@@ -580,26 +563,29 @@ public:
     // mutation (apoptosis or neurogenesis) actually happened this call.
     std::mt19937 _dynamic_rank_rng{std::random_device{}()};
     void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
-    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                    V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 50,
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta, V seed_scale = 0.05f,
+                                    uint32_t grow_grace_period_steps = 50,
                                     uint32_t shrink_grace_period_steps = 50) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
-        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
-            [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            grow_grace_period_steps, shrink_grace_period_steps);
+        return weights.apply_dynamic_rank_control(
+            n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grow_grace_period_steps,
+            shrink_grace_period_steps);
     }
     bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                             V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 5000,
+                                             V seed_scale = 0.05f,
+                                             uint32_t grow_grace_period_steps = 5000,
                                              uint32_t shrink_grace_period_steps = 5000) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
-        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+        return weights.apply_additive_dynamic_rank_control(
+            n_rows, n_cols, tau_death, tau_active, theta,
             [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            grow_grace_period_steps, shrink_grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grow_grace_period_steps,
+            shrink_grace_period_steps);
     }
 
     // AQRS gamma raw get/set + EMA diagnostics (task #293 fix): these
@@ -611,28 +597,44 @@ public:
     // the dynamic-rank triggers never had live EMA data to evaluate.
     // Found via a real 60k-step MQAR curriculum run showing 0 rank
     // mutations in both fp8 and fp4 the entire run.
-    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
-    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
-    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
-    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
-    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
-    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
-    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
-    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_k(S k) const {
+        return weights.get_scale_gamma_k(static_cast<std::size_t>(k));
+    }
+    void set_scale_gamma_raw_k(S k, V v) {
+        weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v);
+    }
+    V get_scale_gamma_abs_ema_k(S k) const {
+        return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_scale_gamma_grad_ema_k(S k) const {
+        return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_additive_gamma_k(S k) const {
+        return weights.get_additive_gamma_k(static_cast<std::size_t>(k));
+    }
+    void set_additive_gamma_raw_k(S k, V v) {
+        weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v);
+    }
+    V get_additive_gamma_abs_ema_k(S k) const {
+        return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_additive_gamma_grad_ema_k(S k) const {
+        return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k));
+    }
 
     // ── Forward (dense input — DISLDO) ──────────────────────────────────────────
 
     py::array_t<V> forward_dense(py::array_t<V> x) {
-        auto xbuf     = x.request();
-        _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        auto xbuf = x.request();
+        _last_batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        _last_cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
-        const V* src  = (V*)xbuf.ptr;
+        const V* src = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
         disldo_forward<S, FP4BiPacked, COL_TYPE>(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), num_cpus);
+                                                 output_buf.data(), num_cpus);
 
         // COPY, not a view -- see forward_sparse's own comment above for
         // why (output_buf is reused/overwritten by every future call).
@@ -660,26 +662,23 @@ public:
     // Simpler and structurally immune to the multi-forward-per-backward
     // corruption class the old single-slot cache had.
     py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                                  bool lr_per_row_nnz = false,
-                                  bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+                                  bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                                  V beta2 = 0.999f, V eps = 1e-8f,
                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                                   V max_ci = kSynapsePolicyMaxCi,
                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
-        auto xbuf  = x.request();
+        auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         std::vector<V> dx(batch * cols, V(0));
-        disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite, StochasticRounding>(
-            (V*)xbuf.ptr, batch, cols,
-            (V*)dybuf.ptr, weights,
-            dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+        disldo_backward<S, FP4BiPacked, COL_TYPE, ScalePolicy, DeferredScaleWrite,
+                        StochasticRounding>(
+            (V*)xbuf.ptr, batch, cols, (V*)dybuf.ptr, weights, dx.data(), neuron_input_accum.data(),
+            neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
+            beta2, eps, kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -719,21 +718,19 @@ public:
         auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
         const S nz = (S)ib.size;
         CSRInput<S, V> csr;
-        csr.rows = batch; csr.cols = cols;
-        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.rows = batch;
+        csr.cols = cols;
+        csr.ptrs[0] = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
         csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nz);
-        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
+        csr.values[0] = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
         return csr;
     }
 
-    py::array_t<V> forward_sparse(
-        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch)
-    {
+    py::array_t<V> forward_sparse(py::array_t<S> ptrs, py::array_t<S> indices,
+                                  py::array_t<V> values, S batch) {
         auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
         output_buf.assign(batch * n_outputs(), V(0));
-        sisldo_forward<S, FP4BiPacked, COL_TYPE>(
-            input, weights, output_buf.data(), num_cpus);
+        sisldo_forward<S, FP4BiPacked, COL_TYPE>(input, weights, output_buf.data(), num_cpus);
         // COPY, not a view -- see SISLDOLayerV::forward_sparse's own
         // comment for why (output_buf is reused/overwritten by every
         // future call on this same object).
@@ -742,16 +739,15 @@ public:
         return result;
     }
 
-    py::array_t<V> backward_sparse(
-        py::array_t<V> x,   // DENSE input -- see class comment for why
-        py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
-        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false,
-        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
-        V min_decay_frac = kSynapsePolicyMinDecayFrac,
-        V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-        V max_ci = kSynapsePolicyMaxCi,
-        bool scale_invariant = kSynapsePolicyScaleInvariant)
-    {
+    py::array_t<V> backward_sparse(py::array_t<V> x, // DENSE input -- see class comment for why
+                                   py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
+                                   py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
+                                   bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                                   V beta2 = 0.999f, V eps = 1e-8f,
+                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                                   V max_ci = kSynapsePolicyMaxCi,
+                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
@@ -765,9 +761,9 @@ public:
         // this was already the case before this change (the function never
         // had that concept), so it is a known follow-up, not a regression.
         disldo_backward_sparse_grad<S, FP4BiPacked, COL_TYPE, ScalePolicy, StochasticRounding>(
-            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz,
-            damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(), neuron_input_accum.data(),
+            neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
+            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -782,14 +778,13 @@ public:
     // (reuses the same ValueAccessor-generic template DISLDOLayerV uses).
     py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
         auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
-            weights.connections.values, _decay_cursor,
-            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
-            static_cast<std::size_t>(chunk_size), decay_factor);
+            weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
+            _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
         py::dict out;
-        out["mean_abs"]       = stats.mean_abs;
-        out["rms"]            = stats.rms;
-        out["max_abs"]        = stats.max_abs;
-        out["n"]              = stats.n;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
         out["cycle_complete"] = stats.cycle_complete;
         return out;
     }
@@ -797,11 +792,11 @@ public:
     // ── Synaptogenesis (NEW — see class comment) ────────────────────────────────
 
     void build_probes(S k, bool per_row = false) {
-        delta_csr_build_probes<S, FP4BiPacked, COL_TYPE>(
-            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
+        delta_csr_build_probes<S, FP4BiPacked, COL_TYPE>(weights, neuron_input_accum.data(),
+                                                         neuron_grad_accum.data(), k, per_row);
     }
-    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
-                        V importance_eps = V(1e-3)) {
+    bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights,
+                        S max_prune_per_step = S(8), V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(current_row);
         return delta_csr_synap_row_step<S, FP4BiPacked, COL_TYPE>(
             weights, row, importance_cutoff, max_row_weights, max_prune_per_step, importance_eps);
@@ -816,7 +811,7 @@ public:
     // cursor from equalizer_step below -- they serve different purposes
     // (synaptogenesis vs. memory rebalancing) and may reasonably progress
     // at different paces.
-    S      _synap_row = 0;
+    S _synap_row = 0;
     bool synap_step(V importance_cutoff, S max_row_weights, S max_prune_per_step = S(8),
                     V importance_eps = V(1e-3)) {
         std::size_t row = static_cast<std::size_t>(_synap_row);
@@ -836,8 +831,8 @@ public:
     // freed by compressing (see block4.hpp: new tiles start empty, sized
     // to real content, not dense-worst-case) stay permanently locked to
     // that one row, unusable anywhere else in the matrix.
-    S      _equalize_row = 0;
-    S      _block4_equalize_row = 0;
+    S _equalize_row = 0;
+    S _block4_equalize_row = 0;
     void equalizer_step() {
         std::size_t row = static_cast<std::size_t>(_equalize_row);
         delta_csr_equalize_step<S, FP4BiPacked, COL_TYPE>(weights.connections, row);
@@ -876,9 +871,9 @@ public:
     void equalize_to_capacity(int target_elems_per_row, int target_bytes_per_row = 0) {
         const std::size_t tgt_e = static_cast<std::size_t>(target_elems_per_row);
         const std::size_t tgt_b = (target_bytes_per_row > 0)
-            ? static_cast<std::size_t>(target_bytes_per_row)
-            : tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
-        auto& dc  = weights.connections;
+                                      ? static_cast<std::size_t>(target_bytes_per_row)
+                                      : tgt_e * uleb128_max_bytes<COL_TYPE>() + 4;
+        auto& dc = weights.connections;
         const std::size_t rows = dc.layout.rows;
 
         for (std::size_t r = 0; r + 1 < rows; ++r) {
@@ -887,7 +882,8 @@ public:
             const std::size_t cur_e = L.row_alloc_elems(r);
             const std::size_t use_b = std::max(cur_b, tgt_b);
             const std::size_t use_e = std::max(cur_e, tgt_e);
-            if (use_b == cur_b && use_e == cur_e) continue;
+            if (use_b == cur_b && use_e == cur_e)
+                continue;
 
             const std::ptrdiff_t bd =
                 static_cast<std::ptrdiff_t>(use_b) - static_cast<std::ptrdiff_t>(cur_b);
@@ -903,7 +899,7 @@ public:
         // extend the flat buffers and update the end markers.
         if (rows > 0) {
             auto& L = dc.layout;
-            const std::size_t r   = rows - 1;
+            const std::size_t r = rows - 1;
             const std::size_t cur_b = L.row_alloc_bytes(r);
             const std::size_t cur_e = L.row_alloc_elems(r);
             const std::size_t use_b = std::max(cur_b, tgt_b);
@@ -934,8 +930,7 @@ public:
         // reverting to unbounded (SIZE_MAX) otherwise. Re-apply every
         // time this member gets reassigned wholesale.
         weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
+            _idx_budget_bytes, ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Opposite of compact(): restores growth headroom, normalized to exactly
@@ -944,12 +939,12 @@ public:
     // that's been compact()ed -- synap_row_step now throws a catchable
     // exception rather than silently doing nothing if headroom is missing.
     void expand_headroom(float blank_fraction = 0.2f) {
-        weights.connections = ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
+        weights.connections =
+            ::expand_headroom<S, FP4BiPacked, COL_TYPE>(weights.connections, blank_fraction);
         // See compact()'s identical comment -- re-apply the cap after
         // every wholesale reassignment of weights.connections.
         weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
+            _idx_budget_bytes, ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Like expand_headroom() but guarantees each row has headroom for at
@@ -959,9 +954,7 @@ public:
     // back toward max_row_weights (which may be much larger).
     void expand_headroom_to(int min_nnz_per_row, float blank_fraction = 0.2f) {
         weights.connections = ::expand_headroom_to<S, FP4BiPacked, COL_TYPE>(
-            weights.connections,
-            static_cast<std::size_t>(min_nnz_per_row),
-            blank_fraction);
+            weights.connections, static_cast<std::size_t>(min_nnz_per_row), blank_fraction);
         // See compact()'s identical comment. NOTE (real, not yet fully
         // closed gap): if min_nnz_per_row * n_rows exceeds the layer's
         // own construction-time budget, THIS call can still allocate
@@ -972,8 +965,7 @@ public:
         // min_nnz_per_row inconsistent with max_weights is still a real
         // way to exceed the intended budget; not fixed here.
         weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
+            _idx_budget_bytes, ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
     }
 
     // Per-ROW scale applied to stored importance/weight to get true units
@@ -981,28 +973,62 @@ public:
     // (delta_csr_types.hpp) for the full motivation, including why per-row
     // rather than per-layer. Default 1.0 for any row not yet touched,
     // exact backward compat.
-    V get_importance_scale(S row) const { return weights.get_importance_scale(static_cast<std::size_t>(row)); }
-    V get_value_scale(S row)      const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
-    V get_output_scale(S col)     const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
-    V get_value_scale_importance(S row)  const { return weights.get_value_scale_importance(static_cast<std::size_t>(row)); }
-    V get_output_scale_importance(S col) const { return weights.get_output_scale_importance(static_cast<std::size_t>(col)); }
-    V get_output_importance_scale(S col) const { return weights.get_output_importance_scale(static_cast<std::size_t>(col)); }
+    V get_importance_scale(S row) const {
+        return weights.get_importance_scale(static_cast<std::size_t>(row));
+    }
+    V get_value_scale(S row) const {
+        return weights.get_value_scale(static_cast<std::size_t>(row));
+    }
+    V get_output_scale(S col) const {
+        return weights.get_output_scale(static_cast<std::size_t>(col));
+    }
+    V get_value_scale_importance(S row) const {
+        return weights.get_value_scale_importance(static_cast<std::size_t>(row));
+    }
+    V get_output_scale_importance(S col) const {
+        return weights.get_output_scale_importance(static_cast<std::size_t>(col));
+    }
+    V get_output_importance_scale(S col) const {
+        return weights.get_output_importance_scale(static_cast<std::size_t>(col));
+    }
 
     // Per-component (rank>1) accessors -- see scale_rank's own docstring.
-    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
-    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
-    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
-    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    V get_value_scale_k(S row, S k) const {
+        return weights.get_value_scale_k(static_cast<std::size_t>(row),
+                                         static_cast<std::size_t>(k));
+    }
+    V get_output_scale_k(S col, S k) const {
+        return weights.get_output_scale_k(static_cast<std::size_t>(col),
+                                          static_cast<std::size_t>(k));
+    }
+    void set_value_scale_raw_k(S row, S k, V v) {
+        weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k),
+                                      v);
+    }
+    void set_output_scale_raw_k(S col, S k, V v) {
+        weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k),
+                                       v);
+    }
     // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
     // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
     // docstring, delta_csr_types.hpp.
-    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
-    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
-    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
-    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
+    std::vector<V> get_value_scale_raw_vector() const {
+        return weights.get_value_scale_raw_vector();
+    }
+    void set_value_scale_raw_vector(const std::vector<V>& v) {
+        weights.set_value_scale_raw_vector(v);
+    }
+    std::vector<V> get_output_scale_raw_vector() const {
+        return weights.get_output_scale_raw_vector();
+    }
+    void set_output_scale_raw_vector(const std::vector<V>& v) {
+        weights.set_output_scale_raw_vector(v);
+    }
     // Combined rank-N scale S(row,col) -- THE quantity Hadamard-multiplied
     // against quant in both forward and backward.
-    V get_scale(S row, S col) const { return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col)); }
+    V get_scale(S row, S col) const {
+        return weights.get_scale(static_cast<std::size_t>(row), static_cast<std::size_t>(col));
+    }
 
     // Change ONE row's scale mid-training without corrupting that row's
     // existing stored data -- see SparseLinearWeightsDelta::
@@ -1020,12 +1046,8 @@ public:
 
     // Bulk convenience: set EVERY row to the same new_scale -- backward-
     // compatible interface with the original per-layer-scalar design.
-    void rescale_importance(V new_scale) {
-        weights.rescale_importance(new_scale);
-    }
-    void rescale_value(V new_scale) {
-        weights.rescale_value(new_scale);
-    }
+    void rescale_importance(V new_scale) { weights.rescale_importance(new_scale); }
+    void rescale_value(V new_scale) { weights.rescale_value(new_scale); }
 
     // Running L1/L2/max stats for the STORED (quantized) importance/value
     // distribution, maintained incrementally at O(1) per synapse touched --
@@ -1033,14 +1055,14 @@ public:
     // the full design (including the max_abs monotonic-bound limitation).
     // Underpins a Python-side adaptive rescaling policy, not built here --
     // see refactoring_todo.md/TODO.md.
-    V get_value_l1()           const { return static_cast<V>(weights.value_l1); }
-    V get_value_l2_sq()        const { return static_cast<V>(weights.value_l2_sq); }
-    V get_value_max_abs()      const { return weights.value_max_abs; }
-    V get_importance_l1()      const { return static_cast<V>(weights.importance_l1); }
-    V get_importance_l2_sq()   const { return static_cast<V>(weights.importance_l2_sq); }
+    V get_value_l1() const { return static_cast<V>(weights.value_l1); }
+    V get_value_l2_sq() const { return static_cast<V>(weights.value_l2_sq); }
+    V get_value_max_abs() const { return weights.value_max_abs; }
+    V get_importance_l1() const { return static_cast<V>(weights.importance_l1); }
+    V get_importance_l2_sq() const { return static_cast<V>(weights.importance_l2_sq); }
     V get_importance_max_abs() const { return weights.importance_max_abs; }
-    V hoyer_value()            const { return weights.hoyer_value(); }
-    V hoyer_importance()       const { return weights.hoyer_importance(); }
+    V hoyer_value() const { return weights.hoyer_value(); }
+    V hoyer_importance() const { return weights.hoyer_importance(); }
 
     // Recompute all six stats above from scratch -- O(nnz). Gives an EXACT
     // max_abs (unlike the incrementally-maintained monotonic bound); call
@@ -1049,15 +1071,14 @@ public:
 
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
-        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+        std::fill(neuron_grad_accum.begin(), neuron_grad_accum.end(), V(0));
     }
 
     // ptrs/indices/vals: standard absolute CSR + true float weights (NOT
     // pre-packed FP4 bytes — delta_csr_from_absolute quantizes internally,
     // unlike the old make_weights(FP4BiPacked(raw_bytes)) contract).
-    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                      py::array_t<V> vals) {
-        auto pb=ptrs.request(), ib=indices.request(), vb=vals.request();
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> vals) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = vals.request();
         const std::size_t rows = weights.connections.layout.rows;
         const std::size_t cols = weights.connections.layout.cols;
         std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
@@ -1075,7 +1096,7 @@ public:
         // bytes written by indices_buf.assign(L.byte_start[rows]) due to
         // per-row headroom, corrupting the heap when a second layer existed.
         const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
-        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
+        const std::size_t val_budget = std::max(_val_budget_nnz, idx.size() + 64);
         weights.connections = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
             p, idx, w, imp, rows, cols, idx_budget, val_budget);
         // If the loaded checkpoint genuinely has more weights than this
@@ -1086,17 +1107,17 @@ public:
         // set_limits() calls (compact()/expand_headroom()) instead of
         // silently shrinking back down to the old, now-too-small one.
         _idx_budget_bytes = idx_budget;
-        _val_budget_nnz   = val_budget;
+        _val_budget_nnz = val_budget;
         weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
+            _idx_budget_bytes, ValueAccessor<FP4BiPacked>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
         // load_weights replaces .connections wholesale, so out_degree
         // (needed by output_scale's own gradient, disldo_backward) must be
         // rebuilt from the new indices -- it isn't touched otherwise and
         // would silently stay at the constructor's all-zero value.
         weights.out_degree.assign(cols, S(0));
-        for (S c : idx) ++weights.out_degree[c];
+        for (S c : idx)
+            ++weights.out_degree[c];
     }
 
     // Bulk LOADING (not quantization) of already-quantized dense weight/
@@ -1106,12 +1127,13 @@ public:
     // n_out uint8 arrays (already-decided FP4 codes 0-15) -- produce them
     // via fp4_quantize_array() for simple deterministic rounding, or any
     // other scheme; this method does no quantization itself.
-    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+    void load_dense_codes(py::array_t<uint8_t> weight_codes,
+                          py::array_t<uint8_t> importance_codes) {
         auto wb = weight_codes.request(), ib = importance_codes.request();
         const std::size_t rows = weights.connections.layout.rows;
         const std::size_t cols = weights.connections.layout.cols;
-        block4_load_dense<S, FP4BiPacked, COL_TYPE>(
-            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        block4_load_dense<S, FP4BiPacked, COL_TYPE>(weights, (const uint8_t*)wb.ptr,
+                                                    (const uint8_t*)ib.ptr, rows, cols);
         // Every row connects to every column -- out_degree[c] = rows for
         // every c, matching load_weights()'s own "rebuild from what was
         // just loaded" precedent (needed for output_scale's gradient, see
@@ -1137,44 +1159,48 @@ public:
     // layer) to reclaim the blank_fraction slack. Call
     // expand_block4_headroom() again afterward before resuming training
     // that needs block4 rows to grow further.
-    void compact_block4() {
-        block4_compact<S, FP4BiPacked, COL_TYPE>(weights);
-    }
+    void compact_block4() { block4_compact<S, FP4BiPacked, COL_TYPE>(weights); }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
-        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
-                              neuron_input_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)}, neuron_input_accum.data(),
+                              py::cast(this));
+    }
     py::array_t<V> get_neuron_grad_accum() {
-        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
-                              neuron_grad_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)}, neuron_grad_accum.data(),
+                              py::cast(this));
+    }
 
     // NOTE: no longer zero-copy (delta-CSR has no plain float array to view
     // directly) — materializes absolute CSR + float weights/importance via
     // delta_csr_to_absolute on each call. O(nnz), not O(1) like before.
     py::array_t<V> get_weights_vals() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, FP4BiPacked, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
@@ -1188,7 +1214,7 @@ public:
 // SparseLinearLayer8Resync already validated for FP8 -- see
 // sili_peridot/JOURNAL.md for why plain FP4 needed this too (true_multi_digit
 // real-FP4 collapse to chance vs a fp32-shadow control that succeeded).
-using SparseLinearLayer       = SparseLinearLayerImpl<>;
+using SparseLinearLayer = SparseLinearLayerImpl<>;
 using SparseLinearLayerResync = SparseLinearLayerImpl<RMSpropScalePolicy<float>, true>;
 // value_scale/output_scale forced to their init value (1.0) forever, never
 // trained -- direct real-hardware test of "zero trained scale" (matches
@@ -1203,13 +1229,16 @@ using SparseLinearLayerNoScale = SparseLinearLayerImpl<NoScalePolicy<float>, fal
 // noise, not any value_scale mechanism, explains true_multi_digit's
 // collapse to chance vs the deterministic-rounding fp32-shadow control
 // that succeeded -- see sili_peridot/JOURNAL.md.
-using SparseLinearLayerDeterministic = SparseLinearLayerImpl<RMSpropScalePolicy<float>, false, false>;
+using SparseLinearLayerDeterministic =
+    SparseLinearLayerImpl<RMSpropScalePolicy<float>, false, false>;
 // Full 2x2: deterministic-rounding counterparts of Resync and NoScale too,
 // now that the machinery exists -- cheap to add, completes the matrix
 // (stochastic/deterministic x plain-scale/resync/noscale) instead of only
 // isolating rounding against the plain baseline.
-using SparseLinearLayerResyncDeterministic  = SparseLinearLayerImpl<RMSpropScalePolicy<float>, true, false>;
-using SparseLinearLayerNoScaleDeterministic = SparseLinearLayerImpl<NoScalePolicy<float>, false, false>;
+using SparseLinearLayerResyncDeterministic =
+    SparseLinearLayerImpl<RMSpropScalePolicy<float>, true, false>;
+using SparseLinearLayerNoScaleDeterministic =
+    SparseLinearLayerImpl<NoScalePolicy<float>, false, false>;
 
 // ── DISLDOLayerV ──────────────────────────────────────────────────────────────
 // Same rewrite as SparseLinearLayer, VALUES_TYPE=DeltaCSRBiValues<float> instead of
@@ -1219,23 +1248,23 @@ using SparseLinearLayerNoScaleDeterministic = SparseLinearLayerImpl<NoScalePolic
 // and run_tests_32_bit should use the same functions" (see conversation).
 
 class DISLDOLayerV {
-public:
+  public:
     using S = int;
     using V = float;
     using COL_TYPE = uint32_t;
     using VT = DeltaCSRBiValues<V>;
 
     SparseLinearWeightsDelta<S, VT, COL_TYPE> weights;
-    std::vector<V>            neuron_input_accum;
-    std::vector<V>            neuron_grad_accum;
-    std::vector<V>            output_buf;
-    int                       num_cpus;
+    std::vector<V> neuron_input_accum;
+    std::vector<V> neuron_grad_accum;
+    std::vector<V> output_buf;
+    int num_cpus;
 
     std::vector<V> _last_input;
-    S              _last_batch = 0;
-    S              _last_cols  = 0;
-    std::size_t    _idx_budget_bytes = 4096;
-    std::size_t    _val_budget_nnz   = 64;
+    S _last_batch = 0;
+    S _last_cols = 0;
+    std::size_t _idx_budget_bytes = 4096;
+    std::size_t _val_budget_nnz = 64;
 
     // ── Amortized decoupled L2 decay + stats (direct instruction) ───────────
     // Persistent rolling cursor over the flat weights.connections.values[0]
@@ -1248,58 +1277,56 @@ public:
     // already has its own adaptive scale, coupling decay through it would
     // repeat the exact Adam-vs-AdamW mistake (fast-moving synapses would
     // decay disproportionately faster).
-    std::size_t _decay_cursor  = 0;
-    double      _decay_sum_abs = 0.0;
-    double      _decay_sum_sq  = 0.0;
-    double      _decay_max_abs = 0.0;
-    std::size_t _decay_n       = 0;
+    std::size_t _decay_cursor = 0;
+    double _decay_sum_abs = 0.0;
+    double _decay_sum_sq = 0.0;
+    double _decay_max_abs = 0.0;
+    std::size_t _decay_n = 0;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus),
-          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
-          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
-    {
+        : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz(static_cast<std::size_t>(max_weights) + 64) {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
         std::vector<S> empty_idx;
         std::vector<V> empty_w, empty_imp;
         weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
-            empty_ptrs, empty_idx, empty_w, empty_imp,
-            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
-            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            empty_ptrs, empty_idx, empty_w, empty_imp, static_cast<std::size_t>(n_inputs),
+            static_cast<std::size_t>(n_outputs), static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
         // Real, enforced cap -- see SparseLinearLayer's identical fix
         // for why (max_indices_bytes/max_values_bytes default to
         // SIZE_MAX otherwise, making reserve_indices/reserve_values a
         // no-op check).
-        weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.connections.set_limits(_idx_budget_bytes,
+                                       ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
-        neuron_input_accum.assign(n_inputs,  V(0));
-        neuron_grad_accum .assign(n_outputs, V(0));
+        neuron_input_accum.assign(n_inputs, V(0));
+        neuron_grad_accum.assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
-    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_inputs() const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    S nnz() const {
+        return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
+    }
     Block4View block4() { return Block4View(weights.block4); }
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
     // explicit backward argument now instead of an engine-side cache.
     py::array_t<V> forward(py::array_t<V> x) {
-        auto xbuf     = x.request();
-        _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        auto xbuf = x.request();
+        _last_batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        _last_cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
-        const V* src  = (V*)xbuf.ptr;
+        const V* src = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
-        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), num_cpus);
+        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights, output_buf.data(),
+                                        num_cpus);
 
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
         std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
@@ -1310,26 +1337,22 @@ public:
     // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above)
     // and on why `x` is now an explicit argument.
     py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                             bool lr_per_row_nnz = false,
-                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
-                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                             V max_ci = kSynapsePolicyMaxCi,
-                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f,
+                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                            V max_ci = kSynapsePolicyMaxCi,
+                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
-        auto xbuf  = x.request();
+        auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         std::vector<V> dx(batch * cols, V(0));
         disldo_backward<S, VT, COL_TYPE>(
-            (V*)xbuf.ptr, batch, cols,
-            (V*)dybuf.ptr, weights,
-            dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            (V*)xbuf.ptr, batch, cols, (V*)dybuf.ptr, weights, dx.data(), neuron_input_accum.data(),
+            neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
+            beta2, eps, kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -1355,17 +1378,16 @@ public:
         auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
         const S nz = (S)ib.size;
         CSRInput<S, V> csr;
-        csr.rows = batch; csr.cols = cols;
-        csr.ptrs[0]    = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
+        csr.rows = batch;
+        csr.cols = cols;
+        csr.ptrs[0] = std::make_shared<std::vector<S>>((S*)pb.ptr, (S*)pb.ptr + batch + 1);
         csr.indices[0] = std::make_shared<std::vector<S>>((S*)ib.ptr, (S*)ib.ptr + nz);
-        csr.values[0]  = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
+        csr.values[0] = std::make_shared<std::vector<V>>((V*)vb.ptr, (V*)vb.ptr + nz);
         return csr;
     }
 
-    py::array_t<V> forward_sparse(
-        py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
-        S batch)
-    {
+    py::array_t<V> forward_sparse(py::array_t<S> ptrs, py::array_t<S> indices,
+                                  py::array_t<V> values, S batch) {
         auto input = _numpy_to_csr_input(ptrs, indices, values, batch, n_inputs());
         output_buf.assign(batch * n_outputs(), V(0));
         sisldo_forward<S, VT, COL_TYPE>(input, weights, output_buf.data(), num_cpus);
@@ -1374,25 +1396,23 @@ public:
         return result;
     }
 
-    py::array_t<V> backward_sparse(
-        py::array_t<V> x,   // DENSE input -- see class comment for why
-        py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values,
-        S batch, V learning_rate = 0.01f, bool lr_per_row_nnz = false,
-        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
-        V min_decay_frac = kSynapsePolicyMinDecayFrac,
-        V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-        V max_ci = kSynapsePolicyMaxCi,
-        bool scale_invariant = kSynapsePolicyScaleInvariant)
-    {
+    py::array_t<V> backward_sparse(py::array_t<V> x, // DENSE input -- see class comment for why
+                                   py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
+                                   py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
+                                   bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                                   V beta2 = 0.999f, V eps = 1e-8f,
+                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                                   V max_ci = kSynapsePolicyMaxCi,
+                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
         disldo_backward_sparse_grad<S, VT, COL_TYPE>(
-            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+            (V*)xbuf.ptr, batch, weights, out_grad, dx.data(), neuron_input_accum.data(),
+            neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
+            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1412,35 +1432,33 @@ public:
     // around only so the dict always has a valid shape).
     py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
         auto stats = apply_amortized_decay_stats<VT, V>(
-            weights.connections.values, _decay_cursor,
-            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
-            static_cast<std::size_t>(chunk_size), decay_factor);
+            weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
+            _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
         py::dict out;
-        out["mean_abs"]       = stats.mean_abs;
-        out["rms"]            = stats.rms;
-        out["max_abs"]        = stats.max_abs;
-        out["n"]              = stats.n;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
         out["cycle_complete"] = stats.cycle_complete;
         return out;
     }
 
     void build_probes(S k, bool per_row = false) {
-        delta_csr_build_probes<S, VT, COL_TYPE>(
-            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
+        delta_csr_build_probes<S, VT, COL_TYPE>(weights, neuron_input_accum.data(),
+                                                neuron_grad_accum.data(), k, per_row);
     }
     bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
         std::size_t row = static_cast<std::size_t>(current_row);
-        return delta_csr_synap_row_step<S, VT, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+        return delta_csr_synap_row_step<S, VT, COL_TYPE>(weights, row, importance_cutoff,
+                                                         max_row_weights);
     }
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
-        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+        std::fill(neuron_grad_accum.begin(), neuron_grad_accum.end(), V(0));
     }
-    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                      py::array_t<V> vals,  py::array_t<V> imp) {
-        auto pb=ptrs.request(), ib=indices.request(),
-             vb=vals.request(), impb=imp.request();
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> vals,
+                      py::array_t<V> imp) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = vals.request(), impb = imp.request();
         const std::size_t rows = weights.connections.layout.rows;
         const std::size_t cols = weights.connections.layout.cols;
         std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
@@ -1448,48 +1466,53 @@ public:
         std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
         std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
         const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
-        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
-        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
-            p, idx, w, imp_v, rows, cols, idx_budget, val_budget);
+        const std::size_t val_budget = std::max(_val_budget_nnz, idx.size() + 64);
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(p, idx, w, imp_v, rows, cols,
+                                                                       idx_budget, val_budget);
         // See SparseLinearLayer::load_weights' identical fix/comment.
         _idx_budget_bytes = idx_budget;
-        _val_budget_nnz   = val_budget;
-        weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        _val_budget_nnz = val_budget;
+        weights.connections.set_limits(_idx_budget_bytes,
+                                       ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
     }
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
-        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
-                              neuron_input_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)}, neuron_input_accum.data(),
+                              py::cast(this));
+    }
     py::array_t<V> get_neuron_grad_accum() {
-        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
-                              neuron_grad_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)}, neuron_grad_accum.data(),
+                              py::cast(this));
+    }
     py::array_t<V> get_weights_vals() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
@@ -1534,50 +1557,47 @@ public:
 // disldo_backward<...> call site actually differs between them.
 template <typename ScalePolicy = RMSpropScalePolicy<float>, bool DeferredScaleWrite = false>
 class SparseLinearLayer8Impl {
-public:
+  public:
     using S = int;
     using V = float;
     using COL_TYPE = uint32_t;
     using VT = FP8BiValues;
 
     SparseLinearWeightsDelta<S, VT, COL_TYPE> weights;
-    std::vector<V>            neuron_input_accum;
-    std::vector<V>            neuron_grad_accum;
-    std::vector<V>            output_buf;
-    int                       num_cpus;
+    std::vector<V> neuron_input_accum;
+    std::vector<V> neuron_grad_accum;
+    std::vector<V> output_buf;
+    int num_cpus;
 
     std::vector<V> _last_input;
-    S              _last_batch = 0;
-    S              _last_cols  = 0;
-    std::size_t    _idx_budget_bytes = 4096;
-    std::size_t    _val_budget_nnz   = 64;
+    S _last_batch = 0;
+    S _last_cols = 0;
+    std::size_t _idx_budget_bytes = 4096;
+    std::size_t _val_budget_nnz = 64;
 
     // ── Amortized decoupled decay + stats -- see DISLDOLayerV's own comment
     // (cpu_backend.cpp) for the full rationale; same mechanism generalized
     // across all VALUES_TYPEs via ValueAccessor (delta_csr_types.hpp).
-    std::size_t _decay_cursor  = 0;
-    double      _decay_sum_abs = 0.0;
-    double      _decay_sum_sq  = 0.0;
-    double      _decay_max_abs = 0.0;
-    std::size_t _decay_n       = 0;
+    std::size_t _decay_cursor = 0;
+    double _decay_sum_abs = 0.0;
+    double _decay_sum_sq = 0.0;
+    double _decay_max_abs = 0.0;
+    std::size_t _decay_n = 0;
 
     SparseLinearLayer8Impl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
-        : num_cpus(cpus),
-          _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
-          _val_budget_nnz  (static_cast<std::size_t>(max_weights) + 64)
-    {
+        : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
+          _val_budget_nnz(static_cast<std::size_t>(max_weights) + 64) {
         std::vector<S> empty_ptrs(static_cast<std::size_t>(n_inputs) + 1, S(0));
         std::vector<S> empty_idx;
         std::vector<V> empty_w, empty_imp;
         weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
-            empty_ptrs, empty_idx, empty_w, empty_imp,
-            static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs),
-            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            empty_ptrs, empty_idx, empty_w, empty_imp, static_cast<std::size_t>(n_inputs),
+            static_cast<std::size_t>(n_outputs), static_cast<std::size_t>(max_weights) * 8 + 4096,
             static_cast<std::size_t>(max_weights) + 64);
-        weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
-        weights.block4.init(static_cast<std::size_t>(n_inputs), static_cast<std::size_t>(n_outputs));
+        weights.connections.set_limits(_idx_budget_bytes,
+                                       ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.block4.init(static_cast<std::size_t>(n_inputs),
+                            static_cast<std::size_t>(n_outputs));
         // Same budget-sizing convention as SparseLinearLayer's (FP4)
         // constructor -- tile COUNT budget identical (max_weights synapses
         // at max fill of BLOCK4_TILE_SLOTS=16/tile), but multiplied by
@@ -1586,18 +1606,21 @@ public:
         // argument actually budgets (tile_data bytes, not tile count).
         weights.block4.set_limits(
             static_cast<std::size_t>(max_weights) * 8 + 4096,
-            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS8_BYTES);
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) *
+                BLOCK4_TILE_SLOTS8_BYTES);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
-        neuron_input_accum.assign(n_inputs,  V(0));
-        neuron_grad_accum .assign(n_outputs, V(0));
+        neuron_input_accum.assign(n_inputs, V(0));
+        neuron_grad_accum.assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
     }
 
-    S n_inputs()  const { return static_cast<S>(weights.connections.layout.rows); }
+    S n_inputs() const { return static_cast<S>(weights.connections.layout.rows); }
     S n_outputs() const { return static_cast<S>(weights.connections.layout.cols); }
-    S nnz()       const { return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses()); }
+    S nnz() const {
+        return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
+    }
     Block4View8 block4() { return Block4View8(weights.block4); }
 
     // Per-ROW/per-COLUMN (rank-1) scale -- true_w = stored_w *
@@ -1610,10 +1633,18 @@ public:
     // toy-model sweep -- output_scale only becomes gradient-trainable in
     // backward() once set_output_scale_raw has been called at least once
     // (see SparseLinearLayer's own identical set_output_scale_raw docstring).
-    V get_value_scale(S row)  const { return weights.get_value_scale(static_cast<std::size_t>(row)); }
-    V get_output_scale(S col) const { return weights.get_output_scale(static_cast<std::size_t>(col)); }
-    void set_value_scale_raw(S row, V scale)  { weights.set_value_scale_raw(static_cast<std::size_t>(row), scale); }
-    void set_output_scale_raw(S col, V scale) { weights.set_output_scale_raw(static_cast<std::size_t>(col), scale); }
+    V get_value_scale(S row) const {
+        return weights.get_value_scale(static_cast<std::size_t>(row));
+    }
+    V get_output_scale(S col) const {
+        return weights.get_output_scale(static_cast<std::size_t>(col));
+    }
+    void set_value_scale_raw(S row, V scale) {
+        weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+    }
+    void set_output_scale_raw(S col, V scale) {
+        weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+    }
     void magnitude_rescale_output(V target, V correction_rate, bool scale_invariant) {
         weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
     }
@@ -1640,17 +1671,37 @@ public:
     void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank) {
         weights.reserve_scale_rank_scratch(threads, rank, BLOCK4_TILE);
     }
-    V get_value_scale_k(S row, S k)  const { return weights.get_value_scale_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k)); }
-    V get_output_scale_k(S col, S k) const { return weights.get_output_scale_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k)); }
-    void set_value_scale_raw_k(S row, S k, V v)  { weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k), v); }
-    void set_output_scale_raw_k(S col, S k, V v) { weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k), v); }
+    V get_value_scale_k(S row, S k) const {
+        return weights.get_value_scale_k(static_cast<std::size_t>(row),
+                                         static_cast<std::size_t>(k));
+    }
+    V get_output_scale_k(S col, S k) const {
+        return weights.get_output_scale_k(static_cast<std::size_t>(col),
+                                          static_cast<std::size_t>(k));
+    }
+    void set_value_scale_raw_k(S row, S k, V v) {
+        weights.set_value_scale_raw_k(static_cast<std::size_t>(row), static_cast<std::size_t>(k),
+                                      v);
+    }
+    void set_output_scale_raw_k(S col, S k, V v) {
+        weights.set_output_scale_raw_k(static_cast<std::size_t>(col), static_cast<std::size_t>(k),
+                                       v);
+    }
     // Bulk raw-vector accessors (task #295 follow-up / #286 virtual
     // -neuron exposure) -- see weights.get_value_scale_raw_vector's own
     // docstring, delta_csr_types.hpp.
-    std::vector<V> get_value_scale_raw_vector() const { return weights.get_value_scale_raw_vector(); }
-    void set_value_scale_raw_vector(const std::vector<V>& v) { weights.set_value_scale_raw_vector(v); }
-    std::vector<V> get_output_scale_raw_vector() const { return weights.get_output_scale_raw_vector(); }
-    void set_output_scale_raw_vector(const std::vector<V>& v) { weights.set_output_scale_raw_vector(v); }
+    std::vector<V> get_value_scale_raw_vector() const {
+        return weights.get_value_scale_raw_vector();
+    }
+    void set_value_scale_raw_vector(const std::vector<V>& v) {
+        weights.set_value_scale_raw_vector(v);
+    }
+    std::vector<V> get_output_scale_raw_vector() const {
+        return weights.get_output_scale_raw_vector();
+    }
+    void set_output_scale_raw_vector(const std::vector<V>& v) {
+        weights.set_output_scale_raw_vector(v);
+    }
 
     // AQRS additive branch -- see SparseLinearLayerImpl's own (FP4)
     // identical block for the full rationale. This is what task #280
@@ -1678,62 +1729,85 @@ public:
     // Bulk raw-vector accessors -- see weights.get_additive_u_raw_vector's
     // own docstring, delta_csr_types.hpp.
     std::vector<V> get_additive_u_raw_vector() const { return weights.get_additive_u_raw_vector(); }
-    void set_additive_u_raw_vector(const std::vector<V>& v) { weights.set_additive_u_raw_vector(v); }
+    void set_additive_u_raw_vector(const std::vector<V>& v) {
+        weights.set_additive_u_raw_vector(v);
+    }
     std::vector<V> get_additive_v_raw_vector() const { return weights.get_additive_v_raw_vector(); }
-    void set_additive_v_raw_vector(const std::vector<V>& v) { weights.set_additive_v_raw_vector(v); }
+    void set_additive_v_raw_vector(const std::vector<V>& v) {
+        weights.set_additive_v_raw_vector(v);
+    }
 
     // AQRS dynamic rank control (task #291) -- same as SparseLinearLayer
     // (FP4)'s own copy above, see its docstring for the full rationale.
     std::mt19937 _dynamic_rank_rng{std::random_device{}()};
     void seed_dynamic_rank_rng(uint32_t seed) { _dynamic_rank_rng.seed(seed); }
-    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                    V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 50,
+    bool apply_dynamic_rank_control(V tau_death, V tau_active, V theta, V seed_scale = 0.05f,
+                                    uint32_t grow_grace_period_steps = 50,
                                     uint32_t shrink_grace_period_steps = 50) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
-        return weights.apply_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
-            [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            grow_grace_period_steps, shrink_grace_period_steps);
+        return weights.apply_dynamic_rank_control(
+            n_rows, n_cols, tau_death, tau_active, theta,
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grow_grace_period_steps,
+            shrink_grace_period_steps);
     }
     bool apply_additive_dynamic_rank_control(V tau_death, V tau_active, V theta,
-                                             V seed_scale = 0.05f, uint32_t grow_grace_period_steps = 5000,
+                                             V seed_scale = 0.05f,
+                                             uint32_t grow_grace_period_steps = 5000,
                                              uint32_t shrink_grace_period_steps = 5000) {
         std::normal_distribution<V> dist(V(0), seed_scale);
         const std::size_t n_rows = weights.connections.layout.rows;
         const std::size_t n_cols = weights.connections.layout.cols;
-        return weights.apply_additive_dynamic_rank_control(n_rows, n_cols, tau_death, tau_active, theta,
+        return weights.apply_additive_dynamic_rank_control(
+            n_rows, n_cols, tau_death, tau_active, theta,
             [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            [&](std::size_t) { return dist(_dynamic_rank_rng); },
-            grow_grace_period_steps, shrink_grace_period_steps);
+            [&](std::size_t) { return dist(_dynamic_rank_rng); }, grow_grace_period_steps,
+            shrink_grace_period_steps);
     }
 
     // AQRS gamma raw get/set + EMA diagnostics -- same as SparseLinearLayer
     // (FP4)'s own copy above, see its comment for the full rationale
     // (task #293 fix: these were never exposed via pybind, so gamma
     // tracking never actually activated).
-    V get_scale_gamma_k(S k) const { return weights.get_scale_gamma_k(static_cast<std::size_t>(k)); }
-    void set_scale_gamma_raw_k(S k, V v) { weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v); }
-    V get_scale_gamma_abs_ema_k(S k) const { return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
-    V get_scale_gamma_grad_ema_k(S k) const { return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
-    V get_additive_gamma_k(S k) const { return weights.get_additive_gamma_k(static_cast<std::size_t>(k)); }
-    void set_additive_gamma_raw_k(S k, V v) { weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v); }
-    V get_additive_gamma_abs_ema_k(S k) const { return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k)); }
-    V get_additive_gamma_grad_ema_k(S k) const { return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k)); }
+    V get_scale_gamma_k(S k) const {
+        return weights.get_scale_gamma_k(static_cast<std::size_t>(k));
+    }
+    void set_scale_gamma_raw_k(S k, V v) {
+        weights.set_scale_gamma_raw_k(static_cast<std::size_t>(k), v);
+    }
+    V get_scale_gamma_abs_ema_k(S k) const {
+        return weights.get_scale_gamma_abs_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_scale_gamma_grad_ema_k(S k) const {
+        return weights.get_scale_gamma_grad_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_additive_gamma_k(S k) const {
+        return weights.get_additive_gamma_k(static_cast<std::size_t>(k));
+    }
+    void set_additive_gamma_raw_k(S k, V v) {
+        weights.set_additive_gamma_raw_k(static_cast<std::size_t>(k), v);
+    }
+    V get_additive_gamma_abs_ema_k(S k) const {
+        return weights.get_additive_gamma_abs_ema_k(static_cast<std::size_t>(k));
+    }
+    V get_additive_gamma_grad_ema_k(S k) const {
+        return weights.get_additive_gamma_grad_ema_k(static_cast<std::size_t>(k));
+    }
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
     // explicit backward argument now instead of an engine-side cache.
     py::array_t<V> forward(py::array_t<V> x) {
-        auto xbuf     = x.request();
-        _last_batch   = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        _last_cols    = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        auto xbuf = x.request();
+        _last_batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        _last_cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
 
-        const V* src  = (V*)xbuf.ptr;
+        const V* src = (V*)xbuf.ptr;
         _last_input.assign(src, src + _last_batch * _last_cols);
 
         output_buf.assign(_last_batch * n_outputs(), V(0));
-        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights,
-                       output_buf.data(), num_cpus);
+        disldo_forward<S, VT, COL_TYPE>(src, _last_batch, _last_cols, weights, output_buf.data(),
+                                        num_cpus);
 
         py::array_t<V> result({(py::ssize_t)_last_batch, (py::ssize_t)n_outputs()});
         std::copy(output_buf.begin(), output_buf.end(), result.mutable_data());
@@ -1744,26 +1818,22 @@ public:
     // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above)
     // and on why `x` is now an explicit argument.
     py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                             bool lr_per_row_nnz = false,
-                             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
-                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                             V max_ci = kSynapsePolicyMaxCi,
-                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f,
+                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                            V max_ci = kSynapsePolicyMaxCi,
+                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
-        auto xbuf  = x.request();
+        auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
-        const S cols  = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         std::vector<V> dx(batch * cols, V(0));
         disldo_backward<S, VT, COL_TYPE, ScalePolicy, DeferredScaleWrite>(
-            (V*)xbuf.ptr, batch, cols,
-            (V*)dybuf.ptr, weights,
-            dx.data(),
-            neuron_input_accum.data(), neuron_grad_accum.data(),
-            learning_rate,
-            num_cpus, lr_per_row_nnz, damp_by_importance, beta2, eps,
-            kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
+            (V*)xbuf.ptr, batch, cols, (V*)dybuf.ptr, weights, dx.data(), neuron_input_accum.data(),
+            neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
+            beta2, eps, kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
             kSynapsePolicyZeroEscapeEps, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
@@ -1779,35 +1849,33 @@ public:
     // (reuses the same ValueAccessor-generic template DISLDOLayerV uses).
     py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
         auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
-            weights.connections.values, _decay_cursor,
-            _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
-            static_cast<std::size_t>(chunk_size), decay_factor);
+            weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
+            _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
         py::dict out;
-        out["mean_abs"]       = stats.mean_abs;
-        out["rms"]            = stats.rms;
-        out["max_abs"]        = stats.max_abs;
-        out["n"]              = stats.n;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
         out["cycle_complete"] = stats.cycle_complete;
         return out;
     }
 
     void build_probes(S k, bool per_row = false) {
-        delta_csr_build_probes<S, VT, COL_TYPE>(
-            weights, neuron_input_accum.data(), neuron_grad_accum.data(), k, per_row);
+        delta_csr_build_probes<S, VT, COL_TYPE>(weights, neuron_input_accum.data(),
+                                                neuron_grad_accum.data(), k, per_row);
     }
     bool synap_row_step(S current_row, V importance_cutoff, S max_row_weights) {
         std::size_t row = static_cast<std::size_t>(current_row);
-        return delta_csr_synap_row_step<S, VT, COL_TYPE>(
-            weights, row, importance_cutoff, max_row_weights);
+        return delta_csr_synap_row_step<S, VT, COL_TYPE>(weights, row, importance_cutoff,
+                                                         max_row_weights);
     }
     void zero_accum() {
         std::fill(neuron_input_accum.begin(), neuron_input_accum.end(), V(0));
-        std::fill(neuron_grad_accum .begin(), neuron_grad_accum .end(), V(0));
+        std::fill(neuron_grad_accum.begin(), neuron_grad_accum.end(), V(0));
     }
-    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices,
-                      py::array_t<V> vals,  py::array_t<V> imp) {
-        auto pb=ptrs.request(), ib=indices.request(),
-             vb=vals.request(), impb=imp.request();
+    void load_weights(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> vals,
+                      py::array_t<V> imp) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = vals.request(), impb = imp.request();
         const std::size_t rows = weights.connections.layout.rows;
         const std::size_t cols = weights.connections.layout.cols;
         std::vector<S> p((S*)pb.ptr, (S*)pb.ptr + pb.size);
@@ -1815,25 +1883,25 @@ public:
         std::vector<V> w((V*)vb.ptr, (V*)vb.ptr + vb.size);
         std::vector<V> imp_v((V*)impb.ptr, (V*)impb.ptr + impb.size);
         const std::size_t idx_budget = std::max(_idx_budget_bytes, idx.size() * 8 + 4096);
-        const std::size_t val_budget = std::max(_val_budget_nnz,   idx.size() + 64);
-        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(
-            p, idx, w, imp_v, rows, cols, idx_budget, val_budget);
+        const std::size_t val_budget = std::max(_val_budget_nnz, idx.size() + 64);
+        weights.connections = delta_csr_from_absolute<S, VT, COL_TYPE>(p, idx, w, imp_v, rows, cols,
+                                                                       idx_budget, val_budget);
         _idx_budget_bytes = idx_budget;
-        _val_budget_nnz   = val_budget;
-        weights.connections.set_limits(
-            _idx_budget_bytes,
-            ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        _val_budget_nnz = val_budget;
+        weights.connections.set_limits(_idx_budget_bytes,
+                                       ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
         weights.recompute_stats();
     }
 
     // See SparseLinearLayerImpl::load_dense_codes' docstring (this file) --
     // same loading-only contract, FP8 (E4M3) codes instead of FP4 nibbles.
-    void load_dense_codes(py::array_t<uint8_t> weight_codes, py::array_t<uint8_t> importance_codes) {
+    void load_dense_codes(py::array_t<uint8_t> weight_codes,
+                          py::array_t<uint8_t> importance_codes) {
         auto wb = weight_codes.request(), ib = importance_codes.request();
         const std::size_t rows = weights.connections.layout.rows;
         const std::size_t cols = weights.connections.layout.cols;
-        block4_load_dense<S, VT, COL_TYPE>(
-            weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr, rows, cols);
+        block4_load_dense<S, VT, COL_TYPE>(weights, (const uint8_t*)wb.ptr, (const uint8_t*)ib.ptr,
+                                           rows, cols);
         // Every row connects to every column -- out_degree[c] = rows for
         // every c, matching the FP4 load_dense_codes' own precedent above
         // (needed for output_scale's gradient, see disldo_backward's
@@ -1845,34 +1913,40 @@ public:
 
     // ── Zero-copy numpy views ────────────────────────────────────────────────
     py::array_t<V> get_neuron_input_accum() {
-        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)},
-                              neuron_input_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_inputs()}, {sizeof(V)}, neuron_input_accum.data(),
+                              py::cast(this));
+    }
     py::array_t<V> get_neuron_grad_accum() {
-        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)},
-                              neuron_grad_accum.data(), py::cast(this)); }
+        return py::array_t<V>({(py::ssize_t)n_outputs()}, {sizeof(V)}, neuron_grad_accum.data(),
+                              py::cast(this));
+    }
     py::array_t<V> get_weights_vals() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)ow.size());
         std::copy(ow.begin(), ow.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<V> get_importance() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<V> result((py::ssize_t)oimp.size());
         std::copy(oimp.begin(), oimp.end(), (V*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_indices() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)oi.size());
         std::copy(oi.begin(), oi.end(), (S*)result.request().ptr);
         return result;
     }
     py::array_t<S> get_ptrs() {
-        std::vector<S> op, oi; std::vector<V> ow, oimp;
+        std::vector<S> op, oi;
+        std::vector<V> ow, oimp;
         delta_csr_combined_to_absolute<S, VT, COL_TYPE>(weights, op, oi, ow, oimp);
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
@@ -1886,106 +1960,105 @@ public:
 // value_scale/output_scale's staleness (Resync) and/or its update rule
 // (AdaMax) closes the out-of-context gap found in sili_peridot's toy
 // simulation -- see delta_csr_types.hpp's ScalePolicy docstring.
-using SparseLinearLayer8       = SparseLinearLayer8Impl<>;
+using SparseLinearLayer8 = SparseLinearLayer8Impl<>;
 using SparseLinearLayer8Resync = SparseLinearLayer8Impl<RMSpropScalePolicy<float>, true>;
 using SparseLinearLayer8AdaMax = SparseLinearLayer8Impl<AdaMaxScalePolicy<float>, true>;
 
-PYBIND11_MODULE(_cpu, m)
-{
+PYBIND11_MODULE(_cpu, m) {
     // ── Block4View ────────────────────────────────────────────────────────────
     py::class_<Block4View>(m, "Block4View")
-        .def_property_readonly("tiles",    &Block4View::tiles,
-             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("tiles", &Block4View::tiles,
+                               "Number of block4 tiles currently promoted -- purely observational.")
         .def_property_readonly("synapses", &Block4View::synapses,
-             "Number of synapses currently living in block4 (subset of nnz) --"
-             " purely observational.")
+                               "Number of synapses currently living in block4 (subset of nnz) --"
+                               " purely observational.")
         .def_property("switch_point", &Block4View::get_switch_point, &Block4View::set_switch_point,
-             "Tiles with <= switch_point live synapses may be packed into the"
-             " sparse-encoded tile layout instead of staying fully dense (see"
-             " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
-             " 0 disables compression entirely. Default 10.")
+                      "Tiles with <= switch_point live synapses may be packed into the"
+                      " sparse-encoded tile layout instead of staying fully dense (see"
+                      " block4.hpp: Block4Store::switch_point, Block4Store::maybe_compress)."
+                      " 0 disables compression entirely. Default 10.")
         .def_property_readonly("dropped_growth_events", &Block4View::dropped_growth_events,
-             "Count of backward/promotion value-updates to an existing tile that"
-             " couldn't be persisted because growing its storage would have"
-             " exceeded the memory budget -- declined (with the tile keeping its"
-             " old value), not thrown, so training keeps running. Nonzero means"
-             " some updates are being silently dropped under the current budget.")
+                               "Count of backward/promotion value-updates to an existing tile that"
+                               " couldn't be persisted because growing its storage would have"
+                               " exceeded the memory budget -- declined (with the tile keeping its"
+                               " old value), not thrown, so training keeps running. Nonzero means"
+                               " some updates are being silently dropped under the current budget.")
         .def_property_readonly("row_merge_overflow_events", &Block4View::row_merge_overflow_events,
-             "Count of backward() calls where a row's block4 write-back couldn't"
-             " fit its full content within the row's existing headroom, even"
-             " after evicting every low-importance synapse it could (each"
-             " distinct block-column touched needs >=1 byte of structural"
-             " overhead that eviction alone can't shrink away). Declined, not"
-             " thrown -- the row's trailing tiles keep their pre-call content"
-             " and training keeps running. Nonzero means this layer's"
-             " max_row_weights genuinely needs expand_headroom_to() with a"
-             " bigger budget.")
+                               "Count of backward() calls where a row's block4 write-back couldn't"
+                               " fit its full content within the row's existing headroom, even"
+                               " after evicting every low-importance synapse it could (each"
+                               " distinct block-column touched needs >=1 byte of structural"
+                               " overhead that eviction alone can't shrink away). Declined, not"
+                               " thrown -- the row's trailing tiles keep their pre-call content"
+                               " and training keeps running. Nonzero means this layer's"
+                               " max_row_weights genuinely needs expand_headroom_to() with a"
+                               " bigger budget.")
         .def_property_readonly("row_merge_overflow_bytes_dropped",
-             &Block4View::row_merge_overflow_bytes_dropped,
-             "Cumulative bytes of intended row content dropped by"
-             " row_merge_overflow_events, across every occurrence.")
+                               &Block4View::row_merge_overflow_bytes_dropped,
+                               "Cumulative bytes of intended row content dropped by"
+                               " row_merge_overflow_events, across every occurrence.")
         .def_property_readonly("used_bytes", &Block4View::used_bytes,
-             "Real bytes of ACTUAL tile content currently live (sparse-vs-dense"
-             " per tile, exactly what merge_row_workspace itself would compute)."
-             " Compare against n_in*n_out to see the real compression ratio at"
-             " the current sparsity level.")
+                               "Real bytes of ACTUAL tile content currently live (sparse-vs-dense"
+                               " per tile, exactly what merge_row_workspace itself would compute)."
+                               " Compare against n_in*n_out to see the real compression ratio at"
+                               " the current sparsity level.")
         .def_property_readonly("alloc_bytes", &Block4View::alloc_bytes,
-             "Current capacity of the tile_data buffer -- used_bytes plus"
-             " whatever per-row growth headroom is currently reserved but not"
-             " yet live (e.g. block4_expand_headroom's blank_fraction slack)."
-             " The gap (alloc_bytes - used_bytes) is the real memory cost of"
-             " allowing rows room to grow.");
+                               "Current capacity of the tile_data buffer -- used_bytes plus"
+                               " whatever per-row growth headroom is currently reserved but not"
+                               " yet live (e.g. block4_expand_headroom's blank_fraction slack)."
+                               " The gap (alloc_bytes - used_bytes) is the real memory cost of"
+                               " allowing rows room to grow.");
 
     // ── Block4View8 (FP8 counterpart, real bug found+fixed: this class was
     //    never registered here, so SparseLinearLayer8.block4 raised
     //    "Unregistered type" from Python despite compiling fine in C++) ──
     py::class_<Block4View8>(m, "Block4View8")
-        .def_property_readonly("tiles",    &Block4View8::tiles,
-             "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("tiles", &Block4View8::tiles,
+                               "Number of block4 tiles currently promoted -- purely observational.")
         .def_property_readonly("synapses", &Block4View8::synapses,
-             "Number of synapses currently living in block4 (subset of nnz) --"
-             " purely observational.")
-        .def_property("switch_point", &Block4View8::get_switch_point, &Block4View8::set_switch_point,
-             "Tiles with <= switch_point live synapses may be packed into the"
-             " sparse-encoded tile layout instead of staying fully dense (see"
-             " block4.hpp: Block4Store8::switch_point, Block4Store8::maybe_compress)."
-             " 0 disables compression entirely. Default BLOCK4_SPARSE_MAX_COUNT8 (12).")
+                               "Number of synapses currently living in block4 (subset of nnz) --"
+                               " purely observational.")
+        .def_property("switch_point", &Block4View8::get_switch_point,
+                      &Block4View8::set_switch_point,
+                      "Tiles with <= switch_point live synapses may be packed into the"
+                      " sparse-encoded tile layout instead of staying fully dense (see"
+                      " block4.hpp: Block4Store8::switch_point, Block4Store8::maybe_compress)."
+                      " 0 disables compression entirely. Default BLOCK4_SPARSE_MAX_COUNT8 (12).")
         .def_property_readonly("dropped_growth_events", &Block4View8::dropped_growth_events,
-             "Count of backward/promotion value-updates to an existing tile that"
-             " couldn't be persisted because growing its storage would have"
-             " exceeded the memory budget -- declined (with the tile keeping its"
-             " old value), not thrown, so training keeps running. Nonzero means"
-             " some updates are being silently dropped under the current budget.")
+                               "Count of backward/promotion value-updates to an existing tile that"
+                               " couldn't be persisted because growing its storage would have"
+                               " exceeded the memory budget -- declined (with the tile keeping its"
+                               " old value), not thrown, so training keeps running. Nonzero means"
+                               " some updates are being silently dropped under the current budget.")
         .def_property_readonly("row_merge_overflow_events", &Block4View8::row_merge_overflow_events,
-             "Count of backward() calls where a row's block4 write-back couldn't"
-             " fit its full content within the row's existing headroom, even"
-             " after evicting every low-importance synapse it could. Declined,"
-             " not thrown -- the row's trailing tiles keep their pre-call"
-             " content and training keeps running. Nonzero means this layer's"
-             " max_row_weights genuinely needs expand_headroom_to() with a"
-             " bigger budget.")
+                               "Count of backward() calls where a row's block4 write-back couldn't"
+                               " fit its full content within the row's existing headroom, even"
+                               " after evicting every low-importance synapse it could. Declined,"
+                               " not thrown -- the row's trailing tiles keep their pre-call"
+                               " content and training keeps running. Nonzero means this layer's"
+                               " max_row_weights genuinely needs expand_headroom_to() with a"
+                               " bigger budget.")
         .def_property_readonly("row_merge_overflow_bytes_dropped",
-             &Block4View8::row_merge_overflow_bytes_dropped,
-             "Cumulative bytes of intended row content dropped by"
-             " row_merge_overflow_events, across every occurrence.");
+                               &Block4View8::row_merge_overflow_bytes_dropped,
+                               "Cumulative bytes of intended row content dropped by"
+                               " row_merge_overflow_events, across every occurrence.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
     py::class_<SparseLinearLayer>(m, "SparseLinearLayer")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("get_scale_rank",       &SparseLinearLayer::get_scale_rank)
-        .def("set_scale_rank",       &SparseLinearLayer::set_scale_rank, py::arg("rank"))
-        .def("get_additive_rank",    &SparseLinearLayer::get_additive_rank,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("get_scale_rank", &SparseLinearLayer::get_scale_rank)
+        .def("set_scale_rank", &SparseLinearLayer::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank", &SparseLinearLayer::get_additive_rank,
              "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
              "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
              "necessary whenever a quantized weight lands on the zero sentinel\n"
              "code, where the multiplicative rank-N scale's own gradient is\n"
              "exactly zero at any rank. additive_rank defaults to 0 (fully off).")
-        .def("set_additive_rank",    &SparseLinearLayer::set_additive_rank, py::arg("rank"))
-        .def("get_scale_rank_max",    &SparseLinearLayer::get_scale_rank_max)
-        .def("set_scale_rank_max",    &SparseLinearLayer::set_scale_rank_max, py::arg("new_max"),
+        .def("set_additive_rank", &SparseLinearLayer::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max", &SparseLinearLayer::get_scale_rank_max)
+        .def("set_scale_rank_max", &SparseLinearLayer::set_scale_rank_max, py::arg("new_max"),
              "Runtime policy cap (task #295) -- replaces the old\n"
              "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
              "set_scale_rank/apply_dynamic_rank_control can grow past\n"
@@ -2000,19 +2073,21 @@ PYBIND11_MODULE(_cpu, m)
              "reallocation during training) or shrink back down (free\n"
              "capacity a layer grew into early on). threads/rank must\n"
              "not be smaller than what is currently actually in use.")
-        .def("get_additive_u_k",     &SparseLinearLayer::get_additive_u_k, py::arg("row"), py::arg("k"))
-        .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("get_additive_v_k",     &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
-        .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_k", &SparseLinearLayer::get_additive_u_k, py::arg("row"), py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer::set_additive_u_raw_k, py::arg("row"),
+             py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k", &SparseLinearLayer::get_additive_v_k, py::arg("col"), py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer::set_additive_v_raw_k, py::arg("col"),
+             py::arg("k"), py::arg("v"))
         .def("get_additive_u_raw_vector", &SparseLinearLayer::get_additive_u_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
-        .def("set_additive_u_raw_vector", &SparseLinearLayer::set_additive_u_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer::set_additive_u_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over additive_u (not a resize).")
         .def("get_additive_v_raw_vector", &SparseLinearLayer::get_additive_v_raw_vector,
              "Flat [n_out*additive_rank], row-major.")
-        .def("set_additive_v_raw_vector", &SparseLinearLayer::set_additive_v_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over additive_v (not a resize).")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer::set_additive_v_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over additive_v (not a resize).")
         .def("seed_dynamic_rank_rng", &SparseLinearLayer::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
@@ -2022,31 +2097,36 @@ PYBIND11_MODULE(_cpu, m)
              "evaluates apoptosis/neurogenesis triggers against the EMA state (updated\n"
              "automatically every backward call) and performs at most one mutation.\n"
              "Returns True if a mutation happened this call.")
-        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer::apply_additive_dynamic_rank_control,
-             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
-             py::arg("shrink_grace_period_steps") = 5000,
+        .def("apply_additive_dynamic_rank_control",
+             &SparseLinearLayer::apply_additive_dynamic_rank_control, py::arg("tau_death"),
+             py::arg("tau_active"), py::arg("theta"), py::arg("seed_scale") = 0.05f,
+             py::arg("grow_grace_period_steps") = 5000, py::arg("shrink_grace_period_steps") = 5000,
              "Additive-branch counterpart to apply_dynamic_rank_control -- same Theorem\n"
              "10 machinery, additive_gamma/additive_u/additive_v instead of scale_gamma/\n"
              "value_scale/output_scale. min_rank=0 (the additive branch can legitimately\n"
              "shrink itself back to fully off, unlike scale_rank's floor of 1).")
-        .def("get_scale_gamma_k",              &SparseLinearLayer::get_scale_gamma_k, py::arg("k"))
-        .def("set_scale_gamma_raw_k",          &SparseLinearLayer::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"),
+        .def("get_scale_gamma_k", &SparseLinearLayer::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k", &SparseLinearLayer::set_scale_gamma_raw_k, py::arg("k"),
+             py::arg("v"),
              "Also flips scale_gamma_is_trainable=true (see get_scale_gamma_k's own\n"
              "docstring) -- call this once before relying on apply_dynamic_rank_control,\n"
              "e.g. set_scale_gamma_raw_k(0, 1.0) activates tracking transparently.")
-        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer::get_scale_gamma_abs_ema_k, py::arg("k"))
-        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer::get_scale_gamma_grad_ema_k, py::arg("k"))
-        .def("get_additive_gamma_k",           &SparseLinearLayer::get_additive_gamma_k, py::arg("k"))
-        .def("set_additive_gamma_raw_k",       &SparseLinearLayer::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
-        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer::get_additive_gamma_abs_ema_k, py::arg("k"))
-        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer::get_additive_gamma_grad_ema_k, py::arg("k"))
-        .def("forward_dense",        &SparseLinearLayer::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayer::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("get_scale_gamma_abs_ema_k", &SparseLinearLayer::get_scale_gamma_abs_ema_k,
+             py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k", &SparseLinearLayer::get_scale_gamma_grad_ema_k,
+             py::arg("k"))
+        .def("get_additive_gamma_k", &SparseLinearLayer::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k", &SparseLinearLayer::set_additive_gamma_raw_k, py::arg("k"),
+             py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k", &SparseLinearLayer::get_additive_gamma_abs_ema_k,
+             py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k", &SparseLinearLayer::get_additive_gamma_grad_ema_k,
+             py::arg("k"))
+        .def("forward_dense", &SparseLinearLayer::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayer::backward_dense, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -2058,33 +2138,31 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayer::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayer::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("forward_sparse", &SparseLinearLayer::forward_sparse, py::arg("ptrs"),
+             py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayer::backward_sparse, py::arg("x"),
+             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
-        .def("build_probes",         &SparseLinearLayer::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayer::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+        .def("build_probes", &SparseLinearLayer::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayer::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayer::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+        .def("synap_step", &SparseLinearLayer::synap_step, py::arg("importance_cutoff"),
+             py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
              py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayer::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayer::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -2093,8 +2171,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayer::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -2103,160 +2180,157 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayer::compact,
+        .def("compact", &SparseLinearLayer::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayer::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayer::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayer::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayer::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
              "before synaptogenesis after a prune cycle.")
-        .def("get_importance_scale", &SparseLinearLayer::get_importance_scale,
-             py::arg("row"),
+        .def("get_importance_scale", &SparseLinearLayer::get_importance_scale, py::arg("row"),
              "Per-ROW scale applied to that row's stored importance to get true\n"
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayer::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayer::get_value_scale, py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
-        .def("get_value_scale_k",    &SparseLinearLayer::get_value_scale_k, py::arg("row"), py::arg("k"))
-        .def("get_output_scale_k",   &SparseLinearLayer::get_output_scale_k, py::arg("col"), py::arg("k"))
-        .def("set_value_scale_raw_k",  &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_k", &SparseLinearLayer::get_value_scale_k, py::arg("row"),
+             py::arg("k"))
+        .def("get_output_scale_k", &SparseLinearLayer::get_output_scale_k, py::arg("col"),
+             py::arg("k"))
+        .def("set_value_scale_raw_k", &SparseLinearLayer::set_value_scale_raw_k, py::arg("row"),
+             py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer::set_output_scale_raw_k, py::arg("col"),
+             py::arg("k"), py::arg("v"))
         .def("get_value_scale_raw_vector", &SparseLinearLayer::get_value_scale_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
-        .def("set_value_scale_raw_vector", &SparseLinearLayer::set_value_scale_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer::set_value_scale_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over value_scale (not a resize).")
         .def("get_output_scale_raw_vector", &SparseLinearLayer::get_output_scale_raw_vector,
              "Flat [n_out*scale_rank], row-major.")
-        .def("set_output_scale_raw_vector", &SparseLinearLayer::set_output_scale_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over output_scale (not a resize).")
-        .def("get_scale",            &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
+        .def("set_output_scale_raw_vector", &SparseLinearLayer::set_output_scale_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over output_scale (not a resize).")
+        .def("get_scale", &SparseLinearLayer::get_scale, py::arg("row"), py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayer& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayer& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayer::get_output_scale,
-             py::arg("col"),
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayer& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayer& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayer::get_output_scale, py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayer& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayer& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
-             "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
-             "lives moves, from output_scale into the stored per-synapse weight code.\n"
-             "Drives each column's stored-weight RMS toward `target` via a damped\n"
-             "(`correction_rate`) multiplicative step. scale_invariant must match\n"
-             "whatever backward_dense(scale_invariant=...) is using -- see\n"
-             "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
-             "SCATTERED CSR ONLY (block4 support is a follow-up).")
-        .def("get_value_scale_importance",  &SparseLinearLayer::get_value_scale_importance,
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayer& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayer& self, float target, float correction_rate, bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "Gradient-free reparametrization: true_weight = stored_w * value_scale *\n"
+            "output_scale is algebraically UNCHANGED -- only WHERE the magnitude\n"
+            "lives moves, from output_scale into the stored per-synapse weight code.\n"
+            "Drives each column's stored-weight RMS toward `target` via a damped\n"
+            "(`correction_rate`) multiplicative step. scale_invariant must match\n"
+            "whatever backward_dense(scale_invariant=...) is using -- see\n"
+            "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
+            "SCATTERED CSR ONLY (block4 support is a follow-up).")
+        .def("get_value_scale_importance", &SparseLinearLayer::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
         .def("get_output_scale_importance", &SparseLinearLayer::get_output_scale_importance,
-             py::arg("col"),
-             "Per-column counterpart for output_scale. Default 0.")
+             py::arg("col"), "Per-column counterpart for output_scale. Default 0.")
         .def("get_output_importance_scale", &SparseLinearLayer::get_output_importance_scale,
              py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayer& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
-        .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row,
-             py::arg("row"), py::arg("new_scale"),
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayer& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def("rescale_importance_row", &SparseLinearLayer::rescale_importance_row, py::arg("row"),
+             py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayer::rescale_value_row,
-             py::arg("row"), py::arg("new_scale"),
-             "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayer::rescale_importance,
-             py::arg("new_scale"),
+        .def("rescale_value_row", &SparseLinearLayer::rescale_value_row, py::arg("row"),
+             py::arg("new_scale"), "Same as rescale_importance_row() but for stored weight values.")
+        .def("rescale_importance", &SparseLinearLayer::rescale_importance, py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayer::rescale_value,
-             py::arg("new_scale"),
+        .def("rescale_value", &SparseLinearLayer::rescale_value, py::arg("new_scale"),
              "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayer::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayer::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayer::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayer::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayer::get_importance_l2_sq)
+        .def_property_readonly("value_l1", &SparseLinearLayer::get_value_l1)
+        .def_property_readonly("value_l2_sq", &SparseLinearLayer::get_value_l2_sq)
+        .def_property_readonly("value_max_abs", &SparseLinearLayer::get_value_max_abs)
+        .def_property_readonly("importance_l1", &SparseLinearLayer::get_importance_l1)
+        .def_property_readonly("importance_l2_sq", &SparseLinearLayer::get_importance_l2_sq)
         .def_property_readonly("importance_max_abs", &SparseLinearLayer::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayer::hoyer_value,
+        .def("hoyer_value", &SparseLinearLayer::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayer::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayer::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayer::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayer::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayer::zero_accum)
+        .def("zero_accum", &SparseLinearLayer::zero_accum)
         .def_property_readonly("neuron_input_accum", &SparseLinearLayer::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayer::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayer::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayer::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayer::get_ptrs)
-        .def("load_weights",        &SparseLinearLayer::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayer::load_dense_codes,
-             py::arg("weight_codes"), py::arg("importance_codes"),
+        .def_property_readonly("neuron_grad_accum", &SparseLinearLayer::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayer::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayer::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayer::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayer::get_ptrs)
+        .def("load_weights", &SparseLinearLayer::load_weights, py::arg("ptrs"), py::arg("indices"),
+             py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayer::load_dense_codes, py::arg("weight_codes"),
+             py::arg("importance_codes"),
              "Bulk-load already-quantized dense FP4 codes directly into block4,\n"
              "bypassing scattered CSR entirely. See block4_load_dense's docstring\n"
              "(delta_csr_memory.hpp) -- loading only, no quantization performed\n"
@@ -2269,24 +2343,26 @@ PYBIND11_MODULE(_cpu, m)
         .def("compact_block4", &SparseLinearLayer::compact_block4,
              "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
              "headroom back down to exactly its current live content.")
-        .def_property_readonly("out_degree", [](const SparseLinearLayer& self) {
-            return py::array_t<SparseLinearLayer::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayer::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayer::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayer::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayer& self) {
+                                   return py::array_t<SparseLinearLayer::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayer::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayer::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayer::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayer::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayer::nnz)
+        .def_property_readonly("block4",
+                               py::cpp_function(&SparseLinearLayer::block4, py::keep_alive<0, 1>()),
+                               "Purely observational view onto this layer's block4 storage --"
+                               " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayer& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -2294,7 +2370,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -2305,21 +2382,18 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
     // ── SparseLinearLayerResync ──────────────────────────────────────────────────
     // Same API as SparseLinearLayer, DeferredScaleWrite=true fix (see class-level
     // comment above SparseLinearLayerImpl).
 
     py::class_<SparseLinearLayerResync>(m, "SparseLinearLayerResync")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward_dense",        &SparseLinearLayerResync::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayerResync::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward_dense", &SparseLinearLayerResync::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayerResync::backward_dense, py::arg("x"),
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -2331,31 +2405,29 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayerResync::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayerResync::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("forward_sparse", &SparseLinearLayerResync::forward_sparse, py::arg("ptrs"),
+             py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayerResync::backward_sparse, py::arg("x"),
+             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayerResync::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayerResync::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+        .def("build_probes", &SparseLinearLayerResync::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayerResync::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayerResync::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+        .def("synap_step", &SparseLinearLayerResync::synap_step, py::arg("importance_cutoff"),
+             py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
              py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayerResync::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayerResync::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -2364,8 +2436,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayerResync::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -2374,155 +2445,154 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayerResync::compact,
+        .def("compact", &SparseLinearLayerResync::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayerResync::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayerResync::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayerResync::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayerResync::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
              "before synaptogenesis after a prune cycle.")
-        .def("get_importance_scale", &SparseLinearLayerResync::get_importance_scale,
-             py::arg("row"),
+        .def("get_importance_scale", &SparseLinearLayerResync::get_importance_scale, py::arg("row"),
              "Per-ROW scale applied to that row's stored importance to get true\n"
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayerResync::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayerResync::get_value_scale, py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayerResync& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayerResync& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayerResync::get_output_scale,
-             py::arg("col"),
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayerResync& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayerResync& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayerResync::get_output_scale, py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayerResync& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayerResync& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
-        .def("get_value_scale_importance",  &SparseLinearLayerResync::get_value_scale_importance,
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayerResync& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayerResync& self, float target, float correction_rate,
+               bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
+        .def("get_value_scale_importance", &SparseLinearLayerResync::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
         .def("get_output_scale_importance", &SparseLinearLayerResync::get_output_scale_importance,
-             py::arg("col"),
-             "Per-column counterpart for output_scale. Default 0.")
+             py::arg("col"), "Per-column counterpart for output_scale. Default 0.")
         .def("get_output_importance_scale", &SparseLinearLayerResync::get_output_importance_scale,
              py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayerResync& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayerResync& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
         .def("rescale_importance_row", &SparseLinearLayerResync::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayerResync::rescale_value_row,
-             py::arg("row"), py::arg("new_scale"),
-             "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayerResync::rescale_importance,
+        .def("rescale_value_row", &SparseLinearLayerResync::rescale_value_row, py::arg("row"),
+             py::arg("new_scale"), "Same as rescale_importance_row() but for stored weight values.")
+        .def("rescale_importance", &SparseLinearLayerResync::rescale_importance,
              py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayerResync::rescale_value,
-             py::arg("new_scale"),
+        .def("rescale_value", &SparseLinearLayerResync::rescale_value, py::arg("new_scale"),
              "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayerResync::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayerResync::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayerResync::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayerResync::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayerResync::get_importance_l2_sq)
-        .def_property_readonly("importance_max_abs", &SparseLinearLayerResync::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayerResync::hoyer_value,
+        .def_property_readonly("value_l1", &SparseLinearLayerResync::get_value_l1)
+        .def_property_readonly("value_l2_sq", &SparseLinearLayerResync::get_value_l2_sq)
+        .def_property_readonly("value_max_abs", &SparseLinearLayerResync::get_value_max_abs)
+        .def_property_readonly("importance_l1", &SparseLinearLayerResync::get_importance_l1)
+        .def_property_readonly("importance_l2_sq", &SparseLinearLayerResync::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs",
+                               &SparseLinearLayerResync::get_importance_max_abs)
+        .def("hoyer_value", &SparseLinearLayerResync::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayerResync::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayerResync::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayerResync::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayerResync::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayerResync::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayerResync::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayerResync::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayerResync::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayerResync::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayerResync::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayerResync::get_ptrs)
-        .def("load_weights",        &SparseLinearLayerResync::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayerResync::load_dense_codes,
+        .def("zero_accum", &SparseLinearLayerResync::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayerResync::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum", &SparseLinearLayerResync::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayerResync::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayerResync::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayerResync::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayerResync::get_ptrs)
+        .def("load_weights", &SparseLinearLayerResync::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayerResync::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def_property_readonly("out_degree", [](const SparseLinearLayerResync& self) {
-            return py::array_t<SparseLinearLayerResync::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayerResync::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayerResync::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayerResync::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayerResync& self) {
+                                   return py::array_t<SparseLinearLayerResync::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayerResync::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayerResync::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayerResync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResync::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayerResync::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResync::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayerResync::nnz)
+        .def_property_readonly(
+            "block4", py::cpp_function(&SparseLinearLayerResync::block4, py::keep_alive<0, 1>()),
+            "Purely observational view onto this layer's block4 storage --"
+            " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayerResync& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -2530,7 +2600,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -2541,22 +2612,19 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
     // ── SparseLinearLayerNoScale ─────────────────────────────────────────────────
     // Same API as SparseLinearLayer, value_scale/output_scale permanently 1.0,
     // never trained -- direct test of the "zero trained scale" hypothesis on
     // real FP4 hardware storage (see NoScalePolicy comment, delta_csr_types.hpp).
 
     py::class_<SparseLinearLayerNoScale>(m, "SparseLinearLayerNoScale")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward_dense",        &SparseLinearLayerNoScale::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayerNoScale::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward_dense", &SparseLinearLayerNoScale::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayerNoScale::backward_dense, py::arg("x"),
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -2568,31 +2636,29 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayerNoScale::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayerNoScale::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("forward_sparse", &SparseLinearLayerNoScale::forward_sparse, py::arg("ptrs"),
+             py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayerNoScale::backward_sparse, py::arg("x"),
+             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayerNoScale::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayerNoScale::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
+        .def("build_probes", &SparseLinearLayerNoScale::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayerNoScale::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayerNoScale::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
+        .def("synap_step", &SparseLinearLayerNoScale::synap_step, py::arg("importance_cutoff"),
+             py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
              py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayerNoScale::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayerNoScale::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -2601,8 +2667,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayerNoScale::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -2611,17 +2676,17 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayerNoScale::compact,
+        .def("compact", &SparseLinearLayerNoScale::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayerNoScale::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayerNoScale::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayerNoScale::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayerNoScale::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
@@ -2632,134 +2697,135 @@ PYBIND11_MODULE(_cpu, m)
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayerNoScale::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayerNoScale::get_value_scale, py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayerNoScale& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayerNoScale& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayerNoScale::get_output_scale,
-             py::arg("col"),
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayerNoScale& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayerNoScale& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayerNoScale::get_output_scale, py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayerNoScale& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayerNoScale& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
-        .def("get_value_scale_importance",  &SparseLinearLayerNoScale::get_value_scale_importance,
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayerNoScale& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayerNoScale& self, float target, float correction_rate,
+               bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
+        .def("get_value_scale_importance", &SparseLinearLayerNoScale::get_value_scale_importance,
              py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
         .def("get_output_scale_importance", &SparseLinearLayerNoScale::get_output_scale_importance,
-             py::arg("col"),
-             "Per-column counterpart for output_scale. Default 0.")
+             py::arg("col"), "Per-column counterpart for output_scale. Default 0.")
         .def("get_output_importance_scale", &SparseLinearLayerNoScale::get_output_importance_scale,
              py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayerNoScale& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayerNoScale& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
         .def("rescale_importance_row", &SparseLinearLayerNoScale::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayerNoScale::rescale_value_row,
-             py::arg("row"), py::arg("new_scale"),
-             "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayerNoScale::rescale_importance,
+        .def("rescale_value_row", &SparseLinearLayerNoScale::rescale_value_row, py::arg("row"),
+             py::arg("new_scale"), "Same as rescale_importance_row() but for stored weight values.")
+        .def("rescale_importance", &SparseLinearLayerNoScale::rescale_importance,
              py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayerNoScale::rescale_value,
-             py::arg("new_scale"),
+        .def("rescale_value", &SparseLinearLayerNoScale::rescale_value, py::arg("new_scale"),
              "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayerNoScale::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayerNoScale::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayerNoScale::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayerNoScale::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayerNoScale::get_importance_l2_sq)
-        .def_property_readonly("importance_max_abs", &SparseLinearLayerNoScale::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayerNoScale::hoyer_value,
+        .def_property_readonly("value_l1", &SparseLinearLayerNoScale::get_value_l1)
+        .def_property_readonly("value_l2_sq", &SparseLinearLayerNoScale::get_value_l2_sq)
+        .def_property_readonly("value_max_abs", &SparseLinearLayerNoScale::get_value_max_abs)
+        .def_property_readonly("importance_l1", &SparseLinearLayerNoScale::get_importance_l1)
+        .def_property_readonly("importance_l2_sq", &SparseLinearLayerNoScale::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs",
+                               &SparseLinearLayerNoScale::get_importance_max_abs)
+        .def("hoyer_value", &SparseLinearLayerNoScale::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayerNoScale::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayerNoScale::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayerNoScale::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayerNoScale::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayerNoScale::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayerNoScale::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayerNoScale::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayerNoScale::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayerNoScale::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayerNoScale::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayerNoScale::get_ptrs)
-        .def("load_weights",        &SparseLinearLayerNoScale::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayerNoScale::load_dense_codes,
+        .def("zero_accum", &SparseLinearLayerNoScale::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayerNoScale::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayerNoScale::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayerNoScale::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayerNoScale::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayerNoScale::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayerNoScale::get_ptrs)
+        .def("load_weights", &SparseLinearLayerNoScale::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayerNoScale::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def_property_readonly("out_degree", [](const SparseLinearLayerNoScale& self) {
-            return py::array_t<SparseLinearLayerNoScale::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayerNoScale::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayerNoScale::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayerNoScale::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayerNoScale& self) {
+                                   return py::array_t<SparseLinearLayerNoScale::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayerNoScale::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayerNoScale::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayerNoScale::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScale::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayerNoScale::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScale::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayerNoScale::nnz)
+        .def_property_readonly(
+            "block4", py::cpp_function(&SparseLinearLayerNoScale::block4, py::keep_alive<0, 1>()),
+            "Purely observational view onto this layer's block4 storage --"
+            " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayerNoScale& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -2767,7 +2833,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -2778,72 +2845,89 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
-
     // ── SparseLinearLayerDeterministic ───────────────────────────────────────────
     // Same API as SparseLinearLayer, StochasticRounding=false only -- see
     // StochasticRounding's docstring on disldo_backward, linear_disldo.hpp.
 
     py::class_<SparseLinearLayerDeterministic>(m, "SparseLinearLayerDeterministic")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("get_scale_rank",       &SparseLinearLayerDeterministic::get_scale_rank)
-        .def("set_scale_rank",       &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
-        .def("get_additive_rank",    &SparseLinearLayerDeterministic::get_additive_rank)
-        .def("set_additive_rank",    &SparseLinearLayerDeterministic::set_additive_rank, py::arg("rank"))
-        .def("get_scale_rank_max",    &SparseLinearLayerDeterministic::get_scale_rank_max)
-        .def("set_scale_rank_max",    &SparseLinearLayerDeterministic::set_scale_rank_max, py::arg("new_max"),
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("get_scale_rank", &SparseLinearLayerDeterministic::get_scale_rank)
+        .def("set_scale_rank", &SparseLinearLayerDeterministic::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank", &SparseLinearLayerDeterministic::get_additive_rank)
+        .def("set_additive_rank", &SparseLinearLayerDeterministic::set_additive_rank,
+             py::arg("rank"))
+        .def("get_scale_rank_max", &SparseLinearLayerDeterministic::get_scale_rank_max)
+        .def("set_scale_rank_max", &SparseLinearLayerDeterministic::set_scale_rank_max,
+             py::arg("new_max"),
              "Runtime policy cap (task #295) -- replaces the old\n"
              "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
              "set_scale_rank/apply_dynamic_rank_control can grow past\n"
              "the old hardcoded ceiling -- block4's SIMD path now uses\n"
              "heap scratch that grows to fit whatever rank is used.")
         .def("get_additive_rank_max", &SparseLinearLayerDeterministic::get_additive_rank_max)
-        .def("set_additive_rank_max", &SparseLinearLayerDeterministic::set_additive_rank_max, py::arg("new_max"))
-        .def("reserve_scale_rank_scratch", &SparseLinearLayerDeterministic::reserve_scale_rank_scratch,
-             py::arg("threads"), py::arg("rank"),
+        .def("set_additive_rank_max", &SparseLinearLayerDeterministic::set_additive_rank_max,
+             py::arg("new_max"))
+        .def("reserve_scale_rank_scratch",
+             &SparseLinearLayerDeterministic::reserve_scale_rank_scratch, py::arg("threads"),
+             py::arg("rank"),
              "Explicit scratch-memory control, independent of the\n"
              "policy cap above -- preallocate ahead of need (no\n"
              "reallocation during training) or shrink back down (free\n"
              "capacity a layer grew into early on). threads/rank must\n"
              "not be smaller than what is currently actually in use.")
-        .def("get_additive_u_k",     &SparseLinearLayerDeterministic::get_additive_u_k, py::arg("row"), py::arg("k"))
-        .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("get_additive_v_k",     &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"), py::arg("k"))
-        .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
-        .def("get_additive_u_raw_vector", &SparseLinearLayerDeterministic::get_additive_u_raw_vector,
+        .def("get_additive_u_k", &SparseLinearLayerDeterministic::get_additive_u_k, py::arg("row"),
+             py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayerDeterministic::set_additive_u_raw_k,
+             py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k", &SparseLinearLayerDeterministic::get_additive_v_k, py::arg("col"),
+             py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayerDeterministic::set_additive_v_raw_k,
+             py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_raw_vector",
+             &SparseLinearLayerDeterministic::get_additive_u_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
-        .def("set_additive_u_raw_vector", &SparseLinearLayerDeterministic::set_additive_u_raw_vector, py::arg("v"),
+        .def("set_additive_u_raw_vector",
+             &SparseLinearLayerDeterministic::set_additive_u_raw_vector, py::arg("v"),
              "Size-preserving correction pass over additive_u (not a resize).")
-        .def("get_additive_v_raw_vector", &SparseLinearLayerDeterministic::get_additive_v_raw_vector,
+        .def("get_additive_v_raw_vector",
+             &SparseLinearLayerDeterministic::get_additive_v_raw_vector,
              "Flat [n_out*additive_rank], row-major.")
-        .def("set_additive_v_raw_vector", &SparseLinearLayerDeterministic::set_additive_v_raw_vector, py::arg("v"),
+        .def("set_additive_v_raw_vector",
+             &SparseLinearLayerDeterministic::set_additive_v_raw_vector, py::arg("v"),
              "Size-preserving correction pass over additive_v (not a resize).")
-        .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng, py::arg("seed"))
-        .def("apply_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_dynamic_rank_control,
-             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 50,
-             py::arg("shrink_grace_period_steps") = 50)
-        .def("apply_additive_dynamic_rank_control", &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
+        .def("seed_dynamic_rank_rng", &SparseLinearLayerDeterministic::seed_dynamic_rank_rng,
+             py::arg("seed"))
+        .def("apply_dynamic_rank_control",
+             &SparseLinearLayerDeterministic::apply_dynamic_rank_control, py::arg("tau_death"),
+             py::arg("tau_active"), py::arg("theta"), py::arg("seed_scale") = 0.05f,
+             py::arg("grow_grace_period_steps") = 50, py::arg("shrink_grace_period_steps") = 50)
+        .def("apply_additive_dynamic_rank_control",
+             &SparseLinearLayerDeterministic::apply_additive_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
              py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
              py::arg("shrink_grace_period_steps") = 5000)
-        .def("get_scale_gamma_k",              &SparseLinearLayerDeterministic::get_scale_gamma_k, py::arg("k"))
-        .def("set_scale_gamma_raw_k",          &SparseLinearLayerDeterministic::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
-        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayerDeterministic::get_scale_gamma_abs_ema_k, py::arg("k"))
-        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayerDeterministic::get_scale_gamma_grad_ema_k, py::arg("k"))
-        .def("get_additive_gamma_k",           &SparseLinearLayerDeterministic::get_additive_gamma_k, py::arg("k"))
-        .def("set_additive_gamma_raw_k",       &SparseLinearLayerDeterministic::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
-        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayerDeterministic::get_additive_gamma_abs_ema_k, py::arg("k"))
-        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayerDeterministic::get_additive_gamma_grad_ema_k, py::arg("k"))
-        .def("forward_dense",        &SparseLinearLayerDeterministic::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayerDeterministic::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("get_scale_gamma_k", &SparseLinearLayerDeterministic::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k", &SparseLinearLayerDeterministic::set_scale_gamma_raw_k,
+             py::arg("k"), py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k",
+             &SparseLinearLayerDeterministic::get_scale_gamma_abs_ema_k, py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k",
+             &SparseLinearLayerDeterministic::get_scale_gamma_grad_ema_k, py::arg("k"))
+        .def("get_additive_gamma_k", &SparseLinearLayerDeterministic::get_additive_gamma_k,
+             py::arg("k"))
+        .def("set_additive_gamma_raw_k", &SparseLinearLayerDeterministic::set_additive_gamma_raw_k,
+             py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k",
+             &SparseLinearLayerDeterministic::get_additive_gamma_abs_ema_k, py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k",
+             &SparseLinearLayerDeterministic::get_additive_gamma_grad_ema_k, py::arg("k"))
+        .def("forward_dense", &SparseLinearLayerDeterministic::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayerDeterministic::backward_dense, py::arg("x"),
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -2855,31 +2939,29 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayerDeterministic::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayerDeterministic::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("forward_sparse", &SparseLinearLayerDeterministic::forward_sparse, py::arg("ptrs"),
+             py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayerDeterministic::backward_sparse, py::arg("x"),
+             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayerDeterministic::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayerDeterministic::synap_row_step,
+        .def("build_probes", &SparseLinearLayerDeterministic::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayerDeterministic::synap_row_step,
              py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayerDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
-             py::arg("importance_eps") = 1e-3f,
+        .def("synap_step", &SparseLinearLayerDeterministic::synap_step,
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayerDeterministic::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayerDeterministic::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -2888,8 +2970,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayerDeterministic::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -2898,17 +2979,17 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayerDeterministic::compact,
+        .def("compact", &SparseLinearLayerDeterministic::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayerDeterministic::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayerDeterministic::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayerDeterministic::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayerDeterministic::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
@@ -2919,131 +3000,142 @@ PYBIND11_MODULE(_cpu, m)
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayerDeterministic::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayerDeterministic::get_value_scale, py::arg("row"),
              "Same as get_importance_scale() but for stored weight values.")
-        .def("get_value_scale_k",    &SparseLinearLayerDeterministic::get_value_scale_k, py::arg("row"), py::arg("k"))
-        .def("get_output_scale_k",   &SparseLinearLayerDeterministic::get_output_scale_k, py::arg("col"), py::arg("k"))
-        .def("set_value_scale_raw_k",  &SparseLinearLayerDeterministic::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
-        .def("get_value_scale_raw_vector", &SparseLinearLayerDeterministic::get_value_scale_raw_vector,
+        .def("get_value_scale_k", &SparseLinearLayerDeterministic::get_value_scale_k,
+             py::arg("row"), py::arg("k"))
+        .def("get_output_scale_k", &SparseLinearLayerDeterministic::get_output_scale_k,
+             py::arg("col"), py::arg("k"))
+        .def("set_value_scale_raw_k", &SparseLinearLayerDeterministic::set_value_scale_raw_k,
+             py::arg("row"), py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayerDeterministic::set_output_scale_raw_k,
+             py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_value_scale_raw_vector",
+             &SparseLinearLayerDeterministic::get_value_scale_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
-        .def("set_value_scale_raw_vector", &SparseLinearLayerDeterministic::set_value_scale_raw_vector, py::arg("v"),
+        .def("set_value_scale_raw_vector",
+             &SparseLinearLayerDeterministic::set_value_scale_raw_vector, py::arg("v"),
              "Size-preserving correction pass over value_scale (not a resize).")
-        .def("get_output_scale_raw_vector", &SparseLinearLayerDeterministic::get_output_scale_raw_vector,
+        .def("get_output_scale_raw_vector",
+             &SparseLinearLayerDeterministic::get_output_scale_raw_vector,
              "Flat [n_out*scale_rank], row-major.")
-        .def("set_output_scale_raw_vector", &SparseLinearLayerDeterministic::set_output_scale_raw_vector, py::arg("v"),
+        .def("set_output_scale_raw_vector",
+             &SparseLinearLayerDeterministic::set_output_scale_raw_vector, py::arg("v"),
              "Size-preserving correction pass over output_scale (not a resize).")
-        .def("get_scale",            &SparseLinearLayerDeterministic::get_scale, py::arg("row"), py::arg("col"),
+        .def("get_scale", &SparseLinearLayerDeterministic::get_scale, py::arg("row"),
+             py::arg("col"),
              "Combined rank-N scale S(row,col) = sum_k value_scale_k(row,k)*"
              "output_scale_k(col,k) -- see scale_rank/set_scale_rank.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayerDeterministic& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayerDeterministic& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayerDeterministic::get_output_scale,
-             py::arg("col"),
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayerDeterministic& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayerDeterministic& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayerDeterministic::get_output_scale, py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayerDeterministic& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayerDeterministic& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
-        .def("get_value_scale_importance",  &SparseLinearLayerDeterministic::get_value_scale_importance,
-             py::arg("row"),
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayerDeterministic& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayerDeterministic& self, float target, float correction_rate,
+               bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
+        .def("get_value_scale_importance",
+             &SparseLinearLayerDeterministic::get_value_scale_importance, py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
-        .def("get_output_scale_importance", &SparseLinearLayerDeterministic::get_output_scale_importance,
-             py::arg("col"),
+        .def("get_output_scale_importance",
+             &SparseLinearLayerDeterministic::get_output_scale_importance, py::arg("col"),
              "Per-column counterpart for output_scale. Default 0.")
-        .def("get_output_importance_scale", &SparseLinearLayerDeterministic::get_output_importance_scale,
-             py::arg("col"),
+        .def("get_output_importance_scale",
+             &SparseLinearLayerDeterministic::get_output_importance_scale, py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayerDeterministic& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayerDeterministic& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
         .def("rescale_importance_row", &SparseLinearLayerDeterministic::rescale_importance_row,
              py::arg("row"), py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayerDeterministic::rescale_value_row,
+        .def("rescale_value_row", &SparseLinearLayerDeterministic::rescale_value_row,
              py::arg("row"), py::arg("new_scale"),
              "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayerDeterministic::rescale_importance,
+        .def("rescale_importance", &SparseLinearLayerDeterministic::rescale_importance,
              py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayerDeterministic::rescale_value,
-             py::arg("new_scale"),
+        .def("rescale_value", &SparseLinearLayerDeterministic::rescale_value, py::arg("new_scale"),
              "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayerDeterministic::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayerDeterministic::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayerDeterministic::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayerDeterministic::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayerDeterministic::get_importance_l2_sq)
-        .def_property_readonly("importance_max_abs", &SparseLinearLayerDeterministic::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayerDeterministic::hoyer_value,
+        .def_property_readonly("value_l1", &SparseLinearLayerDeterministic::get_value_l1)
+        .def_property_readonly("value_l2_sq", &SparseLinearLayerDeterministic::get_value_l2_sq)
+        .def_property_readonly("value_max_abs", &SparseLinearLayerDeterministic::get_value_max_abs)
+        .def_property_readonly("importance_l1", &SparseLinearLayerDeterministic::get_importance_l1)
+        .def_property_readonly("importance_l2_sq",
+                               &SparseLinearLayerDeterministic::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs",
+                               &SparseLinearLayerDeterministic::get_importance_max_abs)
+        .def("hoyer_value", &SparseLinearLayerDeterministic::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayerDeterministic::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayerDeterministic::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayerDeterministic::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayerDeterministic::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayerDeterministic::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayerDeterministic::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayerDeterministic::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayerDeterministic::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayerDeterministic::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayerDeterministic::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayerDeterministic::get_ptrs)
-        .def("load_weights",        &SparseLinearLayerDeterministic::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayerDeterministic::load_dense_codes,
+        .def("zero_accum", &SparseLinearLayerDeterministic::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayerDeterministic::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayerDeterministic::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayerDeterministic::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayerDeterministic::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayerDeterministic::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayerDeterministic::get_ptrs)
+        .def("load_weights", &SparseLinearLayerDeterministic::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayerDeterministic::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
         .def("expand_block4_headroom", &SparseLinearLayerDeterministic::expand_block4_headroom,
              py::arg("blank_fraction") = 0.2f,
@@ -3053,24 +3145,27 @@ PYBIND11_MODULE(_cpu, m)
         .def("compact_block4", &SparseLinearLayerDeterministic::compact_block4,
              "Opposite of expand_block4_headroom(): shrinks every block4 row's\n"
              "headroom back down to exactly its current live content.")
-        .def_property_readonly("out_degree", [](const SparseLinearLayerDeterministic& self) {
-            return py::array_t<SparseLinearLayerDeterministic::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayerDeterministic::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayerDeterministic::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayerDeterministic::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayerDeterministic& self) {
+                                   return py::array_t<SparseLinearLayerDeterministic::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayerDeterministic::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayerDeterministic::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayerDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerDeterministic::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayerDeterministic::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerDeterministic::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayerDeterministic::nnz)
+        .def_property_readonly(
+            "block4",
+            py::cpp_function(&SparseLinearLayerDeterministic::block4, py::keep_alive<0, 1>()),
+            "Purely observational view onto this layer's block4 storage --"
+            " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayerDeterministic& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -3078,7 +3173,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -3089,21 +3185,17 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
-
     // ── SparseLinearLayerResyncDeterministic ─────────────────────────────────────
     // DeferredScaleWrite=true + StochasticRounding=false together.
 
     py::class_<SparseLinearLayerResyncDeterministic>(m, "SparseLinearLayerResyncDeterministic")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward_dense",        &SparseLinearLayerResyncDeterministic::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayerResyncDeterministic::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward_dense", &SparseLinearLayerResyncDeterministic::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayerResyncDeterministic::backward_dense, py::arg("x"),
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -3115,31 +3207,29 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayerResyncDeterministic::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayerResyncDeterministic::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+        .def("forward_sparse", &SparseLinearLayerResyncDeterministic::forward_sparse,
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayerResyncDeterministic::backward_sparse,
+             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayerResyncDeterministic::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayerResyncDeterministic::synap_row_step,
+        .def("build_probes", &SparseLinearLayerResyncDeterministic::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayerResyncDeterministic::synap_row_step,
              py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayerResyncDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
-             py::arg("importance_eps") = 1e-3f,
+        .def("synap_step", &SparseLinearLayerResyncDeterministic::synap_step,
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayerResyncDeterministic::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayerResyncDeterministic::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -3148,8 +3238,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayerResyncDeterministic::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -3158,17 +3247,17 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayerResyncDeterministic::compact,
+        .def("compact", &SparseLinearLayerResyncDeterministic::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayerResyncDeterministic::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayerResyncDeterministic::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayerResyncDeterministic::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayerResyncDeterministic::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
@@ -3179,134 +3268,145 @@ PYBIND11_MODULE(_cpu, m)
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayerResyncDeterministic::get_value_scale,
-             py::arg("row"),
-             "Same as get_importance_scale() but for stored weight values.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayerResyncDeterministic& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayerResyncDeterministic& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayerResyncDeterministic::get_output_scale,
+        .def("get_value_scale", &SparseLinearLayerResyncDeterministic::get_value_scale,
+             py::arg("row"), "Same as get_importance_scale() but for stored weight values.")
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayerResyncDeterministic& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayerResyncDeterministic& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayerResyncDeterministic::get_output_scale,
              py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayerResyncDeterministic& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayerResyncDeterministic& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
-        .def("get_value_scale_importance",  &SparseLinearLayerResyncDeterministic::get_value_scale_importance,
-             py::arg("row"),
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayerResyncDeterministic& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayerResyncDeterministic& self, float target, float correction_rate,
+               bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
+        .def("get_value_scale_importance",
+             &SparseLinearLayerResyncDeterministic::get_value_scale_importance, py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
-        .def("get_output_scale_importance", &SparseLinearLayerResyncDeterministic::get_output_scale_importance,
-             py::arg("col"),
+        .def("get_output_scale_importance",
+             &SparseLinearLayerResyncDeterministic::get_output_scale_importance, py::arg("col"),
              "Per-column counterpart for output_scale. Default 0.")
-        .def("get_output_importance_scale", &SparseLinearLayerResyncDeterministic::get_output_importance_scale,
-             py::arg("col"),
+        .def("get_output_importance_scale",
+             &SparseLinearLayerResyncDeterministic::get_output_importance_scale, py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayerResyncDeterministic& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
-        .def("rescale_importance_row", &SparseLinearLayerResyncDeterministic::rescale_importance_row,
-             py::arg("row"), py::arg("new_scale"),
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayerResyncDeterministic& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def("rescale_importance_row",
+             &SparseLinearLayerResyncDeterministic::rescale_importance_row, py::arg("row"),
+             py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayerResyncDeterministic::rescale_value_row,
+        .def("rescale_value_row", &SparseLinearLayerResyncDeterministic::rescale_value_row,
              py::arg("row"), py::arg("new_scale"),
              "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayerResyncDeterministic::rescale_importance,
+        .def("rescale_importance", &SparseLinearLayerResyncDeterministic::rescale_importance,
              py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayerResyncDeterministic::rescale_value,
-             py::arg("new_scale"),
-             "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayerResyncDeterministic::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayerResyncDeterministic::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayerResyncDeterministic::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayerResyncDeterministic::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayerResyncDeterministic::get_importance_l2_sq)
-        .def_property_readonly("importance_max_abs", &SparseLinearLayerResyncDeterministic::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayerResyncDeterministic::hoyer_value,
+        .def("rescale_value", &SparseLinearLayerResyncDeterministic::rescale_value,
+             py::arg("new_scale"), "Same as rescale_importance() but for stored weight values.")
+        .def_property_readonly("value_l1", &SparseLinearLayerResyncDeterministic::get_value_l1)
+        .def_property_readonly("value_l2_sq",
+                               &SparseLinearLayerResyncDeterministic::get_value_l2_sq)
+        .def_property_readonly("value_max_abs",
+                               &SparseLinearLayerResyncDeterministic::get_value_max_abs)
+        .def_property_readonly("importance_l1",
+                               &SparseLinearLayerResyncDeterministic::get_importance_l1)
+        .def_property_readonly("importance_l2_sq",
+                               &SparseLinearLayerResyncDeterministic::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs",
+                               &SparseLinearLayerResyncDeterministic::get_importance_max_abs)
+        .def("hoyer_value", &SparseLinearLayerResyncDeterministic::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayerResyncDeterministic::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayerResyncDeterministic::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayerResyncDeterministic::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayerResyncDeterministic::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayerResyncDeterministic::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayerResyncDeterministic::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayerResyncDeterministic::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayerResyncDeterministic::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayerResyncDeterministic::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayerResyncDeterministic::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayerResyncDeterministic::get_ptrs)
-        .def("load_weights",        &SparseLinearLayerResyncDeterministic::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayerResyncDeterministic::load_dense_codes,
+        .def("zero_accum", &SparseLinearLayerResyncDeterministic::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayerResyncDeterministic::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayerResyncDeterministic::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",
+                               &SparseLinearLayerResyncDeterministic::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayerResyncDeterministic::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayerResyncDeterministic::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayerResyncDeterministic::get_ptrs)
+        .def("load_weights", &SparseLinearLayerResyncDeterministic::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayerResyncDeterministic::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def_property_readonly("out_degree", [](const SparseLinearLayerResyncDeterministic& self) {
-            return py::array_t<SparseLinearLayerResyncDeterministic::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayerResyncDeterministic::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayerResyncDeterministic::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayerResyncDeterministic::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayerResyncDeterministic& self) {
+                                   return py::array_t<SparseLinearLayerResyncDeterministic::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayerResyncDeterministic::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayerResyncDeterministic::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayerResyncDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerResyncDeterministic::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayerResyncDeterministic::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerResyncDeterministic::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayerResyncDeterministic::nnz)
+        .def_property_readonly(
+            "block4",
+            py::cpp_function(&SparseLinearLayerResyncDeterministic::block4, py::keep_alive<0, 1>()),
+            "Purely observational view onto this layer's block4 storage --"
+            " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayerResyncDeterministic& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -3314,7 +3414,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -3325,20 +3426,17 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
     // ── SparseLinearLayerNoScaleDeterministic ────────────────────────────────────
     // NoScalePolicy + StochasticRounding=false together.
 
     py::class_<SparseLinearLayerNoScaleDeterministic>(m, "SparseLinearLayerNoScaleDeterministic")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward_dense",        &SparseLinearLayerNoScaleDeterministic::forward_dense,
-             py::arg("x"))
-        .def("backward_dense",       &SparseLinearLayerNoScaleDeterministic::backward_dense,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward_dense", &SparseLinearLayerNoScaleDeterministic::forward_dense, py::arg("x"))
+        .def("backward_dense", &SparseLinearLayerNoScaleDeterministic::backward_dense, py::arg("x"),
+             py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
@@ -3350,31 +3448,29 @@ PYBIND11_MODULE(_cpu, m)
              "weight step is toggled. For A/B-testing whether the damping\n"
              "itself helps optimization, not for production use. beta2/eps\n"
              "only affect the True case.")
-        .def("forward_sparse",       &SparseLinearLayerNoScaleDeterministic::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"),
-             py::arg("batch"))
-        .def("backward_sparse",      &SparseLinearLayerNoScaleDeterministic::backward_sparse,
-             py::arg("x"),
-             py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+        .def("forward_sparse", &SparseLinearLayerNoScaleDeterministic::forward_sparse,
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &SparseLinearLayerNoScaleDeterministic::backward_sparse,
+             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayerNoScaleDeterministic::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayerNoScaleDeterministic::synap_row_step,
+        .def("build_probes", &SparseLinearLayerNoScaleDeterministic::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayerNoScaleDeterministic::synap_row_step,
              py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"),
              py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f)
-        .def("synap_step",           &SparseLinearLayerNoScaleDeterministic::synap_step,
-             py::arg("importance_cutoff"), py::arg("max_row_weights"), py::arg("max_prune_per_step") = 8,
-             py::arg("importance_eps") = 1e-3f,
+        .def("synap_step", &SparseLinearLayerNoScaleDeterministic::synap_step,
+             py::arg("importance_cutoff"), py::arg("max_row_weights"),
+             py::arg("max_prune_per_step") = 8, py::arg("importance_eps") = 1e-3f,
              "Stateful convenience wrapper around synap_row_step -- advances an\n"
              "internal row cursor automatically, so a caller doing repeated\n"
              "one-step-per-call synaptogenesis sweeps doesn't need to track the\n"
              "row index itself. Use synap_row_step directly for explicit control.")
-        .def("equalizer_step",       &SparseLinearLayerNoScaleDeterministic::equalizer_step,
+        .def("equalizer_step", &SparseLinearLayerNoScaleDeterministic::equalizer_step,
              "One row of staggered memory redistribution -- call once per\n"
              "synaptogenesis cycle. REDISTRIBUTES the existing pool; does NOT\n"
              "add new memory. Use equalize_to_capacity() first to ensure the\n"
@@ -3383,8 +3479,7 @@ PYBIND11_MODULE(_cpu, m)
              "(own independent cursor) -- lets bytes a row's tiles freed by\n"
              "compressing become usable by growth elsewhere in the matrix.")
         .def("equalize_to_capacity", &SparseLinearLayerNoScaleDeterministic::equalize_to_capacity,
-             py::arg("target_elems_per_row"),
-             py::arg("target_bytes_per_row") = 0,
+             py::arg("target_elems_per_row"), py::arg("target_bytes_per_row") = 0,
              "One-time construction call: grow each row to at least\n"
              "target_elems_per_row elements and target_bytes_per_row index\n"
              "bytes of reserved space. target_bytes_per_row=0 (default)\n"
@@ -3393,17 +3488,17 @@ PYBIND11_MODULE(_cpu, m)
              "e.g. 100 connections with 2-byte deltas = 204 bytes, vs\n"
              "the default 100*5+4=504. After this call the pool is fixed;\n"
              "equalizer_step() only redistributes within it, never grows.")
-        .def("compact",              &SparseLinearLayerNoScaleDeterministic::compact,
+        .def("compact", &SparseLinearLayerNoScaleDeterministic::compact,
              "Repack in place: every row occupies exactly its active bytes/elements,\n"
              "zero inter-row blank space. Call before saving/measuring a freshly\n"
              "converted model. Zeroes growth headroom.")
-        .def("expand_headroom",      &SparseLinearLayerNoScaleDeterministic::expand_headroom,
+        .def("expand_headroom", &SparseLinearLayerNoScaleDeterministic::expand_headroom,
              py::arg("blank_fraction") = 0.2f,
              "Restore per-row growth headroom (proportional to current nnz).\n"
              "WARNING: use expand_headroom_to(max_row_weights) after a prune\n"
              "cycle -- plain expand_headroom allocates headroom proportional\n"
              "to CURRENT nnz, leaving no room to grow back to max_row_weights.")
-        .def("expand_headroom_to",   &SparseLinearLayerNoScaleDeterministic::expand_headroom_to,
+        .def("expand_headroom_to", &SparseLinearLayerNoScaleDeterministic::expand_headroom_to,
              py::arg("min_nnz_per_row"), py::arg("blank_fraction") = 0.2f,
              "Like expand_headroom() but guarantees each row has headroom for\n"
              "at least min_nnz_per_row connections. Call with max_row_weights\n"
@@ -3414,134 +3509,145 @@ PYBIND11_MODULE(_cpu, m)
              "units. Default 1.0 for any row not yet touched, exact backward\n"
              "compat. Use rescale_importance_row()/rescale_importance() to\n"
              "change it, never assign directly.")
-        .def("get_value_scale",      &SparseLinearLayerNoScaleDeterministic::get_value_scale,
-             py::arg("row"),
-             "Same as get_importance_scale() but for stored weight values.")
-        .def("set_value_scale_raw",
-             [](SparseLinearLayerNoScaleDeterministic& self, int row, float scale) {
-                 self.weights.set_value_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
-             "Use this after pre-scaling weights before load_weights() -- calling\n"
-             "rescale_value_row() after a pre-scaled load would double-encode.\n"
-             "Typical pattern:\n"
-             "  row_scale = max_abs / FP4_MAX\n"
-             "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
-             "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
-        .def("set_importance_scale_raw",
-             [](SparseLinearLayerNoScaleDeterministic& self, int row, float scale) {
-                 self.weights.set_importance_scale_raw(
-                     static_cast<std::size_t>(row), scale);
-             },
-             py::arg("row"), py::arg("scale"),
-             "Same as set_value_scale_raw() but for importance.")
-        .def("get_output_scale",     &SparseLinearLayerNoScaleDeterministic::get_output_scale,
+        .def("get_value_scale", &SparseLinearLayerNoScaleDeterministic::get_value_scale,
+             py::arg("row"), "Same as get_importance_scale() but for stored weight values.")
+        .def(
+            "set_value_scale_raw",
+            [](SparseLinearLayerNoScaleDeterministic& self, int row, float scale) {
+                self.weights.set_value_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"),
+            "Set value_scale[row] directly WITHOUT re-encoding stored weights.\n"
+            "Use this after pre-scaling weights before load_weights() -- calling\n"
+            "rescale_value_row() after a pre-scaled load would double-encode.\n"
+            "Typical pattern:\n"
+            "  row_scale = max_abs / FP4_MAX\n"
+            "  layer.load_weights(ptrs, idx, vals / row_scale)  # pre-scaled\n"
+            "  layer.set_value_scale_raw(r, row_scale)          # set metadata only")
+        .def(
+            "set_importance_scale_raw",
+            [](SparseLinearLayerNoScaleDeterministic& self, int row, float scale) {
+                self.weights.set_importance_scale_raw(static_cast<std::size_t>(row), scale);
+            },
+            py::arg("row"), py::arg("scale"), "Same as set_value_scale_raw() but for importance.")
+        .def("get_output_scale", &SparseLinearLayerNoScaleDeterministic::get_output_scale,
              py::arg("col"),
              "Per-COLUMN (per-output) counterpart to get_value_scale() -- true_w =\n"
              "stored_w * value_scale[row] * output_scale[col]. Default 1.0 for any\n"
              "column not yet touched, exact backward compat with every caller that\n"
              "never sets it.")
-        .def("set_output_scale_raw",
-             [](SparseLinearLayerNoScaleDeterministic& self, int col, float scale) {
-                 self.weights.set_output_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
-             "same convention as set_value_scale_raw(), but per-output instead of\n"
-             "per-input. Calling this at least once makes output_scale\n"
-             "gradient-trainable in backward_dense(), like value_scale.")
-        .def("magnitude_rescale_output",
-             [](SparseLinearLayerNoScaleDeterministic& self, float target, float correction_rate, bool scale_invariant) {
-                 self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
-             },
-             py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
-             "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
-        .def("get_value_scale_importance",  &SparseLinearLayerNoScaleDeterministic::get_value_scale_importance,
-             py::arg("row"),
+        .def(
+            "set_output_scale_raw",
+            [](SparseLinearLayerNoScaleDeterministic& self, int col, float scale) {
+                self.weights.set_output_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Set output_scale[col] directly WITHOUT re-encoding stored weights --\n"
+            "same convention as set_value_scale_raw(), but per-output instead of\n"
+            "per-input. Calling this at least once makes output_scale\n"
+            "gradient-trainable in backward_dense(), like value_scale.")
+        .def(
+            "magnitude_rescale_output",
+            [](SparseLinearLayerNoScaleDeterministic& self, float target, float correction_rate,
+               bool scale_invariant) {
+                self.weights.magnitude_rescale_output(target, correction_rate, scale_invariant);
+            },
+            py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
+            "See SparseLinearLayer::magnitude_rescale_output's own docstring.")
+        .def("get_value_scale_importance",
+             &SparseLinearLayerNoScaleDeterministic::get_value_scale_importance, py::arg("row"),
              "Per-row importance backing value_scale's own gradient step, same\n"
              "damping role as a synapse's importance value. Default 0.")
-        .def("get_output_scale_importance", &SparseLinearLayerNoScaleDeterministic::get_output_scale_importance,
-             py::arg("col"),
+        .def("get_output_scale_importance",
+             &SparseLinearLayerNoScaleDeterministic::get_output_scale_importance, py::arg("col"),
              "Per-column counterpart for output_scale. Default 0.")
-        .def("get_output_importance_scale", &SparseLinearLayerNoScaleDeterministic::get_output_importance_scale,
-             py::arg("col"),
+        .def("get_output_importance_scale",
+             &SparseLinearLayerNoScaleDeterministic::get_output_importance_scale, py::arg("col"),
              "Per-COLUMN counterpart to get_importance_scale() -- true_imp =\n"
              "stored_imp * importance_scale[row] * output_importance_scale[col].\n"
              "Default 1.0, same convention as get_output_scale().")
-        .def("set_output_importance_scale_raw",
-             [](SparseLinearLayerNoScaleDeterministic& self, int col, float scale) {
-                 self.weights.set_output_importance_scale_raw(
-                     static_cast<std::size_t>(col), scale);
-             },
-             py::arg("col"), py::arg("scale"),
-             "Same as set_importance_scale_raw() but per-output instead of\n"
-             "per-input -- see set_output_scale_raw() for the analogous pattern.")
-        .def("rescale_importance_row", &SparseLinearLayerNoScaleDeterministic::rescale_importance_row,
-             py::arg("row"), py::arg("new_scale"),
+        .def(
+            "set_output_importance_scale_raw",
+            [](SparseLinearLayerNoScaleDeterministic& self, int col, float scale) {
+                self.weights.set_output_importance_scale_raw(static_cast<std::size_t>(col), scale);
+            },
+            py::arg("col"), py::arg("scale"),
+            "Same as set_importance_scale_raw() but per-output instead of\n"
+            "per-input -- see set_output_scale_raw() for the analogous pattern.")
+        .def("rescale_importance_row",
+             &SparseLinearLayerNoScaleDeterministic::rescale_importance_row, py::arg("row"),
+             py::arg("new_scale"),
              "Change ONE row's importance scale mid-training without corrupting\n"
              "that row's existing stored data -- re-reads at the OLD per-row\n"
              "scale, re-encodes at the NEW one.")
-        .def("rescale_value_row",    &SparseLinearLayerNoScaleDeterministic::rescale_value_row,
+        .def("rescale_value_row", &SparseLinearLayerNoScaleDeterministic::rescale_value_row,
              py::arg("row"), py::arg("new_scale"),
              "Same as rescale_importance_row() but for stored weight values.")
-        .def("rescale_importance",   &SparseLinearLayerNoScaleDeterministic::rescale_importance,
+        .def("rescale_importance", &SparseLinearLayerNoScaleDeterministic::rescale_importance,
              py::arg("new_scale"),
              "Bulk convenience: set EVERY row's importance scale to the same\n"
              "value. Backward-compatible interface with the original\n"
              "per-layer-scalar design.")
-        .def("rescale_value",        &SparseLinearLayerNoScaleDeterministic::rescale_value,
-             py::arg("new_scale"),
-             "Same as rescale_importance() but for stored weight values.")
-        .def_property_readonly("value_l1",           &SparseLinearLayerNoScaleDeterministic::get_value_l1)
-        .def_property_readonly("value_l2_sq",        &SparseLinearLayerNoScaleDeterministic::get_value_l2_sq)
-        .def_property_readonly("value_max_abs",      &SparseLinearLayerNoScaleDeterministic::get_value_max_abs)
-        .def_property_readonly("importance_l1",      &SparseLinearLayerNoScaleDeterministic::get_importance_l1)
-        .def_property_readonly("importance_l2_sq",   &SparseLinearLayerNoScaleDeterministic::get_importance_l2_sq)
-        .def_property_readonly("importance_max_abs", &SparseLinearLayerNoScaleDeterministic::get_importance_max_abs)
-        .def("hoyer_value",          &SparseLinearLayerNoScaleDeterministic::hoyer_value,
+        .def("rescale_value", &SparseLinearLayerNoScaleDeterministic::rescale_value,
+             py::arg("new_scale"), "Same as rescale_importance() but for stored weight values.")
+        .def_property_readonly("value_l1", &SparseLinearLayerNoScaleDeterministic::get_value_l1)
+        .def_property_readonly("value_l2_sq",
+                               &SparseLinearLayerNoScaleDeterministic::get_value_l2_sq)
+        .def_property_readonly("value_max_abs",
+                               &SparseLinearLayerNoScaleDeterministic::get_value_max_abs)
+        .def_property_readonly("importance_l1",
+                               &SparseLinearLayerNoScaleDeterministic::get_importance_l1)
+        .def_property_readonly("importance_l2_sq",
+                               &SparseLinearLayerNoScaleDeterministic::get_importance_l2_sq)
+        .def_property_readonly("importance_max_abs",
+                               &SparseLinearLayerNoScaleDeterministic::get_importance_max_abs)
+        .def("hoyer_value", &SparseLinearLayerNoScaleDeterministic::hoyer_value,
              "Hoyer's sparsity measure on the STORED weight distribution, in\n"
              "[0,1] -- 0 means values spread evenly across FP4's representable\n"
              "range, 1 means concentrated (e.g. mostly zero, or mostly clustered\n"
              "at one magnitude). O(1), from running stats -- see value_max_abs\n"
              "for a cheap complementary saturation check this doesn't catch.")
-        .def("hoyer_importance",     &SparseLinearLayerNoScaleDeterministic::hoyer_importance,
+        .def("hoyer_importance", &SparseLinearLayerNoScaleDeterministic::hoyer_importance,
              "Same as hoyer_value() but for the STORED importance distribution.")
-        .def("recompute_stats",      &SparseLinearLayerNoScaleDeterministic::recompute_stats,
+        .def("recompute_stats", &SparseLinearLayerNoScaleDeterministic::recompute_stats,
              "Recompute value_l1/l2_sq/max_abs and importance_l1/l2_sq/max_abs\n"
              "from scratch, O(nnz). Gives an exact max_abs (the incrementally-\n"
              "maintained one is a monotonic upper bound, not a live exact max).")
-        .def("zero_accum",           &SparseLinearLayerNoScaleDeterministic::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayerNoScaleDeterministic::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayerNoScaleDeterministic::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayerNoScaleDeterministic::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayerNoScaleDeterministic::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayerNoScaleDeterministic::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayerNoScaleDeterministic::get_ptrs)
-        .def("load_weights",        &SparseLinearLayerNoScaleDeterministic::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"))
-        .def("load_dense_codes",    &SparseLinearLayerNoScaleDeterministic::load_dense_codes,
+        .def("zero_accum", &SparseLinearLayerNoScaleDeterministic::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayerNoScaleDeterministic::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayerNoScaleDeterministic::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals",
+                               &SparseLinearLayerNoScaleDeterministic::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayerNoScaleDeterministic::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayerNoScaleDeterministic::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayerNoScaleDeterministic::get_ptrs)
+        .def("load_weights", &SparseLinearLayerNoScaleDeterministic::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"))
+        .def("load_dense_codes", &SparseLinearLayerNoScaleDeterministic::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def_property_readonly("out_degree", [](const SparseLinearLayerNoScaleDeterministic& self) {
-            return py::array_t<SparseLinearLayerNoScaleDeterministic::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayerNoScaleDeterministic::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayerNoScaleDeterministic::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayerNoScaleDeterministic::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayerNoScaleDeterministic& self) {
+                                   return py::array_t<SparseLinearLayerNoScaleDeterministic::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayerNoScaleDeterministic::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayerNoScaleDeterministic::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayerNoScaleDeterministic::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayerNoScaleDeterministic::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayerNoScaleDeterministic::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayerNoScaleDeterministic::block4,
-             py::keep_alive<0, 1>()),
-             "Purely observational view onto this layer's block4 storage --"
-             " layer.block4.tiles / layer.block4.synapses.")
-        .def_property_readonly("last_input",
+        .def_property_readonly("nnz", &SparseLinearLayerNoScaleDeterministic::nnz)
+        .def_property_readonly("block4",
+                               py::cpp_function(&SparseLinearLayerNoScaleDeterministic::block4,
+                                                py::keep_alive<0, 1>()),
+                               "Purely observational view onto this layer's block4 storage --"
+                               " layer.block4.tiles / layer.block4.synapses.")
+        .def_property_readonly(
+            "last_input",
             [](const SparseLinearLayerNoScaleDeterministic& self) -> py::object {
-                if (self._last_input.empty()) return py::none();
+                if (self._last_input.empty())
+                    return py::none();
                 // Return a zero-copy numpy view of the stored last input.
                 // Shape [_last_batch, _last_cols] -- needed by backward_sparse
                 // which requires the explicit forward input (can't retrieve it
@@ -3549,7 +3655,8 @@ PYBIND11_MODULE(_cpu, m)
                 // stored member).
                 return py::array_t<float>(
                     {(py::ssize_t)self._last_batch, (py::ssize_t)self._last_cols},
-                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float), (py::ssize_t)sizeof(float)},
+                    {(py::ssize_t)self._last_cols * (py::ssize_t)sizeof(float),
+                     (py::ssize_t)sizeof(float)},
                     self._last_input.data(), py::cast(&self));
             },
             "Dense input from the most recent forward_dense call ONLY --\n"
@@ -3560,61 +3667,58 @@ PYBIND11_MODULE(_cpu, m)
             "forward_sparse must reconstruct/track their own dense x (e.g. via\n"
             "CSR.to_dense()) rather than reading this property.");
 
-
     // DISLDOLayerV: identical API surface to SparseLinearLayer, DeltaCSRBiValues<float>
     // (32-bit) instead of FP4BiPacked -- same disldo_forward/backward/
     // build_probes/synap_row_step functions, generic via ValueAccessor.
     // Was never registered with pybind at all before this (see conversation).
     py::class_<DISLDOLayerV>(m, "DISLDOLayerV")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward",        &DISLDOLayerV::forward,
-             py::arg("x"))
-        .def("backward",             &DISLDOLayerV::backward,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward", &DISLDOLayerV::forward, py::arg("x"))
+        .def("backward", &DISLDOLayerV::backward, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("forward_sparse", &DISLDOLayerV::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
-        .def("backward_sparse",      &DISLDOLayerV::backward_sparse,
-             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def("forward_sparse", &DISLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
+             py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &DISLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
+             py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &DISLDOLayerV::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
-        .def("build_probes",         &DISLDOLayerV::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &DISLDOLayerV::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
-        .def("zero_accum",           &DISLDOLayerV::zero_accum)
+        .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
+        .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum", &DISLDOLayerV::zero_accum)
         .def_property_readonly("neuron_input_accum", &DISLDOLayerV::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &DISLDOLayerV::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &DISLDOLayerV::get_weights_vals)
-        .def_property_readonly("importance",         &DISLDOLayerV::get_importance)
-        .def_property_readonly("indices",            &DISLDOLayerV::get_indices)
-        .def_property_readonly("ptrs",               &DISLDOLayerV::get_ptrs)
-        .def("load_weights",        &DISLDOLayerV::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def_property_readonly("out_degree", [](const DISLDOLayerV& self) {
-            return py::array_t<DISLDOLayerV::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(DISLDOLayerV::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &DISLDOLayerV::num_cpus)
-        .def_property_readonly("n_inputs",  &DISLDOLayerV::n_inputs)
+        .def_property_readonly("neuron_grad_accum", &DISLDOLayerV::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &DISLDOLayerV::get_weights_vals)
+        .def_property_readonly("importance", &DISLDOLayerV::get_importance)
+        .def_property_readonly("indices", &DISLDOLayerV::get_indices)
+        .def_property_readonly("ptrs", &DISLDOLayerV::get_ptrs)
+        .def("load_weights", &DISLDOLayerV::load_weights, py::arg("ptrs"), py::arg("indices"),
+             py::arg("weights"), py::arg("importance"))
+        .def_property_readonly("out_degree",
+                               [](const DISLDOLayerV& self) {
+                                   return py::array_t<DISLDOLayerV::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(DISLDOLayerV::S)}, self.weights.out_degree.data(),
+                                       py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &DISLDOLayerV::num_cpus)
+        .def_property_readonly("n_inputs", &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
-        .def_property_readonly("nnz",       &DISLDOLayerV::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
+        .def_property_readonly("nnz", &DISLDOLayerV::nnz)
+        .def_property_readonly("block4",
+                               py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 
     // ── SISLDOLayerV ─────────────────────────────────────────────────────────
     // The class itself predates this pybind registration (source existed,
@@ -3624,85 +3728,80 @@ PYBIND11_MODULE(_cpu, m)
     // synap_row_step/apply_dynamic_rank_control -- no scale concept, same
     // as DISLDOLayerV, and no per-row growth op exposed on this class).
     py::class_<SISLDOLayerV>(m, "SISLDOLayerV")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward_sparse",  &SISLDOLayerV::forward_sparse,
-             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
-        .def("backward",        &SISLDOLayerV::backward,
-             py::arg("x_ptrs"), py::arg("x_indices"), py::arg("x_values"), py::arg("dy"),
-             py::arg("dy_sparse_ptrs"), py::arg("dy_sparse_indices"), py::arg("dy_sparse_values"),
-             py::arg("learning_rate"), py::arg("batch"), py::arg("cols"))
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward_sparse", &SISLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
+             py::arg("values"), py::arg("batch"))
+        .def("backward", &SISLDOLayerV::backward, py::arg("x_ptrs"), py::arg("x_indices"),
+             py::arg("x_values"), py::arg("dy"), py::arg("dy_sparse_ptrs"),
+             py::arg("dy_sparse_indices"), py::arg("dy_sparse_values"), py::arg("learning_rate"),
+             py::arg("batch"), py::arg("cols"))
         .def("decay_importance", &SISLDOLayerV::decay_importance, py::arg("rate"))
-        .def("build_probes",     &SISLDOLayerV::build_probes, py::arg("k"))
-        .def("optim_synaptogenesis", &SISLDOLayerV::optim_synaptogenesis,
-             py::arg("learning_rate"), py::arg("importance_beta"), py::arg("max_weights"))
-        .def("zero_accum",       &SISLDOLayerV::zero_accum)
+        .def("build_probes", &SISLDOLayerV::build_probes, py::arg("k"))
+        .def("optim_synaptogenesis", &SISLDOLayerV::optim_synaptogenesis, py::arg("learning_rate"),
+             py::arg("importance_beta"), py::arg("max_weights"))
+        .def("zero_accum", &SISLDOLayerV::zero_accum)
         .def_property_readonly("neuron_input_accum", &SISLDOLayerV::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SISLDOLayerV::get_neuron_grad_accum)
-        .def_property_readonly("output_buf",         &SISLDOLayerV::get_output_buf)
-        .def_property_readonly("weights_vals",       &SISLDOLayerV::get_weights_vals)
-        .def_property_readonly("importance",         &SISLDOLayerV::get_importance)
-        .def_property_readonly("indices",            &SISLDOLayerV::get_indices)
-        .def_property_readonly("ptrs",                &SISLDOLayerV::get_ptrs)
-        .def("load_weights",     &SISLDOLayerV::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def_readonly ("num_cpus",  &SISLDOLayerV::num_cpus)
-        .def_property_readonly("n_inputs",  &SISLDOLayerV::n_inputs)
+        .def_property_readonly("neuron_grad_accum", &SISLDOLayerV::get_neuron_grad_accum)
+        .def_property_readonly("output_buf", &SISLDOLayerV::get_output_buf)
+        .def_property_readonly("weights_vals", &SISLDOLayerV::get_weights_vals)
+        .def_property_readonly("importance", &SISLDOLayerV::get_importance)
+        .def_property_readonly("indices", &SISLDOLayerV::get_indices)
+        .def_property_readonly("ptrs", &SISLDOLayerV::get_ptrs)
+        .def("load_weights", &SISLDOLayerV::load_weights, py::arg("ptrs"), py::arg("indices"),
+             py::arg("weights"), py::arg("importance"))
+        .def_readonly("num_cpus", &SISLDOLayerV::num_cpus)
+        .def_property_readonly("n_inputs", &SISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &SISLDOLayerV::n_outputs)
-        .def_property_readonly("nnz",       &SISLDOLayerV::nnz);
+        .def_property_readonly("nnz", &SISLDOLayerV::nnz);
 
     // ── SparseLinearLayer8 ───────────────────────────────────────────────────
     py::class_<SparseLinearLayer8>(m, "SparseLinearLayer8")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward",        &SparseLinearLayer8::forward,
-             py::arg("x"))
-        .def("backward",             &SparseLinearLayer8::backward,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward", &SparseLinearLayer8::forward, py::arg("x"))
+        .def("backward", &SparseLinearLayer8::backward, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer8::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
-        .def("build_probes",         &SparseLinearLayer8::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayer8::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
-        .def("zero_accum",           &SparseLinearLayer8::zero_accum)
+        .def("build_probes", &SparseLinearLayer8::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayer8::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum", &SparseLinearLayer8::zero_accum)
         .def_property_readonly("neuron_input_accum", &SparseLinearLayer8::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayer8::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayer8::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayer8::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayer8::get_ptrs)
-        .def("load_weights",        &SparseLinearLayer8::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def("load_dense_codes",    &SparseLinearLayer8::load_dense_codes,
-             py::arg("weight_codes"), py::arg("importance_codes"),
+        .def_property_readonly("neuron_grad_accum", &SparseLinearLayer8::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayer8::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayer8::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayer8::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayer8::get_ptrs)
+        .def("load_weights", &SparseLinearLayer8::load_weights, py::arg("ptrs"), py::arg("indices"),
+             py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes", &SparseLinearLayer8::load_dense_codes, py::arg("weight_codes"),
+             py::arg("importance_codes"),
              "Bulk-load already-quantized dense FP8 (E4M3) codes directly into\n"
              "block4, bypassing scattered CSR entirely. See block4_load_dense's\n"
              "docstring (delta_csr_memory.hpp) -- loading only, no quantization\n"
              "performed here; produce codes via fp8_quantize_array() or any other\n"
              "scheme.")
-        .def("get_value_scale",      &SparseLinearLayer8::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayer8::get_value_scale, py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
              "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
              "mechanism SparseLinearLayer (FP4) uses.")
-        .def("set_value_scale_raw",  &SparseLinearLayer8::set_value_scale_raw,
-             py::arg("row"), py::arg("scale"),
+        .def("set_value_scale_raw", &SparseLinearLayer8::set_value_scale_raw, py::arg("row"),
+             py::arg("scale"),
              "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
              "same convention as SparseLinearLayer::set_value_scale_raw.")
-        .def("get_output_scale",     &SparseLinearLayer8::get_output_scale,
-             py::arg("col"),
+        .def("get_output_scale", &SparseLinearLayer8::get_output_scale, py::arg("col"),
              "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
              "any column not yet touched.")
-        .def("set_output_scale_raw", &SparseLinearLayer8::set_output_scale_raw,
-             py::arg("col"), py::arg("scale"),
+        .def("set_output_scale_raw", &SparseLinearLayer8::set_output_scale_raw, py::arg("col"),
+             py::arg("scale"),
              "Set output_scale[col] directly. Calling this at least once makes\n"
              "output_scale gradient-trainable in backward(), like value_scale --\n"
              "this is what makes the row+col scale genuinely rank-1, matching the\n"
@@ -3718,9 +3817,9 @@ PYBIND11_MODULE(_cpu, m)
              "magnitude_rescale_output's own docstring (delta_csr_types.hpp) for why.\n"
              "Covers BOTH scattered CSR and block4 (fixed and verified this session --\n"
              "the \"SCATTERED CSR ONLY\" note that used to be here was stale).")
-        .def("get_scale_rank",       &SparseLinearLayer8::get_scale_rank)
-        .def("set_scale_rank",       &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
-        .def("get_additive_rank",    &SparseLinearLayer8::get_additive_rank,
+        .def("get_scale_rank", &SparseLinearLayer8::get_scale_rank)
+        .def("set_scale_rank", &SparseLinearLayer8::set_scale_rank, py::arg("rank"))
+        .def("get_additive_rank", &SparseLinearLayer8::get_additive_rank,
              "AQRS additive branch: A(row,col) = sum_k additive_u_k(row,k)*"
              "additive_v_k(col,k), ADDED to the effective weight -- structurally\n"
              "necessary whenever a quantized weight lands on the zero sentinel\n"
@@ -3728,16 +3827,17 @@ PYBIND11_MODULE(_cpu, m)
              "exactly zero at any rank. additive_rank defaults to 0 (fully off).\n"
              "This is the branch task #280 re-validates against the fp8 MQAR\n"
              "input-independent-collapse case.")
-        .def("set_additive_rank",    &SparseLinearLayer8::set_additive_rank, py::arg("rank"))
-        .def("get_scale_rank_max",    &SparseLinearLayer8::get_scale_rank_max)
-        .def("set_scale_rank_max",    &SparseLinearLayer8::set_scale_rank_max, py::arg("new_max"),
+        .def("set_additive_rank", &SparseLinearLayer8::set_additive_rank, py::arg("rank"))
+        .def("get_scale_rank_max", &SparseLinearLayer8::get_scale_rank_max)
+        .def("set_scale_rank_max", &SparseLinearLayer8::set_scale_rank_max, py::arg("new_max"),
              "Runtime policy cap (task #295) -- replaces the old\n"
              "compile-time SCALE_RANK_MAX=4 constant. Raise before\n"
              "set_scale_rank/apply_dynamic_rank_control can grow past\n"
              "the old hardcoded ceiling -- block4's SIMD path now uses\n"
              "heap scratch that grows to fit whatever rank is used.")
         .def("get_additive_rank_max", &SparseLinearLayer8::get_additive_rank_max)
-        .def("set_additive_rank_max", &SparseLinearLayer8::set_additive_rank_max, py::arg("new_max"))
+        .def("set_additive_rank_max", &SparseLinearLayer8::set_additive_rank_max,
+             py::arg("new_max"))
         .def("reserve_scale_rank_scratch", &SparseLinearLayer8::reserve_scale_rank_scratch,
              py::arg("threads"), py::arg("rank"),
              "Explicit scratch-memory control, independent of the\n"
@@ -3745,40 +3845,54 @@ PYBIND11_MODULE(_cpu, m)
              "reallocation during training) or shrink back down (free\n"
              "capacity a layer grew into early on). threads/rank must\n"
              "not be smaller than what is currently actually in use.")
-        .def("get_additive_u_k",     &SparseLinearLayer8::get_additive_u_k, py::arg("row"), py::arg("k"))
-        .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("get_additive_v_k",     &SparseLinearLayer8::get_additive_v_k, py::arg("col"), py::arg("k"))
-        .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"), py::arg("k"), py::arg("v"))
+        .def("get_additive_u_k", &SparseLinearLayer8::get_additive_u_k, py::arg("row"),
+             py::arg("k"))
+        .def("set_additive_u_raw_k", &SparseLinearLayer8::set_additive_u_raw_k, py::arg("row"),
+             py::arg("k"), py::arg("v"))
+        .def("get_additive_v_k", &SparseLinearLayer8::get_additive_v_k, py::arg("col"),
+             py::arg("k"))
+        .def("set_additive_v_raw_k", &SparseLinearLayer8::set_additive_v_raw_k, py::arg("col"),
+             py::arg("k"), py::arg("v"))
         .def("get_additive_u_raw_vector", &SparseLinearLayer8::get_additive_u_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*additive_rank], row-major.")
-        .def("set_additive_u_raw_vector", &SparseLinearLayer8::set_additive_u_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over additive_u (not a resize).")
+        .def("set_additive_u_raw_vector", &SparseLinearLayer8::set_additive_u_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over additive_u (not a resize).")
         .def("get_additive_v_raw_vector", &SparseLinearLayer8::get_additive_v_raw_vector,
              "Flat [n_out*additive_rank], row-major.")
-        .def("set_additive_v_raw_vector", &SparseLinearLayer8::set_additive_v_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over additive_v (not a resize).")
+        .def("set_additive_v_raw_vector", &SparseLinearLayer8::set_additive_v_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over additive_v (not a resize).")
         .def("seed_dynamic_rank_rng", &SparseLinearLayer8::seed_dynamic_rank_rng, py::arg("seed"))
         .def("apply_dynamic_rank_control", &SparseLinearLayer8::apply_dynamic_rank_control,
              py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
              py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 50,
              py::arg("shrink_grace_period_steps") = 50)
-        .def("apply_additive_dynamic_rank_control", &SparseLinearLayer8::apply_additive_dynamic_rank_control,
-             py::arg("tau_death"), py::arg("tau_active"), py::arg("theta"),
-             py::arg("seed_scale") = 0.05f, py::arg("grow_grace_period_steps") = 5000,
-             py::arg("shrink_grace_period_steps") = 5000)
-        .def("get_scale_gamma_k",              &SparseLinearLayer8::get_scale_gamma_k, py::arg("k"))
-        .def("set_scale_gamma_raw_k",          &SparseLinearLayer8::set_scale_gamma_raw_k, py::arg("k"), py::arg("v"))
-        .def("get_scale_gamma_abs_ema_k",      &SparseLinearLayer8::get_scale_gamma_abs_ema_k, py::arg("k"))
-        .def("get_scale_gamma_grad_ema_k",     &SparseLinearLayer8::get_scale_gamma_grad_ema_k, py::arg("k"))
-        .def("get_additive_gamma_k",           &SparseLinearLayer8::get_additive_gamma_k, py::arg("k"))
-        .def("set_additive_gamma_raw_k",       &SparseLinearLayer8::set_additive_gamma_raw_k, py::arg("k"), py::arg("v"))
-        .def("get_additive_gamma_abs_ema_k",   &SparseLinearLayer8::get_additive_gamma_abs_ema_k, py::arg("k"))
-        .def("get_additive_gamma_grad_ema_k",  &SparseLinearLayer8::get_additive_gamma_grad_ema_k, py::arg("k"))
-        .def("get_value_scale_k",    &SparseLinearLayer8::get_value_scale_k, py::arg("row"), py::arg("k"))
-        .def("get_output_scale_k",   &SparseLinearLayer8::get_output_scale_k, py::arg("col"), py::arg("k"))
-        .def("set_value_scale_raw_k",  &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"), py::arg("k"), py::arg("v"))
-        .def("set_output_scale_raw_k", &SparseLinearLayer8::set_output_scale_raw_k, py::arg("col"), py::arg("k"), py::arg("v"),
+        .def("apply_additive_dynamic_rank_control",
+             &SparseLinearLayer8::apply_additive_dynamic_rank_control, py::arg("tau_death"),
+             py::arg("tau_active"), py::arg("theta"), py::arg("seed_scale") = 0.05f,
+             py::arg("grow_grace_period_steps") = 5000, py::arg("shrink_grace_period_steps") = 5000)
+        .def("get_scale_gamma_k", &SparseLinearLayer8::get_scale_gamma_k, py::arg("k"))
+        .def("set_scale_gamma_raw_k", &SparseLinearLayer8::set_scale_gamma_raw_k, py::arg("k"),
+             py::arg("v"))
+        .def("get_scale_gamma_abs_ema_k", &SparseLinearLayer8::get_scale_gamma_abs_ema_k,
+             py::arg("k"))
+        .def("get_scale_gamma_grad_ema_k", &SparseLinearLayer8::get_scale_gamma_grad_ema_k,
+             py::arg("k"))
+        .def("get_additive_gamma_k", &SparseLinearLayer8::get_additive_gamma_k, py::arg("k"))
+        .def("set_additive_gamma_raw_k", &SparseLinearLayer8::set_additive_gamma_raw_k,
+             py::arg("k"), py::arg("v"))
+        .def("get_additive_gamma_abs_ema_k", &SparseLinearLayer8::get_additive_gamma_abs_ema_k,
+             py::arg("k"))
+        .def("get_additive_gamma_grad_ema_k", &SparseLinearLayer8::get_additive_gamma_grad_ema_k,
+             py::arg("k"))
+        .def("get_value_scale_k", &SparseLinearLayer8::get_value_scale_k, py::arg("row"),
+             py::arg("k"))
+        .def("get_output_scale_k", &SparseLinearLayer8::get_output_scale_k, py::arg("col"),
+             py::arg("k"))
+        .def("set_value_scale_raw_k", &SparseLinearLayer8::set_value_scale_raw_k, py::arg("row"),
+             py::arg("k"), py::arg("v"))
+        .def("set_output_scale_raw_k", &SparseLinearLayer8::set_output_scale_raw_k, py::arg("col"),
+             py::arg("k"), py::arg("v"),
              "Rank-N scale envelope (see SparseLinearLayer's identical\n"
              "get_scale_rank/set_scale_rank/*_k accessors) -- was missing here\n"
              "entirely until now (a plain oversight, not a real engine gap: the\n"
@@ -3787,67 +3901,66 @@ PYBIND11_MODULE(_cpu, m)
         .def("get_value_scale_raw_vector", &SparseLinearLayer8::get_value_scale_raw_vector,
              "Bulk raw-vector accessor (task #295 follow-up / #286 virtual\n"
              "-neuron exposure) -- flat [n_in*scale_rank], row-major.")
-        .def("set_value_scale_raw_vector", &SparseLinearLayer8::set_value_scale_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over value_scale (not a resize).")
+        .def("set_value_scale_raw_vector", &SparseLinearLayer8::set_value_scale_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over value_scale (not a resize).")
         .def("get_output_scale_raw_vector", &SparseLinearLayer8::get_output_scale_raw_vector,
              "Flat [n_out*scale_rank], row-major.")
-        .def("set_output_scale_raw_vector", &SparseLinearLayer8::set_output_scale_raw_vector, py::arg("v"),
-             "Size-preserving correction pass over output_scale (not a resize).")
-        .def_property_readonly("out_degree", [](const SparseLinearLayer8& self) {
-            return py::array_t<SparseLinearLayer8::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayer8::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayer8::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayer8::n_inputs)
+        .def("set_output_scale_raw_vector", &SparseLinearLayer8::set_output_scale_raw_vector,
+             py::arg("v"), "Size-preserving correction pass over output_scale (not a resize).")
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayer8& self) {
+                                   return py::array_t<SparseLinearLayer8::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayer8::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayer8::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayer8::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayer8::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8::block4, py::keep_alive<0, 1>()));
+        .def_property_readonly("nnz", &SparseLinearLayer8::nnz)
+        .def_property_readonly(
+            "block4", py::cpp_function(&SparseLinearLayer8::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8Resync: exact SparseLinearLayer8 API, but the real
     // DeferredScaleWrite fix (value_scale/output_scale stay consistent with
     // stored codes -- see SparseLinearLayer8Impl/ScalePolicy docstrings).
     py::class_<SparseLinearLayer8Resync>(m, "SparseLinearLayer8Resync")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward",        &SparseLinearLayer8Resync::forward,
-             py::arg("x"))
-        .def("backward",             &SparseLinearLayer8Resync::backward,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward", &SparseLinearLayer8Resync::forward, py::arg("x"))
+        .def("backward", &SparseLinearLayer8Resync::backward, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayer8Resync::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayer8Resync::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
-        .def("zero_accum",           &SparseLinearLayer8Resync::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayer8Resync::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8Resync::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayer8Resync::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayer8Resync::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayer8Resync::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayer8Resync::get_ptrs)
-        .def("load_weights",        &SparseLinearLayer8Resync::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def("load_dense_codes",    &SparseLinearLayer8Resync::load_dense_codes,
+        .def("build_probes", &SparseLinearLayer8Resync::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayer8Resync::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum", &SparseLinearLayer8Resync::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayer8Resync::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayer8Resync::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayer8Resync::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayer8Resync::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayer8Resync::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayer8Resync::get_ptrs)
+        .def("load_weights", &SparseLinearLayer8Resync::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes", &SparseLinearLayer8Resync::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def("get_value_scale",      &SparseLinearLayer8Resync::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayer8Resync::get_value_scale, py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
              "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
              "mechanism SparseLinearLayer (FP4) uses.")
-        .def("set_value_scale_raw",  &SparseLinearLayer8Resync::set_value_scale_raw,
-             py::arg("row"), py::arg("scale"),
+        .def("set_value_scale_raw", &SparseLinearLayer8Resync::set_value_scale_raw, py::arg("row"),
+             py::arg("scale"),
              "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
              "same convention as SparseLinearLayer::set_value_scale_raw.")
-        .def("get_output_scale",     &SparseLinearLayer8Resync::get_output_scale,
-             py::arg("col"),
+        .def("get_output_scale", &SparseLinearLayer8Resync::get_output_scale, py::arg("col"),
              "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
              "any column not yet touched.")
         .def("set_output_scale_raw", &SparseLinearLayer8Resync::set_output_scale_raw,
@@ -3859,62 +3972,61 @@ PYBIND11_MODULE(_cpu, m)
         .def("magnitude_rescale_output", &SparseLinearLayer8Resync::magnitude_rescale_output,
              py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
              "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
-        .def_property_readonly("out_degree", [](const SparseLinearLayer8Resync& self) {
-            return py::array_t<SparseLinearLayer8Resync::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayer8Resync::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayer8Resync::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayer8Resync::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayer8Resync& self) {
+                                   return py::array_t<SparseLinearLayer8Resync::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayer8Resync::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayer8Resync::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayer8Resync::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8Resync::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayer8Resync::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>()));
+        .def_property_readonly("nnz", &SparseLinearLayer8Resync::nnz)
+        .def_property_readonly(
+            "block4", py::cpp_function(&SparseLinearLayer8Resync::block4, py::keep_alive<0, 1>()));
 
     // SparseLinearLayer8AdaMax: exact SparseLinearLayer8 API, but with the
     // AdaMax-style decayed-running-max scale update (also with the
     // DeferredScaleWrite fix -- AdaMax's growth-is-instant safety property
     // only matters if the stored code actually reflects it).
     py::class_<SparseLinearLayer8AdaMax>(m, "SparseLinearLayer8AdaMax")
-        .def(py::init<int, int, int, int>(),
-             py::arg("n_inputs"), py::arg("n_outputs"), py::arg("max_weights"),
-             py::arg("num_cpus") = 4)
-        .def("forward",        &SparseLinearLayer8AdaMax::forward,
-             py::arg("x"))
-        .def("backward",             &SparseLinearLayer8AdaMax::backward,
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
-             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
-             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+        .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("max_weights"), py::arg("num_cpus") = 4)
+        .def("forward", &SparseLinearLayer8AdaMax::forward, py::arg("x"))
+        .def("backward", &SparseLinearLayer8AdaMax::backward, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
-        .def("build_probes",         &SparseLinearLayer8AdaMax::build_probes,
-             py::arg("k"), py::arg("per_row") = false)
-        .def("synap_row_step",       &SparseLinearLayer8AdaMax::synap_row_step,
-             py::arg("current_row"), py::arg("importance_cutoff"), py::arg("max_row_weights"))
-        .def("zero_accum",           &SparseLinearLayer8AdaMax::zero_accum)
-        .def_property_readonly("neuron_input_accum", &SparseLinearLayer8AdaMax::get_neuron_input_accum)
-        .def_property_readonly("neuron_grad_accum",  &SparseLinearLayer8AdaMax::get_neuron_grad_accum)
-        .def_property_readonly("weights_vals",       &SparseLinearLayer8AdaMax::get_weights_vals)
-        .def_property_readonly("importance",         &SparseLinearLayer8AdaMax::get_importance)
-        .def_property_readonly("indices",            &SparseLinearLayer8AdaMax::get_indices)
-        .def_property_readonly("ptrs",               &SparseLinearLayer8AdaMax::get_ptrs)
-        .def("load_weights",        &SparseLinearLayer8AdaMax::load_weights,
-             py::arg("ptrs"), py::arg("indices"), py::arg("weights"), py::arg("importance"))
-        .def("load_dense_codes",    &SparseLinearLayer8AdaMax::load_dense_codes,
+        .def("build_probes", &SparseLinearLayer8AdaMax::build_probes, py::arg("k"),
+             py::arg("per_row") = false)
+        .def("synap_row_step", &SparseLinearLayer8AdaMax::synap_row_step, py::arg("current_row"),
+             py::arg("importance_cutoff"), py::arg("max_row_weights"))
+        .def("zero_accum", &SparseLinearLayer8AdaMax::zero_accum)
+        .def_property_readonly("neuron_input_accum",
+                               &SparseLinearLayer8AdaMax::get_neuron_input_accum)
+        .def_property_readonly("neuron_grad_accum",
+                               &SparseLinearLayer8AdaMax::get_neuron_grad_accum)
+        .def_property_readonly("weights_vals", &SparseLinearLayer8AdaMax::get_weights_vals)
+        .def_property_readonly("importance", &SparseLinearLayer8AdaMax::get_importance)
+        .def_property_readonly("indices", &SparseLinearLayer8AdaMax::get_indices)
+        .def_property_readonly("ptrs", &SparseLinearLayer8AdaMax::get_ptrs)
+        .def("load_weights", &SparseLinearLayer8AdaMax::load_weights, py::arg("ptrs"),
+             py::arg("indices"), py::arg("weights"), py::arg("importance"))
+        .def("load_dense_codes", &SparseLinearLayer8AdaMax::load_dense_codes,
              py::arg("weight_codes"), py::arg("importance_codes"))
-        .def("get_value_scale",      &SparseLinearLayer8AdaMax::get_value_scale,
-             py::arg("row"),
+        .def("get_value_scale", &SparseLinearLayer8AdaMax::get_value_scale, py::arg("row"),
              "Per-ROW scale -- true_w = stored_w * value_scale[row] * output_scale[col].\n"
              "Default 1.0 for any row not yet touched. Same VALUES_TYPE-agnostic\n"
              "mechanism SparseLinearLayer (FP4) uses.")
-        .def("set_value_scale_raw",  &SparseLinearLayer8AdaMax::set_value_scale_raw,
-             py::arg("row"), py::arg("scale"),
+        .def("set_value_scale_raw", &SparseLinearLayer8AdaMax::set_value_scale_raw, py::arg("row"),
+             py::arg("scale"),
              "Set value_scale[row] directly WITHOUT re-encoding stored weights --\n"
              "same convention as SparseLinearLayer::set_value_scale_raw.")
-        .def("get_output_scale",     &SparseLinearLayer8AdaMax::get_output_scale,
-             py::arg("col"),
+        .def("get_output_scale", &SparseLinearLayer8AdaMax::get_output_scale, py::arg("col"),
              "Per-COLUMN (rank-1) counterpart to get_value_scale(). Default 1.0 for\n"
              "any column not yet touched.")
         .def("set_output_scale_raw", &SparseLinearLayer8AdaMax::set_output_scale_raw,
@@ -3926,18 +4038,19 @@ PYBIND11_MODULE(_cpu, m)
         .def("magnitude_rescale_output", &SparseLinearLayer8AdaMax::magnitude_rescale_output,
              py::arg("target"), py::arg("correction_rate"), py::arg("scale_invariant") = false,
              "See SparseLinearLayer8::magnitude_rescale_output's own docstring.")
-        .def_property_readonly("out_degree", [](const SparseLinearLayer8AdaMax& self) {
-            return py::array_t<SparseLinearLayer8AdaMax::S>(
-                {(py::ssize_t)self.weights.out_degree.size()},
-                {sizeof(SparseLinearLayer8AdaMax::S)},
-                self.weights.out_degree.data(),
-                py::cast(&self));
-        })
-        .def_readonly ("num_cpus",  &SparseLinearLayer8AdaMax::num_cpus)
-        .def_property_readonly("n_inputs",  &SparseLinearLayer8AdaMax::n_inputs)
+        .def_property_readonly("out_degree",
+                               [](const SparseLinearLayer8AdaMax& self) {
+                                   return py::array_t<SparseLinearLayer8AdaMax::S>(
+                                       {(py::ssize_t)self.weights.out_degree.size()},
+                                       {sizeof(SparseLinearLayer8AdaMax::S)},
+                                       self.weights.out_degree.data(), py::cast(&self));
+                               })
+        .def_readonly("num_cpus", &SparseLinearLayer8AdaMax::num_cpus)
+        .def_property_readonly("n_inputs", &SparseLinearLayer8AdaMax::n_inputs)
         .def_property_readonly("n_outputs", &SparseLinearLayer8AdaMax::n_outputs)
-        .def_property_readonly("nnz",       &SparseLinearLayer8AdaMax::nnz)
-        .def_property_readonly("block4",    py::cpp_function(&SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>()));
+        .def_property_readonly("nnz", &SparseLinearLayer8AdaMax::nnz)
+        .def_property_readonly(
+            "block4", py::cpp_function(&SparseLinearLayer8AdaMax::block4, py::keep_alive<0, 1>()));
 
     // ── CSR construction utilities ────────────────────────────────────────────
     //
@@ -3945,18 +4058,19 @@ PYBIND11_MODULE(_cpu, m)
     // This is the correct way to sparsify activations for SISLDO — NOT a dense-to-dense
     // roundtrip. Use this on energy dynamics output before passing to forward_sparse.
 
-    m.def("dense_to_csr",
+    m.def(
+        "dense_to_csr",
         [](py::array_t<float> x, float threshold) -> py::tuple {
-            auto buf   = x.request();
-            int batch  = (buf.ndim == 2) ? (int)buf.shape[0] : 1;
-            int cols   = (buf.ndim == 2) ? (int)buf.shape[1] : (int)buf.shape[0];
+            auto buf = x.request();
+            int batch = (buf.ndim == 2) ? (int)buf.shape[0] : 1;
+            int cols = (buf.ndim == 2) ? (int)buf.shape[1] : (int)buf.shape[0];
             float* src = (float*)buf.ptr;
 
-            std::vector<int>   ptrs(batch + 1, 0);
-            std::vector<int>   indices;
+            std::vector<int> ptrs(batch + 1, 0);
+            std::vector<int> indices;
             std::vector<float> values;
             indices.reserve(batch * cols / 8);
-            values .reserve(batch * cols / 8);
+            values.reserve(batch * cols / 8);
 
             for (int b = 0; b < batch; ++b) {
                 ptrs[b] = (int)indices.size();
@@ -3964,22 +4078,19 @@ PYBIND11_MODULE(_cpu, m)
                     float v = src[b * cols + c];
                     if (v > threshold || v < -threshold) {
                         indices.push_back(c);
-                        values .push_back(v);
+                        values.push_back(v);
                     }
                 }
             }
             ptrs[batch] = (int)indices.size();
 
-            py::array_t<int>   out_ptrs   ({batch + 1});
-            py::array_t<int>   out_indices({(py::ssize_t)indices.size()});
-            py::array_t<float> out_values ({(py::ssize_t)values .size()});
+            py::array_t<int> out_ptrs({batch + 1});
+            py::array_t<int> out_indices({(py::ssize_t)indices.size()});
+            py::array_t<float> out_values({(py::ssize_t)values.size()});
 
-            std::copy(ptrs.begin(),    ptrs.end(),
-                      (int*)  out_ptrs   .request().ptr);
-            std::copy(indices.begin(), indices.end(),
-                      (int*)  out_indices.request().ptr);
-            std::copy(values .begin(), values .end(),
-                      (float*)out_values .request().ptr);
+            std::copy(ptrs.begin(), ptrs.end(), (int*)out_ptrs.request().ptr);
+            std::copy(indices.begin(), indices.end(), (int*)out_indices.request().ptr);
+            std::copy(values.begin(), values.end(), (float*)out_values.request().ptr);
 
             return py::make_tuple(out_ptrs, out_indices, out_values);
         },
@@ -3988,7 +4099,8 @@ PYBIND11_MODULE(_cpu, m)
         "Keeps only entries where |v| > threshold. Use this to sparsify activations\n"
         "before passing to SISLDOLayer.forward_sparse().");
 
-    m.def("dense_to_top_k_csr",
+    m.def(
+        "dense_to_top_k_csr",
         [](py::array_t<float> x, int k, int num_threads) -> py::tuple {
             auto buf = x.request();
             int rows = (buf.ndim == 2) ? buf.shape[0] : 1;
@@ -4001,21 +4113,23 @@ PYBIND11_MODULE(_cpu, m)
             // The exact number of non-zeros returned
             int nnz = csr.indices[0]->size();
 
-            py::array_t<int>   out_ptrs({(py::ssize_t)(rows + 1)});
-            py::array_t<int>   out_indices({(py::ssize_t)nnz});
+            py::array_t<int> out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int> out_indices({(py::ssize_t)nnz});
             py::array_t<float> out_values({(py::ssize_t)nnz});
 
             std::copy(csr.ptrs[0]->begin(), csr.ptrs[0]->end(), (int*)out_ptrs.request().ptr);
-            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(), (int*)out_indices.request().ptr);
-            std::copy(csr.values[0]->begin(), csr.values[0]->end(), (float*)out_values.request().ptr);
+            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(),
+                      (int*)out_indices.request().ptr);
+            std::copy(csr.values[0]->begin(), csr.values[0]->end(),
+                      (float*)out_values.request().ptr);
 
             return py::make_tuple(out_ptrs, out_indices, out_values);
         },
         py::arg("x"), py::arg("k"), py::arg("num_threads") = 4,
-        "Exact top-k sparsity conversion for forward and backward passes."
-    );
+        "Exact top-k sparsity conversion for forward and backward passes.");
 
-    m.def("dense_to_graded_top_k_csr",
+    m.def(
+        "dense_to_graded_top_k_csr",
         [](py::array_t<float> x, py::array_t<int> k_per_row, int num_threads) -> py::tuple {
             auto buf = x.request();
             int rows = (buf.ndim == 2) ? buf.shape[0] : 1;
@@ -4024,9 +4138,9 @@ PYBIND11_MODULE(_cpu, m)
 
             auto kbuf = k_per_row.request();
             if (kbuf.size != rows) {
-                throw std::invalid_argument(
-                    "k_per_row length (" + std::to_string(kbuf.size) +
-                    ") must match number of rows (" + std::to_string(rows) + ")");
+                throw std::invalid_argument("k_per_row length (" + std::to_string(kbuf.size) +
+                                            ") must match number of rows (" + std::to_string(rows) +
+                                            ")");
             }
             int* k_src = (int*)kbuf.ptr;
 
@@ -4034,13 +4148,15 @@ PYBIND11_MODULE(_cpu, m)
 
             int nnz = (int)csr.indices[0]->size();
 
-            py::array_t<int>   out_ptrs({(py::ssize_t)(rows + 1)});
-            py::array_t<int>   out_indices({(py::ssize_t)nnz});
+            py::array_t<int> out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int> out_indices({(py::ssize_t)nnz});
             py::array_t<float> out_values({(py::ssize_t)nnz});
 
             std::copy(csr.ptrs[0]->begin(), csr.ptrs[0]->end(), (int*)out_ptrs.request().ptr);
-            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(), (int*)out_indices.request().ptr);
-            std::copy(csr.values[0]->begin(), csr.values[0]->end(), (float*)out_values.request().ptr);
+            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(),
+                      (int*)out_indices.request().ptr);
+            std::copy(csr.values[0]->begin(), csr.values[0]->end(),
+                      (float*)out_values.request().ptr);
 
             return py::make_tuple(out_ptrs, out_indices, out_values);
         },
@@ -4048,12 +4164,12 @@ PYBIND11_MODULE(_cpu, m)
         "Genuine per-row top-k sparsity conversion: row r independently keeps its\n"
         "own top-k_per_row[r] largest-magnitude entries (unlike dense_to_top_k_csr,\n"
         "whose k is spent GLOBALLY across the whole flattened array). Built for\n"
-        "graded per-row/per-position gradient density schedules."
-    );
+        "graded per-row/per-position gradient density schedules.");
 
-    m.def("dense_to_nucleus_top_k_csr",
-        [](py::array_t<float> x, py::array_t<float> r_target_per_row, int num_threads,
-           int k_min, int k_max) -> py::tuple {
+    m.def(
+        "dense_to_nucleus_top_k_csr",
+        [](py::array_t<float> x, py::array_t<float> r_target_per_row, int num_threads, int k_min,
+           int k_max) -> py::tuple {
             auto buf = x.request();
             int rows = (buf.ndim == 2) ? buf.shape[0] : 1;
             int cols = (buf.ndim == 2) ? buf.shape[1] : buf.shape[0];
@@ -4070,23 +4186,25 @@ PYBIND11_MODULE(_cpu, m)
             size_t k_min_arg = (k_min > 0) ? static_cast<size_t>(k_min) : 0;
             size_t k_max_arg = (k_max >= 0) ? static_cast<size_t>(k_max) : SIZE_MAX;
 
-            auto csr = top_k_csr_nucleus<int, float>(src, rows, cols, r_src, num_threads,
-                                                       k_min_arg, k_max_arg);
+            auto csr = top_k_csr_nucleus<int, float>(src, rows, cols, r_src, num_threads, k_min_arg,
+                                                     k_max_arg);
 
             int nnz = (int)csr.indices[0]->size();
 
-            py::array_t<int>   out_ptrs({(py::ssize_t)(rows + 1)});
-            py::array_t<int>   out_indices({(py::ssize_t)nnz});
+            py::array_t<int> out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int> out_indices({(py::ssize_t)nnz});
             py::array_t<float> out_values({(py::ssize_t)nnz});
 
             std::copy(csr.ptrs[0]->begin(), csr.ptrs[0]->end(), (int*)out_ptrs.request().ptr);
-            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(), (int*)out_indices.request().ptr);
-            std::copy(csr.values[0]->begin(), csr.values[0]->end(), (float*)out_values.request().ptr);
+            std::copy(csr.indices[0]->begin(), csr.indices[0]->end(),
+                      (int*)out_indices.request().ptr);
+            std::copy(csr.values[0]->begin(), csr.values[0]->end(),
+                      (float*)out_values.request().ptr);
 
             return py::make_tuple(out_ptrs, out_indices, out_values);
         },
-        py::arg("x"), py::arg("r_target_per_row"), py::arg("num_threads") = 4,
-        py::arg("k_min") = 0, py::arg("k_max") = -1,
+        py::arg("x"), py::arg("r_target_per_row"), py::arg("num_threads") = 4, py::arg("k_min") = 0,
+        py::arg("k_max") = -1,
         "Nucleus/energy-threshold top-k: row r independently keeps the SMALLEST\n"
         "set of its own top-|v| entries whose captured squared-magnitude ratio\n"
         "R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target_per_row[r]. k is a\n"
@@ -4095,8 +4213,7 @@ PYBIND11_MODULE(_cpu, m)
         "sampling applied to squared magnitude instead of softmax probability.\n"
         "k_min/k_max (default 0 / -1=unbounded) clamp the R_target-derived k\n"
         "afterward -- a hardware-driven density floor/ceiling, independent of\n"
-        "how much or little energy R_target says is needed for that row."
-    );
+        "how much or little energy R_target says is needed for that row.");
 
     // ── Bulk quantize-array utilities ───────────────────────────────────────
     //
@@ -4110,13 +4227,15 @@ PYBIND11_MODULE(_cpu, m)
     // smarter scheme (rank-1 scale fit, residual decomposition, etc.) can
     // produce codes some other way and hand them directly to
     // load_dense_codes instead of calling these.
-    m.def("fp4_quantize_array",
+    m.def(
+        "fp4_quantize_array",
         [](py::array_t<float> vals) -> py::array_t<uint8_t> {
             auto buf = vals.request();
             py::array_t<uint8_t> out(buf.size);
             const float* src = (const float*)buf.ptr;
             uint8_t* dst = (uint8_t*)out.request().ptr;
-            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp4_quantize(src[i]);
+            for (py::ssize_t i = 0; i < buf.size; ++i)
+                dst[i] = fp4_quantize(src[i]);
             return out;
         },
         py::arg("vals"),
@@ -4127,13 +4246,15 @@ PYBIND11_MODULE(_cpu, m)
         "row/col value_scale -- pre-divide by scale yourself before calling\n"
         "this if you want one, same convention as load_weights().");
 
-    m.def("fp8_quantize_array",
+    m.def(
+        "fp8_quantize_array",
         [](py::array_t<float> vals) -> py::array_t<uint8_t> {
             auto buf = vals.request();
             py::array_t<uint8_t> out(buf.size);
             const float* src = (const float*)buf.ptr;
             uint8_t* dst = (uint8_t*)out.request().ptr;
-            for (py::ssize_t i = 0; i < buf.size; ++i) dst[i] = fp8_quantize(src[i]);
+            for (py::ssize_t i = 0; i < buf.size; ++i)
+                dst[i] = fp8_quantize(src[i]);
             return out;
         },
         py::arg("vals"),
@@ -4141,22 +4262,23 @@ PYBIND11_MODULE(_cpu, m)
         "to fp4_quantize_array(), same scale convention (pre-divide yourself).");
 
     m.def("seed_fp4_stochastic_rng", &fp4_seed_stochastic_rng, py::arg("seed"),
-        "Reseed the CALLING thread's FP4 stochastic-rounding RNG (see "
-        "fp4quant.hpp's fp4_quantize_stochastic -- used by disldo_forward's "
-        "importance update and disldo_backward's weight+importance update, "
-        "NOT by construction/loading/compact, which stay deterministic). "
-        "For single-threaded test reproducibility, same precedent as pinning "
-        "np.random.seed(0) for EnergyDynamics' own unseeded exploration "
-        "noise -- does not control a real (OpenMP-parallel) training run's "
-        "outcome, only this one thread's RNG state.");
+          "Reseed the CALLING thread's FP4 stochastic-rounding RNG (see "
+          "fp4quant.hpp's fp4_quantize_stochastic -- used by disldo_forward's "
+          "importance update and disldo_backward's weight+importance update, "
+          "NOT by construction/loading/compact, which stay deterministic). "
+          "For single-threaded test reproducibility, same precedent as pinning "
+          "np.random.seed(0) for EnergyDynamics' own unseeded exploration "
+          "noise -- does not control a real (OpenMP-parallel) training run's "
+          "outcome, only this one thread's RNG state.");
 
     // ── csr_union ─────────────────────────────────────────────────────────────
     // OpenMP-parallel replacement for sili.sparse_rnn.csr_union's Python loop
     // (see csr.hpp's csr_union<>) -- construction/loading-time CSR merge only.
-    m.def("csr_union",
+    m.def(
+        "csr_union",
         [](py::array_t<int> ptrs_a, py::array_t<int> idx_a, py::array_t<float> vals_a,
-           py::array_t<int> ptrs_b, py::array_t<int> idx_b, py::array_t<float> vals_b,
-           int n_rows, std::string prefer, int num_cpus) -> py::tuple {
+           py::array_t<int> ptrs_b, py::array_t<int> idx_b, py::array_t<float> vals_b, int n_rows,
+           std::string prefer, int num_cpus) -> py::tuple {
             auto to_vec_i = [](py::array_t<int>& a) {
                 auto buf = a.request();
                 return std::vector<int>((int*)buf.ptr, (int*)buf.ptr + buf.size);
@@ -4165,33 +4287,32 @@ PYBIND11_MODULE(_cpu, m)
                 auto buf = a.request();
                 return std::vector<float>((float*)buf.ptr, (float*)buf.ptr + buf.size);
             };
-            int prefer_code = (prefer == "a") ? 0 : (prefer == "b") ? 1
-                            : (prefer == "sum") ? 2 : throw std::invalid_argument(
-                                "prefer must be 'a', 'b', or 'sum'");
+            int prefer_code =
+                (prefer == "a")   ? 0
+                : (prefer == "b") ? 1
+                : (prefer == "sum")
+                    ? 2
+                    : throw std::invalid_argument("prefer must be 'a', 'b', or 'sum'");
 
-            std::vector<int>   out_ptrs, out_idx;
+            std::vector<int> out_ptrs, out_idx;
             std::vector<float> out_vals;
-            csr_union<int, float>(
-                to_vec_i(ptrs_a), to_vec_i(idx_a), to_vec_f(vals_a),
-                to_vec_i(ptrs_b), to_vec_i(idx_b), to_vec_f(vals_b),
-                n_rows, prefer_code, num_cpus,
-                out_ptrs, out_idx, out_vals);
+            csr_union<int, float>(to_vec_i(ptrs_a), to_vec_i(idx_a), to_vec_f(vals_a),
+                                  to_vec_i(ptrs_b), to_vec_i(idx_b), to_vec_f(vals_b), n_rows,
+                                  prefer_code, num_cpus, out_ptrs, out_idx, out_vals);
 
-            py::array_t<int>   ret_ptrs ({(py::ssize_t)out_ptrs.size()});
-            py::array_t<int>   ret_idx  ({(py::ssize_t)out_idx.size()});
-            py::array_t<float> ret_vals ({(py::ssize_t)out_vals.size()});
-            std::copy(out_ptrs.begin(), out_ptrs.end(), (int*)  ret_ptrs.request().ptr);
-            std::copy(out_idx.begin(),  out_idx.end(),  (int*)  ret_idx .request().ptr);
+            py::array_t<int> ret_ptrs({(py::ssize_t)out_ptrs.size()});
+            py::array_t<int> ret_idx({(py::ssize_t)out_idx.size()});
+            py::array_t<float> ret_vals({(py::ssize_t)out_vals.size()});
+            std::copy(out_ptrs.begin(), out_ptrs.end(), (int*)ret_ptrs.request().ptr);
+            std::copy(out_idx.begin(), out_idx.end(), (int*)ret_idx.request().ptr);
             std::copy(out_vals.begin(), out_vals.end(), (float*)ret_vals.request().ptr);
             return py::make_tuple(ret_ptrs, ret_idx, ret_vals);
         },
-        py::arg("ptrs_a"), py::arg("idx_a"), py::arg("vals_a"),
-        py::arg("ptrs_b"), py::arg("idx_b"), py::arg("vals_b"),
-        py::arg("n_rows"), py::arg("prefer") = "a", py::arg("num_cpus") = 4,
+        py::arg("ptrs_a"), py::arg("idx_a"), py::arg("vals_a"), py::arg("ptrs_b"), py::arg("idx_b"),
+        py::arg("vals_b"), py::arg("n_rows"), py::arg("prefer") = "a", py::arg("num_cpus") = 4,
         "Merge two same-shape CSRs into the union of their nonzero positions.\n"
         "prefer: 'a' keeps A's value on overlap, 'b' keeps B's, 'sum' adds them.\n"
-        "Construction/loading time only -- not used in forward/backward."
-    );
+        "Construction/loading time only -- not used in forward/backward.");
 
     // ── hoyer_sparsify ────────────────────────────────────────────────────────
     // NOT wired into an automatic dense/sparse dispatch (see TODO.md) -- this
@@ -4200,25 +4321,27 @@ PYBIND11_MODULE(_cpu, m)
     // deciding on dispatch thresholds. Returns diagnostics (hoyer_score,
     // k_estimate, l1/l2 norms) alongside the CSR result, since the point is
     // to make the not-obvious behavior actually inspectable.
-    m.def("hoyer_sparsify",
+    m.def(
+        "hoyer_sparsify",
         [](py::array_t<float> x) -> py::dict {
-            auto buf   = x.request();
+            auto buf = x.request();
             const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
-            const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
+            const std::size_t cols =
+                (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
             float* src = (float*)buf.ptr;
 
             auto per_row = hoyer_sparsify_per_batch<float>(src, rows, cols);
 
-            std::vector<int>   ptrs(rows + 1, 0);
-            std::vector<int>   indices;
+            std::vector<int> ptrs(rows + 1, 0);
+            std::vector<int> indices;
             std::vector<float> values;
             py::array_t<float> hoyer_scores({(py::ssize_t)rows});
-            py::array_t<int>   k_estimates ({(py::ssize_t)rows});
-            py::array_t<float> l1_norms    ({(py::ssize_t)rows});
-            py::array_t<float> l2_norms    ({(py::ssize_t)rows});
+            py::array_t<int> k_estimates({(py::ssize_t)rows});
+            py::array_t<float> l1_norms({(py::ssize_t)rows});
+            py::array_t<float> l2_norms({(py::ssize_t)rows});
 
             float* hs = (float*)hoyer_scores.request().ptr;
-            int*   ke = (int*)  k_estimates.request().ptr;
+            int* ke = (int*)k_estimates.request().ptr;
             float* l1 = (float*)l1_norms.request().ptr;
             float* l2 = (float*)l2_norms.request().ptr;
 
@@ -4226,7 +4349,7 @@ PYBIND11_MODULE(_cpu, m)
                 ptrs[r] = (int)indices.size();
                 for (std::size_t j = 0; j < per_row[r].indices.size(); ++j) {
                     indices.push_back(per_row[r].indices[j]);
-                    values .push_back(per_row[r].values[j]);
+                    values.push_back(per_row[r].values[j]);
                 }
                 hs[r] = per_row[r].hoyer_score;
                 ke[r] = per_row[r].k_estimate;
@@ -4235,21 +4358,21 @@ PYBIND11_MODULE(_cpu, m)
             }
             ptrs[rows] = (int)indices.size();
 
-            py::array_t<int>   out_ptrs   ({(py::ssize_t)(rows + 1)});
-            py::array_t<int>   out_indices({(py::ssize_t)indices.size()});
-            py::array_t<float> out_values ({(py::ssize_t)values.size()});
-            std::copy(ptrs.begin(),    ptrs.end(),    (int*)  out_ptrs.request().ptr);
-            std::copy(indices.begin(), indices.end(), (int*)  out_indices.request().ptr);
-            std::copy(values.begin(),  values.end(),  (float*)out_values.request().ptr);
+            py::array_t<int> out_ptrs({(py::ssize_t)(rows + 1)});
+            py::array_t<int> out_indices({(py::ssize_t)indices.size()});
+            py::array_t<float> out_values({(py::ssize_t)values.size()});
+            std::copy(ptrs.begin(), ptrs.end(), (int*)out_ptrs.request().ptr);
+            std::copy(indices.begin(), indices.end(), (int*)out_indices.request().ptr);
+            std::copy(values.begin(), values.end(), (float*)out_values.request().ptr);
 
             py::dict result;
-            result["ptrs"]         = out_ptrs;
-            result["indices"]      = out_indices;
-            result["values"]       = out_values;
-            result["hoyer_score"]  = hoyer_scores;
-            result["k_estimate"]   = k_estimates;
-            result["l1_norm"]      = l1_norms;
-            result["l2_norm"]      = l2_norms;
+            result["ptrs"] = out_ptrs;
+            result["indices"] = out_indices;
+            result["values"] = out_values;
+            result["hoyer_score"] = hoyer_scores;
+            result["k_estimate"] = k_estimates;
+            result["l1_norm"] = l1_norms;
+            result["l2_norm"] = l2_norms;
             return result;
         },
         py::arg("x"),
@@ -4273,21 +4396,23 @@ PYBIND11_MODULE(_cpu, m)
         "Not wired into any automatic dispatch yet -- see TODO.md.");
 
     // ── hoyer_score ─────────────────────────────────────────────────────
-    m.def("hoyer_score",
+    m.def(
+        "hoyer_score",
         [](py::array_t<float> x) -> py::dict {
-            auto buf   = x.request();
+            auto buf = x.request();
             const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
-            const std::size_t cols = (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
+            const std::size_t cols =
+                (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
             float* src = (float*)buf.ptr;
 
             auto agg = hoyer_score<float>(src, rows, cols);
 
             py::dict result;
             result["hoyer_score"] = agg.hoyer_score;
-            result["k_estimate"]  = agg.k_estimate;
-            result["l1_norm"]     = agg.l1_norm;
-            result["l2_norm"]     = agg.l2_norm;
-            result["n_total"]     = (int)(rows * cols);
+            result["k_estimate"] = agg.k_estimate;
+            result["l1_norm"] = agg.l1_norm;
+            result["l2_norm"] = agg.l2_norm;
+            result["n_total"] = (int)(rows * cols);
             return result;
         },
         py::arg("x"),
@@ -4303,20 +4428,17 @@ PYBIND11_MODULE(_cpu, m)
         "automatic dispatch yet -- see TODO.md.");
 
     // ── make_csr_input ────────────────────────────────────────────────────────
-    m.def("make_csr_input",
-        [](int rows, int cols,
-           py::array_t<int>   ptrs,
-           py::array_t<int>   indices,
+    m.def(
+        "make_csr_input",
+        [](int rows, int cols, py::array_t<int> ptrs, py::array_t<int> indices,
            py::array_t<float> values) {
             auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
             return make_csr_input<int, float>(
-                rows, cols,
-                std::vector<int>  ((int*)  pb.ptr, (int*)  pb.ptr + pb.size),
-                std::vector<int>  ((int*)  ib.ptr, (int*)  ib.ptr + ib.size),
+                rows, cols, std::vector<int>((int*)pb.ptr, (int*)pb.ptr + pb.size),
+                std::vector<int>((int*)ib.ptr, (int*)ib.ptr + ib.size),
                 std::vector<float>((float*)vb.ptr, (float*)vb.ptr + vb.size));
         },
-        py::arg("rows"), py::arg("cols"),
-        py::arg("ptrs"), py::arg("indices"), py::arg("values"));
+        py::arg("rows"), py::arg("cols"), py::arg("ptrs"), py::arg("indices"), py::arg("values"));
 
     // NOTE: a standalone m.def("make_weights", ...) binding used to live here,
     // calling make_weights<int,float> with a stale 7-arg signature (rows,
@@ -4337,110 +4459,110 @@ PYBIND11_MODULE(_cpu, m)
     // numpy [T, d] output. The Python-facing names match exactly what
     // multimodal_sparse_rnn.py calls (sparse_attention, sparse_banded_attention).
 
-    m.def("sparse_attention",
-        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           std::size_t top_k, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request();
+    m.def(
+        "sparse_attention",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, std::size_t top_k,
+           int num_cpus, bool causal) {
+            auto qb = q.request(), kb = k.request(), vb = v.request();
             const std::size_t T = qb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
             auto ob = out.request();
-            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
-            sparse_attention_forward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, d, top_k, num_cpus, causal);
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T * d, 0.0f);
+            sparse_attention_forward((const float*)qb.ptr, (const float*)kb.ptr,
+                                     (const float*)vb.ptr, (float*)ob.ptr, T, d, top_k, num_cpus,
+                                     causal);
             return out;
         },
-        py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("top_k") = 0, py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("top_k") = 0, py::arg("num_cpus") = 4,
+        py::arg("causal") = false,
         "Global top-k sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
         "top_k=0 -> use sqrt(T). causal=True masks any selected (query, key)\n"
         "pair where the key's sequence position is after the query's.\n"
         "Returns [T, d] output.");
 
-    m.def("sparse_banded_attention",
+    m.def(
+        "sparse_banded_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            std::size_t half_bandwidth, std::size_t inner_k, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request();
+            auto qb = q.request(), kb = k.request(), vb = v.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
             auto ob = out.request();
-            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
-            sparse_banded_attention_forward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, K, d, half_bandwidth, inner_k, num_cpus, causal);
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T * d, 0.0f);
+            sparse_banded_attention_forward((const float*)qb.ptr, (const float*)kb.ptr,
+                                            (const float*)vb.ptr, (float*)ob.ptr, T, K, d,
+                                            half_bandwidth, inner_k, num_cpus, causal);
             return out;
         },
-        py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
-        py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("half_bandwidth"), py::arg("inner_k") = 0,
+        py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Banded sparse attention. Q/K/V are [T, d] float32 numpy arrays.\n"
         "inner_k=0 -> use all keys in the band (dense banded). causal=True\n"
         "requires T == K and clamps each query's band so it never selects a\n"
         "key past its own position. Returns [T, d] output.");
 
-    m.def("banded_attention",
+    m.def(
+        "banded_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
            std::size_t half_bandwidth, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request();
+            auto qb = q.request(), kb = k.request(), vb = v.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
             auto ob = out.request();
-            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
-            banded_attention_forward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, K, d, half_bandwidth, num_cpus, causal);
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T * d, 0.0f);
+            banded_attention_forward((const float*)qb.ptr, (const float*)kb.ptr,
+                                     (const float*)vb.ptr, (float*)ob.ptr, T, K, d, half_bandwidth,
+                                     num_cpus, causal);
             return out;
         },
-        py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("half_bandwidth"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("half_bandwidth"),
+        py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Dense banded attention. Q/K/V are [T, d] float32 numpy arrays.\n"
         "causal=True requires T == K and clamps each query's band so it\n"
         "never sees a key past its own position (autoregressive self-attn).\n"
         "Returns [T, d] output.");
 
-    m.def("banded_attention_backward",
-        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           py::array_t<float> dO,
+    m.def(
+        "banded_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, py::array_t<float> dO,
            std::size_t half_bandwidth, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            auto qb = q.request(), kb = k.request(), vb = v.request(), dob = dO.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
             py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
             py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
-            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
-            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
-            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
-            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
-            banded_attention_backward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (const float*)dob.ptr,
-                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, K, d, half_bandwidth, num_cpus, causal);
+            auto dqb = dQ.request(), dkb = dK.request(), dvb = dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T * d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K * d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K * d, 0.0f);
+            banded_attention_backward((const float*)qb.ptr, (const float*)kb.ptr,
+                                      (const float*)vb.ptr, (const float*)dob.ptr, (float*)dqb.ptr,
+                                      (float*)dkb.ptr, (float*)dvb.ptr, T, K, d, half_bandwidth,
+                                      num_cpus, causal);
             return py::make_tuple(dQ, dK, dV);
         },
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("half_bandwidth"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("half_bandwidth"),
+        py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Backward pass for banded_attention. causal must match the forward\n"
         "call. Returns (dQ, dK, dV) each [T or K, d].");
 
-    m.def("gaussian_attention",
+    m.def(
+        "gaussian_attention",
         [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           py::array_t<float> centers, py::array_t<float> sigmas,
-           int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request();
-            auto cb=centers.request(), sb=sigmas.request();
+           py::array_t<float> centers, py::array_t<float> sigmas, int num_cpus, bool causal) {
+            auto qb = q.request(), kb = k.request(), vb = v.request();
+            auto cb = centers.request(), sb = sigmas.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> out({(py::ssize_t)T, (py::ssize_t)d});
             auto ob = out.request();
-            std::fill((float*)ob.ptr, (float*)ob.ptr + T*d, 0.0f);
+            std::fill((float*)ob.ptr, (float*)ob.ptr + T * d, 0.0f);
             gaussian_attention_forward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (float*)ob.ptr, T, K, d,
-                (const float*)cb.ptr, (const float*)sb.ptr, num_cpus, causal);
+                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr, (float*)ob.ptr, T,
+                K, d, (const float*)cb.ptr, (const float*)sb.ptr, num_cpus, causal);
             return out;
         },
-        py::arg("q"), py::arg("k"), py::arg("v"),
-        py::arg("centers"), py::arg("sigmas"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("centers"), py::arg("sigmas"),
+        py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Full (every query x every key) attention with a learnable per-query\n"
         "Gaussian log-bias: score[q,j] = Q[q].K[j]*scale - (j-centers[q])^2/\n"
         "(2*sigmas[q]^2), then softmax as usual. Q/K/V are [T or K, d] float32\n"
@@ -4449,127 +4571,128 @@ PYBIND11_MODULE(_cpu, m)
         "before calling in (see sili.tensor.exp), not pass raw trainable sigma\n"
         "directly. Returns [T, d] output.");
 
-    m.def("gaussian_attention_backward",
-        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           py::array_t<float> dO, py::array_t<float> centers, py::array_t<float> sigmas,
-           int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
-            auto cb=centers.request(), sb=sigmas.request();
+    m.def(
+        "gaussian_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, py::array_t<float> dO,
+           py::array_t<float> centers, py::array_t<float> sigmas, int num_cpus, bool causal) {
+            auto qb = q.request(), kb = k.request(), vb = v.request(), dob = dO.request();
+            auto cb = centers.request(), sb = sigmas.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
             py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
             py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
             py::array_t<float> dCenters({(py::ssize_t)T});
             py::array_t<float> dSigmas({(py::ssize_t)T});
-            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
-            auto dcb=dCenters.request(), dsb=dSigmas.request();
-            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
-            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
-            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
+            auto dqb = dQ.request(), dkb = dK.request(), dvb = dV.request();
+            auto dcb = dCenters.request(), dsb = dSigmas.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T * d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K * d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K * d, 0.0f);
             std::fill((float*)dcb.ptr, (float*)dcb.ptr + T, 0.0f);
             std::fill((float*)dsb.ptr, (float*)dsb.ptr + T, 0.0f);
             gaussian_attention_backward(
                 (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (const float*)dob.ptr,
-                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                (float*)dcb.ptr, (float*)dsb.ptr,
-                T, K, d, (const float*)cb.ptr, (const float*)sb.ptr, num_cpus, causal);
+                (const float*)dob.ptr, (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
+                (float*)dcb.ptr, (float*)dsb.ptr, T, K, d, (const float*)cb.ptr,
+                (const float*)sb.ptr, num_cpus, causal);
             return py::make_tuple(dQ, dK, dV, dCenters, dSigmas);
         },
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("centers"), py::arg("sigmas"), py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("centers"),
+        py::arg("sigmas"), py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Backward pass for gaussian_attention. centers/sigmas must match the\n"
         "forward call. Returns (dQ, dK, dV, dCenters, dSigmas).");
 
-    m.def("sparse_banded_attention_backward",
-        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           py::array_t<float> dO,
+    m.def(
+        "sparse_banded_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, py::array_t<float> dO,
            std::size_t half_bandwidth, std::size_t inner_k, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            auto qb = q.request(), kb = k.request(), vb = v.request(), dob = dO.request();
             const std::size_t T = qb.shape[0], K = kb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
             py::array_t<float> dK({(py::ssize_t)K, (py::ssize_t)d});
             py::array_t<float> dV({(py::ssize_t)K, (py::ssize_t)d});
-            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
-            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
-            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K*d, 0.0f);
-            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K*d, 0.0f);
-            sparse_banded_attention_backward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (const float*)dob.ptr,
-                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, K, d, half_bandwidth, inner_k, num_cpus, causal);
+            auto dqb = dQ.request(), dkb = dK.request(), dvb = dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T * d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + K * d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + K * d, 0.0f);
+            sparse_banded_attention_backward((const float*)qb.ptr, (const float*)kb.ptr,
+                                             (const float*)vb.ptr, (const float*)dob.ptr,
+                                             (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr, T,
+                                             K, d, half_bandwidth, inner_k, num_cpus, causal);
             return py::make_tuple(dQ, dK, dV);
         },
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("half_bandwidth"), py::arg("inner_k") = 0, py::arg("num_cpus") = 4,
-        py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("half_bandwidth"),
+        py::arg("inner_k") = 0, py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Backward pass for sparse_banded_attention. causal must match the\n"
         "forward call. Returns (dQ, dK, dV).");
 
-    m.def("sparse_attention_backward",
-        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
-           py::array_t<float> dO,
+    m.def(
+        "sparse_attention_backward",
+        [](py::array_t<float> q, py::array_t<float> k, py::array_t<float> v, py::array_t<float> dO,
            std::size_t top_k, int num_cpus, bool causal) {
-            auto qb=q.request(), kb=k.request(), vb=v.request(), dob=dO.request();
+            auto qb = q.request(), kb = k.request(), vb = v.request(), dob = dO.request();
             const std::size_t T = qb.shape[0], d = qb.shape[1];
             py::array_t<float> dQ({(py::ssize_t)T, (py::ssize_t)d});
             py::array_t<float> dK({(py::ssize_t)T, (py::ssize_t)d});
             py::array_t<float> dV({(py::ssize_t)T, (py::ssize_t)d});
-            auto dqb=dQ.request(), dkb=dK.request(), dvb=dV.request();
-            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T*d, 0.0f);
-            std::fill((float*)dkb.ptr, (float*)dkb.ptr + T*d, 0.0f);
-            std::fill((float*)dvb.ptr, (float*)dvb.ptr + T*d, 0.0f);
-            sparse_attention_backward(
-                (const float*)qb.ptr, (const float*)kb.ptr, (const float*)vb.ptr,
-                (const float*)dob.ptr,
-                (float*)dqb.ptr, (float*)dkb.ptr, (float*)dvb.ptr,
-                T, d, top_k, num_cpus, causal);
+            auto dqb = dQ.request(), dkb = dK.request(), dvb = dV.request();
+            std::fill((float*)dqb.ptr, (float*)dqb.ptr + T * d, 0.0f);
+            std::fill((float*)dkb.ptr, (float*)dkb.ptr + T * d, 0.0f);
+            std::fill((float*)dvb.ptr, (float*)dvb.ptr + T * d, 0.0f);
+            sparse_attention_backward((const float*)qb.ptr, (const float*)kb.ptr,
+                                      (const float*)vb.ptr, (const float*)dob.ptr, (float*)dqb.ptr,
+                                      (float*)dkb.ptr, (float*)dvb.ptr, T, d, top_k, num_cpus,
+                                      causal);
             return py::make_tuple(dQ, dK, dV);
         },
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"),
-        py::arg("top_k") = 0, py::arg("num_cpus") = 4, py::arg("causal") = false,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("top_k") = 0,
+        py::arg("num_cpus") = 4, py::arg("causal") = false,
         "Backward pass for sparse_attention. causal must match the forward\n"
         "call. Returns (dQ, dK, dV).");
 
     // ── Loss functions ────────────────────────────────────────────────────────
 
-    m.def("mse_loss",
+    m.def(
+        "mse_loss",
         [](py::array_t<float> output, py::array_t<float> desired) {
             auto ob = output.request(), db = desired.request();
-            if (ob.size != db.size) throw std::runtime_error("mse_loss: size mismatch");
+            if (ob.size != db.size)
+                throw std::runtime_error("mse_loss: size mismatch");
             return mse_loss((float*)ob.ptr, (float*)db.ptr, (size_t)ob.size);
         },
-        py::arg("output"), py::arg("desired"),
-        "(1/n) * sum((desired - output)^2)");
+        py::arg("output"), py::arg("desired"), "(1/n) * sum((desired - output)^2)");
 
-    m.def("mse_grad",
+    m.def(
+        "mse_grad",
         [](py::array_t<float> output, py::array_t<float> desired) {
             auto ob = output.request(), db = desired.request();
-            if (ob.size != db.size) throw std::runtime_error("mse_grad: size mismatch");
+            if (ob.size != db.size)
+                throw std::runtime_error("mse_grad: size mismatch");
             py::array_t<float> grad((py::ssize_t)ob.size);
-            mse_grad((float*)ob.ptr, (float*)db.ptr,
-                     (float*)grad.request().ptr, (size_t)ob.size);
+            mse_grad((float*)ob.ptr, (float*)db.ptr, (float*)grad.request().ptr, (size_t)ob.size);
             return grad;
         },
-        py::arg("output"), py::arg("desired"),
-        "-2 * (desired - output) / n");
+        py::arg("output"), py::arg("desired"), "-2 * (desired - output) / n");
 
-    m.def("mse_loss_parallel",
+    m.def(
+        "mse_loss_parallel",
         [](py::array_t<float> output, py::array_t<float> desired, int num_cpus) {
             auto ob = output.request(), db = desired.request();
-            if (ob.size != db.size) throw std::runtime_error("mse_loss_parallel: size mismatch");
+            if (ob.size != db.size)
+                throw std::runtime_error("mse_loss_parallel: size mismatch");
             return mse_loss_parallel((float*)ob.ptr, (float*)db.ptr, (size_t)ob.size, num_cpus);
         },
         py::arg("output"), py::arg("desired"), py::arg("num_cpus") = 4);
 
-    m.def("mse_grad_parallel",
+    m.def(
+        "mse_grad_parallel",
         [](py::array_t<float> output, py::array_t<float> desired, int num_cpus) {
             auto ob = output.request(), db = desired.request();
-            if (ob.size != db.size) throw std::runtime_error("mse_grad_parallel: size mismatch");
+            if (ob.size != db.size)
+                throw std::runtime_error("mse_grad_parallel: size mismatch");
             py::array_t<float> grad((py::ssize_t)ob.size);
-            mse_grad_parallel((float*)ob.ptr, (float*)db.ptr,
-                              (float*)grad.request().ptr, (size_t)ob.size, num_cpus);
+            mse_grad_parallel((float*)ob.ptr, (float*)db.ptr, (float*)grad.request().ptr,
+                              (size_t)ob.size, num_cpus);
             return grad;
         },
         py::arg("output"), py::arg("desired"), py::arg("num_cpus") = 4);

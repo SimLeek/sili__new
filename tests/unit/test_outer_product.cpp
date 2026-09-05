@@ -24,7 +24,8 @@ TEST_CASE("Outer Product Function Tests") {
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero
+elements");
     }
 
     SECTION("Rectangular Matrices Test") {
@@ -48,7 +49,8 @@ TEST_CASE("Outer Product Function Tests") {
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero
+elements");
     }
 
     SECTION("Multi-Batched Operations Test") {
@@ -74,7 +76,8 @@ TEST_CASE("Outer Product Function Tests") {
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz/2, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz/2, "Incorrect number of non-zero
+elements");
     }
 }
 
@@ -94,11 +97,13 @@ TEST_CASE("Outer Product Mask Function Tests") {
         b.indices = new int[b.nnz]{0, 1, 2, 3, 4};
 
         // Perform outer product
-        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size, a, b);
+        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size,
+a, b);
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero
+elements");
     }
 
     SECTION("Rectangular Matrices Test") {
@@ -116,11 +121,13 @@ TEST_CASE("Outer Product Mask Function Tests") {
         b.indices = new int[b.nnz]{0, 1, 2, 3};
 
         // Perform outer product
-        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size, a, b);
+        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size,
+a, b);
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz, "Incorrect number of non-zero
+elements");
     }
 
     SECTION("Multi-Batched Operations Test") {
@@ -140,11 +147,13 @@ TEST_CASE("Outer Product Mask Function Tests") {
         b.ptrs = new int[batches + 1]{0, 4, 8}; // Define ptrs for B
 
         // Perform outer product
-        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size, a, b);
+        std::vector<csr_struct> result_batches = build_outer_product_mask(batches, a_size, b_size,
+a, b);
 
         // Check if results match expectations
         REQUIRE_MESSAGE(result_batches.size() == batches, "Number of result batches mismatched");
-        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz/2, "Incorrect number of non-zero elements");
+        REQUIRE_MESSAGE(result_batches.front().nnz == a.nnz*b.nnz/2, "Incorrect number of non-zero
+elements");
     }
 }
 
@@ -262,15 +271,18 @@ TEST_CASE("Backpropagate To B Function Tests") {
 
 TEST_CASE("Backpropagate To A Function Tests") {
     SECTION("Single Batch Test") {
-        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to A");
+        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to
+A");
     }
 
     SECTION("Multiple Batches Test") {
-        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to A");
+        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to
+A");
     }
 
     SECTION("Edge Case Test") {
-        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to A");
+        REQUIRE_MESSAGE(false, "Get backprop to B tests working before adapting them to backprop to
+A");
     }
 }
 */

@@ -2,9 +2,10 @@
 rl_utils.py -- small reusable RL utilities shared across sili's curiosity/RTAC
 experiments. Currently just PopArt; grows as more agents need shared pieces.
 """
+
 from __future__ import annotations
+
 import math
-import numpy as np
 
 
 class PopArt:
@@ -61,8 +62,7 @@ class PopArt:
     def unnormalize(self, normalized: float) -> float:
         return normalized * self.std + self.mean
 
-    def update_and_rescale(self, raw_target: float,
-                           weight_arrays: list, bias_arrays: list) -> float:
+    def update_and_rescale(self, raw_target: float, weight_arrays: list, bias_arrays: list) -> float:
         """
         Update running mean/std with raw_target (EMA), then rescale the given
         weight-like arrays (scale only) and bias-like arrays (scale + shift)
@@ -78,9 +78,9 @@ class PopArt:
         self.n += 1
         old_mean, old_std = self.mean, self.std
 
-        self.mean    = (1 - self.beta) * self.mean    + self.beta * raw_target
-        self.mean_sq = (1 - self.beta) * self.mean_sq + self.beta * (raw_target ** 2)
-        var = max(self.mean_sq - self.mean ** 2, self.eps)
+        self.mean = (1 - self.beta) * self.mean + self.beta * raw_target
+        self.mean_sq = (1 - self.beta) * self.mean_sq + self.beta * (raw_target**2)
+        var = max(self.mean_sq - self.mean**2, self.eps)
         self.std = math.sqrt(var)
 
         if self.n > self.start_pop:

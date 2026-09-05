@@ -9,9 +9,9 @@
 // Test ComparatorLT
 TEST_CASE("ComparatorLT works correctly", "[comparator]") {
     ComparatorLT<int, int> cmp_int;
-    CHECK(cmp_int(1, 2) == true);    // 1 < 2
-    CHECK(cmp_int(2, 1) == false);   // 2 < 1 is false
-    CHECK(cmp_int(1, 1) == false);   // 1 < 1 is false
+    CHECK(cmp_int(1, 2) == true);  // 1 < 2
+    CHECK(cmp_int(2, 1) == false); // 2 < 1 is false
+    CHECK(cmp_int(1, 1) == false); // 1 < 1 is false
 
     ComparatorLT<double, double> cmp_double;
     CHECK(cmp_double(1.5, 2.5) == true);  // 1.5 < 2.5
@@ -22,9 +22,9 @@ TEST_CASE("ComparatorLT works correctly", "[comparator]") {
 // Test ComparatorGT
 TEST_CASE("ComparatorGT works correctly", "[comparator]") {
     ComparatorGT<int, int> cmp_int;
-    CHECK(cmp_int(2, 1) == true);    // 2 > 1
-    CHECK(cmp_int(1, 2) == false);   // 1 > 2 is false
-    CHECK(cmp_int(1, 1) == false);   // 1 > 1 is false
+    CHECK(cmp_int(2, 1) == true);  // 2 > 1
+    CHECK(cmp_int(1, 2) == false); // 1 > 2 is false
+    CHECK(cmp_int(1, 1) == false); // 1 > 1 is false
 
     ComparatorGT<double, double> cmp_double;
     CHECK(cmp_double(2.5, 1.5) == true);  // 2.5 > 1.5
@@ -56,7 +56,8 @@ TEST_CASE("PermutationComparator with GT sorts indices descending", "[comparator
 TEST_CASE("PermutationComparator works with floats", "[comparator]") {
     std::vector<double> v = {3.5, 1.2, 4.8, 2.3};
     std::vector<size_t> indices = {0, 1, 2, 3};
-    auto cmp = PermutationComparator<double, ComparatorLT<double, double>>(v, ComparatorLT<double, double>());
+    auto cmp = PermutationComparator<double, ComparatorLT<double, double>>(
+        v, ComparatorLT<double, double>());
     std::sort(indices.begin(), indices.end(), cmp);
     std::vector<size_t> expected = {1, 3, 0, 2}; // 1.2, 2.3, 3.5, 4.8
     CHECK_VECTOR_EQUAL(indices, expected);
@@ -118,7 +119,7 @@ TEST_CASE("Merge sort sorts partial segment", "[merge_sort]") {
 TEST_CASE("Merge sort sorts large vector", "[merge_sort]") {
     const size_t N = 100000;
     std::vector<int> v(N);
-    std::generate(v.begin(), v.end(), [](){ return rand() % 1000; });
+    std::generate(v.begin(), v.end(), []() { return rand() % 1000; });
     std::vector<int> v_sorted = v;
     omp_merge_sort(v_sorted);
     CHECK(std::is_sorted(v_sorted.begin(), v_sorted.end()));
@@ -209,7 +210,7 @@ TEST_CASE("omp_lower_bound finds lower bound for existing value", "[lower_bound]
     std::vector<int> arr = {1, 3, 3, 5, 7};
     int val = 3;
     size_t idx = omp_lower_bound(arr, arr.size(), val, 2); // 2 threads
-    CHECK(idx == 1); // First 3 is at index 1
+    CHECK(idx == 1);                                       // First 3 is at index 1
 }
 
 // Test omp_lower_bound with value not present
@@ -234,7 +235,7 @@ TEST_CASE("omp_scan computes exclusive prefix sum correctly", "[scan]") {
     std::unique_ptr<int[]> output(new int[input.size()]);
     omp_scan_exclusive(input, output, input.size());
     std::vector<int> expected = {0, 1, 3, 6}; // Exclusive: 0, 1, 1+2, 1+2+3
-    
+
     std::vector<int> out_vec(output.get(), output.get() + input.size());
     CHECK_VECTOR_EQUAL(out_vec, expected);
 }
@@ -246,7 +247,7 @@ TEST_CASE("omp_full_scan computes inclusive prefix sum correctly", "[scan]") {
     omp_full_scan(input, output, input.size());
     std::vector<int> expected = {0, 1, 3, 6, 10}; // Inclusive: 0, 1, 1+2, 1+2+3, 1+2+3+4
 
-    std::vector<int> out_vec(output.get(), output.get() + input.size()+1);
+    std::vector<int> out_vec(output.get(), output.get() + input.size() + 1);
     CHECK_VECTOR_EQUAL(out_vec, expected);
 }
 
@@ -264,7 +265,7 @@ TEST_CASE("omp_full_scan handles single-element vector", "[scan]") {
     std::unique_ptr<int[]> output(new int[2]);
     omp_full_scan(input, output, 1);
 
-    std::vector<int> out_vec(output.get(), output.get() + input.size()+1);
+    std::vector<int> out_vec(output.get(), output.get() + input.size() + 1);
     std::vector<int> expected({0, 42});
     CHECK_VECTOR_EQUAL(out_vec, expected);
 }
@@ -273,7 +274,8 @@ TEST_CASE("omp_full_scan handles single-element vector", "[scan]") {
 TEST_CASE("omp_top_k_per_row basic functionality", "[top_k]") {
     std::vector<int> matrix = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     size_t rows = 3, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 6};
     std::vector<size_t> expected_indices = {2, 3, 2, 3, 2, 3};
     std::vector<int> expected_values = {3, 4, 7, 8, 11, 12};
@@ -284,7 +286,8 @@ TEST_CASE("omp_top_k_per_row basic functionality", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with k=0", "[top_k]") {
     std::vector<int> matrix = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     size_t rows = 3, cols = 4, k = 0;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 0, 0, 0};
     std::vector<size_t> expected_indices = {};
     std::vector<int> expected_values = {};
@@ -295,7 +298,8 @@ TEST_CASE("omp_top_k_per_row with k=0", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with k > cols", "[top_k]") {
     std::vector<int> matrix = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     size_t rows = 3, cols = 4, k = 5;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 4, 8, 12};
     std::vector<size_t> expected_indices = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
     std::vector<int> expected_values = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
@@ -306,7 +310,8 @@ TEST_CASE("omp_top_k_per_row with k > cols", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with rows=0", "[top_k]") {
     std::vector<int> matrix = {};
     size_t rows = 0, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0};
     std::vector<size_t> expected_indices = {};
     std::vector<int> expected_values = {};
@@ -317,7 +322,8 @@ TEST_CASE("omp_top_k_per_row with rows=0", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with cols=0", "[top_k]") {
     std::vector<int> matrix = {};
     size_t rows = 3, cols = 0, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 0, 0, 0};
     std::vector<size_t> expected_indices = {};
     std::vector<int> expected_values = {};
@@ -328,7 +334,8 @@ TEST_CASE("omp_top_k_per_row with cols=0", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with ComparatorLT", "[top_k]") {
     std::vector<int> matrix = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     size_t rows = 3, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorLT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorLT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 6};
     std::vector<size_t> expected_indices = {0, 1, 0, 1, 0, 1};
     std::vector<int> expected_values = {1, 2, 5, 6, 9, 10};
@@ -339,7 +346,8 @@ TEST_CASE("omp_top_k_per_row with ComparatorLT", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with floating-point numbers", "[top_k]") {
     std::vector<double> matrix = {1.5, 2.5, 3.5, 4.5, 0.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5};
     size_t rows = 3, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<double, double>());
+    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4,
+                                 ComparatorGT<double, double>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 6};
     std::vector<size_t> expected_indices = {2, 3, 2, 3, 2, 3};
     std::vector<double> expected_values = {3.5, 4.5, 7.5, 8.5, 11.5, 12.5};
@@ -350,7 +358,8 @@ TEST_CASE("omp_top_k_per_row with floating-point numbers", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with duplicates", "[top_k]") {
     std::vector<int> matrix = {1, 3, 2, 3, 4, 4, 4, 4, 5, 6, 7, 8};
     size_t rows = 3, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 6};
     std::vector<size_t> expected_indices = {1, 3, 0, 1, 2, 3};
     std::vector<int> expected_values = {3, 3, 4, 4, 7, 8};
@@ -361,7 +370,8 @@ TEST_CASE("omp_top_k_per_row with duplicates", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with exclude_zeroes=true", "[top_k]") {
     std::vector<int> matrix = {0, 1, 0, 2, 0, 0, 3, 4, 5, 0, 6, 7};
     size_t rows = 3, cols = 4, k = 3;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, true, false, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, true, false, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 7};
     std::vector<size_t> expected_indices = {1, 3, 2, 3, 0, 2, 3};
     std::vector<int> expected_values = {1, 2, 3, 4, 5, 6, 7};
@@ -372,7 +382,8 @@ TEST_CASE("omp_top_k_per_row with exclude_zeroes=true", "[top_k]") {
 TEST_CASE("omp_top_k_per_row with use_abs=true", "[top_k]") {
     std::vector<int> matrix = {-1, 2, -3, 4, -5, 6, -7, 8, 9, -10, 11, -12};
     size_t rows = 3, cols = 4, k = 2;
-    auto csr = omp_top_k_per_row(matrix.data(), rows, cols, k, false, true, 4, ComparatorGT<int, int>());
+    auto csr =
+        omp_top_k_per_row(matrix.data(), rows, cols, k, false, true, 4, ComparatorGT<int, int>());
     std::vector<size_t> expected_ptrs = {0, 2, 4, 6};
     std::vector<size_t> expected_indices = {2, 3, 2, 3, 2, 3};
     std::vector<int> expected_values = {-3, 4, -7, 8, 11, -12};

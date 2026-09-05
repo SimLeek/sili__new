@@ -36,23 +36,20 @@
  * @brief Type trait to check if a type is a std::array.
  * @tparam T The type to check.
  */
-template <typename T>
-struct is_std_array : std::false_type {};
+template <typename T> struct is_std_array : std::false_type {};
 
 /**
  * @brief Specialization of is_std_array for std::array types.
  * @tparam T The element type of the array.
  * @tparam N The size of the array.
  */
-template <typename T, std::size_t N>
-struct is_std_array<std::array<T, N>> : std::true_type {};
+template <typename T, std::size_t N> struct is_std_array<std::array<T, N>> : std::true_type {};
 
 /**
  * @brief Helper variable template to check if a type is a std::array.
  * @tparam T The type to check.
  */
-template <typename T>
-constexpr bool is_std_array_v = is_std_array<T>::value;
+template <typename T> constexpr bool is_std_array_v = is_std_array<T>::value;
 
 template <class SIZE_TYPE>
 using CSRPointers = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
@@ -60,8 +57,7 @@ using CSRPointers = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
 template <class SIZE_TYPE>
 using CSRIndices = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
 
-template <class SIZE_TYPE>
-using COOPointers = SIZE_TYPE;  // just store nnz
+template <class SIZE_TYPE> using COOPointers = SIZE_TYPE; // just store nnz
 
 template <class SIZE_TYPE>
 using COOIndices = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 2>;
@@ -86,16 +82,15 @@ using PentaValues = std::array<std::shared_ptr<std::vector<VALUE_TYPE>>, 5>;
 template <typename INDEX_ARRAYS>
 constexpr std::size_t num_indices = std::tuple_size<INDEX_ARRAYS>::value;
 
-template <class SIZE_TYPE, class PTRS, class INDICES, class VALUES>
-struct sparse_struct {
-    PTRS ptrs;               // Pointers sub-template
-    INDICES indices;         // Indices sub-template
-    VALUES values;           // Values sub-template
+template <class SIZE_TYPE, class PTRS, class INDICES, class VALUES> struct sparse_struct {
+    PTRS ptrs;       // Pointers sub-template
+    INDICES indices; // Indices sub-template
+    VALUES values;   // Values sub-template
     SIZE_TYPE rows;
     SIZE_TYPE cols;
     SIZE_TYPE _reserved_space = 0;
 
-    using size_type = SIZE_TYPE;   // Exporting the type
+    using size_type = SIZE_TYPE; // Exporting the type
 
     static constexpr std::size_t n_index_arrays = num_indices<INDICES>;
     static constexpr std::size_t n_value_arrays = num_indices<VALUES>;
@@ -104,8 +99,7 @@ struct sparse_struct {
     /**
      * @brief Default constructor, initializes an empty sparse matrix.
      */
-    sparse_struct()
-        : rows(0), cols(0), _reserved_space(0) {}
+    sparse_struct() : rows(0), cols(0), _reserved_space(0) {}
 
     /**
      * @brief Constructor for pre-allocated arrays with reserved space.
@@ -116,9 +110,10 @@ struct sparse_struct {
      * @param max_idx Number of columns.
      * @param reserved Reserved space for future expansion.
      */
-    sparse_struct(PTRS& p, INDICES& ind, VALUES& val, SIZE_TYPE num_p, SIZE_TYPE max_idx, SIZE_TYPE reserved)
-        : ptrs(std::move(p)), indices(std::move(ind)), values(std::move(val)),
-          rows(num_p), cols(max_idx), _reserved_space(reserved) {}
+    sparse_struct(PTRS& p, INDICES& ind, VALUES& val, SIZE_TYPE num_p, SIZE_TYPE max_idx,
+                  SIZE_TYPE reserved)
+        : ptrs(std::move(p)), indices(std::move(ind)), values(std::move(val)), rows(num_p),
+          cols(max_idx), _reserved_space(reserved) {}
 
     /**
      * @brief Constructor for pre-allocated arrays without reserved space.
@@ -140,8 +135,11 @@ struct sparse_struct {
      * @return The number of non-zero elements.
      */
     SIZE_TYPE nnz() const {
-        if constexpr (std::is_array_v<decltype(ptrs)> || is_std_array_v<decltype(ptrs)>) { // Check if ptrs is an array type
-            return (ptrs[ptrs.size()-1] && !ptrs[ptrs.size()-1]->empty()) ? (*ptrs[ptrs.size()-1])[rows] : 0;
+        if constexpr (std::is_array_v<decltype(ptrs)> ||
+                      is_std_array_v<decltype(ptrs)>) { // Check if ptrs is an array type
+            return (ptrs[ptrs.size() - 1] && !ptrs[ptrs.size() - 1]->empty())
+                       ? (*ptrs[ptrs.size() - 1])[rows]
+                       : 0;
         } else { // ptrs is a single nnz value
             return ptrs;
         }
@@ -159,32 +157,36 @@ struct sparse_struct {
             values.clear();
         }
     }
-
 };
 
 // bi = weight multiplier, importance (for optim). Adagrad would use 2 for optim, using quad.
 // Since all these have the same indices, it's much cheaper to store them in the same csr.
 template <class SIZE_TYPE>
-using CSRSynapses = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValuesFP4 >;
+using CSRSynapses =
+    sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValuesFP4>;
 // easier to use in some algorithms
 template <class SIZE_TYPE>
-using COOSynapses = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValuesFP4 >;
+using COOSynapses =
+    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValuesFP4>;
 
 template <class SIZE_TYPE, class VALUE_TYPE>
-using CSRSynapsesV = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValues<VALUE_TYPE> >;
+using CSRSynapsesV =
+    sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, BiValues<VALUE_TYPE>>;
 // easier to use in some algorithms
 template <class SIZE_TYPE, class VALUE_TYPE>
-using COOSynapsesV = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValues<VALUE_TYPE> >;
+using COOSynapsesV =
+    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, BiValues<VALUE_TYPE>>;
 
 template <class SIZE_TYPE, class VALUE_TYPE>
-using CSRInput = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE> >;
+using CSRInput = sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>,
+                               UnaryValues<VALUE_TYPE>>;
 
-//easier to use in some algorithms
+// easier to use in some algorithms
 template <class SIZE_TYPE, class VALUE_TYPE>
-using COOSynaptogenesis = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE> >;
+using COOSynaptogenesis = sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>,
+                                        UnaryValues<VALUE_TYPE>>;
 
-template <class SYNAPSES, class SYNAPTOGENESIS>
-struct sparse_weights{
+template <class SYNAPSES, class SYNAPTOGENESIS> struct sparse_weights {
     using size_type = typename SYNAPSES::size_type;
 
     SYNAPSES connections;
@@ -200,35 +202,36 @@ struct sparse_weights{
 };
 
 template <class SIZE_TYPE, class VALUE_TYPE>
-using SparseLinearWeights = sparse_weights<CSRSynapses<SIZE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
+using SparseLinearWeights =
+    sparse_weights<CSRSynapses<SIZE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
 template <class SIZE_TYPE, class VALUE_TYPE>
-using SparseLinearWeightsV = sparse_weights<CSRSynapsesV<SIZE_TYPE, VALUE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
+using SparseLinearWeightsV =
+    sparse_weights<CSRSynapsesV<SIZE_TYPE, VALUE_TYPE>, COOSynaptogenesis<SIZE_TYPE, VALUE_TYPE>>;
 
 // Delta CSR section
 
 /// Maximum bytes to encode an integer as ULEB128.
-// fake ULEB128, but in practice we're not going to have more than 2^28 zeroes between items in a single row
-template <typename T = uint32_t>
-constexpr std::size_t uleb128_max_bytes() {
+// fake ULEB128, but in practice we're not going to have more than 2^28 zeroes between items in a
+// single row
+template <typename T = uint32_t> constexpr std::size_t uleb128_max_bytes() {
     return (sizeof(T) * 8 + 6) / 7;
 }
 
 /// Encode @p value into @p buf as ULEB128. Returns bytes written.
-template <typename T = uint32_t>
-inline std::size_t uleb128_encode(T value, uint8_t* buf) {
+template <typename T = uint32_t> inline std::size_t uleb128_encode(T value, uint8_t* buf) {
     std::size_t n = 0;
     do {
         uint8_t byte = static_cast<uint8_t>(value & 0x7Fu);
         value >>= 7;
-        if (value) byte |= 0x80u;
+        if (value)
+            byte |= 0x80u;
         buf[n++] = byte;
     } while (value);
     return n;
 }
 
 /// Decode one ULEB128 value from @p buf at byte offset *pos. Advances *pos.
-template <typename T = uint32_t>
-inline T uleb128_decode(const uint8_t* buf, std::size_t& pos) {
+template <typename T = uint32_t> inline T uleb128_decode(const uint8_t* buf, std::size_t& pos) {
     T result = 0;
     int shift = 0;
     uint8_t byte;
@@ -240,12 +243,10 @@ inline T uleb128_decode(const uint8_t* buf, std::size_t& pos) {
     return result;
 }
 
-template <typename V, typename = void>
-struct ValueAccessor;
+template <typename V, typename = void> struct ValueAccessor;
 
 /// Trait to handle FP4BiPacked natively
-template <>
-struct ValueAccessor<FP4BiPacked> {
+template <> struct ValueAccessor<FP4BiPacked> {
     using value_type = float;
     static value_type get_w(const FP4BiPacked& v, std::size_t i) { return v[0][i]; }
     static value_type get_imp(const FP4BiPacked& v, std::size_t i) { return v[1][i]; }
@@ -269,20 +270,18 @@ struct ValueAccessor<FP4BiPacked> {
     static void set_stochastic_live(FP4BiPacked& v, std::size_t i, value_type w, value_type imp) {
         v.set_stochastic_live(i, w, imp);
     }
-    static void reserve(FP4BiPacked& v, std::size_t n) {
-        v.reserve(n); 
-    }
-    static void resize(FP4BiPacked& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) { 
-        v.resize(n, val, imp); 
+    static void reserve(FP4BiPacked& v, std::size_t n) { v.reserve(n); }
+    static void resize(FP4BiPacked& v, std::size_t n, value_type val = 0.0f,
+                       value_type imp = 0.0f) {
+        v.resize(n, val, imp);
     }
     static void move(FP4BiPacked& v, std::size_t dest, std::size_t src, std::size_t count) {
-        if (count == 0 || !v._data) return;
+        if (count == 0 || !v._data)
+            return;
         std::memmove(v._data->data() + dest, v._data->data() + src, count);
     }
 
-    static std::size_t projected_byte_size(std::size_t n) {
-        return n;
-    }
+    static std::size_t projected_byte_size(std::size_t n) { return n; }
 
     static std::size_t size(const FP4BiPacked& v) { return v[0].size(); }
 };
@@ -293,11 +292,14 @@ struct ValueAccessor<FP4BiPacked> {
 /// the DECODED float (matching ValueAccessor<FP4BiPacked>'s convention,
 /// not DeltaCSRBiValues<T>'s raw-passthrough one) since the byte array
 /// itself holds an encoded code, not a usable float directly.
-template <>
-struct ValueAccessor<FP8BiValues> {
+template <> struct ValueAccessor<FP8BiValues> {
     using value_type = float;
-    static value_type get_w(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.weights[i]); }
-    static value_type get_imp(const FP8BiValues& v, std::size_t i) { return fp8_decode_bits(v.importance[i]); }
+    static value_type get_w(const FP8BiValues& v, std::size_t i) {
+        return fp8_decode_bits(v.weights[i]);
+    }
+    static value_type get_imp(const FP8BiValues& v, std::size_t i) {
+        return fp8_decode_bits(v.importance[i]);
+    }
     static void set(FP8BiValues& v, std::size_t i, value_type w, value_type imp) {
         v.weights[i] = fp8_quantize(w);
         v.importance[i] = fp8_quantize(imp);
@@ -328,12 +330,14 @@ struct ValueAccessor<FP8BiValues> {
         v.weights[i] = fp8_quantize_stochastic_live(w);
         v.importance[i] = fp8_quantize_stochastic_live_nonneg(imp);
     }
-    static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f, value_type imp = 0.0f) {
+    static void resize(FP8BiValues& v, std::size_t n, value_type val = 0.0f,
+                       value_type imp = 0.0f) {
         v.weights.resize(n, fp8_quantize(val));
         v.importance.resize(n, fp8_quantize(imp));
     }
     static void move(FP8BiValues& v, std::size_t dest, std::size_t src, std::size_t count) {
-        if (count == 0) return;
+        if (count == 0)
+            return;
         std::memmove(v.weights.data() + dest, v.weights.data() + src, count);
         std::memmove(v.importance.data() + dest, v.importance.data() + src, count);
     }
@@ -343,26 +347,24 @@ struct ValueAccessor<FP8BiValues> {
     }
 
     static std::size_t projected_byte_size(std::size_t n) {
-        return n * 2;  // 1 byte weight + 1 byte importance per element
+        return n * 2; // 1 byte weight + 1 byte importance per element
     }
 
     static std::size_t size(const FP8BiValues& v) { return v.weights.size(); }
 };
 
 /// Fallback standard vector equivalent for floats (e.g. CSRSynapsesV uses)
-template <typename T>
-struct DeltaCSRBiValues {
+template <typename T> struct DeltaCSRBiValues {
     std::vector<T> weights;
     std::vector<T> importance;
 };
 
-
-
-template <typename T>
-struct ValueAccessor<DeltaCSRBiValues<T>> {
+template <typename T> struct ValueAccessor<DeltaCSRBiValues<T>> {
     using value_type = T;
     static value_type get_w(const DeltaCSRBiValues<T>& v, std::size_t i) { return v.weights[i]; }
-    static value_type get_imp(const DeltaCSRBiValues<T>& v, std::size_t i) { return v.importance[i]; }
+    static value_type get_imp(const DeltaCSRBiValues<T>& v, std::size_t i) {
+        return v.importance[i];
+    }
     static void set(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
         v.weights[i] = w;
         v.importance[i] = imp;
@@ -371,7 +373,8 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     /// stochastic rounding is meaningless here -- passthrough to set()
     /// so callers that always use set_stochastic() for gradient-driven
     /// updates work identically against either VALUES_TYPE.
-    static void set_stochastic(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+    static void set_stochastic(DeltaCSRBiValues<T>& v, std::size_t i, value_type w,
+                               value_type imp) {
         set(v, i, w, imp);
     }
     /// No quantization happens for this (float32 fallback) storage, so
@@ -383,26 +386,28 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     static void set_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
         set(v, i, w, imp);
     }
-    static void set_stochastic_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w, value_type imp) {
+    static void set_stochastic_live(DeltaCSRBiValues<T>& v, std::size_t i, value_type w,
+                                    value_type imp) {
         set(v, i, w, imp);
     }
-    static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0), value_type imp = value_type(0)) {
+    static void resize(DeltaCSRBiValues<T>& v, std::size_t n, value_type val = value_type(0),
+                       value_type imp = value_type(0)) {
         v.weights.resize(n, val);
         v.importance.resize(n, imp);
     }
     static void move(DeltaCSRBiValues<T>& v, std::size_t dest, std::size_t src, std::size_t count) {
-        if (count == 0) return;
+        if (count == 0)
+            return;
         std::memmove(v.weights.data() + dest, v.weights.data() + src, count * sizeof(value_type));
-        std::memmove(v.importance.data() + dest, v.importance.data() + src, count * sizeof(value_type));
+        std::memmove(v.importance.data() + dest, v.importance.data() + src,
+                     count * sizeof(value_type));
     }
     static void reserve(DeltaCSRBiValues<T>& v, std::size_t n) {
         v.weights.reserve(n);
         v.importance.reserve(n);
     }
 
-    static std::size_t projected_byte_size(std::size_t n) {
-        return n * sizeof(T) * 2;
-    }
+    static std::size_t projected_byte_size(std::size_t n) { return n * sizeof(T) * 2; }
 
     static std::size_t size(const DeltaCSRBiValues<T>& v) { return v.weights.size(); }
 };
@@ -439,33 +444,34 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
 // stale/undefined in that case (this function still zeroes nothing, but
 // callers should gate on cycle_complete rather than reading them).
 struct AmortizedDecayStats {
-    double      mean_abs       = 0.0;
-    double      rms            = 0.0;
-    double      max_abs        = 0.0;
-    std::size_t n              = 0;
-    bool        cycle_complete = false;
+    double mean_abs = 0.0;
+    double rms = 0.0;
+    double max_abs = 0.0;
+    std::size_t n = 0;
+    bool cycle_complete = false;
 };
 
 template <typename VALUES_TYPE, typename V>
-AmortizedDecayStats apply_amortized_decay_stats(
-    VALUES_TYPE& values, std::size_t& cursor,
-    double& sum_abs, double& sum_sq, double& max_abs, std::size_t& n,
-    std::size_t chunk_size, V decay_factor)
-{
+AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t& cursor,
+                                                double& sum_abs, double& sum_sq, double& max_abs,
+                                                std::size_t& n, std::size_t chunk_size,
+                                                V decay_factor) {
     using VA = ValueAccessor<VALUES_TYPE>;
     const std::size_t total = VA::size(values);
     bool cycle_complete = false;
     if (total > 0) {
         for (std::size_t i = 0; i < chunk_size; ++i) {
-            if (cursor >= total) cursor = 0;
-            const V w      = static_cast<V>(VA::get_w(values, cursor));
-            const V imp    = static_cast<V>(VA::get_imp(values, cursor));
-            const V new_w  = static_cast<V>(w * decay_factor);
+            if (cursor >= total)
+                cursor = 0;
+            const V w = static_cast<V>(VA::get_w(values, cursor));
+            const V imp = static_cast<V>(VA::get_imp(values, cursor));
+            const V new_w = static_cast<V>(w * decay_factor);
             VA::set_live(values, cursor, new_w, imp);
             const double aw = std::abs(static_cast<double>(new_w));
             sum_abs += aw;
-            sum_sq  += aw * aw;
-            if (aw > max_abs) max_abs = aw;
+            sum_sq += aw * aw;
+            if (aw > max_abs)
+                max_abs = aw;
             ++n;
             ++cursor;
             if (cursor >= total) {
@@ -480,10 +486,13 @@ AmortizedDecayStats apply_amortized_decay_stats(
     out.cycle_complete = cycle_complete;
     if (cycle_complete && n > 0) {
         out.mean_abs = sum_abs / static_cast<double>(n);
-        out.rms      = std::sqrt(sum_sq / static_cast<double>(n));
-        out.max_abs  = max_abs;
-        out.n        = n;
-        sum_abs = 0.0; sum_sq = 0.0; max_abs = 0.0; n = 0;
+        out.rms = std::sqrt(sum_sq / static_cast<double>(n));
+        out.max_abs = max_abs;
+        out.n = n;
+        sum_abs = 0.0;
+        sum_sq = 0.0;
+        max_abs = 0.0;
+        n = 0;
     }
     return out;
 }
@@ -506,8 +515,7 @@ AmortizedDecayStats apply_amortized_decay_stats(
 // RMSprop-based scale update collapses -- see sili_peridot/JOURNAL.md's
 // 2026-08-09 tile-recurrence entries for the full investigation.
 
-template <typename VALUE_TYPE>
-struct RMSpropScalePolicy {
+template <typename VALUE_TYPE> struct RMSpropScalePolicy {
     // Extracted verbatim from disldo_backward's existing inline formula --
     // must stay bit-identical to today's behavior on finite inputs (this
     // is the default, used by every existing caller) -- PLUS a NaN/Inf
@@ -586,52 +594,62 @@ struct RMSpropScalePolicy {
     // (toy_tile_recurrence_rmt_torch.py's _scale_update,
     // scale_invariant_chain_rule branch) -- see that module for the
     // validated-in-torch derivation this is a direct port of.
-    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
-                        VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps,
-                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr,
-                        bool log_space = false) {
-        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state, VALUE_TYPE g_agg,
+                       VALUE_TYPE eff_lr, VALUE_TYPE beta2, VALUE_TYPE eps,
+                       VALUE_TYPE contrib_agg = VALUE_TYPE(0), uint32_t* step = nullptr,
+                       bool log_space = false) {
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg))
+            return;
         if (log_space) {
             const VALUE_TYPE log_grad = g_agg * scale;
             const VALUE_TYPE log_contrib = contrib_agg * scale;
-            const VALUE_TYPE new_state = beta2 * scale_state
-                + (VALUE_TYPE(1) - beta2) * (log_grad * log_grad + log_contrib * log_contrib);
-            if (!std::isfinite(new_state)) return;
+            const VALUE_TYPE new_state =
+                beta2 * scale_state +
+                (VALUE_TYPE(1) - beta2) * (log_grad * log_grad + log_contrib * log_contrib);
+            if (!std::isfinite(new_state))
+                return;
             VALUE_TYPE state_hat = new_state;
             if (step != nullptr) {
                 ++(*step);
-                const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
-                if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+                const VALUE_TYPE bias_correction =
+                    VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+                if (bias_correction > VALUE_TYPE(0))
+                    state_hat = new_state / bias_correction;
             }
-            if (!std::isfinite(state_hat)) return;
+            if (!std::isfinite(state_hat))
+                return;
             const VALUE_TYPE log_step = eff_lr * log_grad / (std::sqrt(state_hat) + eps);
             const VALUE_TYPE new_scale = scale * std::exp(-log_step);
-            if (!std::isfinite(new_scale)) return;
+            if (!std::isfinite(new_scale))
+                return;
             scale_state = new_state;
             scale = new_scale;
             return;
         }
-        const VALUE_TYPE new_state = beta2 * scale_state
-            + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
-        if (!std::isfinite(new_state)) return;
+        const VALUE_TYPE new_state =
+            beta2 * scale_state +
+            (VALUE_TYPE(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
+        if (!std::isfinite(new_state))
+            return;
         VALUE_TYPE state_hat = new_state;
         if (step != nullptr) {
             ++(*step);
-            const VALUE_TYPE bias_correction = VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
-            if (bias_correction > VALUE_TYPE(0)) state_hat = new_state / bias_correction;
+            const VALUE_TYPE bias_correction =
+                VALUE_TYPE(1) - std::pow(beta2, static_cast<VALUE_TYPE>(*step));
+            if (bias_correction > VALUE_TYPE(0))
+                state_hat = new_state / bias_correction;
         }
-        if (!std::isfinite(state_hat)) return;
+        if (!std::isfinite(state_hat))
+            return;
         const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (std::sqrt(state_hat) + eps);
-        if (!std::isfinite(new_scale)) return;
+        if (!std::isfinite(new_scale))
+            return;
         scale_state = new_state;
         scale = new_scale;
     }
 };
 
-template <typename VALUE_TYPE>
-struct AdaMaxScalePolicy {
+template <typename VALUE_TYPE> struct AdaMaxScalePolicy {
     // Matches AdaMax's own decayed running-max second-moment tracker
     // (Kingma & Ba 2015, Adam paper sec 7) applied to value_scale/
     // output_scale instead of a gradient: scale_state tracks
@@ -663,20 +681,22 @@ struct AdaMaxScalePolicy {
     // cold-start shrinkage problem (max(0, combined_mag) on step 1 is
     // already the true value, not a shrunk fraction of it), so there's
     // nothing for bias correction to fix.
-    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
-                        VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta2, VALUE_TYPE eps,
-                        VALUE_TYPE contrib_agg = VALUE_TYPE(0),
-                        uint32_t* step = nullptr,
-                        bool log_space = false) {
+    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state, VALUE_TYPE g_agg,
+                       VALUE_TYPE eff_lr, VALUE_TYPE beta2, VALUE_TYPE eps,
+                       VALUE_TYPE contrib_agg = VALUE_TYPE(0), uint32_t* step = nullptr,
+                       bool log_space = false) {
         (void)step;
-        (void)log_space;  // AdaMax's L-infinity tracker has no log-space variant (yet) -- accepted for call-site signature compatibility with RMSpropScalePolicy only.
-        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg)) return;
+        (void)log_space; // AdaMax's L-infinity tracker has no log-space variant (yet) -- accepted
+                         // for call-site signature compatibility with RMSpropScalePolicy only.
+        if (!std::isfinite(g_agg) || !std::isfinite(contrib_agg))
+            return;
         const VALUE_TYPE combined_mag = std::max(std::abs(g_agg), std::abs(contrib_agg));
         const VALUE_TYPE new_state = std::max(beta2 * scale_state, combined_mag);
-        if (!std::isfinite(new_state)) return;
+        if (!std::isfinite(new_state))
+            return;
         const VALUE_TYPE new_scale = scale - eff_lr * g_agg / (new_state + eps);
-        if (!std::isfinite(new_scale)) return;
+        if (!std::isfinite(new_scale))
+            return;
         scale_state = new_state;
         scale = new_scale;
     }
@@ -711,24 +731,25 @@ struct AdaMaxScalePolicy {
 // function during this session) -- everything else here (the first
 // -moment EMA and combining both moments in the final step) is genuinely
 // new, not duplicated from anywhere.
-template <typename VALUE_TYPE>
-struct AdamScalePolicy {
-    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state,
-                        VALUE_TYPE& momentum_state,
-                        VALUE_TYPE g_agg, VALUE_TYPE eff_lr,
-                        VALUE_TYPE beta1, VALUE_TYPE beta2, VALUE_TYPE eps,
-                        uint32_t* step = nullptr) {
-        if (!std::isfinite(g_agg)) return;
+template <typename VALUE_TYPE> struct AdamScalePolicy {
+    static void update(VALUE_TYPE& scale, VALUE_TYPE& scale_state, VALUE_TYPE& momentum_state,
+                       VALUE_TYPE g_agg, VALUE_TYPE eff_lr, VALUE_TYPE beta1, VALUE_TYPE beta2,
+                       VALUE_TYPE eps, uint32_t* step = nullptr) {
+        if (!std::isfinite(g_agg))
+            return;
 
         // First moment (momentum): m = beta1*m + (1-beta1)*g.
         const VALUE_TYPE new_momentum = beta1 * momentum_state + (VALUE_TYPE(1) - beta1) * g_agg;
-        if (!std::isfinite(new_momentum)) return;
+        if (!std::isfinite(new_momentum))
+            return;
 
         // Second moment (RMSprop-style, same formula as
         // RMSpropScalePolicy::update, computed from the RAW gradient --
         // NOT the momentum-smoothed one, per standard Adam).
-        const VALUE_TYPE new_state = beta2 * scale_state + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg);
-        if (!std::isfinite(new_state)) return;
+        const VALUE_TYPE new_state =
+            beta2 * scale_state + (VALUE_TYPE(1) - beta2) * (g_agg * g_agg);
+        if (!std::isfinite(new_state))
+            return;
 
         VALUE_TYPE m_hat = new_momentum;
         VALUE_TYPE v_hat = new_state;
@@ -737,13 +758,17 @@ struct AdamScalePolicy {
             const VALUE_TYPE t = static_cast<VALUE_TYPE>(*step);
             const VALUE_TYPE bc1 = VALUE_TYPE(1) - std::pow(beta1, t);
             const VALUE_TYPE bc2 = VALUE_TYPE(1) - std::pow(beta2, t);
-            if (bc1 > VALUE_TYPE(0)) m_hat = new_momentum / bc1;
-            if (bc2 > VALUE_TYPE(0)) v_hat = new_state / bc2;
+            if (bc1 > VALUE_TYPE(0))
+                m_hat = new_momentum / bc1;
+            if (bc2 > VALUE_TYPE(0))
+                v_hat = new_state / bc2;
         }
-        if (!std::isfinite(m_hat) || !std::isfinite(v_hat)) return;
+        if (!std::isfinite(m_hat) || !std::isfinite(v_hat))
+            return;
 
         const VALUE_TYPE new_scale = scale - eff_lr * m_hat / (std::sqrt(v_hat) + eps);
-        if (!std::isfinite(new_scale)) return;
+        if (!std::isfinite(new_scale))
+            return;
         momentum_state = new_momentum;
         scale_state = new_state;
         scale = new_scale;
@@ -759,14 +784,11 @@ struct AdamScalePolicy {
 // quantize/TrueMultiDigitLayer work) instead of just fixing staleness --
 // use with DeferredScaleWrite=true or false, doesn't matter here since
 // there's nothing to defer (scale never changes either way).
-template <typename VALUE_TYPE>
-struct NoScalePolicy {
-    static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/,
-                        VALUE_TYPE /*g_agg*/, VALUE_TYPE /*eff_lr*/,
-                        VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
-                        VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0),
-                        uint32_t* /*step*/ = nullptr,
-                        bool /*log_space*/ = false) {
+template <typename VALUE_TYPE> struct NoScalePolicy {
+    static void update(VALUE_TYPE& /*scale*/, VALUE_TYPE& /*scale_state*/, VALUE_TYPE /*g_agg*/,
+                       VALUE_TYPE /*eff_lr*/, VALUE_TYPE /*beta2*/, VALUE_TYPE /*eps*/,
+                       VALUE_TYPE /*contrib_agg*/ = VALUE_TYPE(0), uint32_t* /*step*/ = nullptr,
+                       bool /*log_space*/ = false) {
         // Intentionally does nothing.
     }
 };
@@ -831,8 +853,7 @@ struct NoScalePolicy {
 //     factor some call sites multiply into the delta (pass VALUE_TYPE(1)
 //     for sites that don't scale) -- note `ci` itself never sees S, only
 //     the delta does (matches every existing call site's own convention).
-template <typename VALUE_TYPE>
-struct PlainRMSpropSynapsePolicy {
+template <typename VALUE_TYPE> struct PlainRMSpropSynapsePolicy {
     // Reproduces linear_disldo.hpp's original (pre-fix) inline formula
     // exactly, bit-for-bit, on finite inputs -- kept for explicit opt-in
     // and as the reference this whole fix was checked against, but NO
@@ -854,11 +875,12 @@ struct PlainRMSpropSynapsePolicy {
     // this is the fix for the coverage gap ba4af42 left: that commit
     // guarded value_scale/output_scale's own update but never extended
     // the same guard to the per-synapse ci/cw path (see conversation).
-    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
-                                 VALUE_TYPE beta2, VALUE_TYPE /*min_decay_frac*/,
-                                 VALUE_TYPE /*max_ci*/) {
-        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
-        const VALUE_TYPE new_ci = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
+                                VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/) {
+        if (!std::isfinite(g) || !std::isfinite(contrib))
+            return ci;
+        const VALUE_TYPE new_ci =
+            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
         return std::isfinite(new_ci) ? new_ci : ci;
     }
 
@@ -879,26 +901,24 @@ struct PlainRMSpropSynapsePolicy {
     // at the very end instead, giving Delta(true_weight) = eff_lr*raw,
     // independent of S. See BoundedRMSpropSynapsePolicy::update_cw's
     // own copy of this same fix for the max_abs_delta-clip interaction.
-    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
-                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE /*max_abs_delta*/,
-                                 bool scale_invariant = false) {
-        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S, VALUE_TYPE eff_lr,
+                                VALUE_TYPE eps, bool damp_by_importance,
+                                VALUE_TYPE /*max_abs_delta*/, bool scale_invariant = false) {
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S))
+            return VALUE_TYPE(0);
         VALUE_TYPE delta;
         if (scale_invariant) {
             const VALUE_TYPE raw = damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g);
             delta = std::isfinite(raw) ? (eff_lr * raw / S) : VALUE_TYPE(0);
         } else {
-            delta = damp_by_importance
-                ? (-eff_lr * g * S) / (std::sqrt(ci) + eps)
-                : (-eff_lr * g * S);
+            delta =
+                damp_by_importance ? (-eff_lr * g * S) / (std::sqrt(ci) + eps) : (-eff_lr * g * S);
         }
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
 };
 
-template <typename VALUE_TYPE>
-struct BoundedRMSpropSynapsePolicy {
+template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
     // Never let ci decay below `min_decay_frac * ci_old` in a single step,
     // regardless of how small the current (g,contrib) is.
     //
@@ -982,12 +1002,13 @@ struct BoundedRMSpropSynapsePolicy {
     // non-finite g/contrib must not corrupt ci. Checked BEFORE the
     // floor/max_ci clamps since std::min/std::max's behavior on NaN is
     // comparison-order-dependent (not a reliable NaN-filter on its own).
-    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
-                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac,
-                                 VALUE_TYPE max_ci) {
-        if (!std::isfinite(g) || !std::isfinite(contrib)) return ci;
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
+                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
+        if (!std::isfinite(g) || !std::isfinite(contrib))
+            return ci;
         const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
-        if (!std::isfinite(ema)) return ci;
+        if (!std::isfinite(ema))
+            return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
         return std::min(std::max(ema, floor), max_ci);
     }
@@ -1041,17 +1062,20 @@ struct BoundedRMSpropSynapsePolicy {
     // the task-relevant quantity, not the internal w_stored-space one
     // (which is what's actually being deliberately resized by
     // magnitude-scale reparametrization).
-    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S,
-                                 VALUE_TYPE eff_lr, VALUE_TYPE eps,
-                                 bool damp_by_importance, VALUE_TYPE max_abs_delta,
-                                 bool scale_invariant = false) {
-        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S)) return VALUE_TYPE(0);
+    static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE ci, VALUE_TYPE S, VALUE_TYPE eff_lr,
+                                VALUE_TYPE eps, bool damp_by_importance, VALUE_TYPE max_abs_delta,
+                                bool scale_invariant = false) {
+        if (!std::isfinite(g) || !std::isfinite(ci) || !std::isfinite(S))
+            return VALUE_TYPE(0);
         VALUE_TYPE raw = scale_invariant
-            ? (damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g))
-            : (damp_by_importance ? (-g * S) / (std::sqrt(ci) + eps) : (-g * S));
-        if (!std::isfinite(raw)) return VALUE_TYPE(0);
-        if (raw > max_abs_delta) raw = max_abs_delta;
-        if (raw < -max_abs_delta) raw = -max_abs_delta;
+                             ? (damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g))
+                             : (damp_by_importance ? (-g * S) / (std::sqrt(ci) + eps) : (-g * S));
+        if (!std::isfinite(raw))
+            return VALUE_TYPE(0);
+        if (raw > max_abs_delta)
+            raw = max_abs_delta;
+        if (raw < -max_abs_delta)
+            raw = -max_abs_delta;
         const VALUE_TYPE delta = scale_invariant ? (eff_lr * raw / S) : (eff_lr * raw);
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
     }
@@ -1063,32 +1087,34 @@ struct DeltaCSRLayout {
     std::size_t rows = 0;
     std::size_t cols = 0;
 
-    std::vector<std::size_t> byte_start;   // size rows+1
-    std::vector<std::size_t> byte_end;     // size rows
+    std::vector<std::size_t> byte_start; // size rows+1
+    std::vector<std::size_t> byte_end;   // size rows
 
-    std::vector<std::size_t> elem_start;   // size rows+1
-    std::vector<std::size_t> elem_end;     // size rows
+    std::vector<std::size_t> elem_start; // size rows+1
+    std::vector<std::size_t> elem_end;   // size rows
 
     std::size_t total_nnz = 0;
 
-    std::size_t row_nnz        (std::size_t r) const { return elem_end[r] - elem_start[r]; }
-    std::size_t row_byte_len   (std::size_t r) const { return byte_end[r] - byte_start[r]; }
-    std::size_t row_alloc_bytes(std::size_t r) const { return byte_start[r+1] - byte_start[r]; }
-    std::size_t row_alloc_elems(std::size_t r) const { return elem_start[r+1] - elem_start[r]; }
-    std::size_t row_blank_bytes(std::size_t r) const { return byte_start[r+1] - byte_end[r]; }
-    std::size_t row_blank_elems(std::size_t r) const { return elem_start[r+1] - elem_end[r]; }
+    std::size_t row_nnz(std::size_t r) const { return elem_end[r] - elem_start[r]; }
+    std::size_t row_byte_len(std::size_t r) const { return byte_end[r] - byte_start[r]; }
+    std::size_t row_alloc_bytes(std::size_t r) const { return byte_start[r + 1] - byte_start[r]; }
+    std::size_t row_alloc_elems(std::size_t r) const { return elem_start[r + 1] - elem_start[r]; }
+    std::size_t row_blank_bytes(std::size_t r) const { return byte_start[r + 1] - byte_end[r]; }
+    std::size_t row_blank_elems(std::size_t r) const { return elem_start[r + 1] - elem_end[r]; }
 
     std::size_t total_alloc_bytes() const { return byte_start.empty() ? 0 : byte_start.back(); }
     std::size_t total_alloc_elems() const { return elem_start.empty() ? 0 : elem_start.back(); }
 
     std::size_t total_blank_bytes() const {
         std::size_t b = 0;
-        for (std::size_t r = 0; r < rows; ++r) b += row_blank_bytes(r);
+        for (std::size_t r = 0; r < rows; ++r)
+            b += row_blank_bytes(r);
         return b;
     }
     std::size_t total_blank_elems() const {
         std::size_t b = 0;
-        for (std::size_t r = 0; r < rows; ++r) b += row_blank_elems(r);
+        for (std::size_t r = 0; r < rows; ++r)
+            b += row_blank_elems(r);
         return b;
     }
 
@@ -1097,23 +1123,18 @@ struct DeltaCSRLayout {
 
 // ── Forward-only row cursor ───────────────────────────────────────────────────
 
-template <typename COL_TYPE = uint32_t>
-struct DeltaCSRRowCursor {
-    const uint8_t* buf      = nullptr;
-    std::size_t    byte_pos = 0;
-    std::size_t    byte_end = 0;
-    COL_TYPE       cur_col  = 0;
-    std::size_t    n_decoded = 0;
+template <typename COL_TYPE = uint32_t> struct DeltaCSRRowCursor {
+    const uint8_t* buf = nullptr;
+    std::size_t byte_pos = 0;
+    std::size_t byte_end = 0;
+    COL_TYPE cur_col = 0;
+    std::size_t n_decoded = 0;
 
     DeltaCSRRowCursor() = default;
 
     DeltaCSRRowCursor(const uint8_t* indices_buf, const DeltaCSRLayout& L, std::size_t row)
-        : buf(indices_buf)
-        , byte_pos(L.byte_start[row])
-        , byte_end(L.byte_end[row])
-        , cur_col(0)
-        , n_decoded(0)
-    {}
+        : buf(indices_buf), byte_pos(L.byte_start[row]), byte_end(L.byte_end[row]), cur_col(0),
+          n_decoded(0) {}
 
     bool at_end() const { return byte_pos >= byte_end; }
 
@@ -1124,7 +1145,8 @@ struct DeltaCSRRowCursor {
     }
 
     void advance_to(std::size_t target) {
-        while (n_decoded <= target) advance();
+        while (n_decoded <= target)
+            advance();
     }
 
     COL_TYPE col() const { return cur_col; }
@@ -1149,14 +1171,12 @@ struct DeltaCSRRowCursor {
 // already hand-code the same formula twice; this policy abstraction
 // unifies the 8 CALL SITES onto one template parameter, it doesn't
 // eliminate the scalar/SIMD math split itself).
-template <>
-struct PlainRMSpropSynapsePolicy<Block4Vec> {
+template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
     // Same NaN/Inf guard as the scalar PlainRMSpropSynapsePolicy::update_ci
     // above (see its docstring) -- per-lane, via block4_vec_select_finite
     // (block4.hpp), since Block4Vec has no whole-vector isfinite/select.
-    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
-                                Block4Vec beta2, Block4Vec /*min_decay_frac*/,
-                                Block4Vec /*max_ci*/) {
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
+                               Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
         return block4_vec_select_finite(new_ci, ci);
@@ -1167,10 +1187,9 @@ struct PlainRMSpropSynapsePolicy<Block4Vec> {
     // the scalar version's own docstring for the full derivation --
     // host-side bool (like damp_by_importance), selects which SIMD
     // formula runs, not a per-lane value.
-    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
-                                Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec /*max_abs_delta*/,
-                                bool scale_invariant = false) {
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S, Block4Vec eff_lr,
+                               Block4Vec eps, bool damp_by_importance, Block4Vec /*max_abs_delta*/,
+                               bool scale_invariant = false) {
         Block4Vec delta;
         if (scale_invariant) {
             const Block4Vec neg_g = -g;
@@ -1184,15 +1203,13 @@ struct PlainRMSpropSynapsePolicy<Block4Vec> {
     }
 };
 
-template <>
-struct BoundedRMSpropSynapsePolicy<Block4Vec> {
+template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // See the scalar BoundedRMSpropSynapsePolicy::update_ci docstring above
     // for the full min_decay_frac semantics (must exceed beta2 to bind).
     // Same NaN/Inf guard as the scalar BoundedRMSpropSynapsePolicy::update_ci
     // above (checked before the floor/max_ci clamps, same rationale).
-    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
-                                Block4Vec beta2, Block4Vec min_decay_frac,
-                                Block4Vec max_ci) {
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
+                               Block4Vec min_decay_frac, Block4Vec max_ci) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
         const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
         const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
@@ -1208,10 +1225,9 @@ struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // scale_invariant: see the scalar BoundedRMSpropSynapsePolicy::
     // update_cw docstring above for the full derivation -- host-side
     // bool (like damp_by_importance), selects which SIMD formula runs.
-    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S,
-                                Block4Vec eff_lr, Block4Vec eps,
-                                bool damp_by_importance, Block4Vec max_abs_delta,
-                                bool scale_invariant = false) {
+    static Block4Vec update_cw(Block4Vec g, Block4Vec ci, Block4Vec S, Block4Vec eff_lr,
+                               Block4Vec eps, bool damp_by_importance, Block4Vec max_abs_delta,
+                               bool scale_invariant = false) {
         Block4Vec raw;
         if (scale_invariant) {
             const Block4Vec neg_g = -g;
@@ -1231,19 +1247,19 @@ struct BoundedRMSpropSynapsePolicy<Block4Vec> {
 
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 struct DeltaCSRWeights {
-    DeltaCSRLayout       layout;
+    DeltaCSRLayout layout;
     std::vector<uint8_t> indices_buf;
-    VALUES_TYPE          values;
+    VALUES_TYPE values;
 
-    std::size_t          max_indices_bytes = std::numeric_limits<std::size_t>::max();
-    std::size_t          max_values_bytes  = std::numeric_limits<std::size_t>::max();
+    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max();
+    std::size_t max_values_bytes = std::numeric_limits<std::size_t>::max();
 
-    using size_type  = SIZE_TYPE;
-    using col_type   = COL_TYPE;
+    using size_type = SIZE_TYPE;
+    using col_type = COL_TYPE;
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
 
-    bool        empty()    const { return layout.total_nnz == 0; }
-    std::size_t nnz()      const { return layout.total_nnz; }
+    bool empty() const { return layout.total_nnz == 0; }
+    std::size_t nnz() const { return layout.total_nnz; }
     std::size_t num_rows() const { return layout.rows; }
     std::size_t total_blank_bytes() const { return layout.total_blank_bytes(); }
 
@@ -1253,12 +1269,12 @@ struct DeltaCSRWeights {
 
     void set_limits(std::size_t indices_limit_bytes, std::size_t values_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
-        max_values_bytes  = values_limit_bytes;
+        max_values_bytes = values_limit_bytes;
     }
 
     void reserve_indices(std::size_t target_bytes) {
         if (target_bytes > max_indices_bytes) {
-            throw std::bad_alloc(); 
+            throw std::bad_alloc();
         }
         indices_buf.reserve(target_bytes);
     }
@@ -1282,10 +1298,12 @@ struct DeltaCSRWeights {
 // this needed a fully separate store, not a template-parameter retrofit
 // of Block4Store itself). A pure additive trait, not a modification to
 // either existing type.
-template <typename VALUES_TYPE>
-struct Block4StoreFor { using type = Block4Store; };
-template <>
-struct Block4StoreFor<FP8BiValues> { using type = Block4Store8; };
+template <typename VALUES_TYPE> struct Block4StoreFor {
+    using type = Block4Store;
+};
+template <> struct Block4StoreFor<FP8BiValues> {
+    using type = Block4Store8;
+};
 
 // Reshuffles `arr` (currently laid out as entity*old_rank+k) to
 // entity*new_rank+k in place, preserving every existing (entity,k) pair
@@ -1298,9 +1316,10 @@ struct Block4StoreFor<FP8BiValues> { using type = Block4Store8; };
 // until AQRS's additive-branch gamma dynamic-rank-control work needed the
 // identical reshuffle for a second, independent set of rank-length arrays.
 template <typename T, typename DefaultFn>
-static void reshuffle_rank_array(std::vector<T>& arr, std::size_t old_rank,
-                                 std::size_t new_rank, DefaultFn default_for_k) {
-    if (arr.empty() || old_rank == new_rank) return;
+static void reshuffle_rank_array(std::vector<T>& arr, std::size_t old_rank, std::size_t new_rank,
+                                 DefaultFn default_for_k) {
+    if (arr.empty() || old_rank == new_rank)
+        return;
     const std::size_t n_entities = (arr.size() + old_rank - 1) / old_rank;
     std::vector<T> resized(n_entities * new_rank);
     for (std::size_t e = 0; e < n_entities; ++e) {
@@ -1327,8 +1346,7 @@ static void reshuffle_rank_array(std::vector<T>& arr, std::size_t old_rank,
 // on SparseLinearWeightsDelta rather than in here. Extracted specifically
 // per direct instruction not to duplicate scale_gamma's already-proven
 // EMA/trigger logic when adding the equivalent for additive_gamma.
-template <typename value_type>
-struct GammaEMATracker {
+template <typename value_type> struct GammaEMATracker {
     std::vector<value_type> abs_ema;
     std::vector<value_type> share_ema;
     std::vector<value_type> grad_ema;
@@ -1347,12 +1365,15 @@ struct GammaEMATracker {
     // channel's current |gamma| to compute the group's L1 norm first).
     inline void update_k(std::size_t k, value_type abs_gamma_k, value_type share_k,
                          value_type abs_grad_k, value_type decay = value_type(0.98)) {
-        if (abs_ema.size() <= k) abs_ema.resize(k + 1, value_type(0));
-        if (share_ema.size() <= k) share_ema.resize(k + 1, value_type(0));
-        if (grad_ema.size() <= k) grad_ema.resize(k + 1, value_type(0));
-        abs_ema[k]   = decay * abs_ema[k]   + (value_type(1) - decay) * abs_gamma_k;
+        if (abs_ema.size() <= k)
+            abs_ema.resize(k + 1, value_type(0));
+        if (share_ema.size() <= k)
+            share_ema.resize(k + 1, value_type(0));
+        if (grad_ema.size() <= k)
+            grad_ema.resize(k + 1, value_type(0));
+        abs_ema[k] = decay * abs_ema[k] + (value_type(1) - decay) * abs_gamma_k;
         share_ema[k] = decay * share_ema[k] + (value_type(1) - decay) * share_k;
-        grad_ema[k]  = decay * grad_ema[k]  + (value_type(1) - decay) * abs_grad_k;
+        grad_ema[k] = decay * grad_ema[k] + (value_type(1) - decay) * abs_grad_k;
     }
     // Theorem 10's exact apoptosis trigger: A(gamma_i) = (|gamma_i| <
     // tau_death) AND (C_i < tau_death) -- evaluated against the EMA
@@ -1365,8 +1386,10 @@ struct GammaEMATracker {
     // CURRENT rank explicitly (not stored here) since "every existing
     // channel" means every k<rank, not every k the EMA arrays happen to
     // have grown to (a channel could have been apoptosed/shrunk away).
-    inline bool should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
-        if (rank == 0) return false;
+    inline bool should_neurogenesis(std::size_t rank, value_type tau_active,
+                                    value_type theta) const {
+        if (rank == 0)
+            return false;
         value_type min_abs = get_abs_ema_k(0);
         value_type max_grad = get_grad_ema_k(0);
         for (std::size_t k = 1; k < rank; ++k) {
@@ -1379,10 +1402,12 @@ struct GammaEMATracker {
     // own docstring for why -- omitting this makes a relocated channel
     // look freshly-born to the trigger logic).
     inline void swap_k(std::size_t k1, std::size_t k2) {
-        if (k1 == k2) return;
+        if (k1 == k2)
+            return;
         auto swap_one = [&](std::vector<value_type>& arr) {
             const std::size_t need = std::max(k1, k2) + 1;
-            if (arr.size() < need) arr.resize(need, value_type(0));
+            if (arr.size() < need)
+                arr.resize(need, value_type(0));
             std::swap(arr[k1], arr[k2]);
         };
         swap_one(abs_ema);
@@ -1399,13 +1424,13 @@ struct GammaEMATracker {
 
 template <class SIZE_TYPE, class VALUES_TYPE = FP4BiPacked, class COL_TYPE = uint32_t>
 struct SparseLinearWeightsDelta {
-    using size_type  = SIZE_TYPE;
+    using size_type = SIZE_TYPE;
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using block4_type = typename Block4StoreFor<VALUES_TYPE>::type;
 
     DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> connections;
-    COOSynaptogenesis<SIZE_TYPE, value_type>          probes;
-    std::vector<SIZE_TYPE>                            out_degree;
+    COOSynaptogenesis<SIZE_TYPE, value_type> probes;
+    std::vector<SIZE_TYPE> out_degree;
 
     // Locally-dense companion to `connections` -- see block4.hpp. Shares
     // THIS struct's own value_scale/importance_scale below (not a separate
@@ -1451,7 +1476,8 @@ struct SparseLinearWeightsDelta {
         return row < importance_scale.size() ? importance_scale[row] : value_type(1);
     }
     inline void set_importance_scale_raw(std::size_t row, value_type v) {
-        if (row >= importance_scale.size()) importance_scale.resize(row + 1, value_type(1));
+        if (row >= importance_scale.size())
+            importance_scale.resize(row + 1, value_type(1));
         importance_scale[row] = v;
     }
 
@@ -1470,7 +1496,8 @@ struct SparseLinearWeightsDelta {
         return col < output_importance_scale.size() ? output_importance_scale[col] : value_type(1);
     }
     inline void set_output_importance_scale_raw(std::size_t col, value_type v) {
-        if (col >= output_importance_scale.size()) output_importance_scale.resize(col + 1, value_type(1));
+        if (col >= output_importance_scale.size())
+            output_importance_scale.resize(col + 1, value_type(1));
         output_importance_scale[col] = v;
     }
 
@@ -1497,16 +1524,17 @@ struct SparseLinearWeightsDelta {
     // pre-existing use of that exact load/store convention) rather than
     // this struct storing SIMD-typed data directly.
     struct ScaleRankScratch {
-        std::vector<value_type> value_scale_k;        // [thread][k]
-        std::vector<value_type> out_scale_k;           // [thread][k][tile_width]
-        std::vector<value_type> mcol_rank;              // [thread][k][tile_width]
-        std::vector<double>     mrow_local_k;           // [thread][k]
-        std::vector<value_type> mcol_rank_contrib;      // [thread][k][tile_width]
-        std::vector<double>     mrow_local_k_contrib;   // [thread][k]
-        std::vector<double>     mgamma_local_k;         // [thread][k]
-        std::vector<double>     mgamma_local_k_contrib; // [thread][k]
-        std::vector<value_type> mcol_acc_raw;           // [thread][k][tile_width] -- Block4Vec accumulator backing
-        std::vector<value_type> mcol_acc_raw_contrib;   // [thread][k][tile_width]
+        std::vector<value_type> value_scale_k;      // [thread][k]
+        std::vector<value_type> out_scale_k;        // [thread][k][tile_width]
+        std::vector<value_type> mcol_rank;          // [thread][k][tile_width]
+        std::vector<double> mrow_local_k;           // [thread][k]
+        std::vector<value_type> mcol_rank_contrib;  // [thread][k][tile_width]
+        std::vector<double> mrow_local_k_contrib;   // [thread][k]
+        std::vector<double> mgamma_local_k;         // [thread][k]
+        std::vector<double> mgamma_local_k_contrib; // [thread][k]
+        std::vector<value_type>
+            mcol_acc_raw; // [thread][k][tile_width] -- Block4Vec accumulator backing
+        std::vector<value_type> mcol_acc_raw_contrib; // [thread][k][tile_width]
 
         std::size_t cap_threads = 0, cap_rank = 0, cap_tile_width = 0;
 
@@ -1515,9 +1543,10 @@ struct SparseLinearWeightsDelta {
         // enough. tile_width is BLOCK4_TILE, passed in rather than
         // hardcoded (this header has no block4.hpp dependency).
         void ensure(std::size_t threads, std::size_t rank, std::size_t tile_width) {
-            if (threads <= cap_threads && rank <= cap_rank && tile_width <= cap_tile_width) return;
+            if (threads <= cap_threads && rank <= cap_rank && tile_width <= cap_tile_width)
+                return;
             resize_to(std::max(cap_threads, threads), std::max(cap_rank, rank),
-                       std::max(cap_tile_width, tile_width));
+                      std::max(cap_tile_width, tile_width));
         }
 
         // Explicit, caller-driven resize -- unlike ensure(), this CAN
@@ -1526,7 +1555,9 @@ struct SparseLinearWeightsDelta {
         // responsible for validating threads/rank/tile_width aren't
         // smaller than what's currently actually in use.
         void resize_to(std::size_t threads, std::size_t rank, std::size_t tile_width) {
-            cap_threads = threads; cap_rank = rank; cap_tile_width = tile_width;
+            cap_threads = threads;
+            cap_rank = rank;
+            cap_tile_width = tile_width;
             const std::size_t flat = threads * rank;
             const std::size_t flat_tiled = flat * tile_width;
             value_scale_k.resize(flat);
@@ -1552,10 +1583,13 @@ struct SparseLinearWeightsDelta {
     // training). threads/rank must not be smaller than what's currently
     // actually in use -- shrinking below that would corrupt the buffers
     // disldo_backward is actively reading/writing.
-    inline void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank, std::size_t tile_width) {
+    inline void reserve_scale_rank_scratch(std::size_t threads, std::size_t rank,
+                                           std::size_t tile_width) {
         if (rank < scale_rank)
-            throw std::invalid_argument("reserve_scale_rank_scratch: rank below the layer's current scale_rank would corrupt live scratch data");
-        if (threads < 1) throw std::invalid_argument("reserve_scale_rank_scratch: threads must be >= 1");
+            throw std::invalid_argument("reserve_scale_rank_scratch: rank below the layer's "
+                                        "current scale_rank would corrupt live scratch data");
+        if (threads < 1)
+            throw std::invalid_argument("reserve_scale_rank_scratch: threads must be >= 1");
         scale_rank_scratch.resize_to(threads, rank, tile_width);
     }
 
@@ -1646,7 +1680,8 @@ struct SparseLinearWeightsDelta {
     // rank-1 formula until that component is actually trained).
     inline value_type get_value_scale_k(std::size_t row, std::size_t k) const {
         const std::size_t idx = row * scale_rank + k;
-        if (idx < value_scale.size()) return value_scale[idx];
+        if (idx < value_scale.size())
+            return value_scale[idx];
         return k == 0 ? value_type(1) : value_type(0);
     }
     inline void set_value_scale_raw_k(std::size_t row, std::size_t k, value_type v) {
@@ -1661,15 +1696,14 @@ struct SparseLinearWeightsDelta {
             const std::size_t old_size = value_scale.size();
             value_scale.resize(idx + 1, value_type(0));
             for (std::size_t i = old_size; i < value_scale.size(); ++i)
-                if (i % scale_rank == 0) value_scale[i] = value_type(1);
+                if (i % scale_rank == 0)
+                    value_scale[i] = value_type(1);
         }
         value_scale[idx] = v;
     }
     // Backward-compat single-component accessors -- component 0 only,
     // exact original meaning/behavior at scale_rank==1.
-    inline value_type get_value_scale(std::size_t row) const {
-        return get_value_scale_k(row, 0);
-    }
+    inline value_type get_value_scale(std::size_t row) const { return get_value_scale_k(row, 0); }
     inline void set_value_scale_raw(std::size_t row, value_type v) {
         set_value_scale_raw_k(row, 0, v);
     }
@@ -1705,7 +1739,8 @@ struct SparseLinearWeightsDelta {
     std::vector<uint32_t> value_scale_step;
     inline uint32_t& get_value_scale_step_k(std::size_t row, std::size_t k) {
         const std::size_t idx = row * scale_rank + k;
-        if (value_scale_step.size() <= idx) value_scale_step.resize(idx + 1, 0);
+        if (value_scale_step.size() <= idx)
+            value_scale_step.resize(idx + 1, 0);
         return value_scale_step[idx];
     }
 
@@ -1749,12 +1784,11 @@ struct SparseLinearWeightsDelta {
 
     inline value_type get_output_scale_k(std::size_t col, std::size_t k) const {
         const std::size_t idx = col * scale_rank + k;
-        if (idx < output_scale.size()) return output_scale[idx];
+        if (idx < output_scale.size())
+            return output_scale[idx];
         return k == 0 ? value_type(1) : value_type(0);
     }
-    inline value_type get_output_scale(std::size_t col) const {
-        return get_output_scale_k(col, 0);
-    }
+    inline value_type get_output_scale(std::size_t col) const { return get_output_scale_k(col, 0); }
     inline value_type get_output_scale_importance_k(std::size_t col, std::size_t k) const {
         const std::size_t idx = col * scale_rank + k;
         return idx < output_scale_importance.size() ? output_scale_importance[idx] : value_type(0);
@@ -1765,7 +1799,8 @@ struct SparseLinearWeightsDelta {
     std::vector<uint32_t> output_scale_step;
     inline uint32_t& get_output_scale_step_k(std::size_t col, std::size_t k) {
         const std::size_t idx = col * scale_rank + k;
-        if (output_scale_step.size() <= idx) output_scale_step.resize(idx + 1, 0);
+        if (output_scale_step.size() <= idx)
+            output_scale_step.resize(idx + 1, 0);
         return output_scale_step[idx];
     }
     inline value_type get_output_scale_importance(std::size_t col) const {
@@ -1778,7 +1813,8 @@ struct SparseLinearWeightsDelta {
             const std::size_t old_size = output_scale.size();
             output_scale.resize(idx + 1, value_type(0));
             for (std::size_t i = old_size; i < output_scale.size(); ++i)
-                if (i % scale_rank == 0) output_scale[i] = value_type(1);
+                if (i % scale_rank == 0)
+                    output_scale[i] = value_type(1);
         }
         output_scale[idx] = v;
         output_scale_is_trainable = true;
@@ -1806,13 +1842,17 @@ struct SparseLinearWeightsDelta {
     inline const std::vector<value_type>& get_value_scale_raw_vector() const { return value_scale; }
     inline void set_value_scale_raw_vector(const std::vector<value_type>& v) {
         if (v.size() != value_scale.size())
-            throw std::invalid_argument("set_value_scale_raw_vector: size mismatch (correction pass only, not resize)");
+            throw std::invalid_argument(
+                "set_value_scale_raw_vector: size mismatch (correction pass only, not resize)");
         value_scale = v;
     }
-    inline const std::vector<value_type>& get_output_scale_raw_vector() const { return output_scale; }
+    inline const std::vector<value_type>& get_output_scale_raw_vector() const {
+        return output_scale;
+    }
     inline void set_output_scale_raw_vector(const std::vector<value_type>& v) {
         if (v.size() != output_scale.size())
-            throw std::invalid_argument("set_output_scale_raw_vector: size mismatch (correction pass only, not resize)");
+            throw std::invalid_argument(
+                "set_output_scale_raw_vector: size mismatch (correction pass only, not resize)");
         output_scale = v;
     }
 
@@ -1864,23 +1904,27 @@ struct SparseLinearWeightsDelta {
     // because gamma_s_k(0) was drifting away from 1.0 on every step.
     bool scale_gamma_is_trainable = false;
     std::vector<value_type> scale_gamma;
-    std::vector<value_type> scale_gamma_state;   // RMSprop second moment, one per channel
-    std::vector<uint32_t>   scale_gamma_step;    // bias-correction counter, one per channel
+    std::vector<value_type> scale_gamma_state; // RMSprop second moment, one per channel
+    std::vector<uint32_t> scale_gamma_step;    // bias-correction counter, one per channel
     inline value_type get_scale_gamma_k(std::size_t k) const {
-        if (k < scale_gamma.size()) return scale_gamma[k];
+        if (k < scale_gamma.size())
+            return scale_gamma[k];
         return value_type(1);
     }
     inline void set_scale_gamma_raw_k(std::size_t k, value_type v) {
-        if (k >= scale_gamma.size()) scale_gamma.resize(k + 1, value_type(1));
+        if (k >= scale_gamma.size())
+            scale_gamma.resize(k + 1, value_type(1));
         scale_gamma[k] = v;
         scale_gamma_is_trainable = true;
     }
     inline value_type& get_scale_gamma_state_k(std::size_t k) {
-        if (scale_gamma_state.size() <= k) scale_gamma_state.resize(k + 1, value_type(0));
+        if (scale_gamma_state.size() <= k)
+            scale_gamma_state.resize(k + 1, value_type(0));
         return scale_gamma_state[k];
     }
     inline uint32_t& get_scale_gamma_step_k(std::size_t k) {
-        if (scale_gamma_step.size() <= k) scale_gamma_step.resize(k + 1, 0);
+        if (scale_gamma_step.size() <= k)
+            scale_gamma_step.resize(k + 1, 0);
         return scale_gamma_step[k];
     }
 
@@ -1908,22 +1952,29 @@ struct SparseLinearWeightsDelta {
     // original names/signatures so no existing caller (tests, disldo_
     // backward, apply_dynamic_rank_control) needed to change.
     GammaEMATracker<value_type> scale_gamma_ema;
-    inline value_type get_scale_gamma_abs_ema_k(std::size_t k) const { return scale_gamma_ema.get_abs_ema_k(k); }
-    inline value_type get_scale_gamma_share_ema_k(std::size_t k) const { return scale_gamma_ema.get_share_ema_k(k); }
-    inline value_type get_scale_gamma_grad_ema_k(std::size_t k) const { return scale_gamma_ema.get_grad_ema_k(k); }
+    inline value_type get_scale_gamma_abs_ema_k(std::size_t k) const {
+        return scale_gamma_ema.get_abs_ema_k(k);
+    }
+    inline value_type get_scale_gamma_share_ema_k(std::size_t k) const {
+        return scale_gamma_ema.get_share_ema_k(k);
+    }
+    inline value_type get_scale_gamma_grad_ema_k(std::size_t k) const {
+        return scale_gamma_ema.get_grad_ema_k(k);
+    }
     // Called once per k, once per backward call, AFTER gamma's own value
     // update for every channel is finalized (C_k needs every channel's
     // current |gamma| to compute ||gamma||_1 first -- see disldo_backward's
     // own two-pass structure: update all gamma_k, THEN update all EMAs).
-    inline void update_scale_gamma_ema_k(std::size_t k, value_type abs_gamma_k,
-                                          value_type share_k, value_type abs_grad_k,
-                                          value_type decay = value_type(0.98)) {
+    inline void update_scale_gamma_ema_k(std::size_t k, value_type abs_gamma_k, value_type share_k,
+                                         value_type abs_grad_k,
+                                         value_type decay = value_type(0.98)) {
         scale_gamma_ema.update_k(k, abs_gamma_k, share_k, abs_grad_k, decay);
     }
     inline bool scale_gamma_should_apoptose(std::size_t k, value_type tau_death) const {
         return scale_gamma_ema.should_apoptose(k, tau_death);
     }
-    inline bool scale_gamma_should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
+    inline bool scale_gamma_should_neurogenesis(std::size_t rank, value_type tau_active,
+                                                value_type theta) const {
         return scale_gamma_ema.should_neurogenesis(rank, tau_active, theta);
     }
 
@@ -1967,8 +2018,8 @@ struct SparseLinearWeightsDelta {
     // Same cooldown counter as scale_rank_calls_since_mutation above, own
     // copy since the two branches mutate independently.
     uint32_t additive_rank_calls_since_mutation = UINT32_MAX;
-    std::vector<value_type> additive_u;  // row-major per-component: additive_u[row*additive_rank+k]
-    std::vector<value_type> additive_v;  // row-major per-component: additive_v[col*additive_rank+k]
+    std::vector<value_type> additive_u; // row-major per-component: additive_u[row*additive_rank+k]
+    std::vector<value_type> additive_v; // row-major per-component: additive_v[col*additive_rank+k]
 
     inline value_type get_additive_u_k(std::size_t row, std::size_t k) const {
         const std::size_t idx = row * additive_rank + k;
@@ -1976,7 +2027,8 @@ struct SparseLinearWeightsDelta {
     }
     inline void set_additive_u_raw_k(std::size_t row, std::size_t k, value_type v) {
         const std::size_t idx = row * additive_rank + k;
-        if (idx >= additive_u.size()) additive_u.resize(idx + 1, value_type(0));
+        if (idx >= additive_u.size())
+            additive_u.resize(idx + 1, value_type(0));
         additive_u[idx] = v;
     }
     inline value_type get_additive_v_k(std::size_t col, std::size_t k) const {
@@ -1985,7 +2037,8 @@ struct SparseLinearWeightsDelta {
     }
     inline void set_additive_v_raw_k(std::size_t col, std::size_t k, value_type v) {
         const std::size_t idx = col * additive_rank + k;
-        if (idx >= additive_v.size()) additive_v.resize(idx + 1, value_type(0));
+        if (idx >= additive_v.size())
+            additive_v.resize(idx + 1, value_type(0));
         additive_v[idx] = v;
     }
 
@@ -1995,13 +2048,15 @@ struct SparseLinearWeightsDelta {
     inline const std::vector<value_type>& get_additive_u_raw_vector() const { return additive_u; }
     inline void set_additive_u_raw_vector(const std::vector<value_type>& v) {
         if (v.size() != additive_u.size())
-            throw std::invalid_argument("set_additive_u_raw_vector: size mismatch (correction pass only, not resize)");
+            throw std::invalid_argument(
+                "set_additive_u_raw_vector: size mismatch (correction pass only, not resize)");
         additive_u = v;
     }
     inline const std::vector<value_type>& get_additive_v_raw_vector() const { return additive_v; }
     inline void set_additive_v_raw_vector(const std::vector<value_type>& v) {
         if (v.size() != additive_v.size())
-            throw std::invalid_argument("set_additive_v_raw_vector: size mismatch (correction pass only, not resize)");
+            throw std::invalid_argument(
+                "set_additive_v_raw_vector: size mismatch (correction pass only, not resize)");
         additive_v = v;
     }
 
@@ -2050,28 +2105,38 @@ struct SparseLinearWeightsDelta {
     // direction vectors (value_scale/output_scale vs additive_u/v) get
     // to pick their own optimizer independently.
     std::vector<value_type> additive_gamma_state;
-    std::vector<uint32_t>   additive_gamma_step;
+    std::vector<uint32_t> additive_gamma_step;
     GammaEMATracker<value_type> additive_gamma_ema;
     inline value_type get_additive_gamma_k(std::size_t k) const {
-        if (k < additive_gamma.size()) return additive_gamma[k];
+        if (k < additive_gamma.size())
+            return additive_gamma[k];
         return value_type(1);
     }
     inline void set_additive_gamma_raw_k(std::size_t k, value_type v) {
-        if (k >= additive_gamma.size()) additive_gamma.resize(k + 1, value_type(1));
+        if (k >= additive_gamma.size())
+            additive_gamma.resize(k + 1, value_type(1));
         additive_gamma[k] = v;
         additive_gamma_is_trainable = true;
     }
     inline value_type& get_additive_gamma_state_k(std::size_t k) {
-        if (additive_gamma_state.size() <= k) additive_gamma_state.resize(k + 1, value_type(0));
+        if (additive_gamma_state.size() <= k)
+            additive_gamma_state.resize(k + 1, value_type(0));
         return additive_gamma_state[k];
     }
     inline uint32_t& get_additive_gamma_step_k(std::size_t k) {
-        if (additive_gamma_step.size() <= k) additive_gamma_step.resize(k + 1, 0);
+        if (additive_gamma_step.size() <= k)
+            additive_gamma_step.resize(k + 1, 0);
         return additive_gamma_step[k];
     }
-    inline value_type get_additive_gamma_abs_ema_k(std::size_t k) const { return additive_gamma_ema.get_abs_ema_k(k); }
-    inline value_type get_additive_gamma_share_ema_k(std::size_t k) const { return additive_gamma_ema.get_share_ema_k(k); }
-    inline value_type get_additive_gamma_grad_ema_k(std::size_t k) const { return additive_gamma_ema.get_grad_ema_k(k); }
+    inline value_type get_additive_gamma_abs_ema_k(std::size_t k) const {
+        return additive_gamma_ema.get_abs_ema_k(k);
+    }
+    inline value_type get_additive_gamma_share_ema_k(std::size_t k) const {
+        return additive_gamma_ema.get_share_ema_k(k);
+    }
+    inline value_type get_additive_gamma_grad_ema_k(std::size_t k) const {
+        return additive_gamma_ema.get_grad_ema_k(k);
+    }
     inline void update_additive_gamma_ema_k(std::size_t k, value_type abs_gamma_k,
                                             value_type share_k, value_type abs_grad_k,
                                             value_type decay = value_type(0.98)) {
@@ -2080,7 +2145,8 @@ struct SparseLinearWeightsDelta {
     inline bool additive_gamma_should_apoptose(std::size_t k, value_type tau_death) const {
         return additive_gamma_ema.should_apoptose(k, tau_death);
     }
-    inline bool additive_gamma_should_neurogenesis(std::size_t rank, value_type tau_active, value_type theta) const {
+    inline bool additive_gamma_should_neurogenesis(std::size_t rank, value_type tau_active,
+                                                   value_type theta) const {
         return additive_gamma_ema.should_neurogenesis(rank, tau_active, theta);
     }
 
@@ -2091,35 +2157,41 @@ struct SparseLinearWeightsDelta {
     // for bias correction -- see AdamScalePolicy::update's own docstring.
     std::vector<value_type> additive_u_momentum, additive_u_state;
     std::vector<value_type> additive_v_momentum, additive_v_state;
-    std::vector<uint32_t>   additive_u_step, additive_v_step;
+    std::vector<uint32_t> additive_u_step, additive_v_step;
     inline value_type& get_additive_u_momentum_k(std::size_t row, std::size_t k) {
         const std::size_t idx = row * additive_rank + k;
-        if (additive_u_momentum.size() <= idx) additive_u_momentum.resize(idx + 1, value_type(0));
+        if (additive_u_momentum.size() <= idx)
+            additive_u_momentum.resize(idx + 1, value_type(0));
         return additive_u_momentum[idx];
     }
     inline value_type& get_additive_u_state_k(std::size_t row, std::size_t k) {
         const std::size_t idx = row * additive_rank + k;
-        if (additive_u_state.size() <= idx) additive_u_state.resize(idx + 1, value_type(0));
+        if (additive_u_state.size() <= idx)
+            additive_u_state.resize(idx + 1, value_type(0));
         return additive_u_state[idx];
     }
     inline uint32_t& get_additive_u_step_k(std::size_t row, std::size_t k) {
         const std::size_t idx = row * additive_rank + k;
-        if (additive_u_step.size() <= idx) additive_u_step.resize(idx + 1, 0);
+        if (additive_u_step.size() <= idx)
+            additive_u_step.resize(idx + 1, 0);
         return additive_u_step[idx];
     }
     inline value_type& get_additive_v_momentum_k(std::size_t col, std::size_t k) {
         const std::size_t idx = col * additive_rank + k;
-        if (additive_v_momentum.size() <= idx) additive_v_momentum.resize(idx + 1, value_type(0));
+        if (additive_v_momentum.size() <= idx)
+            additive_v_momentum.resize(idx + 1, value_type(0));
         return additive_v_momentum[idx];
     }
     inline value_type& get_additive_v_state_k(std::size_t col, std::size_t k) {
         const std::size_t idx = col * additive_rank + k;
-        if (additive_v_state.size() <= idx) additive_v_state.resize(idx + 1, value_type(0));
+        if (additive_v_state.size() <= idx)
+            additive_v_state.resize(idx + 1, value_type(0));
         return additive_v_state[idx];
     }
     inline uint32_t& get_additive_v_step_k(std::size_t col, std::size_t k) {
         const std::size_t idx = col * additive_rank + k;
-        if (additive_v_step.size() <= idx) additive_v_step.resize(idx + 1, 0);
+        if (additive_v_step.size() <= idx)
+            additive_v_step.resize(idx + 1, 0);
         return additive_v_step[idx];
     }
 
@@ -2155,7 +2227,7 @@ struct SparseLinearWeightsDelta {
     // output_scale_step) and the new additive arrays (additive_u,
     // additive_v) with one shared reshuffle helper rather than
     // hand-duplicating the same logic eight times.
-public:
+  public:
     // Runtime-settable policy cap (task #295 -- was a compile-time
     // SCALE_RANK_MAX=4 constant forced by block4's SIMD backward path's
     // OWN fixed-size stack arrays; those are gone now, replaced by
@@ -2179,13 +2251,15 @@ public:
     inline void set_additive_rank_max(std::size_t new_max) { additive_rank_max = new_max; }
 
     inline void set_scale_rank(std::size_t new_rank) {
-        if (new_rank == 0) throw std::invalid_argument("scale_rank must be >= 1");
+        if (new_rank == 0)
+            throw std::invalid_argument("scale_rank must be >= 1");
         if (new_rank > scale_rank_max)
-            throw std::invalid_argument("scale_rank exceeds scale_rank_max (the configured policy cap -- raise it via set_scale_rank_max first)");
+            throw std::invalid_argument("scale_rank exceeds scale_rank_max (the configured policy "
+                                        "cap -- raise it via set_scale_rank_max first)");
         const std::size_t old_rank = scale_rank;
-        auto scale_default  = [](std::size_t k) { return k == 0 ? value_type(1) : value_type(0); };
-        auto zero_default   = [](std::size_t)   { return value_type(0); };
-        auto step_default   = [](std::size_t)   { return uint32_t(0); };
+        auto scale_default = [](std::size_t k) { return k == 0 ? value_type(1) : value_type(0); };
+        auto zero_default = [](std::size_t) { return value_type(0); };
+        auto step_default = [](std::size_t) { return uint32_t(0); };
         reshuffle_rank_array(value_scale, old_rank, new_rank, scale_default);
         reshuffle_rank_array(value_scale_importance, old_rank, new_rank, zero_default);
         reshuffle_rank_array(value_scale_step, old_rank, new_rank, step_default);
@@ -2227,8 +2301,10 @@ public:
     // their correct defaults and force-written, rather than silently
     // skipped -- a plain vector swap would corrupt any row/col that
     // hadn't been touched yet at one of the two indices.
-    inline void swap_scale_channels(std::size_t k1, std::size_t k2, std::size_t n_rows, std::size_t n_cols) {
-        if (k1 == k2) return;
+    inline void swap_scale_channels(std::size_t k1, std::size_t k2, std::size_t n_rows,
+                                    std::size_t n_cols) {
+        if (k1 == k2)
+            return;
         for (std::size_t r = 0; r < n_rows; ++r) {
             const value_type a = get_value_scale_k(r, k1);
             const value_type b = get_value_scale_k(r, k2);
@@ -2258,7 +2334,8 @@ public:
         // signal itself.
         {
             const std::size_t need = std::max(k1, k2) + 1;
-            if (scale_gamma_step.size() < need) scale_gamma_step.resize(need, 0);
+            if (scale_gamma_step.size() < need)
+                scale_gamma_step.resize(need, 0);
             std::swap(scale_gamma_step[k1], scale_gamma_step[k2]);
         }
     }
@@ -2270,8 +2347,10 @@ public:
     // scale_gamma_step. Needed because apply_additive_dynamic_rank_
     // control's apoptosis can target ANY channel, but set_additive_rank
     // can only truncate the LAST one.
-    inline void swap_additive_channels(std::size_t k1, std::size_t k2, std::size_t n_rows, std::size_t n_cols) {
-        if (k1 == k2) return;
+    inline void swap_additive_channels(std::size_t k1, std::size_t k2, std::size_t n_rows,
+                                       std::size_t n_cols) {
+        if (k1 == k2)
+            return;
         for (std::size_t r = 0; r < n_rows; ++r) {
             const value_type a = get_additive_u_k(r, k1);
             const value_type b = get_additive_u_k(r, k2);
@@ -2291,9 +2370,11 @@ public:
         additive_gamma_ema.swap_k(k1, k2);
         {
             const std::size_t need = std::max(k1, k2) + 1;
-            if (additive_gamma_step.size() < need) additive_gamma_step.resize(need, 0);
+            if (additive_gamma_step.size() < need)
+                additive_gamma_step.resize(need, 0);
             std::swap(additive_gamma_step[k1], additive_gamma_step[k2]);
-            if (additive_gamma_state.size() < need) additive_gamma_state.resize(need, value_type(0));
+            if (additive_gamma_state.size() < need)
+                additive_gamma_state.resize(need, value_type(0));
             std::swap(additive_gamma_state[k1], additive_gamma_state[k2]);
         }
     }
@@ -2352,27 +2433,29 @@ public:
     // branch) while the two branches' own defaults differ by ~100x.
     // The parameters stay independently settable for callers who want
     // within-branch asymmetry too; nothing here prevents it.
-    static bool apply_dynamic_rank_control_generic(std::size_t rank, std::size_t min_rank,
-                                                     std::size_t max_rank,
-                                                     uint32_t grow_grace_period_steps,
-                                                     uint32_t shrink_grace_period_steps,
-                                                     uint32_t& calls_since_mutation,
-                                                     AgeFn age_of, ApoptoseCheckFn should_apoptose,
-                                                     NeurogenesisCheckFn should_neurogenesis,
-                                                     DoApoptoseFn do_apoptose, DoNeurogenesisFn do_neurogenesis) {
-        if (calls_since_mutation < UINT32_MAX) ++calls_since_mutation;
+    static bool apply_dynamic_rank_control_generic(
+        std::size_t rank, std::size_t min_rank, std::size_t max_rank,
+        uint32_t grow_grace_period_steps, uint32_t shrink_grace_period_steps,
+        uint32_t& calls_since_mutation, AgeFn age_of, ApoptoseCheckFn should_apoptose,
+        NeurogenesisCheckFn should_neurogenesis, DoApoptoseFn do_apoptose,
+        DoNeurogenesisFn do_neurogenesis) {
+        if (calls_since_mutation < UINT32_MAX)
+            ++calls_since_mutation;
         const uint32_t min_grace = std::min(grow_grace_period_steps, shrink_grace_period_steps);
-        if (calls_since_mutation < min_grace) return false;
+        if (calls_since_mutation < min_grace)
+            return false;
         if (calls_since_mutation >= shrink_grace_period_steps) {
             for (std::size_t k = 0; k < rank; ++k) {
-                if (rank > min_rank && age_of(k) >= shrink_grace_period_steps && should_apoptose(k)) {
+                if (rank > min_rank && age_of(k) >= shrink_grace_period_steps &&
+                    should_apoptose(k)) {
                     do_apoptose(k);
                     calls_since_mutation = 0;
                     return true;
                 }
             }
         }
-        if (calls_since_mutation >= grow_grace_period_steps && rank < max_rank && should_neurogenesis()) {
+        if (calls_since_mutation >= grow_grace_period_steps && rank < max_rank &&
+            should_neurogenesis()) {
             do_neurogenesis();
             calls_since_mutation = 0;
             return true;
@@ -2438,15 +2521,16 @@ public:
     // branch and the additive branch, not within this branch.
     template <typename SeedFn>
     inline bool apply_dynamic_rank_control(std::size_t n_rows, std::size_t n_cols,
-                                            value_type tau_death, value_type tau_active,
-                                            value_type theta, SeedFn new_channel_seed,
-                                            uint32_t grow_grace_period_steps = 50,
-                                            uint32_t shrink_grace_period_steps = 50) {
+                                           value_type tau_death, value_type tau_active,
+                                           value_type theta, SeedFn new_channel_seed,
+                                           uint32_t grow_grace_period_steps = 50,
+                                           uint32_t shrink_grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
-            scale_rank, /*min_rank=*/std::size_t(1), scale_rank_max,
-            grow_grace_period_steps, shrink_grace_period_steps,
-            scale_rank_calls_since_mutation,
-            [&](std::size_t k) { return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0); },
+            scale_rank, /*min_rank=*/std::size_t(1), scale_rank_max, grow_grace_period_steps,
+            shrink_grace_period_steps, scale_rank_calls_since_mutation,
+            [&](std::size_t k) {
+                return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0);
+            },
             [&](std::size_t k) { return scale_gamma_should_apoptose(k, tau_death); },
             [&]() { return scale_gamma_should_neurogenesis(scale_rank, tau_active, theta); },
             [&](std::size_t k) {
@@ -2456,8 +2540,10 @@ public:
             [&]() {
                 const std::size_t new_k = scale_rank;
                 set_scale_rank(scale_rank + 1);
-                for (std::size_t r = 0; r < n_rows; ++r) set_value_scale_raw_k(r, new_k, new_channel_seed(r));
-                for (std::size_t c = 0; c < n_cols; ++c) set_output_scale_raw_k(c, new_k, value_type(1));
+                for (std::size_t r = 0; r < n_rows; ++r)
+                    set_value_scale_raw_k(r, new_k, new_channel_seed(r));
+                for (std::size_t c = 0; c < n_cols; ++c)
+                    set_output_scale_raw_k(c, new_k, value_type(1));
             });
     }
 
@@ -2503,16 +2589,17 @@ public:
     // settled by this comment.
     template <typename SeedUFn, typename SeedVFn>
     inline bool apply_additive_dynamic_rank_control(std::size_t n_rows, std::size_t n_cols,
-                                                     value_type tau_death, value_type tau_active,
-                                                     value_type theta, SeedUFn new_channel_seed_u,
-                                                     SeedVFn new_channel_seed_v,
-                                                     uint32_t grow_grace_period_steps = 5000,
-                                                     uint32_t shrink_grace_period_steps = 5000) {
+                                                    value_type tau_death, value_type tau_active,
+                                                    value_type theta, SeedUFn new_channel_seed_u,
+                                                    SeedVFn new_channel_seed_v,
+                                                    uint32_t grow_grace_period_steps = 5000,
+                                                    uint32_t shrink_grace_period_steps = 5000) {
         return apply_dynamic_rank_control_generic(
-            additive_rank, /*min_rank=*/std::size_t(0), additive_rank_max,
-            grow_grace_period_steps, shrink_grace_period_steps,
-            additive_rank_calls_since_mutation,
-            [&](std::size_t k) { return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0); },
+            additive_rank, /*min_rank=*/std::size_t(0), additive_rank_max, grow_grace_period_steps,
+            shrink_grace_period_steps, additive_rank_calls_since_mutation,
+            [&](std::size_t k) {
+                return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0);
+            },
             [&](std::size_t k) { return additive_gamma_should_apoptose(k, tau_death); },
             [&]() { return additive_gamma_should_neurogenesis(additive_rank, tau_active, theta); },
             [&](std::size_t k) {
@@ -2522,8 +2609,10 @@ public:
             [&]() {
                 const std::size_t new_k = additive_rank;
                 set_additive_rank(additive_rank + 1);
-                for (std::size_t r = 0; r < n_rows; ++r) set_additive_u_raw_k(r, new_k, new_channel_seed_u(r));
-                for (std::size_t c = 0; c < n_cols; ++c) set_additive_v_raw_k(c, new_k, new_channel_seed_v(c));
+                for (std::size_t r = 0; r < n_rows; ++r)
+                    set_additive_u_raw_k(r, new_k, new_channel_seed_u(r));
+                for (std::size_t c = 0; c < n_cols; ++c)
+                    set_additive_v_raw_k(c, new_k, new_channel_seed_v(c));
             });
     }
 
@@ -2537,10 +2626,11 @@ public:
         // is a plain std::vector now, see disldo_backward), purely a
         // configurable growth ceiling.
         if (new_rank > additive_rank_max)
-            throw std::invalid_argument("additive_rank exceeds additive_rank_max (the configured policy cap -- raise it via set_additive_rank_max first)");
+            throw std::invalid_argument("additive_rank exceeds additive_rank_max (the configured "
+                                        "policy cap -- raise it via set_additive_rank_max first)");
         const std::size_t old_rank = additive_rank;
         auto zero_default = [](std::size_t) { return value_type(0); };
-        auto step_default = [](std::size_t)  { return uint32_t(0); };
+        auto step_default = [](std::size_t) { return uint32_t(0); };
         reshuffle_rank_array(additive_u, old_rank, new_rank, zero_default);
         reshuffle_rank_array(additive_v, old_rank, new_rank, zero_default);
         reshuffle_rank_array(additive_u_momentum, old_rank, new_rank, zero_default);
@@ -2579,12 +2669,12 @@ public:
     // ever touched the ceiling," not as "what is the max right now" --
     // call recompute_stats() to get an exact value if that distinction
     // matters for a particular decision.
-    double     importance_l1      = 0.0;
-    double     importance_l2_sq   = 0.0;
+    double importance_l1 = 0.0;
+    double importance_l2_sq = 0.0;
     value_type importance_max_abs = value_type(0);
-    double     value_l1           = 0.0;
-    double     value_l2_sq        = 0.0;
-    value_type value_max_abs      = value_type(0);
+    double value_l1 = 0.0;
+    double value_l2_sq = 0.0;
+    value_type value_max_abs = value_type(0);
 
     // Decay applied to max_abs on every update, BEFORE comparing against
     // the new value -- new_max = max(old_max * decay, |new_val|). Default
@@ -2600,9 +2690,7 @@ public:
     inline value_type hoyer_importance() const {
         return _hoyer_from_stats(importance_l1, importance_l2_sq);
     }
-    inline value_type hoyer_value() const {
-        return _hoyer_from_stats(value_l1, value_l2_sq);
-    }
+    inline value_type hoyer_value() const { return _hoyer_from_stats(value_l1, value_l2_sq); }
 
     // Call after any write to a synapse's stored importance -- old_val/
     // new_val must be the STORED (post-quantization) values, matching what
@@ -2621,14 +2709,17 @@ public:
     // ONCE per thread after the parallel region, not this method from
     // inside one.
     inline void update_importance_stats(value_type old_val, value_type new_val) {
-        importance_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
-        importance_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
-        importance_max_abs  = std::max(importance_max_abs * max_abs_decay, std::abs(new_val));
+        importance_l1 +=
+            std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
+        importance_l2_sq +=
+            static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
+        importance_max_abs = std::max(importance_max_abs * max_abs_decay, std::abs(new_val));
     }
     inline void update_value_stats(value_type old_val, value_type new_val) {
-        value_l1      += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
-        value_l2_sq   += static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
-        value_max_abs  = std::max(value_max_abs * max_abs_decay, std::abs(new_val));
+        value_l1 += std::abs(static_cast<double>(new_val)) - std::abs(static_cast<double>(old_val));
+        value_l2_sq +=
+            static_cast<double>(new_val) * new_val - static_cast<double>(old_val) * old_val;
+        value_max_abs = std::max(value_max_abs * max_abs_decay, std::abs(new_val));
     }
 
     // Thread-safe: apply ONE thread's worth of pre-summed partial totals.
@@ -2641,23 +2732,19 @@ public:
     // largest |new_val| that thread saw (NOT decayed -- decay is applied
     // once here, matching update_*_stats' per-call semantics as closely as
     // a batched call can).
-    inline void update_importance_stats_aggregate(
-        double sum_abs_new, double sum_abs_old,
-        double sum_sq_new,  double sum_sq_old,
-        value_type local_max_new)
-    {
-        importance_l1      += sum_abs_new - sum_abs_old;
-        importance_l2_sq   += sum_sq_new  - sum_sq_old;
-        importance_max_abs  = std::max(importance_max_abs * max_abs_decay, local_max_new);
+    inline void update_importance_stats_aggregate(double sum_abs_new, double sum_abs_old,
+                                                  double sum_sq_new, double sum_sq_old,
+                                                  value_type local_max_new) {
+        importance_l1 += sum_abs_new - sum_abs_old;
+        importance_l2_sq += sum_sq_new - sum_sq_old;
+        importance_max_abs = std::max(importance_max_abs * max_abs_decay, local_max_new);
     }
-    inline void update_value_stats_aggregate(
-        double sum_abs_new, double sum_abs_old,
-        double sum_sq_new,  double sum_sq_old,
-        value_type local_max_new)
-    {
-        value_l1      += sum_abs_new - sum_abs_old;
-        value_l2_sq   += sum_sq_new  - sum_sq_old;
-        value_max_abs  = std::max(value_max_abs * max_abs_decay, local_max_new);
+    inline void update_value_stats_aggregate(double sum_abs_new, double sum_abs_old,
+                                             double sum_sq_new, double sum_sq_old,
+                                             value_type local_max_new) {
+        value_l1 += sum_abs_new - sum_abs_old;
+        value_l2_sq += sum_sq_new - sum_sq_old;
+        value_max_abs = std::max(value_max_abs * max_abs_decay, local_max_new);
     }
 
     // Recompute all six stats from scratch -- O(nnz), call once after
@@ -2665,17 +2752,19 @@ public:
     // writes values without going through update_*_stats(), or whenever an
     // exact (not monotonic-bound) max_abs is needed.
     inline void recompute_stats() {
-        importance_l1 = importance_l2_sq = 0.0; importance_max_abs = value_type(0);
-        value_l1      = value_l2_sq      = 0.0; value_max_abs      = value_type(0);
+        importance_l1 = importance_l2_sq = 0.0;
+        importance_max_abs = value_type(0);
+        value_l1 = value_l2_sq = 0.0;
+        value_max_abs = value_type(0);
         auto& L = connections.layout;
         for (std::size_t r = 0; r < L.rows; ++r) {
             const std::size_t n = L.row_nnz(r);
             for (std::size_t e = 0; e < n; ++e) {
                 const std::size_t vb = L.elem_start[r] + e;
                 update_value_stats(value_type(0),
-                    ValueAccessor<VALUES_TYPE>::get_w(connections.values, vb));
-                update_importance_stats(value_type(0),
-                    ValueAccessor<VALUES_TYPE>::get_imp(connections.values, vb));
+                                   ValueAccessor<VALUES_TYPE>::get_w(connections.values, vb));
+                update_importance_stats(
+                    value_type(0), ValueAccessor<VALUES_TYPE>::get_imp(connections.values, vb));
             }
         }
     }
@@ -2684,17 +2773,19 @@ public:
         return static_cast<SIZE_TYPE>(connections.layout.row_nnz(i));
     }
 
-private:
+  private:
     inline value_type _hoyer_from_stats(double l1, double l2_sq) const {
         const std::size_t n = connections.nnz();
-        if (n <= 1) return value_type(0);
+        if (n <= 1)
+            return value_type(0);
         const double l2 = std::sqrt(l2_sq);
-        if (l2 <= 0.0) return value_type(1);   // all-zero -> maximally "sparse" by convention
+        if (l2 <= 0.0)
+            return value_type(1); // all-zero -> maximally "sparse" by convention
         const double sqrt_n = std::sqrt(static_cast<double>(n));
         return static_cast<value_type>((sqrt_n - l1 / l2) / (sqrt_n - 1.0));
     }
 
-public:
+  public:
     // Change ONE row's importance_scale mid-training without losing that
     // row's accumulated importance: re-reads its stored importance at
     // whatever scale it currently has (each row can have a DIFFERENT scale
@@ -2705,16 +2796,18 @@ public:
     // one step, not just changing how future arithmetic treats it.
     inline void rescale_importance_row(std::size_t row, value_type new_scale) {
         const value_type old_scale = get_importance_scale(row);
-        if (new_scale == old_scale) return;
+        if (new_scale == old_scale)
+            return;
         auto& dc = connections;
-        auto& L  = dc.layout;
-        if (row >= L.rows) return;
+        auto& L = dc.layout;
+        if (row >= L.rows)
+            return;
         const std::size_t n = L.row_nnz(row);
         for (std::size_t e = 0; e < n; ++e) {
             const std::size_t vb = L.elem_start[row] + e;
-            const value_type w        = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
+            const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
             const value_type stored_i = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-            const value_type true_i   = stored_i * old_scale;
+            const value_type true_i = stored_i * old_scale;
             // Plain set(), not live -- this re-encodes whatever value the
             // row ALREADY had under a new scale (reparametrization, same
             // as block4_maybe_promote), not a training update. A row can
@@ -2735,29 +2828,33 @@ public:
     // this exactly as before.
     inline void rescale_importance(value_type new_scale) {
         auto& L = connections.layout;
-        for (std::size_t r = 0; r < L.rows; ++r) rescale_importance_row(r, new_scale);
+        for (std::size_t r = 0; r < L.rows; ++r)
+            rescale_importance_row(r, new_scale);
     }
 
     // Same pattern, for STORED weight values instead of importance.
     inline void rescale_value_row(std::size_t row, value_type new_scale) {
         const value_type old_scale = get_value_scale(row);
-        if (new_scale == old_scale) return;
+        if (new_scale == old_scale)
+            return;
         auto& dc = connections;
-        auto& L  = dc.layout;
-        if (row >= L.rows) return;
+        auto& L = dc.layout;
+        if (row >= L.rows)
+            return;
         const std::size_t n = L.row_nnz(row);
         for (std::size_t e = 0; e < n; ++e) {
             const std::size_t vb = L.elem_start[row] + e;
-            const value_type stored_w = ValueAccessor<VALUES_TYPE>::get_w  (dc.values, vb);
-            const value_type imp      = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-            const value_type true_w   = stored_w * old_scale;
+            const value_type stored_w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+            const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+            const value_type true_w = stored_w * old_scale;
             ValueAccessor<VALUES_TYPE>::set(dc.values, vb, true_w / new_scale, imp);
         }
         set_value_scale_raw(row, new_scale);
     }
     inline void rescale_value(value_type new_scale) {
         auto& L = connections.layout;
-        for (std::size_t r = 0; r < L.rows; ++r) rescale_value_row(r, new_scale);
+        for (std::size_t r = 0; r < L.rows; ++r)
+            rescale_value_row(r, new_scale);
     }
 
     // Gradient-free reparametrization: true_weight = stored_w *
@@ -2808,18 +2905,20 @@ public:
     // value_row's own convention for this class of scale-bookkeeping
     // rewrite (not the gradient-driven stochastic set_stochastic()).
     inline void magnitude_rescale_output(value_type target, value_type correction_rate,
-                                          bool scale_invariant, value_type eps = value_type(1e-8)) {
+                                         bool scale_invariant, value_type eps = value_type(1e-8)) {
         auto& dc = connections;
         auto& L = dc.layout;
         const std::size_t n_out = L.cols;
-        const std::size_t n_in  = L.rows;
-        if (n_out == 0 || n_in == 0) return;
+        const std::size_t n_in = L.rows;
+        if (n_out == 0 || n_in == 0)
+            return;
 
         std::vector<double> sum_sq(n_out, 0.0);
         std::vector<std::size_t> col_count(n_out, 0);
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n = L.row_nnz(r);
-            if (n == 0) continue;
+            if (n == 0)
+                continue;
             auto cursor = dc.row_cursor(r);
             for (std::size_t e = 0; e < n; ++e) {
                 const COL_TYPE col = cursor.advance();
@@ -2832,26 +2931,31 @@ public:
         const auto& BL = block4.block_layout;
         for (std::size_t br = 0; br < BL.rows; ++br) {
             const std::size_t n_bc = BL.row_nnz(br);
-            if (n_bc == 0) continue;
+            if (n_bc == 0)
+                continue;
             auto bc_cursor = block4.row_cursor(uint32_t(br));
             for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 const uint32_t bc = bc_cursor.advance();
                 const auto tile = block4.find(uint32_t(br), bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                    if (col >= n_out) continue;
+                    if (col >= n_out)
+                        continue;
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = br * BLOCK4_TILE + li;
-                        if (row >= n_in) continue;
+                        if (row >= n_in)
+                            continue;
                         value_type w;
                         if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                             const uint8_t w_byte = tile.at_weight(li, lj);
                             const uint8_t i_byte = tile.at_importance(li, lj);
-                            if (w_byte == 0 && i_byte == 0) continue;  // empty slot
+                            if (w_byte == 0 && i_byte == 0)
+                                continue; // empty slot
                             w = fp8_decode_bits(w_byte);
                         } else {
                             const uint8_t byte = tile.at(li, lj);
-                            if (byte == 0) continue;  // empty slot
+                            if (byte == 0)
+                                continue; // empty slot
                             w = FP4_TABLE[byte & 0xFu];
                         }
                         sum_sq[col] += static_cast<double>(w) * static_cast<double>(w);
@@ -2863,36 +2967,45 @@ public:
 
         std::vector<value_type> k(n_out, value_type(1));
         for (std::size_t c = 0; c < n_out; ++c) {
-            if (col_count[c] == 0) continue;  // nothing to rescale here
+            if (col_count[c] == 0)
+                continue; // nothing to rescale here
             const double mean_sq = sum_sq[c] / static_cast<double>(n_in);
-            const value_type col_rms = static_cast<value_type>(std::sqrt(mean_sq + static_cast<double>(eps)));
-            if (!std::isfinite(col_rms) || col_rms <= value_type(0)) continue;
+            const value_type col_rms =
+                static_cast<value_type>(std::sqrt(mean_sq + static_cast<double>(eps)));
+            if (!std::isfinite(col_rms) || col_rms <= value_type(0))
+                continue;
             value_type kc = target / col_rms;
-            if (kc < value_type(1e-6)) kc = value_type(1e-6);
+            if (kc < value_type(1e-6))
+                kc = value_type(1e-6);
             kc = std::pow(kc, correction_rate);
-            if (!std::isfinite(kc) || kc <= value_type(0)) continue;
+            if (!std::isfinite(kc) || kc <= value_type(0))
+                continue;
             k[c] = kc;
         }
 
         for (std::size_t r = 0; r < n_in; ++r) {
             const std::size_t n = L.row_nnz(r);
-            if (n == 0) continue;
+            if (n == 0)
+                continue;
             auto cursor = dc.row_cursor(r);
             for (std::size_t e = 0; e < n; ++e) {
                 const COL_TYPE col = cursor.advance();
-                if (k[col] == value_type(1)) continue;
+                if (k[col] == value_type(1))
+                    continue;
                 const std::size_t vb = L.elem_start[r] + e;
-                const value_type w   = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                const value_type w = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
                 const value_type imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                const value_type new_w   = w * k[col];
+                const value_type new_w = w * k[col];
                 const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
-                if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
+                if (!std::isfinite(new_w) || !std::isfinite(new_imp))
+                    continue;
                 ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w, new_imp);
             }
         }
         for (std::size_t br = 0; br < BL.rows; ++br) {
             const std::size_t n_bc = BL.row_nnz(br);
-            if (n_bc == 0) continue;
+            if (n_bc == 0)
+                continue;
             auto bc_cursor = block4.row_cursor(uint32_t(br));
             for (std::size_t bk = 0; bk < n_bc; ++bk) {
                 const uint32_t bc = bc_cursor.advance();
@@ -2901,36 +3014,49 @@ public:
                 bool any_col_touched = false;
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                    if (col < n_out && k[col] != value_type(1)) { any_col_touched = true; break; }
+                    if (col < n_out && k[col] != value_type(1)) {
+                        any_col_touched = true;
+                        break;
+                    }
                 }
-                if (!any_col_touched) continue;
+                if (!any_col_touched)
+                    continue;
                 auto tile = block4.find(uint32_t(br), bc);
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
-                    if (col >= n_out || k[col] == value_type(1)) continue;
+                    if (col >= n_out || k[col] == value_type(1))
+                        continue;
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = br * BLOCK4_TILE + li;
-                        if (row >= n_in) continue;
+                        if (row >= n_in)
+                            continue;
                         if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                             const uint8_t w_byte = tile.at_weight(li, lj);
                             const uint8_t i_byte = tile.at_importance(li, lj);
-                            if (w_byte == 0 && i_byte == 0) continue;
-                            const value_type w   = fp8_decode_bits(w_byte);
+                            if (w_byte == 0 && i_byte == 0)
+                                continue;
+                            const value_type w = fp8_decode_bits(w_byte);
                             const value_type imp = fp8_decode_bits(i_byte);
-                            const value_type new_w   = w * k[col];
-                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
-                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
-                            tile.at_weight(li, lj)     = fp8_quantize_live(new_w);
+                            const value_type new_w = w * k[col];
+                            const value_type new_imp =
+                                scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp))
+                                continue;
+                            tile.at_weight(li, lj) = fp8_quantize_live(new_w);
                             tile.at_importance(li, lj) = fp8_quantize_live(new_imp);
                         } else {
                             const uint8_t byte = tile.at(li, lj);
-                            if (byte == 0) continue;
-                            const value_type w   = FP4_TABLE[byte & 0xFu];
+                            if (byte == 0)
+                                continue;
+                            const value_type w = FP4_TABLE[byte & 0xFu];
                             const value_type imp = FP4_TABLE[(byte >> 4) & 0xFu];
-                            const value_type new_w   = w * k[col];
-                            const value_type new_imp = scale_invariant ? imp : imp * k[col] * k[col];
-                            if (!std::isfinite(new_w) || !std::isfinite(new_imp)) continue;
-                            tile.at(li, lj) = uint8_t(fp4_quantize_live(new_w) | (fp4_quantize_live(new_imp) << 4));
+                            const value_type new_w = w * k[col];
+                            const value_type new_imp =
+                                scale_invariant ? imp : imp * k[col] * k[col];
+                            if (!std::isfinite(new_w) || !std::isfinite(new_imp))
+                                continue;
+                            tile.at(li, lj) = uint8_t(fp4_quantize_live(new_w) |
+                                                      (fp4_quantize_live(new_imp) << 4));
                         }
                     }
                 }
@@ -2946,10 +3072,12 @@ public:
         // cleanly to any scale_rank -- at scale_rank==1 it's identical
         // to the original single-component form.
         for (std::size_t c = 0; c < n_out; ++c) {
-            if (k[c] == value_type(1)) continue;
+            if (k[c] == value_type(1))
+                continue;
             for (std::size_t ki = 0; ki < scale_rank; ++ki) {
                 const value_type new_os = get_output_scale_k(c, ki) / k[c];
-                if (!std::isfinite(new_os)) continue;
+                if (!std::isfinite(new_os))
+                    continue;
                 set_output_scale_raw_k(c, ki, new_os);
             }
         }
@@ -2963,9 +3091,7 @@ public:
         connections.reserve_indices(target_bytes);
     }
 
-    inline void reserve_values(std::size_t target_nnz) {
-        connections.reserve_values(target_nnz);
-    }
+    inline void reserve_values(std::size_t target_nnz) { connections.reserve_values(target_nnz); }
 };
 
 #endif

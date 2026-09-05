@@ -28,16 +28,22 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using VT        = DeltaCSRBiValues<float>;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, VT, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using VT = DeltaCSRBiValues<float>;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, VT, COL_TYPE>;
 
-static Weights make_weights(const std::vector<float>& dense_w, std::size_t n_in, std::size_t n_out) {
+static Weights make_weights(const std::vector<float>& dense_w, std::size_t n_in,
+                            std::size_t n_out) {
     Weights w;
     std::vector<SIZE_TYPE> ptrs(n_in + 1);
     std::vector<SIZE_TYPE> idx(n_in * n_out);
@@ -46,7 +52,7 @@ static Weights make_weights(const std::vector<float>& dense_w, std::size_t n_in,
         ptrs[r] = SIZE_TYPE(r * n_out);
         for (std::size_t c = 0; c < n_out; ++c) {
             idx[r * n_out + c] = SIZE_TYPE(c);
-            wv[r * n_out + c]  = dense_w[r * n_out + c];
+            wv[r * n_out + c] = dense_w[r * n_out + c];
         }
     }
     ptrs[n_in] = SIZE_TYPE(n_in * n_out);
@@ -72,33 +78,34 @@ static void run_config() {
     std::vector<SIZE_TYPE> in_idx, dy_idx;
     std::vector<float> in_val, dy_val;
     for (std::size_t r = 0; r < n_in; ++r) {
-        if (r % 3 == 2) continue;
+        if (r % 3 == 2)
+            continue;
         const float v = 0.3f + 0.1f * float(r);
         input[r] = v;
         in_idx.push_back(SIZE_TYPE(r));
         in_val.push_back(v);
     }
     for (std::size_t c = 0; c < n_out; ++c) {
-        if (c % 4 == 3) continue;
+        if (c % 4 == 3)
+            continue;
         const float v = -0.2f + 0.05f * float(c);
         dy[c] = v;
         dy_idx.push_back(SIZE_TYPE(c));
         dy_val.push_back(v);
     }
-    auto in_csr = make_csr_input<SIZE_TYPE, float>(
-        SIZE_TYPE(1), SIZE_TYPE(n_in), {0, SIZE_TYPE(in_idx.size())}, in_idx, in_val);
-    auto dy_csr = make_csr_input<SIZE_TYPE, float>(
-        SIZE_TYPE(1), SIZE_TYPE(n_out), {0, SIZE_TYPE(dy_idx.size())}, dy_idx, dy_val);
+    auto in_csr = make_csr_input<SIZE_TYPE, float>(SIZE_TYPE(1), SIZE_TYPE(n_in),
+                                                   {0, SIZE_TYPE(in_idx.size())}, in_idx, in_val);
+    auto dy_csr = make_csr_input<SIZE_TYPE, float>(SIZE_TYPE(1), SIZE_TYPE(n_out),
+                                                   {0, SIZE_TYPE(dy_idx.size())}, dy_idx, dy_val);
 
-    Weights weights_dense  = make_weights(dense_w, n_in, n_out);
+    Weights weights_dense = make_weights(dense_w, n_in, n_out);
     Weights weights_sparse = make_weights(dense_w, n_in, n_out);
 
     // ── Forward: outputs must match ────────────────────────────────────────
     std::vector<float> y_dense(n_out, 0.0f), y_sparse(n_out, 0.0f);
-    disldo_forward<SIZE_TYPE, VT, COL_TYPE>(
-        input.data(), 1, SIZE_TYPE(n_in), weights_dense, y_dense.data(), 1);
-    sisldo_forward<SIZE_TYPE, VT, COL_TYPE>(
-        in_csr, weights_sparse, y_sparse.data(), 1);
+    disldo_forward<SIZE_TYPE, VT, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_dense,
+                                            y_dense.data(), 1);
+    sisldo_forward<SIZE_TYPE, VT, COL_TYPE>(in_csr, weights_sparse, y_sparse.data(), 1);
     for (std::size_t c = 0; c < n_out; ++c)
         CHECK(std::abs(y_dense[c] - y_sparse[c]) < 1e-4f,
               "forward output[%zu] diverges: dense=%.6f sparse=%.6f", c, y_dense[c], y_sparse[c]);
@@ -112,11 +119,10 @@ static void run_config() {
     std::vector<float> ni_s(n_in, 0.0f), ng_s(n_out, 0.0f);
     const float lr = 0.05f;
     disldo_backward<SIZE_TYPE, VT, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_dense, dx_dense.data(),
-        ni_d.data(), ng_d.data(), lr, 1);
+        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_dense, dx_dense.data(), ni_d.data(),
+        ng_d.data(), lr, 1);
     disldo_backward_sparse_grad<SIZE_TYPE, VT, COL_TYPE, RMSpropScalePolicy<float>, false>(
-        input.data(), 1, weights_sparse, dy_csr, dx_sparse.data(),
-        ni_s.data(), ng_s.data(), lr, 1);
+        input.data(), 1, weights_sparse, dy_csr, dx_sparse.data(), ni_s.data(), ng_s.data(), lr, 1);
 
     for (std::size_t r = 0; r < n_in; ++r)
         CHECK(std::abs(dx_dense[r] - dx_sparse[r]) < 1e-4f,
@@ -130,9 +136,9 @@ static void run_config() {
         for (std::size_t e = 0; e < row_nnz; ++e) {
             const COL_TYPE col = cursor.advance();
             const std::size_t vb = L.elem_start[r] + e;
-            const float w_dense  = ValueAccessor<VT>::get_w(weights_dense.connections.values, vb);
+            const float w_dense = ValueAccessor<VT>::get_w(weights_dense.connections.values, vb);
             const float w_sparse = ValueAccessor<VT>::get_w(weights_sparse.connections.values, vb);
-            const float true_w_dense  = w_dense  * weights_dense.get_scale(r, col);
+            const float true_w_dense = w_dense * weights_dense.get_scale(r, col);
             const float true_w_sparse = w_sparse * weights_sparse.get_scale(r, col);
             // Tolerance looser than forward/dx (1e-4f) but still 50x
             // tighter than the FP4 parity test's own post-update bound
@@ -144,8 +150,8 @@ static void run_config() {
             // sparse loop (RMSprop's division chain amplifies rounding
             // more than the forward/dx sums do, hence looser than those).
             CHECK(std::abs(true_w_dense - true_w_sparse) < 5e-4f,
-                  "true weight[%zu][%u] diverges after update: dense=%.6f sparse=%.6f",
-                  r, col, true_w_dense, true_w_sparse);
+                  "true weight[%zu][%u] diverges after update: dense=%.6f sparse=%.6f", r, col,
+                  true_w_dense, true_w_sparse);
         }
     }
 }

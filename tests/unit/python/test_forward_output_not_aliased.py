@@ -10,6 +10,7 @@ ordinary Python code keeping intermediate results around) silently saw
 that array's contents change to the NEW call's result -- non-obvious,
 easy to hit, and produces WRONG (not crashing) results.
 """
+
 import numpy as np
 
 from sili import _cpu
@@ -30,10 +31,10 @@ class TestForwardDenseOutputNotAliased:
         x_zero = np.zeros((1, 4), dtype=np.float32)
         x1 = np.random.RandomState(10).randn(1, 4).astype(np.float32)
 
-        o_zero = layer.forward_dense(x_zero, 0.0)
+        o_zero = layer.forward_dense(x_zero)
         np.testing.assert_array_equal(o_zero, np.zeros((1, 4), dtype=np.float32))
 
-        o1 = layer.forward_dense(x1, 0.0)
+        o1 = layer.forward_dense(x1)
 
         # o_zero must NOT have changed after the second call.
         np.testing.assert_array_equal(o_zero, np.zeros((1, 4), dtype=np.float32))
@@ -46,8 +47,8 @@ class TestForwardDenseOutputNotAliased:
         layer = _tiny_layer()
         x1 = np.random.RandomState(1).randn(1, 4).astype(np.float32)
         x2 = np.random.RandomState(2).randn(1, 4).astype(np.float32)
-        o1 = layer.forward_dense(x1, 0.0)
-        o2 = layer.forward_dense(x2, 0.0)
+        o1 = layer.forward_dense(x1)
+        o2 = layer.forward_dense(x2)
         assert not np.allclose(o1, o2)
 
     def test_forward_sparse_output_not_aliased(self):
@@ -58,7 +59,7 @@ class TestForwardDenseOutputNotAliased:
         idx2 = np.array([2, 3], dtype=np.int32)
         vals2 = np.array([3.0, 4.0], dtype=np.float32)
 
-        o1 = layer.forward_sparse(ptrs, idx1, vals1, 1, 0.0).copy()
-        o2 = layer.forward_sparse(ptrs, idx2, vals2, 1, 0.0)
+        o1 = layer.forward_sparse(ptrs, idx1, vals1, 1).copy()
+        o2 = layer.forward_sparse(ptrs, idx2, vals2, 1)
         assert not np.allclose(o1, o2)
         assert not np.shares_memory(o1, o2)

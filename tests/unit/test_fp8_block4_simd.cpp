@@ -10,9 +10,14 @@
 #include <random>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 static Block4VecU codes_from(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     Block4VecU v;
@@ -25,16 +30,18 @@ int main() {
     // decode: every code 0..255, batched 4 at a time, bit-exact against
     // the scalar reference (including the two NaN-slot codes).
     for (int base = 0; base < 256; base += 4) {
-        const Block4VecU codes = codes_from(uint8_t(base), uint8_t(base + 1),
-                                             uint8_t(base + 2), uint8_t(base + 3));
+        const Block4VecU codes =
+            codes_from(uint8_t(base), uint8_t(base + 1), uint8_t(base + 2), uint8_t(base + 3));
         const Block4Vec got = block4_vec_decode_fp8(codes);
         float got_arr[4];
         std::memcpy(got_arr, &got, sizeof(got_arr));
         for (int lane = 0; lane < 4; ++lane) {
             const uint8_t code = uint8_t(base + lane);
             const float exp = fp8_decode_bits(code);
-            const bool match = (std::isnan(got_arr[lane]) && std::isnan(exp)) || got_arr[lane] == exp;
-            CHECK(match, "decode(%d) lane %d: got %f, expected %f", code, lane, double(got_arr[lane]), double(exp));
+            const bool match =
+                (std::isnan(got_arr[lane]) && std::isnan(exp)) || got_arr[lane] == exp;
+            CHECK(match, "decode(%d) lane %d: got %f, expected %f", code, lane,
+                  double(got_arr[lane]), double(exp));
         }
     }
 
@@ -55,8 +62,7 @@ int main() {
     for (int lane = 0; lane < 4; ++lane) {
         const double mean = sums[lane] / N;
         const double tol = 0.02 * std::max(1.0f, std::abs(test_vals[lane])) + 1e-4;
-        CHECK(std::abs(mean - test_vals[lane]) <= tol,
-              "E[stochastic(%f)] = %f, off by %f (tol %f)",
+        CHECK(std::abs(mean - test_vals[lane]) <= tol, "E[stochastic(%f)] = %f, off by %f (tol %f)",
               double(test_vals[lane]), mean, mean - test_vals[lane], tol);
     }
 

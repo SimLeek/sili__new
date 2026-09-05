@@ -19,38 +19,38 @@ root) for the external work referenced by name in this file's docstrings.
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple
 
 import numpy as np
 
 from sili.module import Module
 from sili.tensor import Tensor, gather
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Core function
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _apply_energy_dynamics(
-        h: Tensor,
-        energy: np.ndarray,
-        drive: float,                # delta  — baseline energy accumulation rate
-        activation_cost: float,      # gamma  — energy drain per unit |h|
-        precision: float,            # lambda_kl — sparsity enforcement strength
-        density: float,              # beta   — target activation density
-        exploration: float = 0.001,  # sigma  — per-neuron energy noise std
-        setpoint: float = 1.0,       # tau    — homeostatic comfort zone target
-        activation_threshold: float = 1e-4,  # dead zone threshold (architectural)
-        reactivity: float = 0.01,    # alpha  — homeostatic correction gain
-        p: float = 0.05,             # HARD CEILING on active neuron fraction
-        fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
-        fire_cost: Optional[float] = None,  # opt-in: firing drains this much (overrides 2*gamma)
-        fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
-        wake_sign: Optional[np.ndarray] = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
-        rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw below
-        wake_gate_steps: Optional[int] = None,  # opt-in: recency threshold gating the whole mechanism below
-        steps_since_fired: Optional[np.ndarray] = None,  # caller-owned per-neuron recency counter, same shape as h
-) -> Tuple[Tensor, np.ndarray, Tensor, float, np.ndarray, np.ndarray]:
+    h: Tensor,
+    energy: np.ndarray,
+    drive: float,  # delta  — baseline energy accumulation rate
+    activation_cost: float,  # gamma  — energy drain per unit |h|
+    precision: float,  # lambda_kl — sparsity enforcement strength
+    density: float,  # beta   — target activation density
+    exploration: float = 0.001,  # sigma  — per-neuron energy noise std
+    setpoint: float = 1.0,  # tau    — homeostatic comfort zone target
+    activation_threshold: float = 1e-4,  # dead zone threshold (architectural)
+    reactivity: float = 0.01,  # alpha  — homeostatic correction gain
+    p: float = 0.05,  # HARD CEILING on active neuron fraction
+    fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
+    fire_cost: float | None = None,  # opt-in: firing drains this much (overrides 2*gamma)
+    fire_wake_gradient: float | None = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
+    wake_sign: np.ndarray
+    | None = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
+    rng: np.random.Generator | None = None,  # opt-in: seeded source for the exploration noise draw below
+    wake_gate_steps: int | None = None,  # opt-in: recency threshold gating the whole mechanism below
+    steps_since_fired: np.ndarray | None = None,  # caller-owned per-neuron recency counter, same shape as h
+) -> tuple[Tensor, np.ndarray, Tensor, float, np.ndarray, np.ndarray]:
     """
     Apply continuous energy dynamics, returning an updated Tensor in the
     autograd graph.
@@ -256,19 +256,18 @@ def _apply_energy_dynamics(
                  start tracking recency before deciding to gate on it).
     """
 
-    b              = h.backend
     original_shape = h.shape
-    n              = int(np.prod(original_shape))
-    dtype          = np.float32
+    n = int(np.prod(original_shape))
+    dtype = np.float32
 
     # Pull h into numpy for all mask / gate decisions.
     # CPU backend: h.data is already numpy.
-    h_np        = np.asarray(h.data, dtype=dtype).ravel()
+    h_np = np.asarray(h.data, dtype=dtype).ravel()
     energy_flat = np.asarray(energy, dtype=dtype).ravel().copy()
 
     # ── 1. Dead zone ─────────────────────────────────────────────────────────
     alive = np.abs(h_np) > activation_threshold
-    h_dz  = h_np * alive           # zeroed copy for energy computation
+    h_dz = h_np * alive  # zeroed copy for energy computation
 
     # ── 2. Energy update ─────────────────────────────────────────────────────
     # drive     — deterministic drift (every neuron, every step)
@@ -276,8 +275,8 @@ def _apply_energy_dynamics(
     # |h_dz|   — active representation drains energy
     # Constraint: exploration must stay below drive/2 during waking
     #             to remain in curiosity regime, not hallucination regime.
-    noise_src  = rng if rng is not None else np.random
-    noise      = noise_src.normal(0.0, exploration, size=(n,)).astype(dtype)
+    noise_src = rng if rng is not None else np.random
+    noise = noise_src.normal(0.0, exploration, size=(n,)).astype(dtype)
 
     # Per-neuron recency GATE -- see wake_gate_steps' own docstring.
     # steps_since_fired defaults to all-zeros (everybody "awake", not
@@ -289,8 +288,11 @@ def _apply_energy_dynamics(
     # just drive -- awake_drive_scale computed here would be moot: any
     # drive value for an awake neuron gets discarded anyway once its
     # energy is frozen back to its input value in step 3.
-    ssf_flat = (np.asarray(steps_since_fired, dtype=np.int64).ravel()
-                if steps_since_fired is not None else np.zeros(n, dtype=np.int64))
+    ssf_flat = (
+        np.asarray(steps_since_fired, dtype=np.int64).ravel()
+        if steps_since_fired is not None
+        else np.zeros(n, dtype=np.int64)
+    )
     stale = (ssf_flat >= wake_gate_steps) if wake_gate_steps is not None else np.ones(n, dtype=bool)
     new_energy = energy_flat + drive + noise - activation_cost * np.abs(h_dz)
 
@@ -315,13 +317,13 @@ def _apply_energy_dynamics(
     # (steps_since_fired >= wake_gate_steps) get the full mechanism.
     # (`stale` itself computed above, alongside the energy update.)
 
-    fire_mask    = (new_energy >= 2.0) & stale
+    fire_mask = (new_energy >= 2.0) & stale
     shutoff_mask = (new_energy <= -2.0) & stale
 
     shutoff_values = np.zeros(n, dtype=dtype)
     if shutoff_mask.any():
         shutoff_values[shutoff_mask] = (energy_flat + 2.0)[shutoff_mask]
-        new_energy[shutoff_mask]     = -2.0
+        new_energy[shutoff_mask] = -2.0
 
     if fire_mask.any():
         if fire_reset_to_zero:
@@ -329,7 +331,7 @@ def _apply_energy_dynamics(
         elif fire_cost is not None:
             new_energy[fire_mask] -= float(fire_cost)
         else:
-            new_energy[fire_mask] -= 2.0 * activation_cost   # refractory drain (default, unchanged)
+            new_energy[fire_mask] -= 2.0 * activation_cost  # refractory drain (default, unchanged)
 
     # Awake neurons' energy stays exactly at its input value -- frozen,
     # not even subject to drive/noise/drain, until they go stale.
@@ -342,23 +344,23 @@ def _apply_energy_dynamics(
     # Restricted to the STALE population -- awake neurons never compete
     # for a kept slot at all; they always pass through (see step 5).
     n_stale = int(stale.sum())
-    k = max(1, int(round(p * n_stale))) if n_stale > 0 else 0
+    k = max(1, round(p * n_stale)) if n_stale > 0 else 0
 
-    fire_idx     = np.where(fire_mask)[0]
+    fire_idx = np.where(fire_mask)[0]
     non_fire_idx = np.where(stale & ~fire_mask)[0]
-    n_fired      = len(fire_idx)
+    n_fired = len(fire_idx)
 
     if n_fired >= k:
-        top_order  = np.argpartition(new_energy[fire_idx], -k)[-k:]
-        kept_fire  = fire_idx[top_order]
+        top_order = np.argpartition(new_energy[fire_idx], -k)[-k:]
+        kept_fire = fire_idx[top_order]
         kept_nfire = np.empty(0, dtype=int)
     else:
         kept_fire = fire_idx
         remaining = k - n_fired
         if remaining > 0 and len(non_fire_idx) > 0:
-            fill_k     = min(remaining, len(non_fire_idx))
-            scores     = np.abs(h_dz[non_fire_idx])
-            top_local  = np.argpartition(scores, -fill_k)[-fill_k:]
+            fill_k = min(remaining, len(non_fire_idx))
+            scores = np.abs(h_dz[non_fire_idx])
+            top_local = np.argpartition(scores, -fill_k)[-fill_k:]
             kept_nfire = non_fire_idx[top_local]
         else:
             kept_nfire = np.empty(0, dtype=int)
@@ -374,8 +376,7 @@ def _apply_energy_dynamics(
     # _coerce in Tensor handles numpy arrays so operators work directly.
 
     shutoff_in_kept = (
-        np.intersect1d(kept_nfire, np.where(shutoff_mask)[0])
-        if len(kept_nfire) > 0 else np.empty(0, dtype=int)
+        np.intersect1d(kept_nfire, np.where(shutoff_mask)[0]) if len(kept_nfire) > 0 else np.empty(0, dtype=int)
     )
     normal_kept = np.setdiff1d(kept_nfire, shutoff_in_kept)
     normal_kept = normal_kept[alive[normal_kept]]
@@ -432,17 +433,19 @@ def _apply_energy_dynamics(
     # outside this call's energy accounting entirely (see wake_gate_steps'
     # docstring), matching k's own scoping above. Falls back to the whole
     # population when wake_gate_steps is None (n_stale == n then).
-    n_active = len(normal_kept) + len(kept_fire) + (
-        int(np.sum(np.abs(const_np.ravel()[shutoff_in_kept]) > activation_threshold))
-        if len(shutoff_in_kept) > 0 else 0
+    n_active = (
+        len(normal_kept)
+        + len(kept_fire)
+        + (
+            int(np.sum(np.abs(const_np.ravel()[shutoff_in_kept]) > activation_threshold))
+            if len(shutoff_in_kept) > 0
+            else 0
+        )
     )
     actual_p = float(n_active / n_stale) if n_stale > 0 else 0.0
 
-    rho    = float(np.clip(actual_p, 1e-5, 1.0 - 1e-5))
-    kl_val = float(precision * (
-        rho * np.log(rho / density) +
-        (1.0 - rho) * np.log((1.0 - rho) / (1.0 - density))
-    ))
+    rho = float(np.clip(actual_p, 1e-5, 1.0 - 1e-5))
+    kl_val = float(precision * (rho * np.log(rho / density) + (1.0 - rho) * np.log((1.0 - rho) / (1.0 - density))))
 
     # Physical energy uses |h| (always positive drain, unchanged).
     # Loss tensor uses h directly (linear surrogate) — removes the sign(h)
@@ -478,15 +481,15 @@ def _apply_energy_dynamics(
     stale_idx = np.where(stale)[0]
     if len(stale_idx) > 0:
         c_stale_np = (energy_flat + drive + noise)[stale_idx]
-        c_stale_t  = Tensor(c_stale_np.astype(dtype), backend=h.backend)
-        h_stale    = gather(h, stale_idx)
+        c_stale_t = Tensor(c_stale_np.astype(dtype), backend=h.backend)
+        h_stale = gather(h, stale_idx)
         # Abs backward in sili is defined in every backend with `grad[a == 0.0] = 1.0`
         # in pytorch, you would use `h_abs = torch.where(h == 0, h, torch.abs(h))` and then use h_abs instead of abs(h)
         new_energy_t_stale = c_stale_t - activation_cost * abs(h_stale)
-        energy_loss = (reactivity / 2.0) * ((new_energy_t_stale - setpoint)**2).sum()
+        energy_loss = (reactivity / 2.0) * ((new_energy_t_stale - setpoint) ** 2).sum()
     else:
         energy_loss = Tensor(np.float32(0.0), backend=h.backend)
-    aux_loss    = kl_val + energy_loss     # float + Tensor -> Tensor via _coerce
+    aux_loss = kl_val + energy_loss  # float + Tensor -> Tensor via _coerce
 
     # Guaranteed-magnitude gradient at kept-fired positions -- see
     # fire_wake_gradient's own docstring. Deliberately separate from
@@ -494,8 +497,7 @@ def _apply_energy_dynamics(
     # not a hard guarantee): `(h * wake_gate).sum()` backprops exactly
     # `wake_gate` into h regardless of h's actual value.
     if fire_wake_gradient is not None and len(kept_fire) > 0:
-        assert wake_sign is not None, \
-            "wake_sign is required when fire_wake_gradient is set"
+        assert wake_sign is not None, "wake_sign is required when fire_wake_gradient is set"
         wake_sign_flat = np.asarray(wake_sign, dtype=dtype).ravel()
         wake_gate_np = np.zeros(n, dtype=dtype)
         wake_gate_np[kept_fire] = fire_wake_gradient * wake_sign_flat[kept_fire]
@@ -508,9 +510,15 @@ def _apply_energy_dynamics(
     # sparsity via an independent top-k pass that could disagree with what
     # energy actually decided. Sorted ascending -- CSR requires sorted
     # per-row indices.
-    kept_indices = np.sort(np.concatenate([
-        normal_kept, kept_fire, shutoff_in_kept,
-    ])).astype(np.int32)
+    kept_indices = np.sort(
+        np.concatenate(
+            [
+                normal_kept,
+                kept_fire,
+                shutoff_in_kept,
+            ]
+        )
+    ).astype(np.int32)
 
     # Recency counter for wake_gate_steps -- reset wherever a neuron
     # actually fired-and-was-kept this call, incremented everywhere else.
@@ -519,13 +527,13 @@ def _apply_energy_dynamics(
         new_ssf[kept_fire] = 0
     new_steps_since_fired = new_ssf.reshape(energy.shape)
 
-    return (h_out, new_energy.reshape(energy.shape), aux_loss, actual_p,
-            kept_indices, new_steps_since_fired)
+    return (h_out, new_energy.reshape(energy.shape), aux_loss, actual_p, kept_indices, new_steps_since_fired)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Module wrapper
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class EnergyDynamics(Module):
     """
@@ -547,28 +555,29 @@ class EnergyDynamics(Module):
     """
 
     def __init__(
-            self,
-            drive: float,                # delta  — metabolic tempo
-            activation_cost: float,      # gamma  — neural efficiency
-            precision: float,            # lambda_kl — sparsity enforcement
-            density: float,              # beta   — target activation density
-            exploration: float = 0.001,  # sigma  — per-neuron noise
-            setpoint: float   = 1.0,     # tau    — comfort zone target
-            activation_threshold: float = 1e-4,  # dead zone threshold
-            reactivity: float = 0.01,    # alpha  — homeostatic gain
-            p: float          = 0.05,    # hard ceiling on active fraction
-            fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
-            fire_cost: Optional[float] = None,  # opt-in: firing drains this much
-            fire_wake_gradient: Optional[float] = None,  # opt-in: guaranteed-magnitude gradient at fired positions
-            wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
-            rng: Optional[np.random.Generator] = None,  # opt-in: seeded source for the exploration noise draw
-            wake_gate_steps: Optional[int] = None,  # opt-in: per-neuron recency threshold gating the whole mechanism
-            stagger_wake_init: bool = False,  # opt-in: randomize initial steps_since_fired instead of uniform zero
+        self,
+        drive: float,  # delta  — metabolic tempo
+        activation_cost: float,  # gamma  — neural efficiency
+        precision: float,  # lambda_kl — sparsity enforcement
+        density: float,  # beta   — target activation density
+        exploration: float = 0.001,  # sigma  — per-neuron noise
+        setpoint: float = 1.0,  # tau    — comfort zone target
+        activation_threshold: float = 1e-4,  # dead zone threshold
+        reactivity: float = 0.01,  # alpha  — homeostatic gain
+        p: float = 0.05,  # hard ceiling on active fraction
+        fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
+        fire_cost: float | None = None,  # opt-in: firing drains this much
+        fire_wake_gradient: float | None = None,  # opt-in: guaranteed-magnitude gradient at fired positions
+        wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
+        rng: np.random.Generator | None = None,  # opt-in: seeded source for the exploration noise draw
+        wake_gate_steps: int | None = None,  # opt-in: per-neuron recency threshold gating the whole mechanism
+        stagger_wake_init: bool = False,  # opt-in: randomize initial steps_since_fired instead of uniform zero
     ):
-        assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, \
+        assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, (
             "activation_cost (gamma) must be positive and <= 4.0"
-        assert 0.0  <  density         < 1.0,  "density (beta) must be in (0, 1)"
-        assert 0.0  <  p               <= 1.0, "p must be in (0, 1]"
+        )
+        assert 0.0 < density < 1.0, "density (beta) must be in (0, 1)"
+        assert 0.0 < p <= 1.0, "p must be in (0, 1]"
         # p is a hardware/telemetry compute-limit ceiling, not a sparsity
         # target -- it must sit clearly above density so KL/shutoff/forced
         # -firing (not this hard ceiling) are what actually shapes learned
@@ -582,38 +591,40 @@ class EnergyDynamics(Module):
             f"the intended relationship, not p=density or p<density."
         )
 
-        self._energy_start = max(0.0,2.0-drive*10)  # allow 10 steps for noise, but don't wait forever for more noise
+        self._energy_start = max(
+            0.0, 2.0 - drive * 10
+        )  # allow 10 steps for noise, but don't wait forever for more noise
 
-        self.drive                = float(drive)
-        self.activation_cost      = float(activation_cost)
-        self.precision            = float(precision)
-        self.density              = float(density)
-        self.exploration          = float(exploration)
-        self.setpoint             = float(setpoint)
+        self.drive = float(drive)
+        self.activation_cost = float(activation_cost)
+        self.precision = float(precision)
+        self.density = float(density)
+        self.exploration = float(exploration)
+        self.setpoint = float(setpoint)
         self.activation_threshold = float(activation_threshold)
-        self.reactivity           = float(reactivity)
-        self.p                    = float(p)
-        self.fire_reset_to_zero   = bool(fire_reset_to_zero)
-        self.fire_cost            = None if fire_cost is None else float(fire_cost)
-        self.fire_wake_gradient   = None if fire_wake_gradient is None else float(fire_wake_gradient)
-        self.wake_seed            = int(wake_seed)
-        self.rng                  = rng
-        self.wake_gate_steps      = None if wake_gate_steps is None else int(wake_gate_steps)
-        self.stagger_wake_init    = bool(stagger_wake_init)
+        self.reactivity = float(reactivity)
+        self.p = float(p)
+        self.fire_reset_to_zero = bool(fire_reset_to_zero)
+        self.fire_cost = None if fire_cost is None else float(fire_cost)
+        self.fire_wake_gradient = None if fire_wake_gradient is None else float(fire_wake_gradient)
+        self.wake_seed = int(wake_seed)
+        self.rng = rng
+        self.wake_gate_steps = None if wake_gate_steps is None else int(wake_gate_steps)
+        self.stagger_wake_init = bool(stagger_wake_init)
 
         # Running state — numpy, not a Tensor, not a learned parameter
-        self.energy: Optional[np.ndarray] = None
+        self.energy: np.ndarray | None = None
         # Per-neuron recency counter for wake_gate_steps -- same shape
         # as energy, lazily (re)initialized alongside it.
-        self.steps_since_fired: Optional[np.ndarray] = None
+        self.steps_since_fired: np.ndarray | None = None
         # Lazily built on first forward() call, once h's shape is known --
         # a fixed +-1 pattern per position, seeded (not global RNG) so it's
         # reproducible and doesn't consume the project's own seeded
         # stochastic-rounding RNG stream.
-        self._wake_sign: Optional[np.ndarray] = None
+        self._wake_sign: np.ndarray | None = None
 
         # Cached for inspection / logging
-        self.aux_loss: Optional[Tensor] = None
+        self.aux_loss: Tensor | None = None
         self.actual_p: float = 0.0
         # The gate decision from the most recent forward() -- flat indices
         # into h's shape, sorted ascending. See _apply_energy_dynamics's
@@ -621,23 +632,23 @@ class EnergyDynamics(Module):
         # h for a downstream consumer (indices here, values from that
         # forward's PRE-gating h), rather than a separate independent top-k
         # pass that could disagree with this decision.
-        self.kept_indices: Optional[np.ndarray] = None
+        self.kept_indices: np.ndarray | None = None
 
     def parameters(self) -> list:
         return []
 
     def state_dict(self) -> dict:
         return {
-            "energy": (np.array(self.energy, dtype=np.float32)
-                       if self.energy is not None
-                       else np.zeros(0, dtype=np.float32)),
+            "energy": (
+                np.array(self.energy, dtype=np.float32) if self.energy is not None else np.zeros(0, dtype=np.float32)
+            ),
         }
 
     def load_state_dict(self, d: dict):
         e = d["energy"]
         self.energy = e.copy() if e.size > 0 else None
 
-    def forward(self, h: Tensor, density_override: Optional[float] = None) -> Tuple[Tensor, Tensor, float]:
+    def forward(self, h: Tensor, density_override: float | None = None) -> tuple[Tensor, Tensor, float]:
         """
         Parameters
         ----------
@@ -660,34 +671,47 @@ class EnergyDynamics(Module):
         """
         if self.energy is None or self.energy.shape != h.shape:
             # Reset energy on shape change (e.g. body switch, region resize)
-            self.energy = np.ones(h.shape, dtype=np.float32)*self._energy_start
+            self.energy = np.ones(h.shape, dtype=np.float32) * self._energy_start
             self._wake_sign = None
             if self.wake_gate_steps is not None and self.stagger_wake_init:
                 if self.rng is not None:
-                    self.steps_since_fired = self.rng.integers(
-                        0, self.wake_gate_steps, size=h.shape).astype(np.int64)
+                    self.steps_since_fired = self.rng.integers(0, self.wake_gate_steps, size=h.shape).astype(np.int64)
                 else:
-                    self.steps_since_fired = np.random.RandomState(self.wake_seed).randint(
-                        0, self.wake_gate_steps, size=h.shape).astype(np.int64)
+                    self.steps_since_fired = (
+                        np.random.RandomState(self.wake_seed)
+                        .randint(0, self.wake_gate_steps, size=h.shape)
+                        .astype(np.int64)
+                    )
             else:
                 self.steps_since_fired = np.zeros(h.shape, dtype=np.int64)
 
         if self.fire_wake_gradient is not None and self._wake_sign is None:
             n = int(np.prod(h.shape))
-            self._wake_sign = np.random.RandomState(self.wake_seed).choice(
-                [-1.0, 1.0], size=n).astype(np.float32)
+            self._wake_sign = np.random.RandomState(self.wake_seed).choice([-1.0, 1.0], size=n).astype(np.float32)
 
         density = self.density if density_override is None else float(density_override)
 
-        (h_out, self.energy, self.aux_loss, self.actual_p, self.kept_indices,
-         self.steps_since_fired) = _apply_energy_dynamics(
-            h, self.energy,
-            self.drive, self.activation_cost, self.precision, density,
-            self.exploration, self.setpoint, self.activation_threshold, self.reactivity, self.p,
-            self.fire_reset_to_zero, self.fire_cost,
-            self.fire_wake_gradient, self._wake_sign,
-            self.rng,
-            self.wake_gate_steps, self.steps_since_fired,
+        (h_out, self.energy, self.aux_loss, self.actual_p, self.kept_indices, self.steps_since_fired) = (
+            _apply_energy_dynamics(
+                h,
+                self.energy,
+                self.drive,
+                self.activation_cost,
+                self.precision,
+                density,
+                self.exploration,
+                self.setpoint,
+                self.activation_threshold,
+                self.reactivity,
+                self.p,
+                self.fire_reset_to_zero,
+                self.fire_cost,
+                self.fire_wake_gradient,
+                self._wake_sign,
+                self.rng,
+                self.wake_gate_steps,
+                self.steps_since_fired,
+            )
         )
         return h_out, self.aux_loss, self.actual_p
 
@@ -695,6 +719,7 @@ class EnergyDynamics(Module):
 # ══════════════════════════════════════════════════════════════════════════════
 #  BranchingRatioTracker
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class BranchingRatioTracker:
     """
@@ -741,16 +766,16 @@ class BranchingRatioTracker:
         if len(self._history) > self.window:
             self._history.pop(0)
 
-    def branching_ratio(self) -> Optional[float]:
+    def branching_ratio(self) -> float | None:
         """OLS slope of a[t+1] on a[t] over the current window, or None if
         there isn't enough history yet or activity has had zero variance
         (a flat sequence carries no information about self-propagation)."""
         if len(self._history) < 3:
             return None
         a = np.asarray(self._history[:-1], dtype=np.float64)
-        b = np.asarray(self._history[1:],  dtype=np.float64)
+        b = np.asarray(self._history[1:], dtype=np.float64)
         a_mean = a.mean()
-        denom  = float(np.sum((a - a_mean) ** 2))
+        denom = float(np.sum((a - a_mean) ** 2))
         if denom <= 1e-12:
             return None
         b_mean = b.mean()
@@ -811,11 +836,11 @@ class EMABranchingRatioTracker:
     def __init__(self, alpha: float = 0.05):
         assert 0.0 < alpha <= 1.0, "alpha must be in (0, 1]"
         self.alpha = float(alpha)
-        self._prev:    Optional[float] = None
-        self._mean_a:  Optional[float] = None
-        self._mean_b:  Optional[float] = None
-        self._mean_aa: Optional[float] = None
-        self._mean_ab: Optional[float] = None
+        self._prev: float | None = None
+        self._mean_a: float | None = None
+        self._mean_b: float | None = None
+        self._mean_aa: float | None = None
+        self._mean_ab: float | None = None
         self._n_pairs = 0
 
     def update(self, activity: float) -> None:
@@ -828,24 +853,24 @@ class EMABranchingRatioTracker:
             if self._mean_a is None:
                 # First pair -- seed the running means directly rather
                 # than blending against an undefined prior.
-                self._mean_a, self._mean_b   = a, b
+                self._mean_a, self._mean_b = a, b
                 self._mean_aa, self._mean_ab = a2, ab
             else:
                 al = self.alpha
-                self._mean_a  = (1.0 - al) * self._mean_a  + al * a
-                self._mean_b  = (1.0 - al) * self._mean_b  + al * b
+                self._mean_a = (1.0 - al) * self._mean_a + al * a
+                self._mean_b = (1.0 - al) * self._mean_b + al * b
                 self._mean_aa = (1.0 - al) * self._mean_aa + al * a2
                 self._mean_ab = (1.0 - al) * self._mean_ab + al * ab
             self._n_pairs += 1
         self._prev = activity
 
-    def branching_ratio(self) -> Optional[float]:
+    def branching_ratio(self) -> float | None:
         """OLS slope implied by the current EMA statistics, or None if
         there aren't at least two pairs yet or activity has had zero
         variance under the EMA (mirrors BranchingRatioTracker's guards)."""
         if self._n_pairs < 2 or self._mean_a is None:
             return None
-        var = self._mean_aa - self._mean_a ** 2
+        var = self._mean_aa - self._mean_a**2
         if var <= 1e-12:
             return None
         cov = self._mean_ab - self._mean_a * self._mean_b
@@ -861,8 +886,8 @@ class EMABranchingRatioTracker:
 #  Column-averaging loss
 # ══════════════════════════════════════════════════════════════════════════════
 
-def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int,
-                          weight: float = 1.0, indices=None) -> Tensor:
+
+def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int, weight: float = 1.0, indices=None) -> Tensor:
     """
     weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where column_i
     is the set of n_folds neurons tracking input index i.
@@ -889,11 +914,9 @@ def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int,
         column_block = h_out
     else:
         indices = np.asarray(indices)
-        assert indices.shape == (expected,), (
-            f"indices has shape {indices.shape}, expected ({expected},)"
-        )
+        assert indices.shape == (expected,), f"indices has shape {indices.shape}, expected ({expected},)"
         column_block = gather(h_out, indices)
 
     col_mean = column_block.reshape((n_folds, input_size)).sum(axis=0) * (1.0 / n_folds)
-    diff     = col_mean - target
-    return (diff ** 2).sum() * (weight / input_size)
+    diff = col_mean - target
+    return (diff**2).sum() * (weight / input_size)

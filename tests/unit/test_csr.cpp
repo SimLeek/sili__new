@@ -49,7 +49,8 @@ TEST_CASE("CSR Clear - TriValues", "[clear_csr]") {
     // Initialize CSR with three value arrays
     csr.ptrs = {std::make_unique<SIZE_TYPE[]>(6)};
     csr.indices = {std::make_unique<SIZE_TYPE[]>(5)};
-    csr.values = {std::make_unique<float[]>(5), std::make_unique<float[]>(5), std::make_unique<float[]>(5)};
+    csr.values = {std::make_unique<float[]>(5), std::make_unique<float[]>(5),
+                  std::make_unique<float[]>(5)};
     csr.rows = 5;
     csr.cols = 6;
 
@@ -118,9 +119,12 @@ TEST_CASE("CSR to COO - UnaryValues", "[to_coo]") {
     int expected_cols[] = {0, 2, 1, 2};
     float expected_values[] = {1.0f, 2.0f, 3.0f, 4.0f};
 
-    CHECK_VECTOR_EQUAL(vec(coo.indices[0].get(), 4), std::vector<int>(expected_rows, expected_rows + 4));
-    CHECK_VECTOR_EQUAL(vec(coo.indices[1].get(), 4), std::vector<int>(expected_cols, expected_cols + 4));
-    CHECK_VECTOR_EQUAL(vec(coo.values[0].get(), 4), std::vector<float>(expected_values, expected_values + 4));
+    CHECK_VECTOR_EQUAL(vec(coo.indices[0].get(), 4),
+                       std::vector<int>(expected_rows, expected_rows + 4));
+    CHECK_VECTOR_EQUAL(vec(coo.indices[1].get(), 4),
+                       std::vector<int>(expected_cols, expected_cols + 4));
+    CHECK_VECTOR_EQUAL(vec(coo.values[0].get(), 4),
+                       std::vector<float>(expected_values, expected_values + 4));
 }
 
 TEST_CASE("CSR to COO - BiValues", "[to_coo]") {
@@ -158,12 +162,15 @@ TEST_CASE("CSR to COO - BiValues", "[to_coo]") {
     float expected_values1[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
     float expected_values2[] = {10.0f, 20.0f, 30.0f, 40.0f, 50.0f};
 
-    CHECK_VECTOR_EQUAL(vec(coo.indices[0].get(), 5), std::vector<int>(expected_rows, expected_rows + 5));
-    CHECK_VECTOR_EQUAL(vec(coo.indices[1].get(), 5), std::vector<int>(expected_cols, expected_cols + 5));
-    CHECK_VECTOR_EQUAL(vec(coo.values[0].get(), 5), std::vector<float>(expected_values1, expected_values1 + 5));
-    CHECK_VECTOR_EQUAL(vec(coo.values[1].get(), 5), std::vector<float>(expected_values2, expected_values2 + 5));
+    CHECK_VECTOR_EQUAL(vec(coo.indices[0].get(), 5),
+                       std::vector<int>(expected_rows, expected_rows + 5));
+    CHECK_VECTOR_EQUAL(vec(coo.indices[1].get(), 5),
+                       std::vector<int>(expected_cols, expected_cols + 5));
+    CHECK_VECTOR_EQUAL(vec(coo.values[0].get(), 5),
+                       std::vector<float>(expected_values1, expected_values1 + 5));
+    CHECK_VECTOR_EQUAL(vec(coo.values[1].get(), 5),
+                       std::vector<float>(expected_values2, expected_values2 + 5));
 }
-
 
 /* #endregion */
 
@@ -205,14 +212,17 @@ TEST_CASE("COO to CSR - BiValues", "[to_csr]") {
     float expected_values2[] = {10.0f, 20.0f, 30.0f, 40.0f, 50.0f};
 
     // Verify row pointers
-    CHECK_VECTOR_EQUAL(vec(csr.ptrs[0].get(), 5), std::vector<int>(expected_ptrs, expected_ptrs + 5));
+    CHECK_VECTOR_EQUAL(vec(csr.ptrs[0].get(), 5),
+                       std::vector<int>(expected_ptrs, expected_ptrs + 5));
     // Verify column indices
-    CHECK_VECTOR_EQUAL(vec(csr.indices[0].get(), 5), std::vector<int>(expected_indices, expected_indices + 5));
+    CHECK_VECTOR_EQUAL(vec(csr.indices[0].get(), 5),
+                       std::vector<int>(expected_indices, expected_indices + 5));
     // Verify values
-    CHECK_VECTOR_EQUAL(vec(csr.values[0].get(), 5), std::vector<float>(expected_values1, expected_values1 + 5));
-    CHECK_VECTOR_EQUAL(vec(csr.values[1].get(), 5), std::vector<float>(expected_values2, expected_values2 + 5));
+    CHECK_VECTOR_EQUAL(vec(csr.values[0].get(), 5),
+                       std::vector<float>(expected_values1, expected_values1 + 5));
+    CHECK_VECTOR_EQUAL(vec(csr.values[1].get(), 5),
+                       std::vector<float>(expected_values2, expected_values2 + 5));
 }
-
 
 /* #endregion */
 
@@ -222,15 +232,15 @@ TEST_CASE("Convert Functions Tests") {
     // Convert vov_to_csr with valid values
     SECTION("Convert VOV TO CSR With Values Test") {
         sili::unique_vector<sili::unique_vector<int>> indices{{0,1,2},{2,3,4}, {3,4,5}, {4,5,6}};
-        sili::unique_vector<sili::unique_vector<float>> values{{1, 2, 3}, {2, 3, 4}, {3, 4, 5}, {4, 5, 6}};
-        auto csr = convert_vov_to_csr(&indices, &values, 7, 4, 12);
-        
+        sili::unique_vector<sili::unique_vector<float>> values{{1, 2, 3}, {2, 3, 4}, {3, 4, 5}, {4,
+5, 6}}; auto csr = convert_vov_to_csr(&indices, &values, 7, 4, 12);
+
         REQUIRE(csr.cols == 7);
         REQUIRE(csr.rows == 4);
         for(int i=0;i<4;i++){
             for(int j=0;j<3;j++){
-                CHECK_MESSAGE(csr.indices[i*3+j]==indices[i][j], "index mismatch at i,j: "<<i<<", "<<j);
-                CHECK_MESSAGE(csr.values[i*3+j]==values[i][j], "value mismatch at i,j: "<<i<<", "<<j);
+                CHECK_MESSAGE(csr.indices[i*3+j]==indices[i][j], "index mismatch at i,j: "<<i<<",
+"<<j); CHECK_MESSAGE(csr.values[i*3+j]==values[i][j], "value mismatch at i,j: "<<i<<", "<<j);
             }
         }
         sili::unique_vector<int> ptrs{0, 3, 6, 9, 12};
@@ -244,12 +254,13 @@ TEST_CASE("Convert Functions Tests") {
     SECTION("Convert VOV TO CSR Without Values Test") {
         sili::unique_vector<sili::unique_vector<int>> indices{{0,1,2},{2,3,4}, {3,4,5}, {4,5,6}};
         auto csr = convert_vov_to_csr<int, float>(&indices, nullptr, 7, 4, 12);
-        
+
         REQUIRE(csr.cols == 7);
         REQUIRE(csr.rows == 4);
         for(int i=0;i<4;i++){
             for(int j=0;j<3;j++){
-                CHECK_MESSAGE(csr.indices[i*3+j]==indices[i][j], "index mismatch at i,j: "<<i<<", "<<j);
+                CHECK_MESSAGE(csr.indices[i*3+j]==indices[i][j], "index mismatch at i,j: "<<i<<",
+"<<j);
             }
         }
         sili::unique_vector<int> ptrs{0, 3, 6, 9, 12};
@@ -261,8 +272,8 @@ TEST_CASE("Convert Functions Tests") {
 
     SECTION("Convert VOV TO CSR With Incorrect Non-Zero Count") {
         sili::unique_vector<sili::unique_vector<int>> indices{{0,1,2},{2,3,4}, {3,4,5}, {4,5,6}};
-        sili::unique_vector<sili::unique_vector<float>> values{{1, 2, 3}, {2, 3, 4}, {3, 4, 5}, {4, 5, 6}};
-        REQUIRE_THROWS_AS(convert_vov_to_csr(&indices, &values, 7, 4, 11), std::runtime_error);
+        sili::unique_vector<sili::unique_vector<float>> values{{1, 2, 3}, {2, 3, 4}, {3, 4, 5}, {4,
+5, 6}}; REQUIRE_THROWS_AS(convert_vov_to_csr(&indices, &values, 7, 4, 11), std::runtime_error);
     }
 
 }
@@ -287,7 +298,8 @@ TEST_CASE("generate_random_csr", "[csr_matrix]") {
 
     // Random number generator
     std::uniform_int_distribution<size_t> index_dist(0, csr_avoid_pts.rows * csr_avoid_pts.cols);
-    std::mt19937_64 generator(static_cast<unsigned long>(std::time(0))); // Fix the seed for repeatability
+    std::mt19937_64 generator(static_cast<unsigned long>(std::time(0))); // Fix the seed for
+repeatability
 
     // Basic functionality test
     SECTION("Basic Functionality") {
@@ -334,14 +346,16 @@ TEST_CASE("generate_random_csr", "[csr_matrix]") {
         REQUIRE(random_csr_parallel.nnz() == random_csr_sequential.nnz());
 
         // Convert CSR matrices to vectors
-        std::vector<size_t> ptrs_parallel = vec(random_csr_parallel.ptrs.get(), random_csr_parallel.rows + 1);
-        std::vector<size_t> indices_parallel = vec(random_csr_parallel.indices.get(), random_csr_parallel.nnz());
-        std::vector<size_t> ptrs_sequential = vec(random_csr_sequential.ptrs.get(), random_csr_sequential.rows + 1);
-        std::vector<size_t> indices_sequential = vec(random_csr_sequential.indices.get(), random_csr_sequential.nnz());
+        std::vector<size_t> ptrs_parallel = vec(random_csr_parallel.ptrs.get(),
+random_csr_parallel.rows + 1); std::vector<size_t> indices_parallel =
+vec(random_csr_parallel.indices.get(), random_csr_parallel.nnz()); std::vector<size_t>
+ptrs_sequential = vec(random_csr_sequential.ptrs.get(), random_csr_sequential.rows + 1);
+        std::vector<size_t> indices_sequential = vec(random_csr_sequential.indices.get(),
+random_csr_sequential.nnz());
 
         // Compare the vectors
         CHECK_VECTOR_EQUAL(ptrs_parallel, ptrs_sequential);
-        CHECK_VECTOR_EQUAL(indices_parallel, indices_sequential);    
+        CHECK_VECTOR_EQUAL(indices_parallel, indices_sequential);
     }
 
     // Edge case 1: Large number of insertions
@@ -352,11 +366,12 @@ TEST_CASE("generate_random_csr", "[csr_matrix]") {
         CHECK(random_csr.values.get()==nullptr);
         CHECK(random_csr.nnz()==19);
         CHECK_VECTOR_EQUAL(
-            vec(random_csr.ptrs.get(), random_csr.rows+1), 
-            std::vector<size_t>({0, 6, 11, 15, 19})  // initializer lists need to be inside parantheses or are passed to CHECK_VECTOR_EQUAL
+            vec(random_csr.ptrs.get(), random_csr.rows+1),
+            std::vector<size_t>({0, 6, 11, 15, 19})  // initializer lists need to be inside
+parantheses or are passed to CHECK_VECTOR_EQUAL
             );
         CHECK_VECTOR_EQUAL(
-            vec(random_csr.indices.get(), random_csr.nnz()), 
+            vec(random_csr.indices.get(), random_csr.nnz()),
             std::vector<size_t>({1, 2, 4, 5, 7, 8, 5, 6, 7, 8, 9, 0, 7, 8, 9, 0, 1, 8, 9})
             );
     }
@@ -369,11 +384,12 @@ TEST_CASE("generate_random_csr", "[csr_matrix]") {
         CHECK(random_csr.values.get()==nullptr);
         CHECK(random_csr.nnz()==1);
         CHECK_VECTOR_EQUAL(
-            vec(random_csr.ptrs.get(), random_csr.rows+1), 
-            std::vector<size_t>({0, 0, 1, 1, 1})  // initializer lists need to be inside parantheses or are passed to CHECK_VECTOR_EQUAL
+            vec(random_csr.ptrs.get(), random_csr.rows+1),
+            std::vector<size_t>({0, 0, 1, 1, 1})  // initializer lists need to be inside parantheses
+or are passed to CHECK_VECTOR_EQUAL
             );
         CHECK_VECTOR_EQUAL(
-            vec(random_csr.indices.get(), random_csr.nnz()), 
+            vec(random_csr.indices.get(), random_csr.nnz()),
             std::vector<size_t>({6})
             );
     }
@@ -427,7 +443,7 @@ TEST_CASE("merge_csrs basic functionality", "[merge_csrs]") {
     }
 }
 */
-//I don't actually care about this rn
+// I don't actually care about this rn
 /*TEST_CASE("merge_csrs edge cases", "[merge_csrs]") {
     SECTION("Merge with an empty CSR") {
         auto indices_non_empty = sili::unique_vector<sili::unique_vector<size_t>>{{0}, {1}};
@@ -497,11 +513,12 @@ TEST_CASE("merge_csrs parallel vs sequential", "[merge_csrs]") {
 
     // Convert CSR matrices to vectors
     std::vector<size_t> ptrs_parallel = vec(result_parallel.ptrs.get(), result_parallel.rows + 1);
-    std::vector<size_t> indices_parallel = vec(result_parallel.indices.get(), result_parallel.nnz());
-    std::vector<float> values_parallel = vec(result_parallel.values.get(), result_parallel.nnz());
-    std::vector<size_t> ptrs_sequential = vec(result_sequential.ptrs.get(), result_sequential.rows + 1);
-    std::vector<size_t> indices_sequential = vec(result_sequential.indices.get(), result_sequential.nnz());
-    std::vector<float> values_sequential = vec(result_sequential.values.get(), result_sequential.nnz());
+    std::vector<size_t> indices_parallel = vec(result_parallel.indices.get(),
+result_parallel.nnz()); std::vector<float> values_parallel = vec(result_parallel.values.get(),
+result_parallel.nnz()); std::vector<size_t> ptrs_sequential = vec(result_sequential.ptrs.get(),
+result_sequential.rows + 1); std::vector<size_t> indices_sequential =
+vec(result_sequential.indices.get(), result_sequential.nnz()); std::vector<float> values_sequential
+= vec(result_sequential.values.get(), result_sequential.nnz());
 
     // Compare the vectors
     CHECK_VECTOR_EQUAL(ptrs_parallel, ptrs_sequential);
@@ -510,15 +527,13 @@ TEST_CASE("merge_csrs parallel vs sequential", "[merge_csrs]") {
 
     CHECK_VECTOR_EQUAL(ptrs_parallel, std::vector<size_t>({0,5,10,14}));
     CHECK_VECTOR_EQUAL(indices_parallel, std::vector<size_t>({0,1,3,4,6,0,1,2,3,5,1,2,3,6}));
-    CHECK_VECTOR_ALMOST_EQUAL(values_parallel, std::vector<float>({0.1,0.4,0.3,0.7,0.6,0.2,0.1,0.2,0.5,0.8,0.1,0.6,0.3,0.9}),0.0000001);
+    CHECK_VECTOR_ALMOST_EQUAL(values_parallel,
+std::vector<float>({0.1,0.4,0.3,0.7,0.6,0.2,0.1,0.2,0.5,0.8,0.1,0.6,0.3,0.9}),0.0000001);
 
 }
 */
-/*TODO: still need to be tested (but they probably work and I've had enough of this, so moving on for now): 
- * remove_element_from_csr
- * add_few_random_to_csr
- * CSRStarmap constructor
-   * addRandomValue
-   * addRandomElements
-   * iterate
-*/
+/*TODO: still need to be tested (but they probably work and I've had enough of this, so moving on
+ * for now): remove_element_from_csr add_few_random_to_csr CSRStarmap constructor addRandomValue
+ * addRandomElements
+ * iterate
+ */

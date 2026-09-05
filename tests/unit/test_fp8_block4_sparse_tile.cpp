@@ -10,20 +10,26 @@
 #include <algorithm>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 static Block4Tile8 make_random_dense8(std::mt19937& rng, int n) {
     Block4Tile8 t;
     std::vector<int> positions(16);
-    for (int i = 0; i < 16; ++i) positions[i] = i;
+    for (int i = 0; i < 16; ++i)
+        positions[i] = i;
     std::shuffle(positions.begin(), positions.end(), rng);
     std::uniform_int_distribution<int> val_dist(1, 255);
     for (int i = 0; i < n; ++i) {
         const int pos = positions[i];
-        t.data[pos] = uint8_t(val_dist(rng));                    // weight
-        t.data[16 + pos] = uint8_t(val_dist(rng));                // importance
+        t.data[pos] = uint8_t(val_dist(rng));      // weight
+        t.data[16 + pos] = uint8_t(val_dist(rng)); // importance
     }
     return t;
 }
@@ -37,11 +43,12 @@ static void test_pack_unpack_roundtrip() {
             uint8_t packed[32] = {0};
             const uint8_t written_count = block4_sparse_pack8(dense.data, packed);
             CHECK(packed[0] == n, "pack8: count byte should be %d, got %d", n, packed[0]);
-            CHECK(written_count == n, "pack8: returned count should be %d, got %d", n, written_count);
+            CHECK(written_count == n, "pack8: returned count should be %d, got %d", n,
+                  written_count);
             const std::size_t expect_len = block4_sparse_packed_len8(uint8_t(n));
             CHECK(expect_len == std::size_t(1 + (n + 1) / 2 + n * 2),
-                  "block4_sparse_packed_len8(%d) should be 1+ceil(n/2)+2n = %zu, got %zu",
-                  n, std::size_t(1 + (n + 1) / 2 + n * 2), expect_len);
+                  "block4_sparse_packed_len8(%d) should be 1+ceil(n/2)+2n = %zu, got %zu", n,
+                  std::size_t(1 + (n + 1) / 2 + n * 2), expect_len);
             CHECK(expect_len <= 32, "packed length must never exceed the dense size at n=%d", n);
             uint8_t roundtrip[32];
             block4_sparse_unpack8(packed, roundtrip);
@@ -57,7 +64,8 @@ static void test_count_live_matches_pack_count() {
     std::mt19937 rng(1);
     for (int n = 0; n <= 12; ++n) {
         Block4Tile8 dense = make_random_dense8(rng, n);
-        CHECK(dense.count_live() == uint32_t(n), "count_live() = %u, expected %d", dense.count_live(), n);
+        CHECK(dense.count_live() == uint32_t(n), "count_live() = %u, expected %d",
+              dense.count_live(), n);
         CHECK(block4_count_live8(dense.data) == uint32_t(n),
               "block4_count_live8() = %u, expected %d", block4_count_live8(dense.data), n);
     }

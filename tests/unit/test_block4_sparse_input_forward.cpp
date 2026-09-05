@@ -13,13 +13,17 @@
 #include <random>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 int main() {
     const int n_in = 32, n_out = 32;
@@ -27,9 +31,12 @@ int main() {
     // Scattered part: a handful of entries outside block4's coverage.
     std::vector<SIZE_TYPE> ptrs(n_in + 1, 0), idx;
     std::vector<float> w, imp;
-    idx.push_back(20); w.push_back(1.5f); imp.push_back(0.3f);
+    idx.push_back(20);
+    w.push_back(1.5f);
+    imp.push_back(0.3f);
     ptrs[9] = 1; // row 8 -> col 20 (row 8 is outside tiles (0,0)/(1,1))
-    for (int r = 9; r <= n_in; ++r) ptrs[r] = 1;
+    for (int r = 9; r <= n_in; ++r)
+        ptrs[r] = 1;
 
     Weights weights;
     weights.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -62,7 +69,8 @@ int main() {
         std::vector<SIZE_TYPE> x_idx;
         std::vector<float> x_vals;
         for (int i = 0; i < n_in; ++i) {
-            if (!keep(rng)) continue;
+            if (!keep(rng))
+                continue;
             const float v = data_dist(rng);
             x_dense[i] = v;
             x_idx.push_back(i);
@@ -71,18 +79,18 @@ int main() {
         x_ptrs.push_back(static_cast<SIZE_TYPE>(x_idx.size()));
 
         std::vector<float> y_dense(n_out, 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_dense.data(), 1, n_in, weights, y_dense.data(), 4);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_dense.data(), 1, n_in, weights,
+                                                         y_dense.data(), 4);
 
         CSRInput<SIZE_TYPE, float> x_sparse;
-        x_sparse.rows = 1; x_sparse.cols = n_in;
-        x_sparse.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(x_ptrs);
+        x_sparse.rows = 1;
+        x_sparse.cols = n_in;
+        x_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_ptrs);
         x_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_idx);
-        x_sparse.values[0]  = std::make_shared<std::vector<float>>(x_vals);
+        x_sparse.values[0] = std::make_shared<std::vector<float>>(x_vals);
 
         std::vector<float> y_sparse(n_out, 0.0f);
-        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_sparse, weights, y_sparse.data(), 4);
+        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 4);
 
         for (int c = 0; c < n_out; ++c) {
             CHECK(std::abs(y_dense[c] - y_sparse[c]) < 1e-4f,
@@ -99,15 +107,20 @@ int main() {
         std::vector<SIZE_TYPE> x_idx;
         std::vector<float> x_vals;
         for (int i = 0; i < n_in; ++i) {
-            if (!keep2(rng)) continue;
+            if (!keep2(rng))
+                continue;
             const float v = data_dist(rng);
-            x_dense[i] = v; x_idx.push_back(i); x_vals.push_back(v);
+            x_dense[i] = v;
+            x_idx.push_back(i);
+            x_vals.push_back(v);
         }
         x_ptrs.push_back(static_cast<SIZE_TYPE>(x_idx.size()));
         std::vector<float> y_dense(n_out, 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_dense.data(), 1, n_in, weights, y_dense.data(), 1);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_dense.data(), 1, n_in, weights,
+                                                         y_dense.data(), 1);
         CSRInput<SIZE_TYPE, float> x_sparse;
-        x_sparse.rows = 1; x_sparse.cols = n_in;
+        x_sparse.rows = 1;
+        x_sparse.cols = n_in;
         x_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_ptrs);
         x_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_idx);
         x_sparse.values[0] = std::make_shared<std::vector<float>>(x_vals);
@@ -115,7 +128,8 @@ int main() {
         sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x_sparse, weights, y_sparse.data(), 1);
         int local_fail = 0;
         for (int c = 0; c < n_out; ++c)
-            if (std::abs(y_dense[c] - y_sparse[c]) >= 1e-4f) ++local_fail;
+            if (std::abs(y_dense[c] - y_sparse[c]) >= 1e-4f)
+                ++local_fail;
         std::printf("density=%.2f num_cpus=1: %d/%d mismatches\n", density, local_fail, n_out);
         g_fail += local_fail;
     }

@@ -7,9 +7,14 @@
 #include <cstdio>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 static void test_handle_dense_passthrough() {
     Block4Store8 store;
@@ -24,9 +29,12 @@ static void test_handle_dense_passthrough() {
     {
         auto h = store.find(0, 0);
         CHECK(bool(h), "find() should locate the tile just created");
-        CHECK(h.at_weight(0, 0) == 0x12, "at_weight(0,0) should read back 0x12, got %d", h.at_weight(0, 0));
-        CHECK(h.at_importance(0, 0) == 0x99, "at_importance(0,0) should read back 0x99, got %d", h.at_importance(0, 0));
-        CHECK(h.at_weight(1, 1) == 0x34, "at_weight(1,1) should read back 0x34, got %d", h.at_weight(1, 1));
+        CHECK(h.at_weight(0, 0) == 0x12, "at_weight(0,0) should read back 0x12, got %d",
+              h.at_weight(0, 0));
+        CHECK(h.at_importance(0, 0) == 0x99, "at_importance(0,0) should read back 0x99, got %d",
+              h.at_importance(0, 0));
+        CHECK(h.at_weight(1, 1) == 0x34, "at_weight(1,1) should read back 0x34, got %d",
+              h.at_weight(1, 1));
         CHECK(h.at_weight(2, 2) == 0, "untouched slot weight should be 0");
         CHECK(h.at_importance(2, 2) == 0, "untouched slot importance should be 0");
     }
@@ -60,9 +68,11 @@ static void test_maybe_compress_explicit_check() {
         auto h = store.find(0, 0);
         h.at_weight(0, 2) = 0x00;
     }
-    CHECK(store.is_sparse(0, 0) == false, "dropping to 2 active must not auto-compress -- not automatic");
+    CHECK(store.is_sparse(0, 0) == false,
+          "dropping to 2 active must not auto-compress -- not automatic");
     store.maybe_compress(0, 0);
-    CHECK(store.is_sparse(0, 0) == true, "2 active <= switch_point=2, explicit maybe_compress should compress");
+    CHECK(store.is_sparse(0, 0) == true,
+          "2 active <= switch_point=2, explicit maybe_compress should compress");
     {
         auto h = store.find(0, 0);
         CHECK(h.at_weight(0, 0) == 0x11 && h.at_weight(0, 1) == 0x22 && h.at_weight(0, 2) == 0x00,
@@ -79,7 +89,8 @@ static void test_maybe_compress_explicit_check() {
     }
     CHECK(store2.is_sparse(0, 0) == false, "2 active > switch_point=1 should be dense");
     store2.maybe_compress(0, 0);
-    CHECK(store2.is_sparse(0, 0) == false, "2 active > switch_point=1, maybe_compress should NOT compress");
+    CHECK(store2.is_sparse(0, 0) == false,
+          "2 active > switch_point=1, maybe_compress should NOT compress");
     store2.maybe_compress(5, 5); // nonexistent tile: no-op, no crash
 }
 
@@ -119,7 +130,9 @@ static void test_weight_only_or_importance_only_slot_is_still_live() {
     }
     {
         auto h = store.find(0, 0);
-        CHECK(h.count_live() == 1, "weight=0,importance!=0 slot should count as live, got count_live=%u", h.count_live());
+        CHECK(h.count_live() == 1,
+              "weight=0,importance!=0 slot should count as live, got count_live=%u",
+              h.count_live());
     }
 }
 
@@ -138,7 +151,8 @@ static void test_erase_while_handle_alive() {
             h.at_weight(0, 1) = 0x22;
             store.erase(0, 0);
         }
-        CHECK(store.n_tiles() == 0, "tile should be gone after erase(); handle destructor must not resurrect it");
+        CHECK(store.n_tiles() == 0,
+              "tile should be gone after erase(); handle destructor must not resurrect it");
     }
     {
         Block4Store8 store;
@@ -168,8 +182,10 @@ static void test_live_synapses_matches_manual_count() {
     }
     CHECK(store.live_synapses() == 3, "live_synapses() = %zu, expected 3", store.live_synapses());
     store.maybe_compress(0, 0); // force sparse (3 <= default switch_point=12)
-    CHECK(store.is_sparse(0, 0) == true, "setup: should compress at count=3 with default switch_point");
-    CHECK(store.live_synapses() == 3, "live_synapses() after compression = %zu, expected 3", store.live_synapses());
+    CHECK(store.is_sparse(0, 0) == true,
+          "setup: should compress at count=3 with default switch_point");
+    CHECK(store.live_synapses() == 3, "live_synapses() after compression = %zu, expected 3",
+          store.live_synapses());
 }
 
 static void test_multi_row_and_multi_tile_promotion_growth() {
@@ -192,7 +208,8 @@ static void test_multi_row_and_multi_tile_promotion_growth() {
             auto h = store.find(br, bc);
             CHECK(bool(h), "tile (%u,%u) should be findable", br, bc);
             CHECK(h.at_weight(0, 0) == uint8_t(br + 1), "tile (%u,%u) weight corrupted", br, bc);
-            CHECK(h.at_importance(0, 0) == uint8_t(bc + 1), "tile (%u,%u) importance corrupted", br, bc);
+            CHECK(h.at_importance(0, 0) == uint8_t(bc + 1), "tile (%u,%u) importance corrupted", br,
+                  bc);
         }
     }
 }

@@ -12,17 +12,24 @@
 #include <algorithm>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 static Block4Tile make_random_dense(std::mt19937& rng, int n) {
     Block4Tile t;
     std::vector<int> positions(16);
-    for (int i = 0; i < 16; ++i) positions[i] = i;
+    for (int i = 0; i < 16; ++i)
+        positions[i] = i;
     std::shuffle(positions.begin(), positions.end(), rng);
     std::uniform_int_distribution<int> val_dist(1, 255);
-    for (int i = 0; i < n; ++i) t.data[positions[i]] = uint8_t(val_dist(rng));
+    for (int i = 0; i < n; ++i)
+        t.data[positions[i]] = uint8_t(val_dist(rng));
     return t;
 }
 
@@ -35,11 +42,12 @@ static void test_pack_unpack_roundtrip() {
             uint8_t packed[16] = {0};
             const uint8_t written_count = block4_sparse_pack(dense.data, packed);
             CHECK(packed[0] == n, "pack: count byte should be %d, got %d", n, packed[0]);
-            CHECK(written_count == n, "pack: returned count should be %d, got %d", n, written_count);
+            CHECK(written_count == n, "pack: returned count should be %d, got %d", n,
+                  written_count);
             const std::size_t expect_len = block4_sparse_packed_len(uint8_t(n));
             CHECK(expect_len == std::size_t(1 + (n + 1) / 2 + n),
-                  "block4_sparse_packed_len(%d) should be 1+ceil(n/2)+n = %zu, got %zu",
-                  n, std::size_t(1 + (n + 1) / 2 + n), expect_len);
+                  "block4_sparse_packed_len(%d) should be 1+ceil(n/2)+n = %zu, got %zu", n,
+                  std::size_t(1 + (n + 1) / 2 + n), expect_len);
             CHECK(expect_len <= 16, "packed length must never exceed the dense size at n=%d", n);
             uint8_t roundtrip[16];
             block4_sparse_unpack(packed, roundtrip);
@@ -106,12 +114,15 @@ static void test_maybe_compress_explicit_check() {
         auto h = store.find(0, 0);
         h.at(0, 2) = 0x00;
     }
-    CHECK(store.is_sparse(0, 0) == false, "dropping to 2 active must not auto-compress -- not automatic");
+    CHECK(store.is_sparse(0, 0) == false,
+          "dropping to 2 active must not auto-compress -- not automatic");
     store.maybe_compress(0, 0);
-    CHECK(store.is_sparse(0, 0) == true, "2 active <= switch_point=2, explicit maybe_compress should compress");
+    CHECK(store.is_sparse(0, 0) == true,
+          "2 active <= switch_point=2, explicit maybe_compress should compress");
     {
         auto h = store.find(0, 0);
-        CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22 && h.at(0, 2) == 0x00, "values survive compression");
+        CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22 && h.at(0, 2) == 0x00,
+              "values survive compression");
     }
 
     Block4Store store2;
@@ -124,7 +135,8 @@ static void test_maybe_compress_explicit_check() {
     }
     CHECK(store2.is_sparse(0, 0) == false, "2 active > switch_point=1 should be dense");
     store2.maybe_compress(0, 0);
-    CHECK(store2.is_sparse(0, 0) == false, "2 active > switch_point=1, maybe_compress should NOT compress");
+    CHECK(store2.is_sparse(0, 0) == false,
+          "2 active > switch_point=1, maybe_compress should NOT compress");
     store2.maybe_compress(5, 5); // nonexistent tile: no-op, no crash
 }
 
@@ -171,7 +183,8 @@ static void test_erase_while_handle_alive() {
             h.at(0, 1) = 0x22;         // dirty write into scratch
             store.erase(0, 0);         // erase the SAME tile while h is still alive
         } // h's destructor runs here, AFTER erase()
-        CHECK(store.n_tiles() == 0, "tile should be gone after erase(); handle destructor must not resurrect it");
+        CHECK(store.n_tiles() == 0,
+              "tile should be gone after erase(); handle destructor must not resurrect it");
     }
     {
         // Same hazard, dense tile (destructor is a no-op regardless, but
@@ -209,14 +222,16 @@ static void test_real_compression_shrinks_footprint() {
         h.at(0, 0) = 0x11;
         h.at(0, 1) = 0x22; // 2 live synapses
     }
-    CHECK(store.is_sparse(0, 0), "2 <= default switch_point (10) should size itself sparse immediately");
+    CHECK(store.is_sparse(0, 0),
+          "2 <= default switch_point (10) should size itself sparse immediately");
     const std::size_t compressed_bytes = store.total_tile_used_bytes();
     const std::size_t expect_bytes = block4_sparse_packed_len(2); // 1 + 1 + 2 = 4
-    CHECK(compressed_bytes == expect_bytes,
-          "2-live tile should use exactly %zu bytes, got %zu", expect_bytes, compressed_bytes);
+    CHECK(compressed_bytes == expect_bytes, "2-live tile should use exactly %zu bytes, got %zu",
+          expect_bytes, compressed_bytes);
     CHECK(compressed_bytes < BLOCK4_TILE_SLOTS,
           "real per-tile footprint (%zu bytes) must genuinely beat the old fixed dense-worst-case"
-          " reservation (%u bytes)", compressed_bytes, BLOCK4_TILE_SLOTS);
+          " reservation (%u bytes)",
+          compressed_bytes, BLOCK4_TILE_SLOTS);
     {
         auto h = store.find(0, 0);
         CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22, "values survive real compression");
@@ -237,23 +252,26 @@ static void test_real_compression_shrinks_footprint() {
     }
     CHECK(!store2.is_sparse(0, 1), "setup: fully dense tile should stay dense");
     const std::size_t dense_bytes = store2.total_tile_used_bytes();
-    CHECK(dense_bytes == BLOCK4_TILE_SLOTS,
-          "fully dense tile should use exactly %u bytes, got %zu", BLOCK4_TILE_SLOTS, dense_bytes);
+    CHECK(dense_bytes == BLOCK4_TILE_SLOTS, "fully dense tile should use exactly %u bytes, got %zu",
+          BLOCK4_TILE_SLOTS, dense_bytes);
     {
         auto h = store2.find(0, 1);
         for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
-                if (!(li == 0 && (lj == 0 || lj == 1))) h.at(li, lj) = 0x00; // prune down to 2 live
+                if (!(li == 0 && (lj == 0 || lj == 1)))
+                    h.at(li, lj) = 0x00; // prune down to 2 live
     }
     CHECK(!store2.is_sparse(0, 1), "dropping to 2 live must not auto-compress -- not automatic");
     store2.maybe_compress(0, 1);
-    CHECK(store2.is_sparse(0, 1), "explicit maybe_compress should now compress the pruned-down tile");
+    CHECK(store2.is_sparse(0, 1),
+          "explicit maybe_compress should now compress the pruned-down tile");
     const std::size_t shrunk_bytes = store2.total_tile_used_bytes();
     CHECK(shrunk_bytes == block4_sparse_packed_len(2),
           "pruned-then-compressed tile should use exactly %zu bytes, got %zu",
           block4_sparse_packed_len(2), shrunk_bytes);
     CHECK(shrunk_bytes < dense_bytes,
-          "compression must genuinely shrink used bytes (%zu -> %zu), not just flip a flag in a fixed slot",
+          "compression must genuinely shrink used bytes (%zu -> %zu), not just flip a flag in a "
+          "fixed slot",
           dense_bytes, shrunk_bytes);
     // Note: total_tile_alloc_bytes() (row headroom) doesn't necessarily
     // shrink to match total_tile_used_bytes() immediately -- like the
@@ -296,10 +314,12 @@ static void test_equalize_step_redistributes_block4_row_headroom() {
         auto h = store.find(0, 0);
         for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj)
-                if (!(li == 0 && (lj == 0 || lj == 1))) h.at(li, lj) = 0x00;
+                if (!(li == 0 && (lj == 0 || lj == 1)))
+                    h.at(li, lj) = 0x00;
     }
     store.maybe_compress(0, 0);
-    CHECK(store.is_sparse(0, 0), "setup: row0 tile pruned+compressed to 4 bytes, 12 bytes of unreachable slack remain");
+    CHECK(store.is_sparse(0, 0),
+          "setup: row0 tile pruned+compressed to 4 bytes, 12 bytes of unreachable slack remain");
 
     // Row 1: a small tile at its own natural (zero-slack) size.
     {
@@ -335,10 +355,11 @@ static void test_equalize_step_redistributes_block4_row_headroom() {
     // under the fixed max_tile_bytes ceiling for ANY row's later growth
     // (not literally moving bytes into row1's own window directly).
     std::size_t cursor = 0;
-    for (int i = 0; i < 4; ++i) store.equalize_step(cursor);
+    for (int i = 0; i < 4; ++i)
+        store.equalize_step(cursor);
     CHECK(store.total_tile_alloc_bytes() <= total_before,
-          "equalize_step must never grow the pool (%zu -> %zu)",
-          total_before, store.total_tile_alloc_bytes());
+          "equalize_step must never grow the pool (%zu -> %zu)", total_before,
+          store.total_tile_alloc_bytes());
     CHECK(store.total_tile_alloc_bytes() < total_before,
           "row0's slack (12 bytes) should have been freed, shrinking the real total (%zu -> %zu)",
           total_before, store.total_tile_alloc_bytes());
@@ -352,12 +373,14 @@ static void test_equalize_step_redistributes_block4_row_headroom() {
         auto h = store.find(1, 0);
         h.at(0, 2) = 0x33;
     }
-    CHECK(store.dropped_growth_events == drops_before_equalize,
-          "after redistribution the same growth that failed before should now succeed (no new drop)");
+    CHECK(
+        store.dropped_growth_events == drops_before_equalize,
+        "after redistribution the same growth that failed before should now succeed (no new drop)");
     {
         auto h = store.find(1, 0);
         CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22 && h.at(0, 2) == 0x33,
-              "row1's tile should hold all 3 written values after the post-redistribution growth succeeds");
+              "row1's tile should hold all 3 written values after the post-redistribution growth "
+              "succeeds");
     }
 }
 

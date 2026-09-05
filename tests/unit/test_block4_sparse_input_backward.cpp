@@ -18,20 +18,27 @@
 #include <random>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 static Weights make_mixed_layer(int n_in, int n_out) {
     std::vector<SIZE_TYPE> ptrs(n_in + 1, 0), idx;
     std::vector<float> w, imp;
-    idx.push_back(20); w.push_back(1.5f); imp.push_back(0.3f);
+    idx.push_back(20);
+    w.push_back(1.5f);
+    imp.push_back(0.3f);
     ptrs[9] = 1; // row 8 -> col 20 (outside tiles (0,0)/(2,2))
-    for (int r = 9; r <= n_in; ++r) ptrs[r] = 1;
+    for (int r = 9; r <= n_in; ++r)
+        ptrs[r] = 1;
 
     Weights weights;
     weights.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -74,39 +81,44 @@ int main() {
         for (int trial = 0; trial < 20; ++trial) {
             Weights weights = make_mixed_layer(n_in, n_out);
             std::vector<float> input(n_in);
-            for (auto& v : input) v = data_dist(rng);
+            for (auto& v : input)
+                v = data_dist(rng);
 
             std::vector<float> dy_dense(n_out, 0.0f);
             std::vector<SIZE_TYPE> g_ptrs = {0};
             std::vector<SIZE_TYPE> g_idx;
             std::vector<float> g_vals;
             for (int c = 0; c < n_out; ++c) {
-                if (!keep(rng)) continue;
+                if (!keep(rng))
+                    continue;
                 const float v = data_dist(rng);
-                dy_dense[c] = v; g_idx.push_back(c); g_vals.push_back(v);
+                dy_dense[c] = v;
+                g_idx.push_back(c);
+                g_vals.push_back(v);
             }
             g_ptrs.push_back(static_cast<SIZE_TYPE>(g_idx.size()));
 
             std::vector<float> dx_dense(n_in, 0.0f), ni_a(n_in, 0.0f), ng_a(n_out, 0.0f);
             disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-                input.data(), 1, n_in, dy_dense.data(), weights,
-                dx_dense.data(), ni_a.data(), ng_a.data(), 0.0f, 4, false, true);
+                input.data(), 1, n_in, dy_dense.data(), weights, dx_dense.data(), ni_a.data(),
+                ng_a.data(), 0.0f, 4, false, true);
 
             CSRInput<SIZE_TYPE, float> dy_sparse;
-            dy_sparse.rows = 1; dy_sparse.cols = n_out;
-            dy_sparse.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(g_ptrs);
+            dy_sparse.rows = 1;
+            dy_sparse.cols = n_out;
+            dy_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(g_ptrs);
             dy_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(g_idx);
-            dy_sparse.values[0]  = std::make_shared<std::vector<float>>(g_vals);
+            dy_sparse.values[0] = std::make_shared<std::vector<float>>(g_vals);
 
             std::vector<float> dx_sparse(n_in, 0.0f), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
             disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-                input.data(), 1, weights, dy_sparse,
-                dx_sparse.data(), ni_a2.data(), ng_a2.data(), 0.0f, 4, false);
+                input.data(), 1, weights, dy_sparse, dx_sparse.data(), ni_a2.data(), ng_a2.data(),
+                0.0f, 4, false);
 
             for (int r = 0; r < n_in; ++r)
                 CHECK(std::abs(dx_dense[r] - dx_sparse[r]) < 1e-4f,
-                      "density=%.2f trial %d row %d: dense=%.5f sparse=%.5f",
-                      density, trial, r, dx_dense[r], dx_sparse[r]);
+                      "density=%.2f trial %d row %d: dense=%.5f sparse=%.5f", density, trial, r,
+                      dx_dense[r], dx_sparse[r]);
         }
     }
     std::printf("lr=0 dx match: %d failures across 60 trials\n", g_fail - fails_before);
@@ -122,42 +134,49 @@ int main() {
         int mismatches = 0;
         for (int step = 0; step < 20; ++step) {
             std::vector<float> input(n_in);
-            for (auto& v : input) v = data_dist(rng);
+            for (auto& v : input)
+                v = data_dist(rng);
 
             std::vector<float> dy_dense(n_out, 0.0f);
             std::vector<SIZE_TYPE> g_ptrs = {0};
             std::vector<SIZE_TYPE> g_idx;
             std::vector<float> g_vals;
             for (int c = 0; c < n_out; ++c) {
-                if (!keep(rng)) continue;
+                if (!keep(rng))
+                    continue;
                 const float v = data_dist(rng);
-                dy_dense[c] = v; g_idx.push_back(c); g_vals.push_back(v);
+                dy_dense[c] = v;
+                g_idx.push_back(c);
+                g_vals.push_back(v);
             }
             g_ptrs.push_back(static_cast<SIZE_TYPE>(g_idx.size()));
             CSRInput<SIZE_TYPE, float> dy_sparse;
-            dy_sparse.rows = 1; dy_sparse.cols = n_out;
-            dy_sparse.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(g_ptrs);
+            dy_sparse.rows = 1;
+            dy_sparse.cols = n_out;
+            dy_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(g_ptrs);
             dy_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(g_idx);
-            dy_sparse.values[0]  = std::make_shared<std::vector<float>>(g_vals);
+            dy_sparse.values[0] = std::make_shared<std::vector<float>>(g_vals);
 
             std::vector<float> dx_d(n_in, 0.0f), ni_a(n_in, 0.0f), ng_a(n_out, 0.0f);
             disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-                input.data(), 1, n_in, dy_dense.data(), weights_d,
-                dx_d.data(), ni_a.data(), ng_a.data(), 0.05f, 4, false, true);
+                input.data(), 1, n_in, dy_dense.data(), weights_d, dx_d.data(), ni_a.data(),
+                ng_a.data(), 0.05f, 4, false, true);
 
             std::vector<float> dx_s(n_in, 0.0f), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
             disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-                input.data(), 1, weights_s, dy_sparse,
-                dx_s.data(), ni_a2.data(), ng_a2.data(), 0.05f, 4, false);
+                input.data(), 1, weights_s, dy_sparse, dx_s.data(), ni_a2.data(), ng_a2.data(),
+                0.05f, 4, false);
 
             for (int r = 0; r < n_in; ++r) {
                 CHECK(std::isfinite(dx_d[r]), "dense dx not finite at step %d row %d", step, r);
                 CHECK(std::isfinite(dx_s[r]), "sparse dx not finite at step %d row %d", step, r);
-                if (std::abs(dx_d[r] - dx_s[r]) > 0.5f) ++mismatches;
+                if (std::abs(dx_d[r] - dx_s[r]) > 0.5f)
+                    ++mismatches;
             }
         }
-        std::printf("lr>0 smoke test: %d finite-failures, %d large dx drifts (informational, RNG-order dependent)\n",
-                     g_fail - fails_before, mismatches);
+        std::printf("lr>0 smoke test: %d finite-failures, %d large dx drifts (informational, "
+                    "RNG-order dependent)\n",
+                    g_fail - fails_before, mismatches);
     }
 
     std::printf("%s (%d total failures)\n", g_fail ? "FAIL" : "PASS", g_fail);

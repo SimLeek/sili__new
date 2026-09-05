@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import Dict
 
 
 class Backend:
@@ -10,7 +9,7 @@ class Backend:
         """Return the kernel module for this device."""
         raise NotImplementedError
 
-    def move(self, buf, src: "Backend"):
+    def move(self, buf, src: Backend):
         """Copy buf (on src) to this device and return the new buffer."""
         raise NotImplementedError
 
@@ -18,20 +17,22 @@ class Backend:
         """Forward any op not defined on the class to the kernel module."""
         try:
             return getattr(self.mod, name)
-        except AttributeError:
-            raise AttributeError(
-                f"Backend {self.name!r} (mod={type(self.mod).__name__}) "
-                f"has no op {name!r}."
-            )
+        except AttributeError as err:
+            raise AttributeError(f"Backend {self.name!r} (mod={type(self.mod).__name__}) has no op {name!r}.") from err
 
-    def __eq__(self, other):  return isinstance(other, Backend) and self.name == other.name
-    def __hash__(self):       return hash(self.name)
-    def __repr__(self):       return f"Backend({self.name!r})"
+    def __eq__(self, other):
+        return isinstance(other, Backend) and self.name == other.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __repr__(self):
+        return f"Backend({self.name!r})"
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
-_REGISTRY: Dict[str, Backend] = {}
+_REGISTRY: dict[str, Backend] = {}
 
 
 def register_backend(backend: Backend) -> None:
@@ -43,7 +44,7 @@ def register_backend(backend: Backend) -> None:
 def get_backend(device: str) -> Backend:
     if device in _REGISTRY:
         return _REGISTRY[device]
-    base = device.split(":")[0]          # "cuda:1" → "cuda"
+    base = device.split(":", maxsplit=1)[0]  # "cuda:1" → "cuda"
     if base in _REGISTRY:
         return _REGISTRY[base]
     raise KeyError(

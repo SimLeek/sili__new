@@ -50,23 +50,23 @@ Usage
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 # model_reconstruct is a sibling module — imported lazily only by
 # load_combined_runtime().  sparse_runtime.py is fully usable without it.
 _reconstruct_mod = None
+
 
 def _get_reconstruct():
     global _reconstruct_mod
     if _reconstruct_mod is None:
         try:
             import model_reconstruct as _m
+
             _reconstruct_mod = _m
         except ImportError:
             sys.exit(
@@ -80,6 +80,7 @@ def _get_reconstruct():
 #  Sparse operator stubs — clearly labelled by support status
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class _NotImplementedOp(nn.Module):
     """
     Placeholder for a sparse operation that has no kernel yet.
@@ -88,17 +89,15 @@ class _NotImplementedOp(nn.Module):
     NotImplementedError with a descriptive message explaining what is missing
     and what the workaround is.
     """
+
     def __init__(self, op_name: str, reason: str, workaround: str = ""):
         super().__init__()
-        self.op_name   = op_name
-        self.reason    = reason
+        self.op_name = op_name
+        self.reason = reason
         self.workaround = workaround
 
     def forward(self, *args, **kwargs):
-        msg = (
-            f"\n[sparse_runtime]  {self.op_name} is not yet implemented.\n"
-            f"  Reason     : {self.reason}\n"
-        )
+        msg = f"\n[sparse_runtime]  {self.op_name} is not yet implemented.\n  Reason     : {self.reason}\n"
         if self.workaround:
             msg += f"  Workaround : {self.workaround}\n"
         raise NotImplementedError(msg)
@@ -118,6 +117,7 @@ class SparseLayerNorm(_NotImplementedOp):
     2.3.  The standard approach is to keep LayerNorm weights and inputs dense
     and only sparsify the projection weights (Linear layers).
     """
+
     def __init__(self, normalized_shape, **kwargs):
         super().__init__(
             op_name="SparseLayerNorm",
@@ -140,14 +140,15 @@ class SparseEmbedding(_NotImplementedOp):
     vectors are dense by definition (you selected a row), so there is nothing
     to sparsify at this point.
     """
+
     def __init__(self, num_embeddings, embedding_dim, **kwargs):
         super().__init__(
             op_name="SparseEmbedding",
             reason="CSR is not suitable for random row access (embedding lookup).",
             workaround="Keep embedding tables as dense nn.Embedding.",
         )
-        self.num_embeddings  = num_embeddings
-        self.embedding_dim   = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
 
 
 class SparseSoftmax(_NotImplementedOp):
@@ -164,6 +165,7 @@ class SparseSoftmax(_NotImplementedOp):
     scores in the non-zero band and zero-pads the rest, keeping the softmax
     input bounded in size to O(seq_len × band_width).
     """
+
     def __init__(self, **kwargs):
         super().__init__(
             op_name="SparseSoftmax",
@@ -175,6 +177,7 @@ class SparseSoftmax(_NotImplementedOp):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Implemented sparse operators
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class SparseLinear(nn.Module):
     """
@@ -197,19 +200,19 @@ class SparseLinear(nn.Module):
 
     def __init__(
         self,
-        weight_csr:     torch.Tensor,
-        bias:           Optional[torch.Tensor] = None,
-        original_shape: Optional[tuple]        = None,
+        weight_csr: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        original_shape: tuple | None = None,
     ):
         super().__init__()
         if weight_csr.layout != torch.sparse_csr:
             raise TypeError(f"weight_csr must be sparse_csr, got {weight_csr.layout}")
         # Register as a buffer so .to(device) moves it correctly
         self.register_buffer("weight_csr", weight_csr)
-        self.bias           = nn.Parameter(bias) if bias is not None else None
+        self.bias = nn.Parameter(bias) if bias is not None else None
         self.original_shape = original_shape
-        self.out_features   = weight_csr.shape[0]
-        self.in_features    = weight_csr.shape[1]
+        self.out_features = weight_csr.shape[0]
+        self.in_features = weight_csr.shape[1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -220,11 +223,11 @@ class SparseLinear(nn.Module):
         running the sparse matmul, then restoring shape.
         """
         *batch, in_f = x.shape
-        x2 = x.reshape(-1, in_f).t().contiguous()   # [in_f, B*T]
+        x2 = x.reshape(-1, in_f).t().contiguous()  # [in_f, B*T]
 
         # torch.sparse.mm(sparse [M,K], dense [K,N]) → dense [M,N]
-        y2 = torch.sparse.mm(self.weight_csr, x2)   # [out_f, B*T]
-        y  = y2.t().reshape(*batch, self.out_features)
+        y2 = torch.sparse.mm(self.weight_csr, x2)  # [out_f, B*T]
+        y = y2.t().reshape(*batch, self.out_features)
 
         if self.bias is not None:
             y = y + self.bias
@@ -232,13 +235,12 @@ class SparseLinear(nn.Module):
 
     def sparsity(self) -> float:
         total = self.out_features * self.in_features
-        nnz   = int(self.weight_csr.values().numel())
+        nnz = int(self.weight_csr.values().numel())
         return 1.0 - nnz / total if total > 0 else 0.0
 
     def extra_repr(self) -> str:
         nnz = int(self.weight_csr.values().numel())
-        return (f"in={self.in_features}, out={self.out_features}, "
-                f"nnz={nnz:,}, sparsity={self.sparsity():.1%}")
+        return f"in={self.in_features}, out={self.out_features}, nnz={nnz:,}, sparsity={self.sparsity():.1%}"
 
 
 class BandedAttention(nn.Module):
@@ -262,23 +264,22 @@ class BandedAttention(nn.Module):
     causal          : if True, also apply upper-triangular -inf mask
     """
 
-    def __init__(self, n_heads: int, head_dim: int,
-                 band_half_width: int, causal: bool = True):
+    def __init__(self, n_heads: int, head_dim: int, band_half_width: int, causal: bool = True):
         super().__init__()
-        self.n_heads        = n_heads
-        self.head_dim       = head_dim
+        self.n_heads = n_heads
+        self.head_dim = head_dim
         self.band_half_width = band_half_width
-        self.causal         = causal
-        self.scale          = head_dim ** -0.5
+        self.causal = causal
+        self.scale = head_dim**-0.5
 
     def forward(
         self,
-        q: torch.Tensor,   # [B, n_heads, T, head_dim]
+        q: torch.Tensor,  # [B, n_heads, T, head_dim]
         k: torch.Tensor,
         v: torch.Tensor,
-        extra_mask: Optional[torch.Tensor] = None,
+        extra_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        B, H, T, D = q.shape
+        _B, _H, T, _D = q.shape
 
         # Build band + optional causal mask (cached on first use per seq_len)
         q_pos = torch.arange(T, device=q.device).unsqueeze(1)
@@ -297,13 +298,13 @@ class BandedAttention(nn.Module):
         return torch.matmul(attn, v)
 
     def extra_repr(self) -> str:
-        return (f"n_heads={self.n_heads}, head_dim={self.head_dim}, "
-                f"band±{self.band_half_width}, causal={self.causal}")
+        return f"n_heads={self.n_heads}, head_dim={self.head_dim}, band±{self.band_half_width}, causal={self.causal}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Folded RNN layer (wraps rnn_fold.FoldedBlockDescriptor)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class FoldedRNNLayer(nn.Module):
     """
@@ -330,11 +331,11 @@ class FoldedRNNLayer(nn.Module):
     def __init__(self, descriptor):
         super().__init__()
         # Store the descriptor's stacked CSR weights as named buffers
-        self.n_folds                 = descriptor.n_folds
-        self.out_dims                = descriptor.out_dims
-        self.band_half_widths        = descriptor.band_half_widths
+        self.n_folds = descriptor.n_folds
+        self.out_dims = descriptor.out_dims
+        self.band_half_widths = descriptor.band_half_widths
         self.skip_connection_outputs = descriptor.skip_connection_outputs
-        self._suffixes               = list(descriptor.stacked_weights.keys())
+        self._suffixes = list(descriptor.stacked_weights.keys())
 
         for i, suffix in enumerate(self._suffixes):
             safe_key = f"_w{i}"
@@ -346,19 +347,19 @@ class FoldedRNNLayer(nn.Module):
 
     def _slice_fold_weight(self, suffix: str, fold_step: int) -> torch.Tensor:
         """Return dense weight slice for this suffix at fold_step."""
-        csr     = self._get_weight(suffix)
+        csr = self._get_weight(suffix)
         out_dim = self.out_dims[suffix]
-        r0, r1  = fold_step * out_dim, (fold_step + 1) * out_dim
+        r0, r1 = fold_step * out_dim, (fold_step + 1) * out_dim
 
-        crow  = csr.crow_indices()
-        cols  = csr.col_indices()
-        vals  = csr.values()
+        crow = csr.crow_indices()
+        cols = csr.col_indices()
+        vals = csr.values()
         n_col = csr.shape[1]
 
         nnz0 = int(crow[r0].item())
         nnz1 = int(crow[r1].item())
         slice_csr = torch.sparse_csr_tensor(
-            crow[r0:r1+1] - nnz0,
+            crow[r0 : r1 + 1] - nnz0,
             cols[nnz0:nnz1],
             vals[nnz0:nnz1],
             size=(out_dim, n_col),
@@ -366,7 +367,7 @@ class FoldedRNNLayer(nn.Module):
         )
         return slice_csr.to_dense()
 
-    def _attn_mask(self, suffix: str, seq_len: int, device) -> Optional[torch.Tensor]:
+    def _attn_mask(self, suffix: str, seq_len: int, device) -> torch.Tensor | None:
         bw = self.band_half_widths.get(suffix)
         if bw is None:
             return None
@@ -379,28 +380,24 @@ class FoldedRNNLayer(nn.Module):
 
     def _apply_block(
         self,
-        x:        torch.Tensor,
-        weights:  Dict[str, torch.Tensor],
-        masks:    Dict[str, Optional[torch.Tensor]],
+        x: torch.Tensor,
+        weights: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor | None],
         fold_step: int,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "FoldedRNNLayer._apply_block() must be overridden, or use "
-            "forward_with_fn(x, block_fn=...) instead."
+            "FoldedRNNLayer._apply_block() must be overridden, or use forward_with_fn(x, block_fn=...) instead."
         )
 
-    def forward(self, x: torch.Tensor,
-                block_fn: Optional[Callable] = None) -> torch.Tensor:
-        device  = x.device
+    def forward(self, x: torch.Tensor, block_fn: Callable | None = None) -> torch.Tensor:
+        device = x.device
         seq_len = x.shape[1] if x.ndim >= 2 else x.shape[0]
-        state   = torch.zeros_like(x)
-        step_outputs: List[torch.Tensor] = []
+        state = torch.zeros_like(x)
+        step_outputs: list[torch.Tensor] = []
 
         for step in range(self.n_folds):
-            weights = {s: self._slice_fold_weight(s, step).to(device)
-                       for s in self._suffixes}
-            masks   = {s: self._attn_mask(s, seq_len, device)
-                       for s in self._suffixes}
+            weights = {s: self._slice_fold_weight(s, step).to(device) for s in self._suffixes}
+            masks = {s: self._attn_mask(s, seq_len, device) for s in self._suffixes}
 
             if block_fn is not None:
                 out = block_fn(x + state, weights, masks, step)
@@ -415,13 +412,13 @@ class FoldedRNNLayer(nn.Module):
             return torch.stack(step_outputs, dim=0).mean(dim=0)
         return state
 
-    def sparsity_report(self) -> Dict[str, float]:
+    def sparsity_report(self) -> dict[str, float]:
         """Per-suffix sparsity across the full stacked weight."""
         report = {}
         for suffix in self._suffixes:
-            csr   = self._get_weight(suffix)
+            csr = self._get_weight(suffix)
             total = csr.shape[0] * csr.shape[1]
-            nnz   = int(csr.values().numel())
+            nnz = int(csr.values().numel())
             report[suffix] = 1.0 - nnz / total if total > 0 else 0.0
         return report
 
@@ -433,6 +430,7 @@ class FoldedRNNLayer(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 #  RNN-all layer (whole-model additive state, zero-init)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class RNNAllLayer(nn.Module):
     """
@@ -473,20 +471,20 @@ class RNNAllLayer(nn.Module):
 
     def __init__(
         self,
-        inner_module:            nn.Module,
-        hidden_dim:              int,
-        inject_at_input:         bool = True,
+        inner_module: nn.Module,
+        hidden_dim: int,
+        inject_at_input: bool = True,
         skip_connection_outputs: bool = False,
     ):
         super().__init__()
-        self.inner                   = inner_module
-        self.hidden_dim              = hidden_dim
-        self.inject_at_input         = inject_at_input
+        self.inner = inner_module
+        self.hidden_dim = hidden_dim
+        self.inject_at_input = inject_at_input
         self.skip_connection_outputs = skip_connection_outputs
 
         # Non-persistent: not saved in state_dict, zero-init every load
         self.register_buffer("_state", None, persistent=False)
-        self._call_outputs: List[torch.Tensor] = []
+        self._call_outputs: list[torch.Tensor] = []
 
     def _init_state(self, x: torch.Tensor) -> None:
         """Lazily initialise state to zeros matching x's batch/seq/hidden dims."""
@@ -524,21 +522,20 @@ class RNNAllLayer(nn.Module):
         # in that case skip the state update and warn once.
         if out.shape[-1] == self.hidden_dim:
             self._state = out.detach()
-        else:
-            if not getattr(self, "_warned_state_shape", False):
-                print(
-                    f"[RNNAllLayer]  output dim {out.shape[-1]} ≠ hidden_dim "
-                    f"{self.hidden_dim}; state not updated.  Pass the hidden "
-                    "representation, not logits, as the inner module's return value."
-                )
-                self._warned_state_shape = True
+        elif not getattr(self, "_warned_state_shape", False):
+            print(
+                f"[RNNAllLayer]  output dim {out.shape[-1]} ≠ hidden_dim "
+                f"{self.hidden_dim}; state not updated.  Pass the hidden "
+                "representation, not logits, as the inner module's return value."
+            )
+            self._warned_state_shape = True
 
         if self.skip_connection_outputs:
             self._call_outputs.append(out)
 
         return out
 
-    def get_averaged_output(self) -> Optional[torch.Tensor]:
+    def get_averaged_output(self) -> torch.Tensor | None:
         """
         Return the mean of all per-call outputs collected since the last reset.
 
@@ -552,13 +549,13 @@ class RNNAllLayer(nn.Module):
 
     def extra_repr(self) -> str:
         mode = "skip-avg" if self.skip_connection_outputs else "stateful"
-        return (f"hidden_dim={self.hidden_dim}, inject_at_input={self.inject_at_input}, "
-                f"mode={mode}")
+        return f"hidden_dim={self.hidden_dim}, inject_at_input={self.inject_at_input}, mode={mode}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Top-level runtime assembler
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class SparseModelRuntime(nn.Module):
     """
@@ -582,45 +579,45 @@ class SparseModelRuntime(nn.Module):
 
     def __init__(
         self,
-        sparse_layers:   Dict[str, SparseLinear],
-        folded_layers:   List[FoldedRNNLayer],
-        dense_buffers:   Dict[str, torch.Tensor],
-        rnn_all_hidden:  Optional[int] = None,
-        skip_connection_outputs: bool  = False,
+        sparse_layers: dict[str, SparseLinear],
+        folded_layers: list[FoldedRNNLayer],
+        dense_buffers: dict[str, torch.Tensor],
+        rnn_all_hidden: int | None = None,
+        skip_connection_outputs: bool = False,
     ):
         super().__init__()
-        self.sparse_layers = nn.ModuleDict(
-            {k.replace(".", "_"): v for k, v in sparse_layers.items()}
-        )
-        self.folded_layers  = nn.ModuleList(folded_layers)
+        self.sparse_layers = nn.ModuleDict({k.replace(".", "_"): v for k, v in sparse_layers.items()})
+        self.folded_layers = nn.ModuleList(folded_layers)
         self._dense_buffers = dense_buffers  # name → tensor, not nn.Parameter
         for name, tensor in dense_buffers.items():
             self.register_buffer(name.replace(".", "_"), tensor)
 
-        self.rnn_all_hidden          = rnn_all_hidden
+        self.rnn_all_hidden = rnn_all_hidden
         self.skip_connection_outputs = skip_connection_outputs
 
         # Declare unsupported ops as named stubs for introspection
-        self.not_impl_ops = nn.ModuleDict({
-            "layer_norm":   SparseLayerNorm((1,)),
-            "embedding":    SparseEmbedding(1, 1),
-            "softmax":      SparseSoftmax(),
-        })
+        self.not_impl_ops = nn.ModuleDict(
+            {
+                "layer_norm": SparseLayerNorm((1,)),
+                "embedding": SparseEmbedding(1, 1),
+                "softmax": SparseSoftmax(),
+            }
+        )
 
     def op_summary(self) -> None:
         """Print a table of which ops are and are not supported."""
         print("\n[sparse_runtime]  Operator support summary")
         print("─" * 60)
         supported = [
-            ("SparseLinear",     "torch.sparse.mm(CSR, dense)"),
-            ("BandedAttention",  "dense QKᵀ + -inf band mask"),
-            ("FoldedRNNLayer",   "slice-per-step + RNN state"),
-            ("RNNAllLayer",      "zero-init whole-model state"),
+            ("SparseLinear", "torch.sparse.mm(CSR, dense)"),
+            ("BandedAttention", "dense QKᵀ + -inf band mask"),
+            ("FoldedRNNLayer", "slice-per-step + RNN state"),
+            ("RNNAllLayer", "zero-init whole-model state"),
         ]
         unsupported = [
-            ("SparseLayerNorm",     "no sparse mean/var kernel"),
-            ("SparseEmbedding",     "CSR unsuitable for row lookup"),
-            ("SparseSoftmax",       "softmax output is always dense"),
+            ("SparseLayerNorm", "no sparse mean/var kernel"),
+            ("SparseEmbedding", "CSR unsuitable for row lookup"),
+            ("SparseSoftmax", "softmax output is always dense"),
             ("SparseAttentionFull", "Q·Kᵀ product remains dense"),
         ]
         print("  SUPPORTED:")
@@ -639,15 +636,12 @@ class SparseModelRuntime(nn.Module):
             print(f"  RNN-all hidden dim  : {self.rnn_all_hidden}")
         print()
 
-        total_nnz   = sum(
-            int(m.weight_csr.values().numel())
-            for m in self.sparse_layers.values()
-        )
+        total_nnz = sum(int(m.weight_csr.values().numel()) for m in self.sparse_layers.values())
         total_dense = sum(t.numel() for t in self._dense_buffers.values())
         print(f"  Sparse nnz (Linear) : {total_nnz:,}")
         print(f"  Dense elements      : {total_dense:,}")
 
-    def sparsity_report(self) -> Dict[str, float]:
+    def sparsity_report(self) -> dict[str, float]:
         """Return per-layer sparsity dict."""
         report = {}
         for safe_name, layer in self.sparse_layers.items():
@@ -666,8 +660,8 @@ class SparseModelRuntime(nn.Module):
 
     def forward_with_fn(
         self,
-        x:          torch.Tensor,
-        block_fn:   Callable,
+        x: torch.Tensor,
+        block_fn: Callable,
         fold_index: int = 0,
     ) -> torch.Tensor:
         """
@@ -684,10 +678,7 @@ class SparseModelRuntime(nn.Module):
         Output tensor from the chosen FoldedRNNLayer.
         """
         if fold_index >= len(self.folded_layers):
-            raise IndexError(
-                f"fold_index={fold_index} but only {len(self.folded_layers)} "
-                "folded groups exist."
-            )
+            raise IndexError(f"fold_index={fold_index} but only {len(self.folded_layers)} folded groups exist.")
         return self.folded_layers[fold_index](x, block_fn=block_fn)
 
 
@@ -695,42 +686,41 @@ class SparseModelRuntime(nn.Module):
 #  Factory — build SparseModelRuntime from a payload file
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _csr_from_entry(entry) -> Optional[torch.Tensor]:
+
+def _csr_from_entry(entry) -> torch.Tensor | None:
     """Extract a CSR tensor from a sparse_prune.py state-dict entry."""
     if isinstance(entry, dict):
         csr = entry.get("csr")
         if csr is not None and isinstance(csr, torch.Tensor):
             return csr
         raw = entry.get("raw")
-        if raw is not None and isinstance(raw, torch.Tensor):
-            if raw.layout == torch.sparse_csr:
-                return raw
+        if raw is not None and isinstance(raw, torch.Tensor) and raw.layout == torch.sparse_csr:
+            return raw
         return None
     if isinstance(entry, torch.Tensor) and entry.layout == torch.sparse_csr:
         return entry
     return None
 
 
-def _bias_from_entry(entry) -> Optional[torch.Tensor]:
+def _bias_from_entry(entry) -> torch.Tensor | None:
     """Return dense bias tensor if present, else None."""
     if isinstance(entry, dict):
         raw = entry.get("raw")
         if raw is not None and isinstance(raw, torch.Tensor) and raw.ndim == 1:
             return raw
-    if isinstance(entry, torch.Tensor) and entry.layout == torch.strided:
-        if entry.ndim == 1:
-            return entry
+    if isinstance(entry, torch.Tensor) and entry.layout == torch.strided and entry.ndim == 1:
+        return entry
     return None
 
 
 def load_sparse_runtime(
     path: str,
     skip_connection_outputs: bool = False,
-    rnn_all_hidden: Optional[int] = None,
+    rnn_all_hidden: int | None = None,
     device: str = "cpu",
     generate_trace: bool = True,
-    trace_output: Optional[str] = None,
-    original_model: Optional[nn.Module] = None,
+    trace_output: str | None = None,
+    original_model: nn.Module | None = None,
 ) -> SparseModelRuntime:
     """
     Build a SparseModelRuntime from a sparse_prune (+ optional rnn_fold) payload.
@@ -760,12 +750,12 @@ def load_sparse_runtime(
     ssd = payload.get("sparse_state_dict", payload)
 
     # ── Build SparseLinear layers for each CSR weight ────────────────────────
-    sparse_layers:  Dict[str, SparseLinear] = {}
-    dense_buffers:  Dict[str, torch.Tensor] = {}
+    sparse_layers: dict[str, SparseLinear] = {}
+    dense_buffers: dict[str, torch.Tensor] = {}
 
     # Pair weights with matching biases (same prefix, weight vs bias suffix)
     weight_names = {k for k in ssd if k.endswith(".weight")}
-    bias_names   = {k for k in ssd if k.endswith(".bias")}
+    bias_names = {k for k in ssd if k.endswith(".bias")}
 
     for wname in sorted(weight_names):
         csr = _csr_from_entry(ssd[wname])
@@ -777,8 +767,8 @@ def load_sparse_runtime(
                 dense_buffers[wname] = t
             continue
 
-        bname = wname[:-len(".weight")] + ".bias"
-        bias  = None
+        bname = wname[: -len(".weight")] + ".bias"
+        bias = None
         if bname in ssd:
             bias = _bias_from_entry(ssd[bname])
             bias_names.discard(bname)
@@ -802,26 +792,26 @@ def load_sparse_runtime(
             continue
         # Any other tensor (embedding, norm, etc.)
         entry = ssd[name]
-        csr   = _csr_from_entry(entry)
+        csr = _csr_from_entry(entry)
         if csr is None:
             t = entry.get("raw") if isinstance(entry, dict) else entry
             if isinstance(t, torch.Tensor) and t.ndim > 0:
                 dense_buffers[name] = t
 
     # ── Reconstruct FoldedRNNLayer objects from folded_blocks ─────────────────
-    folded_layers: List[FoldedRNNLayer] = []
+    folded_layers: list[FoldedRNNLayer] = []
     for fd in payload.get("folded_blocks", []):
         # Reconstruct a minimal descriptor-like object
         class _Desc:
             pass
+
         desc = _Desc()
-        desc.n_folds                 = fd["n_folds"]
-        desc.block_indices           = fd["block_indices"]
-        desc.stacked_weights         = fd["stacked_weights"]
-        desc.out_dims                = fd["out_dims"]
-        desc.band_half_widths        = fd["band_half_widths"]
-        desc.skip_connection_outputs = fd.get("skip_connection_outputs",
-                                              skip_connection_outputs)
+        desc.n_folds = fd["n_folds"]
+        desc.block_indices = fd["block_indices"]
+        desc.stacked_weights = fd["stacked_weights"]
+        desc.out_dims = fd["out_dims"]
+        desc.band_half_widths = fd["band_half_widths"]
+        desc.skip_connection_outputs = fd.get("skip_connection_outputs", skip_connection_outputs)
         folded_layers.append(FoldedRNNLayer(desc))
 
     print(f"[sparse_runtime]  SparseLinear   : {len(sparse_layers)}")
@@ -864,15 +854,17 @@ def load_sparse_runtime(
                 original_model=original_model,
             )
             print(f"[sparse_runtime]  Trace written : {trace_path}")
-            print(f"[sparse_runtime]  Running trace to surface first NotImplementedError ...")
+            print("[sparse_runtime]  Running trace to surface first NotImplementedError ...")
             print()
-            import subprocess, sys as _sys
             # Run with inherited stdout/stderr so output appears in real time.
             # PYTHONUNBUFFERED=1 forces line-buffered output even through pipes.
             import os as _os
-            env = {**_os.environ, 'PYTHONUNBUFFERED': '1'}
+            import subprocess
+            import sys as _sys
+
+            env = {**_os.environ, "PYTHONUNBUFFERED": "1"}
             subprocess.run(
-                [_sys.executable, '-u', trace_path],
+                [_sys.executable, "-u", trace_path],
                 env=env,
                 # stdout/stderr intentionally NOT redirected — output goes
                 # straight to the terminal in real time with no buffering.
@@ -885,15 +877,16 @@ def load_sparse_runtime(
 #  Combined reconstruct + sparsify loader
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def load_combined_runtime(
     original_path: str,
-    sparse_path:   str,
-    device:        str  = "cpu",
+    sparse_path: str,
+    device: str = "cpu",
     skip_connection_outputs: bool = False,
-    rnn_all_hidden: Optional[int] = None,
+    rnn_all_hidden: int | None = None,
     generate_trace: bool = True,
-    trace_output:  Optional[str] = None,
-) -> Tuple[nn.Module, "SparseModelRuntime"]:
+    trace_output: str | None = None,
+) -> tuple[nn.Module, SparseModelRuntime]:
     """
     Load BOTH the original reconstructed module AND the sparse/folded runtime.
 
@@ -945,35 +938,43 @@ def load_combined_runtime(
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def main() -> None:
     import argparse
+
     p = argparse.ArgumentParser(
         description="Build and inspect a sparse/folded model runtime.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input",         help="sparse_prune / rnn_fold .pt payload")
-    p.add_argument("--summary",     action="store_true",
-                   help="Print op support table and layer inventory, then exit")
-    p.add_argument("--sparsity",    action="store_true",
-                   help="Print per-layer sparsity report")
-    p.add_argument("--original",    default=None, metavar="PATH",
-                   help="Also load the original model from this .bin/safetensors path "
-                        "(uses model_reconstruct.py)")
-    p.add_argument("--rnn-all",     type=int, default=None, metavar="DIM",
-                   help="Wrap runtime in RNNAllLayer with this hidden dimension")
-    p.add_argument("--skip-outputs", action="store_true",
-                   help="Enable pyramidal (skip-connection) output averaging")
-    p.add_argument("--device",      default="cpu")
-    p.add_argument("--no-trace",    action="store_true",
-                   help="Skip trace file generation (default: generate and run trace)")
-    p.add_argument("--trace-output", default=None, metavar="PATH",
-                   help="Override path for generated trace .py file")
+    p.add_argument("input", help="sparse_prune / rnn_fold .pt payload")
+    p.add_argument("--summary", action="store_true", help="Print op support table and layer inventory, then exit")
+    p.add_argument("--sparsity", action="store_true", help="Print per-layer sparsity report")
+    p.add_argument(
+        "--original",
+        default=None,
+        metavar="PATH",
+        help="Also load the original model from this .bin/safetensors path (uses model_reconstruct.py)",
+    )
+    p.add_argument(
+        "--rnn-all",
+        type=int,
+        default=None,
+        metavar="DIM",
+        help="Wrap runtime in RNNAllLayer with this hidden dimension",
+    )
+    p.add_argument("--skip-outputs", action="store_true", help="Enable pyramidal (skip-connection) output averaging")
+    p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--no-trace", action="store_true", help="Skip trace file generation (default: generate and run trace)"
+    )
+    p.add_argument("--trace-output", default=None, metavar="PATH", help="Override path for generated trace .py file")
     args = p.parse_args()
 
     if args.original:
         original, runtime = load_combined_runtime(
-            args.original, args.input,
+            args.original,
+            args.input,
             device=args.device,
             skip_connection_outputs=args.skip_outputs,
             rnn_all_hidden=args.rnn_all,

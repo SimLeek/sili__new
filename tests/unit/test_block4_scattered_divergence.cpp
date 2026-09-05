@@ -16,16 +16,21 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 int main() {
-    const std::size_t n_in = 8, n_out = 8;  // 2x2 block4 tiles, fully dense both ways
+    const std::size_t n_in = 8, n_out = 8; // 2x2 block4 tiles, fully dense both ways
 
     // Varied but comfortably mid-range values -- avoids FP4 rounding
     // boundaries and near-zero RMSprop denominators that would otherwise
@@ -46,8 +51,10 @@ int main() {
         weight_codes[i] = fp4_quantize(dense_w[i]);
 
     std::vector<float> input(n_in), dy(n_out);
-    for (std::size_t r = 0; r < n_in; ++r)  input[r] = 0.3f + 0.1f * float(r);
-    for (std::size_t c = 0; c < n_out; ++c) dy[c]    = -0.2f + 0.05f * float(c);
+    for (std::size_t r = 0; r < n_in; ++r)
+        input[r] = 0.3f + 0.1f * float(r);
+    for (std::size_t c = 0; c < n_out; ++c)
+        dy[c] = -0.2f + 0.05f * float(c);
 
     // ── Arm A: everything in scattered CSR, block4 left empty ─────────────
     Weights weights_a;
@@ -59,7 +66,7 @@ int main() {
             ptrs[r] = SIZE_TYPE(r * n_out);
             for (std::size_t c = 0; c < n_out; ++c) {
                 idx[r * n_out + c] = SIZE_TYPE(c);
-                w[r * n_out + c]   = FP4_TABLE[weight_codes[r * n_out + c] & 0x0Fu];
+                w[r * n_out + c] = FP4_TABLE[weight_codes[r * n_out + c] & 0x0Fu];
             }
         }
         ptrs[n_in] = SIZE_TYPE(n_in * n_out);
@@ -86,14 +93,16 @@ int main() {
         weights_b.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
             ptrs, idx, w, imp, n_in, n_out, std::size_t(64), std::size_t(64));
     }
-    block4_load_dense<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights_b, weight_codes.data(), importance_codes.data(), n_in, n_out);
+    block4_load_dense<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights_b, weight_codes.data(),
+                                                        importance_codes.data(), n_in, n_out);
     weights_b.out_degree.assign(n_out, SIZE_TYPE(n_in));
 
     // ── Forward: outputs must match ────────────────────────────────────────
     std::vector<float> y_a(n_out, 0.0f), y_b(n_out, 0.0f);
-    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_a, y_a.data(), 1);
-    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_b, y_b.data(), 1);
+    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_a,
+                                                     y_a.data(), 1);
+    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_b,
+                                                     y_b.data(), 1);
     for (std::size_t c = 0; c < n_out; ++c)
         CHECK(std::abs(y_a[c] - y_b[c]) < 1e-4f,
               "forward output[%zu] diverges: scattered=%.6f block4=%.6f", c, y_a[c], y_b[c]);
@@ -108,15 +117,15 @@ int main() {
     std::vector<float> ni_b(n_in, 0.0f), ng_b(n_out, 0.0f);
     const float lr = 0.05f;
     disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_a, dx_a.data(),
-        ni_a.data(), ng_a.data(), lr, 1);
+        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_a, dx_a.data(), ni_a.data(),
+        ng_a.data(), lr, 1);
     disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_b, dx_b.data(),
-        ni_b.data(), ng_b.data(), lr, 1);
+        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_b, dx_b.data(), ni_b.data(),
+        ng_b.data(), lr, 1);
 
     for (std::size_t r = 0; r < n_in; ++r)
-        CHECK(std::abs(dx_a[r] - dx_b[r]) < 1e-3f,
-              "dx[%zu] diverges: scattered=%.6f block4=%.6f", r, dx_a[r], dx_b[r]);
+        CHECK(std::abs(dx_a[r] - dx_b[r]) < 1e-3f, "dx[%zu] diverges: scattered=%.6f block4=%.6f",
+              r, dx_a[r], dx_b[r]);
 
     // ── Post-update true weights must match ────────────────────────────────
     for (std::size_t r = 0; r < n_in; ++r) {
@@ -137,20 +146,20 @@ int main() {
             const float true_w_a = w_a * weights_a.get_scale(r, col);
             const float true_w_b = w_b * weights_b.get_scale(r, col);
             CHECK(std::abs(true_w_a - true_w_b) < 5e-2f,
-                  "true weight[%zu][%zu] diverges after update: scattered=%.6f block4=%.6f",
-                  r, c, true_w_a, true_w_b);
+                  "true weight[%zu][%zu] diverges after update: scattered=%.6f block4=%.6f", r, c,
+                  true_w_a, true_w_b);
         }
     }
 
     // ── value_scale / output_scale must match ──────────────────────────────
     for (std::size_t r = 0; r < n_in; ++r)
         CHECK(std::abs(weights_a.get_value_scale(r) - weights_b.get_value_scale(r)) < 1e-3f,
-              "value_scale[%zu] diverges: scattered=%.6f block4=%.6f",
-              r, weights_a.get_value_scale(r), weights_b.get_value_scale(r));
+              "value_scale[%zu] diverges: scattered=%.6f block4=%.6f", r,
+              weights_a.get_value_scale(r), weights_b.get_value_scale(r));
     for (std::size_t c = 0; c < n_out; ++c)
         CHECK(std::abs(weights_a.get_output_scale(c) - weights_b.get_output_scale(c)) < 1e-3f,
-              "output_scale[%zu] diverges: scattered=%.6f block4=%.6f",
-              c, weights_a.get_output_scale(c), weights_b.get_output_scale(c));
+              "output_scale[%zu] diverges: scattered=%.6f block4=%.6f", c,
+              weights_a.get_output_scale(c), weights_b.get_output_scale(c));
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

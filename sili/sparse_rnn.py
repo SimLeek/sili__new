@@ -52,37 +52,39 @@ from the old design, not an oversight.
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional, Tuple
-
 import time as _diag_time
+from typing import NamedTuple
+
 import numpy as np
-import sili._cpu as _cpu
+
+from sili import _cpu
 
 _DIAG_TIMING: dict = {}
 
+from sili.energy import BranchingRatioTracker, EMABranchingRatioTracker, EnergyDynamics
 from sili.module import Module
 from sili.tensor import Tensor, _acc
-from sili.energy import EnergyDynamics, BranchingRatioTracker, EMABranchingRatioTracker
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CSR activation format
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class CSR(NamedTuple):
     """Sparse row-major activation tensor."""
-    ptrs:    np.ndarray   # int32   [rows+1]
-    indices: np.ndarray   # int32   [nnz]
-    values:  np.ndarray   # float32 [nnz]
-    rows:    int
-    cols:    int
+
+    ptrs: np.ndarray  # int32   [rows+1]
+    indices: np.ndarray  # int32   [nnz]
+    values: np.ndarray  # float32 [nnz]
+    rows: int
+    cols: int
 
     @property
     def nnz(self) -> int:
         return len(self.indices)
 
     @staticmethod
-    def from_dense(x: np.ndarray, p: float = 0.03, num_cpus: int = 4) -> "CSR":
+    def from_dense(x: np.ndarray, p: float = 0.03, num_cpus: int = 4) -> CSR:
         """
         Build CSR keeping the top-k entries by magnitude PER ROW,
         k = max(1, round(cols * p)).
@@ -96,14 +98,12 @@ class CSR(NamedTuple):
         """
         x2d = x[np.newaxis, :] if x.ndim == 1 else x
         x2d = np.asarray(x2d, dtype=np.float32)
-        k   = max(1, int(x2d.shape[1] * p))
-        ptrs, indices, values = _graded_top_k_csr(
-            x2d, np.full(x2d.shape[0], k, dtype=np.int32), num_cpus)
+        k = max(1, int(x2d.shape[1] * p))
+        ptrs, indices, values = _graded_top_k_csr(x2d, np.full(x2d.shape[0], k, dtype=np.int32), num_cpus)
         return CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
 
     @staticmethod
-    def from_kept_indices(kept_indices: np.ndarray, values_source: np.ndarray,
-                          cols: int) -> "CSR":
+    def from_kept_indices(kept_indices: np.ndarray, values_source: np.ndarray, cols: int) -> CSR:
         """
         Build a single-row CSR directly from an already-decided set of kept
         column indices (e.g. EnergyDynamics.kept_indices) and a dense array
@@ -124,25 +124,26 @@ class CSR(NamedTuple):
                         activation magnitude the gate decided to keep.
         cols          : full (dense) width this row represents
         """
-        kept_indices  = np.asarray(kept_indices, dtype=np.int32)
+        kept_indices = np.asarray(kept_indices, dtype=np.int32)
         values_source = np.asarray(values_source, dtype=np.float32).ravel()
-        values        = values_source[kept_indices]
-        ptrs          = np.array([0, len(kept_indices)], dtype=np.int32)
+        values = values_source[kept_indices]
+        ptrs = np.array([0, len(kept_indices)], dtype=np.int32)
         return CSR(ptrs, kept_indices, values, rows=1, cols=cols)
 
     def to_dense(self) -> np.ndarray:
         """Reconstruct dense float32 [rows, cols]."""
         out = np.zeros((self.rows, self.cols), dtype=np.float32)
-        p   = np.asarray(self.ptrs)
+        p = np.asarray(self.ptrs)
         idx = np.asarray(self.indices)
-        v   = np.asarray(self.values)
+        v = np.asarray(self.values)
         for r in range(self.rows):
-            out[r, idx[p[r]:p[r+1]]] = v[p[r]:p[r+1]]
+            out[r, idx[p[r] : p[r + 1]]] = v[p[r] : p[r + 1]]
         return out
 
-    def as_tensor(self, backend=None) -> "Tensor":
+    def as_tensor(self, backend=None) -> Tensor:
         """Wrap this CSR as a Tensor. The CSR is the data; grad will be dense."""
         from sili.tensor import get_backend
+
         b = backend or get_backend("cpu")
         return Tensor(self, backend=b)
 
@@ -150,6 +151,7 @@ class CSR(NamedTuple):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Shared base for C++-backed sparse layers
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class _SparseLayerBase(Module):
     """
@@ -163,33 +165,57 @@ class _SparseLayerBase(Module):
         return []
 
     @property
-    def in_features(self)  -> int: return self._c.n_inputs
-    @property
-    def out_features(self) -> int: return self._c.n_outputs
-    @property
-    def nnz(self)          -> int: return self._c.nnz
-    @property
-    def num_cpus(self)     -> int: return self._c.num_cpus
+    def in_features(self) -> int:
+        return self._c.n_inputs
 
     @property
-    def out_degree(self) -> int: return self._c.out_degree
+    def out_features(self) -> int:
+        return self._c.n_outputs
 
     @property
-    def weights(self)    -> np.ndarray: return self._c.weights_vals
-    @property
-    def importance(self) -> np.ndarray: return self._c.importance
-    @property
-    def indices(self)    -> np.ndarray: return self._c.indices
-    @property
-    def ptrs(self)       -> np.ndarray: return self._c.ptrs
+    def nnz(self) -> int:
+        return self._c.nnz
 
     @property
-    def neuron_input_accum(self) -> np.ndarray: return self._c.neuron_input_accum
-    @property
-    def neuron_grad_accum(self)  -> np.ndarray: return self._c.neuron_grad_accum
+    def num_cpus(self) -> int:
+        return self._c.num_cpus
 
-    def synaptogenesis(self, k: int, importance_cutoff: float, max_row_weights: int,
-                       importance_eps: float = 1e-3, max_prune_per_step: int = 8):
+    @property
+    def out_degree(self) -> int:
+        return self._c.out_degree
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self._c.weights_vals
+
+    @property
+    def importance(self) -> np.ndarray:
+        return self._c.importance
+
+    @property
+    def indices(self) -> np.ndarray:
+        return self._c.indices
+
+    @property
+    def ptrs(self) -> np.ndarray:
+        return self._c.ptrs
+
+    @property
+    def neuron_input_accum(self) -> np.ndarray:
+        return self._c.neuron_input_accum
+
+    @property
+    def neuron_grad_accum(self) -> np.ndarray:
+        return self._c.neuron_grad_accum
+
+    def synaptogenesis(
+        self,
+        k: int,
+        importance_cutoff: float,
+        max_row_weights: int,
+        importance_eps: float = 1e-3,
+        max_prune_per_step: int = 8,
+    ):
         """Structural growth + memory rebalancing -- the only call here
         that ISN'T inline with forward/backward, since it changes which
         synapses exist rather than updating a value. No learning_rate:
@@ -219,12 +245,12 @@ class _SparseLayerBase(Module):
         importance -- a safety ceiling (default rarely binds), not a
         throttle on ordinary capacity trimming."""
         self._c.build_probes(k)
-        self._c.synap_step(importance_cutoff, max_row_weights, max_prune_per_step=max_prune_per_step,
-                           importance_eps=importance_eps)
+        self._c.synap_step(
+            importance_cutoff, max_row_weights, max_prune_per_step=max_prune_per_step, importance_eps=importance_eps
+        )
         self._c.equalizer_step()
 
-    def magnitude_rescale_output(self, target: float, correction_rate: float,
-                                 scale_invariant: bool = False) -> None:
+    def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
         """Passthrough to the real C++ magnitude_rescale_output (see
         delta_csr_types.hpp's own docstring). Not every backend has
         this bound -- e.g. the fp32 DISLDOLayerV backend has no scale
@@ -251,9 +277,9 @@ class _SparseLayerBase(Module):
 
     def state_dict(self) -> dict:
         return {
-            "ptrs":       np.array(self.ptrs),
-            "indices":    np.array(self.indices),
-            "weights":    np.array(self.weights),
+            "ptrs": np.array(self.ptrs),
+            "indices": np.array(self.indices),
+            "weights": np.array(self.weights),
             "importance": np.array(self.importance),
         }
 
@@ -263,7 +289,7 @@ class _SparseLayerBase(Module):
         # importance starts fresh and rebuilds through subsequent
         # training, rather than being restored from the saved value.
         self._c.load_weights(
-            d["ptrs"]   .astype(np.int32),
+            d["ptrs"].astype(np.int32),
             d["indices"].astype(np.int32),
             d["weights"].astype(np.float32),
         )
@@ -277,8 +303,9 @@ class _SparseLayerBase(Module):
             self._c.equalize_to_capacity(max_row_weights)
 
 
-def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
-                           rng: Optional[np.random.Generator] = None) -> int:
+def _preseed_random_sparse(
+    c, n_inputs: int, n_outputs: int, max_weights: int, rng: np.random.Generator | None = None
+) -> int:
     """A freshly-constructed SparseLinearLayer has zero connections and
     produces literal all-zero output until synaptogenesis grows some.
     NOT strictly required when EnergyDynamics is in the loop (as it is
@@ -321,15 +348,15 @@ def _preseed_random_sparse(c, n_inputs: int, n_outputs: int, max_weights: int,
     per_row = max(2, max_weights // max(1, n_inputs))
     if rng is None:
         rng = np.random.default_rng()
-    k     = max(1, min(n_outputs, per_row // 2))  # leave half the row's headroom free to grow into
+    k = max(1, min(n_outputs, per_row // 2))  # leave half the row's headroom free to grow into
     scale = 1.0 / np.sqrt(k)
-    ptrs    = np.zeros(n_inputs + 1, dtype=np.int32)
+    ptrs = np.zeros(n_inputs + 1, dtype=np.int32)
     indices = np.empty(n_inputs * k, dtype=np.int32)
-    values  = np.empty(n_inputs * k, dtype=np.float32)
+    values = np.empty(n_inputs * k, dtype=np.float32)
     for row in range(n_inputs):
         cols = np.sort(rng.choice(n_outputs, size=k, replace=False))
-        indices[row * k:(row + 1) * k] = cols
-        values[row * k:(row + 1) * k]  = rng.standard_normal(k).astype(np.float32) * scale
+        indices[row * k : (row + 1) * k] = cols
+        values[row * k : (row + 1) * k] = rng.standard_normal(k).astype(np.float32) * scale
         ptrs[row + 1] = ptrs[row] + k
     if hasattr(c, "equalize_to_capacity"):
         # SparseLinearLayer (FP4) convention -- 3-arg load_weights,
@@ -577,9 +604,9 @@ def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
     return max(1, int((remaining_budget / 2) // per_channel_bytes))
 
 
-def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
-                     rng: Optional[np.random.Generator] = None,
-                     scale: float = 0.05) -> None:
+def _seed_scale_rank(
+    c, rank: int, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None, scale: float = 0.05
+) -> None:
     """Sets scale_rank on the C++ layer and seeds components k>=1 (both
     value_scale_k and output_scale_k) with small random values. Required:
     per scale_rank's own docstring (delta_csr_types.hpp), k>=1 defaults to
@@ -612,9 +639,9 @@ def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
             c.set_output_scale_raw_k(col, k, float(rng.normal(0.0, scale)))
 
 
-def _seed_additive_rank(c, rank: int, n_inputs: int, n_outputs: int,
-                        rng: Optional[np.random.Generator] = None,
-                        scale: float = 0.05) -> None:
+def _seed_additive_rank(
+    c, rank: int, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None, scale: float = 0.05
+) -> None:
     """Sets additive_rank on the C++ layer and seeds EVERY component
     (k=0..rank-1, unlike _seed_scale_rank's k>=1) with small independent
     random values on BOTH additive_u and additive_v.
@@ -686,9 +713,7 @@ def _activate_gamma_tracking(c, additive_rank: int) -> None:
         c.set_additive_gamma_raw_k(0, 1.0)
 
 
-def _preseed_dense(c, n_inputs: int, n_outputs: int,
-                   rng: Optional[np.random.Generator] = None,
-                   quantize_fn=None) -> int:
+def _preseed_dense(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None, quantize_fn=None) -> int:
     """Fully dense counterpart to `_preseed_random_sparse` -- every
     (input, output) pair connected, loaded straight into block4 via
     `load_dense_codes` (sili__new's `block4_load_dense`, see its own
@@ -769,7 +794,7 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     if quantize_fn is None:
         quantize_fn = _cpu.fp4_quantize_array
     scale = 1.5  # fixed, not fan-in-scaled -- keeps codes representable, see docstring point 1
-    dense = (rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale)
+    dense = rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale
     weight_codes = quantize_fn(dense.flatten())
     importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
     c.load_dense_codes(weight_codes, importance_codes)
@@ -783,8 +808,7 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int,
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
-def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int,
-                             rng: Optional[np.random.Generator] = None) -> int:
+def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None) -> int:
     """Fully dense counterpart to `_preseed_random_sparse`, for storage
     types with no block4 support (DeltaCSRBiValues<float>/DISLDOLayerV
     -- `_preseed_dense`'s own `load_dense_codes`/block4 path doesn't
@@ -803,7 +827,7 @@ def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int,
     scale = 1.0 / np.sqrt(max(1, n_inputs))
     ptrs = np.arange(0, n_inputs * n_outputs + 1, n_outputs, dtype=np.int32)
     indices = np.tile(np.arange(n_outputs, dtype=np.int32), n_inputs)
-    values = (rng.standard_normal(n_inputs * n_outputs).astype(np.float32) * scale)
+    values = rng.standard_normal(n_inputs * n_outputs).astype(np.float32) * scale
     importance = np.zeros(n_inputs * n_outputs, dtype=np.float32)
     c.load_weights(ptrs, indices, values, importance)
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
@@ -835,8 +859,7 @@ def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     return per_row
 
 
-def _graded_top_k_csr(dy2d: np.ndarray, k_per_row,
-                      num_cpus: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _graded_top_k_csr(dy2d: np.ndarray, k_per_row, num_cpus: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """GENUINELY per-row top-k selection: row r independently keeps its
     own top-k_per_row[r] largest-magnitude entries. Lets a caller grade
     gradient density by row (e.g. by how far back in time a row's
@@ -863,16 +886,16 @@ def _graded_top_k_csr(dy2d: np.ndarray, k_per_row,
     losing the global competition, no matter what k is requested. Don't
     "verify" this function by comparing its output against
     dy_sparsity_p's existing path; they answer different questions."""
-    rows, cols = dy2d.shape
+    _rows, cols = dy2d.shape
     k_arr = np.array([min(int(k), cols) for k in k_per_row], dtype=np.int32)
     dy2d_f32 = np.ascontiguousarray(dy2d, dtype=np.float32)
     ptrs, indices, values = _cpu.dense_to_graded_top_k_csr(dy2d_f32, k_arr, num_cpus)
     return ptrs, indices, values
 
 
-def _nucleus_top_k_csr(x2d: np.ndarray, r_target, num_cpus: int = 4,
-                        k_min: int = 0, k_max: Optional[int] = None
-                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _nucleus_top_k_csr(
+    x2d: np.ndarray, r_target, num_cpus: int = 4, k_min: int = 0, k_max: int | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Nucleus/energy-threshold top-k: row r independently keeps the
     SMALLEST set of its own top-|v| entries whose captured squared-
     magnitude ratio R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target[r].
@@ -892,14 +915,15 @@ def _nucleus_top_k_csr(x2d: np.ndarray, r_target, num_cpus: int = 4,
     already computed, so a clamped row degrades to plain top-k rather
     than picking arbitrarily; an all-zero row can't manufacture k_min
     entries out of nothing and stays at k=0 regardless."""
-    rows, cols = x2d.shape
+    rows, _cols = x2d.shape
     if np.isscalar(r_target):
         r_arr = np.full(rows, float(r_target), dtype=np.float32)
     else:
         r_arr = np.asarray(r_target, dtype=np.float32)
     x2d_f32 = np.ascontiguousarray(x2d, dtype=np.float32)
     ptrs, indices, values = _cpu.dense_to_nucleus_top_k_csr(
-        x2d_f32, r_arr, num_cpus, k_min=k_min, k_max=(-1 if k_max is None else int(k_max)))
+        x2d_f32, r_arr, num_cpus, k_min=k_min, k_max=(-1 if k_max is None else int(k_max))
+    )
     return ptrs, indices, values
 
 
@@ -907,18 +931,28 @@ def _nucleus_top_k_csr(x2d: np.ndarray, r_target, num_cpus: int = 4,
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class DISLDOLayer(_SparseLayerBase):
     """Dense observation → state contribution. No CSR on either side --
     dense in, dense out, via SparseLinearLayer.forward_dense/backward_dense
     (both sides dense, weight update inline in backward_dense -- see module
     docstring). No batch dimension required for online (single-sample) use."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0, dynamic_rank_control: bool = False,
-                 scale_rank_max: Optional[int] = None,
-                 additive_rank_max: Optional[int] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+        dense: bool = False,
+        scale_rank: int = 1,
+        empty_init: bool = False,
+        additive_rank: int = 0,
+        dynamic_rank_control: bool = False,
+        scale_rank_max: int | None = None,
+        additive_rank_max: int | None = None,
+    ):
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -939,13 +973,23 @@ class DISLDOLayer(_SparseLayerBase):
         if dynamic_rank_control:
             _activate_gamma_tracking(self._c, additive_rank)
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
-                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True,
-                dy_sparsity_p: Optional[float] = None,
-                dy_sparsity_schedule: Optional[List[float]] = None,
-                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        min_decay_frac: float | None = None,
+        max_abs_delta: float | None = None,
+        max_ci: float | None = None,
+        scale_invariant: bool = False,
+        requires_grad: bool = True,
+        dy_sparsity_p: float | None = None,
+        dy_sparsity_schedule: list[float] | None = None,
+        dy_r_target=None,
+        dy_k_min: int = 0,
+        dy_k_max: int | None = None,
+    ) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -991,7 +1035,7 @@ class DISLDOLayer(_SparseLayerBase):
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
-            csr    = x.data
+            csr = x.data
             was_1d = csr.rows == 1
             # backward_sparse's own dense-input design (see its docstring)
             # needs the real dense x regardless of forward's own path --
@@ -999,12 +1043,12 @@ class DISLDOLayer(_SparseLayerBase):
             # explicitly (same fix as SISLDOLayer.forward(), task #333 --
             # never read a cached last_input off the C++ side).
             x_dense = csr.to_dense()
-            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+            out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
         else:
-            x_np    = np.asarray(x.data, dtype=np.float32)
-            was_1d  = x_np.ndim == 1
+            x_np = np.asarray(x.data, dtype=np.float32)
+            was_1d = x_np.ndim == 1
             x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
-            out_np  = self._c.forward_dense(x_np)
+            out_np = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # requires_grad=False: this output is never meant to be
@@ -1019,10 +1063,14 @@ class DISLDOLayer(_SparseLayerBase):
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
                 extra = {}
-                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
-                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
-                if max_ci is not None: extra["max_ci"] = max_ci
-                if scale_invariant: extra["scale_invariant"] = True
+                if min_decay_frac is not None:
+                    extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None:
+                    extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None:
+                    extra["max_ci"] = max_ci
+                if scale_invariant:
+                    extra["scale_invariant"] = True
                 # dy_sparsity_p (task #334/Phase 5): genuinely independent
                 # axis from x's own type (disldo_backward_sparse_grad's own
                 # signature takes a dense x + sparse dy -- confirmed
@@ -1043,12 +1091,21 @@ class DISLDOLayer(_SparseLayerBase):
                     if len(dy_sparsity_schedule) != dy2d.shape[0]:
                         raise ValueError(
                             f"dy_sparsity_schedule has {len(dy_sparsity_schedule)} entries, "
-                            f"but dy has {dy2d.shape[0]} rows")
+                            f"but dy has {dy2d.shape[0]} rows"
+                        )
                     k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
                     dp, di, dv = _graded_top_k_csr(dy2d, k_per_row, self._c.num_cpus)
-                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
-                                                  lr_per_row_nnz=lr_per_row_nnz,
-                                                  damp_by_importance=damp_by_importance, **extra)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                 elif dy_r_target is not None:
                     # Nucleus/energy-threshold grad sparsification (task
                     # #367, priority 1 per direct instruction -- "grad is
@@ -1057,28 +1114,49 @@ class DISLDOLayer(_SparseLayerBase):
                     # gradient energy, not a fixed fraction. See
                     # sili_peridot/JOURNAL.md's nucleus design note.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                    dp, di, dv = _nucleus_top_k_csr(
-                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
-                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
-                                                  lr_per_row_nnz=lr_per_row_nnz,
-                                                  damp_by_importance=damp_by_importance, **extra)
+                    dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                 elif dy_sparsity_p is None:
                     _t0 = _diag_time.perf_counter()
-                    dx = self._c.backward_dense(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
-                                                 learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                                 damp_by_importance=damp_by_importance, **extra)
-                    _DIAG_TIMING["backward_dense"] = _DIAG_TIMING.get("backward_dense", 0.0) + (_diag_time.perf_counter() - _t0)
+                    dx = self._c.backward_dense(
+                        x_dense,
+                        dy if dy.ndim == 2 else dy[np.newaxis, :],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
+                    _DIAG_TIMING["backward_dense"] = _DIAG_TIMING.get("backward_dense", 0.0) + (
+                        _diag_time.perf_counter() - _t0
+                    )
                     _DIAG_TIMING["backward_dense_n"] = _DIAG_TIMING.get("backward_dense_n", 0) + 1
                 else:
                     _t0 = _diag_time.perf_counter()
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
-                    dp, di, dv = _graded_top_k_csr(
-                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
+                    dp, di, dv = _graded_top_k_csr(dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
                     _t1 = _diag_time.perf_counter()
-                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
-                                                  lr_per_row_nnz=lr_per_row_nnz,
-                                                  damp_by_importance=damp_by_importance, **extra)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                     _t2 = _diag_time.perf_counter()
                     _DIAG_TIMING["topk_csr"] = _DIAG_TIMING.get("topk_csr", 0.0) + (_t1 - _t0)
                     _DIAG_TIMING["backward_sparse"] = _DIAG_TIMING.get("backward_sparse", 0.0) + (_t2 - _t1)
@@ -1092,10 +1170,15 @@ class DISLDOLayer(_SparseLayerBase):
         out._backward = _bwd
         return out
 
-    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
-                                   theta: float = 1e-4, seed_scale: float = 0.05,
-                                   scale_grace_period_steps: int = 50,
-                                   additive_grace_period_steps: int = 5000) -> bool:
+    def apply_dynamic_rank_control(
+        self,
+        tau_death: float = 0.05,
+        tau_active: float = 0.3,
+        theta: float = 1e-4,
+        seed_scale: float = 0.05,
+        scale_grace_period_steps: int = 50,
+        additive_grace_period_steps: int = 5000,
+    ) -> bool:
         """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
         BOTH branches' apoptosis/neurogenesis triggers against their own
         EMA state (updated automatically inside backward_dense/backward,
@@ -1142,15 +1225,14 @@ class DISLDOLayer(_SparseLayerBase):
         outcomes, not treated as settled by this docstring.
         """
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale,
-            scale_grace_period_steps, scale_grace_period_steps)
+            tau_death, tau_active, theta, seed_scale, scale_grace_period_steps, scale_grace_period_steps
+        )
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale,
-            additive_grace_period_steps, additive_grace_period_steps)
+            tau_death, tau_active, theta, seed_scale, additive_grace_period_steps, additive_grace_period_steps
+        )
         return mutated_scale or mutated_additive
 
-    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
-                                    coef: float = 0.1) -> None:
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0, coef: float = 0.1) -> None:
         """AQRS scale/additive channel numerical-safety pass (task #295
         follow-up) -- see _overflow_guard_array's own docstring for the
         full rationale. Call once per training step, any time after
@@ -1186,8 +1268,14 @@ class DISLDOLayerResync(DISLDOLayer):
     identical fp32-shadow control succeeded by a wide margin, which is
     what prompted checking whether FP4 had this same staleness bug too."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayerResync(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1200,8 +1288,14 @@ class DISLDOLayerNoScale(DISLDOLayer):
     work) instead of just fixing the staleness bug. See NoScalePolicy's
     docstring, delta_csr_types.hpp."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayerNoScale(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1219,12 +1313,21 @@ class DISLDOLayerDeterministic(DISLDOLayer):
     were actually avoiding. See StochasticRounding's docstring,
     linear_disldo.hpp."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, empty_init: bool = False,
-                 additive_rank: int = 0, dynamic_rank_control: bool = False,
-                 scale_rank_max: Optional[int] = None,
-                 additive_rank_max: Optional[int] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+        dense: bool = False,
+        scale_rank: int = 1,
+        empty_init: bool = False,
+        additive_rank: int = 0,
+        dynamic_rank_control: bool = False,
+        scale_rank_max: int | None = None,
+        additive_rank_max: int | None = None,
+    ):
         self._c = _cpu.SparseLinearLayerDeterministic(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -1244,8 +1347,14 @@ class DISLDOLayerDeterministic(DISLDOLayer):
 class DISLDOLayerResyncDeterministic(DISLDOLayer):
     """DeferredScaleWrite fix + deterministic rounding together."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayerResyncDeterministic(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1255,8 +1364,14 @@ class DISLDOLayerNoScaleDeterministic(DISLDOLayer):
     together -- the closest real-hardware match to the zero-trained-scale,
     deterministic-quantize design of fixed_digit_residual_quantize."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayerNoScaleDeterministic(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1269,6 +1384,7 @@ class DISLDOLayerNoScaleDeterministic(DISLDOLayer):
 #  separate "FP4's coarse quantization noise" from "the importance-damping
 #  update rule" as candidate explanations for DISLDO's training instability.
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class DISLDOLayer32(_SparseLayerBase):
     """Same disldo_forward/disldo_backward kernels as DISLDOLayer, generic
@@ -1296,9 +1412,15 @@ class DISLDOLayer32(_SparseLayerBase):
     precision or optimizer difference, confirmed as a real contributor
     to fp32's poor MQAR results before this existed (see conversation)."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+        dense: bool = False,
+    ):
         if dense:
             max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
@@ -1307,12 +1429,22 @@ class DISLDOLayer32(_SparseLayerBase):
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
-                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True,
-                dy_sparsity_p: Optional[float] = None,
-                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        min_decay_frac: float | None = None,
+        max_abs_delta: float | None = None,
+        max_ci: float | None = None,
+        scale_invariant: bool = False,
+        requires_grad: bool = True,
+        dy_sparsity_p: float | None = None,
+        dy_r_target=None,
+        dy_k_min: int = 0,
+        dy_k_max: int | None = None,
+    ) -> Tensor:
         # CSR-typed input / dy_sparsity_p (direct instruction): DISLDOLayerV
         # already uses SparseLinearWeightsDelta with VT=DeltaCSRBiValues<V>,
         # the SAME storage family FP4's SparseLinearLayer uses -- its own
@@ -1329,15 +1461,15 @@ class DISLDOLayer32(_SparseLayerBase):
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
-            csr    = x.data
+            csr = x.data
             was_1d = csr.rows == 1
             x_dense = csr.to_dense()
-            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+            out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
         else:
-            x_np    = np.asarray(x.data, dtype=np.float32)
-            was_1d  = x_np.ndim == 1
+            x_np = np.asarray(x.data, dtype=np.float32)
+            was_1d = x_np.ndim == 1
             x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
-            out_np  = self._c.forward(x_np)
+            out_np = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # See DISLDOLayer.forward's own requires_grad comment.
@@ -1349,30 +1481,53 @@ class DISLDOLayer32(_SparseLayerBase):
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
                 extra = {}
-                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
-                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
-                if max_ci is not None: extra["max_ci"] = max_ci
-                if scale_invariant: extra["scale_invariant"] = True
+                if min_decay_frac is not None:
+                    extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None:
+                    extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None:
+                    extra["max_ci"] = max_ci
+                if scale_invariant:
+                    extra["scale_invariant"] = True
                 if dy_r_target is not None:
                     # See DISLDOLayer.forward's own dy_r_target comment.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                    dp, di, dv = _nucleus_top_k_csr(
-                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
-                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
-                                                 lr_per_row_nnz=lr_per_row_nnz,
-                                                 damp_by_importance=damp_by_importance, **extra)
+                    dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                 elif dy_sparsity_p is None:
-                    dx = self._c.backward(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
-                                          learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                          damp_by_importance=damp_by_importance, **extra)
+                    dx = self._c.backward(
+                        x_dense,
+                        dy if dy.ndim == 2 else dy[np.newaxis, :],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                 else:
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
-                    dp, di, dv = _graded_top_k_csr(
-                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
-                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
-                                                 lr_per_row_nnz=lr_per_row_nnz,
-                                                 damp_by_importance=damp_by_importance, **extra)
+                    dp, di, dv = _graded_top_k_csr(dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -1405,16 +1560,25 @@ class DISLDOLayer8(_SparseLayerBase):
     C++/pybind side (SparseLinearLayer8.load_dense_codes) has been
     ready since #123."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None,
-                 dense: bool = False, scale_rank: int = 1, additive_rank: int = 0,
-                 dynamic_rank_control: bool = False,
-                 scale_rank_max: Optional[int] = None,
-                 additive_rank_max: Optional[int] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+        dense: bool = False,
+        scale_rank: int = 1,
+        additive_rank: int = 0,
+        dynamic_rank_control: bool = False,
+        scale_rank_max: int | None = None,
+        additive_rank_max: int | None = None,
+    ):
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
-            self._max_row_weights = _preseed_dense(self._c, in_features, out_features, rng,
-                                                    quantize_fn=_cpu.fp8_quantize_array)
+            self._max_row_weights = _preseed_dense(
+                self._c, in_features, out_features, rng, quantize_fn=_cpu.fp8_quantize_array
+            )
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         default_cap = _default_rank_cap(in_features, out_features)
@@ -1436,13 +1600,21 @@ class DISLDOLayer8(_SparseLayerBase):
         if dynamic_rank_control:
             _activate_gamma_tracking(self._c, additive_rank)
 
-    def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
-                damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
-                max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        min_decay_frac: float | None = None,
+        max_abs_delta: float | None = None,
+        max_ci: float | None = None,
+        scale_invariant: bool = False,
+        requires_grad: bool = True,
+    ) -> Tensor:
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)
+        x_np = np.asarray(x.data, dtype=np.float32)
         was_1d = x_np.ndim == 1
         out_np = self._c.forward(x_np)
         if was_1d:
@@ -1456,12 +1628,22 @@ class DISLDOLayer8(_SparseLayerBase):
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
                 extra = {}
-                if min_decay_frac is not None: extra["min_decay_frac"] = min_decay_frac
-                if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
-                if max_ci is not None: extra["max_ci"] = max_ci
-                if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance, **extra)
+                if min_decay_frac is not None:
+                    extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None:
+                    extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None:
+                    extra["max_ci"] = max_ci
+                if scale_invariant:
+                    extra["scale_invariant"] = True
+                dx = self._c.backward(
+                    x_np,
+                    dy,
+                    learning_rate,
+                    lr_per_row_nnz=lr_per_row_nnz,
+                    damp_by_importance=damp_by_importance,
+                    **extra,
+                )
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -1469,10 +1651,15 @@ class DISLDOLayer8(_SparseLayerBase):
         out._backward = _bwd
         return out
 
-    def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
-                                   theta: float = 1e-4, seed_scale: float = 0.05,
-                                   scale_grace_period_steps: int = 50,
-                                   additive_grace_period_steps: int = 5000) -> bool:
+    def apply_dynamic_rank_control(
+        self,
+        tau_death: float = 0.05,
+        tau_active: float = 0.3,
+        theta: float = 1e-4,
+        seed_scale: float = 0.05,
+        scale_grace_period_steps: int = 50,
+        additive_grace_period_steps: int = 5000,
+    ) -> bool:
         """Same as DISLDOLayer's own apply_dynamic_rank_control (task
         #292; per-branch grace periods + biology citations added per
         direct instruction, see that method's own docstring for the
@@ -1481,15 +1668,14 @@ class DISLDOLayer8(_SparseLayerBase):
         (separate VALUES_TYPE entirely), see this class's own
         docstring."""
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale,
-            scale_grace_period_steps, scale_grace_period_steps)
+            tau_death, tau_active, theta, seed_scale, scale_grace_period_steps, scale_grace_period_steps
+        )
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale,
-            additive_grace_period_steps, additive_grace_period_steps)
+            tau_death, tau_active, theta, seed_scale, additive_grace_period_steps, additive_grace_period_steps
+        )
         return mutated_scale or mutated_additive
 
-    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
-                                    coef: float = 0.1) -> None:
+    def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0, coef: float = 0.1) -> None:
         """Same as DISLDOLayer's own apply_scale_overflow_guard (task
         #295 follow-up) -- duplicated for the same reason
         apply_dynamic_rank_control above is (DISLDOLayer8 doesn't
@@ -1516,8 +1702,14 @@ class DISLDOLayer8Resync(DISLDOLayer8):
     sili_peridot/JOURNAL.md's 2026-08-09 tile-recurrence entries for
     the investigation this was built to answer."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayer8Resync(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1528,8 +1720,14 @@ class DISLDOLayer8AdaMax(DISLDOLayer8):
     update instead of RMSprop -- see AdaMaxScalePolicy's own docstring,
     delta_csr_types.hpp."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, rng: Optional[np.random.Generator] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
         self._c = _cpu.SparseLinearLayer8AdaMax(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
@@ -1537,6 +1735,7 @@ class DISLDOLayer8AdaMax(DISLDOLayer8):
 # ══════════════════════════════════════════════════════════════════════════════
 #  SISLDOLayer — Sparse Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class SISLDOLayer(_SparseLayerBase):
     """Sparse state → state contribution. Input must be a CSR.
@@ -1554,10 +1753,16 @@ class SISLDOLayer(_SparseLayerBase):
     called forward_dense would otherwise silently compute its weight
     update against stale/empty data."""
 
-    def __init__(self, in_features: int, out_features: int, max_weights: int,
-                 num_cpus: int = 4, backprop_p: float = 0.03,
-                 rng: Optional[np.random.Generator] = None):
-        self._c         = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        backprop_p: float = 0.03,
+        rng: np.random.Generator | None = None,
+    ):
+        self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
         self.backprop_p = backprop_p
 
@@ -1571,20 +1776,24 @@ class SISLDOLayer(_SparseLayerBase):
         Structural Plasticity) importance update on every call,
         independent of whether backward() would ever follow. Real
         weight/importance updates now happen ONLY in backward_sparse."""
-        csr      = x.data
-        x_dense  = csr.to_dense()
-        out_np = self._c.forward_sparse(
-            csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
-        out    = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
+        csr = x.data
+        x_dense = csr.to_dense()
+        out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
+        out = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
 
         def _bwd():
             if out.grad is not None:
-                dy   = np.asarray(out.grad, dtype=np.float32)[np.newaxis, :]
-                k    = max(1, int(dy.shape[1] * self.backprop_p))
+                dy = np.asarray(out.grad, dtype=np.float32)[np.newaxis, :]
+                k = max(1, int(dy.shape[1] * self.backprop_p))
                 dp, di, dv = _cpu.dense_to_top_k_csr(dy, k, self._c.num_cpus)
                 dx = self._c.backward_sparse(
-                    x_dense, dp, di, dv,
-                    csr.rows, learning_rate, lr_per_row_nnz=True,
+                    x_dense,
+                    dp,
+                    di,
+                    dv,
+                    csr.rows,
+                    learning_rate,
+                    lr_per_row_nnz=True,
                 ).squeeze(0)
                 _acc(x, dx)
 
@@ -1595,6 +1804,7 @@ class SISLDOLayer(_SparseLayerBase):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Save/restore helpers for a raw _cpu.SparseLinearLayer
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def _sparse_linear_layer_state_dict(layer) -> dict:
     """
@@ -1610,11 +1820,11 @@ def _sparse_linear_layer_state_dict(layer) -> dict:
     """
     n = layer.n_inputs
     return {
-        "ptrs":             np.array(layer.ptrs),
-        "indices":          np.array(layer.indices),
-        "weights":          np.array(layer.weights_vals),
-        "importance":       np.array(layer.importance),  # NOT restorable -- see docstring
-        "value_scale":      np.array([layer.get_value_scale(r) for r in range(n)], dtype=np.float32),
+        "ptrs": np.array(layer.ptrs),
+        "indices": np.array(layer.indices),
+        "weights": np.array(layer.weights_vals),
+        "importance": np.array(layer.importance),  # NOT restorable -- see docstring
+        "value_scale": np.array([layer.get_value_scale(r) for r in range(n)], dtype=np.float32),
         "importance_scale": np.array([layer.get_importance_scale(r) for r in range(n)], dtype=np.float32),
     }
 
@@ -1624,7 +1834,7 @@ def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
     already-constructed layer of the matching shape. Does not restore
     importance (see _sparse_linear_layer_state_dict)."""
     layer.load_weights(
-        np.asarray(d["ptrs"],    dtype=np.int32),
+        np.asarray(d["ptrs"], dtype=np.int32),
         np.asarray(d["indices"], dtype=np.int32),
         np.asarray(d["weights"], dtype=np.float32),
     )
@@ -1633,8 +1843,7 @@ def _sparse_linear_layer_load_state_dict(layer, d: dict) -> None:
         layer.set_importance_scale_raw(r, float(d["importance_scale"][r]))
 
 
-def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: int,
-                             n_iters: int = 6):
+def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: int, n_iters: int = 6):
     """
     Alternating max-fit producing a rank-1 (outer-product) envelope:
     row_scale[r] * col_scale[c] >= |M[r, c]| for every entry, using
@@ -1654,6 +1863,7 @@ def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: in
     float64 here would double the O(nnz) working set for no benefit).
     """
     import numpy as np
+
     col_scale = np.ones(n_cols, dtype=np.float32)
     row_scale = np.ones(n_rows, dtype=np.float32)
     for _ in range(n_iters):
@@ -1667,6 +1877,7 @@ def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: in
 # ══════════════════════════════════════════════════════════════════════════════
 #  FoldedLayer — runtime sili Module for a converted folded transformer block
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class FoldedLayer(Module):
     """
@@ -1696,26 +1907,30 @@ class FoldedLayer(Module):
 
     def __init__(
         self,
-        layers:        dict,   # {suffix: SparseLinearLayer}
-        n_folds:       int,
-        out_dims:      dict,   # {suffix: out_dim}
+        layers: dict,  # {suffix: SparseLinearLayer}
+        n_folds: int,
+        out_dims: dict,  # {suffix: out_dim}
         learning_rate: float = 0.01,
     ):
         self._sili_layers = layers
-        self._n_folds     = n_folds
-        self._out_dims    = out_dims
-        self.lr           = learning_rate
+        self._n_folds = n_folds
+        self._out_dims = out_dims
+        self.lr = learning_rate
 
     # ── Factory ------------------------------------------------------------------
 
     @classmethod
-    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
-                        num_cpus: int = 4,
-                        max_row_weights: int = 0,
-                        bytes_per_row: int = 0,
-                        value_scale_mode: str = "per_row",
-                        rank1_iters: int = 6,
-                        compact_after_build: bool = True) -> "FoldedLayer":
+    def from_descriptor(
+        cls,
+        descriptor,
+        learning_rate: float = 0.01,
+        num_cpus: int = 4,
+        max_row_weights: int = 0,
+        bytes_per_row: int = 0,
+        value_scale_mode: str = "per_row",
+        rank1_iters: int = 6,
+        compact_after_build: bool = True,
+    ) -> FoldedLayer:
         """
         Build a FoldedLayer from a FoldedBlockDescriptor.
 
@@ -1751,14 +1966,15 @@ class FoldedLayer(Module):
                              the built layer before synaptogenesis needs room
                              to grow again.
         """
+        import warnings
+
         import numpy as np
-        import torch as _torch   # local import: conversion step only -- sili does
+
         # the compute. Do not use torch in forward/backward paths.
-        import warnings; warnings.filterwarnings("ignore")
+        warnings.filterwarnings("ignore")
         _FP4_MAX = 6.0
         if value_scale_mode not in ("per_row", "rank1"):
-            raise ValueError(
-                f"value_scale_mode must be 'per_row' or 'rank1', got {value_scale_mode!r}")
+            raise ValueError(f"value_scale_mode must be 'per_row' or 'rank1', got {value_scale_mode!r}")
 
         layers = {}
         for suffix, csr in descriptor.stacked_weights.items():
@@ -1773,7 +1989,7 @@ class FoldedLayer(Module):
             # [110592, 1536]; densifying that alone risked OOM converting
             # a real checkpoint).
             csr_t = csr.t().to_sparse_csr()
-            n_in  = int(csr_t.shape[0])
+            n_in = int(csr_t.shape[0])
             n_out = int(csr_t.shape[1])
             # Budget for the delta-CSR pool: size for the fully-connected
             # maximum (n_in * n_out), not for current nnz. This is the fixed
@@ -1785,7 +2001,7 @@ class FoldedLayer(Module):
             budget = n_in * n_out
             layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
-            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            idx = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
 
             if value_scale_mode == "rank1":
@@ -1794,7 +2010,8 @@ class FoldedLayer(Module):
                 # intermediate (see fit_rank1_scale_envelope).
                 row_of_nnz = np.repeat(np.arange(n_in, dtype=np.int64), np.diff(ptrs))
                 row_env, col_env = fit_rank1_scale_envelope(
-                    row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters)
+                    row_of_nnz, idx.astype(np.int64), np.abs(vals), n_in, n_out, n_iters=rank1_iters
+                )
                 row_scales = (row_env / _FP4_MAX).astype(np.float32)
                 col_scales = col_env.astype(np.float32)
                 combined = row_scales[row_of_nnz] * col_scales[idx]
@@ -1804,7 +2021,7 @@ class FoldedLayer(Module):
                 # Per-row: map each row's max-abs to FP4_MAX for full
                 # quantizer resolution.
                 row_scales = np.ones(n_in, dtype=np.float32)
-                col_scales = np.ones(n_out, dtype=np.float32)   # left at default (1.0) in this mode
+                col_scales = np.ones(n_out, dtype=np.float32)  # left at default (1.0) in this mode
                 for r in range(n_in):
                     start, end = int(ptrs[r]), int(ptrs[r + 1])
                     if end > start:
@@ -1847,8 +2064,8 @@ class FoldedLayer(Module):
                 bpr = bytes_per_row
             else:
                 bits = max(1, n_out - 1).bit_length()
-                typ  = (bits + 6) // 7    # ceil(bits / 7)
-                bpr  = mrw * typ + 4       # +4 bytes margin per step
+                typ = (bits + 6) // 7  # ceil(bits / 7)
+                bpr = mrw * typ + 4  # +4 bytes margin per step
 
             layer.equalize_to_capacity(mrw, bpr)
             if compact_after_build:
@@ -1861,7 +2078,7 @@ class FoldedLayer(Module):
     # ── Module interface ---------------------------------------------------------
 
     def parameters(self) -> list:
-        return []   # weights live in C++, not in the Tensor graph
+        return []  # weights live in C++, not in the Tensor graph
 
     # ── Properties --------------------------------------------------------------
 
@@ -1875,7 +2092,7 @@ class FoldedLayer(Module):
 
     # ── Forward ------------------------------------------------------------------
 
-    def forward(self, x: "Tensor") -> "Tensor":
+    def forward(self, x: Tensor) -> Tensor:
         """
         x: sili Tensor [batch, in_dim]  (or [in_dim] -- squeezed automatically)
         Returns: sili Tensor [batch, out_dim]
@@ -1894,14 +2111,13 @@ class FoldedLayer(Module):
         squeezed = x_np.ndim == 1
         if squeezed:
             x_np = x_np[np.newaxis, :]
-        batch   = x_np.shape[0]
+        batch = x_np.shape[0]
         out_dim = next(iter(self._out_dims.values()))
-        lr      = self.lr  # used by the backward closure below, not forward
+        lr = self.lr  # used by the backward closure below, not forward
 
         # Single call per suffix -- the full stacked matrix is one layer.
-        raw_parts = [layer.forward_dense(x_np)
-                     for layer in self._sili_layers.values()]
-        raw_np = sum(raw_parts)   # [batch, n_folds * out_dim]
+        raw_parts = [layer.forward_dense(x_np) for layer in self._sili_layers.values()]
+        raw_np = sum(raw_parts)  # [batch, n_folds * out_dim]
 
         # Fold sum: [batch, n_folds, out_dim] -> [batch, out_dim]
         summed = raw_np.reshape(batch, self._n_folds, out_dim).sum(axis=1)
@@ -1911,9 +2127,9 @@ class FoldedLayer(Module):
         out = Tensor(summed, _children=(x,), _op="folded", backend=x.backend)
 
         # Capture loop variables for the closure (Python late-binding risk).
-        _layers  = list(self._sili_layers.values())
+        _layers = list(self._sili_layers.values())
         _n_folds = self._n_folds
-        _sq      = squeezed
+        _sq = squeezed
 
         def _bwd():
             if out.grad is None:
@@ -1925,14 +2141,14 @@ class FoldedLayer(Module):
 
             # Backward of fold reshape+sum:
             # grad of sum is 1 to each summand -> broadcast dy to all n_folds slots.
-            dy_raw = np.tile(
-                dy_np.reshape(_batch, 1, out_dim),
-                (1, _n_folds, 1)
-            ).reshape(_batch, _n_folds * out_dim).astype(np.float32)
+            dy_raw = (
+                np.tile(dy_np.reshape(_batch, 1, out_dim), (1, _n_folds, 1))
+                .reshape(_batch, _n_folds * out_dim)
+                .astype(np.float32)
+            )
 
             # Each suffix layer gets the same dy_raw; accumulate dx.
-            dx_parts = [layer.backward_dense(dy_raw, lr, lr_per_row_nnz=True)
-                        for layer in _layers]
+            dx_parts = [layer.backward_dense(dy_raw, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(_batch, -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)
@@ -1945,10 +2161,10 @@ class FoldedLayer(Module):
 
     def synaptogenesis(
         self,
-        k:                int,
+        k: int,
         importance_cutoff: float,
-        max_row_weights:   int,
-        rows_per_call:     int = 0,
+        max_row_weights: int,
+        rows_per_call: int = 0,
     ) -> None:
         """
         Grow and prune connections across all suffix layers.
@@ -1990,7 +2206,7 @@ class FoldedLayer(Module):
             n = rows_per_call if rows_per_call > 0 else layer.n_inputs
             for _ in range(n):
                 layer.synap_step(importance_cutoff, max_row_weights)
-            layer.equalizer_step()   # staggered 1-row redistribution
+            layer.equalizer_step()  # staggered 1-row redistribution
             layer.zero_accum()
 
     def nnz_total(self) -> int:
@@ -2005,8 +2221,8 @@ class FoldedLayer(Module):
             d = _sparse_linear_layer_state_dict(layer)
             d["n_folds"] = np.array([self._n_folds])
             d["out_dim"] = np.array([self._out_dims[suffix]])
-            d["lr"]      = np.array([self.lr], dtype=np.float32)
-            out[suffix]  = d
+            d["lr"] = np.array([self.lr], dtype=np.float32)
+            out[suffix] = d
         return out
 
     def load_state_dict(self, d: dict) -> None:
@@ -2020,6 +2236,7 @@ class FoldedLayer(Module):
 # ══════════════════════════════════════════════════════════════════════════════
 #  FoldedColumnLayer — FoldedLayer variant for the column-averaging mechanism
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class FoldedColumnLayer(FoldedLayer):
     """
@@ -2048,13 +2265,18 @@ class FoldedColumnLayer(FoldedLayer):
     """
 
     @classmethod
-    def from_descriptor(cls, descriptor, learning_rate: float = 0.01,
-                        num_cpus: int = 4, max_row_weights: int = 0,
-                        bytes_per_row: int = 0,
-                        recurrent_bandwidth: int = None,
-                        existing_recurrent=None,
-                        existing_recurrent_prefer: str = "b",
-                        input_skip_bandwidth: int = None) -> "FoldedColumnLayer":
+    def from_descriptor(
+        cls,
+        descriptor,
+        learning_rate: float = 0.01,
+        num_cpus: int = 4,
+        max_row_weights: int = 0,
+        bytes_per_row: int = 0,
+        recurrent_bandwidth: int | None = None,
+        existing_recurrent=None,
+        existing_recurrent_prefer: str = "b",
+        input_skip_bandwidth: int | None = None,
+    ) -> FoldedColumnLayer:
         """
         Like FoldedLayer.from_descriptor, plus builds `recurrent` sized to
         this layer's [n_folds*out_dim] output space, and unconditionally
@@ -2077,22 +2299,33 @@ class FoldedColumnLayer(FoldedLayer):
         values always winning (see _rebuild_layer_with_preseed).
         """
         obj = super().from_descriptor(
-            descriptor, learning_rate=learning_rate, num_cpus=num_cpus,
-            max_row_weights=max_row_weights, bytes_per_row=bytes_per_row,
+            descriptor,
+            learning_rate=learning_rate,
+            num_cpus=num_cpus,
+            max_row_weights=max_row_weights,
+            bytes_per_row=bytes_per_row,
         )
         obj.recurrent = build_fold_skip_layer(
-            obj._n_folds, obj.column_width, num_cpus=num_cpus,
-            bandwidth=recurrent_bandwidth, expected_lr=learning_rate,
-            existing=existing_recurrent, existing_prefer=existing_recurrent_prefer,
+            obj._n_folds,
+            obj.column_width,
+            num_cpus=num_cpus,
+            bandwidth=recurrent_bandwidth,
+            expected_lr=learning_rate,
+            existing=existing_recurrent,
+            existing_prefer=existing_recurrent_prefer,
         )
 
         out_dim = obj.column_width
         for suffix, layer in list(obj._sili_layers.items()):
             preseed_ptrs, preseed_idx, _ = build_input_skip_preseed(
-                layer.n_inputs, obj._n_folds, out_dim, bandwidth=input_skip_bandwidth)
+                layer.n_inputs, obj._n_folds, out_dim, bandwidth=input_skip_bandwidth
+            )
             obj._sili_layers[suffix] = _rebuild_layer_with_preseed(
-                layer, preseed_ptrs, preseed_idx,
-                num_cpus=num_cpus, expected_lr=learning_rate,
+                layer,
+                preseed_ptrs,
+                preseed_idx,
+                num_cpus=num_cpus,
+                expected_lr=learning_rate,
             )
 
         return obj
@@ -2110,7 +2343,7 @@ class FoldedColumnLayer(FoldedLayer):
         count divided by n_folds."""
         return next(iter(self._out_dims.values()))
 
-    def in_proj(self, x: "Tensor") -> "Tensor":
+    def in_proj(self, x: Tensor) -> Tensor:
         """
         The pretrained-weight half of forward(): does NOT sum over the
         fold axis like FoldedLayer.forward does -- returns
@@ -2124,16 +2357,15 @@ class FoldedColumnLayer(FoldedLayer):
             x_np = x_np[np.newaxis, :]
         lr = self.lr  # used by the backward closure below, not forward
 
-        raw_parts = [layer.forward_dense(x_np)
-                     for layer in self._sili_layers.values()]
-        raw_np = sum(raw_parts)   # [batch, n_folds*out_dim] -- kept as-is
+        raw_parts = [layer.forward_dense(x_np) for layer in self._sili_layers.values()]
+        raw_np = sum(raw_parts)  # [batch, n_folds*out_dim] -- kept as-is
         if squeezed:
             raw_np = raw_np.squeeze(0)
 
         out = Tensor(raw_np, _children=(x,), _op="folded_column_in_proj", backend=x.backend)
 
         _layers = list(self._sili_layers.values())
-        _sq     = squeezed
+        _sq = squeezed
 
         def _bwd():
             if out.grad is None:
@@ -2141,8 +2373,7 @@ class FoldedColumnLayer(FoldedLayer):
             dy_np = np.asarray(out.grad, dtype=np.float32)
             if dy_np.ndim == 1:
                 dy_np = dy_np[np.newaxis, :]
-            dx_parts = [layer.backward_dense(dy_np, lr, lr_per_row_nnz=True)
-                        for layer in _layers]
+            dx_parts = [layer.backward_dense(dy_np, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(dy_np.shape[0], -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)
@@ -2151,7 +2382,7 @@ class FoldedColumnLayer(FoldedLayer):
         out._backward = _bwd
         return out
 
-    def forward(self, x: "Tensor", state: "Tensor" = None) -> "Tensor":
+    def forward(self, x: Tensor, state: Tensor = None) -> Tensor:
         """
         h = in_proj(x) + recurrent(state) -- same pattern as
         SparseRNNCell.forward. Returns the new state; feed it back in as
@@ -2160,8 +2391,7 @@ class FoldedColumnLayer(FoldedLayer):
         """
         raw = self.in_proj(x)
         if state is None:
-            state = Tensor(np.zeros(self.out_features, dtype=np.float32),
-                           backend=x.backend)
+            state = Tensor(np.zeros(self.out_features, dtype=np.float32), backend=x.backend)
         rec = apply_fold_skip(self.recurrent, state, lr=self.lr)
         return raw + rec
 
@@ -2196,7 +2426,7 @@ def _build_banded_csr(total: int, bandwidth: int):
     pos = 0
     for r in range(total):
         n = int(row_lengths[r])
-        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        idx[pos : pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
         pos += n
 
     return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
@@ -2223,7 +2453,7 @@ def _build_rectangular_banded_csr(rows: int, cols: int, bandwidth: int):
     pos = 0
     for r in range(rows):
         n = int(row_lengths[r])
-        idx[pos:pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
+        idx[pos : pos + n] = np.arange(lo[r], hi[r] + 1, dtype=np.int32)
         pos += n
 
     return ptrs.astype(np.int32), idx, np.zeros(nnz, dtype=np.float32)
@@ -2237,11 +2467,11 @@ def state_dict_to_true_csr(d: dict):
     `existing` expects, since raw FP4 units from differently-scaled
     sources aren't directly comparable.
     """
-    ptrs   = np.asarray(d["ptrs"],  dtype=np.int32)
-    idx    = np.asarray(d["indices"], dtype=np.int32)
-    raw    = np.asarray(d["weights"], dtype=np.float32)
-    scale  = np.asarray(d["value_scale"], dtype=np.float32)
-    vals   = raw.copy()
+    ptrs = np.asarray(d["ptrs"], dtype=np.int32)
+    idx = np.asarray(d["indices"], dtype=np.int32)
+    raw = np.asarray(d["weights"], dtype=np.float32)
+    scale = np.asarray(d["value_scale"], dtype=np.float32)
+    vals = raw.copy()
     for r in range(len(ptrs) - 1):
         start, end = int(ptrs[r]), int(ptrs[r + 1])
         if end > start:
@@ -2249,8 +2479,7 @@ def state_dict_to_true_csr(d: dict):
     return ptrs, idx, vals
 
 
-def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
-              n_rows: int, prefer: str = "a", num_cpus: int = 4):
+def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b, n_rows: int, prefer: str = "a", num_cpus: int = 4):
     """
     Merge two CSRs of the SAME shape into one holding the union of their
     nonzero positions. `vals_a`/`vals_b` must already be in true units
@@ -2270,20 +2499,28 @@ def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b,
     """
     assert prefer in ("a", "b", "sum")
     return _cpu.csr_union(
-        np.asarray(ptrs_a, dtype=np.int32), np.asarray(idx_a, dtype=np.int32),
+        np.asarray(ptrs_a, dtype=np.int32),
+        np.asarray(idx_a, dtype=np.int32),
         np.asarray(vals_a, dtype=np.float32),
-        np.asarray(ptrs_b, dtype=np.int32), np.asarray(idx_b, dtype=np.int32),
+        np.asarray(ptrs_b, dtype=np.int32),
+        np.asarray(idx_b, dtype=np.int32),
         np.asarray(vals_b, dtype=np.float32),
-        int(n_rows), prefer, num_cpus,
+        int(n_rows),
+        prefer,
+        num_cpus,
     )
 
 
-def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
-                          bandwidth: int = None,
-                          headroom_fraction: float = 0.5,
-                          expected_lr: float = 0.01,
-                          existing=None,
-                          existing_prefer: str = "b") -> "_cpu.SparseLinearLayer":
+def build_fold_skip_layer(
+    n_folds: int,
+    out_dim: int,
+    num_cpus: int = 4,
+    bandwidth: int | None = None,
+    headroom_fraction: float = 0.5,
+    expected_lr: float = 0.01,
+    existing=None,
+    existing_prefer: str = "b",
+) -> _cpu.SparseLinearLayer:
     """
     Sparse layer mapping a FoldedColumnLayer's own [n_folds*out_dim]
     output space back to itself: skip connections between virtual
@@ -2317,8 +2554,9 @@ def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
 
     if existing is not None:
         ex_ptrs, ex_idx, ex_vals = existing
-        ptrs, idx, vals = csr_union(ptrs, idx, vals, ex_ptrs, ex_idx, ex_vals,
-                                    total, prefer=existing_prefer, num_cpus=num_cpus)
+        ptrs, idx, vals = csr_union(
+            ptrs, idx, vals, ex_ptrs, ex_idx, ex_vals, total, prefer=existing_prefer, num_cpus=num_cpus
+        )
 
     nnz = len(idx)
     row_lengths = ptrs[1:] - ptrs[:-1]
@@ -2346,7 +2584,7 @@ def build_fold_skip_layer(n_folds: int, out_dim: int, num_cpus: int = 4,
     return layer
 
 
-def build_input_skip_preseed(n_in: int, n_folds: int, out_dim: int, bandwidth: int = None):
+def build_input_skip_preseed(n_in: int, n_folds: int, out_dim: int, bandwidth: int | None = None):
     """
     Zero-valued, trainable skip connections from external input directly to
     every fold-depth column -- the in_proj analogue of build_fold_skip_layer
@@ -2367,9 +2605,9 @@ def build_input_skip_preseed(n_in: int, n_folds: int, out_dim: int, bandwidth: i
     return _build_rectangular_banded_csr(n_in, total_out, bw)
 
 
-def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
-                                num_cpus: int, expected_lr: float,
-                                headroom_fraction: float = 0.5):
+def _rebuild_layer_with_preseed(
+    layer, preseed_ptrs, preseed_idx, num_cpus: int, expected_lr: float, headroom_fraction: float = 0.5
+):
     """
     Rebuild a SparseLinearLayer, unioning a zero-valued pre-seed CSR's
     structural positions onto the layer's real (already-trained/pretrained)
@@ -2379,12 +2617,11 @@ def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
     headroom, per-row FP4 rescaling recomputed on the merged row).
     """
     n_in, n_out = layer.n_inputs, layer.n_outputs
-    real_ptrs, real_idx, real_vals = state_dict_to_true_csr(
-        _sparse_linear_layer_state_dict(layer))
+    real_ptrs, real_idx, real_vals = state_dict_to_true_csr(_sparse_linear_layer_state_dict(layer))
     preseed_vals = np.zeros(len(preseed_idx), dtype=np.float32)
-    ptrs, idx, vals = csr_union(real_ptrs, real_idx, real_vals,
-                                preseed_ptrs, preseed_idx, preseed_vals,
-                                n_in, prefer="a", num_cpus=num_cpus)
+    ptrs, idx, vals = csr_union(
+        real_ptrs, real_idx, real_vals, preseed_ptrs, preseed_idx, preseed_vals, n_in, prefer="a", num_cpus=num_cpus
+    )
 
     nnz = len(idx)
     row_lengths = ptrs[1:] - ptrs[:-1]
@@ -2410,7 +2647,7 @@ def _rebuild_layer_with_preseed(layer, preseed_ptrs, preseed_idx,
     return new_layer
 
 
-def apply_fold_skip(skip_layer, x: "Tensor", lr: float = 0.01) -> "Tensor":
+def apply_fold_skip(skip_layer, x: Tensor, lr: float = 0.01) -> Tensor:
     """
     Apply a build_fold_skip_layer()-constructed layer to a
     FoldedColumnLayer's raw output, wired into the Tensor autograd graph
@@ -2467,9 +2704,9 @@ class LayerMemoryState:
     """
 
     def __init__(self, layer):
-        self._layer  = layer   # SparseLinearLayer (_cpu object)
-        self._cursor = 0       # mirrors C++ _equalize_row
-        self._calls  = 0
+        self._layer = layer  # SparseLinearLayer (_cpu object)
+        self._cursor = 0  # mirrors C++ _equalize_row
+        self._calls = 0
 
     def step(self) -> None:
         """One equalization step (advance cursor by one row)."""
@@ -2529,33 +2766,33 @@ class SynaptogenesisSchedule:
 
     def __init__(
         self,
-        layer:             "FoldedLayer",
-        base_connections:  int,
-        k_factor:          int   = 4,        # probes = k_factor * max_row_weights
-        importance_cutoff: float = 0.0,      # stored-unit importance threshold
-        amplitude:         float = 0.0,      # 0 = constant, 0.3 = +-30%
-        period:            int   = 200,      # steps per full sine cycle
-        every_n_steps:     int   = 20,       # run synaptogenesis every N steps
-        rows_per_call:     int   = 0,        # 0 = full sweep
+        layer: FoldedLayer,
+        base_connections: int,
+        k_factor: int = 4,  # probes = k_factor * max_row_weights
+        importance_cutoff: float = 0.0,  # stored-unit importance threshold
+        amplitude: float = 0.0,  # 0 = constant, 0.3 = +-30%
+        period: int = 200,  # steps per full sine cycle
+        every_n_steps: int = 20,  # run synaptogenesis every N steps
+        rows_per_call: int = 0,  # 0 = full sweep
     ):
-        self._layer             = layer
-        self._base              = base_connections
-        self._k_factor          = k_factor
+        self._layer = layer
+        self._base = base_connections
+        self._k_factor = k_factor
         self._importance_cutoff = importance_cutoff
-        self._amplitude         = amplitude
-        self._period            = period
-        self._every             = every_n_steps
-        self._rows_per_call     = rows_per_call
-        self._t                 = 0      # training steps counted
-        self._synap_t           = 0      # synaptogenesis calls counted
+        self._amplitude = amplitude
+        self._period = period
+        self._every = every_n_steps
+        self._rows_per_call = rows_per_call
+        self._t = 0  # training steps counted
+        self._synap_t = 0  # synaptogenesis calls counted
 
     def current_max_row_weights(self) -> int:
         """Current target based on the sine wave at this step."""
         if self._amplitude == 0.0:
             return self._base
         import math
-        factor = 1.0 + self._amplitude * math.sin(
-            2.0 * math.pi * self._synap_t / self._period)
+
+        factor = 1.0 + self._amplitude * math.sin(2.0 * math.pi * self._synap_t / self._period)
         return max(1, round(self._base * factor))
 
     def step(self) -> bool:
@@ -2567,9 +2804,8 @@ class SynaptogenesisSchedule:
         if self._t % self._every != 0:
             return False
         mrw = self.current_max_row_weights()
-        k   = max(1, self._k_factor * mrw)
-        self._layer.synaptogenesis(
-            k, self._importance_cutoff, mrw, self._rows_per_call)
+        k = max(1, self._k_factor * mrw)
+        self._layer.synaptogenesis(k, self._importance_cutoff, mrw, self._rows_per_call)
         self._synap_t += 1
         return True
 
@@ -2587,6 +2823,7 @@ class SynaptogenesisSchedule:
 # ══════════════════════════════════════════════════════════════════════════════
 #  SparseRNNCell
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class SparseRNNCell(Module):
     """
@@ -2636,18 +2873,24 @@ class SparseRNNCell(Module):
     something this cell should hardcode a combination of.
     """
 
-    def __init__(self, n_inputs: int, state_size: int, max_weights: int,
-                 num_cpus: int = 4, percent_active: float = 0.03,
-                 dynamic_density_from_branching_ratio: bool = False,
-                 branching_tracker: str = "ema",
-                 branching_window: int = 200,
-                 branching_ema_alpha: float = 0.05):
-        assert branching_tracker in ("window", "ema"), \
+    def __init__(
+        self,
+        n_inputs: int,
+        state_size: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        percent_active: float = 0.03,
+        dynamic_density_from_branching_ratio: bool = False,
+        branching_tracker: str = "ema",
+        branching_window: int = 200,
+        branching_ema_alpha: float = 0.05,
+    ):
+        assert branching_tracker in ("window", "ema"), (
             f"branching_tracker must be 'window' or 'ema', got {branching_tracker!r}"
+        )
         r = percent_active / 0.02
-        self.input_proj = DISLDOLayer(n_inputs,   state_size, max_weights, num_cpus)
-        self.recurrent  = SISLDOLayer(state_size, state_size, max_weights, num_cpus,
-                                      backprop_p=percent_active)
+        self.input_proj = DISLDOLayer(n_inputs, state_size, max_weights, num_cpus)
+        self.recurrent = SISLDOLayer(state_size, state_size, max_weights, num_cpus, backprop_p=percent_active)
         # density IS the target active fraction; p is a hard compute-limit
         # ceiling that must sit clearly above it (~5x here), not the thing
         # that shapes learned sparsity -- see EnergyDynamics's own
@@ -2656,7 +2899,7 @@ class SparseRNNCell(Module):
         # derived FROM percent_active*0.9 while p was set TO percent_active
         # directly, i.e. density could exceed p*0.8 -- the actual bug).
         density = min(0.9, percent_active)
-        p       = min(1.0, percent_active * 5.0)
+        p = min(1.0, percent_active * 5.0)
         # activation_cost=0.08*r grows unbounded with percent_active (r
         # scales linearly with it) -- fine for the small percent_active
         # this formula was tuned around, but a small state legitimately
@@ -2665,18 +2908,18 @@ class SparseRNNCell(Module):
         # EnergyDynamics's own asserted [0.01, 0.5] range. Clamp rather
         # than let construction fail for that (valid) regime.
         activation_cost = min(0.5, max(0.01, 0.08 * r))
-        self.energy     = EnergyDynamics(
-            drive          = 0.08*percent_active * r,
-            activation_cost= activation_cost,
-            density        = density,
-            exploration    = 0.001 * r,
-            reactivity     = 0.01  * r,
-            precision      = 0.04  * r,
-            setpoint       = 1.0,
-            activation_threshold = 1e-4,
-            p              = p,
+        self.energy = EnergyDynamics(
+            drive=0.08 * percent_active * r,
+            activation_cost=activation_cost,
+            density=density,
+            exploration=0.001 * r,
+            reactivity=0.01 * r,
+            precision=0.04 * r,
+            setpoint=1.0,
+            activation_threshold=1e-4,
+            p=p,
         )
-        self.state_size      = state_size
+        self.state_size = state_size
         self._percent_active = percent_active
 
         # Recurrent-only branching-ratio measurement (A6 item 5) and its
@@ -2695,14 +2938,15 @@ class SparseRNNCell(Module):
         self.dynamic_density_from_branching_ratio = bool(dynamic_density_from_branching_ratio)
 
         # Cache for unifying the sparsification passes -- see class docstring.
-        self._prev_kept_indices: Optional[np.ndarray] = None
-        self._prev_h_dense:      Optional[np.ndarray] = None
+        self._prev_kept_indices: np.ndarray | None = None
+        self._prev_h_dense: np.ndarray | None = None
 
     def parameters(self) -> list:
         return []
 
-    def forward(self, obs: Tensor, state: Tensor, learning_rate: float = 0.0,
-                requires_grad: bool = True) -> Tuple[Tensor, Tensor, float]:
+    def forward(
+        self, obs: Tensor, state: Tensor, learning_rate: float = 0.0, requires_grad: bool = True
+    ) -> tuple[Tensor, Tensor, float]:
         # state.data is a CSR only if the caller explicitly handed us one
         # (e.g. warm-starting from a saved CSR); the cell's own output is
         # always dense (see class docstring). Normal path: build the CSR
@@ -2711,8 +2955,7 @@ class SparseRNNCell(Module):
         # back to the true step-0 independent top-k.
         if not isinstance(state.data, CSR):
             if self._prev_kept_indices is not None:
-                state_csr = CSR.from_kept_indices(
-                    self._prev_kept_indices, self._prev_h_dense, cols=self.state_size)
+                state_csr = CSR.from_kept_indices(self._prev_kept_indices, self._prev_h_dense, cols=self.state_size)
             else:
                 state_csr = CSR.from_dense(
                     np.asarray(state.data, dtype=np.float32),
@@ -2724,10 +2967,9 @@ class SparseRNNCell(Module):
         # Measure the recurrent pathway's OWN activity before it's mixed
         # with input_proj(obs) -- see class docstring / BranchingRatioTracker.
         recurrent_out = self.recurrent(state, learning_rate)
-        recurrent_activity = float(np.sum(
-            np.abs(np.asarray(recurrent_out.data, dtype=np.float32))
-            > self.energy.activation_threshold
-        ))
+        recurrent_activity = float(
+            np.sum(np.abs(np.asarray(recurrent_out.data, dtype=np.float32)) > self.energy.activation_threshold)
+        )
         self.branching_recurrent.update(recurrent_activity)
 
         h = self.input_proj(obs, learning_rate, requires_grad=requires_grad) + recurrent_out
@@ -2742,17 +2984,20 @@ class SparseRNNCell(Module):
                 # Bounded to +/-2x the base density so a noisy early
                 # estimate can't send the target somewhere degenerate.
                 m_target = 0.98
-                density_override = float(np.clip(
-                    self.energy.density * (1.0 + 2.0 * (m - m_target)),
-                    self.energy.density * 0.5, self.energy.density * 2.0,
-                ))
+                density_override = float(
+                    np.clip(
+                        self.energy.density * (1.0 + 2.0 * (m - m_target)),
+                        self.energy.density * 0.5,
+                        self.energy.density * 2.0,
+                    )
+                )
 
         new_state, aux_loss, actual_p = self.energy(h, density_override=density_override)
 
         # Cache this call's gating decision for the NEXT call's CSR
         # construction (pre-gating h, not h_out -- see class docstring).
         self._prev_kept_indices = self.energy.kept_indices
-        self._prev_h_dense      = np.asarray(h.data, dtype=np.float32).ravel().copy()
+        self._prev_h_dense = np.asarray(h.data, dtype=np.float32).ravel().copy()
 
         return new_state, aux_loss, actual_p
 
@@ -2762,7 +3007,7 @@ class SparseRNNCell(Module):
         # call (e.g. after an external reset or a loaded checkpoint), so
         # the cached kept_indices/h_dense no longer describe it.
         self._prev_kept_indices = None
-        self._prev_h_dense      = None
+        self._prev_h_dense = None
         self.branching_recurrent.reset()
 
     def synaptogenesis(self, k: int, importance_cutoff: float, max_weights: int):
@@ -2779,28 +3024,28 @@ class SparseRNNCell(Module):
         recurrent generally have different row counts and a single
         scalar can't be a correct per-row cap for both at once."""
         input_proj_cap = max(1, max_weights // self.input_proj.in_features)
-        recurrent_cap  = max(1, max_weights // self.recurrent.in_features)
+        recurrent_cap = max(1, max_weights // self.recurrent.in_features)
         self.input_proj.synaptogenesis(k, importance_cutoff, input_proj_cap)
-        self.recurrent .synaptogenesis(k, importance_cutoff, recurrent_cap)
+        self.recurrent.synaptogenesis(k, importance_cutoff, recurrent_cap)
 
     def state_dict(self) -> dict:
         return {
             "input_proj": self.input_proj.state_dict(),
-            "recurrent":  self.recurrent .state_dict(),
-            "energy":     self.energy    .state_dict(),
+            "recurrent": self.recurrent.state_dict(),
+            "energy": self.energy.state_dict(),
         }
 
     def load_state_dict(self, d: dict):
         self.input_proj.load_state_dict(d["input_proj"])
-        self.recurrent .load_state_dict(d["recurrent"])
-        self.energy    .load_state_dict(d["energy"])
+        self.recurrent.load_state_dict(d["recurrent"])
+        self.energy.load_state_dict(d["energy"])
         self.reset()  # loaded weights, not a state this cell itself produced
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SparseRNNAgent
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class SparseRNNAgent(Module):
     """
@@ -2814,10 +3059,18 @@ class SparseRNNAgent(Module):
     aux_loss is public so callers can sum it with task losses before backward.
     """
 
-    def __init__(self, n_inputs: int, n_actions: int, state_size: int, max_weights: int,
-                 num_cpus: int = 4, percent_active: float = 0.03,
-                 lr: float = 1e-3, importance_cutoff: float = 0.01,
-                 synaptogenesis_k: int = 4):
+    def __init__(
+        self,
+        n_inputs: int,
+        n_actions: int,
+        state_size: int,
+        max_weights: int,
+        num_cpus: int = 4,
+        percent_active: float = 0.03,
+        lr: float = 1e-3,
+        importance_cutoff: float = 0.01,
+        synaptogenesis_k: int = 4,
+    ):
         # build_probes(k) generates min(k, n_in) * min(k, n_out) candidate
         # pairs (top-k input rows outer-producted against top-k output
         # columns) -- O(k^2), not O(k). Measured directly: on a 1000x1000
@@ -2835,18 +3088,18 @@ class SparseRNNAgent(Module):
 
         self.state = Tensor(np.zeros(state_size, dtype=np.float32))
 
-        self.n_inputs    = n_inputs
-        self.n_actions   = n_actions
-        self.state_size  = state_size
+        self.n_inputs = n_inputs
+        self.n_actions = n_actions
+        self.state_size = state_size
         self.max_weights = max_weights
 
-        self.lr                = lr
+        self.lr = lr
         self.importance_cutoff = importance_cutoff
-        self.synaptogenesis_k  = synaptogenesis_k
+        self.synaptogenesis_k = synaptogenesis_k
 
         self._step_count = 0
-        self.aux_loss:   Optional[Tensor] = None
-        self._actual_p:  float = 0.0
+        self.aux_loss: Tensor | None = None
+        self._actual_p: float = 0.0
 
     def parameters(self) -> list:
         return []
@@ -2859,10 +3112,10 @@ class SparseRNNAgent(Module):
         inline whenever backward() eventually runs (see module docstring) --
         forward() itself never updates anything, only backward() does."""
         h_out, aux_loss, actual_p = self.cell(obs, self.state, self.lr)
-        self.state      = h_out
-        self.aux_loss   = aux_loss
-        self._actual_p  = actual_p
-        return int(np.argmax(np.asarray(self.state.data, dtype=np.float32)[:self.n_actions]))
+        self.state = h_out
+        self.aux_loss = aux_loss
+        self._actual_p = actual_p
+        return int(np.argmax(np.asarray(self.state.data, dtype=np.float32)[: self.n_actions]))
 
     def train_step(self, obs: Tensor) -> int:
         """
@@ -2903,17 +3156,17 @@ class SparseRNNAgent(Module):
         self._step_count += 1
 
     def reset_state(self):
-        self.state    = Tensor(np.zeros(self.state_size, dtype=np.float32))
+        self.state = Tensor(np.zeros(self.state_size, dtype=np.float32))
         self.aux_loss = None
         self.cell.reset()
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def save(self, path: str):
-        d    = self.cell.state_dict()
+        d = self.cell.state_dict()
         flat = {
             "_step_count": np.array([self._step_count]),
-            "_state":      np.asarray(self.state.data, dtype=np.float32),
+            "_state": np.asarray(self.state.data, dtype=np.float32),
         }
         for section, sub in d.items():
             for k, v in sub.items():
@@ -2923,21 +3176,24 @@ class SparseRNNAgent(Module):
     def load(self, path: str):
         raw = np.load(path, allow_pickle=False)
         self._step_count = int(raw["_step_count"][0])
-        self.state       = Tensor(raw["_state"].copy())
+        self.state = Tensor(raw["_state"].copy())
 
         def _section(prefix):
-            return {k[len(prefix)+2:]: raw[k] for k in raw if k.startswith(prefix + "__")}
+            return {k[len(prefix) + 2 :]: raw[k] for k in raw if k.startswith(prefix + "__")}
 
-        self.cell.load_state_dict({
-            "input_proj": _section("input_proj"),
-            "recurrent":  _section("recurrent"),
-            "energy":     {"energy": raw.get("energy__energy", np.zeros(0, dtype=np.float32))},
-        })
+        self.cell.load_state_dict(
+            {
+                "input_proj": _section("input_proj"),
+                "recurrent": _section("recurrent"),
+                "energy": {"energy": raw.get("energy__energy", np.zeros(0, dtype=np.float32))},
+            }
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UnifiedOptimizer
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class UnifiedOptimizer:
     """
@@ -2946,9 +3202,9 @@ class UnifiedOptimizer:
     """
 
     def __init__(self, model: Module, lr: float = 0.001):
-        self.lr               = lr
-        self._tensor_params   = model.parameters()       # Tensors via _iter_leaves
-        self._sparse_layers   = self._find_sparse(model)
+        self.lr = lr
+        self._tensor_params = model.parameters()  # Tensors via _iter_leaves
+        self._sparse_layers = self._find_sparse(model)
 
     def _find_sparse(self, module: Module) -> list:
         out = []
@@ -2969,6 +3225,6 @@ class UnifiedOptimizer:
         for p in self._tensor_params:
             if p.grad is not None:
                 p.data -= self.lr * p.grad
-                p.grad  = None
+                p.grad = None
         for layer in self._sparse_layers:
             layer.step(self.lr)
