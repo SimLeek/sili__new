@@ -83,8 +83,8 @@ inline void banded_attention_forward(
             sum_e += s;
         }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : scores)
-            s *= inv;
+        std::transform(scores.begin(), scores.end(), scores.begin(),
+                       [inv](float s) { return s * inv; });
 
         // Weighted sum of V.
         for (std::size_t bi = 0; bi < band_w; ++bi) {
@@ -190,8 +190,8 @@ inline void sparse_banded_attention_forward(
             sum_e += s;
         }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : scores)
-            s *= inv;
+        std::transform(scores.begin(), scores.end(), scores.begin(),
+                       [inv](float s) { return s * inv; });
 
         // Weighted V sum.
         for (std::size_t bi = 0; bi < kk; ++bi) {
@@ -413,8 +413,7 @@ banded_attention_backward(const float* q, ///< [T x d] forward inputs (needed to
             sum_e += s;
         }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : attn)
-            s *= inv;
+        std::transform(attn.begin(), attn.end(), attn.begin(), [inv](float s) { return s * inv; });
 
         // g[t] = sum_k( attn[k] * (dO[t] . V[k]) )
         float g = 0.0f;
@@ -526,8 +525,7 @@ inline void sparse_banded_attention_backward(
             sum_e += s;
         }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : attn)
-            s *= inv;
+        std::transform(attn.begin(), attn.end(), attn.begin(), [inv](float s) { return s * inv; });
 
         // g[t] = sum_k( attn[k] * (dO[t].V[k]) )
         float g = 0.0f;
@@ -667,7 +665,6 @@ sparse_attention_backward(const float* q, const float* k_mat, const float* v, co
 // dL/dK[k_idx[ki]] += scale * sum_{qi}( ds[qi,ki] * Q[q_idx[qi]] )
 #pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t qi = 0; qi < kk; ++qi) {
-        const float* qr = q + q_idx[qi] * d;
         const float* dOr = dO + q_idx[qi] * d;
         float* dQr = dQ + q_idx[qi] * d;
         for (std::size_t ki = 0; ki < kk; ++ki) {
@@ -758,9 +755,7 @@ inline void gaussian_attention_forward(
             scores[j] = dot * scale - diff * diff * inv_2s2;
         }
 
-        float max_s = -1e38f;
-        for (std::size_t j = 0; j < K; ++j)
-            max_s = std::max(max_s, scores[j]);
+        const float max_s = *std::max_element(scores.begin(), scores.end());
         float sum_e = 0.0f;
         for (std::size_t j = 0; j < K; ++j) {
             scores[j] = std::exp(scores[j] - max_s);

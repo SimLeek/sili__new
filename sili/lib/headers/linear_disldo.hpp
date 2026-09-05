@@ -226,8 +226,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             const int tid = omp_get_thread_num();
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
 #pragma omp for schedule(static)
-            for (int64_t ti = 0; ti < n_tiles_local; ++ti) {
-                const uint32_t br = tile_br[std::size_t(ti)], bc = tile_bc[std::size_t(ti)];
+            for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
+                const uint32_t br = tile_br[std::size_t(row_ti)], bc = tile_bc[std::size_t(row_ti)];
                 // const: routes .at() through the const overload, which
                 // does NOT mark the handle dirty -- forward is read-only,
                 // so a sparse tile's destructor should do nothing here
@@ -235,8 +235,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 // collection loop above already knows this tile's exact
                 // storage position, so skip find()'s redundant O(row_nnz)
                 // re-scan (see collection loop's comment).
-                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(ti)],
-                                                          tile_byte[std::size_t(ti)]);
+                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(row_ti)],
+                                                          tile_byte[std::size_t(row_ti)]);
                 // Resolved ONCE per tile instead of once per .at() call
                 // (16 calls/tile below otherwise, each re-branching on
                 // whether this tile is sparse-packed -- a property that
@@ -559,11 +559,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // BOTH value_scale[row] and output_scale[col] are finalized for
     // this whole call (output_scale's own reduction runs last, after
     // every row AND after block4 -- see the end of this function).
+    // Always constructed via full brace-init at its one push_back call
+    // site below (never member-by-member) -- false positive.
     struct DeferredScaleWriteEntry {
+        // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t vb;
         value_type cw;
         value_type ci;
+        // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t row;
+        // cppcheck-suppress uninitMemberVarNoCtor
         COL_TYPE col;
     };
     std::vector<std::vector<DeferredScaleWriteEntry>> t_deferred;
@@ -728,18 +733,26 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
             // Per-component now: mcol[col*rank+k]. Indexing helper local to
             // this thread, rank captured from the enclosing scope.
+            // (false positive on all m*_base pointers below: cppcheck can't
+            // trace that they're mutated indirectly through the m*_at
+            // lambdas, which return mutable references derived from
+            // indexing them -- e.g. mcol_at(col,k) += ...)
+            // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
                 t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_base[col * rank + k];
             };
+            // cppcheck-suppress constVariablePointer
             value_type* mcol_contrib_base =
                 t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_contrib_base[col * rank + k];
             };
+            // cppcheck-suppress constVariablePointer
             value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
             auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+            // cppcheck-suppress constVariablePointer
             value_type* mgamma_contrib_base =
                 t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
             auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
@@ -1256,20 +1269,24 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             // accessors; there is no separate rank-1-strided pointer,
             // which would alias incorrectly against this same buffer once
             // rank>1.
+            // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
                 t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_base[col * rank + k];
             };
+            // cppcheck-suppress constVariablePointer
             double* mrow_base = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank;
             auto mrow_at = [&](std::size_t row, std::size_t k) -> double& {
                 return mrow_base[row * rank + k];
             };
+            // cppcheck-suppress constVariablePointer
             value_type* mcol_contrib_base =
                 t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
             auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_contrib_base[col * rank + k];
             };
+            // cppcheck-suppress constVariablePointer
             double* mrow_contrib_base =
                 t_row_grad_contrib.data() + static_cast<std::size_t>(tid) * n_in * rank;
             auto mrow_at_contrib = [&](std::size_t row, std::size_t k) -> double& {
@@ -1284,8 +1301,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             // path's own mgamma_at uses -- both regions' threads
             // accumulate into the same shared array, reduced together once
             // after both parallel regions close.
+            // cppcheck-suppress constVariablePointer
             value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
             auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+            // cppcheck-suppress constVariablePointer
             value_type* mgamma_contrib_base =
                 t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
             auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
@@ -2700,8 +2719,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     auto bc_cursor = weights.block4.row_cursor(br);
                     std::size_t elem_pos = BL4.elem_start[br];
                     std::size_t byte_pos = weights.block4.tile_byte_start[br];
-                    for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1];
-                         ++ti, ++elem_pos) {
+                    for (std::size_t row_ti = row_ti_start[br]; row_ti < row_ti_start[br + 1];
+                         ++row_ti, ++elem_pos) {
                         const uint32_t bc = bc_cursor.advance();
                         const auto tile =
                             weights.block4.at_index(uint32_t(br), bc, elem_pos, byte_pos);
@@ -2722,8 +2741,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     // necessary under concurrency, not just an optimization.
                     auto ws = weights.block4.snapshot_row(br);
                     std::size_t live_byte_pos = 0;
-                    for (std::size_t ti = row_ti_start[br]; ti < row_ti_start[br + 1]; ++ti) {
-                        const std::size_t e = ti - row_ti_start[br];
+                    for (std::size_t row_ti = row_ti_start[br]; row_ti < row_ti_start[br + 1];
+                         ++row_ti) {
+                        const std::size_t e = row_ti - row_ti_start[br];
                         const uint32_t bc = ws.bc[e];
                         const std::size_t this_byte_pos = live_byte_pos;
                         // Sized per VALUES_TYPE: FP8's Block4Tile8 is 32
@@ -2746,7 +2766,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         else
                             live_byte_pos +=
                                 block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
-                    } // closes for (ti...)
+                    } // closes for (row_ti...)
                     // Merge back -- evicts lowest-|true-importance| synapses
                     // only if this row genuinely grew past its own current
                     // headroom (see Block4Store::merge_row_workspace's

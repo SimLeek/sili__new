@@ -267,8 +267,6 @@ void sisldo_backward_trivalues(const CSRInput<SIZE_TYPE, VALUE_TYPE>& in_tensor,
 
     const auto& conn_ptrs = *weights.connections.ptrs[0];
     const auto& conn_indices = *weights.connections.indices[0];
-    auto& conn_val = *weights.connections.values[0];
-    auto& conn_str = *weights.connections.values[1];
 
     std::vector<SIZE_TYPE> weight_grad_offsets;
     std::vector<SIZE_TYPE> input_grad_offsets;
@@ -277,6 +275,8 @@ void sisldo_backward_trivalues(const CSRInput<SIZE_TYPE, VALUE_TYPE>& in_tensor,
     {
         const int tid = omp_get_thread_num();
         const int nthreads = omp_get_num_threads();
+        auto& conn_val = *weights.connections.values[0];
+        auto& conn_str = *weights.connections.values[1];
 
         std::vector<VALUE_TYPE> local_input_accum(num_inputs, VALUE_TYPE(0));
         std::vector<VALUE_TYPE> local_grad_accum(num_outputs, VALUE_TYPE(0));

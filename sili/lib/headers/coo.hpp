@@ -114,7 +114,7 @@ std::size_t inplace_merge_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::
         }
 
         if (less_than) {
-            i++;
+            ++i;
         } else if (equal) {
             // Sum duplicate values
             for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
@@ -129,9 +129,9 @@ std::size_t inplace_merge_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::
                     (*values[valIdx])[k] = (*values[valIdx])[k + 1];
                 }
             }
-            duplicates++;
+            ++duplicates;
 #pragma omp atomic
-            right--;
+            --right;
         } else {
             // Rotate element from right half to left
             for (std::size_t idx = 0; idx < numIndices; ++idx) {
@@ -151,9 +151,9 @@ std::size_t inplace_merge_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::
             }
 
             // Update indices
-            i++;
-            mid++;
-            j++;
+            ++i;
+            ++mid;
+            ++j;
         }
     }
     return duplicates;
@@ -184,7 +184,7 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std:
     using INDEX_TYPE = std::remove_pointer_t<decltype(indices[0].get())>::value_type;
 
     INDEX_TYPE duplicates = 0;
-    for (INDEX_TYPE i = left + 1; i <= right; i++) {
+    for (INDEX_TYPE i = left + 1; i <= right; ++i) {
         VALUE_TYPE temp_indices[numIndices];
         VALUE_TYPE temp_values[numValues];
         for (std::size_t idx = 0; idx < numIndices; ++idx) {
@@ -212,7 +212,7 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std:
             for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
                 (*values[valIdx])[j] = (*values[valIdx])[j - 1];
             }
-            j--;
+            --j;
         }
         // Insert the current element into its correct position
         for (std::size_t idx = 0; idx < numIndices; ++idx) {
@@ -240,7 +240,7 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std:
             }
 
             // Remove the duplicate element
-            for (INDEX_TYPE k = j; k < right; k++) {
+            for (INDEX_TYPE k = j; k < right; ++k) {
                 for (std::size_t idx = 0; idx < numIndices; ++idx) {
                     (*indices[idx])[k] = (*indices[idx])[k + 1];
                 }
@@ -248,10 +248,10 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std:
                     (*values[valIdx])[k] = (*values[valIdx])[k + 1];
                 }
             }
-            duplicates++;
+            ++duplicates;
 #pragma omp atomic
-            right--;
-            i--; // Adjust 'i' because the array size has decreased
+            --right;
+            --i; // Adjust 'i' because the array size has decreased
         }
     }
     return duplicates;
@@ -301,7 +301,7 @@ std::size_t recursive_merge_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values
             // Adjust indices after handling duplicates
             if (left_duplicates > 0) {
                 // Shift the right subarray to the left by left_duplicates
-                for (INDEX_TYPE i = mid + 1; i <= right; i++) {
+                for (INDEX_TYPE i = mid + 1; i <= right; ++i) {
                     for (std::size_t idx = 0; idx < numIndices; ++idx) {
                         (*indices[idx])[i - left_duplicates] = (*indices[idx])[i];
                     }
@@ -411,9 +411,9 @@ SIZE_TYPE inplace_merge_coo_external(SIZE_TYPE *cols,
             ext_vals[i] = temp_ext_val;
 
             // Update indices
-            i++;
-            mid++;
-            j++;
+            ++i;
+            ++mid;
+            ++j;
         }
     }
     return;
@@ -858,14 +858,12 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS& m_indices, VALUE_ARRAYS& m_
             n_ends[std::min((size_t)num_threads - 1, std::min(n_size - 1, m_size - 1))];
 
         chunk_size = (n_size - final_end + num_threads - 1) / num_threads;
-        size_t c_start =
-            m_size - scanned_duplicates[num_threads] + final_end + thread_id * chunk_size;
-        size_t c_end =
-            std::min(c_start + chunk_size, m_size + n_size - scanned_duplicates[num_threads]);
         size_t n_start = final_end + thread_id * chunk_size;
         size_t n_end = std::min(n_start + chunk_size, n_size);
 
         if (n_end > n_start) { // this prevents segfaults from unsigned types
+            size_t c_start =
+                m_size - scanned_duplicates[num_threads] + final_end + thread_id * chunk_size;
             for (size_t idx = 0; idx < n_end - n_start; ++idx) {
                 size_t n_idx = idx + n_start;
                 size_t c_idx = idx + c_start;

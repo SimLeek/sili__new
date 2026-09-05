@@ -30,10 +30,17 @@
 // the k_estimate largest-magnitude elements, treat the rest as noise (not
 // "whatever happens to be exactly zero").
 
+// No ctor, but every scalar field below is unconditionally assigned on
+// every branch of hoyer_sparsify_row before any return -- cppcheck can't
+// see across the early-return branch, false positive.
 struct HoyerSparsifyRow {
+    // cppcheck-suppress uninitMemberVarNoCtor
     float l1_norm;
+    // cppcheck-suppress uninitMemberVarNoCtor
     float l2_norm;
-    float hoyer_score;         // normalized [0,1], 0=dense, 1=maximally sparse
+    // cppcheck-suppress uninitMemberVarNoCtor
+    float hoyer_score; // normalized [0,1], 0=dense, 1=maximally sparse
+    // cppcheck-suppress uninitMemberVarNoCtor
     int k_estimate;            // (l1/l2)^2, rounded, clamped to [0, n]
     std::vector<int> indices;  // top-k_estimate indices, ascending
     std::vector<float> values; // corresponding values (not zeroed elsewhere)
