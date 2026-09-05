@@ -1,40 +1,12 @@
 // Fair block4-vs-dense-FP4-floor benchmark, batch=1 (sili's real-time
-// target -- see TODO_DUAL_BLOCK4.md's Part C).
-//
-// Two things this specifically corrects, both real methodology bugs
-// found and fixed during the investigation this file documents:
-//
-// 1. An earlier "dense floor" used plain float32 weights with no FP4
-//    cost at all, making block4 look ~20x off. FP4 encode/decode is
-//    required regardless of representation -- not a cost to blame on
-//    block4. The floor here decodes/encodes through the SAME
-//    FP4_TABLE / fp4_quantize_stochastic block4 itself uses.
-//
-// 2. A later "dense floor" got the FP4 codec right but still only did a
-//    bare weight update (no value_scale/output_scale composition, no
-//    per-synapse importance tracking/damping, deterministic not
-//    stochastic re-quantization) -- while the block4 benchmark it was
-//    compared against used learning_rate=0, which skips ALL of that
-//    same work on block4's side too, but for a DIFFERENT (accidental)
-//    reason. Neither comparison was apples-to-apples. This benchmark
-//    runs BOTH sides through the real block4 disldo_forward/
-//    disldo_backward feature set (value_scale/output_scale,
-//    damp_by_importance, stochastic re-quantize of both weight and
-//    importance nibbles) at a real, nonzero learning_rate, matching
-//    what real online learning actually pays.
-//
-// Result once corrected: block4 backward beats the fair dense floor at
-// EVERY density tested, including 100% (the earlier "~3x slower"
-// framing was measuring an unfair baseline, not a real block4
-// shortfall). Forward remains genuinely slower (~5x) since forward at
-// learning_rate=0 -- the case this library's block4 population is
-// normally read through -- never touches the importance/stochastic
-// machinery that backward's SIMD wins on.
+// target -- see TODO_DUAL_BLOCK4.md's Part C). Corrects two real
+// methodology bugs from earlier versions and the result once fixed:
+// see docs/research/bench_block4_vs_dense_fp4.rst:
+// bench_block4_vs_dense_fp4.methodology_bugs.
 //
 // Usage: run once per density point, in a FRESH process each time --
-// see TODO_DUAL_BLOCK4.md's Part C for why a bare sequential loop over
-// multiple densities in one process is unreliable (a real
-// thermal/frequency-scaling confound hit twice in this file's history).
+// see docs/research/bench_block4_vs_dense_fp4.rst:
+// bench_block4_vs_dense_fp4.fresh_process_per_density for why.
 //   g++ -std=c++20 -O3 -ffast-math -march=native -fopenmp \
 //     -I <repo_root> scripts/bench_block4_vs_dense_fp4.cpp -o bench_b4_vs_dense
 //   ./bench_b4_vs_dense 0.10   # tile-fill fraction, 0.0-1.0
@@ -88,10 +60,9 @@ int main(int argc, char** argv) {
     for (auto& v : dy)
         v = data_dist(rng);
 
-    // ---- block4 side: bulk-load tile_fraction of all possible tile
-    // positions directly (matches the planned "load network into
-    // block4, then prune/grow" workflow -- NOT growth-driven promotion,
-    // which only touches a probe-budget-limited fraction per run). ----
+    // block4 side: bulk-load tile_fraction of all tile positions directly
+    // (matches the planned "load network into block4, then prune/grow"
+    // workflow, not growth-driven promotion).
     Weights w_b4;
     std::vector<SIZE_TYPE> empty_ptrs(n_in + 1, 0);
     w_b4.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -136,14 +107,11 @@ int main(int argc, char** argv) {
                                      }) *
                              1e3;
 
-    // ---- fair dense-FP4 floor: SAME per-element math block4's
-    // disldo_forward/disldo_backward do (value_scale/output_scale
-    // composition, damp_by_importance, stochastic re-quantize of BOTH
-    // weight and importance nibbles), on a flat n_in x n_out byte array
-    // -- no tile/block/CSR indirection at all. Always processes the
-    // FULL matrix regardless of tile_fraction (a dense loop has no
-    // sparsity to exploit) -- this is the fixed floor block4 is
-    // compared against at every density. ----
+    // Fair dense-FP4 floor: same per-element math as block4's
+    // disldo_forward/disldo_backward, flat n_in x n_out byte array, no
+    // tile/CSR indirection. Always processes the FULL matrix (a dense
+    // loop has no sparsity to exploit) -- the fixed floor block4 is
+    // compared against at every density.
     std::vector<uint8_t> Wd(std::size_t(n_in) * n_out);
     for (auto& v : Wd)
         v = fp4_quantize(val_dist(rng)) | (fp4_quantize(0.5f) << 4);
