@@ -85,7 +85,7 @@ template <typename A, typename B, typename Compare> class AbsComparator {
      * @brief Constructs the comparator with a vector and comparison function.
      * @param cmp Comparator to use for ordering.
      */
-    AbsComparator(Compare cmp) : cmp(cmp) {}
+    explicit AbsComparator(Compare cmp) : cmp(cmp) {}
 
     /**
      * @brief Compares two indices based on their corresponding values.

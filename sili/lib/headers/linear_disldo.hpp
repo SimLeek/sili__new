@@ -559,11 +559,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // BOTH value_scale[row] and output_scale[col] are finalized for
     // this whole call (output_scale's own reduction runs last, after
     // every row AND after block4 -- see the end of this function).
+    // Always constructed via full brace-init at its one push_back call
+    // site below (never member-by-member) -- false positive.
     struct DeferredScaleWriteEntry {
+        // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t vb;
         value_type cw;
         value_type ci;
+        // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t row;
+        // cppcheck-suppress uninitMemberVarNoCtor
         COL_TYPE col;
     };
     std::vector<std::vector<DeferredScaleWriteEntry>> t_deferred;

@@ -99,6 +99,11 @@ template <class SIZE_TYPE, class PTRS, class INDICES, class VALUES> struct spars
     /**
      * @brief Default constructor, initializes an empty sparse matrix.
      */
+    // (false positive: ptrs/indices/values are class types -- e.g.
+    // std::array<std::shared_ptr<...>> -- with their own default ctors, so
+    // they're safely default-constructed even though this ctor's own
+    // init-list only lists the POD SIZE_TYPE members.)
+    // cppcheck-suppress uninitMemberVar
     sparse_struct() : rows(0), cols(0), _reserved_space(0) {}
 
     /**

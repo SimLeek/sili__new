@@ -370,9 +370,9 @@ std::vector<SIZE_TYPE> top_k_indices_biased(VALUE_TYPE* values,
 
     merged_pairs.resize(k);
     std::vector<SIZE_TYPE> indices;
-    for (const auto& pair : merged_pairs) {
-        indices.push_back(pair.first);
-    }
+    indices.reserve(merged_pairs.size());
+    std::transform(merged_pairs.begin(), merged_pairs.end(), std::back_inserter(indices),
+                   [](const auto& pair) { return pair.first; });
 
     return indices;
 }

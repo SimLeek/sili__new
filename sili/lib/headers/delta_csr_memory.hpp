@@ -153,7 +153,10 @@ void delta_csr_combined_to_absolute(
         out_weights.clear();
         out_importance.clear();
 
+        // Always constructed via full brace-init at every push_back call
+        // site below -- false positive, same as Found above.
         struct Entry {
+            // cppcheck-suppress uninitMemberVarNoCtor
             COL_TYPE col;
             value_type w, imp;
         };
@@ -672,9 +675,14 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
         const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
         const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, L.cols);
 
+        // Always constructed via full brace-init at its one push_back call
+        // site below (never member-by-member), so cppcheck's "no
+        // initializer" warning here is a false positive.
         struct Found {
+            // cppcheck-suppress uninitMemberVarNoCtor
             std::size_t row;
             COL_TYPE col;
+            // cppcheck-suppress uninitMemberVarNoCtor
             std::size_t elem_idx;
         };
         std::vector<Found> found;
@@ -1171,8 +1179,11 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
     std::sort(by_imp.begin(), by_imp.end(),
               [&](std::size_t a, std::size_t b) { return exist_imp[a] < exist_imp[b]; });
 
+    // Always constructed via full brace-init at its one push_back call site
+    // below -- false positive, same as Found above.
     struct RemoveEntry {
         COL_TYPE col;
+        // cppcheck-suppress uninitMemberVarNoCtor
         bool is_b4;
     };
     std::vector<RemoveEntry> to_remove;

@@ -590,7 +590,7 @@ struct FP4BiPacked {
 
     FP4BiPacked() : _data(), _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
 
-    FP4BiPacked(std::vector<uint8_t>&& data)
+    explicit FP4BiPacked(std::vector<uint8_t>&& data)
         : _data(std::make_shared<std::vector<uint8_t>>(std::move(data))),
           _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
 

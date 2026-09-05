@@ -541,6 +541,10 @@ inline uint32_t block4_count_live8(const uint8_t dense[BLOCK4_TILE_SLOTS8_BYTES]
     return n;
 }
 
+// (false positive: this genuinely reads the instance's own `data` member,
+// via its implicit decay to a pointer argument -- cppcheck's checker
+// doesn't attribute that as "uses a member")
+// cppcheck-suppress functionStatic
 inline uint32_t Block4Tile8::count_live() const {
     return block4_count_live8(data);
 }
@@ -1470,7 +1474,7 @@ struct Block4Store {
     }
 
     // Returns the byte offset of local tile index `e`'s start
-    std::size_t workspace_tile_byte_pos(const RowWorkspace& ws, std::size_t e) const {
+    static std::size_t workspace_tile_byte_pos(const RowWorkspace& ws, std::size_t e) {
         std::size_t pos = 0;
         for (std::size_t i = 0; i < e; ++i)
             pos += block4_stored_tile_len(ws.is_sparse[i], &ws.bytes[pos]);
@@ -1502,8 +1506,9 @@ struct Block4Store {
     }
 
     // Unpacks local tile `e` into `scratch`
-    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
-                               uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
+    static void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e,
+                                      std::size_t local_byte_pos,
+                                      uint8_t scratch[BLOCK4_TILE_SLOTS]) {
         if (ws.is_sparse[e])
             block4_sparse_unpack(&ws.bytes[local_byte_pos], scratch);
         else
@@ -1997,7 +2002,7 @@ struct Block4Store8 {
         return ws;
     }
 
-    std::size_t workspace_tile_byte_pos(const RowWorkspace& ws, std::size_t e) const {
+    static std::size_t workspace_tile_byte_pos(const RowWorkspace& ws, std::size_t e) {
         std::size_t pos = 0;
         for (std::size_t i = 0; i < e; ++i)
             pos += block4_stored_tile_len8(ws.is_sparse[i], &ws.bytes[pos]);
@@ -2027,8 +2032,9 @@ struct Block4Store8 {
         ws.is_sparse[e] = now_sparse ? 1 : 0;
     }
 
-    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
-                               uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) const {
+    static void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e,
+                                      std::size_t local_byte_pos,
+                                      uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) {
         if (ws.is_sparse[e])
             block4_sparse_unpack8(&ws.bytes[local_byte_pos], scratch);
         else

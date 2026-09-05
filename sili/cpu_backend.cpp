@@ -4273,7 +4273,7 @@ PYBIND11_MODULE(_cpu, m) {
         "csr_union",
         [](py::array_t<int> ptrs_a, py::array_t<int> idx_a, py::array_t<float> vals_a,
            py::array_t<int> ptrs_b, py::array_t<int> idx_b, py::array_t<float> vals_b, int n_rows,
-           std::string prefer, int num_cpus) -> py::tuple {
+           const std::string& prefer, int num_cpus) -> py::tuple {
             auto to_vec_i = [](py::array_t<int>& a) {
                 auto buf = a.request();
                 return std::vector<int>((int*)buf.ptr, (int*)buf.ptr + buf.size);
