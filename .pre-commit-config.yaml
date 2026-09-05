@@ -67,10 +67,7 @@ repos:
         # practice).
         # cppcheck-remediation pass (task #386 followup): lib/headers/scan.hpp
         # 44.7% (down to a single real 47-line function after removing dead
-        # code -- same "tiny file, N/A in practice" case as sparse_struct.hpp
-        # above), lib/headers/sisldo_ops.hpp 30.1% (justified cppcheck-suppress
-        # comments nudged it barely back over the same razor's-edge threshold
-        # noted below as "dropped below 30% after clang-format").
+        # code -- same "tiny file, N/A in practice" case as sparse_struct.hpp above).
         # task #389 (comment-to-research-doc pass): lib/headers/linear_disldo.hpp
         # moved its research narrative to docs/research/linear_disldo.rst and
         # dropped from 44.5% to under 30% -- removed from this list. energy.py
@@ -97,7 +94,9 @@ repos:
         # docs/research/hoyer_sparsify.rst, 30.3% -> under 30% (the 4
         # cppcheck-suppress comments on HoyerSparsifyRow's fields stayed
         # untouched -- those are lint-tooling directives, not narrative).
-        exclude: ^(tests/|sili/__init__\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp)
+        # lib/headers/sisldo_ops.hpp did the same to docs/research/sisldo_ops.rst,
+        # 30.3% -> under 30% (the 8 cppcheck-suppress comments stayed untouched).
+        exclude: ^(tests/|sili/__init__\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/scan\.hpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)
