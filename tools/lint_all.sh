@@ -71,7 +71,7 @@ if [ -f compile_commands.json ]; then
     advisory "clang-tidy (full)" bash -c \
       "find sili -name '*.cpp' -print0 | xargs -0 -n1 run-clang-tidy -p . -header-filter='.*' -quiet 2>/dev/null | grep -E 'warning:|error:' | head -40"
 else
-    skip "clang-tidy (no compile_commands.json — build with cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or run: bear -- make)"
+    skip "clang-tidy (no compile_commands.json — run: python3 tools/gen_compile_commands.py)"
 fi
 
 if command -v cppcheck >/dev/null && [ "${#hpp_files[@]}" -gt 0 ]; then
