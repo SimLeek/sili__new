@@ -70,8 +70,7 @@ repos:
         # Also 3 one-off benchmark
         # scripts (mostly header-comment-driven, never covered by this
         # hook before it applied repo-wide):
-        # scripts/bench_block4_vs_dense_fp4.cpp 31.1%,
-        # scripts/bench_block4_memory_and_compression.cpp 40.2%.
+        # scripts/bench_block4_vs_dense_fp4.cpp 31.1%.
         # cppcheck-remediation pass (task #386 followup): lib/headers/scan.hpp
         # 44.7% (down to a single real 47-line function after removing dead
         # code -- same "tiny file, N/A in practice" case as sparse_struct.hpp
@@ -91,7 +90,10 @@ repos:
         # sparse_rnn.py did the same to docs/research/sparse_rnn.rst, 43.0% -> under 30%.
         # scripts/bench_block4_fp8_simd.cpp did the same to
         # docs/research/bench_block4_fp8_simd.rst, 42.3% -> under 30%.
-        exclude: ^(tests/|sili/__init__\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/conversion/prune_sensitivity\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp|scripts/bench_block4_memory_and_compression\.cpp)
+        # scripts/bench_block4_memory_and_compression.cpp did the same to
+        # docs/research/bench_block4_memory_and_compression.rst, 40.2% ->
+        # under 30%.
+        exclude: ^(tests/|sili/__init__\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/conversion/prune_sensitivity\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)
