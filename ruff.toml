@@ -1,0 +1,44 @@
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # isort
+  "UP",            # pyupgrade
+  "B",             # flake8-bugbear
+  "SIM",           # flake8-simplify
+  "C90",           # mccabe complexity
+  "PL",            # pylint port
+  "RUF",           # ruff-specific
+  "NPY",           # numpy
+  "ARG",           # unused arguments
+  "ERA",           # commented-out code  <- the AI-slop killer
+  "S",             # bandit-equivalent security
+  "C4",            # comprehension style
+  "PIE",           # misc bugs
+  "RET",           # return style
+  "PERF",          # perf anti-patterns
+]
+ignore = [
+  "E501",          # line length handled by formatter
+  "PLR0913",       # too many args   (research code: _apply_energy_dynamics has 19)
+  "PLR0915",       # too many statements
+  "PLR2004",       # magic values    (research code)
+  "S101",          # assert          (asserts are load-bearing in this codebase)
+  "RET504",        # assignment before return (readability preference)
+]
+mccabe.max-complexity = 12
+
+[lint.pylint]
+max-args = 20
+max-locals = 40
+
+[lint.per-file-ignores]
+# Pre-existing style debt in a file whose failing tests are already
+# marked pre_existing_failure (task #320, investigated not fixed) --
+# NPY002/RUF002/RUF003/S306/SIM115/PLC0415 findings here predate this
+# lint setup and are out of scope for it; rewriting ~85 findings across
+# a known-broken legacy test file is a separate, deliberate task, not
+# a side effect of adding pre-commit hooks.
+"tests/unit/python/test_sili_pre_existing_failures.py" = ["NPY002", "RUF002", "RUF003", "S306", "SIM115", "PLC0415", "E402", "PLW0177"]

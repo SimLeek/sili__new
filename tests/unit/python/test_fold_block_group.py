@@ -24,13 +24,22 @@ pattern sili_peridot's per-suffix folding needs, since
 fold_sparse_payload bundles every suffix sharing a block range into one
 descriptor, which is wrong when suffixes have different out_dim).
 """
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
-import torch
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
 import pytest
 
-from sili.conversion.rnn_fold import fold_block_group, fold_sparse_payload, FoldedBlockDescriptor, SiliBlock
+torch = pytest.importorskip("torch")
+
+from sili.conversion.rnn_fold import (  # noqa: E402
+    FoldedBlockDescriptor,
+    SiliBlock,
+    fold_block_group,
+    fold_sparse_payload,
+)
 
 
 def _block_group_state_dict(n_layers=3, hidden=4, second_suffix="raw"):
@@ -93,10 +102,7 @@ class TestFoldBlockGroupRawEntries:
         sd = _block_group_state_dict(n_layers=3, second_suffix="raw")
         desc = fold_block_group(list(range(3)), sd, "model.layers.")
         stacked = desc.stacked_weights[".mlp.down_proj.weight"]
-        original_nnz = sum(
-            int((sd[f"model.layers.{i}.mlp.down_proj.weight"]["raw"] != 0).sum())
-            for i in range(3)
-        )
+        original_nnz = sum(int((sd[f"model.layers.{i}.mlp.down_proj.weight"]["raw"] != 0).sum()) for i in range(3))
         assert int(stacked.values().numel()) == original_nnz
 
     def test_true_scalar_stacks_like_a_bare_tensor_scalar_would(self):
@@ -116,7 +122,7 @@ class TestFoldBlockGroupRawEntries:
 
     def test_dict_entry_with_neither_key_raises(self):
         sd = _block_group_state_dict(n_layers=2, second_suffix="csr")
-        sd["model.layers.0.mlp.down_proj.weight"] = {"shape": (4, 4)}   # no csr, no raw
+        sd["model.layers.0.mlp.down_proj.weight"] = {"shape": (4, 4)}  # no csr, no raw
         with pytest.raises(ValueError, match="neither 'csr' nor 'raw'"):
             fold_block_group([0, 1], sd, "model.layers.")
 
@@ -127,7 +133,7 @@ class TestFoldSparsePayloadRemovalMatchesFoldedSuffixes:
         payload = {"sparse_state_dict": sd, "min_abs_param": 0.0, "meta": {}}
         out = fold_sparse_payload(payload)
         remaining = [k for k in out["sparse_state_dict"] if "layers." in k]
-        assert remaining == []   # both suffixes folded -- nothing left over
+        assert remaining == []  # both suffixes folded -- nothing left over
 
 
 class TestSiliBlockNoDensifyTranspose:
@@ -142,9 +148,12 @@ class TestSiliBlockNoDensifyTranspose:
         w = w * (torch.rand(n_folds * out_dim, in_dim) < 0.6)
         csr = w.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
         desc = FoldedBlockDescriptor(
-            n_folds=n_folds, block_indices=list(range(n_folds)),
-            stacked_weights={".w": csr}, out_dims={".w": out_dim},
-            band_half_widths={".w": None}, prefix="model.",
+            n_folds=n_folds,
+            block_indices=list(range(n_folds)),
+            stacked_weights={".w": csr},
+            out_dims={".w": out_dim},
+            band_half_widths={".w": None},
+            prefix="model.",
         )
         return desc, w
 

@@ -1,0 +1,66 @@
+# Runs on every commit. Hard gates: ruff, format, mypy, bandit, codespell,
+# gitleaks, shellcheck, pydoclint. Advisory-only tools (clang-tidy, cppcheck,
+# vulture, radon) live in tools/lint_all.sh instead.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4          # bump to latest
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [numpy]
+        # mypy.ini's own `exclude` only applies to recursive discovery, not
+        # to files pre-commit passes explicitly -- must exclude here too,
+        # or every commit touching a legacy test file hard-fails on its
+        # pre-existing untyped-def backlog.
+        exclude: ^tests/unit/python/
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.2
+    hooks:
+      - id: bandit
+        args: ["-c", ".bandit", "-r", "sili"]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        args: ["--skip", "*.sst,*.safetensors,*.cpp,*.hpp"]
+
+  - repo: https://github.com/jsh9/pydoclint
+    rev: 0.6.0
+    hooks:
+      - id: pydoclint
+        args: ["--style=numpy", "--check-return-types=False"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: ["--external-sources"]
+
+  - repo: local
+    hooks:
+      - id: comment-limit
+        name: comment density limit (<=30%)
+        entry: python3 tools/comment_limit.py
+        language: system
+        types_or: [python, c++, c]
+        exclude: ^tests/
+
+      - id: pytest-fast
+        name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)
+        entry: python3 -m pytest
+        language: system
+        pass_filenames: false
+        always_run: true

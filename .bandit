@@ -1,0 +1,2 @@
+skips: ["B101"]   # asserts are intentional here
+exclude_dirs: ["tests"]
