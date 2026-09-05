@@ -66,8 +66,8 @@ repos:
         # conversion/rnn_fold.py 38.0%, conversion/streaming_prune.py
         # 30.4%, conversion/prune_sensitivity.py 39.9%,
         # lib/headers/sparse_struct.hpp 38.1% (21-line file, N/A in
-        # practice), lib/headers/fp4quant.hpp 35.7%, lib/headers/fp8quant.hpp 32.5%,
-        # lib/headers/delta_csr_types.hpp 45.1%. Also 3 one-off benchmark
+        # practice), lib/headers/fp4quant.hpp 35.7%, lib/headers/fp8quant.hpp 32.5%.
+        # Also 3 one-off benchmark
         # scripts (mostly header-comment-driven, never covered by this
         # hook before it applied repo-wide):
         # scripts/bench_block4_vs_dense_fp4.cpp 31.1%,
@@ -87,8 +87,9 @@ repos:
         # dropped from 44.5% to under 30% -- removed from this list. energy.py
         # did the same to docs/research/energy.rst, 54.8% -> under 30%.
         # rl_utils.py did the same to docs/research/rl_utils.rst, 52.5% ->
-        # under 30%.
-        exclude: ^(tests/|sili/sparse_rnn\.py|sili/__init__\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/conversion/prune_sensitivity\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/delta_csr_types\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp|scripts/bench_block4_memory_and_compression\.cpp|scripts/bench_block4_fp8_simd\.cpp)
+        # under 30%. lib/headers/delta_csr_types.hpp did the same to
+        # docs/research/delta_csr_types.rst, 45.2% -> under 30%.
+        exclude: ^(tests/|sili/sparse_rnn\.py|sili/__init__\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/conversion/prune_sensitivity\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp|scripts/bench_block4_memory_and_compression\.cpp|scripts/bench_block4_fp8_simd\.cpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)
