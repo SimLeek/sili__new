@@ -5,30 +5,11 @@
 #include <numeric>
 #include <vector>
 
-// ── Hoyer's Sparsity Measure -> top-k sparsification ────────────────────────────
-//
-// NOT wired into an automatic dense/sparse dispatch (see TODO.md) -- this is
-// the standalone operation, exposed so its actual behavior on real data can
-// be explored/tested from Python before deciding on dispatch thresholds
-// ("not obvious" -- per conversation).
-//
-// The idea: rather than an arbitrary epsilon-threshold count of "near-zero"
-// elements, use the ratio of L1 to L2 norm as a principled estimate of the
-// EFFECTIVE number of significant elements in a vector.
-//
-//   hoyer(x) = (sqrt(n) - ||x||_1/||x||_2) / (sqrt(n) - 1)     in [0, 1]
-//
-// For a vector with exactly k nonzero entries of EQUAL magnitude (rest
-// exactly zero), ||x||_1/||x||_2 = sqrt(k) exactly -- verified below, not
-// just asserted. For a realistic vector (mixed magnitudes, not exactly
-// k-sparse), the same ratio still gives a smooth estimate of the
-// "effective" significant-element count:
-//
-//   k_estimate = (||x||_1 / ||x||_2)^2
-//
-// which becomes the target k for a top-k sparsification pass -- keep only
-// the k_estimate largest-magnitude elements, treat the rest as noise (not
-// "whatever happens to be exactly zero").
+// Hoyer's Sparsity Measure -> top-k sparsification. NOT wired into an
+// automatic dense/sparse dispatch (see TODO.md) -- standalone, exposed
+// for exploration before deciding dispatch thresholds. See
+// docs/research/hoyer_sparsify.rst:hoyer_sparsify.math_derivation for
+// the L1/L2-ratio derivation of k_estimate.
 
 // No ctor, but every scalar field below is unconditionally assigned on
 // every branch of hoyer_sparsify_row before any return -- cppcheck can't
@@ -105,24 +86,13 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
 }
 
 /**
- * @brief Batched version: one HoyerSparsifyRow per BATCH SAMPLE (not weight-
- * matrix row -- "row" here means one row of the [batch, cols] activation
- * array, i.e. one sample; DeltaCSRWeights elsewhere in this codebase uses
- * "row" for input NEURON, a different axis entirely -- same word, easy to
- * conflate, worth being careful about). k_estimate computed independently
- * per sample, not one shared k across the batch (unlike top_k_csr) --
- * different samples can have genuinely different effective sparsity.
- *
- * IMPORTANT (see conversation): this is for CONSTRUCTING an accurate sparse
- * representation once you've already decided to route a batch through the
- * sparse path -- it is NOT the right thing to base that routing decision
- * on. forward_dense/forward_sparse are each called ONCE for the whole
- * batch together; a per-sample "is this one sparse enough" answer isn't
- * actionable at that granularity, since you can't send some samples
- * through one kernel and some through the other in a single call. For the
- * actual dense-vs-sparse ROUTING decision, use hoyer_score() below,
- * which aggregates over the whole batch to produce the one number that
- * question actually needs.
+ * @brief Batched version: one HoyerSparsifyRow per BATCH SAMPLE, not
+ * weight-matrix row -- see docs/research/hoyer_sparsify.rst:
+ * hoyer_sparsify_per_batch.row_terminology_warning for the terminology
+ * collision with DeltaCSRWeights' "row". For constructing sparse
+ * representations, not for the dense-vs-sparse routing decision -- see
+ * hoyer_sparsify_per_batch.not_for_routing_decision; use hoyer_score()
+ * below for that.
  */
 template <typename VALUE_TYPE>
 std::vector<HoyerSparsifyRow> hoyer_sparsify_per_batch(const VALUE_TYPE* x, std::size_t rows,
@@ -135,19 +105,11 @@ std::vector<HoyerSparsifyRow> hoyer_sparsify_per_batch(const VALUE_TYPE* x, std:
 }
 
 /**
- * @brief Batch-level aggregate Hoyer's measure -- the actual quantity a
- * dense-vs-sparse ROUTING decision should be based on, computed over the
- * WHOLE flattened batch (all rows*cols elements together) rather than per
- * sample, since forward_dense/forward_sparse are each invoked once for the
- * entire batch in a single call, not once per sample.
- *
- * Returns the raw hoyer_score (l1/l2-derived, in [0,1]) plus l1/l2 and a
- * batch-wide k_estimate -- what a threshold comparison should actually use
- * to decide which of forward_dense/forward_sparse to call for this batch.
- * Per-sample construction of the actual CSR data, once that decision is
- * made, should still use hoyer_sparsify_per_batch() above (or a fixed/shared k
- * if uniform treatment across the batch is preferred) -- this function
- * only answers "which kernel", not "which elements to keep per row".
+ * @brief Batch-level aggregate Hoyer's measure -- the quantity a
+ * dense-vs-sparse ROUTING decision should use, over the WHOLE flattened
+ * batch. See docs/research/hoyer_sparsify.rst:
+ * hoyer_score.batch_aggregate_rationale for why (forward_dense/
+ * forward_sparse are invoked once per batch, not once per sample).
  */
 template <typename VALUE_TYPE>
 HoyerSparsifyRow hoyer_score(const VALUE_TYPE* x, std::size_t rows, std::size_t cols) {
