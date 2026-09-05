@@ -860,8 +860,6 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS& m_indices, VALUE_ARRAYS& m_
         chunk_size = (n_size - final_end + num_threads - 1) / num_threads;
         size_t c_start =
             m_size - scanned_duplicates[num_threads] + final_end + thread_id * chunk_size;
-        size_t c_end =
-            std::min(c_start + chunk_size, m_size + n_size - scanned_duplicates[num_threads]);
         size_t n_start = final_end + thread_id * chunk_size;
         size_t n_end = std::min(n_start + chunk_size, n_size);
 

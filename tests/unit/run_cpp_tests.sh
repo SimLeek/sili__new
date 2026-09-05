@@ -1,9 +1,4 @@
 #!/bin/bash
-# shellcheck disable=SC2317
-# Dead code below the early `exit` (near the bottom of this file) looks
-# like it was meant to also test AVX/AVX2/FMA-disabled build configs but
-# was never wired back in after that `exit` was added. Flagged for the
-# user (task #386 followup), not deleted or revived here.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
@@ -42,74 +37,17 @@ else
     exit 1
 fi
 
-exit
-
-
 # Return to the original directory
 cd ..
 
 # Clean the build directory
 rm -rf "$build_dir"
 
-# Change to the build directory again
-mkdir "$build_dir"
-cd "$build_dir" || exit
-
-# Configure the project using CMake with AVX enabled and AVX2 disabled
-cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_AVX2=OFF ..
-
-# Build the tests (specify the number of CPU cores for parallel build with -j)
-# Replace 4 with the desired number of CPU cores
-if cmake --build . -j4 && ./sparse_tests; then
-    echo "Tests passed."
-else
-    echo "Tests failed."
-    exit 1
-fi
-
-# Return to the original directory
-cd ..
-
-# Clean the build directory again
-rm -rf "$build_dir"
-
-# Change to the build directory once more
-mkdir "$build_dir"
-cd "$build_dir" || exit
-
-# Configure the project using CMake with both AVX and AVX2 disabled
-cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_AVX2=OFF -DENABLE_FMA=OFF ..
-
-# Build the tests (specify the number of CPU cores for parallel build with -j)
-# Replace 4 with the desired number of CPU cores
-if cmake --build . -j4 && ./sparse_tests; then
-    echo "Tests passed."
-else
-    echo "Tests failed."
-    exit 1
-fi
-
-# Return to the original directory
-cd ..
-
-# Clean the build directory again
-rm -rf "$build_dir"
-
-# Change to the build directory once more
-mkdir "$build_dir"
-cd "$build_dir" || exit
-
-# Configure the project using CMake with both AVX and AVX2 disabled
-cmake -DCMAKE_BUILD_TYPE=Debug -DENABLE_AVX2=OFF -DENABLE_FMA=OFF -DENABLE_AVX=OFF ..
-
-# Build the tests (specify the number of CPU cores for parallel build with -j)
-# Replace 4 with the desired number of CPU cores
-if cmake --build . -j4 && ./sparse_tests; then
-    echo "Tests passed."
-else
-    echo "Tests failed."
-    exit 1
-fi
-
-# Return to the original directory
-cd ..
+# AVX/AVX2/AVX512-disabled build-config variants used to run here in the
+# same script (ENABLE_AVX2=OFF, then also ENABLE_FMA=OFF, then also
+# ENABLE_AVX=OFF), but that only ever validates the non-vectorized scalar
+# fallback path on THIS machine -- it says nothing about whether the real
+# AVX/AVX2/AVX512 SIMD code paths are actually correct on hardware that
+# has them. That needs its own dedicated CI/test job running on real
+# AVX/AVX2/AVX512-capable hardware (task #390), not a same-machine
+# same-CPU sweep of what to disable.

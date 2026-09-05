@@ -667,7 +667,6 @@ sparse_attention_backward(const float* q, const float* k_mat, const float* v, co
 // dL/dK[k_idx[ki]] += scale * sum_{qi}( ds[qi,ki] * Q[q_idx[qi]] )
 #pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t qi = 0; qi < kk; ++qi) {
-        const float* qr = q + q_idx[qi] * d;
         const float* dOr = dO + q_idx[qi] * d;
         float* dQr = dQ + q_idx[qi] * d;
         for (std::size_t ki = 0; ki < kk; ++ki) {

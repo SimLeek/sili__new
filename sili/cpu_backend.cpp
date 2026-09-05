@@ -877,18 +877,13 @@ class SparseLinearLayerImpl {
         const std::size_t rows = dc.layout.rows;
 
         for (std::size_t r = 0; r + 1 < rows; ++r) {
-            auto& L = dc.layout;
+            const auto& L = dc.layout;
             const std::size_t cur_b = L.row_alloc_bytes(r);
             const std::size_t cur_e = L.row_alloc_elems(r);
             const std::size_t use_b = std::max(cur_b, tgt_b);
             const std::size_t use_e = std::max(cur_e, tgt_e);
             if (use_b == cur_b && use_e == cur_e)
                 continue;
-
-            const std::ptrdiff_t bd =
-                static_cast<std::ptrdiff_t>(use_b) - static_cast<std::ptrdiff_t>(cur_b);
-            const std::ptrdiff_t ed =
-                static_cast<std::ptrdiff_t>(use_e) - static_cast<std::ptrdiff_t>(cur_e);
 
             delta_csr_shift_row<S, FP4BiPacked, COL_TYPE>(dc, r, use_b, use_e);
             // delta_csr_shift_row now updates byte_end and elem_end for all
@@ -4064,7 +4059,7 @@ PYBIND11_MODULE(_cpu, m) {
             auto buf = x.request();
             int batch = (buf.ndim == 2) ? (int)buf.shape[0] : 1;
             int cols = (buf.ndim == 2) ? (int)buf.shape[1] : (int)buf.shape[0];
-            float* src = (float*)buf.ptr;
+            const float* src = (const float*)buf.ptr;
 
             std::vector<int> ptrs(batch + 1, 0);
             std::vector<int> indices;
@@ -4142,7 +4137,7 @@ PYBIND11_MODULE(_cpu, m) {
                                             ") must match number of rows (" + std::to_string(rows) +
                                             ")");
             }
-            int* k_src = (int*)kbuf.ptr;
+            const int* k_src = (const int*)kbuf.ptr;
 
             auto csr = top_k_csr_graded<int, float>(src, rows, cols, k_src, num_threads);
 
@@ -4181,7 +4176,7 @@ PYBIND11_MODULE(_cpu, m) {
                     "r_target_per_row length (" + std::to_string(rbuf.size) +
                     ") must match number of rows (" + std::to_string(rows) + ")");
             }
-            float* r_src = (float*)rbuf.ptr;
+            const float* r_src = (const float*)rbuf.ptr;
 
             size_t k_min_arg = (k_min > 0) ? static_cast<size_t>(k_min) : 0;
             size_t k_max_arg = (k_max >= 0) ? static_cast<size_t>(k_max) : SIZE_MAX;
@@ -4328,7 +4323,7 @@ PYBIND11_MODULE(_cpu, m) {
             const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
             const std::size_t cols =
                 (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
-            float* src = (float*)buf.ptr;
+            const float* src = (const float*)buf.ptr;
 
             auto per_row = hoyer_sparsify_per_batch<float>(src, rows, cols);
 
@@ -4403,7 +4398,7 @@ PYBIND11_MODULE(_cpu, m) {
             const std::size_t rows = (buf.ndim == 2) ? (std::size_t)buf.shape[0] : 1;
             const std::size_t cols =
                 (buf.ndim == 2) ? (std::size_t)buf.shape[1] : (std::size_t)buf.shape[0];
-            float* src = (float*)buf.ptr;
+            const float* src = (const float*)buf.ptr;
 
             auto agg = hoyer_score<float>(src, rows, cols);
 

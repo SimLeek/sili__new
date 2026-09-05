@@ -83,7 +83,10 @@ inline float block4_vec_hsum(Block4Vec x) {
 // see linear_disldo.hpp's disldo_backward) instead of block4_vec_abs.
 inline Block4Vec block4_vec_sqrt(Block4Vec x) {
     Block4Vec result;
+    // (false positive: cppcheck doesn't track that this fixed-trip-count
+    // loop fully initializes every lane of the vector-extension type)
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        // cppcheck-suppress uninitvar
         result[i] = std::sqrt(x[i]);
     return result;
 }
@@ -96,7 +99,9 @@ inline Block4Vec block4_vec_sqrt(Block4Vec x) {
 // (delta_csr_types.hpp) to bound how fast per-synapse `ci` can decay.
 inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
     Block4Vec result;
+    // (false positive, same as block4_vec_sqrt above)
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        // cppcheck-suppress uninitvar
         result[i] = std::max(a[i], b[i]);
     return result;
 }
@@ -107,7 +112,9 @@ inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
 // (only a floor, which bounds how fast it can shrink, not grow).
 inline Block4Vec block4_vec_min(Block4Vec a, Block4Vec b) {
     Block4Vec result;
+    // (false positive, same as block4_vec_sqrt above)
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        // cppcheck-suppress uninitvar
         result[i] = std::min(a[i], b[i]);
     return result;
 }
@@ -119,7 +126,9 @@ inline Block4Vec block4_vec_min(Block4Vec a, Block4Vec b) {
 // magnitude.
 inline Block4Vec block4_vec_clip_abs(Block4Vec x, Block4Vec max_abs) {
     Block4Vec result;
+    // (false positive, same as block4_vec_sqrt above)
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        // cppcheck-suppress uninitvar
         result[i] = x[i] > max_abs[i] ? max_abs[i] : (x[i] < -max_abs[i] ? -max_abs[i] : x[i]);
     }
     return result;
@@ -136,7 +145,9 @@ inline Block4Vec block4_vec_clip_abs(Block4Vec x, Block4Vec max_abs) {
 // NaN/Inf guard anywhere despite value_scale/output_scale getting one.
 inline Block4Vec block4_vec_select_finite(Block4Vec new_val, Block4Vec fallback) {
     Block4Vec result;
+    // (false positive, same as block4_vec_sqrt above)
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
+        // cppcheck-suppress uninitvar
         result[i] = std::isfinite(new_val[i]) ? new_val[i] : fallback[i];
     }
     return result;
@@ -207,7 +218,12 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
     {
         const auto cmp_low = (uniform01 < p_low);
         const auto cmp_mid = (uniform01 < p_mid);
+        // (false positive: cppcheck doesn't know the true size of GCC
+        // vector-extension comparison-result types; this is a same-size
+        // bit-reinterpret memcpy, not an out-of-bounds copy)
+        // cppcheck-suppress bufferAccessOutOfBounds
         std::memcpy(&up_low_mask, &cmp_low, sizeof(up_low_mask));
+        // cppcheck-suppress bufferAccessOutOfBounds
         std::memcpy(&up_mid_mask, &cmp_mid, sizeof(up_mid_mask));
     }
 
@@ -300,8 +316,11 @@ inline Block4Vec block4_vec_decode_fp8(Block4VecU codes) {
     std::memcpy(&result, &bits_normal, sizeof(result));
 
     uint32_t codes_arr[SILI_BLOCK4_TILE_SIZE];
+    // (false positive, same GCC vector-extension size-blindness as above)
+    // cppcheck-suppress bufferAccessOutOfBounds
     std::memcpy(codes_arr, &codes, sizeof(codes_arr));
     float result_arr[SILI_BLOCK4_TILE_SIZE];
+    // cppcheck-suppress bufferAccessOutOfBounds
     std::memcpy(result_arr, &result, sizeof(result_arr));
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
         const uint32_t e_i = (codes_arr[i] >> 3) & 0xFu;
@@ -342,14 +361,21 @@ inline Block4VecU block4_vec_quantize_stochastic_fp8(Block4Vec v) {
     Block4VecU result = sign_bit | (e4 << 3) | m3;
 
     uint32_t bits_arr[SILI_BLOCK4_TILE_SIZE];
+    // (false positive, same GCC vector-extension size-blindness as above)
+    // cppcheck-suppress bufferAccessOutOfBounds
     std::memcpy(bits_arr, &bits, sizeof(bits_arr));
     uint32_t result_arr[SILI_BLOCK4_TILE_SIZE];
+    // cppcheck-suppress bufferAccessOutOfBounds
     std::memcpy(result_arr, &result, sizeof(result_arr));
     for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
         float vi;
         std::memcpy(&vi, &bits_arr[i], sizeof(vi));
         const uint32_t ab = bits_arr[i] & 0x7FFFFFFFu;
-        if (ab < FP8_MIN_NORMAL_BITS || ab >= FP8_NAN_SLOT_BITS || ab > 0x7F800000u)
+        // `ab > 0x7F800000u` was redundant here: FP8_NAN_SLOT_BITS (0x43F00000)
+        // < 0x7F800000, so any ab satisfying it already satisfies the
+        // `ab >= FP8_NAN_SLOT_BITS` clause -- removed (cppcheck
+        // knownConditionTrueFalse, confirmed real dead code, not a blind spot).
+        if (ab < FP8_MIN_NORMAL_BITS || ab >= FP8_NAN_SLOT_BITS)
             result_arr[i] = fp8_quantize_stochastic(vi);
     }
     Block4VecU final_result;
@@ -702,10 +728,10 @@ block4_row_shift(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
 
 inline void
 block4_grow_last_row(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
-                     std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
-                     std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
-                     std::size_t target_idx_byte_alloc, std::size_t target_tile_byte_alloc,
-                     std::size_t target_elem_alloc,
+                     std::vector<std::size_t>& tbyte_start,
+                     const std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
+                     std::vector<uint8_t>& tile_is_sparse, std::size_t target_idx_byte_alloc,
+                     std::size_t target_tile_byte_alloc, std::size_t target_elem_alloc,
                      std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
                      std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max()) {
     if (L.rows == 0)
@@ -756,9 +782,9 @@ block4_ensure_row_headroom(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
 
 inline bool
 block4_row_insert_tile(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
-                       std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
-                       std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
-                       std::size_t row, uint32_t new_col,
+                       const std::vector<std::size_t>& tbyte_start,
+                       std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
+                       std::vector<uint8_t>& tile_is_sparse, std::size_t row, uint32_t new_col,
                        // Defaulted to FP4's tile-length formula -- every existing (FP4)
                        // caller is unaffected. Block4Store8 passes block4_stored_tile_len8
                        // explicitly (real bug found via ASan: this function walks a row's
@@ -857,9 +883,9 @@ block4_row_insert_tile(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
 
 inline bool
 block4_row_remove_tile(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
-                       std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
-                       std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
-                       std::size_t row, uint32_t target_col,
+                       const std::vector<std::size_t>& tbyte_start,
+                       std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
+                       std::vector<uint8_t>& tile_is_sparse, std::size_t row, uint32_t target_col,
                        // See block4_row_insert_tile's identical parameter for why this
                        // exists -- same real bug (ASan-confirmed), same fix.
                        std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len) {
@@ -989,7 +1015,7 @@ inline bool block4_row_grow_needs_realloc(const std::vector<uint8_t>& tile_data,
 }
 
 inline void
-block4_resize_tile_in_row(DeltaCSRLayout& L, std::vector<std::size_t>& tbyte_start,
+block4_resize_tile_in_row(const DeltaCSRLayout& L, std::vector<std::size_t>& tbyte_start,
                           std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
                           std::size_t row, std::size_t tbyte_pos, std::size_t old_len,
                           const uint8_t* new_bytes, std::size_t new_len,
@@ -1318,17 +1344,13 @@ struct Block4Store {
         if (block_layout.rows == 0)
             return;
         const std::size_t row = current_row % block_layout.rows;
+        // rows>0 guaranteed by the early return above; no ternary needed.
         const std::size_t target_idx =
-            block_layout.rows > 0
-                ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows
-                : 0;
+            (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows;
         const std::size_t target_tile =
-            block_layout.rows > 0 ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows
-                                  : 0;
+            (tile_data.size() + block_layout.rows - 1) / block_layout.rows;
         const std::size_t target_elem =
-            block_layout.rows > 0
-                ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows
-                : 0;
+            (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows;
         block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
                          tile_is_sparse, row, target_idx, target_tile, target_elem,
                          max_indices_bytes, max_tile_bytes);
@@ -1875,17 +1897,13 @@ struct Block4Store8 {
         if (block_layout.rows == 0)
             return;
         const std::size_t row = current_row % block_layout.rows;
+        // rows>0 guaranteed by the early return above; no ternary needed.
         const std::size_t target_idx =
-            block_layout.rows > 0
-                ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows
-                : 0;
+            (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows;
         const std::size_t target_tile =
-            block_layout.rows > 0 ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows
-                                  : 0;
+            (tile_data.size() + block_layout.rows - 1) / block_layout.rows;
         const std::size_t target_elem =
-            block_layout.rows > 0
-                ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows
-                : 0;
+            (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows;
         block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
                          tile_is_sparse, row, target_idx, target_tile, target_elem,
                          max_indices_bytes, max_tile_bytes);

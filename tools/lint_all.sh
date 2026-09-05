@@ -75,7 +75,7 @@ else
 fi
 
 if command -v cppcheck >/dev/null && [ "${#hpp_files[@]}" -gt 0 ]; then
-    advisory "cppcheck" cppcheck --enable=all --std=c++20 -q \
+    advisory "cppcheck" cppcheck --enable=all --std=c++20 -q --inline-suppr \
         --suppress=missingIncludeSystem -I sili/lib/headers "${cpp_all[@]}" 2>&1 | head -30
 else
     skip "cppcheck"

@@ -41,7 +41,12 @@ DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE> delta_csr_from_absolute(
     std::vector<std::size_t> row_bytes(rows, 0);
     for (std::size_t r = 0; r < rows; ++r) {
         COL_TYPE prev = 0;
+        // (caller invariant, not a bug here: csr_indices must be sized to
+        // at least csr_ptrs[rows] entries, same as every other CSR-walking
+        // loop in this codebase -- trusted, not defensively re-checked on
+        // every access, for the same hot-path-cost reason as elsewhere.)
         for (SIZE_TYPE i = csr_ptrs[r]; i < csr_ptrs[r + 1]; ++i) {
+            // cppcheck-suppress containerOutOfBounds
             COL_TYPE col = static_cast<COL_TYPE>(csr_indices[i]);
             row_bytes[r] += uleb128_encode<COL_TYPE>(col - prev, tmp);
             prev = col;
@@ -970,7 +975,7 @@ void block4_demote_tile(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYP
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
-        auto& L = dc.layout;
+        const auto& L = dc.layout;
         const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
         const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
         {
@@ -1072,7 +1077,7 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
     constexpr bool has_block4 = is_fp4 || is_fp8;
     auto& dc = weights.connections;
-    auto& L = dc.layout;
+    const auto& L = dc.layout;
     if (L.rows == 0)
         return false;
 
@@ -1342,7 +1347,7 @@ void delta_csr_build_probes(
     // see that function's own importance_eps parameter.
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
-    auto& L = dc.layout;
+    const auto& L = dc.layout;
     const std::size_t n_in = L.rows;
     const std::size_t n_out = L.cols;
     if (n_in == 0 || n_out == 0 || k <= 0) {

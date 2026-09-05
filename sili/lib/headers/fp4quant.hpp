@@ -600,11 +600,16 @@ struct FP4BiPacked {
     FP4BiPacked(FP4BiPacked&& o) noexcept
         : _data(std::move(o._data)), _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
 
+    // (false positive: _lanes are views holding &this->_data, not
+    // independent state -- correct already after copying _data, see
+    // the ctors' own comment above)
+    // cppcheck-suppress operatorEqVarError
     FP4BiPacked& operator=(const FP4BiPacked& o) {
         if (this != &o)
             _data = o._data; // _lanes._dp = &_data already correct
         return *this;
     }
+    // cppcheck-suppress operatorEqVarError
     FP4BiPacked& operator=(FP4BiPacked&& o) noexcept {
         if (this != &o)
             _data = std::move(o._data);

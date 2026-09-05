@@ -864,22 +864,28 @@ void disldo_backward_sparse_grad(
                 value_type dx_accum = value_type(0);
                 const value_type imp_scale = weights.get_importance_scale(r);
 
-                // Per-thread rank-N accumulator lambdas -- mirrors
-                // disldo_backward's mcol_at/mgamma_at exactly (linear_disldo.hpp).
+                // Per-thread rank-N accumulator lambdas -- mirrors disldo_backward's
+                // mcol_at/mgamma_at exactly (linear_disldo.hpp).
                 const int tid = omp_get_thread_num();
+                // cppcheck-suppress constVariablePointer -- false positive, mutated indirectly via
+                // the m*_at lambdas below (see linear_disldo.hpp's mcol_base for the full
+                // rationale)
                 value_type* mcol_base =
                     t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
                 auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
                     return mcol_base[col_ * rank + k];
                 };
+                // cppcheck-suppress constVariablePointer
                 value_type* mcol_contrib_base =
                     t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
                 auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
                     return mcol_contrib_base[col_ * rank + k];
                 };
+                // cppcheck-suppress constVariablePointer
                 value_type* mgamma_base =
                     t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
                 auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+                // cppcheck-suppress constVariablePointer
                 value_type* mgamma_contrib_base =
                     t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
                 auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
@@ -1109,24 +1115,27 @@ void disldo_backward_sparse_grad(
 
                     value_type dx_accum[BLOCK4_TILE] = {0, 0, 0, 0};
 
-                    // Per-thread rank-N accumulator lambdas -- same pattern
-                    // as the scattered path's mcol_at/mgamma_at (this loop
-                    // is itself the `#pragma omp parallel for` over br, so
-                    // tid is stable for this whole br's work).
+                    // Per-thread rank-N accumulator lambdas -- same pattern as the scattered path's
+                    // mcol_at/mgamma_at (this loop is itself the `#pragma omp parallel for` over
+                    // br, so tid is stable for this whole br's work).
                     const int tid = omp_get_thread_num();
+                    // cppcheck-suppress constVariablePointer
                     value_type* mcol_base =
                         t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
                     auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
                         return mcol_base[col_ * rank + k];
                     };
+                    // cppcheck-suppress constVariablePointer
                     value_type* mcol_contrib_base =
                         t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
                     auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
                         return mcol_contrib_base[col_ * rank + k];
                     };
+                    // cppcheck-suppress constVariablePointer
                     value_type* mgamma_base =
                         t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
                     auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+                    // cppcheck-suppress constVariablePointer
                     value_type* mgamma_contrib_base =
                         t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
                     auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {

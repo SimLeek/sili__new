@@ -2756,7 +2756,7 @@ struct SparseLinearWeightsDelta {
         importance_max_abs = value_type(0);
         value_l1 = value_l2_sq = 0.0;
         value_max_abs = value_type(0);
-        auto& L = connections.layout;
+        const auto& L = connections.layout;
         for (std::size_t r = 0; r < L.rows; ++r) {
             const std::size_t n = L.row_nnz(r);
             for (std::size_t e = 0; e < n; ++e) {
@@ -2799,7 +2799,7 @@ struct SparseLinearWeightsDelta {
         if (new_scale == old_scale)
             return;
         auto& dc = connections;
-        auto& L = dc.layout;
+        const auto& L = dc.layout;
         if (row >= L.rows)
             return;
         const std::size_t n = L.row_nnz(row);
@@ -2827,7 +2827,7 @@ struct SparseLinearWeightsDelta {
     // callers that never think about per-row scale at all can keep using
     // this exactly as before.
     inline void rescale_importance(value_type new_scale) {
-        auto& L = connections.layout;
+        const auto& L = connections.layout;
         for (std::size_t r = 0; r < L.rows; ++r)
             rescale_importance_row(r, new_scale);
     }
@@ -2838,7 +2838,7 @@ struct SparseLinearWeightsDelta {
         if (new_scale == old_scale)
             return;
         auto& dc = connections;
-        auto& L = dc.layout;
+        const auto& L = dc.layout;
         if (row >= L.rows)
             return;
         const std::size_t n = L.row_nnz(row);
@@ -2852,7 +2852,7 @@ struct SparseLinearWeightsDelta {
         set_value_scale_raw(row, new_scale);
     }
     inline void rescale_value(value_type new_scale) {
-        auto& L = connections.layout;
+        const auto& L = connections.layout;
         for (std::size_t r = 0; r < L.rows; ++r)
             rescale_value_row(r, new_scale);
     }
@@ -2907,7 +2907,7 @@ struct SparseLinearWeightsDelta {
     inline void magnitude_rescale_output(value_type target, value_type correction_rate,
                                          bool scale_invariant, value_type eps = value_type(1e-8)) {
         auto& dc = connections;
-        auto& L = dc.layout;
+        const auto& L = dc.layout;
         const std::size_t n_out = L.cols;
         const std::size_t n_in = L.rows;
         if (n_out == 0 || n_in == 0)

@@ -341,10 +341,11 @@ std::vector<SIZE_TYPE> top_k_indices_biased(VALUE_TYPE* values,
         }
 
         // Sort local indices by values
-        std::partial_sort(local_pairs.begin(),
-                          local_pairs.begin() + std::min(k, local_pairs.size()), local_pairs.end(),
-                          [](std::pair<SIZE_TYPE, VALUE_TYPE>& a,
-                             std::pair<SIZE_TYPE, VALUE_TYPE>& b) { return a.second > b.second; });
+        std::partial_sort(
+            local_pairs.begin(), local_pairs.begin() + std::min(k, local_pairs.size()),
+            local_pairs.end(),
+            [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a,
+               const std::pair<SIZE_TYPE, VALUE_TYPE>& b) { return a.second > b.second; });
 
         // Keep only the smallest k elements
         if (local_pairs.size() > k) {
@@ -361,10 +362,11 @@ std::vector<SIZE_TYPE> top_k_indices_biased(VALUE_TYPE* values,
     }
 
     // Find the global bottom-k indices
-    std::partial_sort(merged_pairs.begin(), merged_pairs.begin() + k, merged_pairs.end(),
-                      [](std::pair<SIZE_TYPE, VALUE_TYPE>& a, std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
-                          return a.second > b.second;
-                      });
+    std::partial_sort(
+        merged_pairs.begin(), merged_pairs.begin() + k, merged_pairs.end(),
+        [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+            return a.second > b.second;
+        });
 
     merged_pairs.resize(k);
     std::vector<SIZE_TYPE> indices;
@@ -493,9 +495,9 @@ template <class SIZE_TYPE, class VALUE_TYPE>
 sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
 top_k_csr(VALUE_TYPE* values, size_t rows, size_t cols, size_t k, int num_threads) {
     // Step 1: Get the unbiased top-k indices
-    std::vector<SIZE_TYPE> top_k =
+    std::vector<SIZE_TYPE> top_k_idx =
         top_k_indices<SIZE_TYPE, VALUE_TYPE>(values, rows * cols, k, num_threads);
-    size_t actual_k = top_k.size();
+    size_t actual_k = top_k_idx.size();
 
     // Step 2: Allocate shared vectors for COO
     auto row_vec = std::make_shared<std::vector<SIZE_TYPE>>(actual_k);
@@ -514,7 +516,7 @@ top_k_csr(VALUE_TYPE* values, size_t rows, size_t cols, size_t k, int num_thread
     // left unconditional).
     if (actual_k < SILI_OMP_SMALL_THRESHOLD || num_threads <= 1) {
         for (size_t i = 0; i < actual_k; ++i) {
-            SIZE_TYPE flat_idx = top_k[i];
+            SIZE_TYPE flat_idx = top_k_idx[i];
             r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
             c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
             v_ptr[i] = values[flat_idx];
@@ -522,7 +524,7 @@ top_k_csr(VALUE_TYPE* values, size_t rows, size_t cols, size_t k, int num_thread
     } else {
 #pragma omp parallel for num_threads(num_threads)
         for (size_t i = 0; i < actual_k; ++i) {
-            SIZE_TYPE flat_idx = top_k[i];
+            SIZE_TYPE flat_idx = top_k_idx[i];
             r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
             c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
             v_ptr[i] = values[flat_idx];
@@ -581,6 +583,9 @@ top_k_csr_graded(VALUE_TYPE* values, size_t rows, size_t cols, const SIZE_TYPE* 
     // work here is O(cols), usually a single layer's own width, so
     // #pragma omp parallel's fork/join rendezvous can easily exceed the
     // whole serial cost. Only parallelize once total work justifies it.
+    // (false positive: read in the `if (use_omp)` clause of the #pragma
+    // omp line right below -- cppcheck doesn't parse pragma contents)
+    // cppcheck-suppress unreadVariable
     bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
 
 #pragma omp parallel for num_threads(num_threads) if (use_omp) schedule(dynamic)
@@ -644,6 +649,9 @@ top_k_csr_nucleus(VALUE_TYPE* values, size_t rows, size_t cols, const VALUE_TYPE
     std::vector<SIZE_TYPE> k_per_row(rows, 0);
     std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> kept_rows(rows);
 
+    // (false positive: read in the `if (use_omp)` clause of the #pragma
+    // omp line right below -- cppcheck doesn't parse pragma contents)
+    // cppcheck-suppress unreadVariable
     bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
 
 #pragma omp parallel for num_threads(num_threads) if (use_omp) schedule(dynamic)
