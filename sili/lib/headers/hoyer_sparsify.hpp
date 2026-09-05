@@ -31,12 +31,12 @@
 // "whatever happens to be exactly zero").
 
 struct HoyerSparsifyRow {
-    float               l1_norm;
-    float               l2_norm;
-    float               hoyer_score;   // normalized [0,1], 0=dense, 1=maximally sparse
-    int                 k_estimate;    // (l1/l2)^2, rounded, clamped to [0, n]
-    std::vector<int>    indices;       // top-k_estimate indices, ascending
-    std::vector<float>  values;        // corresponding values (not zeroed elsewhere)
+    float l1_norm;
+    float l2_norm;
+    float hoyer_score;         // normalized [0,1], 0=dense, 1=maximally sparse
+    int k_estimate;            // (l1/l2)^2, rounded, clamped to [0, n]
+    std::vector<int> indices;  // top-k_estimate indices, ascending
+    std::vector<float> values; // corresponding values (not zeroed elsewhere)
 };
 
 template <typename VALUE_TYPE>
@@ -46,7 +46,7 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
     double l1 = 0.0, l2sq = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
         const double v = std::abs(static_cast<double>(x[i]));
-        l1   += v;
+        l1 += v;
         l2sq += v * v;
     }
     const double l2 = std::sqrt(l2sq);
@@ -59,20 +59,19 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
         // there's no meaningful "ratio" to compute, but "keep nothing" is
         // the only sensible top-k result either way.
         result.hoyer_score = 1.0f;
-        result.k_estimate  = 0;
+        result.k_estimate = 0;
         return result;
     }
 
-    const double ratio  = l1 / l2;
+    const double ratio = l1 / l2;
     const double sqrt_n = std::sqrt(static_cast<double>(n));
 
-    result.hoyer_score = (n > 1)
-        ? static_cast<float>((sqrt_n - ratio) / (sqrt_n - 1.0))
-        : 0.0f;   // n=1: a single element is trivially "all of it", not meaningfully sparse
+    result.hoyer_score =
+        (n > 1) ? static_cast<float>((sqrt_n - ratio) / (sqrt_n - 1.0))
+                : 0.0f; // n=1: a single element is trivially "all of it", not meaningfully sparse
 
     const double k_raw = ratio * ratio;
-    result.k_estimate = static_cast<int>(
-        std::round(std::min(k_raw, static_cast<double>(n))));
+    result.k_estimate = static_cast<int>(std::round(std::min(k_raw, static_cast<double>(n))));
 
     // Top-k_estimate selection by |value|, then re-sort ascending by index
     // (matching CSR column-order convention elsewhere in this codebase).
@@ -80,8 +79,8 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
     std::iota(idx.begin(), idx.end(), 0);
     const std::size_t kk = static_cast<std::size_t>(result.k_estimate);
     if (kk < n) {
-        std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
-            [&](std::size_t a, std::size_t b) {
+        std::partial_sort(
+            idx.begin(), idx.begin() + kk, idx.end(), [&](std::size_t a, std::size_t b) {
                 return std::abs(static_cast<double>(x[a])) > std::abs(static_cast<double>(x[b]));
             });
         idx.resize(kk);
@@ -89,10 +88,10 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
     }
 
     result.indices.reserve(idx.size());
-    result.values .reserve(idx.size());
+    result.values.reserve(idx.size());
     for (auto i : idx) {
         result.indices.push_back(static_cast<int>(i));
-        result.values .push_back(static_cast<float>(x[i]));
+        result.values.push_back(static_cast<float>(x[i]));
     }
 
     return result;
@@ -119,9 +118,8 @@ HoyerSparsifyRow hoyer_sparsify_row(const VALUE_TYPE* x, std::size_t n) {
  * question actually needs.
  */
 template <typename VALUE_TYPE>
-std::vector<HoyerSparsifyRow> hoyer_sparsify_per_batch(
-    const VALUE_TYPE* x, std::size_t rows, std::size_t cols)
-{
+std::vector<HoyerSparsifyRow> hoyer_sparsify_per_batch(const VALUE_TYPE* x, std::size_t rows,
+                                                       std::size_t cols) {
     std::vector<HoyerSparsifyRow> result;
     result.reserve(rows);
     for (std::size_t r = 0; r < rows; ++r)

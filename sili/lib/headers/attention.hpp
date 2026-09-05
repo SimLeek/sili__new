@@ -17,7 +17,6 @@
 #include <numeric>
 #include <vector>
 
-
 // ── Banded attention ──────────────────────────────────────────────────────────
 
 /**
@@ -37,36 +36,33 @@
  * match naive full attention (all pairs covered by the band).
  */
 inline void banded_attention_forward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    float*       output,
-    std::size_t  T,
-    std::size_t  K,       ///< Number of key positions (may differ from T for cross-attn)
-    std::size_t  d,
-    std::size_t  half_bandwidth,
-    int          num_cpus = 4,
-    bool         causal = false)   ///< requires T == K (self-attention); clamps
-                                    ///< the band so query t never sees key > t.
+    const float* q, const float* k_mat, const float* v, float* output, std::size_t T,
+    std::size_t K, ///< Number of key positions (may differ from T for cross-attn)
+    std::size_t d, std::size_t half_bandwidth, int num_cpus = 4,
+    bool causal = false) ///< requires T == K (self-attention); clamps
+                         ///< the band so query t never sees key > t.
 {
-    if (T == 0 || K == 0 || d == 0) return;
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
     // Centre key index for query position t along the geometric diagonal.
     auto centre_k = [&](std::size_t t) -> std::size_t {
-        if (T <= 1 || K <= 1) return 0;
+        if (T <= 1 || K <= 1)
+            return 0;
         return (t * (K - 1) + (T - 1) / 2) / (T - 1);
     };
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr   = q + t * d;
-        float*       outr = output + t * d;
+        const float* qr = q + t * d;
+        float* outr = output + t * d;
 
         const std::size_t ck = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
         std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
-        if (causal) k_hi = std::min(k_hi, t);
+        if (causal)
+            k_hi = std::min(k_hi, t);
 
         // Compute scores for the band.
         const std::size_t band_w = k_hi - k_lo + 1;
@@ -74,26 +70,31 @@ inline void banded_attention_forward(
         for (std::size_t bi = 0; bi < band_w; ++bi) {
             const float* kr = k_mat + (k_lo + bi) * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             scores[bi] = dot * scale;
         }
 
         // Softmax over the band.
         float max_s = *std::max_element(scores.begin(), scores.end());
         float sum_e = 0.0f;
-        for (float& s : scores) { s = std::exp(s - max_s); sum_e += s; }
+        for (float& s : scores) {
+            s = std::exp(s - max_s);
+            sum_e += s;
+        }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : scores) s *= inv;
+        for (float& s : scores)
+            s *= inv;
 
         // Weighted sum of V.
         for (std::size_t bi = 0; bi < band_w; ++bi) {
-            const float  w  = scores[bi];
+            const float w = scores[bi];
             const float* vr = v + (k_lo + bi) * d;
-            for (std::size_t i = 0; i < d; ++i) outr[i] += w * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                outr[i] += w * vr[i];
         }
     }
 }
-
 
 /**
  * @brief Sparse banded attention.
@@ -120,59 +121,55 @@ inline void banded_attention_forward(
  * NOTE (test): inner_k=1 — output[t] == v[argmax_norm(k in band(t))].
  */
 inline void sparse_banded_attention_forward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    float*       output,
-    std::size_t  T,
-    std::size_t  K,
-    std::size_t  d,
-    std::size_t  half_bandwidth,
-    std::size_t  inner_k = 0,
-    int          num_cpus = 4,
-    bool         causal = false)   ///< requires T == K; clamps the band so
-                                    ///< query t never selects a key > t.
+    const float* q, const float* k_mat, const float* v, float* output, std::size_t T, std::size_t K,
+    std::size_t d, std::size_t half_bandwidth, std::size_t inner_k = 0, int num_cpus = 4,
+    bool causal = false) ///< requires T == K; clamps the band so
+                         ///< query t never selects a key > t.
 {
-    if (T == 0 || K == 0 || d == 0) return;
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
     auto centre_k = [&](std::size_t t) -> std::size_t {
-        if (T <= 1 || K <= 1) return 0;
+        if (T <= 1 || K <= 1)
+            return 0;
         return (t * (K - 1) + (T - 1) / 2) / (T - 1);
     };
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr   = q + t * d;
-        float*       outr = output + t * d;
+        const float* qr = q + t * d;
+        float* outr = output + t * d;
 
-        const std::size_t ck   = centre_k(t);
+        const std::size_t ck = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
         std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
-        if (causal) k_hi = std::min(k_hi, t);
+        if (causal)
+            k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
 
         // inner_k=0 → use full band (dense banded).
-        const std::size_t kk = (inner_k == 0 || inner_k >= band_w)
-            ? band_w
-            : inner_k;
+        const std::size_t kk = (inner_k == 0 || inner_k >= band_w) ? band_w : inner_k;
 
         // Select top-kk keys in the band by L2 norm.
         std::vector<std::size_t> band_idx(band_w);
-        std::iota(band_idx.begin(), band_idx.end(), k_lo);  // absolute key positions
+        std::iota(band_idx.begin(), band_idx.end(), k_lo); // absolute key positions
 
         if (kk < band_w) {
             std::partial_sort(band_idx.begin(), band_idx.begin() + kk, band_idx.end(),
-                [&](std::size_t a, std::size_t b) {
-                    // Compare L2 norms (avoid sqrt — monotone).
-                    float na = 0.0f, nb = 0.0f;
-                    const float* ka = k_mat + a * d;
-                    const float* kb = k_mat + b * d;
-                    for (std::size_t i = 0; i < d; ++i) { na += ka[i]*ka[i]; nb += kb[i]*kb[i]; }
-                    return na > nb;
-                });
+                              [&](std::size_t a, std::size_t b) {
+                                  // Compare L2 norms (avoid sqrt — monotone).
+                                  float na = 0.0f, nb = 0.0f;
+                                  const float* ka = k_mat + a * d;
+                                  const float* kb = k_mat + b * d;
+                                  for (std::size_t i = 0; i < d; ++i) {
+                                      na += ka[i] * ka[i];
+                                      nb += kb[i] * kb[i];
+                                  }
+                                  return na > nb;
+                              });
             band_idx.resize(kk);
-            std::sort(band_idx.begin(), band_idx.end());  // restore key order
+            std::sort(band_idx.begin(), band_idx.end()); // restore key order
         }
 
         // Dot-products for selected keys.
@@ -180,26 +177,31 @@ inline void sparse_banded_attention_forward(
         for (std::size_t bi = 0; bi < kk; ++bi) {
             const float* kr = k_mat + band_idx[bi] * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             scores[bi] = dot * scale;
         }
 
         // Sparse softmax over selected keys only.
         float max_s = *std::max_element(scores.begin(), scores.end());
         float sum_e = 0.0f;
-        for (float& s : scores) { s = std::exp(s - max_s); sum_e += s; }
+        for (float& s : scores) {
+            s = std::exp(s - max_s);
+            sum_e += s;
+        }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : scores) s *= inv;
+        for (float& s : scores)
+            s *= inv;
 
         // Weighted V sum.
         for (std::size_t bi = 0; bi < kk; ++bi) {
-            const float  w  = scores[bi];
+            const float w = scores[bi];
             const float* vr = v + band_idx[bi] * d;
-            for (std::size_t i = 0; i < d; ++i) outr[i] += w * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                outr[i] += w * vr[i];
         }
     }
 }
-
 
 // ── Sparse attention ──────────────────────────────────────────────────────────
 
@@ -230,30 +232,31 @@ inline void sparse_banded_attention_forward(
  * NOTE (test): With k=1, exactly one (q,k) pair is scored.  The single
  * attention weight after softmax is 1.0, so output[q_row] == v[k_row].
  */
-inline void sparse_attention_forward(
-    const float* q,       ///< [T × d]
-    const float* k_mat,   ///< [T × d]
-    const float* v,       ///< [T × d]
-    float*       output,  ///< [T × d]  — caller zeroes; only selected rows written
-    std::size_t  T,       ///< Sequence length
-    std::size_t  d,       ///< Head dimension
-    std::size_t  k,       ///< Top-k budget (0 = use √T, minimum 1)
-    int          num_cpus = 4,
-    bool         causal = false)   ///< mask out (qi,ki) pairs where the
-                                    ///< selected key position exceeds the
-                                    ///< selected query position.
+inline void
+sparse_attention_forward(const float* q,     ///< [T × d]
+                         const float* k_mat, ///< [T × d]
+                         const float* v,     ///< [T × d]
+                         float* output, ///< [T × d]  — caller zeroes; only selected rows written
+                         std::size_t T, ///< Sequence length
+                         std::size_t d, ///< Head dimension
+                         std::size_t k, ///< Top-k budget (0 = use √T, minimum 1)
+                         int num_cpus = 4,
+                         bool causal = false) ///< mask out (qi,ki) pairs where the
+                                              ///< selected key position exceeds the
+                                              ///< selected query position.
 {
-    if (T == 0 || d == 0) return;
+    if (T == 0 || d == 0)
+        return;
 
-    const std::size_t kk = (k == 0)
-        ? std::max(std::size_t(1), static_cast<std::size_t>(std::sqrt(float(T))))
-        : std::min(k, T);
+    const std::size_t kk =
+        (k == 0) ? std::max(std::size_t(1), static_cast<std::size_t>(std::sqrt(float(T))))
+                 : std::min(k, T);
 
     // ── L2 norms for query and key rows ──────────────────────────────────────
     std::vector<float> q_norms(T, 0.0f), k_norms(T, 0.0f);
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr = q       + t * d;
-        const float* kr = k_mat   + t * d;
+        const float* qr = q + t * d;
+        const float* kr = k_mat + t * d;
         for (std::size_t i = 0; i < d; ++i) {
             q_norms[t] += qr[i] * qr[i];
             k_norms[t] += kr[i] * kr[i];
@@ -265,13 +268,13 @@ inline void sparse_attention_forward(
         std::vector<std::size_t> idx(T);
         std::iota(idx.begin(), idx.end(), 0);
         std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
-            [&](std::size_t a, std::size_t b){ return norms[a] > norms[b]; });
+                          [&](std::size_t a, std::size_t b) { return norms[a] > norms[b]; });
         idx.resize(kk);
         return idx;
     };
 
-    const auto q_idx = topk_idx(q_norms);   // selected query positions
-    const auto k_idx = topk_idx(k_norms);   // selected key positions
+    const auto q_idx = topk_idx(q_norms); // selected query positions
+    const auto k_idx = topk_idx(k_norms); // selected key positions
 
     const float scale = 1.0f / std::sqrt(float(d));
 
@@ -280,13 +283,14 @@ inline void sparse_attention_forward(
     // Stored as a flat [kk × kk] matrix (small, fits in cache).
     std::vector<float> scores(kk * kk, 0.0f);
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t qi = 0; qi < kk; ++qi) {
-        const float* qr = q     + q_idx[qi] * d;
+        const float* qr = q + q_idx[qi] * d;
         for (std::size_t ki = 0; ki < kk; ++ki) {
             const float* kr = k_mat + k_idx[ki] * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             scores[qi * kk + ki] = dot * scale;
         }
     }
@@ -307,12 +311,12 @@ inline void sparse_attention_forward(
 
         float row_max = -1e38f;
         for (std::size_t ki = 0; ki < kk; ++ki)
-            if (valid[ki]) row_max = std::max(row_max, scores[qi * kk + ki]);
+            if (valid[ki])
+                row_max = std::max(row_max, scores[qi * kk + ki]);
 
         float row_sum = 0.0f;
         for (std::size_t ki = 0; ki < kk; ++ki) {
-            weights[qi * kk + ki] = valid[ki]
-                ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
+            weights[qi * kk + ki] = valid[ki] ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
             row_sum += weights[qi * kk + ki];
         }
         const float inv_sum = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
@@ -320,12 +324,12 @@ inline void sparse_attention_forward(
             weights[qi * kk + ki] *= inv_sum;
     }
 
-    // ── Weighted sum of V rows for each selected query ────────────────────────
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+// ── Weighted sum of V rows for each selected query ────────────────────────
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t qi = 0; qi < kk; ++qi) {
         float* out_row = output + q_idx[qi] * d;
         for (std::size_t ki = 0; ki < kk; ++ki) {
-            const float  w  = weights[qi * kk + ki];
+            const float w = weights[qi * kk + ki];
             const float* vr = v + k_idx[ki] * d;
             for (std::size_t i = 0; i < d; ++i)
                 out_row[i] += w * vr[i];
@@ -351,44 +355,44 @@ inline void sparse_attention_forward(
 // Memory: dL/dQ, dL/dK, dL/dV are ACCUMULATED into the output arrays (+=),
 // not assigned. Callers should zero them first.
 
-inline void banded_attention_backward(
-    const float* q,         ///< [T x d] forward inputs (needed to recompute weights)
-    const float* k_mat,     ///< [K x d]
-    const float* v,         ///< [K x d]
-    const float* dO,        ///< [T x d] output gradient
-    float*       dQ,        ///< [T x d] accumulated gradient output
-    float*       dK,        ///< [K x d] accumulated gradient output
-    float*       dV,        ///< [K x d] accumulated gradient output
-    std::size_t  T,
-    std::size_t  K,
-    std::size_t  d,
-    std::size_t  half_bandwidth,
-    int          num_cpus = 4,
-    bool         causal = false)   ///< must match the forward call's causal flag.
+inline void
+banded_attention_backward(const float* q, ///< [T x d] forward inputs (needed to recompute weights)
+                          const float* k_mat, ///< [K x d]
+                          const float* v,     ///< [K x d]
+                          const float* dO,    ///< [T x d] output gradient
+                          float* dQ,          ///< [T x d] accumulated gradient output
+                          float* dK,          ///< [K x d] accumulated gradient output
+                          float* dV,          ///< [K x d] accumulated gradient output
+                          std::size_t T, std::size_t K, std::size_t d, std::size_t half_bandwidth,
+                          int num_cpus = 4,
+                          bool causal = false) ///< must match the forward call's causal flag.
 {
-    if (T == 0 || K == 0 || d == 0) return;
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
     auto centre_k = [&](std::size_t t) -> std::size_t {
-        if (T <= 1 || K <= 1) return 0;
+        if (T <= 1 || K <= 1)
+            return 0;
         return (t * (K - 1) + (T - 1) / 2) / (T - 1);
     };
 
-    // dV can be accumulated by multiple queries in parallel -- use a mutex-
-    // free approach: each thread accumulates into its own dV scratch, then
-    // reduce. But dV[K x d] could be large, so we use a critical section on
-    // the dV/dK writes instead (the hot path is the per-query softmax Jacobian).
-    // For dQ each row is independent (one thread owns it), so no locking needed.
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+// dV can be accumulated by multiple queries in parallel -- use a mutex-
+// free approach: each thread accumulates into its own dV scratch, then
+// reduce. But dV[K x d] could be large, so we use a critical section on
+// the dV/dK writes instead (the hot path is the per-query softmax Jacobian).
+// For dQ each row is independent (one thread owns it), so no locking needed.
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr  = q   + t * d;
-        const float* dOr = dO  + t * d;
-        float*       dQr = dQ  + t * d;
+        const float* qr = q + t * d;
+        const float* dOr = dO + t * d;
+        float* dQr = dQ + t * d;
 
-        const std::size_t ck   = centre_k(t);
+        const std::size_t ck = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
         std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
-        if (causal) k_hi = std::min(k_hi, t);
+        if (causal)
+            k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
 
         // Recompute softmax weights for this query's band.
@@ -397,89 +401,92 @@ inline void banded_attention_backward(
         for (std::size_t bi = 0; bi < band_w; ++bi) {
             const float* kr = k_mat + (k_lo + bi) * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             attn[bi] = dot * scale;
-            if (attn[bi] > max_s) max_s = attn[bi];
+            if (attn[bi] > max_s)
+                max_s = attn[bi];
         }
         float sum_e = 0.0f;
-        for (float& s : attn) { s = std::exp(s - max_s); sum_e += s; }
+        for (float& s : attn) {
+            s = std::exp(s - max_s);
+            sum_e += s;
+        }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : attn) s *= inv;
+        for (float& s : attn)
+            s *= inv;
 
         // g[t] = sum_k( attn[k] * (dO[t] . V[k]) )
         float g = 0.0f;
         for (std::size_t bi = 0; bi < band_w; ++bi) {
             const float* vr = v + (k_lo + bi) * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += dOr[i] * vr[i];
             g += attn[bi] * dot;
         }
 
-        // Per-band accumulations (dK, dV have race hazard across queries --
-        // use critical section since band_w is small and the writes are rare
-        // relative to the softmax Jacobian computation above).
-        #pragma omp critical
+// Per-band accumulations (dK, dV have race hazard across queries --
+// use critical section since band_w is small and the writes are rare
+// relative to the softmax Jacobian computation above).
+#pragma omp critical
         {
             for (std::size_t bi = 0; bi < band_w; ++bi) {
                 const std::size_t kp = k_lo + bi;
-                const float*      vr = v     + kp * d;
-                float*            dVr = dV   + kp * d;
-                float*            dKr = dK   + kp * d;
+                const float* vr = v + kp * d;
+                float* dVr = dV + kp * d;
+                float* dKr = dK + kp * d;
 
                 // dL/dV[k] += attn[q,k] * dO[q]
-                for (std::size_t i = 0; i < d; ++i) dVr[i] += attn[bi] * dOr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dVr[i] += attn[bi] * dOr[i];
 
                 // ds[q,k] = attn[q,k] * (dO[q].V[k] - g[q])
                 float dov = 0.0f;
-                for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dov += dOr[i] * vr[i];
                 const float ds = attn[bi] * (dov - g);
 
                 // dL/dK[k] += ds * Q[q] * scale
                 const float* kr = k_mat + kp * d;
-                for (std::size_t i = 0; i < d; ++i) dKr[i] += ds * scale * qr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dKr[i] += ds * scale * qr[i];
 
                 // dL/dQ[q] += ds * K[k] * scale  (no race: one thread per q)
-                for (std::size_t i = 0; i < d; ++i) dQr[i] += ds * scale * kr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dQr[i] += ds * scale * kr[i];
             }
         }
     }
 }
 
-
 inline void sparse_banded_attention_backward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    const float* dO,
-    float*       dQ,
-    float*       dK,
-    float*       dV,
-    std::size_t  T,
-    std::size_t  K,
-    std::size_t  d,
-    std::size_t  half_bandwidth,
-    std::size_t  inner_k = 0,
-    int          num_cpus = 4,
-    bool         causal = false)   ///< must match the forward call's causal flag.
+    const float* q, const float* k_mat, const float* v, const float* dO, float* dQ, float* dK,
+    float* dV, std::size_t T, std::size_t K, std::size_t d, std::size_t half_bandwidth,
+    std::size_t inner_k = 0, int num_cpus = 4,
+    bool causal = false) ///< must match the forward call's causal flag.
 {
-    if (T == 0 || K == 0 || d == 0) return;
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
     auto centre_k = [&](std::size_t t) -> std::size_t {
-        if (T <= 1 || K <= 1) return 0;
+        if (T <= 1 || K <= 1)
+            return 0;
         return (t * (K - 1) + (T - 1) / 2) / (T - 1);
     };
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr  = q  + t * d;
+        const float* qr = q + t * d;
         const float* dOr = dO + t * d;
-        float*       dQr = dQ + t * d;
+        float* dQr = dQ + t * d;
 
-        const std::size_t ck   = centre_k(t);
+        const std::size_t ck = centre_k(t);
         const std::size_t k_lo = (ck > half_bandwidth) ? ck - half_bandwidth : 0;
         std::size_t k_hi = std::min(ck + half_bandwidth, K - 1);
-        if (causal) k_hi = std::min(k_hi, t);
+        if (causal)
+            k_hi = std::min(k_hi, t);
         const std::size_t band_w = k_hi - k_lo + 1;
         const std::size_t kk = (inner_k == 0 || inner_k >= band_w) ? band_w : inner_k;
 
@@ -488,13 +495,16 @@ inline void sparse_banded_attention_backward(
         std::iota(band_idx.begin(), band_idx.end(), k_lo);
         if (kk < band_w) {
             std::partial_sort(band_idx.begin(), band_idx.begin() + kk, band_idx.end(),
-                [&](std::size_t a, std::size_t b) {
-                    float na = 0.0f, nb = 0.0f;
-                    const float* ka = k_mat + a * d;
-                    const float* kb = k_mat + b * d;
-                    for (std::size_t i = 0; i < d; ++i) { na += ka[i]*ka[i]; nb += kb[i]*kb[i]; }
-                    return na > nb;
-                });
+                              [&](std::size_t a, std::size_t b) {
+                                  float na = 0.0f, nb = 0.0f;
+                                  const float* ka = k_mat + a * d;
+                                  const float* kb = k_mat + b * d;
+                                  for (std::size_t i = 0; i < d; ++i) {
+                                      na += ka[i] * ka[i];
+                                      nb += kb[i] * kb[i];
+                                  }
+                                  return na > nb;
+                              });
             band_idx.resize(kk);
         }
 
@@ -504,80 +514,86 @@ inline void sparse_banded_attention_backward(
         for (std::size_t bi = 0; bi < kk; ++bi) {
             const float* kr = k_mat + band_idx[bi] * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             attn[bi] = dot * scale;
-            if (attn[bi] > max_s) max_s = attn[bi];
+            if (attn[bi] > max_s)
+                max_s = attn[bi];
         }
         float sum_e = 0.0f;
-        for (float& s : attn) { s = std::exp(s - max_s); sum_e += s; }
+        for (float& s : attn) {
+            s = std::exp(s - max_s);
+            sum_e += s;
+        }
         const float inv = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (float& s : attn) s *= inv;
+        for (float& s : attn)
+            s *= inv;
 
         // g[t] = sum_k( attn[k] * (dO[t].V[k]) )
         float g = 0.0f;
         for (std::size_t bi = 0; bi < kk; ++bi) {
             const float* vr = v + band_idx[bi] * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += dOr[i] * vr[i];
             g += attn[bi] * dot;
         }
 
-        #pragma omp critical
+#pragma omp critical
         {
             for (std::size_t bi = 0; bi < kk; ++bi) {
-                const std::size_t kp  = band_idx[bi];
-                const float*      vr  = v   + kp * d;
-                float*            dVr = dV  + kp * d;
-                float*            dKr = dK  + kp * d;
-                const float*      kr  = k_mat + kp * d;
+                const std::size_t kp = band_idx[bi];
+                const float* vr = v + kp * d;
+                float* dVr = dV + kp * d;
+                float* dKr = dK + kp * d;
+                const float* kr = k_mat + kp * d;
 
-                for (std::size_t i = 0; i < d; ++i) dVr[i] += attn[bi] * dOr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dVr[i] += attn[bi] * dOr[i];
 
                 float dov = 0.0f;
-                for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dov += dOr[i] * vr[i];
                 const float ds = attn[bi] * (dov - g);
 
-                for (std::size_t i = 0; i < d; ++i) dKr[i] += ds * scale * qr[i];
-                for (std::size_t i = 0; i < d; ++i) dQr[i] += ds * scale * kr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dKr[i] += ds * scale * qr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dQr[i] += ds * scale * kr[i];
             }
         }
     }
 }
 
-
-inline void sparse_attention_backward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    const float* dO,
-    float*       dQ,
-    float*       dK,
-    float*       dV,
-    std::size_t  T,
-    std::size_t  d,
-    std::size_t  k,
-    int          num_cpus = 4,
-    bool         causal = false)   ///< must match the forward call's causal flag.
+inline void
+sparse_attention_backward(const float* q, const float* k_mat, const float* v, const float* dO,
+                          float* dQ, float* dK, float* dV, std::size_t T, std::size_t d,
+                          std::size_t k, int num_cpus = 4,
+                          bool causal = false) ///< must match the forward call's causal flag.
 {
-    if (T == 0 || d == 0) return;
+    if (T == 0 || d == 0)
+        return;
 
-    const std::size_t kk = (k == 0)
-        ? std::max(std::size_t(1), static_cast<std::size_t>(std::sqrt(float(T))))
-        : std::min(k, T);
+    const std::size_t kk =
+        (k == 0) ? std::max(std::size_t(1), static_cast<std::size_t>(std::sqrt(float(T))))
+                 : std::min(k, T);
     const float scale = 1.0f / std::sqrt(float(d));
 
     // Re-select same top-k query/key indices as in the forward pass.
     std::vector<float> q_norms(T, 0.0f), k_norms(T, 0.0f);
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr = q     + t * d;
+        const float* qr = q + t * d;
         const float* kr = k_mat + t * d;
-        for (std::size_t i = 0; i < d; ++i) { q_norms[t] += qr[i]*qr[i]; k_norms[t] += kr[i]*kr[i]; }
+        for (std::size_t i = 0; i < d; ++i) {
+            q_norms[t] += qr[i] * qr[i];
+            k_norms[t] += kr[i] * kr[i];
+        }
     }
     auto topk_idx = [&](const std::vector<float>& norms) {
         std::vector<std::size_t> idx(T);
         std::iota(idx.begin(), idx.end(), 0);
         std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
-            [&](std::size_t a, std::size_t b){ return norms[a] > norms[b]; });
+                          [&](std::size_t a, std::size_t b) { return norms[a] > norms[b]; });
         idx.resize(kk);
         return idx;
     };
@@ -593,7 +609,8 @@ inline void sparse_attention_backward(
             for (std::size_t ki = 0; ki < kk; ++ki) {
                 const float* kr = k_mat + k_idx[ki] * d;
                 float dot = 0.0f;
-                for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dot += qr[i] * kr[i];
                 scores[qi * kk + ki] = dot * scale;
             }
         }
@@ -605,16 +622,17 @@ inline void sparse_attention_backward(
 
             float row_max = -1e38f;
             for (std::size_t ki = 0; ki < kk; ++ki)
-                if (valid[ki]) row_max = std::max(row_max, scores[qi * kk + ki]);
+                if (valid[ki])
+                    row_max = std::max(row_max, scores[qi * kk + ki]);
 
             float row_sum = 0.0f;
             for (std::size_t ki = 0; ki < kk; ++ki) {
-                weights[qi * kk + ki] = valid[ki]
-                    ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
+                weights[qi * kk + ki] = valid[ki] ? std::exp(scores[qi * kk + ki] - row_max) : 0.0f;
                 row_sum += weights[qi * kk + ki];
             }
             const float inv = (row_sum > 0.0f) ? 1.0f / row_sum : 0.0f;
-            for (std::size_t ki = 0; ki < kk; ++ki) weights[qi * kk + ki] *= inv;
+            for (std::size_t ki = 0; ki < kk; ++ki)
+                weights[qi * kk + ki] *= inv;
         }
     }
 
@@ -625,7 +643,8 @@ inline void sparse_attention_backward(
         for (std::size_t qi = 0; qi < kk; ++qi) {
             const float w = weights[qi * kk + ki];
             const float* dOr = dO + q_idx[qi] * d;
-            for (std::size_t i = 0; i < d; ++i) dVr[i] += w * dOr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dVr[i] += w * dOr[i];
         }
     }
 
@@ -637,26 +656,29 @@ inline void sparse_attention_backward(
         for (std::size_t ki = 0; ki < kk; ++ki) {
             const float* vr = v + k_idx[ki] * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += dOr[i] * vr[i];
             g[qi] += weights[qi * kk + ki] * dot;
         }
     }
 
-    // ds[qi,ki] = weights[qi,ki] * (dO[q_idx[qi]].V[k_idx[ki]] - g[qi])
-    // dL/dQ[q_idx[qi]] += scale * sum_{ki}( ds[qi,ki] * K[k_idx[ki]] )
-    // dL/dK[k_idx[ki]] += scale * sum_{qi}( ds[qi,ki] * Q[q_idx[qi]] )
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+// ds[qi,ki] = weights[qi,ki] * (dO[q_idx[qi]].V[k_idx[ki]] - g[qi])
+// dL/dQ[q_idx[qi]] += scale * sum_{ki}( ds[qi,ki] * K[k_idx[ki]] )
+// dL/dK[k_idx[ki]] += scale * sum_{qi}( ds[qi,ki] * Q[q_idx[qi]] )
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t qi = 0; qi < kk; ++qi) {
-        const float* qr  = q   + q_idx[qi] * d;
-        const float* dOr = dO  + q_idx[qi] * d;
-        float*       dQr = dQ  + q_idx[qi] * d;
+        const float* qr = q + q_idx[qi] * d;
+        const float* dOr = dO + q_idx[qi] * d;
+        float* dQr = dQ + q_idx[qi] * d;
         for (std::size_t ki = 0; ki < kk; ++ki) {
-            const float* vr = v     + k_idx[ki] * d;
+            const float* vr = v + k_idx[ki] * d;
             const float* kr = k_mat + k_idx[ki] * d;
             float dov = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dov += dOr[i] * vr[i];
             const float ds = weights[qi * kk + ki] * (dov - g[qi]);
-            for (std::size_t i = 0; i < d; ++i) dQr[i] += ds * scale * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dQr[i] += ds * scale * kr[i];
         }
     }
     // dL/dK: serial to avoid races (each k_idx[ki] written by all qi)
@@ -667,9 +689,11 @@ inline void sparse_attention_backward(
             const float* vr = v + k_idx[ki] * d;
             const float* dOr = dO + q_idx[qi] * d;
             float dov = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dov += dOr[i] * vr[i];
             const float ds = weights[qi * kk + ki] * (dov - g[qi]);
-            for (std::size_t i = 0; i < d; ++i) dKr[i] += ds * scale * qr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dKr[i] += ds * scale * qr[i];
         }
     }
 }
@@ -704,40 +728,39 @@ inline void sparse_attention_backward(
  * the Q.K term as sigma shrinks).
  */
 inline void gaussian_attention_forward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    float*       output,
-    std::size_t  T,
-    std::size_t  K,
-    std::size_t  d,
-    const float* centers,   ///< [T] -- per-query center position (float, can be fractional)
-    const float* sigmas,    ///< [T] -- per-query std dev, must be > 0
-    int          num_cpus = 4,
-    bool         causal = false)
-{
-    if (T == 0 || K == 0 || d == 0) return;
+    const float* q, const float* k_mat, const float* v, float* output, std::size_t T, std::size_t K,
+    std::size_t d,
+    const float* centers, ///< [T] -- per-query center position (float, can be fractional)
+    const float* sigmas,  ///< [T] -- per-query std dev, must be > 0
+    int num_cpus = 4, bool causal = false) {
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr   = q + t * d;
-        float*       outr = output + t * d;
-        const float  c = centers[t];
-        const float  inv_2s2 = 1.0f / (2.0f * sigmas[t] * sigmas[t]);
+        const float* qr = q + t * d;
+        float* outr = output + t * d;
+        const float c = centers[t];
+        const float inv_2s2 = 1.0f / (2.0f * sigmas[t] * sigmas[t]);
 
         std::vector<float> scores(K);
         for (std::size_t j = 0; j < K; ++j) {
-            if (causal && j > t) { scores[j] = -1e38f; continue; }
+            if (causal && j > t) {
+                scores[j] = -1e38f;
+                continue;
+            }
             const float* kr = k_mat + j * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             const float diff = float(j) - c;
             scores[j] = dot * scale - diff * diff * inv_2s2;
         }
 
         float max_s = -1e38f;
-        for (std::size_t j = 0; j < K; ++j) max_s = std::max(max_s, scores[j]);
+        for (std::size_t j = 0; j < K; ++j)
+            max_s = std::max(max_s, scores[j]);
         float sum_e = 0.0f;
         for (std::size_t j = 0; j < K; ++j) {
             scores[j] = std::exp(scores[j] - max_s);
@@ -746,13 +769,13 @@ inline void gaussian_attention_forward(
         const float inv_sum = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
 
         for (std::size_t j = 0; j < K; ++j) {
-            const float w  = scores[j] * inv_sum;
+            const float w = scores[j] * inv_sum;
             const float* vr = v + j * d;
-            for (std::size_t i = 0; i < d; ++i) outr[i] += w * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                outr[i] += w * vr[i];
         }
     }
 }
-
 
 /**
  * @brief Backward pass for gaussian_attention_forward.
@@ -775,46 +798,41 @@ inline void gaussian_attention_forward(
  * exactly one thread, no locking needed (unlike dK/dV, which every
  * query's row can write to and need a critical section).
  */
-inline void gaussian_attention_backward(
-    const float* q,
-    const float* k_mat,
-    const float* v,
-    const float* dO,
-    float*       dQ,
-    float*       dK,
-    float*       dV,
-    float*       dCenters,   ///< [T] accumulated gradient output
-    float*       dSigmas,    ///< [T] accumulated gradient output
-    std::size_t  T,
-    std::size_t  K,
-    std::size_t  d,
-    const float* centers,
-    const float* sigmas,
-    int          num_cpus = 4,
-    bool         causal = false)
-{
-    if (T == 0 || K == 0 || d == 0) return;
+inline void gaussian_attention_backward(const float* q, const float* k_mat, const float* v,
+                                        const float* dO, float* dQ, float* dK, float* dV,
+                                        float* dCenters, ///< [T] accumulated gradient output
+                                        float* dSigmas,  ///< [T] accumulated gradient output
+                                        std::size_t T, std::size_t K, std::size_t d,
+                                        const float* centers, const float* sigmas, int num_cpus = 4,
+                                        bool causal = false) {
+    if (T == 0 || K == 0 || d == 0)
+        return;
     const float scale = 1.0f / std::sqrt(float(d));
 
-    #pragma omp parallel for num_threads(num_cpus) schedule(static)
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
     for (std::size_t t = 0; t < T; ++t) {
-        const float* qr  = q  + t * d;
+        const float* qr = q + t * d;
         const float* dOr = dO + t * d;
-        float*       dQr = dQ + t * d;
-        const float  c = centers[t];
-        const float  s = sigmas[t];
-        const float  inv_2s2 = 1.0f / (2.0f * s * s);
+        float* dQr = dQ + t * d;
+        const float c = centers[t];
+        const float s = sigmas[t];
+        const float inv_2s2 = 1.0f / (2.0f * s * s);
 
         std::vector<float> attn(K);
         float max_s = -1e38f;
         for (std::size_t j = 0; j < K; ++j) {
-            if (causal && j > t) { attn[j] = -1e38f; continue; }
+            if (causal && j > t) {
+                attn[j] = -1e38f;
+                continue;
+            }
             const float* kr = k_mat + j * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += qr[i] * kr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += qr[i] * kr[i];
             const float diff = float(j) - c;
             attn[j] = dot * scale - diff * diff * inv_2s2;
-            if (attn[j] > max_s) max_s = attn[j];
+            if (attn[j] > max_s)
+                max_s = attn[j];
         }
         float sum_e = 0.0f;
         for (std::size_t j = 0; j < K; ++j) {
@@ -822,43 +840,49 @@ inline void gaussian_attention_backward(
             sum_e += attn[j];
         }
         const float inv_sum = (sum_e > 0.0f) ? 1.0f / sum_e : 0.0f;
-        for (std::size_t j = 0; j < K; ++j) attn[j] *= inv_sum;
+        for (std::size_t j = 0; j < K; ++j)
+            attn[j] *= inv_sum;
 
         // g[t] = sum_j( attn[t,j] * (dO[t].V[j]) )
         float g = 0.0f;
         for (std::size_t j = 0; j < K; ++j) {
             const float* vr = v + j * d;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < d; ++i) dot += dOr[i] * vr[i];
+            for (std::size_t i = 0; i < d; ++i)
+                dot += dOr[i] * vr[i];
             g += attn[j] * dot;
         }
 
         float dc = 0.0f, ds_sigma = 0.0f;
-        #pragma omp critical
+#pragma omp critical
         {
             for (std::size_t j = 0; j < K; ++j) {
                 const std::size_t kp = j;
-                const float*      vr  = v  + kp * d;
-                float*             dVr = dV + kp * d;
-                float*             dKr = dK + kp * d;
+                const float* vr = v + kp * d;
+                float* dVr = dV + kp * d;
+                float* dKr = dK + kp * d;
 
-                for (std::size_t i = 0; i < d; ++i) dVr[i] += attn[j] * dOr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dVr[i] += attn[j] * dOr[i];
 
                 float dov = 0.0f;
-                for (std::size_t i = 0; i < d; ++i) dov += dOr[i] * vr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dov += dOr[i] * vr[i];
                 const float ds = attn[j] * (dov - g);
 
                 const float* kr = k_mat + kp * d;
-                for (std::size_t i = 0; i < d; ++i) dKr[i] += ds * scale * qr[i];
-                for (std::size_t i = 0; i < d; ++i) dQr[i] += ds * scale * kr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dKr[i] += ds * scale * qr[i];
+                for (std::size_t i = 0; i < d; ++i)
+                    dQr[i] += ds * scale * kr[i];
 
                 const float diff = float(j) - c;
-                dc       += ds * diff / (s * s);
+                dc += ds * diff / (s * s);
                 ds_sigma += ds * diff * diff / (s * s * s);
             }
         }
         dCenters[t] += dc;
-        dSigmas[t]  += ds_sigma;
+        dSigmas[t] += ds_sigma;
     }
 }
 

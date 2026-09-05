@@ -14,22 +14,22 @@
 // Fits in 4 bits; two values pack exactly into one byte with no spanning.
 
 static constexpr float FP4_TABLE[16] = {
-     0.0f,    // 0000
-     0.5f,    // 0001
-     1.0f,    // 0010
-     1.5f,    // 0011
-     2.0f,    // 0100
-     3.0f,    // 0101
-     4.0f,    // 0110
-     6.0f,    // 0111
-     NAN,     // 1000
-    -0.5f,    // 1001
-    -1.0f,   // 1010
-    -1.5f,   // 1011
-    -2.0f,   // 1100
-    -3.0f,   // 1101
-    -4.0f,   // 1110
-    -6.0f,   // 1111
+    0.0f,  // 0000
+    0.5f,  // 0001
+    1.0f,  // 0010
+    1.5f,  // 0011
+    2.0f,  // 0100
+    3.0f,  // 0101
+    4.0f,  // 0110
+    6.0f,  // 0111
+    NAN,   // 1000
+    -0.5f, // 1001
+    -1.0f, // 1010
+    -1.5f, // 1011
+    -2.0f, // 1100
+    -3.0f, // 1101
+    -4.0f, // 1110
+    -6.0f, // 1111
 };
 
 // ── Bit-shift codec (no table, no branch-per-candidate) ─────────────────────
@@ -84,14 +84,14 @@ inline float fp4_decode_bits(uint8_t code) {
 }
 
 inline uint8_t fp4_encode_bits(float v) {
-    static constexpr uint32_t TH_025 = 0x3E800000u;  // bits_of(0.25f)
-    static constexpr uint32_t TH_075 = 0x3F400000u;  // bits_of(0.75f)
-    static constexpr uint32_t TH_1   = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX    = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t TH_025 = 0x3E800000u; // bits_of(0.25f)
+    static constexpr uint32_t TH_075 = 0x3F400000u; // bits_of(0.75f)
+    static constexpr uint32_t TH_1 = 0x3F800000u;   // bits_of(1.0f)
+    static constexpr uint32_t SIX = 0x40C00000u;    // bits_of(6.0f)
 
     uint32_t bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t sign = bits & 0x80000000u;
     const uint32_t abits = bits & 0x7FFFFFFFu;
 
     uint32_t mag_code;
@@ -108,19 +108,21 @@ inline uint8_t fp4_encode_bits(float v) {
         mag_code = 2;
     } else {
         uint32_t rounded = abits + (1u << 21);
-        if (rounded > SIX) rounded = SIX;
+        if (rounded > SIX)
+            rounded = SIX;
         const uint32_t exp_field = (rounded >> 23) & 0xFFu;
-        const uint32_t m         = (rounded >> 22) & 1u;
+        const uint32_t m = (rounded >> 22) & 1u;
         mag_code = ((exp_field - 126u) << 1) | m;
     }
     // A near-zero input must land on code 0 regardless of sign -- never
     // the repurposed NaN slot (8 = sign 1, magnitude 0).
-    if (mag_code == 0) return 0;
+    if (mag_code == 0)
+        return 0;
     const uint32_t s = sign ? 1u : 0u;
     return uint8_t((s << 3) | mag_code);
 }
 
-///Nearest-neighbour quantize @p v to a 4-bit FP4 index. NaN slot (8) is skipped.
+/// Nearest-neighbour quantize @p v to a 4-bit FP4 index. NaN slot (8) is skipped.
 inline uint8_t fp4_quantize(float v) {
     return fp4_encode_bits(v);
 }
@@ -151,14 +153,14 @@ inline uint8_t fp4_quantize(float v) {
 // "stuck dead synapse" episodes cost far more than this variant's small
 // steady-state discretization floor.
 inline uint8_t fp4_encode_bits_live(float v) {
-    static constexpr uint32_t TH_025 = 0x3E800000u;  // bits_of(0.25f)
-    static constexpr uint32_t TH_075 = 0x3F400000u;  // bits_of(0.75f)
-    static constexpr uint32_t TH_1   = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX    = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t TH_025 = 0x3E800000u; // bits_of(0.25f)
+    static constexpr uint32_t TH_075 = 0x3F400000u; // bits_of(0.75f)
+    static constexpr uint32_t TH_1 = 0x3F800000u;   // bits_of(1.0f)
+    static constexpr uint32_t SIX = 0x40C00000u;    // bits_of(6.0f)
 
     uint32_t bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t sign = bits & 0x80000000u;
     const uint32_t abits = bits & 0x7FFFFFFFu;
 
     uint32_t mag_code;
@@ -169,22 +171,24 @@ inline uint8_t fp4_encode_bits_live(float v) {
         // code 1 rather than fp4_quantize's own code-0 convention.
         return uint8_t(((sign ? 1u : 0u) << 3) | 1u);
     } else if (abits < TH_025) {
-        mag_code = 1;  // was 0 in fp4_encode_bits -- the whole point of "live"
+        mag_code = 1; // was 0 in fp4_encode_bits -- the whole point of "live"
     } else if (abits < TH_075) {
         mag_code = 1;
     } else if (abits < TH_1) {
         mag_code = 2;
     } else {
         uint32_t rounded = abits + (1u << 21);
-        if (rounded > SIX) rounded = SIX;
+        if (rounded > SIX)
+            rounded = SIX;
         const uint32_t exp_field = (rounded >> 23) & 0xFFu;
-        const uint32_t m         = (rounded >> 22) & 1u;
+        const uint32_t m = (rounded >> 22) & 1u;
         mag_code = ((exp_field - 126u) << 1) | m;
     }
     // Defensive fallback -- every branch above already guarantees mag_code
     // >= 1, this should be unreachable; kept cheap in case a future edit to
     // the carry-propagation path above reintroduces a 0.
-    if (mag_code == 0) mag_code = 1;
+    if (mag_code == 0)
+        mag_code = 1;
     const uint32_t s = sign ? 1u : 0u;
     return uint8_t((s << 3) | mag_code);
 }
@@ -265,13 +269,15 @@ inline void fp4_seed_stochastic_rng(uint64_t seed) {
 /// quantize at exactly one RNG step per call, same as before this split).
 inline uint64_t fp4_stochastic_next_u64() {
     uint64_t& s = fp4_stochastic_rng_state();
-    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
     return s * 0x2545F4914F6CDD1DULL;
 }
 
 inline float fp4_stochastic_uniform01() {
     const uint64_t r = fp4_stochastic_next_u64();
-    return static_cast<float>((r >> 40) * (1.0 / 16777216.0));  // top 24 bits -> [0,1)
+    return static_cast<float>((r >> 40) * (1.0 / 16777216.0)); // top 24 bits -> [0,1)
 }
 
 /// Stochastic quantize @p v to a 4-bit FP4 index -- unbiased (E[result] == v
@@ -306,39 +312,43 @@ inline float fp4_stochastic_uniform01() {
 ///     the interpolation fraction is just a plain multiply (2v, or
 ///     2v-1), no bit tricks needed.
 inline uint8_t fp4_quantize_stochastic(float v) {
-    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
-    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t HALF_BITS = 0x3F000000u; // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS = 0x40C00000u;  // bits_of(6.0f)
 
     uint32_t bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t sign = bits & 0x80000000u;
     const uint32_t abits = bits & 0x7FFFFFFFu;
 
-    if (abits > 0x7F800000u) return 0;  // NaN input -- matches fp4_quantize(NaN) == 0
+    if (abits > 0x7F800000u)
+        return 0; // NaN input -- matches fp4_quantize(NaN) == 0
 
     uint32_t mag_code;
     if (abits >= SIX_BITS) {
-        mag_code = 7;  // deterministic saturate, matches the old scan's v >= hi_bound clamp
+        mag_code = 7; // deterministic saturate, matches the old scan's v >= hi_bound clamp
     } else if (abits < HALF_BITS) {
         float av;
         std::memcpy(&av, &abits, sizeof(av));
-        const float p_up = av * 2.0f;   // (v - 0.0) / (0.5 - 0.0)
+        const float p_up = av * 2.0f; // (v - 0.0) / (0.5 - 0.0)
         mag_code = (fp4_stochastic_uniform01() < p_up) ? 1u : 0u;
     } else if (abits < ONE_BITS) {
         float av;
         std::memcpy(&av, &abits, sizeof(av));
-        const float p_up = av * 2.0f - 1.0f;   // (v - 0.5) / (1.0 - 0.5)
+        const float p_up = av * 2.0f - 1.0f; // (v - 0.5) / (1.0 - 0.5)
         mag_code = (fp4_stochastic_uniform01() < p_up) ? 2u : 1u;
     } else {
-        const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);  // uniform in [0, 2^22)
+        const uint32_t dither =
+            uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu); // uniform in [0, 2^22)
         uint32_t rounded = abits + dither;
-        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        if (rounded > SIX_BITS)
+            rounded = SIX_BITS;
         const uint32_t exp_field = (rounded >> 23) & 0xFFu;
-        const uint32_t m         = (rounded >> 22) & 1u;
+        const uint32_t m = (rounded >> 22) & 1u;
         mag_code = ((exp_field - 126u) << 1) | m;
     }
-    if (mag_code == 0) return 0;  // never the repurposed NaN slot, see fp4_encode_bits
+    if (mag_code == 0)
+        return 0; // never the repurposed NaN slot, see fp4_encode_bits
     return uint8_t(((sign ? 1u : 0u) << 3) | mag_code);
 }
 
@@ -359,13 +369,13 @@ inline uint8_t fp4_quantize_stochastic(float v) {
 /// untouched and stays exactly as unbiased as fp4_quantize_stochastic's
 /// own.
 inline uint8_t fp4_quantize_stochastic_live(float v) {
-    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
-    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t HALF_BITS = 0x3F000000u; // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS = 0x40C00000u;  // bits_of(6.0f)
 
     uint32_t bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t sign = bits & 0x80000000u;
     const uint32_t abits = bits & 0x7FFFFFFFu;
 
     if (abits > 0x7F800000u) {
@@ -376,32 +386,35 @@ inline uint8_t fp4_quantize_stochastic_live(float v) {
     uint32_t mag_code;
     uint32_t s_out = sign ? 1u : 0u;
     if (abits >= SIX_BITS) {
-        mag_code = 7;  // deterministic saturate, matches fp4_quantize_stochastic
+        mag_code = 7; // deterministic saturate, matches fp4_quantize_stochastic
     } else if (abits < HALF_BITS) {
         // Full signed bracket [-0.5,+0.5) -- see this function's own
         // docstring above for the probability-weighted redirect.
         float av;
         std::memcpy(&av, &abits, sizeof(av));
         const float signed_v = sign ? -av : av;
-        const float p_pos = signed_v + 0.5f;  // (v - (-0.5)) / ((+0.5) - (-0.5))
+        const float p_pos = signed_v + 0.5f; // (v - (-0.5)) / ((+0.5) - (-0.5))
         const bool pick_pos = fp4_stochastic_uniform01() < p_pos;
         mag_code = 1u;
         s_out = pick_pos ? 0u : 1u;
     } else if (abits < ONE_BITS) {
         float av;
         std::memcpy(&av, &abits, sizeof(av));
-        const float p_up = av * 2.0f - 1.0f;   // (v - 0.5) / (1.0 - 0.5)
+        const float p_up = av * 2.0f - 1.0f; // (v - 0.5) / (1.0 - 0.5)
         mag_code = (fp4_stochastic_uniform01() < p_up) ? 2u : 1u;
     } else {
-        const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);  // uniform in [0, 2^22)
+        const uint32_t dither =
+            uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu); // uniform in [0, 2^22)
         uint32_t rounded = abits + dither;
-        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        if (rounded > SIX_BITS)
+            rounded = SIX_BITS;
         const uint32_t exp_field = (rounded >> 23) & 0xFFu;
-        const uint32_t m         = (rounded >> 22) & 1u;
+        const uint32_t m = (rounded >> 22) & 1u;
         mag_code = ((exp_field - 126u) << 1) | m;
     }
     // Defensive fallback, should be unreachable -- see fp4_encode_bits_live.
-    if (mag_code == 0) mag_code = 1u;
+    if (mag_code == 0)
+        mag_code = 1u;
     return uint8_t((s_out << 3) | mag_code);
 }
 
@@ -428,25 +441,25 @@ inline uint8_t fp4_quantize_stochastic_live(float v) {
 /// fp4_quantize_stochastic_live's own (those never touch sign or produce
 /// mag_code 0 anyway).
 inline uint8_t fp4_quantize_stochastic_live_nonneg(float v) {
-    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
-    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t HALF_BITS = 0x3F000000u; // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS = 0x40C00000u;  // bits_of(6.0f)
 
     uint32_t bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const uint32_t sign  = bits & 0x80000000u;
+    const uint32_t sign = bits & 0x80000000u;
     const uint32_t abits = bits & 0x7FFFFFFFu;
     const uint32_t s_out = sign ? 1u : 0u;
 
     if (abits > 0x7F800000u) {
-        return uint8_t((s_out << 3) | 1u);  // NaN input
+        return uint8_t((s_out << 3) | 1u); // NaN input
     }
 
     uint32_t mag_code;
     if (abits >= SIX_BITS) {
         mag_code = 7;
     } else if (abits < HALF_BITS) {
-        mag_code = 1u;  // deterministic -- see docstring above
+        mag_code = 1u; // deterministic -- see docstring above
     } else if (abits < ONE_BITS) {
         float av;
         std::memcpy(&av, &abits, sizeof(av));
@@ -455,12 +468,14 @@ inline uint8_t fp4_quantize_stochastic_live_nonneg(float v) {
     } else {
         const uint32_t dither = uint32_t(fp4_stochastic_next_u64() & 0x3FFFFFu);
         uint32_t rounded = abits + dither;
-        if (rounded > SIX_BITS) rounded = SIX_BITS;
+        if (rounded > SIX_BITS)
+            rounded = SIX_BITS;
         const uint32_t exp_field = (rounded >> 23) & 0xFFu;
-        const uint32_t m         = (rounded >> 22) & 1u;
+        const uint32_t m = (rounded >> 22) & 1u;
         mag_code = ((exp_field - 126u) << 1) | m;
     }
-    if (mag_code == 0) mag_code = 1u;
+    if (mag_code == 0)
+        mag_code = 1u;
     return uint8_t((s_out << 3) | mag_code);
 }
 
@@ -475,15 +490,15 @@ struct FP4BiPacked {
 
     struct ElemRef {
         uint8_t& _byte;
-        bool     _hi;
- 
-        operator float() const {
-            return FP4_TABLE[_hi ? (_byte >> 4) : (_byte & 0xF)];
-        }
+        bool _hi;
+
+        operator float() const { return FP4_TABLE[_hi ? (_byte >> 4) : (_byte & 0xF)]; }
         ElemRef& operator=(float v) {
             const uint8_t idx = fp4_quantize(v);
-            if (_hi) _byte = (_byte & 0x0F) | (idx << 4);
-            else     _byte = (_byte & 0xF0) |  idx;
+            if (_hi)
+                _byte = (_byte & 0x0F) | (idx << 4);
+            else
+                _byte = (_byte & 0xF0) | idx;
             return *this;
         }
         ElemRef& operator=(const ElemRef& other) { return *this = float(other); }
@@ -491,110 +506,108 @@ struct FP4BiPacked {
         ElemRef& operator-=(float v) { return *this = (float)*this - v; }
         ElemRef& operator*=(float v) { return *this = (float)*this * v; }
         ElemRef& operator/=(float v) { return *this = (float)*this / v; }
-        
     };
 
     struct Lane {
         std::shared_ptr<std::vector<uint8_t>>* _dp;
         bool _hi;
- 
+
         // ── shared_ptr-like interface ─────────────────────────────────────────
- 
+
         explicit operator bool() const { return bool(*_dp); }
- 
-        ///operator* and operator-> return *this — Lane is both ptr and vector.
-        Lane&       operator*()        { return *this; }
-        const Lane& operator*()  const { return *this; }
-        Lane*       operator->()       { return this; }
+
+        /// operator* and operator-> return *this — Lane is both ptr and vector.
+        Lane& operator*() { return *this; }
+        const Lane& operator*() const { return *this; }
+        Lane* operator->() { return this; }
         const Lane* operator->() const { return this; }
- 
-        ///Assignment from make_shared<vector<T>> ensures the backing store exists.
-        ///Both lanes always share one array; the assigned ptr's contents are ignored.
-        template <class T>
-        Lane& operator=(std::shared_ptr<std::vector<T>>) {
+
+        /// Assignment from make_shared<vector<T>> ensures the backing store exists.
+        /// Both lanes always share one array; the assigned ptr's contents are ignored.
+        template <class T> Lane& operator=(std::shared_ptr<std::vector<T>>) {
             if (!*_dp)
                 *_dp = std::make_shared<std::vector<uint8_t>>();
             return *this;
         }
- 
+
         // ── vector-like interface ─────────────────────────────────────────────
- 
-        ElemRef operator[](std::size_t i) {
-            return ElemRef{(**_dp)[i], _hi};
-        }
+
+        ElemRef operator[](std::size_t i) { return ElemRef{(**_dp)[i], _hi}; }
         float operator[](std::size_t i) const {
             const uint8_t b = (**_dp)[i];
             return FP4_TABLE[_hi ? (b >> 4) : (b & 0xF)];
         }
- 
-        std::size_t size()     const { return *_dp ? (*_dp)->size()     : 0; }
+
+        std::size_t size() const { return *_dp ? (*_dp)->size() : 0; }
         std::size_t capacity() const { return *_dp ? (*_dp)->capacity() : 0; }
-        bool        empty()    const { return !*_dp || (*_dp)->empty(); }
- 
+        bool empty() const { return !*_dp || (*_dp)->empty(); }
+
         void reserve(std::size_t n) {
-            if (!*_dp) *_dp = std::make_shared<std::vector<uint8_t>>();
+            if (!*_dp)
+                *_dp = std::make_shared<std::vector<uint8_t>>();
             (*_dp)->reserve(n);
         }
         void resize(std::size_t n, float v = 0.0f) {
-            if (!*_dp) *_dp = std::make_shared<std::vector<uint8_t>>();
+            if (!*_dp)
+                *_dp = std::make_shared<std::vector<uint8_t>>();
             const std::size_t old = (*_dp)->size();
             (*_dp)->resize(n, uint8_t(0));
             if (v != 0.0f) {
                 const uint8_t idx = fp4_quantize(v);
                 for (std::size_t i = old; i < n; ++i) {
                     auto& b = (**_dp)[i];
-                    if (_hi) b = (b & 0x0F) | (idx << 4);
-                    else     b = (b & 0xF0) |  idx;
+                    if (_hi)
+                        b = (b & 0x0F) | (idx << 4);
+                    else
+                        b = (b & 0xF0) | idx;
                 }
             }
         }
-        ///push_back allocates one new byte (both nibbles share it).
-        ///Call on one lane per element; set the other nibble via operator[].
+        /// push_back allocates one new byte (both nibbles share it).
+        /// Call on one lane per element; set the other nibble via operator[].
         void push_back(float v) {
-            if (!*_dp) *_dp = std::make_shared<std::vector<uint8_t>>();
-            const uint8_t idx  = fp4_quantize(v);
+            if (!*_dp)
+                *_dp = std::make_shared<std::vector<uint8_t>>();
+            const uint8_t idx = fp4_quantize(v);
             const uint8_t byte = _hi ? uint8_t(idx << 4) : idx;
             (*_dp)->push_back(byte);
         }
-        void clear() { if (*_dp) (*_dp)->clear(); }
+        void clear() {
+            if (*_dp)
+                (*_dp)->clear();
+        }
     };
- 
+
     // ── state ─────────────────────────────────────────────────────────────────
     // _data declared before _lanes so &_data is valid in initializer lists.
- 
+
     std::shared_ptr<std::vector<uint8_t>> _data;
     Lane _lanes[2];
- 
+
     // ── constructors ──────────────────────────────────────────────────────────
     // Each ctor rebuilds _lanes pointing to this->_data.
     // Copy/move assignment only touches _data; _lanes already point to it.
- 
-    FP4BiPacked()
-        : _data()
-        , _lanes{Lane{&_data, true}, Lane{&_data, false}}
-    {}
+
+    FP4BiPacked() : _data(), _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
 
     FP4BiPacked(std::vector<uint8_t>&& data)
-        : _data(std::make_shared<std::vector<uint8_t>>(std::move(data)))
-        , _lanes{Lane{&_data, true}, Lane{&_data, false}}
-    {}
- 
+        : _data(std::make_shared<std::vector<uint8_t>>(std::move(data))),
+          _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
+
     FP4BiPacked(const FP4BiPacked& o)
-        : _data(o._data)
-        , _lanes{Lane{&_data, true}, Lane{&_data, false}}
-    {}
- 
+        : _data(o._data), _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
+
     FP4BiPacked(FP4BiPacked&& o) noexcept
-        : _data(std::move(o._data))
-        , _lanes{Lane{&_data, true}, Lane{&_data, false}}
-    {}
- 
+        : _data(std::move(o._data)), _lanes{Lane{&_data, true}, Lane{&_data, false}} {}
+
     FP4BiPacked& operator=(const FP4BiPacked& o) {
-        if (this != &o) _data = o._data;       // _lanes._dp = &_data already correct
+        if (this != &o)
+            _data = o._data; // _lanes._dp = &_data already correct
         return *this;
     }
     FP4BiPacked& operator=(FP4BiPacked&& o) noexcept {
-        if (this != &o) _data = std::move(o._data);
+        if (this != &o)
+            _data = std::move(o._data);
         return *this;
     }
 
@@ -604,35 +617,37 @@ struct FP4BiPacked {
     // are known together — avoids touching the backing store twice.
 
     void reserve(std::size_t n) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
         _data->reserve(n);
     }
 
     void resize(std::size_t n, float weight = 0.0f, float importance = 0.0f) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
         const std::size_t old = _data->size();
         _data->resize(n, uint8_t(0));
         if (weight != 0.0f || importance != 0.0f) {
-            const uint8_t fill = uint8_t((fp4_quantize(weight) << 4)
-                                    |  fp4_quantize(importance));
+            const uint8_t fill = uint8_t((fp4_quantize(weight) << 4) | fp4_quantize(importance));
             for (std::size_t j = old; j < n; ++j)
                 (*_data)[j] = fill;
         }
     }
 
     void push_back(float weight, float importance) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
-        _data->push_back(uint8_t((fp4_quantize(weight) << 4)
-                                |  fp4_quantize(importance)));
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
+        _data->push_back(uint8_t((fp4_quantize(weight) << 4) | fp4_quantize(importance)));
     }
 
     /// Gradient-driven update only -- see fp4_quantize_stochastic()'s own
     /// docstring for why this exists separately from operator[]=/resize/
     /// push_back (all of which stay deterministic on purpose).
     void set_stochastic(std::size_t i, float weight, float importance) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
-        (*_data)[i] = uint8_t((fp4_quantize_stochastic(weight) << 4)
-                             |  fp4_quantize_stochastic(importance));
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] =
+            uint8_t((fp4_quantize_stochastic(weight) << 4) | fp4_quantize_stochastic(importance));
     }
 
     /// Same as set() but for a LIVE synapse -- see fp4_encode_bits_live's
@@ -643,9 +658,9 @@ struct FP4BiPacked {
     /// read importance as the significance signal), not a separate
     /// concern -- see conversation.
     void set_live(std::size_t i, float weight, float importance) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
-        (*_data)[i] = uint8_t((fp4_quantize_live(weight) << 4)
-                             |  fp4_quantize_live(importance));
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] = uint8_t((fp4_quantize_live(weight) << 4) | fp4_quantize_live(importance));
     }
 
     /// Same as set_stochastic() but for a LIVE synapse. Importance uses
@@ -656,12 +671,16 @@ struct FP4BiPacked {
     /// land on a negative code near zero, NaN-ing every downstream
     /// sqrt(ci) call.
     void set_stochastic_live(std::size_t i, float weight, float importance) {
-        if (!_data) _data = std::make_shared<std::vector<uint8_t>>();
-        (*_data)[i] = uint8_t((fp4_quantize_stochastic_live(weight) << 4)
-                             |  fp4_quantize_stochastic_live_nonneg(importance));
+        if (!_data)
+            _data = std::make_shared<std::vector<uint8_t>>();
+        (*_data)[i] = uint8_t((fp4_quantize_stochastic_live(weight) << 4) |
+                              fp4_quantize_stochastic_live_nonneg(importance));
     }
 
-    void clear() { if (_data) _data->clear(); }
+    void clear() {
+        if (_data)
+            _data->clear();
+    }
 
     /// Serializes the internal data into a standard byte vector.
     std::vector<uint8_t> serialize() const {
@@ -676,18 +695,17 @@ struct FP4BiPacked {
     static FP4BiPacked deserialize(std::vector<uint8_t>&& buffer) {
         return FP4BiPacked(std::move(buffer));
     }
- 
-    Lane&       operator[](std::size_t i)       { return _lanes[i]; }
+
+    Lane& operator[](std::size_t i) { return _lanes[i]; }
     const Lane& operator[](std::size_t i) const { return _lanes[i]; }
- 
-    std::size_t size()  const { return _data ? _data->size()  : 0; }
-    bool        empty() const { return !_data || _data->empty(); }
+
+    std::size_t size() const { return _data ? _data->size() : 0; }
+    bool empty() const { return !_data || _data->empty(); }
 };
 
 // tuple_size specialization so sparse_struct::n_value_arrays constexpr compiles.
 namespace std {
-    template <> struct tuple_size<FP4BiPacked>
-        : integral_constant<size_t, 2> {};
-}
+template <> struct tuple_size<FP4BiPacked> : integral_constant<size_t, 2> {};
+} // namespace std
 
 #endif

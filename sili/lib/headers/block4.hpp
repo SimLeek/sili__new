@@ -10,11 +10,11 @@
 #include <stdexcept>
 #include <vector>
 
-// block4: dense 4x4 tiles in a larger sparse matrix for SIMD optimization  
+// block4: dense 4x4 tiles in a larger sparse matrix for SIMD optimization
 
 // Block4 = 4. Changing this might break everything for obvious reasons.
 #ifndef SILI_BLOCK4_TILE_SIZE
-#define SILI_BLOCK4_TILE_SIZE 4 
+#define SILI_BLOCK4_TILE_SIZE 4
 #endif
 
 // 2 is chosen for speed & memory compared to pure csr after testing
@@ -31,25 +31,27 @@ constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 // Currently the only supported activation and backprop value is float32.
 //
 // GCC/Clang's vector_size extension is portable across SSE/AVX/NEON/etc.,
-// and got the compiler to emit real SIMD for block4's for backprop, 
+// and got the compiler to emit real SIMD for block4's for backprop,
 // confirmed via -fopt-info-vec that it vectorizes, and while plain scalar
 // arrays could vectorize, they weren't as fast since gcc couldn't prove they
 // array indexed load was contiguous.
-using Block4Vec  = float    __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(float))));
-using Block4VecU = uint32_t __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(uint32_t))));
-static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float), "Block4Vec width must match BLOCK4_TILE");
+using Block4Vec = float __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(float))));
+using Block4VecU =
+    uint32_t __attribute__((__vector_size__(SILI_BLOCK4_TILE_SIZE * sizeof(uint32_t))));
+static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float),
+              "Block4Vec width must match BLOCK4_TILE");
 
 inline Block4Vec block4_vec_load(const float* p) {
     Block4Vec v;
-    std::memcpy(&v, p, sizeof(v));   // unaligned-safe load
+    std::memcpy(&v, p, sizeof(v)); // unaligned-safe load
     return v;
 }
 inline void block4_vec_store(float* p, Block4Vec v) {
     std::memcpy(p, &v, sizeof(v));
 }
 
-// `for (i...) v[i]=x` forces GCC to treat the whole vector as memory 
-// instead of a register, and 7.6% of all instructions in a disldo_backward 
+// `for (i...) v[i]=x` forces GCC to treat the whole vector as memory
+// instead of a register, and 7.6% of all instructions in a disldo_backward
 // run were this "vectorized" broadcast helper alone. This turns multiple
 // load/store ops into a single op.
 inline Block4Vec block4_vec_broadcast(float x) {
@@ -81,7 +83,8 @@ inline float block4_vec_hsum(Block4Vec x) {
 // see linear_disldo.hpp's disldo_backward) instead of block4_vec_abs.
 inline Block4Vec block4_vec_sqrt(Block4Vec x) {
     Block4Vec result;
-    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::sqrt(x[i]);
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        result[i] = std::sqrt(x[i]);
     return result;
 }
 
@@ -93,7 +96,8 @@ inline Block4Vec block4_vec_sqrt(Block4Vec x) {
 // (delta_csr_types.hpp) to bound how fast per-synapse `ci` can decay.
 inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
     Block4Vec result;
-    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::max(a[i], b[i]);
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        result[i] = std::max(a[i], b[i]);
     return result;
 }
 
@@ -103,7 +107,8 @@ inline Block4Vec block4_vec_max(Block4Vec a, Block4Vec b) {
 // (only a floor, which bounds how fast it can shrink, not grow).
 inline Block4Vec block4_vec_min(Block4Vec a, Block4Vec b) {
     Block4Vec result;
-    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = std::min(a[i], b[i]);
+    for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+        result[i] = std::min(a[i], b[i]);
     return result;
 }
 
@@ -138,11 +143,11 @@ inline Block4Vec block4_vec_select_finite(Block4Vec new_val, Block4Vec fallback)
 }
 
 // 4-wide fp4_decode_bits (fp4quant.hpp) -- decodes 4 codes in one
-// shot instead of 4 separate FP4_TABLE[code] lookups. 
+// shot instead of 4 separate FP4_TABLE[code] lookups.
 // Verified bit-exact against fp4_decode_bits()
 // (see test_fp4_bitshift.cpp.)
 inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
-    const Block4VecU one_u  = block4_vecu_broadcast(1u);
+    const Block4VecU one_u = block4_vecu_broadcast(1u);
     const Block4VecU zero_u = block4_vecu_broadcast(0u);
     const Block4VecU s = (codes >> 3) & one_u;
     const Block4VecU e = (codes >> 1) & block4_vecu_broadcast(3u);
@@ -152,10 +157,10 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
         (s << 31) | ((e + block4_vecu_broadcast(126u)) << 23) | (m << 22);
 
     const Block4VecU half_bits = block4_vecu_broadcast(0x3F000000u) | (s << 31);
-    const Block4VecU nan_bits  = block4_vecu_broadcast(0x7FC00000u);
-    const Block4VecU s_mask    = (s != zero_u);
-    const Block4VecU bits_m0   = (nan_bits & s_mask) | (zero_u & ~s_mask);
-    const Block4VecU m_mask    = (m != zero_u);
+    const Block4VecU nan_bits = block4_vecu_broadcast(0x7FC00000u);
+    const Block4VecU s_mask = (s != zero_u);
+    const Block4VecU bits_m0 = (nan_bits & s_mask) | (zero_u & ~s_mask);
+    const Block4VecU m_mask = (m != zero_u);
     const Block4VecU bits_special = (half_bits & m_mask) | (bits_m0 & ~m_mask);
 
     const Block4VecU e_mask = (e != zero_u);
@@ -167,19 +172,19 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
 }
 
 // 4-wide fp4_quantize_stochastic (fp4quant.hpp) -- stochastically quantizes
-// 4 values in one shot. 
+// 4 values in one shot.
 // See fp4quant.hpp's header comment for why the |v|>=1.0 branch's bit-add
 // dithering is exact, not approximate. Verified against
 // fp4_quantize_stochastic() via matched-seed statistical (mean-converges-
 // to-v) and saturation/exact-value checks -- see test_fp4_stochastic.cpp.
 inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
-    static constexpr uint32_t HALF_BITS = 0x3F000000u;  // bits_of(0.5f)
-    static constexpr uint32_t ONE_BITS  = 0x3F800000u;  // bits_of(1.0f)
-    static constexpr uint32_t SIX_BITS  = 0x40C00000u;  // bits_of(6.0f)
+    static constexpr uint32_t HALF_BITS = 0x3F000000u; // bits_of(0.5f)
+    static constexpr uint32_t ONE_BITS = 0x3F800000u;  // bits_of(1.0f)
+    static constexpr uint32_t SIX_BITS = 0x40C00000u;  // bits_of(6.0f)
 
     Block4VecU bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const Block4VecU sign  = bits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU sign = bits & block4_vecu_broadcast(0x80000000u);
     const Block4VecU abits = bits & block4_vecu_broadcast(0x7FFFFFFFu);
 
     const uint64_t r0 = fp4_stochastic_next_u64();
@@ -190,13 +195,13 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
         float((r0 >> 40) * (1.0 / 16777216.0)), float((r1 >> 40) * (1.0 / 16777216.0)),
         float((r2 >> 40) * (1.0 / 16777216.0)), float((r3 >> 40) * (1.0 / 16777216.0))};
     const Block4VecU dither22 = {uint32_t(r0 & 0x3FFFFFu), uint32_t(r1 & 0x3FFFFFu),
-                                  uint32_t(r2 & 0x3FFFFFu), uint32_t(r3 & 0x3FFFFFu)};
+                                 uint32_t(r2 & 0x3FFFFFu), uint32_t(r3 & 0x3FFFFFu)};
 
-    Block4Vec av;  // abits reinterpreted as float -- always >= 0, a valid magnitude
+    Block4Vec av; // abits reinterpreted as float -- always >= 0, a valid magnitude
     std::memcpy(&av, &abits, sizeof(av));
     const Block4Vec two_v = block4_vec_broadcast(2.0f);
     const Block4Vec p_low = av * two_v;                              // (v-0.0)/(0.5-0.0)
-    const Block4Vec p_mid = av * two_v - block4_vec_broadcast(1.0f);  // (v-0.5)/(1.0-0.5)
+    const Block4Vec p_mid = av * two_v - block4_vec_broadcast(1.0f); // (v-0.5)/(1.0-0.5)
 
     Block4VecU up_low_mask, up_mid_mask;
     {
@@ -212,15 +217,16 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4(Block4Vec v) {
     const Block4VecU norm_mask = ~sat_mask & ~low_mask & ~mid_mask;
 
     const Block4VecU mag_sat = block4_vecu_broadcast(7u);
-    const Block4VecU mag_low = up_low_mask & block4_vecu_broadcast(1u);  // 1 if round up else 0
-    const Block4VecU mag_mid = (up_mid_mask & block4_vecu_broadcast(2u)) | (~up_mid_mask & block4_vecu_broadcast(1u));
+    const Block4VecU mag_low = up_low_mask & block4_vecu_broadcast(1u); // 1 if round up else 0
+    const Block4VecU mag_mid =
+        (up_mid_mask & block4_vecu_broadcast(2u)) | (~up_mid_mask & block4_vecu_broadcast(1u));
 
     Block4VecU rounded = abits + dither22;
     const Block4VecU six_mask = (rounded > block4_vecu_broadcast(SIX_BITS));
     rounded = (rounded & ~six_mask) | (block4_vecu_broadcast(SIX_BITS) & six_mask);
     const Block4VecU exp_field = (rounded >> 23) & block4_vecu_broadcast(0xFFu);
-    const Block4VecU m_bit     = (rounded >> 22) & block4_vecu_broadcast(1u);
-    const Block4VecU mag_norm  = ((exp_field - block4_vecu_broadcast(126u)) << 1) | m_bit;
+    const Block4VecU m_bit = (rounded >> 22) & block4_vecu_broadcast(1u);
+    const Block4VecU mag_norm = ((exp_field - block4_vecu_broadcast(126u)) << 1) | m_bit;
 
     Block4VecU mag_code =
         (mag_sat & sat_mask) | (mag_low & low_mask) | (mag_mid & mid_mask) | (mag_norm & norm_mask);
@@ -262,10 +268,10 @@ inline Block4VecU block4_vec_quantize_stochastic_fp4_live(Block4Vec v) {
     const Block4VecU codes = block4_vec_quantize_stochastic_fp4(v);
     Block4VecU vbits;
     std::memcpy(&vbits, &v, sizeof(vbits));
-    const Block4VecU sign      = vbits & block4_vecu_broadcast(0x80000000u);
-    const Block4VecU sign_bit  = sign >> 28;
+    const Block4VecU sign = vbits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU sign_bit = sign >> 28;
     const Block4VecU zero_mask = (codes == block4_vecu_broadcast(0u));
-    const Block4VecU redirect  = sign_bit | block4_vecu_broadcast(1u);
+    const Block4VecU redirect = sign_bit | block4_vecu_broadcast(1u);
     return (codes & ~zero_mask) | (redirect & zero_mask);
 }
 
@@ -315,7 +321,7 @@ inline Block4Vec block4_vec_decode_fp8(Block4VecU codes) {
 inline Block4VecU block4_vec_quantize_stochastic_fp8(Block4Vec v) {
     Block4VecU bits;
     std::memcpy(&bits, &v, sizeof(bits));
-    const Block4VecU sign  = bits & block4_vecu_broadcast(0x80000000u);
+    const Block4VecU sign = bits & block4_vecu_broadcast(0x80000000u);
     const Block4VecU abits = bits & block4_vecu_broadcast(0x7FFFFFFFu);
 
     const uint64_t r0 = fp4_stochastic_next_u64();
@@ -323,16 +329,16 @@ inline Block4VecU block4_vec_quantize_stochastic_fp8(Block4Vec v) {
     const uint64_t r2 = fp4_stochastic_next_u64();
     const uint64_t r3 = fp4_stochastic_next_u64();
     const Block4VecU dither20 = {uint32_t(r0 & 0xFFFFFu), uint32_t(r1 & 0xFFFFFu),
-                                  uint32_t(r2 & 0xFFFFFu), uint32_t(r3 & 0xFFFFFu)};
+                                 uint32_t(r2 & 0xFFFFFu), uint32_t(r3 & 0xFFFFFu)};
 
     Block4VecU rounded = abits + dither20;
     const Block4VecU nan_slot_u = block4_vecu_broadcast(FP8_NAN_SLOT_BITS);
     const Block4VecU over_mask = (rounded >= nan_slot_u);
     rounded = (rounded & ~over_mask) | (block4_vecu_broadcast(FP8_MAX_BITS) & over_mask);
     const Block4VecU exp_field = (rounded >> 23) & block4_vecu_broadcast(0xFFu);
-    const Block4VecU m3        = (rounded >> 20) & block4_vecu_broadcast(0x7u);
-    const Block4VecU e4        = exp_field - block4_vecu_broadcast(120u);
-    const Block4VecU sign_bit  = sign >> 24;  // bit31 -> bit7
+    const Block4VecU m3 = (rounded >> 20) & block4_vecu_broadcast(0x7u);
+    const Block4VecU e4 = exp_field - block4_vecu_broadcast(120u);
+    const Block4VecU sign_bit = sign >> 24; // bit31 -> bit7
     Block4VecU result = sign_bit | (e4 << 3) | m3;
 
     uint32_t bits_arr[SILI_BLOCK4_TILE_SIZE];
@@ -354,24 +360,29 @@ inline Block4VecU block4_vec_quantize_stochastic_fp8(Block4Vec v) {
 // One dense tile: 16 bytes, (4-bit importance<<4|4-bit weight) per slot,
 // stored [local_j * 4 + local_i] (Matches disldo's CSR orientation,
 // so no transpose is needed)
-// 
-// count_live() is a full O(16) byte scan, but used only by 
-// promotion/demotion/reporting 
+//
+// count_live() is a full O(16) byte scan, but used only by
+// promotion/demotion/reporting
 struct Block4Tile {
     uint8_t data[BLOCK4_TILE_SLOTS] = {0};
 
-    static uint32_t slot_index(uint32_t local_i, uint32_t local_j) { return local_j * BLOCK4_TILE + local_i; }
+    static uint32_t slot_index(uint32_t local_i, uint32_t local_j) {
+        return local_j * BLOCK4_TILE + local_i;
+    }
 
     uint8_t& at(uint32_t local_i, uint32_t local_j) { return data[slot_index(local_i, local_j)]; }
-    uint8_t  at(uint32_t local_i, uint32_t local_j) const { return data[slot_index(local_i, local_j)]; }
+    uint8_t at(uint32_t local_i, uint32_t local_j) const {
+        return data[slot_index(local_i, local_j)];
+    }
 
     uint32_t count_live() const {
         // todo: check if (data[i]>>4 != 0) or (data[i]>>4 > min_importance)
-	// performs better, because low importance synapses aren't important
-	// enough to count.
-	uint32_t n = 0;
+        // performs better, because low importance synapses aren't important
+        // enough to count.
+        uint32_t n = 0;
         for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
-            if (data[i] != 0) ++n;
+            if (data[i] != 0)
+                ++n;
         return n;
     }
 };
@@ -387,10 +398,10 @@ struct Block4Tile {
 #define SILI_BLOCK4_SPARSE_MAX_COUNT 10
 #endif
 static_assert(SILI_BLOCK4_SPARSE_MAX_COUNT * 12 + 8 <= 128,
-    "sparse tile encoding must fit in the same 128 bits as the dense one");
+              "sparse tile encoding must fit in the same 128 bits as the dense one");
 constexpr uint32_t BLOCK4_SPARSE_MAX_COUNT = SILI_BLOCK4_SPARSE_MAX_COUNT;
 
-// Total byte length of a sparse-packed tile holding `count` live synapses 
+// Total byte length of a sparse-packed tile holding `count` live synapses
 inline std::size_t block4_sparse_packed_len(uint8_t count) {
     return std::size_t(1) + (std::size_t(count) + 1) / 2 + std::size_t(count);
 }
@@ -402,12 +413,15 @@ inline uint8_t block4_sparse_get_pos(const uint8_t* packed, uint32_t i) {
 }
 inline void block4_sparse_set_pos(uint8_t* packed, uint32_t i, uint8_t pos) {
     uint8_t& b = packed[1 + i / 2];
-    if (i % 2 == 0) b = uint8_t((b & 0x0Fu) | (pos << 4));
-    else            b = uint8_t((b & 0xF0u) | (pos & 0xFu));
+    if (i % 2 == 0)
+        b = uint8_t((b & 0x0Fu) | (pos << 4));
+    else
+        b = uint8_t((b & 0xF0u) | (pos & 0xFu));
 }
 
 inline void block4_sparse_unpack(const uint8_t* packed, uint8_t dense[BLOCK4_TILE_SLOTS]) {
-    for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i) dense[i] = 0;
+    for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
+        dense[i] = 0;
     const uint8_t count = packed[0];
     const std::size_t value_off = 1 + (std::size_t(count) + 1) / 2;
     for (uint8_t i = 0; i < count; ++i)
@@ -421,14 +435,17 @@ inline void block4_sparse_unpack(const uint8_t* packed, uint8_t dense[BLOCK4_TIL
 inline uint8_t block4_sparse_pack(const uint8_t dense[BLOCK4_TILE_SLOTS], uint8_t* packed) {
     uint8_t count = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
-        if (dense[i] != 0) ++count;
+        if (dense[i] != 0)
+            ++count;
     packed[0] = count;
     const std::size_t nib_bytes = (std::size_t(count) + 1) / 2;
-    for (std::size_t k = 0; k < nib_bytes; ++k) packed[1 + k] = 0; // set_pos does read-modify-write
+    for (std::size_t k = 0; k < nib_bytes; ++k)
+        packed[1 + k] = 0; // set_pos does read-modify-write
     const std::size_t value_off = 1 + nib_bytes;
     uint8_t idx = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i) {
-        if (dense[i] == 0) continue;
+        if (dense[i] == 0)
+            continue;
         block4_sparse_set_pos(packed, idx, uint8_t(i));
         packed[value_off + idx] = dense[i];
         ++idx;
@@ -458,7 +475,8 @@ inline std::size_t block4_stored_tile_len(bool is_sparse, const uint8_t* tile_by
 // value(s) -- so Block4Store8 (further below) reuses every one of them
 // UNCHANGED; only the tile-encoding layer here is FP8-specific.
 
-constexpr uint32_t BLOCK4_TILE_SLOTS8_BYTES = BLOCK4_TILE_SLOTS * 2;  // 32: weight half + importance half
+constexpr uint32_t BLOCK4_TILE_SLOTS8_BYTES =
+    BLOCK4_TILE_SLOTS * 2; // 32: weight half + importance half
 
 // One dense FP8 tile: 32 bytes, weight byte per slot at [0..15],
 // importance byte per slot at [16..31], same [local_j*4+local_i] slot
@@ -466,14 +484,24 @@ constexpr uint32_t BLOCK4_TILE_SLOTS8_BYTES = BLOCK4_TILE_SLOTS * 2;  // 32: wei
 struct Block4Tile8 {
     uint8_t data[BLOCK4_TILE_SLOTS8_BYTES] = {0};
 
-    static uint32_t slot_index(uint32_t local_i, uint32_t local_j) { return local_j * BLOCK4_TILE + local_i; }
+    static uint32_t slot_index(uint32_t local_i, uint32_t local_j) {
+        return local_j * BLOCK4_TILE + local_i;
+    }
 
-    uint8_t& at_weight(uint32_t local_i, uint32_t local_j) { return data[slot_index(local_i, local_j)]; }
-    uint8_t  at_weight(uint32_t local_i, uint32_t local_j) const { return data[slot_index(local_i, local_j)]; }
-    uint8_t& at_importance(uint32_t local_i, uint32_t local_j) { return data[BLOCK4_TILE_SLOTS + slot_index(local_i, local_j)]; }
-    uint8_t  at_importance(uint32_t local_i, uint32_t local_j) const { return data[BLOCK4_TILE_SLOTS + slot_index(local_i, local_j)]; }
+    uint8_t& at_weight(uint32_t local_i, uint32_t local_j) {
+        return data[slot_index(local_i, local_j)];
+    }
+    uint8_t at_weight(uint32_t local_i, uint32_t local_j) const {
+        return data[slot_index(local_i, local_j)];
+    }
+    uint8_t& at_importance(uint32_t local_i, uint32_t local_j) {
+        return data[BLOCK4_TILE_SLOTS + slot_index(local_i, local_j)];
+    }
+    uint8_t at_importance(uint32_t local_i, uint32_t local_j) const {
+        return data[BLOCK4_TILE_SLOTS + slot_index(local_i, local_j)];
+    }
 
-    uint32_t count_live() const;  // defined after block4_count_live8 below
+    uint32_t count_live() const; // defined after block4_count_live8 below
 };
 
 // A slot is live iff EITHER its weight or importance byte is nonzero --
@@ -482,11 +510,14 @@ struct Block4Tile8 {
 inline uint32_t block4_count_live8(const uint8_t dense[BLOCK4_TILE_SLOTS8_BYTES]) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
-        if (dense[i] != 0 || dense[BLOCK4_TILE_SLOTS + i] != 0) ++n;
+        if (dense[i] != 0 || dense[BLOCK4_TILE_SLOTS + i] != 0)
+            ++n;
     return n;
 }
 
-inline uint32_t Block4Tile8::count_live() const { return block4_count_live8(data); }
+inline uint32_t Block4Tile8::count_live() const {
+    return block4_count_live8(data);
+}
 
 // Sparse-packed FP8 tile encoding -- same position-nibble scheme as FP4's
 // block4_sparse_pack (4-bit slot position, 2 packed per byte), but 2
@@ -503,7 +534,7 @@ inline uint32_t Block4Tile8::count_live() const { return block4_count_live8(data
 #define SILI_BLOCK4_SPARSE_MAX_COUNT8 12
 #endif
 static_assert(SILI_BLOCK4_SPARSE_MAX_COUNT8 * 20 + 8 <= 256,
-    "sparse FP8 tile encoding must fit in the same 256 bits as the dense one");
+              "sparse FP8 tile encoding must fit in the same 256 bits as the dense one");
 constexpr uint32_t BLOCK4_SPARSE_MAX_COUNT8 = SILI_BLOCK4_SPARSE_MAX_COUNT8;
 
 inline std::size_t block4_sparse_packed_len8(uint8_t count) {
@@ -515,12 +546,13 @@ inline std::size_t block4_sparse_packed_len8(uint8_t count) {
 // encoding has nothing to do with value width).
 
 inline void block4_sparse_unpack8(const uint8_t* packed, uint8_t dense[BLOCK4_TILE_SLOTS8_BYTES]) {
-    for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS8_BYTES; ++i) dense[i] = 0;
+    for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS8_BYTES; ++i)
+        dense[i] = 0;
     const uint8_t count = packed[0];
     const std::size_t value_off = 1 + (std::size_t(count) + 1) / 2;
     for (uint8_t i = 0; i < count; ++i) {
         const uint8_t pos = block4_sparse_get_pos(packed, i);
-        dense[pos] = packed[value_off + i];                                    // weight
+        dense[pos] = packed[value_off + i];                                          // weight
         dense[BLOCK4_TILE_SLOTS + pos] = packed[value_off + std::size_t(count) + i]; // importance
     }
 }
@@ -528,14 +560,17 @@ inline void block4_sparse_unpack8(const uint8_t* packed, uint8_t dense[BLOCK4_TI
 inline uint8_t block4_sparse_pack8(const uint8_t dense[BLOCK4_TILE_SLOTS8_BYTES], uint8_t* packed) {
     uint8_t count = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
-        if (dense[i] != 0 || dense[BLOCK4_TILE_SLOTS + i] != 0) ++count;
+        if (dense[i] != 0 || dense[BLOCK4_TILE_SLOTS + i] != 0)
+            ++count;
     packed[0] = count;
     const std::size_t nib_bytes = (std::size_t(count) + 1) / 2;
-    for (std::size_t k = 0; k < nib_bytes; ++k) packed[1 + k] = 0;
+    for (std::size_t k = 0; k < nib_bytes; ++k)
+        packed[1 + k] = 0;
     const std::size_t value_off = 1 + nib_bytes;
     uint8_t idx = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i) {
-        if (dense[i] == 0 && dense[BLOCK4_TILE_SLOTS + i] == 0) continue;
+        if (dense[i] == 0 && dense[BLOCK4_TILE_SLOTS + i] == 0)
+            continue;
         block4_sparse_set_pos(packed, idx, uint8_t(i));
         packed[value_off + idx] = dense[i];
         packed[value_off + std::size_t(count) + idx] = dense[BLOCK4_TILE_SLOTS + i];
@@ -545,23 +580,19 @@ inline uint8_t block4_sparse_pack8(const uint8_t dense[BLOCK4_TILE_SLOTS8_BYTES]
 }
 
 inline std::size_t block4_stored_tile_len8(bool is_sparse, const uint8_t* tile_bytes) {
-    return is_sparse ? block4_sparse_packed_len8(tile_bytes[0]) : std::size_t(BLOCK4_TILE_SLOTS8_BYTES);
+    return is_sparse ? block4_sparse_packed_len8(tile_bytes[0])
+                     : std::size_t(BLOCK4_TILE_SLOTS8_BYTES);
 }
 
-inline void block4_row_shift(
-    DeltaCSRLayout& L,
-    std::vector<uint8_t>& ibuf,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::vector<uint8_t>& tile_is_sparse, // todo: should be 1 bit per tile not 1 byte
-    std::size_t row,
-    std::size_t target_idx_byte_alloc,
-    std::size_t target_tile_byte_alloc,
-    std::size_t target_elem_alloc,
-    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
-    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
-{
+inline void
+block4_row_shift(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
+                 std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
+                 std::vector<uint8_t>& tile_data,
+                 std::vector<uint8_t>& tile_is_sparse, // todo: should be 1 bit per tile not 1 byte
+                 std::size_t row, std::size_t target_idx_byte_alloc,
+                 std::size_t target_tile_byte_alloc, std::size_t target_elem_alloc,
+                 std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+                 std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max()) {
     // Real bug found via ASan (heap-buffer-overflow READ, downstream of
     // this function shrinking a row's allocation below what it's
     // ALREADY using): this function redistributes/resizes row `row`'s
@@ -581,20 +612,21 @@ inline void block4_row_shift(
     // redistribution/growth still fully succeeds, it just can't shrink
     // a row past what's genuinely already stored in it. Shared by both
     // Block4Store (FP4) and Block4Store8 (FP8) -- one fix covers both.
-    target_idx_byte_alloc  = std::max(target_idx_byte_alloc,  L.byte_end[row] - L.byte_start[row]);
+    target_idx_byte_alloc = std::max(target_idx_byte_alloc, L.byte_end[row] - L.byte_start[row]);
     target_tile_byte_alloc = std::max(target_tile_byte_alloc, tbyte_end[row] - tbyte_start[row]);
-    target_elem_alloc      = std::max(target_elem_alloc,      L.elem_end[row] - L.elem_start[row]);
+    target_elem_alloc = std::max(target_elem_alloc, L.elem_end[row] - L.elem_start[row]);
 
     // indices_buf byte side (uleb128 column deltas)
     const std::size_t cur_idx_alloc = L.row_alloc_bytes(row);
     if (cur_idx_alloc != target_idx_byte_alloc && row + 1 < L.rows) {
-        const std::size_t move_src  = L.byte_start[row + 1];
-        const std::size_t move_len  = L.byte_start[L.rows] - move_src;
+        const std::size_t move_src = L.byte_start[row + 1];
+        const std::size_t move_len = L.byte_start[L.rows] - move_src;
         const std::size_t new_start = L.byte_start[row] + target_idx_byte_alloc;
 
         if (target_idx_byte_alloc > cur_idx_alloc) {
             const std::size_t new_total = ibuf.size() + (target_idx_byte_alloc - cur_idx_alloc);
-            if (new_total > max_indices_bytes) throw std::bad_alloc();
+            if (new_total > max_indices_bytes)
+                throw std::bad_alloc();
             ibuf.resize(new_total);
         }
         if (move_len > 0)
@@ -602,23 +634,26 @@ inline void block4_row_shift(
         if (target_idx_byte_alloc < cur_idx_alloc)
             ibuf.resize(ibuf.size() - (cur_idx_alloc - target_idx_byte_alloc));
 
-        const std::ptrdiff_t d = std::ptrdiff_t(target_idx_byte_alloc) - std::ptrdiff_t(cur_idx_alloc);
+        const std::ptrdiff_t d =
+            std::ptrdiff_t(target_idx_byte_alloc) - std::ptrdiff_t(cur_idx_alloc);
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             L.byte_start[r] = std::size_t(std::ptrdiff_t(L.byte_start[r]) + d);
         for (std::size_t r = row + 1; r < L.rows; ++r)
             L.byte_end[r] = std::size_t(std::ptrdiff_t(L.byte_end[r]) + d);
     }
 
-    // tile_data byte side (variable-length packed/dense tile bytes 
+    // tile_data byte side (variable-length packed/dense tile bytes
     const std::size_t cur_tile_alloc = tbyte_start[row + 1] - tbyte_start[row];
     if (cur_tile_alloc != target_tile_byte_alloc && row + 1 < L.rows) {
-        const std::size_t move_src  = tbyte_start[row + 1];
-        const std::size_t move_len  = tbyte_start[L.rows] - move_src;
+        const std::size_t move_src = tbyte_start[row + 1];
+        const std::size_t move_len = tbyte_start[L.rows] - move_src;
         const std::size_t new_start = tbyte_start[row] + target_tile_byte_alloc;
 
         if (target_tile_byte_alloc > cur_tile_alloc) {
-            const std::size_t new_total = tile_data.size() + (target_tile_byte_alloc - cur_tile_alloc);
-            if (new_total > max_tile_bytes) throw std::bad_alloc();
+            const std::size_t new_total =
+                tile_data.size() + (target_tile_byte_alloc - cur_tile_alloc);
+            if (new_total > max_tile_bytes)
+                throw std::bad_alloc();
             tile_data.resize(new_total);
         }
         if (move_len > 0)
@@ -626,7 +661,8 @@ inline void block4_row_shift(
         if (target_tile_byte_alloc < cur_tile_alloc)
             tile_data.resize(tile_data.size() - (cur_tile_alloc - target_tile_byte_alloc));
 
-        const std::ptrdiff_t d = std::ptrdiff_t(target_tile_byte_alloc) - std::ptrdiff_t(cur_tile_alloc);
+        const std::ptrdiff_t d =
+            std::ptrdiff_t(target_tile_byte_alloc) - std::ptrdiff_t(cur_tile_alloc);
         for (std::size_t r = row + 1; r <= L.rows; ++r)
             tbyte_start[r] = std::size_t(std::ptrdiff_t(tbyte_start[r]) + d);
         for (std::size_t r = row + 1; r < L.rows; ++r)
@@ -636,8 +672,8 @@ inline void block4_row_shift(
     // tile_is_sparse elem side (1 byte/slot flag)
     const std::size_t cur_elem_alloc = L.row_alloc_elems(row);
     if (cur_elem_alloc != target_elem_alloc && row + 1 < L.rows) {
-        const std::size_t move_src  = L.elem_start[row + 1];
-        const std::size_t move_len  = L.elem_start[L.rows] - move_src;
+        const std::size_t move_src = L.elem_start[row + 1];
+        const std::size_t move_len = L.elem_start[L.rows] - move_src;
         const std::size_t new_start = L.elem_start[row] + target_elem_alloc;
         const std::size_t current_total = L.total_alloc_elems();
 
@@ -646,11 +682,13 @@ inline void block4_row_shift(
             // elem slot can't exist without real tile_data bytes to back
             // it, so tile_data's own check above is always the binding
             // one; this is 1 byte/slot, real but small next to it.
-            const std::size_t new_total_elems = current_total + (target_elem_alloc - cur_elem_alloc);
+            const std::size_t new_total_elems =
+                current_total + (target_elem_alloc - cur_elem_alloc);
             tile_is_sparse.resize(new_total_elems);
         }
         if (move_len > 0)
-            std::memmove(tile_is_sparse.data() + new_start, tile_is_sparse.data() + move_src, move_len);
+            std::memmove(tile_is_sparse.data() + new_start, tile_is_sparse.data() + move_src,
+                         move_len);
         if (target_elem_alloc < cur_elem_alloc)
             tile_is_sparse.resize(current_total - (cur_elem_alloc - target_elem_alloc));
 
@@ -662,33 +700,31 @@ inline void block4_row_shift(
     }
 }
 
-inline void block4_grow_last_row(
-    DeltaCSRLayout& L,
-    std::vector<uint8_t>& ibuf,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::vector<uint8_t>& tile_is_sparse,
-    std::size_t target_idx_byte_alloc,
-    std::size_t target_tile_byte_alloc,
-    std::size_t target_elem_alloc,
-    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
-    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
-{
-    if (L.rows == 0) return;
+inline void
+block4_grow_last_row(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
+                     std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
+                     std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
+                     std::size_t target_idx_byte_alloc, std::size_t target_tile_byte_alloc,
+                     std::size_t target_elem_alloc,
+                     std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+                     std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max()) {
+    if (L.rows == 0)
+        return;
     const std::size_t r = L.rows - 1;
-    const std::size_t cur_idx  = L.row_alloc_bytes(r);
+    const std::size_t cur_idx = L.row_alloc_bytes(r);
     const std::size_t cur_tile = tbyte_start[r + 1] - tbyte_start[r];
     const std::size_t cur_elem = L.row_alloc_elems(r);
     if (target_idx_byte_alloc > cur_idx) {
         const std::size_t new_total = ibuf.size() + (target_idx_byte_alloc - cur_idx);
-        if (new_total > max_indices_bytes) throw std::bad_alloc();
+        if (new_total > max_indices_bytes)
+            throw std::bad_alloc();
         ibuf.resize(new_total, uint8_t(0));
         L.byte_start[L.rows] = L.byte_start[r] + target_idx_byte_alloc;
     }
     if (target_tile_byte_alloc > cur_tile) {
         const std::size_t new_total = tile_data.size() + (target_tile_byte_alloc - cur_tile);
-        if (new_total > max_tile_bytes) throw std::bad_alloc();
+        if (new_total > max_tile_bytes)
+            throw std::bad_alloc();
         tile_data.resize(new_total, uint8_t(0));
         tbyte_start[r + 1] = tbyte_start[r] + target_tile_byte_alloc;
     }
@@ -699,75 +735,69 @@ inline void block4_grow_last_row(
     }
 }
 
-inline void block4_ensure_row_headroom(
-    DeltaCSRLayout& L,
-    std::vector<uint8_t>& ibuf,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::vector<uint8_t>& tile_is_sparse,
-    std::size_t row,
-    std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
-    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
-{
-    const std::size_t target_idx  = L.row_alloc_bytes(row) + uleb128_max_bytes<uint32_t>();
-    const std::size_t target_tile = (tbyte_start[row + 1] - tbyte_start[row]) + block4_sparse_packed_len(0);
+inline void
+block4_ensure_row_headroom(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
+                           std::vector<std::size_t>& tbyte_start,
+                           std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
+                           std::vector<uint8_t>& tile_is_sparse, std::size_t row,
+                           std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max(),
+                           std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max()) {
+    const std::size_t target_idx = L.row_alloc_bytes(row) + uleb128_max_bytes<uint32_t>();
+    const std::size_t target_tile =
+        (tbyte_start[row + 1] - tbyte_start[row]) + block4_sparse_packed_len(0);
     const std::size_t target_elem = L.row_alloc_elems(row) + 1;
     if (row + 1 < L.rows)
         block4_row_shift(L, ibuf, tbyte_start, tbyte_end, tile_data, tile_is_sparse, row,
-                          target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
+                         target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
     else
-        block4_grow_last_row(L, ibuf, tbyte_start, tbyte_end, tile_data, tile_is_sparse,
-                              target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
+        block4_grow_last_row(L, ibuf, tbyte_start, tbyte_end, tile_data, tile_is_sparse, target_idx,
+                             target_tile, target_elem, max_indices_bytes, max_tile_bytes);
 }
 
-inline bool block4_row_insert_tile(
-    DeltaCSRLayout& L,
-    std::vector<uint8_t>& ibuf,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::vector<uint8_t>& tile_is_sparse,
-    std::size_t row,
-    uint32_t new_col,
-    // Defaulted to FP4's tile-length formula -- every existing (FP4)
-    // caller is unaffected. Block4Store8 passes block4_stored_tile_len8
-    // explicitly (real bug found via ASan: this function walks a row's
-    // EXISTING tiles to find the insert position, and without this it
-    // silently used FP4's 1-byte/entry formula on FP8's 2-byte/entry
-    // tiles, corrupting the row's own byte bookkeeping).
-    std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len)
-{
+inline bool
+block4_row_insert_tile(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
+                       std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
+                       std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
+                       std::size_t row, uint32_t new_col,
+                       // Defaulted to FP4's tile-length formula -- every existing (FP4)
+                       // caller is unaffected. Block4Store8 passes block4_stored_tile_len8
+                       // explicitly (real bug found via ASan: this function walks a row's
+                       // EXISTING tiles to find the insert position, and without this it
+                       // silently used FP4's 1-byte/entry formula on FP8's 2-byte/entry
+                       // tiles, corrupting the row's own byte bookkeeping).
+                       std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len) {
     const std::size_t n = L.row_nnz(row);
 
-    std::size_t byte_pos      = L.byte_start[row];
-    std::size_t elem_pos      = L.elem_start[row];
-    std::size_t tbyte_pos     = tbyte_start[row];
-    uint32_t    prev_col      = 0;
-    std::size_t ins_byte_pos  = L.byte_end[row];
-    std::size_t ins_elem_pos  = L.elem_end[row];
+    std::size_t byte_pos = L.byte_start[row];
+    std::size_t elem_pos = L.elem_start[row];
+    std::size_t tbyte_pos = tbyte_start[row];
+    uint32_t prev_col = 0;
+    std::size_t ins_byte_pos = L.byte_end[row];
+    std::size_t ins_elem_pos = L.elem_end[row];
     std::size_t ins_tbyte_pos = tbyte_end[row];
-    bool        has_next      = false;
-    uint32_t    next_col      = 0;
-    std::size_t next_dlen     = 0;
+    bool has_next = false;
+    uint32_t next_col = 0;
+    std::size_t next_dlen = 0;
 
     for (std::size_t e = 0; e < n; ++e) {
         std::size_t dlen = 0;
         const uint32_t delta = uleb128_decode<uint32_t>(ibuf.data() + byte_pos, dlen);
-        const uint32_t col   = prev_col + delta;
-        if (col == new_col) return false; // duplicate, skip (tile already exists)
+        const uint32_t col = prev_col + delta;
+        if (col == new_col)
+            return false; // duplicate, skip (tile already exists)
         if (col > new_col) {
-            ins_byte_pos  = byte_pos;
-            ins_elem_pos  = elem_pos;
+            ins_byte_pos = byte_pos;
+            ins_elem_pos = elem_pos;
             ins_tbyte_pos = tbyte_pos;
-            has_next      = true;
-            next_col      = col;
-            next_dlen     = dlen;
+            has_next = true;
+            next_col = col;
+            next_dlen = dlen;
             break;
         }
-        const std::size_t tlen = tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
-        prev_col   = col;
-        byte_pos  += dlen;
+        const std::size_t tlen =
+            tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
+        prev_col = col;
+        byte_pos += dlen;
         elem_pos++;
         tbyte_pos += tlen;
     }
@@ -795,7 +825,7 @@ inline bool block4_row_insert_tile(
 
     if (idx_delta != 0) {
         const std::size_t shift_from = ins_byte_pos;
-        const std::size_t shift_len  = L.byte_end[row] - shift_from;
+        const std::size_t shift_len = L.byte_end[row] - shift_from;
         if (shift_len > 0)
             std::memmove(ibuf.data() + shift_from + idx_delta, ibuf.data() + shift_from, shift_len);
         L.byte_end[row] = std::size_t(std::ptrdiff_t(L.byte_end[row]) + idx_delta);
@@ -806,9 +836,10 @@ inline bool block4_row_insert_tile(
 
     {
         const std::size_t shift_from = ins_tbyte_pos;
-        const std::size_t shift_len  = tbyte_end[row] - shift_from;
+        const std::size_t shift_len = tbyte_end[row] - shift_from;
         if (shift_len > 0)
-            std::memmove(tile_data.data() + shift_from + new_tile_len, tile_data.data() + shift_from, shift_len);
+            std::memmove(tile_data.data() + shift_from + new_tile_len,
+                         tile_data.data() + shift_from, shift_len);
         // new_tile_len is 1. writes just the sparse-tile count byte (0 = empty)
         std::memset(tile_data.data() + ins_tbyte_pos, 0, new_tile_len);
         tbyte_end[row] += new_tile_len;
@@ -824,32 +855,29 @@ inline bool block4_row_insert_tile(
     return true;
 }
 
-inline bool block4_row_remove_tile(
-    DeltaCSRLayout& L,
-    std::vector<uint8_t>& ibuf,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::vector<uint8_t>& tile_is_sparse,
-    std::size_t row,
-    uint32_t target_col,
-    // See block4_row_insert_tile's identical parameter for why this
-    // exists -- same real bug (ASan-confirmed), same fix.
-    std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len)
-{
+inline bool
+block4_row_remove_tile(DeltaCSRLayout& L, std::vector<uint8_t>& ibuf,
+                       std::vector<std::size_t>& tbyte_start, std::vector<std::size_t>& tbyte_end,
+                       std::vector<uint8_t>& tile_data, std::vector<uint8_t>& tile_is_sparse,
+                       std::size_t row, uint32_t target_col,
+                       // See block4_row_insert_tile's identical parameter for why this
+                       // exists -- same real bug (ASan-confirmed), same fix.
+                       std::size_t (*tile_len_fn)(bool, const uint8_t*) = block4_stored_tile_len) {
     const std::size_t n = L.row_nnz(row);
-    if (n == 0) return false;
+    if (n == 0)
+        return false;
 
-    std::size_t byte_pos  = L.byte_start[row];
-    std::size_t elem_pos  = L.elem_start[row];
+    std::size_t byte_pos = L.byte_start[row];
+    std::size_t elem_pos = L.elem_start[row];
     std::size_t tbyte_pos = tbyte_start[row];
-    uint32_t    prev_col  = 0;
+    uint32_t prev_col = 0;
 
     for (std::size_t e = 0; e < n; ++e) {
         std::size_t delta_len = 0;
         const uint32_t delta = uleb128_decode<uint32_t>(ibuf.data() + byte_pos, delta_len);
-        const uint32_t col   = prev_col + delta;
-        const std::size_t tlen = tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
+        const uint32_t col = prev_col + delta;
+        const std::size_t tlen =
+            tile_len_fn(tile_is_sparse[elem_pos], tile_data.data() + tbyte_pos);
 
         if (col == target_col) {
             const std::size_t next_byte_pos = byte_pos + delta_len;
@@ -866,10 +894,11 @@ inline bool block4_row_remove_tile(
                 std::memcpy(ibuf.data() + byte_pos, merged_buf, merged_len);
 
                 const std::size_t shift_from = next_byte_pos + next_delta_len;
-                const std::size_t shift_len  = L.byte_end[row] - shift_from;
-                const std::size_t freed      = delta_len + next_delta_len - merged_len;
+                const std::size_t shift_len = L.byte_end[row] - shift_from;
+                const std::size_t freed = delta_len + next_delta_len - merged_len;
                 if (shift_len > 0)
-                    std::memmove(ibuf.data() + byte_pos + merged_len, ibuf.data() + shift_from, shift_len);
+                    std::memmove(ibuf.data() + byte_pos + merged_len, ibuf.data() + shift_from,
+                                 shift_len);
                 L.byte_end[row] -= freed;
             } else {
                 L.byte_end[row] -= delta_len;
@@ -877,9 +906,10 @@ inline bool block4_row_remove_tile(
 
             {
                 const std::size_t shift_from = tbyte_pos + tlen;
-                const std::size_t shift_len  = tbyte_end[row] - shift_from;
+                const std::size_t shift_len = tbyte_end[row] - shift_from;
                 if (shift_len > 0)
-                    std::memmove(tile_data.data() + tbyte_pos, tile_data.data() + shift_from, shift_len);
+                    std::memmove(tile_data.data() + tbyte_pos, tile_data.data() + shift_from,
+                                 shift_len);
                 tbyte_end[row] -= tlen;
             }
 
@@ -892,8 +922,8 @@ inline bool block4_row_remove_tile(
             return true;
         }
 
-        prev_col   = col;
-        byte_pos  += delta_len;
+        prev_col = col;
+        byte_pos += delta_len;
         elem_pos++;
         tbyte_pos += tlen;
     }
@@ -941,54 +971,53 @@ inline bool block4_row_remove_tile(
 // thread's pointer, and (given set_limits()'s own upfront reservation)
 // should be rare in practice, exactly matching that "caps on massive
 // buffers" design intent.
-inline bool block4_row_grow_needs_realloc(
-    const std::vector<uint8_t>& tile_data,
-    const std::vector<std::size_t>& tbyte_start,
-    const std::vector<std::size_t>& tbyte_end,
-    std::size_t row, std::size_t old_len, std::size_t new_len)
-{
-    if (new_len <= old_len) return false;
-    const std::size_t delta    = new_len - old_len;
-    const std::size_t alloc    = tbyte_start[row + 1] - tbyte_start[row];
-    const std::size_t used     = tbyte_end[row] - tbyte_start[row];
+inline bool block4_row_grow_needs_realloc(const std::vector<uint8_t>& tile_data,
+                                          const std::vector<std::size_t>& tbyte_start,
+                                          const std::vector<std::size_t>& tbyte_end,
+                                          std::size_t row, std::size_t old_len,
+                                          std::size_t new_len) {
+    if (new_len <= old_len)
+        return false;
+    const std::size_t delta = new_len - old_len;
+    const std::size_t alloc = tbyte_start[row + 1] - tbyte_start[row];
+    const std::size_t used = tbyte_end[row] - tbyte_start[row];
     const std::size_t headroom = alloc - used;
-    if (delta <= headroom) return false;  // pure in-row shift, tile_data.resize() never called
+    if (delta <= headroom)
+        return false; // pure in-row shift, tile_data.resize() never called
     const std::size_t shortfall = delta - headroom;
     return tile_data.size() + shortfall > tile_data.capacity();
 }
 
-inline void block4_resize_tile_in_row(
-    DeltaCSRLayout& L,
-    std::vector<std::size_t>& tbyte_start,
-    std::vector<std::size_t>& tbyte_end,
-    std::vector<uint8_t>& tile_data,
-    std::size_t row,
-    std::size_t tbyte_pos,
-    std::size_t old_len,
-    const uint8_t* new_bytes,
-    std::size_t new_len,
-    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max())
-{
+inline void
+block4_resize_tile_in_row(DeltaCSRLayout& L, std::vector<std::size_t>& tbyte_start,
+                          std::vector<std::size_t>& tbyte_end, std::vector<uint8_t>& tile_data,
+                          std::size_t row, std::size_t tbyte_pos, std::size_t old_len,
+                          const uint8_t* new_bytes, std::size_t new_len,
+                          std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max()) {
     if (new_len == old_len) {
         std::memcpy(tile_data.data() + tbyte_pos, new_bytes, new_len);
         return;
     }
     const std::ptrdiff_t delta = std::ptrdiff_t(new_len) - std::ptrdiff_t(old_len);
     if (delta > 0) {
-        const std::size_t alloc    = tbyte_start[row + 1] - tbyte_start[row];
-        const std::size_t used     = tbyte_end[row] - tbyte_start[row];
+        const std::size_t alloc = tbyte_start[row + 1] - tbyte_start[row];
+        const std::size_t used = tbyte_end[row] - tbyte_start[row];
         const std::size_t headroom = alloc - used;
         if (std::size_t(delta) > headroom) {
             const std::size_t shortfall = std::size_t(delta) - headroom;
             const std::size_t new_total = tile_data.size() + shortfall;
-            if (new_total > max_tile_bytes) throw std::bad_alloc();
+            if (new_total > max_tile_bytes)
+                throw std::bad_alloc();
             if (row + 1 < L.rows) {
                 const std::size_t move_src = tbyte_start[row + 1];
                 const std::size_t move_len = tbyte_start[L.rows] - move_src;
                 tile_data.resize(new_total);
-                std::memmove(tile_data.data() + move_src + shortfall, tile_data.data() + move_src, move_len);
-                for (std::size_t r = row + 1; r <= L.rows; ++r) tbyte_start[r] += shortfall;
-                for (std::size_t r = row + 1; r < L.rows; ++r)  tbyte_end[r]   += shortfall;
+                std::memmove(tile_data.data() + move_src + shortfall, tile_data.data() + move_src,
+                             move_len);
+                for (std::size_t r = row + 1; r <= L.rows; ++r)
+                    tbyte_start[r] += shortfall;
+                for (std::size_t r = row + 1; r < L.rows; ++r)
+                    tbyte_end[r] += shortfall;
             } else {
                 tile_data.resize(new_total);
                 tbyte_start[L.rows] += shortfall;
@@ -996,9 +1025,10 @@ inline void block4_resize_tile_in_row(
         }
     }
     const std::size_t shift_from = tbyte_pos + old_len;
-    const std::size_t shift_len  = tbyte_end[row] - shift_from;
+    const std::size_t shift_len = tbyte_end[row] - shift_from;
     if (shift_len > 0)
-        std::memmove(tile_data.data() + tbyte_pos + new_len, tile_data.data() + shift_from, shift_len);
+        std::memmove(tile_data.data() + tbyte_pos + new_len, tile_data.data() + shift_from,
+                     shift_len);
     std::memcpy(tile_data.data() + tbyte_pos, new_bytes, new_len);
     tbyte_end[row] = std::size_t(std::ptrdiff_t(tbyte_end[row]) + delta);
 }
@@ -1013,44 +1043,59 @@ inline void block4_resize_tile_in_row(
 inline uint32_t block4_count_live(const uint8_t dense[BLOCK4_TILE_SLOTS]) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < BLOCK4_TILE_SLOTS; ++i)
-        if (dense[i] != 0) ++n;
+        if (dense[i] != 0)
+            ++n;
     return n;
 }
 
 struct Block4Store;
 
-// RAII accessor for one logical tile's synapse data. 
+// RAII accessor for one logical tile's synapse data.
 class Block4TileHandle {
     Block4Store* store_ = nullptr;
     uint32_t br_ = 0, bc_ = 0;
-    std::size_t byte_pos_ = 0;  // position in store_->tile_data
+    std::size_t byte_pos_ = 0; // position in store_->tile_data
     uint8_t scratch_[BLOCK4_TILE_SLOTS] = {0};
     bool was_sparse_ = false;
     bool dirty_ = false;
     bool valid_ = false;
 
-public:
+  public:
     Block4TileHandle() = default;
     Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc);
     // Fast-path constructor
-    Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos);
+    Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos,
+                     std::size_t byte_pos);
     ~Block4TileHandle();
 
     Block4TileHandle(Block4TileHandle&& other) noexcept {
-        store_ = other.store_; br_ = other.br_; bc_ = other.bc_; byte_pos_ = other.byte_pos_;
+        store_ = other.store_;
+        br_ = other.br_;
+        bc_ = other.bc_;
+        byte_pos_ = other.byte_pos_;
         std::memcpy(scratch_, other.scratch_, sizeof(scratch_));
-        was_sparse_ = other.was_sparse_; dirty_ = other.dirty_; valid_ = other.valid_;
-        other.valid_ = false; other.dirty_ = false; // moved-from: destructor becomes a no-op
+        was_sparse_ = other.was_sparse_;
+        dirty_ = other.dirty_;
+        valid_ = other.valid_;
+        other.valid_ = false;
+        other.dirty_ = false; // moved-from: destructor becomes a no-op
     }
     Block4TileHandle& operator=(Block4TileHandle&& other) noexcept {
-        if (this == &other) return *this;
+        if (this == &other)
+            return *this;
         // Flush any pending write of THIS handle before taking over
         // other's state -- moving must not silently drop a re-pack.
         this->~Block4TileHandle();
-        store_ = other.store_; br_ = other.br_; bc_ = other.bc_; byte_pos_ = other.byte_pos_;
+        store_ = other.store_;
+        br_ = other.br_;
+        bc_ = other.bc_;
+        byte_pos_ = other.byte_pos_;
         std::memcpy(scratch_, other.scratch_, sizeof(scratch_));
-        was_sparse_ = other.was_sparse_; dirty_ = other.dirty_; valid_ = other.valid_;
-        other.valid_ = false; other.dirty_ = false;
+        was_sparse_ = other.was_sparse_;
+        dirty_ = other.dirty_;
+        valid_ = other.valid_;
+        other.valid_ = false;
+        other.dirty_ = false;
         return *this;
     }
     Block4TileHandle(const Block4TileHandle&) = delete;
@@ -1068,21 +1113,21 @@ public:
 };
 
 struct Block4Store {
-    DeltaCSRLayout            block_layout;    // rows/cols are block-granularity (ceil(n_in/4), ceil(n_out/4))
-    std::vector<uint8_t>      indices_buf;     // uleb128-encoded block-col deltas
+    DeltaCSRLayout block_layout; // rows/cols are block-granularity (ceil(n_in/4), ceil(n_out/4))
+    std::vector<uint8_t> indices_buf; // uleb128-encoded block-col deltas
 
     // Variable-length tile storage
-    std::vector<uint8_t>      tile_data;
-    std::vector<std::size_t>  tile_byte_start; // size rows+1
-    std::vector<std::size_t>  tile_byte_end;   // size rows
-    std::vector<uint8_t>      tile_is_sparse;  // parallel to block_layout's elem_start/elem_end
+    std::vector<uint8_t> tile_data;
+    std::vector<std::size_t> tile_byte_start; // size rows+1
+    std::vector<std::size_t> tile_byte_end;   // size rows
+    std::vector<uint8_t> tile_is_sparse;      // parallel to block_layout's elem_start/elem_end
 
     // Default BLOCK4_SPARSE_MAX_COUNT (10, the exact 10*12+8=128
     // arithmetic) saves the most memory, but lowering may increase speed.
     uint32_t switch_point = BLOCK4_SPARSE_MAX_COUNT;
 
     std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max();
-    std::size_t max_tile_bytes    = std::numeric_limits<std::size_t>::max();
+    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max();
 
     /**
      * @brief Sets the memory limits for indices and tile data.
@@ -1095,7 +1140,7 @@ struct Block4Store {
      */
     void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
-        max_tile_bytes    = tile_limit_bytes;
+        max_tile_bytes = tile_limit_bytes;
         // Reserve capacity up front, for real, to the SAME bound
         // max_tile_bytes enforces everywhere else -- deliberately no
         // try/catch here (previously silently swallowed bad_alloc/
@@ -1146,11 +1191,11 @@ struct Block4Store {
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
     // Persistent scratch buffers for disldo_forward/disldo_backward
-    std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
+    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
-    std::vector<uint32_t>    scratch_row_live_count; // backward only
-    std::vector<double>      scratch_row_grad;        // backward only
-    // backward only: 
+    std::vector<uint32_t> scratch_row_live_count; // backward only
+    std::vector<double> scratch_row_grad;         // backward only
+    // backward only:
     std::vector<std::size_t> scratch_row_ti_start;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
@@ -1174,16 +1219,17 @@ struct Block4Store {
         return DeltaCSRRowCursor<uint32_t>(indices_buf.data(), block_layout, br);
     }
 
-    // Byte length of the tile at (elem_pos, byte_pos) 
+    // Byte length of the tile at (elem_pos, byte_pos)
     std::size_t tile_len_at(std::size_t elem_pos, std::size_t byte_pos) const {
         return block4_stored_tile_len(tile_is_sparse[elem_pos], &tile_data[byte_pos]);
     }
 
-    // Raw storage lookup. Returns this tile's byte offset into tile_data 
-    // (SIZE_MAX if (br,bc) has no live tile), and writes its elem_pos to 
+    // Raw storage lookup. Returns this tile's byte offset into tile_data
+    // (SIZE_MAX if (br,bc) has no live tile), and writes its elem_pos to
     // *out_elem_pos if non-null.
     std::size_t raw_find(uint32_t br, uint32_t bc, std::size_t* out_elem_pos = nullptr) const {
-        if (br >= block_layout.rows) return std::numeric_limits<std::size_t>::max();
+        if (br >= block_layout.rows)
+            return std::numeric_limits<std::size_t>::max();
         auto cur = row_cursor(br);
         const std::size_t n = block_layout.row_nnz(br);
         std::size_t elem_pos = block_layout.elem_start[br];
@@ -1191,10 +1237,12 @@ struct Block4Store {
         for (std::size_t e = 0; e < n; ++e, ++elem_pos) {
             const uint32_t col = cur.advance();
             if (col == bc) {
-                if (out_elem_pos) *out_elem_pos = elem_pos;
+                if (out_elem_pos)
+                    *out_elem_pos = elem_pos;
                 return byte_pos;
             }
-            if (col > bc) break; // sorted ascending -- can't appear later
+            if (col > bc)
+                break; // sorted ascending -- can't appear later
             byte_pos += tile_len_at(elem_pos, byte_pos);
         }
         return std::numeric_limits<std::size_t>::max();
@@ -1202,8 +1250,8 @@ struct Block4Store {
 
     bool is_sparse(uint32_t br, uint32_t bc) const {
         std::size_t elem_pos = 0;
-        return raw_find(br, bc, &elem_pos) != std::numeric_limits<std::size_t>::max()
-            && bool(tile_is_sparse[elem_pos]);
+        return raw_find(br, bc, &elem_pos) != std::numeric_limits<std::size_t>::max() &&
+               bool(tile_is_sparse[elem_pos]);
     }
 
     Block4TileHandle find(uint32_t br, uint32_t bc) { return Block4TileHandle(*this, br, bc); }
@@ -1212,74 +1260,90 @@ struct Block4Store {
     }
 
     // Fast path for a caller that already walked row_cursor(br) itself
-    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos) {
+    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos,
+                              std::size_t byte_pos) {
         return Block4TileHandle(*this, br, bc, elem_pos, byte_pos);
     }
-    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos) const {
+    Block4TileHandle at_index(uint32_t br, uint32_t bc, std::size_t elem_pos,
+                              std::size_t byte_pos) const {
         return const_cast<Block4Store*>(this)->at_index(br, bc, elem_pos, byte_pos);
     }
 
     Block4TileHandle get_or_create(uint32_t br, uint32_t bc) {
         if (raw_find(br, bc) == std::numeric_limits<std::size_t>::max()) {
             if (br >= block_layout.rows)
-                throw std::out_of_range(
-                    "Block4Store::get_or_create: block_row out of range -- "
-                    "was Block4Store::init(n_in, n_out) called?");
+                throw std::out_of_range("Block4Store::get_or_create: block_row out of range -- "
+                                        "was Block4Store::init(n_in, n_out) called?");
             if (!block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                         tile_data, tile_is_sparse, br, bc)) {
-                block4_ensure_row_headroom(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                            tile_data, tile_is_sparse, br, max_indices_bytes, max_tile_bytes);
-                const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                                        tile_data, tile_is_sparse, br, bc);
-                (void)ok; // block4_ensure_row_headroom grows by exactly enough for one more tile -- this must succeed
+                                        tile_data, tile_is_sparse, br, bc)) {
+                block4_ensure_row_headroom(block_layout, indices_buf, tile_byte_start,
+                                           tile_byte_end, tile_data, tile_is_sparse, br,
+                                           max_indices_bytes, max_tile_bytes);
+                const bool ok =
+                    block4_row_insert_tile(block_layout, indices_buf, tile_byte_start,
+                                           tile_byte_end, tile_data, tile_is_sparse, br, bc);
+                (void)ok; // block4_ensure_row_headroom grows by exactly enough for one more tile --
+                          // this must succeed
             }
         }
         return Block4TileHandle(*this, br, bc);
     }
 
     void erase(uint32_t br, uint32_t bc) {
-        if (br >= block_layout.rows) return;
-        block4_row_remove_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                tile_data, tile_is_sparse, br, bc);
+        if (br >= block_layout.rows)
+            return;
+        block4_row_remove_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
+                               tile_is_sparse, br, bc);
     }
 
     // Explicit compression check called at synaptogenesis/pruning checkpoints
     void maybe_compress(uint32_t br, uint32_t bc) {
         std::size_t elem_pos = 0;
         const std::size_t byte_pos = raw_find(br, bc, &elem_pos);
-        if (byte_pos == std::numeric_limits<std::size_t>::max() || tile_is_sparse[elem_pos]) return;
+        if (byte_pos == std::numeric_limits<std::size_t>::max() || tile_is_sparse[elem_pos])
+            return;
         const uint32_t n = block4_count_live(&tile_data[byte_pos]);
-        if (n > switch_point) return;
+        if (n > switch_point)
+            return;
         uint8_t packed[BLOCK4_TILE_SLOTS];
         block4_sparse_pack(&tile_data[byte_pos], packed);
         const std::size_t new_len = block4_sparse_packed_len(uint8_t(n));
-        block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                   br, byte_pos, BLOCK4_TILE_SLOTS, packed, new_len, max_tile_bytes);
+        block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data, br,
+                                  byte_pos, BLOCK4_TILE_SLOTS, packed, new_len, max_tile_bytes);
         tile_is_sparse[elem_pos] = 1;
     }
 
     // Redistributes row-level headroom
     void equalize_step(std::size_t& current_row) {
-        if (block_layout.rows == 0) return;
+        if (block_layout.rows == 0)
+            return;
         const std::size_t row = current_row % block_layout.rows;
-        const std::size_t target_idx = block_layout.rows > 0
-            ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows : 0;
-        const std::size_t target_tile = block_layout.rows > 0
-            ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows : 0;
-        const std::size_t target_elem = block_layout.rows > 0
-            ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows : 0;
-        block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data, tile_is_sparse,
-                          row, target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
+        const std::size_t target_idx =
+            block_layout.rows > 0
+                ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows
+                : 0;
+        const std::size_t target_tile =
+            block_layout.rows > 0 ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows
+                                  : 0;
+        const std::size_t target_elem =
+            block_layout.rows > 0
+                ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows
+                : 0;
+        block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
+                         tile_is_sparse, row, target_idx, target_tile, target_elem,
+                         max_indices_bytes, max_tile_bytes);
         current_row = (current_row + 1) % block_layout.rows;
     }
 
     // called from ~Block4TileHandle()'s was_sparse_ branch (rare)
-    void commit_dirty_sparse_tile(uint32_t br, uint32_t bc, const uint8_t scratch[BLOCK4_TILE_SLOTS]) {
+    void commit_dirty_sparse_tile(uint32_t br, uint32_t bc,
+                                  const uint8_t scratch[BLOCK4_TILE_SLOTS]) {
         // Another call could have inserted/removed a different tile in this same
         // row in between, so we need to fetch by coordinate and not a cached pointer
-	std::size_t elem_pos = 0;
+        std::size_t elem_pos = 0;
         const std::size_t fresh_byte_pos = raw_find(br, bc, &elem_pos);
-        if (fresh_byte_pos == std::numeric_limits<std::size_t>::max()) return; // was already erased
+        if (fresh_byte_pos == std::numeric_limits<std::size_t>::max())
+            return; // was already erased
 
         const uint32_t n = block4_count_live(scratch);
         uint8_t packed[BLOCK4_TILE_SLOTS];
@@ -1304,13 +1368,16 @@ struct Block4Store {
         // call set_limits() with a genuine budget, reserving full
         // capacity up front, exactly so ordinary growth never needs to
         // fall through to the slow path below).
-        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len, new_len)) {
+        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len,
+                                           new_len)) {
             try {
                 block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                           br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+                                          br, fresh_byte_pos, cur_len, packed, new_len,
+                                          max_tile_bytes);
                 tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
             } catch (const std::bad_alloc&) {
-                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+                std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                    .fetch_add(1, std::memory_order_relaxed);
             }
             return;
         }
@@ -1328,52 +1395,55 @@ struct Block4Store {
         std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
         std::uint32_t expected = 0;
         if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
-            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                .fetch_add(1, std::memory_order_relaxed);
             return;
         }
         try {
-            block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                       br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+            block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data, br,
+                                      fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
             tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
         } catch (const std::bad_alloc&) {
-            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                .fetch_add(1, std::memory_order_relaxed);
         }
         grow_lock.store(0, std::memory_order_release);
     }
 
     // Row-local workspace (concurrency-safe growth path)
     struct RowWorkspace {
-        std::vector<uint8_t>  bytes;       // this row's tile bytes, private copy
-        std::vector<uint8_t>  is_sparse;   // one flag per tile, 0-based within this row
-        std::vector<uint32_t> bc;          // block-column of each tile, 0-based within this row --
-                                            // needed by merge_row_workspace's eviction scan to
-                                            // resolve (row, col) for importance-scale lookups
-        std::size_t elem_start = 0;        // == block_layout.elem_start[br] (global elem index base)
-        std::size_t row_nnz    = 0;
+        std::vector<uint8_t> bytes;     // this row's tile bytes, private copy
+        std::vector<uint8_t> is_sparse; // one flag per tile, 0-based within this row
+        std::vector<uint32_t> bc;       // block-column of each tile, 0-based within this row --
+                                        // needed by merge_row_workspace's eviction scan to
+                                        // resolve (row, col) for importance-scale lookups
+        std::size_t elem_start = 0;     // == block_layout.elem_start[br] (global elem index base)
+        std::size_t row_nnz = 0;
         // Fake single-row layout so block4_resize_tile_in_row's cross-row
         // shift branch (`row + 1 < L.rows`) is always false here
-	DeltaCSRLayout local_L;
+        DeltaCSRLayout local_L;
         std::vector<std::size_t> local_tbyte_start; // {0, capacity}
         std::vector<std::size_t> local_tbyte_end;   // {used}
     };
 
     RowWorkspace snapshot_row(std::size_t br) const {
         RowWorkspace ws;
-        ws.row_nnz    = block_layout.row_nnz(br);
+        ws.row_nnz = block_layout.row_nnz(br);
         ws.elem_start = block_layout.elem_start[br];
         const std::size_t used = tile_byte_end[br] - tile_byte_start[br];
         ws.bytes.assign(tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]),
-                         tile_data.begin() + std::ptrdiff_t(tile_byte_end[br]));
+                        tile_data.begin() + std::ptrdiff_t(tile_byte_end[br]));
         ws.is_sparse.assign(tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start),
-                             tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start + ws.row_nnz));
+                            tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start + ws.row_nnz));
         ws.bc.resize(ws.row_nnz);
         {
             auto cur = row_cursor(br);
-            for (std::size_t e = 0; e < ws.row_nnz; ++e) ws.bc[e] = cur.advance();
+            for (std::size_t e = 0; e < ws.row_nnz; ++e)
+                ws.bc[e] = cur.advance();
         }
-        ws.local_L.rows      = 1;
+        ws.local_L.rows = 1;
         ws.local_tbyte_start = {0, used};
-        ws.local_tbyte_end   = {used};
+        ws.local_tbyte_end = {used};
         return ws;
     }
 
@@ -1386,9 +1456,8 @@ struct Block4Store {
     }
 
     // Packs `scratch` into the workspace at local tile index `e`
-    void commit_dirty_tile_in_workspace(RowWorkspace& ws, std::size_t e,
-                                         std::size_t local_byte_pos,
-                                         const uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
+    void commit_dirty_tile_in_workspace(RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
+                                        const uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
         const uint32_t n = block4_count_live(scratch);
         uint8_t packed[BLOCK4_TILE_SLOTS];
         std::size_t new_len;
@@ -1402,32 +1471,35 @@ struct Block4Store {
             new_len = BLOCK4_TILE_SLOTS;
             now_sparse = false;
         }
-        const std::size_t cur_len = block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[local_byte_pos]);
-        block4_resize_tile_in_row(ws.local_L, ws.local_tbyte_start, ws.local_tbyte_end, ws.bytes,
-                                   0, local_byte_pos, cur_len, packed, new_len,
-                                   std::numeric_limits<std::size_t>::max());
+        const std::size_t cur_len =
+            block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[local_byte_pos]);
+        block4_resize_tile_in_row(ws.local_L, ws.local_tbyte_start, ws.local_tbyte_end, ws.bytes, 0,
+                                  local_byte_pos, cur_len, packed, new_len,
+                                  std::numeric_limits<std::size_t>::max());
         ws.is_sparse[e] = now_sparse ? 1 : 0;
     }
 
-    // Unpacks local tile `e` into `scratch` 
-    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e,
-                                std::size_t local_byte_pos,
-                                uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
-        if (ws.is_sparse[e]) block4_sparse_unpack(&ws.bytes[local_byte_pos], scratch);
-        else std::memcpy(scratch, &ws.bytes[local_byte_pos], BLOCK4_TILE_SLOTS);
+    // Unpacks local tile `e` into `scratch`
+    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
+                               uint8_t scratch[BLOCK4_TILE_SLOTS]) const {
+        if (ws.is_sparse[e])
+            block4_sparse_unpack(&ws.bytes[local_byte_pos], scratch);
+        else
+            std::memcpy(scratch, &ws.bytes[local_byte_pos], BLOCK4_TILE_SLOTS);
     }
 
     // Writes the workspace back into the shared store
     template <typename TrueImportanceFn>
-    std::size_t merge_row_workspace(std::size_t br, RowWorkspace& ws, TrueImportanceFn&& true_importance) {
+    std::size_t merge_row_workspace(std::size_t br, RowWorkspace& ws,
+                                    TrueImportanceFn&& true_importance) {
         const std::size_t global_headroom = tile_byte_start[br + 1] - tile_byte_start[br];
         std::size_t evicted = 0;
         while (ws.local_tbyte_end[0] > global_headroom) {
             // Find the globally lowest-|true-importance| LIVE slot across
             // every tile in this row.
-	    // todo: ensure this is SIMD optimized instead of 3 for loops
-	    //   with if statements in the deepest loop
-	    double best_abs_imp = -1.0;
+            // todo: ensure this is SIMD optimized instead of 3 for loops
+            //   with if statements in the deepest loop
+            double best_abs_imp = -1.0;
             std::size_t best_e = 0, best_local_pos = 0;
             uint32_t best_li = 0, best_lj = 0;
             std::size_t pos = 0;
@@ -1437,24 +1509,29 @@ struct Block4Store {
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const uint8_t byte = scratch[Block4Tile::slot_index(li, lj)];
-                        if (byte == 0) continue; // not live
+                        if (byte == 0)
+                            continue; // not live
                         const uint8_t imp_code = (byte >> 4) & 0xFu;
                         const std::size_t row = br * BLOCK4_TILE + li;
-                        const std::size_t col = static_cast<std::size_t>(ws.bc[e]) * BLOCK4_TILE + lj;
-                        const double abs_imp = std::abs(static_cast<double>(
-                            true_importance(row, col, imp_code)));
+                        const std::size_t col =
+                            static_cast<std::size_t>(ws.bc[e]) * BLOCK4_TILE + lj;
+                        const double abs_imp =
+                            std::abs(static_cast<double>(true_importance(row, col, imp_code)));
                         if (best_abs_imp < 0.0 || abs_imp < best_abs_imp) {
                             best_abs_imp = abs_imp;
-                            best_e = e; best_local_pos = pos;
-                            best_li = li; best_lj = lj;
+                            best_e = e;
+                            best_local_pos = pos;
+                            best_li = li;
+                            best_lj = lj;
                         }
                     }
                 }
                 pos += block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[pos]);
             }
-            if (best_abs_imp < 0.0) break; // nothing live left to evict -- see the
-                                            // clamp fallback right below for why
-                                            // this can genuinely happen.
+            if (best_abs_imp < 0.0)
+                break; // nothing live left to evict -- see the
+                       // clamp fallback right below for why
+                       // this can genuinely happen.
             uint8_t scratch[BLOCK4_TILE_SLOTS];
             unpack_workspace_tile(ws, best_e, best_local_pos, scratch);
             scratch[Block4Tile::slot_index(best_li, best_lj)] = 0;
@@ -1496,22 +1573,25 @@ struct Block4Store {
         // needs expand_headroom_to() with a bigger budget.
         std::size_t fit_pos = 0, fit_tiles = 0;
         for (std::size_t e = 0; e < ws.row_nnz; ++e) {
-            if (fit_pos >= ws.bytes.size()) break;
+            if (fit_pos >= ws.bytes.size())
+                break;
             const std::size_t tlen = block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[fit_pos]);
-            if (fit_pos + tlen > global_headroom) break;
+            if (fit_pos + tlen > global_headroom)
+                break;
             fit_pos += tlen;
             ++fit_tiles;
         }
         if (fit_tiles < ws.row_nnz) {
-            std::atomic_ref<std::uint64_t>(row_merge_overflow_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_events)
+                .fetch_add(1, std::memory_order_relaxed);
             std::atomic_ref<std::uint64_t>(row_merge_overflow_bytes_dropped)
                 .fetch_add(ws.local_tbyte_end[0] - fit_pos, std::memory_order_relaxed);
         }
         std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(fit_pos),
-                   tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
+                  tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
         tile_byte_end[br] = tile_byte_start[br] + fit_pos;
         std::copy(ws.is_sparse.begin(), ws.is_sparse.begin() + std::ptrdiff_t(fit_tiles),
-                   tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
+                  tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
         return evicted;
     }
 
@@ -1520,7 +1600,8 @@ struct Block4Store {
     std::size_t total_tile_alloc_bytes() const { return tile_data.size(); }
     std::size_t total_tile_used_bytes() const {
         std::size_t n = 0;
-        for (std::size_t r = 0; r < block_layout.rows; ++r) n += tile_byte_end[r] - tile_byte_start[r];
+        for (std::size_t r = 0; r < block_layout.rows; ++r)
+            n += tile_byte_end[r] - tile_byte_start[r];
         return n;
     }
 
@@ -1529,7 +1610,7 @@ struct Block4Store {
         std::size_t n = 0;
         for (std::size_t r = 0; r < block_layout.rows; ++r) {
             const std::size_t start = block_layout.elem_start[r];
-            const std::size_t end   = block_layout.elem_end[r];
+            const std::size_t end = block_layout.elem_end[r];
             std::size_t byte_pos = tile_byte_start[r];
             for (std::size_t i = start; i < end; ++i) {
                 if (tile_is_sparse[i]) {
@@ -1549,14 +1630,15 @@ struct Block4Store {
 inline uint8_t& Block4TileHandle::at(uint32_t li, uint32_t lj) {
     dirty_ = true;
     return was_sparse_ ? scratch_[Block4Tile::slot_index(li, lj)]
-                        : store_->tile_data[byte_pos_ + Block4Tile::slot_index(li, lj)];
+                       : store_->tile_data[byte_pos_ + Block4Tile::slot_index(li, lj)];
 }
 inline uint8_t Block4TileHandle::at(uint32_t li, uint32_t lj) const {
     return was_sparse_ ? scratch_[Block4Tile::slot_index(li, lj)]
-                        : store_->tile_data[byte_pos_ + Block4Tile::slot_index(li, lj)];
+                       : store_->tile_data[byte_pos_ + Block4Tile::slot_index(li, lj)];
 }
 inline uint32_t Block4TileHandle::count_live() const {
-    return was_sparse_ ? block4_count_live(scratch_) : block4_count_live(&store_->tile_data[byte_pos_]);
+    return was_sparse_ ? block4_count_live(scratch_)
+                       : block4_count_live(&store_->tile_data[byte_pos_]);
 }
 inline const uint8_t* Block4TileHandle::raw_data() const {
     return was_sparse_ ? scratch_ : &store_->tile_data[byte_pos_];
@@ -1588,25 +1670,39 @@ class Block4TileHandle8 {
     bool dirty_ = false;
     bool valid_ = false;
 
-public:
+  public:
     Block4TileHandle8() = default;
     Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc);
-    Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos);
+    Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc, std::size_t elem_pos,
+                      std::size_t byte_pos);
     ~Block4TileHandle8();
 
     Block4TileHandle8(Block4TileHandle8&& other) noexcept {
-        store_ = other.store_; br_ = other.br_; bc_ = other.bc_; byte_pos_ = other.byte_pos_;
+        store_ = other.store_;
+        br_ = other.br_;
+        bc_ = other.bc_;
+        byte_pos_ = other.byte_pos_;
         std::memcpy(scratch_, other.scratch_, sizeof(scratch_));
-        was_sparse_ = other.was_sparse_; dirty_ = other.dirty_; valid_ = other.valid_;
-        other.valid_ = false; other.dirty_ = false;
+        was_sparse_ = other.was_sparse_;
+        dirty_ = other.dirty_;
+        valid_ = other.valid_;
+        other.valid_ = false;
+        other.dirty_ = false;
     }
     Block4TileHandle8& operator=(Block4TileHandle8&& other) noexcept {
-        if (this == &other) return *this;
+        if (this == &other)
+            return *this;
         this->~Block4TileHandle8();
-        store_ = other.store_; br_ = other.br_; bc_ = other.bc_; byte_pos_ = other.byte_pos_;
+        store_ = other.store_;
+        br_ = other.br_;
+        bc_ = other.bc_;
+        byte_pos_ = other.byte_pos_;
         std::memcpy(scratch_, other.scratch_, sizeof(scratch_));
-        was_sparse_ = other.was_sparse_; dirty_ = other.dirty_; valid_ = other.valid_;
-        other.valid_ = false; other.dirty_ = false;
+        was_sparse_ = other.was_sparse_;
+        dirty_ = other.dirty_;
+        valid_ = other.valid_;
+        other.valid_ = false;
+        other.dirty_ = false;
         return *this;
     }
     Block4TileHandle8(const Block4TileHandle8&) = delete;
@@ -1615,9 +1711,9 @@ public:
     explicit operator bool() const { return valid_; }
 
     uint8_t& at_weight(uint32_t li, uint32_t lj);
-    uint8_t  at_weight(uint32_t li, uint32_t lj) const;
+    uint8_t at_weight(uint32_t li, uint32_t lj) const;
     uint8_t& at_importance(uint32_t li, uint32_t lj);
-    uint8_t  at_importance(uint32_t li, uint32_t lj) const;
+    uint8_t at_importance(uint32_t li, uint32_t lj) const;
     uint32_t count_live() const;
 
     // Raw read-only pointer to this tile's 32 bytes (scratch_ if sparse,
@@ -1627,24 +1723,24 @@ public:
 };
 
 struct Block4Store8 {
-    DeltaCSRLayout            block_layout;
-    std::vector<uint8_t>      indices_buf;
+    DeltaCSRLayout block_layout;
+    std::vector<uint8_t> indices_buf;
 
-    std::vector<uint8_t>      tile_data;
-    std::vector<std::size_t>  tile_byte_start;
-    std::vector<std::size_t>  tile_byte_end;
-    std::vector<uint8_t>      tile_is_sparse;
+    std::vector<uint8_t> tile_data;
+    std::vector<std::size_t> tile_byte_start;
+    std::vector<std::size_t> tile_byte_end;
+    std::vector<uint8_t> tile_is_sparse;
 
     // Default BLOCK4_SPARSE_MAX_COUNT8 (12, the exact 12*20+8=248<=256
     // arithmetic -- see block4_sparse_packed_len8's own comment).
     uint32_t switch_point = BLOCK4_SPARSE_MAX_COUNT8;
 
     std::size_t max_indices_bytes = std::numeric_limits<std::size_t>::max();
-    std::size_t max_tile_bytes    = std::numeric_limits<std::size_t>::max();
+    std::size_t max_tile_bytes = std::numeric_limits<std::size_t>::max();
 
     void set_limits(std::size_t indices_limit_bytes, std::size_t tile_limit_bytes) {
         max_indices_bytes = indices_limit_bytes;
-        max_tile_bytes    = tile_limit_bytes;
+        max_tile_bytes = tile_limit_bytes;
         // See Block4Store::set_limits's identical comment -- no
         // try/catch here (previously silently swallowed), same reason.
         if (tile_limit_bytes != std::numeric_limits<std::size_t>::max()) {
@@ -1660,10 +1756,10 @@ struct Block4Store8 {
     std::uint64_t row_merge_overflow_events = 0;
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
-    std::vector<uint32_t>    scratch_tile_br, scratch_tile_bc;
+    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
     std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
-    std::vector<uint32_t>    scratch_row_live_count;
-    std::vector<double>      scratch_row_grad;
+    std::vector<uint32_t> scratch_row_live_count;
+    std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
 
     void init(std::size_t n_in, std::size_t n_out) {
@@ -1691,7 +1787,8 @@ struct Block4Store8 {
     }
 
     std::size_t raw_find(uint32_t br, uint32_t bc, std::size_t* out_elem_pos = nullptr) const {
-        if (br >= block_layout.rows) return std::numeric_limits<std::size_t>::max();
+        if (br >= block_layout.rows)
+            return std::numeric_limits<std::size_t>::max();
         auto cur = row_cursor(br);
         const std::size_t n = block_layout.row_nnz(br);
         std::size_t elem_pos = block_layout.elem_start[br];
@@ -1699,10 +1796,12 @@ struct Block4Store8 {
         for (std::size_t e = 0; e < n; ++e, ++elem_pos) {
             const uint32_t col = cur.advance();
             if (col == bc) {
-                if (out_elem_pos) *out_elem_pos = elem_pos;
+                if (out_elem_pos)
+                    *out_elem_pos = elem_pos;
                 return byte_pos;
             }
-            if (col > bc) break;
+            if (col > bc)
+                break;
             byte_pos += tile_len_at(elem_pos, byte_pos);
         }
         return std::numeric_limits<std::size_t>::max();
@@ -1710,8 +1809,8 @@ struct Block4Store8 {
 
     bool is_sparse(uint32_t br, uint32_t bc) const {
         std::size_t elem_pos = 0;
-        return raw_find(br, bc, &elem_pos) != std::numeric_limits<std::size_t>::max()
-            && bool(tile_is_sparse[elem_pos]);
+        return raw_find(br, bc, &elem_pos) != std::numeric_limits<std::size_t>::max() &&
+               bool(tile_is_sparse[elem_pos]);
     }
 
     Block4TileHandle8 find(uint32_t br, uint32_t bc) { return Block4TileHandle8(*this, br, bc); }
@@ -1719,25 +1818,29 @@ struct Block4Store8 {
         return const_cast<Block4Store8*>(this)->find(br, bc);
     }
 
-    Block4TileHandle8 at_index(uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos) {
+    Block4TileHandle8 at_index(uint32_t br, uint32_t bc, std::size_t elem_pos,
+                               std::size_t byte_pos) {
         return Block4TileHandle8(*this, br, bc, elem_pos, byte_pos);
     }
-    Block4TileHandle8 at_index(uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos) const {
+    Block4TileHandle8 at_index(uint32_t br, uint32_t bc, std::size_t elem_pos,
+                               std::size_t byte_pos) const {
         return const_cast<Block4Store8*>(this)->at_index(br, bc, elem_pos, byte_pos);
     }
 
     Block4TileHandle8 get_or_create(uint32_t br, uint32_t bc) {
         if (raw_find(br, bc) == std::numeric_limits<std::size_t>::max()) {
             if (br >= block_layout.rows)
-                throw std::out_of_range(
-                    "Block4Store8::get_or_create: block_row out of range -- "
-                    "was Block4Store8::init(n_in, n_out) called?");
+                throw std::out_of_range("Block4Store8::get_or_create: block_row out of range -- "
+                                        "was Block4Store8::init(n_in, n_out) called?");
             if (!block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                         tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8)) {
-                block4_ensure_row_headroom(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                            tile_data, tile_is_sparse, br, max_indices_bytes, max_tile_bytes);
-                const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                                        tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8);
+                                        tile_data, tile_is_sparse, br, bc,
+                                        block4_stored_tile_len8)) {
+                block4_ensure_row_headroom(block_layout, indices_buf, tile_byte_start,
+                                           tile_byte_end, tile_data, tile_is_sparse, br,
+                                           max_indices_bytes, max_tile_bytes);
+                const bool ok = block4_row_insert_tile(block_layout, indices_buf, tile_byte_start,
+                                                       tile_byte_end, tile_data, tile_is_sparse, br,
+                                                       bc, block4_stored_tile_len8);
                 (void)ok;
             }
         }
@@ -1745,43 +1848,56 @@ struct Block4Store8 {
     }
 
     void erase(uint32_t br, uint32_t bc) {
-        if (br >= block_layout.rows) return;
-        block4_row_remove_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end,
-                                tile_data, tile_is_sparse, br, bc, block4_stored_tile_len8);
+        if (br >= block_layout.rows)
+            return;
+        block4_row_remove_tile(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
+                               tile_is_sparse, br, bc, block4_stored_tile_len8);
     }
 
     void maybe_compress(uint32_t br, uint32_t bc) {
         std::size_t elem_pos = 0;
         const std::size_t byte_pos = raw_find(br, bc, &elem_pos);
-        if (byte_pos == std::numeric_limits<std::size_t>::max() || tile_is_sparse[elem_pos]) return;
+        if (byte_pos == std::numeric_limits<std::size_t>::max() || tile_is_sparse[elem_pos])
+            return;
         const uint32_t n = block4_count_live8(&tile_data[byte_pos]);
-        if (n > switch_point) return;
+        if (n > switch_point)
+            return;
         uint8_t packed[BLOCK4_TILE_SLOTS8_BYTES];
         block4_sparse_pack8(&tile_data[byte_pos], packed);
         const std::size_t new_len = block4_sparse_packed_len8(uint8_t(n));
-        block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                   br, byte_pos, BLOCK4_TILE_SLOTS8_BYTES, packed, new_len, max_tile_bytes);
+        block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data, br,
+                                  byte_pos, BLOCK4_TILE_SLOTS8_BYTES, packed, new_len,
+                                  max_tile_bytes);
         tile_is_sparse[elem_pos] = 1;
     }
 
     void equalize_step(std::size_t& current_row) {
-        if (block_layout.rows == 0) return;
+        if (block_layout.rows == 0)
+            return;
         const std::size_t row = current_row % block_layout.rows;
-        const std::size_t target_idx = block_layout.rows > 0
-            ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows : 0;
-        const std::size_t target_tile = block_layout.rows > 0
-            ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows : 0;
-        const std::size_t target_elem = block_layout.rows > 0
-            ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows : 0;
-        block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data, tile_is_sparse,
-                          row, target_idx, target_tile, target_elem, max_indices_bytes, max_tile_bytes);
+        const std::size_t target_idx =
+            block_layout.rows > 0
+                ? (block_layout.total_alloc_bytes() + block_layout.rows - 1) / block_layout.rows
+                : 0;
+        const std::size_t target_tile =
+            block_layout.rows > 0 ? (tile_data.size() + block_layout.rows - 1) / block_layout.rows
+                                  : 0;
+        const std::size_t target_elem =
+            block_layout.rows > 0
+                ? (block_layout.total_alloc_elems() + block_layout.rows - 1) / block_layout.rows
+                : 0;
+        block4_row_shift(block_layout, indices_buf, tile_byte_start, tile_byte_end, tile_data,
+                         tile_is_sparse, row, target_idx, target_tile, target_elem,
+                         max_indices_bytes, max_tile_bytes);
         current_row = (current_row + 1) % block_layout.rows;
     }
 
-    void commit_dirty_sparse_tile(uint32_t br, uint32_t bc, const uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) {
+    void commit_dirty_sparse_tile(uint32_t br, uint32_t bc,
+                                  const uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) {
         std::size_t elem_pos = 0;
         const std::size_t fresh_byte_pos = raw_find(br, bc, &elem_pos);
-        if (fresh_byte_pos == std::numeric_limits<std::size_t>::max()) return;
+        if (fresh_byte_pos == std::numeric_limits<std::size_t>::max())
+            return;
 
         const uint32_t n = block4_count_live8(scratch);
         uint8_t packed[BLOCK4_TILE_SLOTS8_BYTES];
@@ -1800,38 +1916,43 @@ struct Block4Store8 {
         // See Block4Store::commit_dirty_sparse_tile's identical fast/
         // fallback-path comment -- same fix, same reason, FP8's own
         // tile_data.
-        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len, new_len)) {
+        if (!block4_row_grow_needs_realloc(tile_data, tile_byte_start, tile_byte_end, br, cur_len,
+                                           new_len)) {
             try {
                 block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                           br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+                                          br, fresh_byte_pos, cur_len, packed, new_len,
+                                          max_tile_bytes);
                 tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
             } catch (const std::bad_alloc&) {
-                std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+                std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                    .fetch_add(1, std::memory_order_relaxed);
             }
             return;
         }
         std::atomic_ref<std::uint32_t> grow_lock(tile_data_grow_lock);
         std::uint32_t expected = 0;
         if (!grow_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
-            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                .fetch_add(1, std::memory_order_relaxed);
             return;
         }
         try {
-            block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data,
-                                       br, fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
+            block4_resize_tile_in_row(block_layout, tile_byte_start, tile_byte_end, tile_data, br,
+                                      fresh_byte_pos, cur_len, packed, new_len, max_tile_bytes);
             tile_is_sparse[elem_pos] = now_sparse ? 1 : 0;
         } catch (const std::bad_alloc&) {
-            std::atomic_ref<std::uint64_t>(dropped_growth_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(dropped_growth_events)
+                .fetch_add(1, std::memory_order_relaxed);
         }
         grow_lock.store(0, std::memory_order_release);
     }
 
     struct RowWorkspace {
-        std::vector<uint8_t>  bytes;
-        std::vector<uint8_t>  is_sparse;
+        std::vector<uint8_t> bytes;
+        std::vector<uint8_t> is_sparse;
         std::vector<uint32_t> bc;
         std::size_t elem_start = 0;
-        std::size_t row_nnz    = 0;
+        std::size_t row_nnz = 0;
         DeltaCSRLayout local_L;
         std::vector<std::size_t> local_tbyte_start;
         std::vector<std::size_t> local_tbyte_end;
@@ -1839,21 +1960,22 @@ struct Block4Store8 {
 
     RowWorkspace snapshot_row(std::size_t br) const {
         RowWorkspace ws;
-        ws.row_nnz    = block_layout.row_nnz(br);
+        ws.row_nnz = block_layout.row_nnz(br);
         ws.elem_start = block_layout.elem_start[br];
         const std::size_t used = tile_byte_end[br] - tile_byte_start[br];
         ws.bytes.assign(tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]),
-                         tile_data.begin() + std::ptrdiff_t(tile_byte_end[br]));
+                        tile_data.begin() + std::ptrdiff_t(tile_byte_end[br]));
         ws.is_sparse.assign(tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start),
-                             tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start + ws.row_nnz));
+                            tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start + ws.row_nnz));
         ws.bc.resize(ws.row_nnz);
         {
             auto cur = row_cursor(br);
-            for (std::size_t e = 0; e < ws.row_nnz; ++e) ws.bc[e] = cur.advance();
+            for (std::size_t e = 0; e < ws.row_nnz; ++e)
+                ws.bc[e] = cur.advance();
         }
-        ws.local_L.rows      = 1;
+        ws.local_L.rows = 1;
         ws.local_tbyte_start = {0, used};
-        ws.local_tbyte_end   = {used};
+        ws.local_tbyte_end = {used};
         return ws;
     }
 
@@ -1864,9 +1986,8 @@ struct Block4Store8 {
         return pos;
     }
 
-    void commit_dirty_tile_in_workspace(RowWorkspace& ws, std::size_t e,
-                                         std::size_t local_byte_pos,
-                                         const uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) const {
+    void commit_dirty_tile_in_workspace(RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
+                                        const uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) const {
         const uint32_t n = block4_count_live8(scratch);
         uint8_t packed[BLOCK4_TILE_SLOTS8_BYTES];
         std::size_t new_len;
@@ -1880,18 +2001,20 @@ struct Block4Store8 {
             new_len = BLOCK4_TILE_SLOTS8_BYTES;
             now_sparse = false;
         }
-        const std::size_t cur_len = block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[local_byte_pos]);
-        block4_resize_tile_in_row(ws.local_L, ws.local_tbyte_start, ws.local_tbyte_end, ws.bytes,
-                                   0, local_byte_pos, cur_len, packed, new_len,
-                                   std::numeric_limits<std::size_t>::max());
+        const std::size_t cur_len =
+            block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[local_byte_pos]);
+        block4_resize_tile_in_row(ws.local_L, ws.local_tbyte_start, ws.local_tbyte_end, ws.bytes, 0,
+                                  local_byte_pos, cur_len, packed, new_len,
+                                  std::numeric_limits<std::size_t>::max());
         ws.is_sparse[e] = now_sparse ? 1 : 0;
     }
 
-    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e,
-                                std::size_t local_byte_pos,
-                                uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) const {
-        if (ws.is_sparse[e]) block4_sparse_unpack8(&ws.bytes[local_byte_pos], scratch);
-        else std::memcpy(scratch, &ws.bytes[local_byte_pos], BLOCK4_TILE_SLOTS8_BYTES);
+    void unpack_workspace_tile(const RowWorkspace& ws, std::size_t e, std::size_t local_byte_pos,
+                               uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES]) const {
+        if (ws.is_sparse[e])
+            block4_sparse_unpack8(&ws.bytes[local_byte_pos], scratch);
+        else
+            std::memcpy(scratch, &ws.bytes[local_byte_pos], BLOCK4_TILE_SLOTS8_BYTES);
     }
 
     // Writes the workspace back into the shared store. `true_importance`
@@ -1900,7 +2023,8 @@ struct Block4Store8 {
     // a whole byte per value; the caller's own lambda decodes it via
     // fp8_decode_bits(imp_code), not FP4_TABLE[imp_code & 0xF].
     template <typename TrueImportanceFn>
-    std::size_t merge_row_workspace(std::size_t br, RowWorkspace& ws, TrueImportanceFn&& true_importance) {
+    std::size_t merge_row_workspace(std::size_t br, RowWorkspace& ws,
+                                    TrueImportanceFn&& true_importance) {
         const std::size_t global_headroom = tile_byte_start[br + 1] - tile_byte_start[br];
         std::size_t evicted = 0;
         while (ws.local_tbyte_end[0] > global_headroom) {
@@ -1914,23 +2038,28 @@ struct Block4Store8 {
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                        const uint8_t w_byte   = scratch[slot];
+                        const uint8_t w_byte = scratch[slot];
                         const uint8_t imp_code = scratch[BLOCK4_TILE_SLOTS + slot];
-                        if (w_byte == 0 && imp_code == 0) continue; // not live
+                        if (w_byte == 0 && imp_code == 0)
+                            continue; // not live
                         const std::size_t row = br * BLOCK4_TILE + li;
-                        const std::size_t col = static_cast<std::size_t>(ws.bc[e]) * BLOCK4_TILE + lj;
-                        const double abs_imp = std::abs(static_cast<double>(
-                            true_importance(row, col, imp_code)));
+                        const std::size_t col =
+                            static_cast<std::size_t>(ws.bc[e]) * BLOCK4_TILE + lj;
+                        const double abs_imp =
+                            std::abs(static_cast<double>(true_importance(row, col, imp_code)));
                         if (best_abs_imp < 0.0 || abs_imp < best_abs_imp) {
                             best_abs_imp = abs_imp;
-                            best_e = e; best_local_pos = pos;
-                            best_li = li; best_lj = lj;
+                            best_e = e;
+                            best_local_pos = pos;
+                            best_li = li;
+                            best_lj = lj;
                         }
                     }
                 }
                 pos += block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[pos]);
             }
-            if (best_abs_imp < 0.0) break;
+            if (best_abs_imp < 0.0)
+                break;
             uint8_t scratch[BLOCK4_TILE_SLOTS8_BYTES];
             unpack_workspace_tile(ws, best_e, best_local_pos, scratch);
             const uint32_t best_slot = Block4Tile8::slot_index(best_li, best_lj);
@@ -1945,22 +2074,25 @@ struct Block4Store8 {
         // within global_headroom instead of writing back unconditionally.
         std::size_t fit_pos = 0, fit_tiles = 0;
         for (std::size_t e = 0; e < ws.row_nnz; ++e) {
-            if (fit_pos >= ws.bytes.size()) break;
+            if (fit_pos >= ws.bytes.size())
+                break;
             const std::size_t tlen = block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[fit_pos]);
-            if (fit_pos + tlen > global_headroom) break;
+            if (fit_pos + tlen > global_headroom)
+                break;
             fit_pos += tlen;
             ++fit_tiles;
         }
         if (fit_tiles < ws.row_nnz) {
-            std::atomic_ref<std::uint64_t>(row_merge_overflow_events).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<std::uint64_t>(row_merge_overflow_events)
+                .fetch_add(1, std::memory_order_relaxed);
             std::atomic_ref<std::uint64_t>(row_merge_overflow_bytes_dropped)
                 .fetch_add(ws.local_tbyte_end[0] - fit_pos, std::memory_order_relaxed);
         }
         std::copy(ws.bytes.begin(), ws.bytes.begin() + std::ptrdiff_t(fit_pos),
-                   tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
+                  tile_data.begin() + std::ptrdiff_t(tile_byte_start[br]));
         tile_byte_end[br] = tile_byte_start[br] + fit_pos;
         std::copy(ws.is_sparse.begin(), ws.is_sparse.begin() + std::ptrdiff_t(fit_tiles),
-                   tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
+                  tile_is_sparse.begin() + std::ptrdiff_t(ws.elem_start));
         return evicted;
     }
 
@@ -1969,7 +2101,8 @@ struct Block4Store8 {
     std::size_t total_tile_alloc_bytes() const { return tile_data.size(); }
     std::size_t total_tile_used_bytes() const {
         std::size_t n = 0;
-        for (std::size_t r = 0; r < block_layout.rows; ++r) n += tile_byte_end[r] - tile_byte_start[r];
+        for (std::size_t r = 0; r < block_layout.rows; ++r)
+            n += tile_byte_end[r] - tile_byte_start[r];
         return n;
     }
 
@@ -1977,7 +2110,7 @@ struct Block4Store8 {
         std::size_t n = 0;
         for (std::size_t r = 0; r < block_layout.rows; ++r) {
             const std::size_t start = block_layout.elem_start[r];
-            const std::size_t end   = block_layout.elem_end[r];
+            const std::size_t end = block_layout.elem_end[r];
             std::size_t byte_pos = tile_byte_start[r];
             for (std::size_t i = start; i < end; ++i) {
                 if (tile_is_sparse[i]) {
@@ -1995,28 +2128,33 @@ struct Block4Store8 {
 };
 
 inline Block4TileHandle8::Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc)
-    : store_(&store), br_(br), bc_(bc)
-{
+    : store_(&store), br_(br), bc_(bc) {
     const std::size_t bp = store_->raw_find(br_, bc_);
-    if (bp == std::numeric_limits<std::size_t>::max()) { valid_ = false; return; }
+    if (bp == std::numeric_limits<std::size_t>::max()) {
+        valid_ = false;
+        return;
+    }
     valid_ = true;
     byte_pos_ = bp;
     std::size_t elem_pos = 0;
     store_->raw_find(br_, bc_, &elem_pos);
     was_sparse_ = bool(store_->tile_is_sparse[elem_pos]);
-    if (was_sparse_) block4_sparse_unpack8(&store_->tile_data[byte_pos_], scratch_);
+    if (was_sparse_)
+        block4_sparse_unpack8(&store_->tile_data[byte_pos_], scratch_);
 }
 
-inline Block4TileHandle8::Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos)
-    : store_(&store), br_(br), bc_(bc), byte_pos_(byte_pos)
-{
+inline Block4TileHandle8::Block4TileHandle8(Block4Store8& store, uint32_t br, uint32_t bc,
+                                            std::size_t elem_pos, std::size_t byte_pos)
+    : store_(&store), br_(br), bc_(bc), byte_pos_(byte_pos) {
     valid_ = true;
     was_sparse_ = bool(store_->tile_is_sparse[elem_pos]);
-    if (was_sparse_) block4_sparse_unpack8(&store_->tile_data[byte_pos_], scratch_);
+    if (was_sparse_)
+        block4_sparse_unpack8(&store_->tile_data[byte_pos_], scratch_);
 }
 
 inline Block4TileHandle8::~Block4TileHandle8() {
-    if (!dirty_ || !valid_ || !was_sparse_) return;
+    if (!dirty_ || !valid_ || !was_sparse_)
+        return;
     store_->commit_dirty_sparse_tile(br_, bc_, scratch_);
 }
 
@@ -2039,39 +2177,45 @@ inline uint8_t Block4TileHandle8::at_importance(uint32_t li, uint32_t lj) const 
     return was_sparse_ ? scratch_[slot] : store_->tile_data[byte_pos_ + slot];
 }
 inline uint32_t Block4TileHandle8::count_live() const {
-    return was_sparse_ ? block4_count_live8(scratch_) : block4_count_live8(&store_->tile_data[byte_pos_]);
+    return was_sparse_ ? block4_count_live8(scratch_)
+                       : block4_count_live8(&store_->tile_data[byte_pos_]);
 }
 inline const uint8_t* Block4TileHandle8::raw_data() const {
     return was_sparse_ ? scratch_ : &store_->tile_data[byte_pos_];
 }
 
 inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc)
-    : store_(&store), br_(br), bc_(bc)
-{
+    : store_(&store), br_(br), bc_(bc) {
     const std::size_t bp = store_->raw_find(br_, bc_);
-    if (bp == std::numeric_limits<std::size_t>::max()) { valid_ = false; return; }
+    if (bp == std::numeric_limits<std::size_t>::max()) {
+        valid_ = false;
+        return;
+    }
     valid_ = true;
     byte_pos_ = bp;
     std::size_t elem_pos = 0;
     store_->raw_find(br_, bc_, &elem_pos);
     was_sparse_ = bool(store_->tile_is_sparse[elem_pos]);
-    if (was_sparse_) block4_sparse_unpack(&store_->tile_data[byte_pos_], scratch_);
+    if (was_sparse_)
+        block4_sparse_unpack(&store_->tile_data[byte_pos_], scratch_);
 }
 
-inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc, std::size_t elem_pos, std::size_t byte_pos)
-    : store_(&store), br_(br), bc_(bc), byte_pos_(byte_pos)
-{
+inline Block4TileHandle::Block4TileHandle(Block4Store& store, uint32_t br, uint32_t bc,
+                                          std::size_t elem_pos, std::size_t byte_pos)
+    : store_(&store), br_(br), bc_(bc), byte_pos_(byte_pos) {
     valid_ = true;
     was_sparse_ = bool(store_->tile_is_sparse[elem_pos]);
-    if (was_sparse_) block4_sparse_unpack(&store_->tile_data[byte_pos_], scratch_);
+    if (was_sparse_)
+        block4_sparse_unpack(&store_->tile_data[byte_pos_], scratch_);
 }
 
-// Not noexcept: a dirty sparse tile that grew past switch_point 
+// Not noexcept: a dirty sparse tile that grew past switch_point
 // can throw std::bad_alloc under budget exhaustion
 //
-// No try/catch: it slows the code path down and every dense tile 
+// No try/catch: it slows the code path down and every dense tile
 // touched by disldo_backward destructs through this function.
 inline Block4TileHandle::~Block4TileHandle() {
-    if (!dirty_ || !valid_ || !was_sparse_) return;
+    if (!dirty_ || !valid_ || !was_sparse_)
+        return;
     store_->commit_dirty_sparse_tile(br_, bc_, scratch_);
 }

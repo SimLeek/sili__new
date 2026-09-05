@@ -37,9 +37,11 @@ Stars, because they're sparse like COOs:
 *The main functions provided by this file include:
 * merge_sort_coo - Sorting COO format data using merge sort
 *  Use this for sorting synapses before adding them to sorted sparse layers
-* parallel_merge_sorted_coos - Merging two sorted COO matrices into a single sorted COO matrix using multi-threading
+* parallel_merge_sorted_coos - Merging two sorted COO matrices into a single sorted COO matrix using
+multi-threading
 *  Use this for merging sparse layers with new synapses and learning
-* coo_subtract_bottom_k - Removing bottom k elements based on external values and copying the result into another COO array in parallel
+* coo_subtract_bottom_k - Removing bottom k elements based on external values and copying the result
+into another COO array in parallel
 *  Use this for deleting the least important synapses to keep memory/processing within limits
 * merge_sort_coo_external - Sorting a COO matrix based on an external array using merge sort
 *
@@ -49,26 +51,27 @@ Stars, because they're sparse like COOs:
 #define __COO__HPP_
 
 /*
-* merge_sort_coo - this is effectively the coalesce operation in pytorch
-* parallel_merge_coo - for combining two COOs quickly, like stored synapses plus some additional random or sparse backprop synapses
-* coo_subtract_bottom_k - for removing the bottom k importance COO elements in order to keep the COO array under a specific size.
-*/
+ * merge_sort_coo - this is effectively the coalesce operation in pytorch
+ * parallel_merge_coo - for combining two COOs quickly, like stored synapses plus some additional
+ * random or sparse backprop synapses coo_subtract_bottom_k - for removing the bottom k importance
+ * COO elements in order to keep the COO array under a specific size.
+ */
 
 /**
-* @brief Merges two sorted subarrays in COO format, removing duplicates.
-*
-* @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
-* @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
-*
-* @param cols Pointer to the column index array.
-* @param rows Pointer to the row index array.
-* @param vals Pointer to the value array.
-* @param left Left boundary of the first subarray.
-* @param mid Midpoint separating the two subarrays.
-* @param right Right boundary of the second subarray.
-*
-* @return Number of duplicates removed during merging.
-*/
+ * @brief Merges two sorted subarrays in COO format, removing duplicates.
+ *
+ * @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
+ * @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
+ *
+ * @param cols Pointer to the column index array.
+ * @param rows Pointer to the row index array.
+ * @param vals Pointer to the value array.
+ * @param left Left boundary of the first subarray.
+ * @param mid Midpoint separating the two subarrays.
+ * @param right Right boundary of the second subarray.
+ *
+ * @return Number of duplicates removed during merging.
+ */
 #include "scan.hpp"
 #include "sparse_struct.hpp"
 #include <algorithm>
@@ -77,18 +80,15 @@ Stars, because they're sparse like COOs:
 #include <omp.h>
 #include <vector>
 
-//todo: use a c++ ide to rename this coalesce everywhere
+// todo: use a c++ ide to rename this coalesce everywhere
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS>
-std::size_t inplace_merge_coo(INDEX_ARRAYS &indices,
-                            VALUE_ARRAYS &values,
-                            std::size_t left,
-                            std::size_t mid,
-                            std::size_t right) {
+std::size_t inplace_merge_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::size_t left,
+                              std::size_t mid, std::size_t right) {
     constexpr std::size_t numValues = std::tuple_size<VALUE_ARRAYS>::value;
-    //using VALUE_TYPE = VALUE_ARRAYS::value_type;
+    // using VALUE_TYPE = VALUE_ARRAYS::value_type;
     using VALUE_TYPE = std::remove_pointer_t<decltype(values[0].get())>::value_type;
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
-    //using INDEX_TYPE = VALUE_ARRAYS::value_type;
+    // using INDEX_TYPE = VALUE_ARRAYS::value_type;
     using INDEX_TYPE = std::remove_pointer_t<decltype(values[0].get())>::value_type;
 
     INDEX_TYPE i = left;
@@ -130,7 +130,7 @@ std::size_t inplace_merge_coo(INDEX_ARRAYS &indices,
                 }
             }
             duplicates++;
-            #pragma omp atomic
+#pragma omp atomic
             right--;
         } else {
             // Rotate element from right half to left
@@ -161,28 +161,26 @@ std::size_t inplace_merge_coo(INDEX_ARRAYS &indices,
 
 /**
  *@brief Performs insertion sort on a subarray in COO format, removing duplicates.
-*
+ *
  *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
-* @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
-*
-* @param cols Pointer to the column index array.
-* @param rows Pointer to the row index array.
-* @param vals Pointer to the value array.
-* @param left Left boundary of the subarray.
-* @param right Right boundary of the subarray.
-*
-* @return Number of duplicates removed during sorting.
-*/
+ * @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
+ *
+ * @param cols Pointer to the column index array.
+ * @param rows Pointer to the row index array.
+ * @param vals Pointer to the value array.
+ * @param left Left boundary of the subarray.
+ * @param right Right boundary of the subarray.
+ *
+ * @return Number of duplicates removed during sorting.
+ */
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS>
-std::size_t insertion_sort_coo(INDEX_ARRAYS &indices,
-                            VALUE_ARRAYS &values, 
-                            std::size_t left, 
-                            std::size_t right) {
+std::size_t insertion_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::size_t left,
+                               std::size_t right) {
     constexpr std::size_t numValues = std::tuple_size<VALUE_ARRAYS>::value;
-    //using VALUE_TYPE = VALUE_ARRAYS::value_type;
+    // using VALUE_TYPE = VALUE_ARRAYS::value_type;
     using VALUE_TYPE = std::remove_pointer_t<decltype(values[0].get())>::value_type;
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
-    //using INDEX_TYPE = VALUE_ARRAYS::value_type;
+    // using INDEX_TYPE = VALUE_ARRAYS::value_type;
     using INDEX_TYPE = std::remove_pointer_t<decltype(indices[0].get())>::value_type;
 
     INDEX_TYPE duplicates = 0;
@@ -196,17 +194,16 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS &indices,
             temp_values[valIdx] = (*values[valIdx])[i];
         }
         INDEX_TYPE j = i;
-        while (j > left ) {
-            bool all_equal=true;
+        while (j > left) {
+            bool all_equal = true;
             for (std::size_t idx = 0; idx < numIndices; ++idx) {
                 if (!((*indices[idx])[j - 1] >= temp_indices[idx])) {
                     break;
-                }
-                else if((*indices[idx])[j-1]!= temp_indices[idx]){
+                } else if ((*indices[idx])[j - 1] != temp_indices[idx]) {
                     all_equal = false;
                 }
             }
-            if(all_equal){
+            if (all_equal) {
                 break;
             }
             for (std::size_t idx = 0; idx < numIndices; ++idx) {
@@ -252,40 +249,37 @@ std::size_t insertion_sort_coo(INDEX_ARRAYS &indices,
                 }
             }
             duplicates++;
-            #pragma omp atomic
+#pragma omp atomic
             right--;
-            i--;  // Adjust 'i' because the array size has decreased
+            i--; // Adjust 'i' because the array size has decreased
         }
     }
     return duplicates;
 }
 
 /**
-* @brief Recursively sorts COO format data using merge sort, removing duplicates.
-*
-* @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
- *@tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
-*
- *@param cols Pointer to the column index array.
-* @param rows Pointer to the row index array.
- *@param vals Pointer to the value array.
-* @param left Left boundary of the subarray.
- *@param right Right boundary of the subarray.
-* @param duplicates Accumulator for the total number of duplicates removed.
+ * @brief Recursively sorts COO format data using merge sort, removing duplicates.
  *
-* @return Total number of duplicates removed during sorting.
+ * @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
+ *@tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
+ *
+ *@param cols Pointer to the column index array.
+ * @param rows Pointer to the row index array.
+ *@param vals Pointer to the value array.
+ * @param left Left boundary of the subarray.
+ *@param right Right boundary of the subarray.
+ * @param duplicates Accumulator for the total number of duplicates removed.
+ *
+ * @return Total number of duplicates removed during sorting.
  */
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS>
-std::size_t recursive_merge_sort_coo(INDEX_ARRAYS &indices,
-                                   VALUE_ARRAYS &values,
-                                   std::size_t left,
-                                   std::size_t right,
-                                   std::size_t duplicates) {
+std::size_t recursive_merge_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::size_t left,
+                                     std::size_t right, std::size_t duplicates) {
     constexpr std::size_t numValues = std::tuple_size<VALUE_ARRAYS>::value;
-    //using VALUE_TYPE = VALUE_ARRAYS::value_type;
+    // using VALUE_TYPE = VALUE_ARRAYS::value_type;
     using VALUE_TYPE = std::remove_pointer_t<decltype(values[0].get())>::value_type;
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
-    //using INDEX_TYPE = VALUE_ARRAYS::value_type;
+    // using INDEX_TYPE = VALUE_ARRAYS::value_type;
     using INDEX_TYPE = std::remove_pointer_t<decltype(indices[0].get())>::value_type;
 
     if (left < right) {
@@ -296,9 +290,11 @@ std::size_t recursive_merge_sort_coo(INDEX_ARRAYS &indices,
 #pragma omp taskgroup
             {
 #pragma omp task shared(indices, values, left_duplicates) untied if (right - left >= (1 << 14))
-                left_duplicates= recursive_merge_sort_coo(indices, values, left, mid, (std::size_t)0);
+                left_duplicates =
+                    recursive_merge_sort_coo(indices, values, left, mid, (std::size_t)0);
 #pragma omp task shared(indices, values, right_duplicates) untied if (right - left >= (1 << 14))
-                right_duplicates= recursive_merge_sort_coo(indices, values, mid + 1, right, (std::size_t)0);
+                right_duplicates =
+                    recursive_merge_sort_coo(indices, values, mid + 1, right, (std::size_t)0);
 #pragma omp taskyield
             }
 
@@ -313,15 +309,16 @@ std::size_t recursive_merge_sort_coo(INDEX_ARRAYS &indices,
                         (*values[valIdx])[i - left_duplicates] = (*values[valIdx])[i + 1];
                     }
                 }
-                mid -= left_duplicates;  // Adjust mid after the shift
-                right -= left_duplicates;  // Adjust right boundary after the shift
+                mid -= left_duplicates;   // Adjust mid after the shift
+                right -= left_duplicates; // Adjust right boundary after the shift
             }
 
             if (right_duplicates > 0) {
-                right -= right_duplicates;  // Adjust right for right-side duplicates
+                right -= right_duplicates; // Adjust right for right-side duplicates
             }
 
-            duplicates += inplace_merge_coo(indices, values, left, mid, right) + left_duplicates + right_duplicates;
+            duplicates += inplace_merge_coo(indices, values, left, mid, right) + left_duplicates +
+                          right_duplicates;
         } else {
             duplicates += insertion_sort_coo(indices, values, left, right);
         }
@@ -330,50 +327,52 @@ std::size_t recursive_merge_sort_coo(INDEX_ARRAYS &indices,
 }
 
 /**
-* @brief Top-level function for sorting COO format data using merge sort.
+ * @brief Top-level function for sorting COO format data using merge sort.
  *
-* @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
-* @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
+ * @tparam SIZE_TYPE Type for indexing (e.g., unsigned int).
+ * @tparam VALUE_TYPE Type for values stored in the matrix (e.g., float, double).
  *@tparam SIZE_TYPE_2 Type for the overall size of the matrix (e.g., unsigned int).
-*
- *@param cols Pointer to the column index array.
-* @param rows Pointer to the row index array.
- *@param vals Pointer to the value array.
-* @param size Overall size of the matrix.
  *
-* @return Total number of duplicates removed during sorting.
+ *@param cols Pointer to the column index array.
+ * @param rows Pointer to the row index array.
+ *@param vals Pointer to the value array.
+ * @param size Overall size of the matrix.
+ *
+ * @return Total number of duplicates removed during sorting.
  */
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS>
-std::size_t merge_sort_coo(INDEX_ARRAYS &indices, VALUE_ARRAYS &values, std::size_t size) {
+std::size_t merge_sort_coo(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, std::size_t size) {
     int duplicates = 0;
 #pragma omp parallel
 #pragma omp single
-    duplicates+=recursive_merge_sort_coo(indices, values, 0, (std::size_t)size - 1, 0);
+    duplicates += recursive_merge_sort_coo(indices, values, 0, (std::size_t)size - 1, 0);
 
     return duplicates;
 }
 
 //-------EXTERNAL SORT---------
 
-//use these functions to sort the synapse COO by importance and then delete the least important for synaptic pruning
-// then use the above sort to coalesce for conversion to CSR
+// use these functions to sort the synapse COO by importance and then delete the least important for
+// synaptic pruning
+//  then use the above sort to coalesce for conversion to CSR
 
 /**
-*@brief Merges two sorted subarrays of a COO matrix based on an external array.
-*
-*@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
-*@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
-*@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
-*@param cols Pointer to column indices
-*@param rows Pointer to row indices
-*@param vals Pointer to values in the COO matrix
-*@param ext_vals Pointer to the external sorting array
-*@param left Left index of the first subarray
-*@param mid Middle index separating the two subarrays
-*@param right Right index of the second subarray
-*
-*This function merges two sorted subarrays within the COO matrix based on the corresponding values in the external sorting array.
-*/
+ *@brief Merges two sorted subarrays of a COO matrix based on an external array.
+ *
+ *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
+ *@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
+ *@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
+ *@param cols Pointer to column indices
+ *@param rows Pointer to row indices
+ *@param vals Pointer to values in the COO matrix
+ *@param ext_vals Pointer to the external sorting array
+ *@param left Left index of the first subarray
+ *@param mid Middle index separating the two subarrays
+ *@param right Right index of the second subarray
+ *
+ *This function merges two sorted subarrays within the COO matrix based on the corresponding values
+ * in the external sorting array.
+ */
 /*template <typename SIZE_TYPE, typename VALUE_TYPE, typename EXTERNAL_TYPE>
 SIZE_TYPE inplace_merge_coo_external(SIZE_TYPE *cols,
                             SIZE_TYPE *rows,
@@ -421,20 +420,21 @@ SIZE_TYPE inplace_merge_coo_external(SIZE_TYPE *cols,
 }*/
 
 /**
-*@brief Sorts a COO matrix based on an external array using insertion sort.
-*
-*@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
-*@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
-*@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
-*@param cols Pointer to column indices
-*@param rows Pointer to row indices
-*@param vals Pointer to values in the COO matrix
-*@param ext_vals Pointer to the external sorting array
-*@param left Left index of the subarray
-*@param right Right index of the subarray
-*
-*This function sorts a subarray within the COO matrix based on the corresponding values in the external sorting array using insertion sort.
-*/
+ *@brief Sorts a COO matrix based on an external array using insertion sort.
+ *
+ *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
+ *@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
+ *@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
+ *@param cols Pointer to column indices
+ *@param rows Pointer to row indices
+ *@param vals Pointer to values in the COO matrix
+ *@param ext_vals Pointer to the external sorting array
+ *@param left Left index of the subarray
+ *@param right Right index of the subarray
+ *
+ *This function sorts a subarray within the COO matrix based on the corresponding values in the
+ * external sorting array using insertion sort.
+ */
 /*template <typename SIZE_TYPE, typename VALUE_TYPE, typename EXTERNAL_TYPE>
 void insertion_sort_coo_external(SIZE_TYPE *cols,
                                  SIZE_TYPE *rows,
@@ -466,20 +466,21 @@ void insertion_sort_coo_external(SIZE_TYPE *cols,
 }*/
 
 /**
-*@brief Recursively sorts a COO matrix based on an external array using merge sort.
-*
-*@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
-*@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
-*@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
-*@param cols Pointer to column indices
-*@param rows Pointer to row indices
-*@param vals Pointer to values in the COO matrix
-*@param ext_vals Pointer to the external sorting array
-*@param left Left index of the subarray
-*@param right Right index of the subarray
-*
-*This function recursively sorts a subarray within the COO matrix based on the corresponding values in the external sorting array using merge sort.
-*/
+ *@brief Recursively sorts a COO matrix based on an external array using merge sort.
+ *
+ *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
+ *@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
+ *@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
+ *@param cols Pointer to column indices
+ *@param rows Pointer to row indices
+ *@param vals Pointer to values in the COO matrix
+ *@param ext_vals Pointer to the external sorting array
+ *@param left Left index of the subarray
+ *@param right Right index of the subarray
+ *
+ *This function recursively sorts a subarray within the COO matrix based on the corresponding values
+ * in the external sorting array using merge sort.
+ */
 /*template <typename SIZE_TYPE, typename VALUE_TYPE, typename EXTERNAL_TYPE>
 void recursive_merge_sort_coo_external(SIZE_TYPE *cols,
                                        SIZE_TYPE *rows,
@@ -508,31 +509,33 @@ void recursive_merge_sort_coo_external(SIZE_TYPE *cols,
 }*/
 
 /**
-*@brief Sorts a COO matrix based on an external array using merge sort.
-*
-*@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
-*@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
-*@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
-*@param cols Pointer to column indices
-*@param rows Pointer to row indices
-*@param vals Pointer to values in the COO matrix
-*@param ext_vals Pointer to the external sorting array
-*
-*This function sorts the entire COO matrix based on the corresponding values in the external sorting array using merge sort.
-*/
+ *@brief Sorts a COO matrix based on an external array using merge sort.
+ *
+ *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
+ *@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
+ *@tparam EXTERNAL_TYPE Type for values in the external sorting array (e.g., double)
+ *@param cols Pointer to column indices
+ *@param rows Pointer to row indices
+ *@param vals Pointer to values in the COO matrix
+ *@param ext_vals Pointer to the external sorting array
+ *
+ *This function sorts the entire COO matrix based on the corresponding values in the external
+ * sorting array using merge sort.
+ */
 /*template <typename SIZE_TYPE, typename VALUE_TYPE, typename EXTERNAL_TYPE>
-void merge_sort_coo_external(SIZE_TYPE *cols, SIZE_TYPE *rows, VALUE_TYPE *vals, EXTERNAL_TYPE *ext_vals, SIZE_TYPE size) {
-#pragma omp parallel
-#pragma omp single
-    recursive_merge_sort_coo(cols, rows, vals, 0, (SIZE_TYPE)size - 1, 0);
+void merge_sort_coo_external(SIZE_TYPE *cols, SIZE_TYPE *rows, VALUE_TYPE *vals, EXTERNAL_TYPE
+*ext_vals, SIZE_TYPE size) { #pragma omp parallel #pragma omp single recursive_merge_sort_coo(cols,
+rows, vals, 0, (SIZE_TYPE)size - 1, 0);
 
     return;
 }*/
 
-/*-----------------------------------------MERGE SORTED COOs-------------------------------------------*/
+/*-----------------------------------------MERGE SORTED
+ * COOs-------------------------------------------*/
 
 /**
- * @brief Performs a binary search on a COO matrix to find the appropriate position for a given index pair.
+ * @brief Performs a binary search on a COO matrix to find the appropriate position for a given
+ * index pair.
  *
  * @tparam INDEX_TYPE Type for indexing (e.g., unsigned int)
  * @tparam VALUE_TYPE Placeholder type for values (not used here)
@@ -543,8 +546,10 @@ void merge_sort_coo_external(SIZE_TYPE *cols, SIZE_TYPE *rows, VALUE_TYPE *vals,
  * @return The position where the target indices should be inserted.
  */
 template <typename INDEX_ARRAYS>
-std::size_t binary_search_coo(const INDEX_ARRAYS &indices,
-                              const std::array<std::remove_pointer_t<decltype(indices[0].get())>, std::tuple_size<INDEX_ARRAYS>::value> &target_indices,  // should this be size_t, size instead?
+std::size_t binary_search_coo(const INDEX_ARRAYS& indices,
+                              const std::array<std::remove_pointer_t<decltype(indices[0].get())>,
+                                               std::tuple_size<INDEX_ARRAYS>::value>&
+                                  target_indices, // should this be size_t, size instead?
                               std::size_t low, std::size_t high) {
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
 
@@ -574,8 +579,9 @@ std::size_t binary_search_coo(const INDEX_ARRAYS &indices,
 
 template <typename INDEX_ARRAYS>
 std::size_t binary_search_upper_bound_coo(
-    const INDEX_ARRAYS &indices,
-    const std::array<std::remove_pointer_t<decltype(indices[0].get())>, std::tuple_size<INDEX_ARRAYS>::value> &target_indices,
+    const INDEX_ARRAYS& indices,
+    const std::array<std::remove_pointer_t<decltype(indices[0].get())>,
+                     std::tuple_size<INDEX_ARRAYS>::value>& target_indices,
     std::size_t low, std::size_t high) {
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
 
@@ -598,43 +604,44 @@ std::size_t binary_search_upper_bound_coo(
         if (is_less_or_equal)
             low = mid + 1; // Proceed to the right
         else
-            high = mid;     // Move to the left
+            high = mid; // Move to the left
     }
 
     return low; // Returns the first index where element > target
 }
 
 /**
-*@brief Merges two sorted COO matrices into a single sorted COO matrix using multi-threading.
-*
-*@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
-*@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
-*@param m_rows Pointer to row indices of the first COO matrix
-*@param m_cols Pointer to column indices of the first COO matrix
-*@param m_vals Pointer to values of the first COO matrix
-*@param n_rows Pointer to row indices of the second COO matrix
-*@param n_cols Pointer to column indices of the second COO matrix
-*@param n_vals Pointer to values of the second COO matrix
-*@param c_rows Pointer to row indices of the resulting COO matrix
-*@param c_cols Pointer to column indices of the resulting COO matrix
-*@param c_vals Pointer to values of the resulting COO matrix
-*@param m_size Size of the first COO matrix
-*@param n_size Size of the second COO matrix
-*@param num_threads Number of threads to use for parallel processing
-*
-*This function merges two sorted COO matrices into a single sorted COO matrix using multi-threading.
-*/
+ *@brief Merges two sorted COO matrices into a single sorted COO matrix using multi-threading.
+ *
+ *@tparam SIZE_TYPE Type for indexing (e.g., unsigned int)
+ *@tparam VALUE_TYPE Type for values stored in the COO matrix (e.g., float)
+ *@param m_rows Pointer to row indices of the first COO matrix
+ *@param m_cols Pointer to column indices of the first COO matrix
+ *@param m_vals Pointer to values of the first COO matrix
+ *@param n_rows Pointer to row indices of the second COO matrix
+ *@param n_cols Pointer to column indices of the second COO matrix
+ *@param n_vals Pointer to values of the second COO matrix
+ *@param c_rows Pointer to row indices of the resulting COO matrix
+ *@param c_cols Pointer to column indices of the resulting COO matrix
+ *@param c_vals Pointer to values of the resulting COO matrix
+ *@param m_size Size of the first COO matrix
+ *@param n_size Size of the second COO matrix
+ *@param num_threads Number of threads to use for parallel processing
+ *
+ *This function merges two sorted COO matrices into a single sorted COO matrix using
+ * multi-threading.
+ */
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS>
-std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_values,
-                                  INDEX_ARRAYS &n_indices, VALUE_ARRAYS &n_values,
-                                  INDEX_ARRAYS &c_indices, VALUE_ARRAYS &c_values,
-                                  std::size_t m_size, std::size_t n_size, int num_threads) {
-    //todo: make a csr variant of this.
+std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS& m_indices, VALUE_ARRAYS& m_values,
+                                       INDEX_ARRAYS& n_indices, VALUE_ARRAYS& n_values,
+                                       INDEX_ARRAYS& c_indices, VALUE_ARRAYS& c_values,
+                                       std::size_t m_size, std::size_t n_size, int num_threads) {
+    // todo: make a csr variant of this.
     constexpr std::size_t numValues = std::tuple_size<VALUE_ARRAYS>::value;
-    //using VALUE_TYPE = VALUE_ARRAYS::value_type;
+    // using VALUE_TYPE = VALUE_ARRAYS::value_type;
     using VALUE_TYPE = std::remove_pointer_t<decltype(m_values[0].get())>;
     constexpr std::size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
-    //using INDEX_TYPE = VALUE_ARRAYS::value_type;
+    // using INDEX_TYPE = VALUE_ARRAYS::value_type;
     using INDEX_TYPE = std::remove_pointer_t<decltype(m_indices[0].get())>;
 
     std::vector<std::size_t> duplicates_per_thread(num_threads, 0);
@@ -642,8 +649,8 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
     std::vector<std::size_t> n_begins(num_threads, 0);
     std::vector<std::size_t> n_ends(num_threads, 0);
 
-    // Step 1: Determine chunk ranges for m and corresponding n ranges
-    #pragma omp parallel num_threads(num_threads) shared(n_begins, n_ends, duplicates_per_thread)
+// Step 1: Determine chunk ranges for m and corresponding n ranges
+#pragma omp parallel num_threads(num_threads) shared(n_begins, n_ends, duplicates_per_thread)
     {
         int thread_id = omp_get_thread_num();
         size_t chunk_size = (m_size + num_threads - 1) / num_threads; // Ceiling division
@@ -651,39 +658,98 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
         size_t m_begin = thread_id * chunk_size;
         size_t m_end = std::min(m_begin + chunk_size, m_size);
 
-        if(m_begin<m_end){
-        std::array<INDEX_TYPE, numIndices> m_begin_indices;
-        std::array<INDEX_TYPE, numIndices> m_end_indices;
-
-        for (std::size_t idx = 0; idx < numIndices; ++idx) {
-            m_begin_indices[idx] = m_indices[idx][m_begin];
-            m_end_indices[idx] = m_indices[idx][m_end - 1];
-        }
-
-        n_begins[thread_id] = binary_search_coo(n_indices, m_begin_indices, 0, n_size);
-        n_ends[thread_id] = binary_search_upper_bound_coo(n_indices, m_end_indices, 0, n_size);
-
-        size_t c_start = m_begin + n_begins[thread_id];
-
-        // Merge subarrays into c
-        size_t i = m_begin, j = n_begins[thread_id], k = c_start;
-        while (i < m_end && j < n_ends[thread_id]) {
-            bool m_lt_n = false, m_eq_n = true;
+        if (m_begin < m_end) {
+            std::array<INDEX_TYPE, numIndices> m_begin_indices;
+            std::array<INDEX_TYPE, numIndices> m_end_indices;
 
             for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                auto m_val = m_indices[idx][i];
-                auto n_val = n_indices[idx][j];
-                if (m_val < n_val) {
-                    m_lt_n = true;
-                    m_eq_n = false;
-                    break;
-                } else if (m_val > n_val) {
-                    m_eq_n = false;
-                    break;
-                }
+                m_begin_indices[idx] = m_indices[idx][m_begin];
+                m_end_indices[idx] = m_indices[idx][m_end - 1];
             }
 
-            if (m_lt_n || m_eq_n) { // todo: split out m_eq_n and have it do i++ and j++ and sum std::get<valIdx>(m_values)[i] + std::get<valIdx>(m_values)[j] for a slight speed boost
+            n_begins[thread_id] = binary_search_coo(n_indices, m_begin_indices, 0, n_size);
+            n_ends[thread_id] = binary_search_upper_bound_coo(n_indices, m_end_indices, 0, n_size);
+
+            size_t c_start = m_begin + n_begins[thread_id];
+
+            // Merge subarrays into c
+            size_t i = m_begin, j = n_begins[thread_id], k = c_start;
+            while (i < m_end && j < n_ends[thread_id]) {
+                bool m_lt_n = false, m_eq_n = true;
+
+                for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                    auto m_val = m_indices[idx][i];
+                    auto n_val = n_indices[idx][j];
+                    if (m_val < n_val) {
+                        m_lt_n = true;
+                        m_eq_n = false;
+                        break;
+                    } else if (m_val > n_val) {
+                        m_eq_n = false;
+                        break;
+                    }
+                }
+
+                if (m_lt_n || m_eq_n) { // todo: split out m_eq_n and have it do i++ and j++ and sum
+                                        // std::get<valIdx>(m_values)[i] +
+                                        // std::get<valIdx>(m_values)[j] for a slight speed boost
+                    bool is_duplicate = false;
+                    if (k > 0) {
+                        is_duplicate = true;
+                        for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                            if (c_indices[idx][k - 1] != m_indices[idx][i]) {
+                                is_duplicate = false;
+                                break;
+                            }
+                        }
+
+                        if (is_duplicate) {
+                            for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
+                                c_values[valIdx][k - 1] += m_values[valIdx][i];
+                            }
+                            duplicates_per_thread[thread_id]++;
+                        }
+                    }
+                    if (!is_duplicate) {
+                        for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                            c_indices[idx][k] = m_indices[idx][i];
+                        }
+                        for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
+                            c_values[valIdx][k] = m_values[valIdx][i];
+                        }
+                        k++;
+                    }
+                    i++;
+                } else {
+                    bool is_duplicate = false;
+                    if (k > 0) {
+                        is_duplicate = true;
+                        for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                            if (c_indices[idx][k - 1] != n_indices[idx][j]) {
+                                is_duplicate = false;
+                                break;
+                            }
+                        }
+                        if (is_duplicate) {
+                            for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
+                                c_values[valIdx][k - 1] += n_values[valIdx][j];
+                            }
+                            duplicates_per_thread[thread_id]++;
+                        }
+                    }
+                    if (!is_duplicate) {
+                        for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                            c_indices[idx][k] = n_indices[idx][j];
+                        }
+                        for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
+                            c_values[valIdx][k] = n_values[valIdx][j];
+                        }
+                        k++;
+                    }
+                    j++;
+                }
+            }
+            while (i < m_end) {
                 bool is_duplicate = false;
                 if (k > 0) {
                     is_duplicate = true;
@@ -693,7 +759,6 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
                             break;
                         }
                     }
-                    
                     if (is_duplicate) {
                         for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
                             c_values[valIdx][k - 1] += m_values[valIdx][i];
@@ -701,7 +766,7 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
                         duplicates_per_thread[thread_id]++;
                     }
                 }
-                if(!is_duplicate){
+                if (!is_duplicate) {
                     for (std::size_t idx = 0; idx < numIndices; ++idx) {
                         c_indices[idx][k] = m_indices[idx][i];
                     }
@@ -711,7 +776,8 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
                     k++;
                 }
                 i++;
-            } else {
+            }
+            while (j < n_ends[thread_id]) {
                 bool is_duplicate = false;
                 if (k > 0) {
                     is_duplicate = true;
@@ -727,89 +793,33 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
                         }
                         duplicates_per_thread[thread_id]++;
                     }
-                } if(!is_duplicate) {
-                        for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                            c_indices[idx][k] = n_indices[idx][j];
-                        }
-                        for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
-                            c_values[valIdx][k] = n_values[valIdx][j];
-                        }
-                        k++;
-                    }
-                    j++;
                 }
-            }
-        while (i < m_end) {
-            bool is_duplicate = false;
-            if (k > 0) {
-                is_duplicate = true;
-                for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                    if (c_indices[idx][k - 1] != m_indices[idx][i]) {
-                        is_duplicate = false;
-                        break;
+                if (!is_duplicate) {
+                    for (std::size_t idx = 0; idx < numIndices; ++idx) {
+                        c_indices[idx][k] = n_indices[idx][j];
                     }
-                }
-                if (is_duplicate) {
                     for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
-                        c_values[valIdx][k - 1] += m_values[valIdx][i];
+                        c_values[valIdx][k] = n_values[valIdx][j];
                     }
-                    duplicates_per_thread[thread_id]++;
+                    k++;
                 }
+                j++;
             }
-            if(!is_duplicate){
-                for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                    c_indices[idx][k] = m_indices[idx][i];
-                }
-                for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
-                    c_values[valIdx][k] = m_values[valIdx][i];
-                }
-                k++;
-            }
-            i++;
-        }
-        while (j < n_ends[thread_id]) {
-            bool is_duplicate = false;
-            if (k > 0) {
-                is_duplicate = true;
-                for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                    if (c_indices[idx][k - 1] != n_indices[idx][j]) {
-                        is_duplicate = false;
-                        break;
-                    }
-                }
-                if (is_duplicate) {
-                    for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
-                        c_values[valIdx][k - 1] += n_values[valIdx][j];
-                    }
-                    duplicates_per_thread[thread_id]++;
-                }
-            } 
-            if(!is_duplicate) {
-                for (std::size_t idx = 0; idx < numIndices; ++idx) {
-                    c_indices[idx][k] = n_indices[idx][j];
-                }
-                for (std::size_t valIdx = 0; valIdx < numValues; ++valIdx) {
-                    c_values[valIdx][k] = n_values[valIdx][j];
-                }
-                k++;
-            }
-            j++;
-        }
         }
     }
 
     // step 1.5: scan the duplicates
-    std::vector<std::size_t> scanned_duplicates(num_threads+1, 0);
+    std::vector<std::size_t> scanned_duplicates(num_threads + 1, 0);
     fullScanValues(duplicates_per_thread, scanned_duplicates);
 
-    // step 1.6: shift the chunks
-    #pragma omp parallel num_threads(num_threads) shared(scanned_duplicates)
+// step 1.6: shift the chunks
+#pragma omp parallel num_threads(num_threads) shared(scanned_duplicates)
     {
         int thread_id = omp_get_thread_num();
         size_t chunk_size = (m_size + num_threads - 1) / num_threads;
         size_t m_begin = thread_id * chunk_size;
         size_t m_end = std::min(m_begin + chunk_size, m_size);
-        if(m_begin<m_end){
+        if (m_begin < m_end) {
             size_t c_end = n_ends[thread_id] + m_end;
             size_t c_begin = n_begins[thread_id] + m_begin;
 
@@ -827,8 +837,8 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
         }
     }
 
-    // Step 2: Copy remaining elements from n to c
-    #pragma omp parallel num_threads(num_threads) shared(scanned_duplicates)
+// Step 2: Copy remaining elements from n to c
+#pragma omp parallel num_threads(num_threads) shared(scanned_duplicates)
     {
         int thread_id = omp_get_thread_num();
         size_t chunk_size = (n_begins[0] + num_threads - 1) / num_threads;
@@ -844,16 +854,19 @@ std::size_t parallel_merge_sorted_coos(INDEX_ARRAYS &m_indices, VALUE_ARRAYS &m_
             }
         }
 
-        size_t final_end = n_ends[std::min((size_t)num_threads-1, std::min(n_size-1, m_size-1))];
+        size_t final_end =
+            n_ends[std::min((size_t)num_threads - 1, std::min(n_size - 1, m_size - 1))];
 
         chunk_size = (n_size - final_end + num_threads - 1) / num_threads;
-        size_t c_start = m_size - scanned_duplicates[num_threads] + final_end + thread_id * chunk_size;
-        size_t c_end = std::min(c_start + chunk_size, m_size + n_size - scanned_duplicates[num_threads]);
+        size_t c_start =
+            m_size - scanned_duplicates[num_threads] + final_end + thread_id * chunk_size;
+        size_t c_end =
+            std::min(c_start + chunk_size, m_size + n_size - scanned_duplicates[num_threads]);
         size_t n_start = final_end + thread_id * chunk_size;
-        size_t n_end = std::min(n_start + chunk_size,  n_size);
+        size_t n_end = std::min(n_start + chunk_size, n_size);
 
-        if(n_end > n_start){  // this prevents segfaults from unsigned types
-            for (size_t idx = 0; idx < n_end-n_start; ++idx) {
+        if (n_end > n_start) { // this prevents segfaults from unsigned types
+            for (size_t idx = 0; idx < n_end - n_start; ++idx) {
                 size_t n_idx = idx + n_start;
                 size_t c_idx = idx + c_start;
                 for (std::size_t j = 0; j < numIndices; ++j) {
@@ -904,30 +917,31 @@ int main() {
 }
 */
 
-/*------------------------SUBTRACT BOTTOM K FROM COOs (external importance array)----------------------------------*/
+/*------------------------SUBTRACT BOTTOM K FROM COOs (external importance
+ * array)----------------------------------*/
 
 /**
-*@brief Finds the bottom-k indices of an array in parallel.
-*
-*@tparam VALUE_TYPE Type for values stored in the array (e.g., float)
-*@param values Pointer to the array of external values
-*@param size The size of the input array
-*@param k The number of smallest elements to find
-*@param num_threads Number of threads to use for parallel processing
-*
-*This function finds the bottom-k indices of an array in parallel.
-*/
+ *@brief Finds the bottom-k indices of an array in parallel.
+ *
+ *@tparam VALUE_TYPE Type for values stored in the array (e.g., float)
+ *@param values Pointer to the array of external values
+ *@param size The size of the input array
+ *@param k The number of smallest elements to find
+ *@param num_threads Number of threads to use for parallel processing
+ *
+ *This function finds the bottom-k indices of an array in parallel.
+ */
 template <typename VALUE_TYPE>
-std::vector<size_t> bottom_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {    
+std::vector<size_t> bottom_k_indices(VALUE_TYPE* values, size_t size, size_t k, int num_threads) {
     // Each thread processes a chunk of the array
     size_t chunk_size = (size + num_threads - 1) / num_threads;
     std::vector<std::vector<size_t>> thread_indices(num_threads);
 
-    if(k>size){
-        k=size;
+    if (k > size) {
+        k = size;
     }
 
-    #pragma omp parallel num_threads(num_threads)
+#pragma omp parallel num_threads(num_threads)
     {
         int thread_id = omp_get_thread_num();
         size_t start = thread_id * chunk_size;
@@ -940,8 +954,9 @@ std::vector<size_t> bottom_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
         }
 
         // Sort local indices by values
-        std::partial_sort(local_indices.begin(), local_indices.begin() + std::min(k, local_indices.size()), local_indices.end(),
-                          [&values](size_t a, size_t b) { return values[a] < values[b]; });
+        std::partial_sort(
+            local_indices.begin(), local_indices.begin() + std::min(k, local_indices.size()),
+            local_indices.end(), [&values](size_t a, size_t b) { return values[a] < values[b]; });
 
         // Keep only the smallest k elements
         if (local_indices.size() > k) {
@@ -953,7 +968,7 @@ std::vector<size_t> bottom_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
 
     // Merge results from all threads
     std::vector<size_t> merged_indices;
-    for (const auto &indices : thread_indices) {
+    for (const auto& indices : thread_indices) {
         merged_indices.insert(merged_indices.end(), indices.begin(), indices.end());
     }
 
@@ -966,11 +981,13 @@ std::vector<size_t> bottom_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
 }
 
 /**
- * @brief Removes bottom k elements based on specified values and copies the result into another COO array in parallel.
+ * @brief Removes bottom k elements based on specified values and copies the result into another COO
+ * array in parallel.
  *
  * @tparam INDEX_ARRAYS Tuple type containing index arrays
  * @tparam VALUE_ARRAYS Tuple type containing value arrays
- * @tparam VALUE_INDEX Index of the value array to use for finding bottom-k (default: -1, uses the last value array)
+ * @tparam VALUE_INDEX Index of the value array to use for finding bottom-k (default: -1, uses the
+ * last value array)
  * @param indices Tuple containing input column and row indices arrays
  * @param values Tuple containing input value arrays
  * @param c_indices Tuple containing output column and row indices arrays
@@ -980,10 +997,9 @@ std::vector<size_t> bottom_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
  * @param num_threads Number of threads to use for parallel processing
  */
 template <typename INDEX_ARRAYS, typename VALUE_ARRAYS, int VALUE_INDEX = -1>
-void coo_subtract_bottom_k(INDEX_ARRAYS &indices, VALUE_ARRAYS &values,
-                           INDEX_ARRAYS &c_indices, VALUE_ARRAYS &c_values,
-                           size_t size, size_t k, int num_threads) {
-    //todo: make a csr variant of this.
+void coo_subtract_bottom_k(INDEX_ARRAYS& indices, VALUE_ARRAYS& values, INDEX_ARRAYS& c_indices,
+                           VALUE_ARRAYS& c_values, size_t size, size_t k, int num_threads) {
+    // todo: make a csr variant of this.
 
     constexpr size_t numIndices = std::tuple_size<INDEX_ARRAYS>::value;
     constexpr size_t numValues = std::tuple_size<VALUE_ARRAYS>::value;
@@ -992,26 +1008,29 @@ void coo_subtract_bottom_k(INDEX_ARRAYS &indices, VALUE_ARRAYS &values,
 
     // Determine the array to base the bottom-k selection on
     constexpr int selectedIndex = (VALUE_INDEX == -1) ? (numValues - 1) : VALUE_INDEX;
-    static_assert(selectedIndex >= 0 && selectedIndex < numValues, "Invalid VALUE_INDEX specified.");
+    static_assert(selectedIndex >= 0 && selectedIndex < numValues,
+                  "Invalid VALUE_INDEX specified.");
 
     // Select the array for bottom-k computation
-    auto &selected_values = values[selectedIndex];
+    auto& selected_values = values[selectedIndex];
 
     // Step 1: Find bottom-k indices in parallel
-    std::vector<size_t> bottom_k_vec = bottom_k_indices(selected_values.get(), size, k, num_threads);
+    std::vector<size_t> bottom_k_vec =
+        bottom_k_indices(selected_values.get(), size, k, num_threads);
 
-    // Step 2: Copy COO elements to the output array, skipping bottom-k
-    #pragma omp parallel for num_threads(num_threads)
+// Step 2: Copy COO elements to the output array, skipping bottom-k
+#pragma omp parallel for num_threads(num_threads)
     for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
         size_t start = thread_id * (size / num_threads);
         size_t end = (thread_id == num_threads - 1) ? size : (thread_id + 1) * (size / num_threads);
 
-        size_t bottom_k_index = std::lower_bound(bottom_k_vec.begin(), bottom_k_vec.end(), start) - bottom_k_vec.begin();
+        size_t bottom_k_index = std::lower_bound(bottom_k_vec.begin(), bottom_k_vec.end(), start) -
+                                bottom_k_vec.begin();
 
         size_t c_index = start - bottom_k_index;
         for (size_t i = start; i < end; ++i) {
             if (bottom_k_index < bottom_k_vec.size() && bottom_k_vec[bottom_k_index] == i) {
-                ++bottom_k_index;  // Skip this index
+                ++bottom_k_index; // Skip this index
             } else {
                 // Copy indices to output COO
                 for (size_t idx = 0; idx < numIndices; ++idx) {
@@ -1047,27 +1066,29 @@ void coo_subtract_bottom_k(INDEX_ARRAYS &indices, VALUE_ARRAYS &values,
     float c_ext_vals[size - k];
 
     // Call the function
-    coo_subtract_bottom_k(cols, rows, vals, ext_vals, c_cols, c_rows, c_vals, c_ext_vals, size, k, num_threads);
+    coo_subtract_bottom_k(cols, rows, vals, ext_vals, c_cols, c_rows, c_vals, c_ext_vals, size, k,
+num_threads);
 
     // Output results
     for (size_t i = 0; i < size - k; ++i) {
-        printf("Row: %zu, Col: %zu, Val: %.2f, Ext Val: %.2f\n", c_rows[i], c_cols[i], c_vals[i], c_ext_vals[i]);
+        printf("Row: %zu, Col: %zu, Val: %.2f, Ext Val: %.2f\n", c_rows[i], c_cols[i], c_vals[i],
+c_ext_vals[i]);
     }
 
     return 0;
 }*/
 
 template <typename VALUE_TYPE>
-std::vector<size_t> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {    
+std::vector<size_t> top_k_indices(VALUE_TYPE* values, size_t size, size_t k, int num_threads) {
     // Each thread processes a chunk of the array
     size_t chunk_size = (size + num_threads - 1) / num_threads;
     std::vector<std::vector<size_t>> thread_indices(num_threads);
 
-    if(k>size){
-        k=size;
+    if (k > size) {
+        k = size;
     }
 
-    #pragma omp parallel num_threads(num_threads)
+#pragma omp parallel num_threads(num_threads)
     {
         int thread_id = omp_get_thread_num();
         size_t start = thread_id * chunk_size;
@@ -1080,8 +1101,9 @@ std::vector<size_t> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int
         }
 
         // Sort local indices by values
-        std::partial_sort(local_indices.begin(), local_indices.begin() + std::min(k, local_indices.size()), local_indices.end(),
-                          [&values](size_t a, size_t b) { return values[a] > values[b]; });
+        std::partial_sort(
+            local_indices.begin(), local_indices.begin() + std::min(k, local_indices.size()),
+            local_indices.end(), [&values](size_t a, size_t b) { return values[a] > values[b]; });
 
         // Keep only the smallest k elements
         if (local_indices.size() > k) {
@@ -1093,7 +1115,7 @@ std::vector<size_t> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int
 
     // Merge results from all threads
     std::vector<size_t> merged_indices;
-    for (const auto &indices : thread_indices) {
+    for (const auto& indices : thread_indices) {
         merged_indices.insert(merged_indices.end(), indices.begin(), indices.end());
     }
 
@@ -1107,7 +1129,7 @@ std::vector<size_t> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int
 
 template <class SIZE_TYPE, class VALUE_TYPE>
 sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
-top_k_coo(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_threads) {
+top_k_coo(VALUE_TYPE* values, size_t rows, size_t cols, size_t k, int num_threads) {
     // Step 1: Get the top-k indices
     std::vector<size_t> top_k = top_k_indices(values, rows * cols, k, num_threads);
 
@@ -1116,8 +1138,8 @@ top_k_coo(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
     std::unique_ptr<SIZE_TYPE[]> col_indices(new SIZE_TYPE[k]);
     std::unique_ptr<VALUE_TYPE[]> top_values(new VALUE_TYPE[k]);
 
-    // Step 3: Convert flat indices to row/column indices in parallel
-    #pragma omp parallel for num_threads(num_threads)
+// Step 3: Convert flat indices to row/column indices in parallel
+#pragma omp parallel for num_threads(num_threads)
     for (size_t i = 0; i < k; ++i) {
         size_t flat_idx = top_k[i];
         row_indices[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
@@ -1127,20 +1149,13 @@ top_k_coo(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
 
     // Step 4: Create the COO sparse struct
     COOPointers<SIZE_TYPE> ptrs = k; // Store nnz directly
-    COOIndices<SIZE_TYPE> indices{
-        std::move(row_indices),
-        std::move(col_indices)
-    };
-    UnaryValues<VALUE_TYPE> coo_values{
-        std::move(top_values)
-    };
+    COOIndices<SIZE_TYPE> indices{std::move(row_indices), std::move(col_indices)};
+    UnaryValues<VALUE_TYPE> coo_values{std::move(top_values)};
 
-    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>> coo_result(
-        ptrs, indices, coo_values, rows, cols, k);
+    sparse_struct<SIZE_TYPE, COOPointers<SIZE_TYPE>, COOIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+        coo_result(ptrs, indices, coo_values, rows, cols, k);
 
     return coo_result;
 }
-
-
 
 #endif

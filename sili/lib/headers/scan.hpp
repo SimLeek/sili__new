@@ -13,31 +13,30 @@
  * @param vec_of_vec A vector of vectors of type T.
  * @return A vector of size_t with cumulative sizes, one element larger than the input.
  */
-template <class T> void fullScanSizes(const std::vector<std::vector<T>> &vec_of_vec, std::vector<size_t>&fullScan, int&& scan_a=0) {
-    
-#ifdef __clang__ // OMP scan is broken in clang and may crash it: https://github.com/llvm/llvm-project/issues/87466
+template <class T>
+void fullScanSizes(const std::vector<std::vector<T>>& vec_of_vec, std::vector<size_t>& fullScan,
+                   int&& scan_a = 0) {
+
+#ifdef __clang__ // OMP scan is broken in clang and may crash it:
+                 // https://github.com/llvm/llvm-project/issues/87466
     std::inclusive_scan(
-        vec_of_vec.begin(),
-        vec_of_vec.end(),
-        fullScan.begin() + 1,
-        [](const size_t &cum_sum, const std::vector<T> &vec) { return cum_sum + vec.size(); },
-        0);
+        vec_of_vec.begin(), vec_of_vec.end(), fullScan.begin() + 1,
+        [](const size_t& cum_sum, const std::vector<T>& vec) { return cum_sum + vec.size(); }, 0);
 #else
 
 #pragma omp for simd reduction(inscan, + : scan_a)
-    for (int i = 0; i < vec_of_vec.size()+1; i++) {
+    for (int i = 0; i < vec_of_vec.size() + 1; i++) {
         fullScan[i] = scan_a;
-        #pragma omp scan exclusive(scan_a)
+#pragma omp scan exclusive(scan_a)
         {
-            if(i<vec_of_vec.size()){
+            if (i < vec_of_vec.size()) {
                 scan_a += vec_of_vec[i].size();
-            }else{
-                scan_a += vec_of_vec[i-1].size();
+            } else {
+                scan_a += vec_of_vec[i - 1].size();
             }
         }
-        
     }
-# pragma omp barrier
+#pragma omp barrier
 #endif
 }
 
@@ -49,7 +48,8 @@ template <class T> void fullScanSizes(const std::vector<std::vector<T>> &vec_of_
  * @return A vector of size_t with cumulative sizes, one element larger than the input.
  */
 template <class T>
-void fullScanSizes2(const std::vector<std::vector<std::vector<T>>> &vec_of_vec_of_vec, std::vector<std::vector<size_t>>& fullScans) {
+void fullScanSizes2(const std::vector<std::vector<std::vector<T>>>& vec_of_vec_of_vec,
+                    std::vector<std::vector<size_t>>& fullScans) {
     for (int i = 0; i < vec_of_vec_of_vec.size(); i++) {
         fullScanSizes(vec_of_vec_of_vec[i], fullScans[i]);
     }
@@ -62,31 +62,29 @@ void fullScanSizes2(const std::vector<std::vector<std::vector<T>>> &vec_of_vec_o
  * @param vec_of_vec A vector of vectors of type T.
  * @return A vector of size_t with cumulative sizes, one element larger than the input.
  */
-template <class CONTAINER> void fullScanValues(const CONTAINER &vec, CONTAINER& fullScan, typename CONTAINER::value_type&& scan_a = typename CONTAINER::value_type{}) {
+template <class CONTAINER>
+void fullScanValues(const CONTAINER& vec, CONTAINER& fullScan,
+                    typename CONTAINER::value_type&& scan_a = typename CONTAINER::value_type{}) {
 
-#ifdef __clang__ // OMP scan is broken in clang and may crash it: https://github.com/llvm/llvm-project/issues/87466
-    std::inclusive_scan(
-        vec.begin(),
-        vec.end(),
-        fullScan.begin() + 1,
-        std::plus<typename CONTAINER::value_type>()
-    );
+#ifdef __clang__ // OMP scan is broken in clang and may crash it:
+                 // https://github.com/llvm/llvm-project/issues/87466
+    std::inclusive_scan(vec.begin(), vec.end(), fullScan.begin() + 1,
+                        std::plus<typename CONTAINER::value_type>());
 #else
 
 #pragma omp for simd reduction(inscan, + : scan_a)
-    for (int i = 0; i < vec.size()+1; i++) {
+    for (int i = 0; i < vec.size() + 1; i++) {
         fullScan[i] = scan_a;
-        #pragma omp scan exclusive(scan_a)
+#pragma omp scan exclusive(scan_a)
         {
-            if(i<vec.size()){
+            if (i < vec.size()) {
                 scan_a += vec[i];
-            }else{
-                scan_a += vec[i-1];
+            } else {
+                scan_a += vec[i - 1];
             }
         }
-
     }
-# pragma omp barrier
+#pragma omp barrier
 #endif
 }
 
