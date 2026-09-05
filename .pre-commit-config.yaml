@@ -63,7 +63,7 @@ repos:
         # below are post-clang-format (task #386 followup):
         # __init__.py 66.7%
         # (3-line file, N/A in practice),
-        # conversion/rnn_fold.py 38.0%, conversion/streaming_prune.py
+        # conversion/streaming_prune.py
         # 30.4%,
         # lib/headers/sparse_struct.hpp 38.1% (21-line file, N/A in
         # practice), lib/headers/fp4quant.hpp 35.7%, lib/headers/fp8quant.hpp 32.5%.
@@ -94,7 +94,9 @@ repos:
         # docs/research/bench_block4_memory_and_compression.rst, 40.2% ->
         # under 30%. conversion/prune_sensitivity.py did the same to
         # docs/research/prune_sensitivity.rst, 39.9% -> under 30%.
-        exclude: ^(tests/|sili/__init__\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp)
+        # conversion/rnn_fold.py did the same to docs/research/rnn_fold.rst,
+        # 38.0% -> under 30%.
+        exclude: ^(tests/|sili/__init__\.py|sili/conversion/streaming_prune\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)

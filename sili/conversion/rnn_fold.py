@@ -1,78 +1,10 @@
 #!/usr/bin/env python3
 """
-rnn_fold.py
-───────────
-Detect consecutive identical transformer blocks in a (sparse-pruned) model
-and fold them into a single recurrent block whose weights are stored as one
-stacked sparse CSR matrix.
-
-Conceptual transform
-────────────────────
-Original:  in ──► [Block_0] ──► [Block_1] ──► ··· ──► [Block_{N-1}] ──► out
-           N identical-structure blocks, each with different trained weights.
-
-Folded:    ┌─────────────────────────────────────┐
-           │  state = 0                           │
-           │  for i in 0..N-1:                    │
-           │    state += Block_folded(x + state)  │
-           └─────────────────────────────────────-┘
-           One block, N steps, state accumulates all fold outputs.
-
-Weight layout in the stacked CSR matrix
-────────────────────────────────────────
-If each block has a weight of shape [out, in], the stacked matrix is
-[N·out, in].  Visually, the nonzeros form horizontal bands:
-
-  row 0         ┌──────────────────────────────┐
-  …             │  Block_0 nonzeros  (band 0)  │
-  row out-1     └──────────────────────────────┘
-  row out        ┌─────────────────────────────┐
-  …              │  Block_1 nonzeros  (band 1) │
-  row 2·out-1   └─────────────────────────────┘
-        …                    …
-  row (N-1)·out  ┌────────────────────────────┐
-  …              │ Block_{N-1} nonzeros (band N-1) │
-  row N·out-1   └────────────────────────────┘
-
-At fold step i the executing code slices rows [i·out : (i+1)·out] from the
-CSR matrix and uses them as the current weight, so the original per-block
-computation is faithfully reproduced.
-
-Attention banding for Q / K / V projections
-────────────────────────────────────────────
-In each block the attention score matrix is [seq_len × seq_len].
-After folding, the state fed back into the block carries information from
-all previous fold steps. To prevent a fold-step i from "seeing" context that
-was more than one fold step away — matching the locality of the original per-
-block computation — an additive band mask is applied to the attention scores:
-
-    mask[q, k] = 0       if |q − k| ≤ band_half_width
-               = −∞      otherwise
-
-where band_half_width defaults to seq_len (the row or column dimension of
-the original Q/K/V projection weight).  With band_half_width = seq_len every
-position in the current fold step is allowed to attend to every position in
-the immediately adjacent state context, but nothing further back, bounding
-the effective receptive field per fold step to match the original block.
-
-Integration with sparse_prune.py
-─────────────────────────────────
-  from sparse_prune import load_state_dict
-  from rnn_fold import fold_sparse_payload
-
-  payload = torch.load("model_sparse.pt")           # from sparse_prune.py
-  folded  = fold_sparse_payload(payload)
-  torch.save(folded, "model_folded.pt")
-
-  # Or as part of the sparse_prune pipeline:
-  python sparse_prune.py model.pt --rnn-fold
-
-CLI
-───
-  python rnn_fold.py model_sparse.pt                     # auto-detect & fold
-  python rnn_fold.py model_sparse.pt -o model_folded.pt
-  python rnn_fold.py model_sparse.pt --show-groups        # detect only, no fold
-  python rnn_fold.py model.pt        --also-prune         # prune then fold
+rnn_fold.py -- fold N consecutive identical transformer blocks in a
+(sparse-pruned) model into a single recurrent block whose weights are one
+stacked sparse CSR matrix. See docs/research/rnn_fold.rst:
+rnn_fold.module_overview for the conceptual transform, weight-layout
+diagram, sparse_prune.py integration, and full CLI usage.
 """
 
 from __future__ import annotations
@@ -89,20 +21,9 @@ import torch
 from torch import nn
 
 try:
-    # Package-qualified import ONLY. A previous version of this block did
-    # `sys.path.insert(0, .../sili)` then a bare `import _cpu`, which makes
-    # the compiled extension importable under TWO DIFFERENT sys.modules keys
-    # ('_cpu' and 'sili._cpu') depending on which import path some other
-    # module in the process happens to use first. Since each key triggers a
-    # SEPARATE execution of the extension's module-init code, pybind11's
-    # static type registrations run twice, raising "generic_type ... already
-    # registered" the moment both paths get exercised in one process --
-    # exactly what happened repeatedly when this file was transitively
-    # imported alongside sili/sparse_rnn.py's `import sili._cpu as _cpu`.
-    # A single, consistent, package-qualified import path everywhere makes
-    # sys.modules naturally deduplicate the extension regardless of import
-    # order, which is also required for tools that walk the whole `sili`
-    # package tree (pdoc, Sphinx autodoc) without controlling import order.
+    # Package-qualified import ONLY -- see docs/research/rnn_fold.rst:
+    # rnn_fold.package_qualified_import_bug for the pybind11 double-
+    # registration crash a bare `import _cpu` used to cause.
     from sili import _cpu as _sili_cpu  # SparseLinearLayer, hoyer_score, dense_to_csr
 
     _SILI_AVAILABLE = True
@@ -144,8 +65,8 @@ def detect_repeated_block_groups(
     """
     Find runs of consecutive blocks that share identical parameter structure.
 
-    Two blocks are considered structurally identical if every parameter suffix
-    maps to the same tensor shape in both, AND they share the same prefix.
+    Two blocks are structurally identical if every parameter suffix maps to
+    the same tensor shape in both, AND they share the same prefix.
 
     Parameters
     ----------
@@ -154,32 +75,13 @@ def detect_repeated_block_groups(
 
     Returns
     -------
-    List of (prefix, indices) pairs. Each `indices` is a sorted list of block
-    indices sharing `prefix` that can be folded together. Non-repeated or
-    structurally inconsistent blocks are excluded.
-
-    Example
-    -------
-    Blocks 0-23 under "model.layers." identical
-        -> [("model.layers.", [0,1,...,23])]
-    Blocks 0-11 one shape, 12-23 another, same prefix
-        -> [("model.layers.", [0..11]), ("model.layers.", [12..23])]
-    Two DIFFERENT prefixes sharing an index range (e.g. a VLM's language and
-    vision towers, both indexed 0..N-1)
-        -> [("model.language_model.layers.", [0..11]),
-            ("model.vision_tower.transformer.layers.", [0..5])]
-
-    NOTE: keying on (prefix, index) rather than bare index is load-bearing,
-    not cosmetic. Bare-index keying merges unrelated block families that
-    happen to share index ranges -- caught by the toy VLM generator
-    (tests/unit/python/gen_toy_mistral_vlm.py): 12 language layers + 6 vision
-    layers were returned as two groups of 6 instead of one of 12 and one of
-    6, because indices 0-5 silently merged both families' suffixes into one
-    shape-dict, then diverged from indices 6-11 (language-only) once the
-    vision family ran out of blocks. Every downstream match on `_parse_block_key`
-    output must check the prefix too, not just the index (see
-    `report_block_groups` and `fold_sparse_payload` below, which had the same
-    latent bug and are fixed alongside this function).
+    List of (prefix, indices) pairs, e.g. blocks 0-23 under "model.layers."
+    all identical -> [("model.layers.", [0,1,...,23])]. Non-repeated or
+    structurally inconsistent blocks are excluded. Keyed by (prefix, index),
+    NOT bare index -- see docs/research/rnn_fold.rst:
+    detect_repeated_block_groups.prefix_index_keying_bug for why (a VLM's
+    language/vision towers sharing an index range will silently merge under
+    bare-index keying).
     """
     # Gather {(prefix, block_index): {suffix: shape}}
     block_params: dict[tuple[str, int], dict[str, torch.Size]] = defaultdict(dict)
@@ -233,10 +135,7 @@ def report_block_groups(
     for g_idx, (prefix, group) in enumerate(groups):
         n = len(group)
         sample_idx = group[0]
-        # Collect parameter suffixes for this block. Must match prefix AND
-        # index -- matching index alone can pull suffixes from an unrelated
-        # block family that happens to share the same index (see
-        # detect_repeated_block_groups docstring).
+        # Match prefix AND index -- see detect_repeated_block_groups.prefix_index_keying_bug.
         suffixes = sorted(
             suffix
             for name in state_dict
@@ -263,22 +162,12 @@ def report_block_groups(
 
 def stack_csr_vertical(csr_list: list[torch.Tensor]) -> torch.Tensor:
     """
-    Vertically stack N CSR matrices of shape [out_i, in] into one [Σout_i, in].
+    Vertically stack N CSR matrices of shape [out_i, in] into one [sum(out_i), in].
 
-    Each input matrix is expected to have shape [out_i, in] (2-D CSR).
-    They need not have the same number of rows, but must share the same
-    number of columns (in_dim).
-
-    The stacking is pure index arithmetic on the three CSR arrays:
-      values       : concatenate directly
-      col_indices  : concatenate directly (column positions are unchanged)
-      crow_indices : for each successive block, offset by the total nonzeros
-                     from all preceding blocks, then append (skipping the
-                     leading 0 of each subsequent block's crow_indices)
-
-    Returns
-    -------
-    A single coalesced CSR tensor of shape [total_rows, in_dim].
+    Inputs need not share row count but must share column count (in_dim).
+    Pure index arithmetic: values/col_indices concatenate directly;
+    crow_indices are offset by preceding blocks' total nonzeros then
+    appended (skipping each subsequent block's leading 0).
     """
     if not csr_list:
         raise ValueError("csr_list is empty")
@@ -327,8 +216,8 @@ def slice_csr_rows(csr: torch.Tensor, row_start: int, row_end: int) -> torch.Ten
     """
     Extract rows [row_start, row_end) from a CSR matrix as a dense tensor.
 
-    CSR row slicing is O(nnz_in_slice) — we only materialise the needed rows.
-    Returns a float32 dense tensor of shape [row_end - row_start, n_cols].
+    O(nnz_in_slice) -- only materialises the needed rows. Returns float32
+    dense [row_end - row_start, n_cols].
     """
     crow = csr.crow_indices()
     cols = csr.col_indices()
@@ -367,41 +256,11 @@ def make_banded_attention_mask(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Build an additive attention mask that restricts each query position to
-    only attend to keys within ±band_half_width positions.
-
-    Shape: [seq_len, seq_len]
-    Values:
-      0        where |q_pos − k_pos| ≤ band_half_width  (allowed)
-      -inf     otherwise                                  (blocked)
-
-    Why this is needed after folding
-    ──────────────────────────────────
-    In the original N-block transformer each block computes full attention
-    over the sequence.  After folding into one RNN block that runs N times,
-    the state carried between steps mixes context from previous fold steps.
-    To prevent step i from attending to "stale" context that is more than one
-    fold step away — which would not have been possible in the original
-    sequential layout — the attention window is capped at band_half_width.
-
-    Setting band_half_width = seq_len (the default in fold_sparse_payload)
-    means every query sees the full current sequence plus exactly one step of
-    prior state, matching the per-block locality of the original model.
-
-    For a pure same-sequence self-attention (no cross-step state in the keys)
-    band_half_width = seq_len covers the entire matrix and the mask is all-0.
-    The mask becomes non-trivial only when key/value context is extended with
-    state from previous fold steps.
-
-    Parameters
-    ----------
-    seq_len          : sequence length (and query/key count)
-    band_half_width  : half-width of the allowed attention band
-    device / dtype   : target device and float dtype
-
-    Returns
-    -------
-    Additive bias tensor of shape [seq_len, seq_len].
+    Build an additive attention mask restricting each query position to keys
+    within +-band_half_width positions: 0 where allowed, -inf where blocked.
+    Shape [seq_len, seq_len]. See docs/research/rnn_fold.rst:
+    make_banded_attention_mask.locality_rationale for why folding needs this
+    at all (state carries cross-fold-step context that must stay local).
     """
     q_pos = torch.arange(seq_len, device=device).unsqueeze(1)  # [L, 1]
     k_pos = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, L]
@@ -415,15 +274,12 @@ def infer_seq_len_from_attn_weight(
     weight_shape: torch.Size,
 ) -> int:
     """
-    Guess the sequence length / attention band-width from a Q/K/V weight shape.
-
-    Convention: Q/K/V projection weights are [d_model, d_k] or [d_model, d_model].
-    The row dimension (d_model = weight_shape[0]) is the embedding dimension and
-    also, in most fixed-position transformers, equals the sequence length used
-    for position embeddings.  We return that as the band half-width.
-
-    For architectures with rotary or ALiBi embeddings, override band_half_width
-    explicitly in fold_sparse_payload().
+    Guess the sequence length / attention band-width from a Q/K/V weight
+    shape. Convention: Q/K/V weights are [d_model, d_k] or [d_model,
+    d_model]; the row dimension equals the sequence length used for
+    position embeddings in most fixed-position transformers. Rotary/ALiBi
+    architectures should override band_half_width explicitly in
+    fold_sparse_payload() instead of trusting this.
     """
     return int(weight_shape[0])
 
@@ -442,11 +298,12 @@ class FoldedBlockDescriptor:
     n_folds                 : number of original blocks folded together
     block_indices           : original block indices (e.g. [0,1,2,...,23])
     stacked_weights         : {param_suffix: stacked_csr_tensor}
-    out_dims                : {param_suffix: int}  — rows per fold step in stacked matrix
-    band_half_widths        : {param_suffix: int | None}  — attention band, None = no mask
+    out_dims                : {param_suffix: int}  -- rows per fold step in stacked matrix
+    band_half_widths        : {param_suffix: int | None}  -- attention band, None = no mask
     prefix                  : common name prefix before the block index
-    skip_connection_outputs : if True, average per-step outputs instead of returning
-                              final accumulated state (see RNNFoldedBlock.forward)
+    skip_connection_outputs : if True, average per-step outputs instead of
+                              final accumulated state -- see docs/research/rnn_fold.rst:
+                              RNNFoldedBlock.average_vs_sum_rationale
     """
 
     def __init__(
@@ -468,12 +325,7 @@ class FoldedBlockDescriptor:
         self.skip_connection_outputs = skip_connection_outputs
 
     def fold_weight(self, suffix: str, fold_step: int) -> torch.Tensor:
-        """
-        Return the dense weight slice for parameter `suffix` at `fold_step`.
-
-        Slices rows [fold_step * out_dim : (fold_step+1) * out_dim] from the
-        stacked CSR matrix and densifies them.
-        """
+        """Dense weight slice for `suffix` at `fold_step` (rows [fold_step*out_dim:(fold_step+1)*out_dim], densified)."""
         csr = self.stacked_weights[suffix]
         out_dim = self.out_dims[suffix]
         r_start = fold_step * out_dim
@@ -482,15 +334,12 @@ class FoldedBlockDescriptor:
 
     def fold_weight_csr(self, suffix: str, fold_step: int) -> torch.Tensor:
         """
-        Return the CSR weight slice for parameter `suffix` at `fold_step`
-        WITHOUT densifying. Use this when passing weights to a SparseLinearLayer
-        via load_weights() -- the layer handles the sparse format natively and
-        densifying before handing it over throws away the sparsity structure.
-
-        Note: column indices are sorted within each row (via coalesce on a COO
-        round-trip) since SparseLinearLayer's delta-CSR kernels require
-        ascending column order within rows -- the stacked CSR may have unsorted
-        column indices depending on how the original weights were stored.
+        CSR weight slice for `suffix` at `fold_step` WITHOUT densifying --
+        use when passing weights to a SparseLinearLayer via load_weights()
+        (densifying first throws away the sparsity structure it expects).
+        Column indices are re-sorted per row via a COO coalesce round-trip
+        since the delta-CSR kernels require ascending column order, which
+        the stacked CSR does not guarantee.
         """
         csr = self.stacked_weights[suffix]
         out_dim = self.out_dims[suffix]
@@ -506,9 +355,7 @@ class FoldedBlockDescriptor:
         csr_slice = torch.sparse_csr_tensor(
             slice_crow, cols[nnz_start:nnz_end], vals[nnz_start:nnz_end], size=(out_dim, n_col), dtype=csr.dtype
         )
-        # Ensure sorted column indices (required by delta-CSR kernels).
-        # Round-trip through COO with coalesce() is the portable PyTorch way.
-        return csr_slice.to_sparse().coalesce().to_sparse_csr()
+        return csr_slice.to_sparse().coalesce().to_sparse_csr()  # sort col indices via COO round-trip
 
     def attention_mask(
         self,
@@ -516,10 +363,7 @@ class FoldedBlockDescriptor:
         seq_len: int,
         device: torch.device = torch.device("cpu"),
     ) -> torch.Tensor | None:
-        """
-        Return the banded attention mask for a Q/K/V parameter, or None if
-        this parameter is not an attention projection or banding is disabled.
-        """
+        """Banded attention mask for a Q/K/V parameter, or None if not an attention projection / banding disabled."""
         bw = self.band_half_widths.get(suffix)
         if bw is None:
             return None
@@ -549,56 +393,17 @@ class RNNFoldedBlock(nn.Module):
     """
     Reference inference module for a single folded block descriptor.
 
-    This is an architecture-agnostic skeleton that shows the canonical RNN
-    fold execution pattern.  Real use requires either:
-      (a) subclassing and overriding _apply_block(), or
-      (b) using FoldedBlockDescriptor directly inside an architecture-specific
-          forward() method.
+    Architecture-agnostic skeleton showing the canonical RNN fold execution
+    pattern. Real use requires either (a) subclassing and overriding
+    _apply_block(), or (b) using FoldedBlockDescriptor directly inside an
+    architecture-specific forward() method.
 
-    Two output modes (controlled by descriptor.skip_connection_outputs)
-    ────────────────────────────────────────────────────────────────────
-    Standard (skip_connection_outputs=False):
-        state = 0
-        for i in range(n_folds):
-            out    = block(x + state)
-            state += out
-        return state                    # final accumulated state
-
-    Skip-connection outputs (skip_connection_outputs=True):
-        state   = 0
-        outputs = []
-        for i in range(n_folds):
-            out    = block(x + state)
-            state += out
-            outputs.append(out)
-        return mean(outputs)            # average of all per-step outputs
-
-    Why average and not sum?
-    ────────────────────────
-    Each fold step computes at a different temporal scale: early steps see
-    only local context (narrow banded attention over x), later steps see
-    richer integrated context (x + accumulated state from prior steps).
-    Averaging lets every scale contribute equally to the final output,
-    regardless of how many fold steps there are — analogous to how pyramidal
-    neurons in cortex receive both fast/local signals on basal dendrites and
-    slow/long-range signals on apical dendrites, with the soma averaging
-    across both.
-
-    Mathematically, with windowed attention of half-width W, fold step i has
-    an effective receptive field of (i+1)·W tokens.  Averaging the outputs
-    produces a weighted sum over all receptive-field sizes 1W…N·W with equal
-    weight 1/N — equivalent to an ensemble over scales.  A plain sum would
-    make the last step dominate (it has seen the most context); averaging
-    removes that bias.
-
-    Why no LSTM/GRU?
-    ────────────────
-    Gates add parameters and complexity.  The original transformer already
-    has residual connections, layer norms, and attention — these collectively
-    perform the role of gating.  A plain additive state lets the folded block
-    leverage those existing mechanisms without duplicating them.  Attention
-    banding enforces locality between fold steps, the main stability
-    mechanism that an LSTM gate would otherwise provide.
+    Two output modes, controlled by descriptor.skip_connection_outputs: the
+    standard mode returns the final accumulated state; the skip-connection
+    mode returns the mean of all per-step outputs instead. See
+    docs/research/rnn_fold.rst:RNNFoldedBlock.average_vs_sum_rationale for
+    why averaging (not summing) and RNNFoldedBlock.no_gating_rationale for
+    why no LSTM/GRU-style gates.
     """
 
     def __init__(self, descriptor: FoldedBlockDescriptor):
@@ -611,12 +416,7 @@ class RNNFoldedBlock(nn.Module):
         weights: dict[str, torch.Tensor],  # {suffix: dense weight}
         masks: dict[str, torch.Tensor | None],  # {suffix: attn mask | None}
     ) -> torch.Tensor:
-        """
-        Override this in architecture-specific subclasses.
-
-        The base implementation raises NotImplementedError.  See module
-        docstring for the expected pattern.
-        """
+        """Override in architecture-specific subclasses; base implementation raises NotImplementedError."""
         raise NotImplementedError(
             "RNNFoldedBlock._apply_block() must be overridden for your "
             "specific transformer architecture.  Use FoldedBlockDescriptor "
@@ -630,9 +430,7 @@ class RNNFoldedBlock(nn.Module):
         state = torch.zeros_like(x)
         suffixes = list(self.desc.stacked_weights.keys())
 
-        # Collect per-step outputs when skip_connection_outputs is enabled.
-        # The state update is identical in both modes — only the return value
-        # differs (final state vs. mean of all per-step outputs).
+        # State update is identical in both modes; only the return value differs.
         step_outputs: list[torch.Tensor] = []
 
         for fold_step in range(self.desc.n_folds):
@@ -645,8 +443,7 @@ class RNNFoldedBlock(nn.Module):
                 step_outputs.append(out)
 
         if self.desc.skip_connection_outputs:
-            # Stack along a new leading dimension → [n_folds, ...] then mean
-            return torch.stack(step_outputs, dim=0).mean(dim=0)
+            return torch.stack(step_outputs, dim=0).mean(dim=0)  # [n_folds, ...] -> mean
 
         return state
 
@@ -655,31 +452,23 @@ class RNNFoldedBlock(nn.Module):
 #  SiliBlock: SparseLinearLayer-backed folded block with hoyer_score dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Threshold for routing to forward_sparse instead of forward_dense.
-# hoyer_score > 0.8 means roughly <20% of activations are active.
-# This fixed constant could eventually become adaptive (benchmarked) --
-# note: also add that TODO to TODO.md if/when adapting.
+# hoyer_score > 0.8 means roughly <20% of activations are active -> routes
+# to forward_sparse instead of forward_dense. Fixed for now; could become
+# adaptive (benchmarked) later -- add a TODO.md entry if/when adapting.
 _HOYER_SPARSE_THRESHOLD = 0.8
 
 
 class SiliBlock(RNNFoldedBlock):
     """
-    SparseLinearLayer-backed version of RNNFoldedBlock.
+    SparseLinearLayer-backed version of RNNFoldedBlock. Requires _sili_cpu
+    (_cpu module) importable; raises ImportError at construction otherwise.
 
-    Requires _sili_cpu (_cpu module) to be importable. Each fold step has its
-    own pre-built SparseLinearLayer (built at construction from the CSR slice,
-    not re-loaded per call), so the forward loop is just a layer call rather
-    than a weight-load + matmul.
-
-    Dispatch (Python-level, not in the C++ hot path):
-      hoyer_score(x) > 0.8  ->  forward_sparse (activations are sparse)
-      otherwise              ->  forward_dense
-
-    For the backward pass the same threshold is applied to the gradient.
-    Per-row importance and value scale normalization (lr / nnz_this_row) is
+    Each fold step's SparseLinearLayer is pre-built at construction from the
+    CSR slice (not re-loaded per call). Dispatch (Python-level, not in the
+    C++ hot path): hoyer_score(x) > threshold -> forward_sparse, else
+    forward_dense; same threshold applies to the gradient on backward.
+    Per-row importance/value-scale normalization (lr / nnz_this_row) is
     always enabled on backward (lr_per_row_nnz=True).
-
-    Raises ImportError at construction if _cpu is not available.
     """
 
     # Per-parameter-suffix threshold can be overridden per instance
@@ -700,35 +489,21 @@ class SiliBlock(RNNFoldedBlock):
         self._lr = learning_rate
         self._num_cpus = num_cpus
 
-        # ONE SparseLinearLayer per suffix -- loaded with the FULL stacked
-        # weight matrix, not individual fold-step slices.
-        #
-        # Design (per conversation): loading all N fold steps into ONE layer
-        # means forward_sili calls _forward_one_suffix EXACTLY ONCE, not N
-        # times. At initialisation the result is equivalent to running the N
-        # original transformer blocks sequentially. After synaptogenesis,
-        # redundant connections across fold steps are pruned -- only what is
-        # genuinely needed survives. Dense stacking would be an N-wide layer
-        # with no benefit; sparsity is what makes the single-call design
-        # viable, not a micro-optimisation.
-        #
-        # Weight orientation: SparseLinearLayer is [n_inputs x n_outputs].
-        # stacked_weights[suffix] is [n_folds*out_dim x in_dim] (standard
-        # weight-matrix orientation) -- transpose before loading so the layer
-        # has n_inputs=in_dim, n_outputs=n_folds*out_dim.
+        # ONE SparseLinearLayer per suffix, loaded with the FULL stacked
+        # weight matrix (not per-fold-step slices) -- see docs/research/
+        # rnn_fold.rst:SiliBlock.single_call_stacked_layer_design for why,
+        # and for the weight-orientation transpose below (SparseLinearLayer
+        # is [n_inputs x n_outputs]; stacked_weights[suffix] is
+        # [n_folds*out_dim x in_dim]).
         import numpy as np
 
         # FP4 table largest magnitude -- scale each row so its max maps here.
         _FP4_MAX = 6.0
         self._layers: dict[str, object] = {}
         for suffix, csr in descriptor.stacked_weights.items():
-            # csr.t() is metadata-only (CSC relabelling, no densify, no
-            # nnz-proportional copy); .to_sparse_csr() does the real (but
-            # nnz-proportional, never dense) reorganization into row-major
-            # order. NEVER call .to_dense() here -- csr is a whole folded/
-            # stacked layer's matrix, which can be too large to safely
-            # materialize (see sparse_rnn.py's FoldedLayer.from_descriptor,
-            # which had the identical bug).
+            # csr.t() then .to_sparse_csr(): metadata-only transpose + real
+            # but nnz-proportional (never dense) reorg. NEVER .to_dense()
+            # here -- see SiliBlock.single_call_stacked_layer_design.
             csr_t = csr.t().to_sparse_csr()
             n_in = int(csr_t.shape[0])  # in_dim
             n_out = int(csr_t.shape[1])  # n_folds * out_dim
@@ -738,18 +513,9 @@ class SiliBlock(RNNFoldedBlock):
             idx = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
 
-            # Per-row value scaling (per conversation): the stacked matrix
-            # spans rows from N different original layers with potentially very
-            # different weight magnitudes. FP4's table is {0, +-0.5 ... +-6.0}
-            # so a row with max-abs ~0.1 maps almost entirely to 0 or +-0.5.
-            # Per-row scaling maps each row's max-abs to 6.0 before
-            # quantization, then records the inverse scale in value_scale[r]
-            # so the forward kernel recovers: true_w = stored_fp4 * value_scale.
-            #
-            # Workflow: pre-scale -> load_weights (quantizes accurately) ->
-            # set_value_scale_raw (metadata only, no re-encoding).
-            # DO NOT call rescale_value_row() after a pre-scaled load -- it
-            # would re-encode the already-scaled values.
+            # Per-row FP4 scaling -- see docs/research/rnn_fold.rst:
+            # SiliBlock.per_row_fp4_scaling. DO NOT call rescale_value_row()
+            # after this pre-scaled load -- it would re-encode already-scaled values.
             row_scales = np.ones(n_in, dtype=np.float32)
             for r in range(n_in):
                 start, end = int(ptrs[r]), int(ptrs[r + 1])
@@ -791,11 +557,9 @@ class SiliBlock(RNNFoldedBlock):
     ) -> np.ndarray:
         """
         Backward through one SparseLinearLayer. lr_per_row_nnz always True.
-
-        Sparse gradient path (hoyer_score > threshold): uses backward_sparse
-        with the explicitly stored last_input (now exposed as a Python property).
-        Falls back to backward_dense if no forward pass has been run or if the
-        gradient is dense.
+        Sparse gradient path (hoyer_score > threshold) uses backward_sparse
+        with last_input (exposed as a Python property); falls back to
+        backward_dense if no forward pass has run yet or the gradient is dense.
         """
         import numpy as np
 
@@ -813,24 +577,14 @@ class SiliBlock(RNNFoldedBlock):
         lr: float = 0.0,
     ) -> torch.Tensor:
         """
-        Backward pass through the entire folded RNN block.
-
-        Reverses both levels of sum in forward_sili:
-
-          (1) Fold sum backward: dy[batch, out_dim]
-              -> broadcast to dy_raw[batch, n_folds, out_dim]
-              -> flatten to [batch, n_folds * out_dim]
-              Gradient of a sum is 1 for each summand, so every fold slot
-              gets the same dy -- not split across folds.
-
-          (2) Suffix sum backward: each suffix layer gets the same dy_raw;
-              returns dx_suffix[batch, in_dim]; final dx = sum(dx_suffix).
-
-        Weight updates happen inside _backward_one_suffix via backward_dense /
-        backward_sparse with lr_per_row_nnz=True.
-
-        dy shape: [batch, out_dim]  (same as forward output)
-        dx shape: [batch, in_dim]   (same as forward input x)
+        Backward pass through the entire folded RNN block. Reverses both
+        levels of sum in forward_sili: (1) fold sum -- dy[batch, out_dim]
+        broadcasts to dy_raw[batch, n_folds, out_dim] (gradient of a sum is
+        1 per summand, so every fold slot gets the same dy, not split
+        across folds); (2) suffix sum -- each suffix layer gets the same
+        dy_raw, dx = sum of per-suffix dx. Weight updates happen inside
+        _backward_one_suffix via backward_dense/backward_sparse with
+        lr_per_row_nnz=True. dy: [batch, out_dim], dx: [batch, in_dim].
         """
         import numpy as np
 
@@ -839,10 +593,8 @@ class SiliBlock(RNNFoldedBlock):
         batch = dy_np.shape[0]
         out_dim = next(iter(self.desc.out_dims.values()))
 
-        # (1) Broadcast dy through the fold reshape+sum.
-        # Forward:   raw[batch, n_folds*out_dim] -> sum(axis=1) -> [batch, out_dim]
-        # Backward:  dy[batch, out_dim] -> tile to [batch, n_folds, out_dim]
-        #            -> flatten to [batch, n_folds*out_dim]
+        # (1) Broadcast dy through the fold reshape+sum (reverse of forward's
+        # raw[batch, n_folds*out_dim].sum(axis=1) -> [batch, out_dim]).
         dy_raw = (
             np.tile(dy_np.reshape(batch, 1, out_dim), (1, self.desc.n_folds, 1))
             .reshape(batch, self.desc.n_folds * out_dim)
@@ -861,37 +613,25 @@ class SiliBlock(RNNFoldedBlock):
         lr: float = 0.0,
     ) -> torch.Tensor:
         """
-        Single forward pass through the entire folded RNN block.
-
-        _forward_one_suffix is called EXACTLY ONCE per suffix (not N times).
-        The full stacked weight matrix handles all N fold steps in one shot.
-
-        Shape contract (matches RNNFoldedBlock.forward's base class contract):
-          input:  [batch, hidden_dim]  (same as original x)
-          output: [batch, hidden_dim]  (same shape, so it can be a drop-in)
-
-        Internally the SparseLinearLayer produces [batch, n_folds * out_dim],
-        which we map back to [batch, out_dim] by reshaping to
-        [batch, n_folds, out_dim] and summing across the fold dimension.
-
-        At initialisation this approximates the sequential composition of all
-        N original transformer blocks (linear regime, small weights, sum ≈
-        chain).  After synaptogenesis the sparse connections that survive are
-        exactly the ones that contribute meaningfully -- the sum only has
-        nonzero terms for active connections.
+        Single forward pass through the entire folded RNN block --
+        _forward_one_suffix runs EXACTLY ONCE per suffix (not N times); the
+        full stacked weight matrix handles all N fold steps in one shot.
+        Shape contract matches RNNFoldedBlock.forward: [batch, hidden_dim]
+        in and out. Internally each SparseLinearLayer produces
+        [batch, n_folds*out_dim], mapped back to [batch, out_dim] by
+        reshaping and summing across the fold dimension -- at
+        initialization this approximates the sequential composition of all
+        N original blocks (linear regime, sum ~= chain); after
+        synaptogenesis only the sparse connections that contribute
+        meaningfully survive.
         """
         device = x.device
         x_np = x.detach().cpu().float().numpy()
 
-        # One call per suffix -- each produces [1, n_folds * out_dim]
         out_parts = [self._forward_one_suffix(layer, x_np, lr) for layer in self._layers.values()]
-        # Sum suffix contributions (Q, K, V, MLP etc. all write to state)
-        raw_np = sum(out_parts)  # [1, n_folds * out_dim]
+        raw_np = sum(out_parts)  # sum suffix contributions (Q, K, V, MLP etc. all write to state)
 
-        # Map [batch, n_folds * out_dim] → [batch, out_dim]
-        # by summing the n_folds "slots" that the stacked matrix wrote into.
-        # out_dim is the hidden_dim of the original per-layer weights.
-        # Pick the out_dim from any suffix (they all agree for compatible blocks).
+        # out_dim (hidden_dim of original per-layer weights) agrees across suffixes for compatible blocks.
         out_dim = next(iter(self.desc.out_dims.values()))
         batch = raw_np.shape[0]
         summed = raw_np.reshape(batch, self.desc.n_folds, out_dim).sum(axis=1)
@@ -925,32 +665,16 @@ def fold_block_group(
 ) -> FoldedBlockDescriptor:
     """
     Fold a group of consecutive identical blocks into a FoldedBlockDescriptor.
+    For each parameter suffix shared by all blocks: collect CSR tensors
+    (converting dense to CSR if needed), vertically stack into one CSR
+    matrix, record out_dim (rows per fold step) and attention band width.
 
-    For each parameter suffix shared by all blocks in the group:
-      1. Collect the CSR tensors (or convert dense to CSR if needed).
-      2. Vertically stack them into one large CSR matrix.
-      3. Record out_dim (rows per fold step) and attention band width.
-
-    Parameters
-    ----------
-    group                    : sorted list of block indices to fold
-    state_dict               : the (sparse) state dict
-    prefix                   : common name prefix, e.g. "model.layers."
-    band_half_width_override : override the inferred attention band half-width
-
-    Returns
-    -------
-    FoldedBlockDescriptor ready for use at inference time.
+    band_half_width_override overrides the inferred attention band half-width.
     """
     n_folds = len(group)
     sample_idx = group[0]
 
-    # Collect all parameter suffixes present in the sample block.
-    # Must match prefix AND index -- index alone pulls in suffixes from an
-    # unrelated block family sharing the same index (e.g. a VLM's vision
-    # tower block 0 has the same bare index as its language block 0). This
-    # is the same root-cause bug fixed in detect_repeated_block_groups and
-    # report_block_groups above; see that docstring for the full story.
+    # Match prefix AND index -- see detect_repeated_block_groups.prefix_index_keying_bug.
     suffixes: list[str] = sorted(
         parsed[2]
         for name in state_dict
@@ -970,31 +694,14 @@ def fold_block_group(
             if raw is None:
                 raise KeyError(f"Expected parameter '{param_name}' not found in state_dict")
 
-            # Accept either a raw CSR tensor or a dict entry from sparse_prune.py.
-            # sparse_prune.py's "raw" key is NOT only used for true scalars/
-            # vectors -- _keep_dense_reason falls back to "raw" for ANY 2-D
-            # matrix that stayed dense (low sparsity, or CSR overhead not
-            # worth it), which is the common case for a gently-pruned model.
-            # BUG (found converting a real checkpoint): this used to check
-            # `raw.get("csr") is None` and treat that as "scalar, skip" --
-            # silently skipping every dense-stored 2-D suffix instead of
-            # stacking it like the plain-dense-tensor branch below already
-            # does. Worse, fold_sparse_payload's removal step deletes a
-            # block's per-layer keys by (prefix, index) alone, not by
-            # whether the suffix was actually captured here -- a suffix
-            # skipped this way had its weights silently DELETED from the
-            # payload with no trace, not just left unfolded.
+            # Accept a raw CSR tensor or a sparse_prune.py dict entry. See
+            # docs/research/rnn_fold.rst:fold_block_group.dense_raw_entry_bug
+            # for why the "raw" branch below must be treated identically to
+            # the plain-dense-tensor branch, not skipped as a scalar.
             if isinstance(raw, dict):
                 if "csr" in raw:
                     tensor = raw["csr"]
                 elif "raw" in raw:
-                    # Identical treatment to the plain-dense-tensor branch
-                    # below -- a "raw" dict entry is just a dense tensor
-                    # that happens to be wrapped, not a distinct case
-                    # (that wrapping is exactly what the old buggy check
-                    # missed: it treated ANY dict without a "csr" key as
-                    # a non-stackable scalar, regardless of what the
-                    # wrapped tensor actually was).
                     t = raw["raw"].detach().float()
                     if t.ndim == 0:
                         t = t.reshape(1, 1)
@@ -1010,8 +717,7 @@ def fold_block_group(
             elif isinstance(raw, torch.Tensor) and raw.layout == torch.sparse_csr:
                 tensor = raw
             elif isinstance(raw, torch.Tensor):
-                # Dense tensor — convert to CSR (no pruning, just layout)
-                t = raw.detach().float()
+                t = raw.detach().float()  # dense tensor -> CSR (no pruning, just layout)
                 if t.ndim == 0:
                     t = t.reshape(1, 1)
                 elif t.ndim == 1:
@@ -1030,7 +736,6 @@ def fold_block_group(
         stacked_weights[suffix] = stacked
         out_dims[suffix] = out_dim
 
-        # Determine attention band half-width
         if _is_attention_param(suffix):
             if band_half_width_override is not None:
                 bw = band_half_width_override
@@ -1058,40 +763,18 @@ def fold_sparse_payload(
     skip_connection_outputs: bool = False,
 ) -> dict:
     """
-    Top-level function: take a sparse_prune.py payload and fold repeated blocks.
-
-    The input payload is the dict saved by sparse_prune.sparsify_model():
-    {
-        "sparse_state_dict": { name: {"csr": tensor, "shape": ...} | {"raw": tensor} },
-        "min_abs_param":     float,
-        "meta":              { ... },
-    }
-
-    This function:
-      1. Extracts the flat tensor view for block detection.
-      2. Finds repeated block groups.
-      3. For each group, builds a FoldedBlockDescriptor.
-      4. Returns a new payload with folded_blocks added and folded parameters
-         removed from sparse_state_dict.
-
-    Parameters
-    ----------
-    payload                  : output of sparse_prune.sparsify_model()
-    min_group_size           : minimum consecutive identical blocks to fold
-    band_half_width_override : override inferred attention band half-width
-    skip_connection_outputs  : if True, each fold step's output is collected
-                               and the mean is returned instead of the final
-                               accumulated state (see RNNFoldedBlock docstring)
-
-    Returns
-    -------
-    Modified payload dict with extra keys:
-      "folded_blocks": list of serialisable FoldedBlockDescriptor dicts
-      "rnn_fold_meta": summary statistics
+    Top-level function: take a sparse_prune.py payload (the dict saved by
+    sparse_prune.sparsify_model(), with a "sparse_state_dict" of
+    {name: {"csr": tensor, "shape": ...} | {"raw": tensor}}) and fold
+    repeated blocks: extract a flat tensor view, find repeated block
+    groups, build a FoldedBlockDescriptor per group, and return a new
+    payload with "folded_blocks" (serialisable descriptors) and
+    "rnn_fold_meta" (summary stats) added, folded parameters removed from
+    sparse_state_dict. skip_connection_outputs is passed straight through
+    to each descriptor -- see RNNFoldedBlock.average_vs_sum_rationale.
     """
     ssd = payload.get("sparse_state_dict", payload)
 
-    # Build a flat {name: tensor} view for detection
     flat: dict[str, torch.Tensor] = {}
     for name, entry in ssd.items():
         if isinstance(entry, dict):
@@ -1108,10 +791,6 @@ def fold_sparse_payload(
     if not groups:
         print("[rnn_fold]  No repeated block groups found.  Payload unchanged.")
         return payload
-
-    # Prefix now comes directly from detect_repeated_block_groups -- no more
-    # reverse lookup by bare index, which was ambiguous whenever two block
-    # families (e.g. a VLM's language and vision towers) share an index range.
 
     folded_descriptors: list[dict] = []
     removed_names: set = set()
@@ -1130,16 +809,8 @@ def fold_sparse_payload(
         print(desc.summary())
         print()
 
-        # Record which param names to remove from the flat state dict.
-        # Must match prefix AND index -- index alone would also remove
-        # same-indexed tensors belonging to an unrelated block family.
-        # Must ALSO match a suffix that's actually in desc.stacked_weights
-        # -- a suffix fold_block_group genuinely couldn't fold (true
-        # scalar/empty entries) must not be removed here, or its weights
-        # would be deleted from the payload with no trace anywhere in the
-        # output (see fold_block_group's docstring for the bug this
-        # guards against, found via a real checkpoint's dense-stored 2-D
-        # suffixes).
+        # Match prefix AND index, AND a suffix actually in desc.stacked_weights --
+        # see fold_block_group.dense_raw_entry_bug for why the latter matters.
         folded_suffixes = set(desc.stacked_weights.keys())
         for block_idx in group:
             for name in list(flat.keys()):
@@ -1147,7 +818,6 @@ def fold_sparse_payload(
                 if parsed and parsed[0] == prefix and parsed[1] == block_idx and parsed[2] in folded_suffixes:
                     removed_names.add(name)
 
-        # Serialise descriptor for the payload
         folded_descriptors.append(
             {
                 "n_folds": desc.n_folds,
@@ -1160,22 +830,10 @@ def fold_sparse_payload(
             }
         )
 
-    # Build cleaned sparse_state_dict (without folded params)
     cleaned_ssd = {k: v for k, v in ssd.items() if k not in removed_names}
 
-    # Compute fold statistics
-    #
-    # original_nnz must count ACTUAL nonzero content regardless of whether a
-    # given tensor started as CSR or dense/strided layout -- the old
-    # `flat[n].layout == torch.sparse_csr` filter silently EXCLUDED
-    # dense-format entries (LayerNorm weights, and anything that fell back to
-    # dense via min_sparsity/max_sparse_ratio) from this count entirely,
-    # while folded_nnz correctly counts EVERYTHING post-stacking (fold_block_group
-    # converts dense entries to CSR too, see line ~654). That asymmetry made
-    # "lossless stacking" read False whenever any dense-format layer
-    # participated in a fold group -- not because stacking actually lost or
-    # duplicated data, but because the "before" count was silently smaller
-    # than the true content it was supposed to represent.
+    # _real_nnz counts real nonzeros regardless of CSR vs dense/strided layout --
+    # see docs/research/rnn_fold.rst:fold_sparse_payload.nnz_accounting_bug.
     def _real_nnz(t: torch.Tensor) -> int:
         if t.layout == torch.sparse_csr:
             return int(t.values().numel())
@@ -1216,45 +874,8 @@ def _print_fold_summary(meta: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 #  RNN-all: per-layer recurrent extension (zero-init, no new synapses)
 # ══════════════════════════════════════════════════════════════════════════════
-
-"""
-Per-layer recurrent transform
-──────────────────────────────
-For every linear weight W of shape [out, in] (or conv weight [out, in_c, *k])
-we extend the input dimension so the layer now accepts cat(x, state) as input:
-
-  W_extended : [out,  in + out]       # linear
-  W_extended : [out, in_c + out, *k]  # conv (out channels appended to in_c)
-
-  Layout of extended weight columns:
-    cols  0 … in-1          : original feedforward weights (unchanged)
-    cols  in … in+out-1     : recurrent block (zero-sparse at conversion time)
-
-  Recurrence per call:
-    y     = W_ff @ x  +  W_rec @ state   # W_ff = cols[:in], W_rec = cols[in:]
-    state = y                             # update for next call
-
-  Zero init:
-    state starts as all-zeros.  The recurrent block also starts empty (no
-    nonzero CSR entries).  This means the first forward pass is bit-identical
-    to the original model.  Synaptogenesis (a separate process) grows
-    nonzeros into the recurrent block over time, using the zero-init
-    trajectory as a supervised signal.
-
-    Because no new synapses exist at conversion time, file size does not
-    increase (new CSR columns are free — they just extend the shape metadata).
-
-  Conv handling:
-    For a conv kernel [out_c, in_c, kH, kW] the recurrent state is a feature
-    map [out_c, H, W].  The kernel is extended to [out_c, in_c+out_c, kH, kW].
-    At call time the state is spatially aligned with x and concatenated along
-    the channel dimension before convolution.  The new in_c+out_c input
-    channels map cleanly to the extended kernel.
-
-  Skipped layers:
-    Embeddings, biases, layer-norm parameters, and 1-D weights are not
-    extended — they are not linear projections in the matmul sense.
-"""
+# See docs/research/rnn_fold.rst:rnn_all.zero_init_transform_overview for
+# the full per-layer recurrent transform, zero-init rationale, and conv handling.
 
 # Parameter name fragments that indicate non-projection weights to skip.
 _RNN_ALL_SKIP_SUFFIXES = re.compile(
@@ -1272,14 +893,7 @@ _RNN_ALL_SKIP_NAMES = re.compile(
 
 
 def _is_rnn_all_eligible(name: str, shape: torch.Size) -> bool:
-    """
-    Return True if this parameter should be extended with a recurrent block.
-
-    Eligibility rules:
-      1. Must be 2-D (linear) or 4-D (conv).
-      2. Neither dimension may be 1 (no bias-shaped weights, no single-channel).
-      3. Name must not match known non-projection patterns.
-    """
+    """True if extendable with a recurrent block: 2-D/4-D, no dim==1, name not a known non-projection pattern."""
     if _RNN_ALL_SKIP_SUFFIXES.search(name):
         return False
     if _RNN_ALL_SKIP_NAMES.search(name):
@@ -1293,20 +907,8 @@ def _is_rnn_all_eligible(name: str, shape: torch.Size) -> bool:
 
 def _extend_csr_columns(csr: torch.Tensor, extra_cols: int) -> torch.Tensor:
     """
-    Extend a CSR matrix of shape [rows, cols] to [rows, cols + extra_cols].
-
-    The new columns contain no nonzero entries (zero-sparse init).
-    This is a pure metadata operation: values and indices are unchanged;
-    only the stored shape is widened.
-
-    Parameters
-    ----------
-    csr        : existing CSR tensor  [rows, cols]
-    extra_cols : number of new (empty) columns to append
-
-    Returns
-    -------
-    New CSR tensor of shape [rows, cols + extra_cols] with identical nonzeros.
+    Extend CSR [rows, cols] to [rows, cols+extra_cols]; new columns hold no
+    nonzeros (zero-sparse init) -- pure metadata op, values/indices unchanged.
     """
     new_cols = csr.shape[1] + extra_cols
     return torch.sparse_csr_tensor(
@@ -1319,19 +921,13 @@ def _extend_csr_columns(csr: torch.Tensor, extra_cols: int) -> torch.Tensor:
 
 
 def _extend_dense_columns(t: torch.Tensor, extra_cols: int) -> torch.Tensor:
-    """
-    Extend a dense 2-D tensor of shape [rows, cols] to [rows, cols + extra_cols]
-    by appending zero columns.  Used for non-sparse weights.
-    """
+    """Extend dense [rows, cols] to [rows, cols+extra_cols] by appending zero columns (non-sparse weights)."""
     zeros = torch.zeros(t.shape[0], extra_cols, dtype=t.dtype, device=t.device)
     return torch.cat([t, zeros], dim=1)
 
 
 def _extend_dense_conv(t: torch.Tensor, extra_in_channels: int) -> torch.Tensor:
-    """
-    Extend a conv weight [out_c, in_c, kH, kW] to [out_c, in_c+extra, kH, kW]
-    by appending zero input-channel slices.
-    """
+    """Extend conv [out_c, in_c, kH, kW] to [out_c, in_c+extra, kH, kW] by appending zero input-channel slices."""
     kH, kW = t.shape[2], t.shape[3]
     zeros = torch.zeros(t.shape[0], extra_in_channels, kH, kW, dtype=t.dtype, device=t.device)
     return torch.cat([t, zeros], dim=1)
@@ -1345,9 +941,9 @@ class RNNAllLayerInfo:
     ----------
     name          : parameter name in the state dict
     original_shape: shape before extension
-    ff_dim        : original input dimension (cols 0…ff_dim-1 are feedforward)
-    rec_dim       : recurrent dimension = output dim (= out for linear, out_c for conv)
-    is_conv       : True if this is a conv weight (4-D), False for linear (2-D)
+    ff_dim        : original input dimension (cols 0..ff_dim-1 are feedforward)
+    rec_dim       : recurrent dimension = output dim (out for linear, out_c for conv)
+    is_conv       : True if a conv weight (4-D), False for linear (2-D)
     """
 
     def __init__(self, name: str, original_shape: torch.Size, ff_dim: int, rec_dim: int, is_conv: bool):
@@ -1358,12 +954,7 @@ class RNNAllLayerInfo:
         self.is_conv = is_conv
 
     def state_shape(self, batch: int = 1, seq: int = 1, spatial_h: int = 1, spatial_w: int = 1) -> tuple:
-        """
-        Runtime state shape for this layer.
-
-        Linear:  (batch, seq, rec_dim)  — broadcasts over sequence dim
-        Conv:    (batch, rec_dim, spatial_h, spatial_w)
-        """
+        """Runtime state shape: linear -> (batch, seq, rec_dim); conv -> (batch, rec_dim, spatial_h, spatial_w)."""
         if self.is_conv:
             return (batch, self.rec_dim, spatial_h, spatial_w)
         return (batch, seq, self.rec_dim)
@@ -1377,24 +968,12 @@ class RNNAllLayerInfo:
 
 def apply_rnn_all_to_payload(payload: dict) -> dict:
     """
-    Extend every eligible linear / conv weight in the payload with a zero-sparse
-    recurrent input block, converting each op into a per-layer RNN cell.
-
-    Transform per eligible weight W
-    ─────────────────────────────────
-    Linear  [out, in]           →  [out, in + out]
-    Conv    [out_c, in_c, k, k] →  [out_c, in_c + out_c, k, k]
-
-    The appended columns / channels are empty (no nonzero entries for sparse
-    tensors, zero-padded for dense tensors).  File size increases only by the
-    additional shape metadata, not by new weight values.
-
-    Returns
-    -------
-    Modified payload with:
-      "sparse_state_dict"  : weights replaced by extended versions
-      "rnn_all_layers"     : list of RNNAllLayerInfo dicts (for runtime use)
-      "rnn_all_meta"       : summary counts
+    Extend every eligible linear/conv weight in the payload with a
+    zero-sparse recurrent input block, converting each op into a per-layer
+    RNN cell -- see docs/research/rnn_fold.rst:
+    rnn_all.zero_init_transform_overview for the transform and rationale.
+    Returns payload with "sparse_state_dict" replaced by extended versions,
+    "rnn_all_layers" (list of RNNAllLayerInfo dicts), "rnn_all_meta" (summary counts).
     """
     ssd = payload.get("sparse_state_dict", payload)
 
@@ -1724,11 +1303,8 @@ def main() -> None:
 
     working = payload
 
-    # fold is the default operation; --rnn-all is the opt-in extension.
-    # --rnn-fold was never added to the CLI parser (pre-existing bug) so
-    # the original `if args.rnn_fold or not args.rnn_all:` would crash with
-    # AttributeError. The corrected intent: fold unless --rnn-all was the
-    # ONLY flag passed (meaning the user explicitly opted out of folding).
+    # Fold unless --rnn-all is the only flag passed -- see docs/research/
+    # rnn_fold.rst:main.rnn_fold_flag_bug.
     if not args.rnn_all:
         working = fold_sparse_payload(
             working,
