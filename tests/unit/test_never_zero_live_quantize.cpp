@@ -16,16 +16,21 @@
 #include <cstring>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 int main() {
     fp4_seed_stochastic_rng(0);
 
     // ── (1) Never code 0 / byte 0x00 -- deterministic, dense sweep ──────────
     for (int i = -10000; i <= 10000; ++i) {
-        const float v = float(i) / 10000.0f;  // [-1, 1]
+        const float v = float(i) / 10000.0f; // [-1, 1]
         CHECK(fp4_quantize_live(v) != 0, "fp4_quantize_live(%f) returned code 0", double(v));
         CHECK(fp8_quantize_live(v) != 0, "fp8_quantize_live(%f) returned code 0", double(v));
     }
@@ -41,26 +46,30 @@ int main() {
     CHECK(fp8_quantize_live(-0.0f) != 0x80, "fp8_quantize_live(-0.0) returned -0 byte (0x80)");
 
     // ── (2) Never code 0 -- stochastic, hard floor over many draws ──────────
-    const float fp4_test_vals[] = {0.0f, -0.0f, 0.01f, -0.01f, 0.1f, -0.1f, 0.2f, -0.2f,
-                                    0.24f, -0.24f, 0.4f, -0.4f, 0.5f, -0.5f, 1.0f, -1.0f,
-                                    2.0f, -2.0f, 5.9f, -5.9f, 100.0f, -100.0f};
+    const float fp4_test_vals[] = {0.0f,  -0.0f,  0.01f, -0.01f, 0.1f,   -0.1f,  0.2f, -0.2f,
+                                   0.24f, -0.24f, 0.4f,  -0.4f,  0.5f,   -0.5f,  1.0f, -1.0f,
+                                   2.0f,  -2.0f,  5.9f,  -5.9f,  100.0f, -100.0f};
     for (float v : fp4_test_vals) {
         for (int i = 0; i < 100000; ++i) {
             CHECK(fp4_quantize_stochastic_live(v) != 0,
                   "fp4_quantize_stochastic_live(%f) returned code 0 on draw %d", double(v), i);
         }
     }
-    const float fp8_test_vals[] = {0.0f, -0.0f, 1e-4f, -1e-4f, 0.001f, -0.001f, 0.01f, -0.01f,
-                                    1.0f, -1.0f, 100.0f, -100.0f, 500.0f, -500.0f};
+    const float fp8_test_vals[] = {0.0f,   -0.0f, 1e-4f, -1e-4f, 0.001f,  -0.001f, 0.01f,
+                                   -0.01f, 1.0f,  -1.0f, 100.0f, -100.0f, 500.0f,  -500.0f};
     for (float v : fp8_test_vals) {
         for (int i = 0; i < 100000; ++i) {
             const uint8_t code = fp8_quantize_stochastic_live(v);
-            CHECK(code != 0x00, "fp8_quantize_stochastic_live(%f) returned +0 byte on draw %d", double(v), i);
-            CHECK(code != 0x80, "fp8_quantize_stochastic_live(%f) returned -0 byte on draw %d", double(v), i);
+            CHECK(code != 0x00, "fp8_quantize_stochastic_live(%f) returned +0 byte on draw %d",
+                  double(v), i);
+            CHECK(code != 0x80, "fp8_quantize_stochastic_live(%f) returned -0 byte on draw %d",
+                  double(v), i);
         }
     }
-    CHECK(fp4_quantize_stochastic_live(NAN) != 0, "fp4_quantize_stochastic_live(NaN) returned code 0");
-    CHECK(fp8_quantize_stochastic_live(NAN) != 0, "fp8_quantize_stochastic_live(NaN) returned code 0");
+    CHECK(fp4_quantize_stochastic_live(NAN) != 0,
+          "fp4_quantize_stochastic_live(NaN) returned code 0");
+    CHECK(fp8_quantize_stochastic_live(NAN) != 0,
+          "fp8_quantize_stochastic_live(NaN) returned code 0");
 
     // ── (3) Sign-swing probability curve matches the design's intended ──────
     //        p_pos = (v + HALF_BITS) / (2*HALF_BITS) for FP4's [-0.5,0.5)
@@ -73,19 +82,21 @@ int main() {
         for (float v : grid) {
             int pos_count = 0;
             for (int i = 0; i < N; ++i) {
-                if (fp4_decode_bits(fp4_quantize_stochastic_live(v)) > 0.0f) ++pos_count;
+                if (fp4_decode_bits(fp4_quantize_stochastic_live(v)) > 0.0f)
+                    ++pos_count;
             }
             const double p_pos_measured = double(pos_count) / N;
             const double p_pos_expected = (double(v) + 0.5) / 1.0;
             CHECK(std::abs(p_pos_measured - p_pos_expected) < 0.01,
-                  "fp4 sign-swing P(+0.5) for v=%f: measured=%f expected=%f",
-                  double(v), p_pos_measured, p_pos_expected);
+                  "fp4 sign-swing P(+0.5) for v=%f: measured=%f expected=%f", double(v),
+                  p_pos_measured, p_pos_expected);
         }
         // v=0.0 must be close to a fair coin flip, NOT near-0 or near-1
         // (that would mean the redirect collapsed to a fixed sign again).
         int pos_count_zero = 0;
         for (int i = 0; i < N; ++i)
-            if (fp4_decode_bits(fp4_quantize_stochastic_live(0.0f)) > 0.0f) ++pos_count_zero;
+            if (fp4_decode_bits(fp4_quantize_stochastic_live(0.0f)) > 0.0f)
+                ++pos_count_zero;
         const double p_zero = double(pos_count_zero) / N;
         CHECK(p_zero > 0.45 && p_zero < 0.55,
               "fp4 sign-swing at v=0.0 should be ~50/50, measured P(+0.5)=%f", p_zero);
@@ -94,18 +105,19 @@ int main() {
         // Same curve check for FP8's [-2^-9,+2^-9) bracket.
         const int N = 200000;
         const float half = 1.0f / 512.0f;
-        const float grid[] = {-0.9f*1.0f/512.0f, -0.5f/512.0f, -0.1f/512.0f, 0.0f,
-                               0.1f/512.0f, 0.5f/512.0f, 0.9f/512.0f};
+        const float grid[] = {-0.9f * 1.0f / 512.0f, -0.5f / 512.0f, -0.1f / 512.0f, 0.0f,
+                              0.1f / 512.0f,         0.5f / 512.0f,  0.9f / 512.0f};
         for (float v : grid) {
             int pos_count = 0;
             for (int i = 0; i < N; ++i) {
-                if (fp8_decode_bits(fp8_quantize_stochastic_live(v)) > 0.0f) ++pos_count;
+                if (fp8_decode_bits(fp8_quantize_stochastic_live(v)) > 0.0f)
+                    ++pos_count;
             }
             const double p_pos_measured = double(pos_count) / N;
             const double p_pos_expected = (double(v) + double(half)) / (2.0 * double(half));
             CHECK(std::abs(p_pos_measured - p_pos_expected) < 0.01,
-                  "fp8 sign-swing P(+2^-9) for v=%f: measured=%f expected=%f",
-                  double(v), p_pos_measured, p_pos_expected);
+                  "fp8 sign-swing P(+2^-9) for v=%f: measured=%f expected=%f", double(v),
+                  p_pos_measured, p_pos_expected);
         }
     }
 
@@ -121,21 +133,23 @@ int main() {
     //        regressions before the fix landed -- see conversation.
     {
         const float nonneg_vals[] = {0.0f, 1e-6f, 0.001f, 0.01f, 0.1f, 0.24f,
-                                      0.4f, 0.49f, 0.5f, 1.0f, 5.9f, 100.0f};
+                                     0.4f, 0.49f, 0.5f,   1.0f,  5.9f, 100.0f};
         for (float v : nonneg_vals) {
             for (int i = 0; i < 50000; ++i) {
                 CHECK(fp4_decode_bits(fp4_quantize_stochastic_live_nonneg(v)) >= 0.0f,
-                      "fp4_quantize_stochastic_live_nonneg(%f) went negative on draw %d",
-                      double(v), i);
+                      "fp4_quantize_stochastic_live_nonneg(%f) went negative on draw %d", double(v),
+                      i);
                 CHECK(fp8_decode_bits(fp8_quantize_stochastic_live_nonneg(v)) >= 0.0f,
-                      "fp8_quantize_stochastic_live_nonneg(%f) went negative on draw %d",
-                      double(v), i);
+                      "fp8_quantize_stochastic_live_nonneg(%f) went negative on draw %d", double(v),
+                      i);
             }
         }
         // Deterministic live functions were already safe (never had this
         // bug) -- guard that stays true too.
-        CHECK(fp4_decode_bits(fp4_quantize_live(0.0f)) >= 0.0f, "fp4_quantize_live(0.0) went negative");
-        CHECK(fp8_decode_bits(fp8_quantize_live(0.0f)) >= 0.0f, "fp8_quantize_live(0.0) went negative");
+        CHECK(fp4_decode_bits(fp4_quantize_live(0.0f)) >= 0.0f,
+              "fp4_quantize_live(0.0) went negative");
+        CHECK(fp8_decode_bits(fp8_quantize_live(0.0f)) >= 0.0f,
+              "fp8_quantize_live(0.0) went negative");
     }
 
     // ── (3b) SIMD wrapper: same never-0 guarantee, all 4 lanes ──────────────
@@ -154,7 +168,8 @@ int main() {
                 std::memcpy(code_arr, &codes, sizeof(code_arr));
                 for (int lane = 0; lane < 4; ++lane) {
                     CHECK((code_arr[lane] & 0xFu) != 0,
-                          "block4_vec_quantize_stochastic_fp4_live lane %d (v=%f) returned code 0 on draw %d",
+                          "block4_vec_quantize_stochastic_fp4_live lane %d (v=%f) returned code 0 "
+                          "on draw %d",
                           lane, double(lv[lane]), i);
                 }
             }
@@ -162,18 +177,24 @@ int main() {
     }
 
     // ── (4) Regression guard: non-live functions must be completely untouched ──
-    CHECK(fp4_quantize(0.0f) == 0, "fp4_quantize(0.0) should still be code 0 (non-live unaffected)");
-    CHECK(fp8_quantize(0.0f) == 0, "fp8_quantize(0.0) should still be code 0 (non-live unaffected)");
+    CHECK(fp4_quantize(0.0f) == 0,
+          "fp4_quantize(0.0) should still be code 0 (non-live unaffected)");
+    CHECK(fp8_quantize(0.0f) == 0,
+          "fp8_quantize(0.0) should still be code 0 (non-live unaffected)");
     {
         // Confirm the non-live stochastic function can still land on 0 for
         // near-zero values (statistical -- at least one 0 across many draws).
         bool saw_zero_fp4 = false, saw_zero_fp8 = false;
         for (int i = 0; i < 10000; ++i) {
-            if (fp4_quantize_stochastic(0.1f) == 0) saw_zero_fp4 = true;
-            if (fp8_quantize_stochastic(0.001f) == 0) saw_zero_fp8 = true;
+            if (fp4_quantize_stochastic(0.1f) == 0)
+                saw_zero_fp4 = true;
+            if (fp8_quantize_stochastic(0.001f) == 0)
+                saw_zero_fp8 = true;
         }
-        CHECK(saw_zero_fp4, "fp4_quantize_stochastic(0.1) never landed on code 0 in 10000 draws -- non-live behavior changed?");
-        CHECK(saw_zero_fp8, "fp8_quantize_stochastic(0.001) never landed on code 0 in 10000 draws -- non-live behavior changed?");
+        CHECK(saw_zero_fp4, "fp4_quantize_stochastic(0.1) never landed on code 0 in 10000 draws -- "
+                            "non-live behavior changed?");
+        CHECK(saw_zero_fp8, "fp8_quantize_stochastic(0.001) never landed on code 0 in 10000 draws "
+                            "-- non-live behavior changed?");
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);

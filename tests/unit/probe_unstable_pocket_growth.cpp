@@ -55,8 +55,8 @@
 #include <vector>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static const std::size_t N = 8;
 static const std::size_t N_STEPS = 30000;
@@ -64,7 +64,8 @@ static const float LR = 0.05f;
 
 static std::vector<float> permutation_target(std::size_t n) {
     std::vector<float> t(n * n, 0.0f);
-    for (std::size_t i = 0; i < n; ++i) t[i * n + (i + 1) % n] = 0.37f;
+    for (std::size_t i = 0; i < n; ++i)
+        t[i * n + (i + 1) % n] = 0.37f;
     return t;
 }
 
@@ -75,7 +76,8 @@ static Weights make_dense_layer(std::size_t n) {
     std::vector<float> wv(n * n, 0.0f), imp(n * n, 0.0f);
     for (std::size_t r = 0; r < n; ++r) {
         ptrs[r] = SIZE_TYPE(r * n);
-        for (std::size_t c = 0; c < n; ++c) idx[r * n + c] = SIZE_TYPE(c);
+        for (std::size_t c = 0; c < n; ++c)
+            idx[r * n + c] = SIZE_TYPE(c);
     }
     ptrs[n] = SIZE_TYPE(n * n);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -85,13 +87,14 @@ static Weights make_dense_layer(std::size_t n) {
 }
 
 int main() {
-    const float min_decay_frac = 0.9995f;   // no-op-adjacent value, matches production default region
-    const float max_abs_delta = 12.0f;      // known unsafe pocket (raw-space; == 0.6 final-space)
+    const float min_decay_frac = 0.9995f; // no-op-adjacent value, matches production default region
+    const float max_abs_delta = 12.0f;    // known unsafe pocket (raw-space; == 0.6 final-space)
 
     Weights weights = make_dense_layer(N);
     const std::vector<float> target = permutation_target(N);
     std::vector<float> basis(N * N, 0.0f);
-    for (std::size_t i = 0; i < N; ++i) basis[i * N + i] = 1.0f;
+    for (std::size_t i = 0; i < N; ++i)
+        basis[i * N + i] = 1.0f;
 
     const std::size_t checkpoint_every = N_STEPS / 30;
     std::vector<float> checkpoints;
@@ -99,13 +102,16 @@ int main() {
     for (std::size_t step = 0; step < N_STEPS; ++step) {
         for (std::size_t i = 0; i < N; ++i) {
             std::vector<float> y(N, 0.0f);
-            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), weights, y.data(), 1);
+            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N),
+                                                             weights, y.data(), 1);
             std::vector<float> dy(N);
-            for (std::size_t c = 0; c < N; ++c) dy[c] = 2.0f * (y[c] - target[i * N + c]);
+            for (std::size_t c = 0; c < N; ++c)
+                dy[c] = 2.0f * (y[c] - target[i * N + c]);
             std::vector<float> dx(N, 0.0f), ni(N, 0.0f), ng(N, 0.0f);
-            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false, BoundedRMSpropSynapsePolicy>(
-                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(), ni.data(), ng.data(), LR, 1,
-                false, true, 0.999f, 1e-8f, 0.9f, min_decay_frac, max_abs_delta);
+            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false,
+                            false, BoundedRMSpropSynapsePolicy>(
+                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(), ni.data(), ng.data(),
+                LR, 1, false, true, 0.999f, 1e-8f, 0.9f, min_decay_frac, max_abs_delta);
         }
 
         const bool fine_grained_tail = step >= N_STEPS - 2000 && step % 50 == 0;
@@ -114,7 +120,8 @@ int main() {
             float max_abs_y = 0.0f;
             for (std::size_t i = 0; i < N; ++i) {
                 std::vector<float> y(N, 0.0f);
-                disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), weights, y.data(), 1);
+                disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N),
+                                                                 weights, y.data(), 1);
                 for (std::size_t c = 0; c < N; ++c) {
                     max_abs_y = std::max(max_abs_y, std::abs(y[c]));
                     const float d = y[c] - target[i * N + c];
@@ -124,7 +131,9 @@ int main() {
             checkpoints.push_back(sse);
             std::printf("step=%6zu sse=%12.2f max_abs_y=%.6f\n", step, sse, max_abs_y);
             if (!std::isfinite(sse)) {
-                std::printf("SSE became non-finite at step %zu -- genuine unbounded blowup, not a bounded plateau.\n", step);
+                std::printf("SSE became non-finite at step %zu -- genuine unbounded blowup, not a "
+                            "bounded plateau.\n",
+                            step);
                 return 1;
             }
         }
@@ -154,17 +163,20 @@ int main() {
                 first_of_last_quarter, last, ratio);
     if (ratio > 1.5f) {
         std::printf("VERDICT: still growing substantially in the last quarter of the run -- "
-                    "leans UNBOUNDED, not a settled plateau (at least not within %zu steps).\n", N_STEPS);
+                    "leans UNBOUNDED, not a settled plateau (at least not within %zu steps).\n",
+                    N_STEPS);
     } else if (ratio < 0.67f) {
-        std::printf("VERDICT: SSE dropped sharply -- this is NOT necessarily real recovery, see the\n"
-                    "         per-checkpoint max_abs_y log above. A drop to a target-dependent SSE\n"
-                    "         value (e.g. exactly sum(importance*target^2), what an all-zero output\n"
-                    "         gives) combined with max_abs_y==0.0 means numeric overflow got silently\n"
-                    "         masked, NOT genuine convergence -- check max_abs_y at the final steps\n"
-                    "         before trusting a dropping SSE trend at all.\n");
+        std::printf(
+            "VERDICT: SSE dropped sharply -- this is NOT necessarily real recovery, see the\n"
+            "         per-checkpoint max_abs_y log above. A drop to a target-dependent SSE\n"
+            "         value (e.g. exactly sum(importance*target^2), what an all-zero output\n"
+            "         gives) combined with max_abs_y==0.0 means numeric overflow got silently\n"
+            "         masked, NOT genuine convergence -- check max_abs_y at the final steps\n"
+            "         before trusting a dropping SSE trend at all.\n");
     } else {
         std::printf("VERDICT: roughly flat in the last quarter -- BOUNDED plateau, "
-                    "elevated but not unbounded (at least not within %zu steps).\n", N_STEPS);
+                    "elevated but not unbounded (at least not within %zu steps).\n",
+                    N_STEPS);
     }
     std::printf("\nOVERALL FINDING (this run): SSE grew smoothly and continuously for the entire\n"
                 "run (692 -> 313544 across steps 1000-29950, no sign of leveling off) until a\n"

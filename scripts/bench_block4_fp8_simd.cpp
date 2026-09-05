@@ -49,8 +49,8 @@
 #include <algorithm>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP8BiValues, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP8BiValues, COL_TYPE>;
 
 static double best_of(int reps, const std::function<void()>& fn) {
     fn();
@@ -58,7 +58,9 @@ static double best_of(int reps, const std::function<void()>& fn) {
     for (int i = 0; i < reps; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
         fn();
-        best = std::min(best, std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
+        best = std::min(
+            best,
+            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
     }
     return best;
 }
@@ -73,15 +75,18 @@ int main(int argc, char** argv) {
     std::uniform_real_distribution<float> data_dist(-1.0f, 1.0f);
 
     std::vector<float> x(std::size_t(batch) * n_in), dy(std::size_t(batch) * n_out);
-    for (auto& v : x) v = data_dist(rng);
-    for (auto& v : dy) v = data_dist(rng);
+    for (auto& v : x)
+        v = data_dist(rng);
+    for (auto& v : dy)
+        v = data_dist(rng);
 
     Weights w;
     std::vector<SIZE_TYPE> empty_ptrs(n_in + 1, 0);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP8BiValues, COL_TYPE>(
         empty_ptrs, {}, {}, {}, n_in, n_out, 4096, 64, 0.1f);
     w.block4.init(n_in, n_out);
-    w.block4.switch_point = 0; // fully dense-loaded, no compression -- matches the "load dense, then prune" workflow
+    w.block4.switch_point =
+        0; // fully dense-loaded, no compression -- matches the "load dense, then prune" workflow
     w.out_degree.assign(n_out, SIZE_TYPE(0));
 
     const int tiles_r = n_in / 4, tiles_c = n_out / 4;
@@ -90,26 +95,29 @@ int main(int argc, char** argv) {
             auto tile = w.block4.get_or_create(uint32_t(br), uint32_t(bc));
             for (uint32_t li = 0; li < 4; ++li)
                 for (uint32_t lj = 0; lj < 4; ++lj) {
-                    tile.at_weight(li, lj)     = fp8_quantize(val_dist(rng));
+                    tile.at_weight(li, lj) = fp8_quantize(val_dist(rng));
                     tile.at_importance(li, lj) = fp8_quantize(std::abs(val_dist(rng)));
                 }
         }
     }
-    for (int c = 0; c < n_out; ++c) w.out_degree[c] = tiles_r * 4;
+    for (int c = 0; c < n_out; ++c)
+        w.out_degree[c] = tiles_r * 4;
 
     std::vector<float> dx(std::size_t(batch) * n_in), nia(n_in, 0.f), nga(n_out, 0.f);
 
     const double t = best_of(reps, [&]() {
         std::fill(dx.begin(), dx.end(), 0.f);
-        disldo_backward<SIZE_TYPE, FP8BiValues, COL_TYPE>(
-            x.data(), batch, n_in, dy.data(), w, dx.data(), nia.data(), nga.data(),
-            learning_rate, 1, false, true);
+        disldo_backward<SIZE_TYPE, FP8BiValues, COL_TYPE>(x.data(), batch, n_in, dy.data(), w,
+                                                          dx.data(), nia.data(), nga.data(),
+                                                          learning_rate, 1, false, true);
     });
 
 #if SILI_BLOCK4_FORCE_SCALAR_BACKWARD
-    std::printf("scalar: batch=%d  %.6f s/call (best of %d), n_tiles=%zu\n", batch, t, reps, w.block4.n_tiles());
+    std::printf("scalar: batch=%d  %.6f s/call (best of %d), n_tiles=%zu\n", batch, t, reps,
+                w.block4.n_tiles());
 #else
-    std::printf("simd:   batch=%d  %.6f s/call (best of %d), n_tiles=%zu\n", batch, t, reps, w.block4.n_tiles());
+    std::printf("simd:   batch=%d  %.6f s/call (best of %d), n_tiles=%zu\n", batch, t, reps,
+                w.block4.n_tiles());
 #endif
     return 0;
 }

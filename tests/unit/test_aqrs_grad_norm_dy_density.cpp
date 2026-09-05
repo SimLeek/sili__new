@@ -31,13 +31,18 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static const std::size_t N_IN = 8, N_OUT = 8;
 
@@ -50,7 +55,7 @@ static Weights make_weights(std::size_t scale_rank, std::size_t additive_rank) {
         ptrs[r] = SIZE_TYPE(r * N_OUT);
         for (std::size_t c = 0; c < N_OUT; ++c) {
             idx[r * N_OUT + c] = SIZE_TYPE(c);
-            wv[r * N_OUT + c]  = 1.0f + 0.05f * float((r + c) % 5);
+            wv[r * N_OUT + c] = 1.0f + 0.05f * float((r + c) % 5);
         }
     }
     ptrs[N_IN] = SIZE_TYPE(N_IN * N_OUT);
@@ -83,14 +88,15 @@ static Weights make_weights(std::size_t scale_rank, std::size_t additive_rank) {
 // entries at the SAME magnitude M, so only density differs between calls),
 // returns the resulting scale_gamma/additive_gamma grad_ema[0].
 static void run_backward(Weights& w, const std::vector<SIZE_TYPE>& present_cols, float magnitude,
-                          float& out_scale_grad_ema, float& out_additive_grad_ema) {
+                         float& out_scale_grad_ema, float& out_additive_grad_ema) {
     std::vector<float> input(N_IN);
-    for (std::size_t r = 0; r < N_IN; ++r) input[r] = 0.2f + 0.1f * float(r);
+    for (std::size_t r = 0; r < N_IN; ++r)
+        input[r] = 0.2f + 0.1f * float(r);
 
     std::vector<SIZE_TYPE> dy_idx = present_cols;
     std::vector<float> dy_val(present_cols.size(), magnitude);
-    auto dy_csr = make_csr_input<SIZE_TYPE, float>(
-        SIZE_TYPE(1), SIZE_TYPE(N_OUT), {0, SIZE_TYPE(dy_idx.size())}, dy_idx, dy_val);
+    auto dy_csr = make_csr_input<SIZE_TYPE, float>(SIZE_TYPE(1), SIZE_TYPE(N_OUT),
+                                                   {0, SIZE_TYPE(dy_idx.size())}, dy_idx, dy_val);
 
     std::vector<float> dx(N_IN, 0.0f), ni(N_IN, 0.0f), ng(N_OUT, 0.0f);
     disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false>(
@@ -101,13 +107,15 @@ static void run_backward(Weights& w, const std::vector<SIZE_TYPE>& present_cols,
 }
 
 static void test_grad_ema_density_independent() {
-    Weights w_dense_dy  = make_weights(/*scale_rank=*/2, /*additive_rank=*/2);
+    Weights w_dense_dy = make_weights(/*scale_rank=*/2, /*additive_rank=*/2);
     Weights w_sparse_dy = make_weights(/*scale_rank=*/2, /*additive_rank=*/2);
 
     std::vector<SIZE_TYPE> all_cols;
-    for (SIZE_TYPE c = 0; c < SIZE_TYPE(N_OUT); ++c) all_cols.push_back(c);
+    for (SIZE_TYPE c = 0; c < SIZE_TYPE(N_OUT); ++c)
+        all_cols.push_back(c);
     std::vector<SIZE_TYPE> half_cols;
-    for (SIZE_TYPE c = 0; c < SIZE_TYPE(N_OUT); c += 2) half_cols.push_back(c);   // 50% density
+    for (SIZE_TYPE c = 0; c < SIZE_TYPE(N_OUT); c += 2)
+        half_cols.push_back(c); // 50% density
 
     const float magnitude = -0.3f;
     float scale_ema_dense, additive_ema_dense;
@@ -117,16 +125,21 @@ static void test_grad_ema_density_independent() {
 
     std::printf("[grad_norm_dy_density] scale_gamma grad_ema: dense_dy=%.6f sparse_dy(50%%)=%.6f\n",
                 scale_ema_dense, scale_ema_sparse);
-    std::printf("[grad_norm_dy_density] additive_gamma grad_ema: dense_dy=%.6f sparse_dy(50%%)=%.6f\n",
-                additive_ema_dense, additive_ema_sparse);
+    std::printf(
+        "[grad_norm_dy_density] additive_gamma grad_ema: dense_dy=%.6f sparse_dy(50%%)=%.6f\n",
+        additive_ema_dense, additive_ema_sparse);
 
     // Both nonzero (real signal reached the trigger at all -- the whole
     // point of the fix; pre-fix the sparse arm would still be nonzero, just
     // roughly half).
-    CHECK(scale_ema_dense > 0.0f, "dense-dy scale_gamma grad_ema should be nonzero (got %.6f)", scale_ema_dense);
-    CHECK(scale_ema_sparse > 0.0f, "sparse-dy scale_gamma grad_ema should be nonzero (got %.6f)", scale_ema_sparse);
-    CHECK(additive_ema_dense > 0.0f, "dense-dy additive_gamma grad_ema should be nonzero (got %.6f)", additive_ema_dense);
-    CHECK(additive_ema_sparse > 0.0f, "sparse-dy additive_gamma grad_ema should be nonzero (got %.6f)", additive_ema_sparse);
+    CHECK(scale_ema_dense > 0.0f, "dense-dy scale_gamma grad_ema should be nonzero (got %.6f)",
+          scale_ema_dense);
+    CHECK(scale_ema_sparse > 0.0f, "sparse-dy scale_gamma grad_ema should be nonzero (got %.6f)",
+          scale_ema_sparse);
+    CHECK(additive_ema_dense > 0.0f,
+          "dense-dy additive_gamma grad_ema should be nonzero (got %.6f)", additive_ema_dense);
+    CHECK(additive_ema_sparse > 0.0f,
+          "sparse-dy additive_gamma grad_ema should be nonzero (got %.6f)", additive_ema_sparse);
 
     // The real property under test: density-compensated, so the sparse arm
     // should land within a real tolerance of the dense arm -- NOT at ~50%
@@ -135,10 +148,12 @@ static void test_grad_ema_density_independent() {
     const float additive_ratio = additive_ema_sparse / additive_ema_dense;
     CHECK(scale_ratio > 0.7f && scale_ratio < 1.4f,
           "scale_gamma grad_ema should be density-independent after the fix -- "
-          "ratio sparse/dense = %.3f (pre-fix this would land near 0.5)", scale_ratio);
+          "ratio sparse/dense = %.3f (pre-fix this would land near 0.5)",
+          scale_ratio);
     CHECK(additive_ratio > 0.7f && additive_ratio < 1.4f,
           "additive_gamma grad_ema should be density-independent after the fix -- "
-          "ratio sparse/dense = %.3f (pre-fix this would land near 0.5)", additive_ratio);
+          "ratio sparse/dense = %.3f (pre-fix this would land near 0.5)",
+          additive_ratio);
 }
 
 int main() {

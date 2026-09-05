@@ -7,9 +7,13 @@
 #include <cmath>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 int main() {
     const int n_in = 8, n_out = 8;
@@ -19,11 +23,16 @@ int main() {
     // so the two paths are cleanly separable in this test.
     std::vector<int> ptrs(n_in + 1, 0), idx;
     std::vector<float> w, imp;
-    idx.push_back(5); w.push_back(2.0f); imp.push_back(0.5f);
+    idx.push_back(5);
+    w.push_back(2.0f);
+    imp.push_back(0.5f);
     ptrs[1] = 1;
-    idx.push_back(2); w.push_back(-1.5f); imp.push_back(0.5f);
+    idx.push_back(2);
+    w.push_back(-1.5f);
+    imp.push_back(0.5f);
     ptrs[2] = 2;
-    for (int r = 2; r <= n_in; ++r) ptrs[r] = 2;
+    for (int r = 2; r <= n_in; ++r)
+        ptrs[r] = 2;
 
     SparseLinearWeightsDelta<int, FP4BiPacked, uint32_t> weights;
     weights.connections = delta_csr_from_absolute<int, FP4BiPacked, uint32_t>(
@@ -40,14 +49,15 @@ int main() {
     // before disldo_forward below reads this tile back out.
     {
         auto tile = weights.block4.get_or_create(0, 0);
-        tile.at(0, 1) = fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4);   // row=0(local_i),col=1(local_j)
-        tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4);   // row=2,col=3
+        tile.at(0, 1) =
+            fp4_quantize(1.0f) | (fp4_quantize(0.5f) << 4); // row=0(local_i),col=1(local_j)
+        tile.at(2, 3) = fp4_quantize(0.5f) | (fp4_quantize(0.5f) << 4); // row=2,col=3
     }
 
     std::vector<float> x(n_in, 0.f);
-    x[0] = 3.0f;   // feeds block4's (row=0,col=1)
-    x[1] = 1.0f;   // feeds scattered row=1
-    x[2] = 2.0f;   // feeds block4's (row=2,col=3) AND scattered row=2(none)
+    x[0] = 3.0f; // feeds block4's (row=0,col=1)
+    x[1] = 1.0f; // feeds scattered row=1
+    x[2] = 2.0f; // feeds block4's (row=2,col=3) AND scattered row=2(none)
 
     // Expected output computed by hand:
     // scattered: row0->col5 w=2.0, contributes x[0]*2.0 = 3.0*2.0 = 6.0 to output[5]
@@ -64,7 +74,8 @@ int main() {
     disldo_forward<int, FP4BiPacked, uint32_t>(x.data(), 1, n_in, weights, y.data(), 1);
 
     for (int c = 0; c < n_out; ++c)
-        CHECK(std::abs(y[c] - y_ref[c]) < 1e-4f, "output[%d]: got %.4f expected %.4f", c, y[c], y_ref[c]);
+        CHECK(std::abs(y[c] - y_ref[c]) < 1e-4f, "output[%d]: got %.4f expected %.4f", c, y[c],
+              y_ref[c]);
 
     // Regression check: with block4 empty, output must match the
     // scattered-only contributions exactly (no change to the pre-block4

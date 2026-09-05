@@ -24,8 +24,8 @@
 #include <random>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static double best_of(int reps, const std::function<void()>& fn) {
     fn();
@@ -33,7 +33,9 @@ static double best_of(int reps, const std::function<void()>& fn) {
     for (int i = 0; i < reps; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
         fn();
-        best = std::min(best, std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
+        best = std::min(
+            best,
+            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
     }
     return best;
 }
@@ -67,13 +69,15 @@ int main(int argc, char** argv) {
     weights.recompute_stats();
 
     std::vector<float> input(n_in);
-    for (auto& v : input) v = data_dist(rng);
+    for (auto& v : input)
+        v = data_dist(rng);
 
     std::vector<float> dy_dense(n_out, 0.0f);
     std::vector<SIZE_TYPE> g_idx;
     std::vector<float> g_vals;
     for (int c = 0; c < n_out; ++c) {
-        if (!keep(rng)) continue;
+        if (!keep(rng))
+            continue;
         const float v = data_dist(rng);
         dy_dense[c] = v;
         g_idx.push_back(c);
@@ -82,34 +86,41 @@ int main(int argc, char** argv) {
     const double real_density = double(g_idx.size()) / n_out;
 
     CSRInput<SIZE_TYPE, float> dy_sparse;
-    dy_sparse.rows = 1; dy_sparse.cols = n_out;
+    dy_sparse.rows = 1;
+    dy_sparse.cols = n_out;
     dy_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(
         std::vector<SIZE_TYPE>{0, static_cast<SIZE_TYPE>(g_idx.size())});
     dy_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(g_idx);
-    dy_sparse.values[0]  = std::make_shared<std::vector<float>>(g_vals);
+    dy_sparse.values[0] = std::make_shared<std::vector<float>>(g_vals);
 
     // lr=0: read-only comparison, isolates the gather/decode cost itself
     // from stochastic-quantize write-back cost (RNG calls aren't free and
     // differ in count/order between the two implementations -- see
     // conversation on why lr>0 correctness can't be checked bit-exact).
     std::vector<float> dx_dense(n_in), ni_a(n_in, 0.0f), ng_a(n_out, 0.0f);
-    const double dense_ms = best_of(reps, [&]() {
-        std::fill(dx_dense.begin(), dx_dense.end(), 0.0f);
-        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            input.data(), 1, n_in, dy_dense.data(), weights,
-            dx_dense.data(), ni_a.data(), ng_a.data(), 0.0f, num_cpus, false, true);
-    }) * 1e3;
+    const double dense_ms =
+        best_of(reps,
+                [&]() {
+                    std::fill(dx_dense.begin(), dx_dense.end(), 0.0f);
+                    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+                        input.data(), 1, n_in, dy_dense.data(), weights, dx_dense.data(),
+                        ni_a.data(), ng_a.data(), 0.0f, num_cpus, false, true);
+                }) *
+        1e3;
 
     std::vector<float> dx_sparse(n_in), ni_a2(n_in, 0.0f), ng_a2(n_out, 0.0f);
-    const double sparse_ms = best_of(reps, [&]() {
-        std::fill(dx_sparse.begin(), dx_sparse.end(), 0.0f);
-        disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            input.data(), 1, weights, dy_sparse,
-            dx_sparse.data(), ni_a2.data(), ng_a2.data(), 0.0f, num_cpus, false);
-    }) * 1e3;
+    const double sparse_ms =
+        best_of(reps,
+                [&]() {
+                    std::fill(dx_sparse.begin(), dx_sparse.end(), 0.0f);
+                    disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+                        input.data(), 1, weights, dy_sparse, dx_sparse.data(), ni_a2.data(),
+                        ng_a2.data(), 0.0f, num_cpus, false);
+                }) *
+        1e3;
 
-    std::printf("density=%.3f (real=%.3f) num_cpus=%d n_tiles=%zu\n",
-                density, real_density, num_cpus, weights.block4.n_tiles());
+    std::printf("density=%.3f (real=%.3f) num_cpus=%d n_tiles=%zu\n", density, real_density,
+                num_cpus, weights.block4.n_tiles());
     std::printf("  dense (disldo_backward):            %.4f ms\n", dense_ms);
     std::printf("  sparse (disldo_backward_sparse_grad b4): %.4f ms\n", sparse_ms);
     std::printf("  speedup (dense/sparse): %.2fx %s\n", dense_ms / sparse_ms,

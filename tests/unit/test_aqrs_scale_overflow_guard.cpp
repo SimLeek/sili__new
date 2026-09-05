@@ -18,13 +18,18 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static const std::size_t N = 8;
 
@@ -35,7 +40,8 @@ static Weights make_layer() {
     std::vector<float> vals(N * N, 1.0f), imp(N * N, 1.0f);
     for (std::size_t r = 0; r < N; ++r) {
         ptrs[r] = SIZE_TYPE(r * N);
-        for (std::size_t c = 0; c < N; ++c) idx[r * N + c] = SIZE_TYPE(c);
+        for (std::size_t c = 0; c < N; ++c)
+            idx[r * N + c] = SIZE_TYPE(c);
     }
     ptrs[N] = SIZE_TYPE(N * N);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -68,7 +74,8 @@ static void test_value_scale_round_trip() {
 
     auto vs = w.get_value_scale_raw_vector();
     CHECK(vs.size() == N * 4, "expected value_scale vector size %zu, got %zu", N * 4, vs.size());
-    for (auto& x : vs) x *= 2.0f;
+    for (auto& x : vs)
+        x *= 2.0f;
     w.set_value_scale_raw_vector(vs);
 
     for (std::size_t r = 0; r < N; ++r)
@@ -76,7 +83,8 @@ static void test_value_scale_round_trip() {
             float expected = float(r * 10 + k) * 2.0f;
             float got = w.get_value_scale_k(r, k);
             CHECK(std::fabs(got - expected) < 1e-4f,
-                  "row=%zu k=%zu: expected %.3f after bulk round-trip, got %.3f", r, k, expected, got);
+                  "row=%zu k=%zu: expected %.3f after bulk round-trip, got %.3f", r, k, expected,
+                  got);
         }
 }
 
@@ -90,7 +98,8 @@ static void test_output_scale_round_trip() {
 
     auto os = w.get_output_scale_raw_vector();
     CHECK(os.size() == N * 3, "expected output_scale vector size %zu, got %zu", N * 3, os.size());
-    for (auto& x : os) x += 100.0f;
+    for (auto& x : os)
+        x += 100.0f;
     w.set_output_scale_raw_vector(os);
 
     for (std::size_t c = 0; c < N; ++c)
@@ -98,7 +107,8 @@ static void test_output_scale_round_trip() {
             float expected = float(c + k) * 0.5f + 100.0f;
             float got = w.get_output_scale_k(c, k);
             CHECK(std::fabs(got - expected) < 1e-4f,
-                  "col=%zu k=%zu: expected %.3f after bulk round-trip, got %.3f", c, k, expected, got);
+                  "col=%zu k=%zu: expected %.3f after bulk round-trip, got %.3f", c, k, expected,
+                  got);
         }
 }
 
@@ -117,8 +127,10 @@ static void test_additive_u_v_round_trip() {
     auto av = w.get_additive_v_raw_vector();
     CHECK(au.size() == N * 5, "expected additive_u size %zu, got %zu", N * 5, au.size());
     CHECK(av.size() == N * 5, "expected additive_v size %zu, got %zu", N * 5, av.size());
-    for (auto& x : au) x = -x;
-    for (auto& x : av) x = -x;
+    for (auto& x : au)
+        x = -x;
+    for (auto& x : av)
+        x = -x;
     w.set_additive_u_raw_vector(au);
     w.set_additive_v_raw_vector(av);
 
@@ -145,23 +157,32 @@ static void test_size_mismatch_throws() {
     Weights w = make_layer();
     w.set_scale_rank_max(4);
     w.set_scale_rank(4);
-    w.set_value_scale_raw_k(0, 0, 1.0f);  // touch it so the vector is non-empty
+    w.set_value_scale_raw_k(0, 0, 1.0f); // touch it so the vector is non-empty
     bool threw = false;
-    try { w.set_value_scale_raw_vector(std::vector<float>{1.0f, 2.0f}); }
-    catch (const std::invalid_argument&) { threw = true; }
+    try {
+        w.set_value_scale_raw_vector(std::vector<float>{1.0f, 2.0f});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
     CHECK(threw, "set_value_scale_raw_vector should throw on size mismatch");
 
     threw = false;
-    try { w.set_output_scale_raw_vector(std::vector<float>(1000, 0.0f)); }
-    catch (const std::invalid_argument&) { threw = true; }
+    try {
+        w.set_output_scale_raw_vector(std::vector<float>(1000, 0.0f));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
     CHECK(threw, "set_output_scale_raw_vector should throw on size mismatch");
 
     w.set_additive_rank_max(2);
     w.set_additive_rank(2);
     w.set_additive_u_raw_k(0, 0, 1.0f);
     threw = false;
-    try { w.set_additive_u_raw_vector(std::vector<float>{}); }
-    catch (const std::invalid_argument&) { threw = true; }
+    try {
+        w.set_additive_u_raw_vector(std::vector<float>{});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
     CHECK(threw, "set_additive_u_raw_vector should throw on size mismatch (empty vs non-empty)");
 }
 
@@ -174,8 +195,11 @@ static void test_exact_size_set_does_not_throw() {
     w.set_value_scale_raw_k(0, 0, 1.0f);
     auto vs = w.get_value_scale_raw_vector();
     bool threw = false;
-    try { w.set_value_scale_raw_vector(vs); }
-    catch (const std::invalid_argument&) { threw = true; }
+    try {
+        w.set_value_scale_raw_vector(vs);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
     CHECK(!threw, "set_value_scale_raw_vector should NOT throw on exact-size input");
 }
 

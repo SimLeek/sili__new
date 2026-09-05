@@ -25,48 +25,53 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 // Test-only policy -- deliberately NOT in delta_csr_types.hpp alongside the
 // real Plain/Bounded policies (matches NoScalePolicy's own "diagnostic
 // only" precedent for the ScalePolicy family): its whole job is to make
 // dispatch failures loud and easy to spot, not to be a real optimizer.
-template <typename VALUE_TYPE>
-struct SentinelSynapsePolicy {
+template <typename VALUE_TYPE> struct SentinelSynapsePolicy {
     // ci itself isn't what this test checks (packed FP4 importance storage
     // makes an exact-value assertion on it awkward) -- reuse the real
     // Plain formula so ci stays finite/sane and doesn't itself become the
     // reason something looks wrong.
-    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib,
-                                 VALUE_TYPE beta2, VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
-        return PlainRMSpropSynapsePolicy<VALUE_TYPE>::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
+    static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
+                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
+        return PlainRMSpropSynapsePolicy<VALUE_TYPE>::update_ci(ci, g, contrib, beta2,
+                                                                min_decay_frac, max_ci);
     }
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE /*ci*/, VALUE_TYPE /*S*/,
-                                 VALUE_TYPE /*eff_lr*/, VALUE_TYPE /*eps*/,
-                                 bool /*damp_by_importance*/, VALUE_TYPE /*max_abs_delta*/,
-                                 bool /*scale_invariant*/ = false) {
+                                VALUE_TYPE /*eff_lr*/, VALUE_TYPE /*eps*/,
+                                bool /*damp_by_importance*/, VALUE_TYPE /*max_abs_delta*/,
+                                bool /*scale_invariant*/ = false) {
         return g >= VALUE_TYPE(0) ? VALUE_TYPE(-1e6) : VALUE_TYPE(1e6);
     }
 };
 
-template <>
-struct SentinelSynapsePolicy<Block4Vec> {
-    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib,
-                                Block4Vec beta2, Block4Vec min_decay_frac, Block4Vec max_ci) {
-        return PlainRMSpropSynapsePolicy<Block4Vec>::update_ci(ci, g, contrib, beta2, min_decay_frac, max_ci);
+template <> struct SentinelSynapsePolicy<Block4Vec> {
+    static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
+                               Block4Vec min_decay_frac, Block4Vec max_ci) {
+        return PlainRMSpropSynapsePolicy<Block4Vec>::update_ci(ci, g, contrib, beta2,
+                                                               min_decay_frac, max_ci);
     }
-    static Block4Vec update_cw(Block4Vec g, Block4Vec /*ci*/, Block4Vec /*S*/,
-                                Block4Vec /*eff_lr*/, Block4Vec /*eps*/,
-                                bool /*damp_by_importance*/, Block4Vec /*max_abs_delta*/,
-                                bool /*scale_invariant*/ = false) {
+    static Block4Vec update_cw(Block4Vec g, Block4Vec /*ci*/, Block4Vec /*S*/, Block4Vec /*eff_lr*/,
+                               Block4Vec /*eps*/, bool /*damp_by_importance*/,
+                               Block4Vec /*max_abs_delta*/, bool /*scale_invariant*/ = false) {
         Block4Vec result;
-        for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) result[i] = g[i] >= 0.0f ? -1e6f : 1e6f;
+        for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i)
+            result[i] = g[i] >= 0.0f ? -1e6f : 1e6f;
         return result;
     }
 };
@@ -90,8 +95,10 @@ int main() {
         weight_codes[i] = fp4_quantize(dense_w[i]);
 
     std::vector<float> input(n_in), dy(n_out);
-    for (std::size_t r = 0; r < n_in; ++r)  input[r] = 0.3f + 0.1f * float(r);
-    for (std::size_t c = 0; c < n_out; ++c) dy[c]    = -0.2f + 0.05f * float(c);
+    for (std::size_t r = 0; r < n_in; ++r)
+        input[r] = 0.3f + 0.1f * float(r);
+    for (std::size_t c = 0; c < n_out; ++c)
+        dy[c] = -0.2f + 0.05f * float(c);
 
     // ── Arm A: everything in scattered CSR, block4 left empty ─────────────
     Weights weights_a;
@@ -103,7 +110,7 @@ int main() {
             ptrs[r] = SIZE_TYPE(r * n_out);
             for (std::size_t c = 0; c < n_out; ++c) {
                 idx[r * n_out + c] = SIZE_TYPE(c);
-                w[r * n_out + c]   = FP4_TABLE[weight_codes[r * n_out + c] & 0x0Fu];
+                w[r * n_out + c] = FP4_TABLE[weight_codes[r * n_out + c] & 0x0Fu];
             }
         }
         ptrs[n_in] = SIZE_TYPE(n_in * n_out);
@@ -144,12 +151,12 @@ int main() {
     std::vector<float> ni_a(n_in, 0.0f), ng_a(n_out, 0.0f);
     std::vector<float> ni_b(n_in, 0.0f), ng_b(n_out, 0.0f);
     const float lr = 0.05f;
-    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false, SentinelSynapsePolicy>(
-        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_a, dx_a.data(),
-        ni_a.data(), ng_a.data(), lr, 1);
-    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false, SentinelSynapsePolicy>(
-        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_b, dx_b.data(),
-        ni_b.data(), ng_b.data(), lr, 1);
+    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false,
+                    SentinelSynapsePolicy>(input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_a,
+                                           dx_a.data(), ni_a.data(), ng_a.data(), lr, 1);
+    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false,
+                    SentinelSynapsePolicy>(input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_b,
+                                           dx_b.data(), ni_b.data(), ng_b.data(), lr, 1);
 
     // ── Every touched weight in BOTH arms must have saturated to +-6.0 ─────
     for (std::size_t r = 0; r < n_in; ++r) {
@@ -179,8 +186,9 @@ int main() {
     }
 
     if (g_fail == 0) {
-        std::printf("test_synapse_policy_dispatch: all sites dispatch correctly (%zu synapses x 2 arms checked)\n",
-                     n_in * n_out);
+        std::printf("test_synapse_policy_dispatch: all sites dispatch correctly (%zu synapses x 2 "
+                    "arms checked)\n",
+                    n_in * n_out);
         return 0;
     }
     std::printf("test_synapse_policy_dispatch: %d failure(s)\n", g_fail);

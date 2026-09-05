@@ -3,17 +3,11 @@
 #include <random>
 #include <vector>
 
-
 /* #region Inplace Merge COO */
 TEST_CASE("Inplace Merge COO - Simple Merge without Duplicates", "[inplace_merge_coo]") {
     // Input data
-    COOIndices<int> indices = {
-        std::make_unique<int[]>(8),
-        std::make_unique<int[]>(8)
-    };
-    UnaryValues<float> values = {
-        std::make_unique<float[]>(8)
-    };
+    COOIndices<int> indices = {std::make_unique<int[]>(8), std::make_unique<int[]>(8)};
+    UnaryValues<float> values = {std::make_unique<float[]>(8)};
 
     int col_data[] = {1, 3, 5, 7, 2, 4, 6, 8};
     int row_data[] = {1, 1, 2, 2, 1, 1, 2, 2};
@@ -36,7 +30,6 @@ TEST_CASE("Inplace Merge COO - Simple Merge without Duplicates", "[inplace_merge
 
     REQUIRE_MESSAGE(duplicates == 0, "No duplicates should be found");
 
-
     CHECK_VECTOR_EQUAL(vec(indices[0].get(), 8), expected_cols);
     CHECK_VECTOR_EQUAL(vec(indices[1].get(), 8), expected_rows);
     CHECK_VECTOR_EQUAL(vec(values[0].get(), 8), expected_vals);
@@ -44,14 +37,8 @@ TEST_CASE("Inplace Merge COO - Simple Merge without Duplicates", "[inplace_merge
 
 TEST_CASE("Inplace Merge COO - Merge with Duplicates", "[inplace_merge_coo]") {
     // Input data
-    COOIndices<int> indices = {
-        std::make_unique<int[]>(8),
-        std::make_unique<int[]>(8)
-    };
-    BiValues<float> values = {
-        std::make_unique<float[]>(8),
-        std::make_unique<float[]>(8)
-    };
+    COOIndices<int> indices = {std::make_unique<int[]>(8), std::make_unique<int[]>(8)};
+    BiValues<float> values = {std::make_unique<float[]>(8), std::make_unique<float[]>(8)};
 
     int col_data[] = {1, 3, 5, 7, 1, 3, 5, 7};
     int row_data[] = {1, 1, 1, 1, 1, 1, 1, 1};
@@ -85,15 +72,9 @@ TEST_CASE("Inplace Merge COO - Merge with Duplicates", "[inplace_merge_coo]") {
 
 TEST_CASE("Inplace Merge COO - Mixed Duplicates and Non-Duplicates", "[inplace_merge_coo]") {
     // Input data
-    COOIndices<int> indices = {
-        std::make_unique<int[]>(8),
-        std::make_unique<int[]>(8)
-    };
-    TriValues<float> values = {
-        std::make_unique<float[]>(8),
-        std::make_unique<float[]>(8),
-        std::make_unique<float[]>(8)
-    };
+    COOIndices<int> indices = {std::make_unique<int[]>(8), std::make_unique<int[]>(8)};
+    TriValues<float> values = {std::make_unique<float[]>(8), std::make_unique<float[]>(8),
+                               std::make_unique<float[]>(8)};
 
     int row_data[] = {1, 1, 1, 1, 1, 1, 2, 2};
     int col_data[] = {1, 2, 3, 7, 1, 3, 5, 8};
@@ -140,9 +121,9 @@ TEST_CASE("Insertion Sort COO - Already Sorted Input", "[insertion_sort_coo]") {
     int cols[] = {1, 2, 3, 4};
     float vals[] = {1.0, 2.0, 3.0, 4.0};
 
-    std::copy(rows, rows+4, indices[0].get());
-    std::copy(cols, cols+4, indices[1].get());
-    std::copy(vals, vals+4, values[0].get());
+    std::copy(rows, rows + 4, indices[0].get());
+    std::copy(cols, cols + 4, indices[1].get());
+    std::copy(vals, vals + 4, values[0].get());
 
     size_t duplicates = insertion_sort_coo(indices, values, 0, 3);
 
@@ -259,11 +240,15 @@ TEST_CASE("Merge Sort COO - Simple Case", "[merge_sort_coo]") {
 
     std::size_t duplicates = merge_sort_coo(indices, values, 4);
 
-    CHECK(duplicates == 0);  // No duplicates in this test case
-    CHECK_VECTOR_EQUAL(vec(indices[0].get(), 4), std::vector<int>(expected_cols, expected_cols + 4));
-    CHECK_VECTOR_EQUAL(vec(indices[1].get(), 4), std::vector<int>(expected_rows, expected_rows + 4));
-    CHECK_VECTOR_EQUAL(vec(values[0].get(), 4), std::vector<float>(expected_vals1, expected_vals1 + 4));
-    CHECK_VECTOR_EQUAL(vec(values[1].get(), 4), std::vector<float>(expected_vals2, expected_vals2 + 4));
+    CHECK(duplicates == 0); // No duplicates in this test case
+    CHECK_VECTOR_EQUAL(vec(indices[0].get(), 4),
+                       std::vector<int>(expected_cols, expected_cols + 4));
+    CHECK_VECTOR_EQUAL(vec(indices[1].get(), 4),
+                       std::vector<int>(expected_rows, expected_rows + 4));
+    CHECK_VECTOR_EQUAL(vec(values[0].get(), 4),
+                       std::vector<float>(expected_vals1, expected_vals1 + 4));
+    CHECK_VECTOR_EQUAL(vec(values[1].get(), 4),
+                       std::vector<float>(expected_vals2, expected_vals2 + 4));
 }
 
 TEST_CASE("Merge Sort COO - Complex Case with Duplicates", "[merge_sort_coo]") {
@@ -287,11 +272,15 @@ TEST_CASE("Merge Sort COO - Complex Case with Duplicates", "[merge_sort_coo]") {
 
     std::size_t duplicates = merge_sort_coo(indices, values, 7);
 
-    CHECK(duplicates == 1);  // One duplicate should be removed
-    CHECK_VECTOR_EQUAL(vec(indices[0].get(), 6), std::vector<int>(expected_rows, expected_rows + 6));
-    CHECK_VECTOR_EQUAL(vec(indices[1].get(), 6), std::vector<int>(expected_cols, expected_cols + 6));
-    CHECK_VECTOR_EQUAL(vec(values[0].get(), 6), std::vector<float>(expected_vals1, expected_vals1 + 6));
-    CHECK_VECTOR_EQUAL(vec(values[1].get(), 6), std::vector<float>(expected_vals2, expected_vals2 + 6));
+    CHECK(duplicates == 1); // One duplicate should be removed
+    CHECK_VECTOR_EQUAL(vec(indices[0].get(), 6),
+                       std::vector<int>(expected_rows, expected_rows + 6));
+    CHECK_VECTOR_EQUAL(vec(indices[1].get(), 6),
+                       std::vector<int>(expected_cols, expected_cols + 6));
+    CHECK_VECTOR_EQUAL(vec(values[0].get(), 6),
+                       std::vector<float>(expected_vals1, expected_vals1 + 6));
+    CHECK_VECTOR_EQUAL(vec(values[1].get(), 6),
+                       std::vector<float>(expected_vals2, expected_vals2 + 6));
 }
 
 /* #endregion */
@@ -299,7 +288,7 @@ TEST_CASE("Merge Sort COO - Complex Case with Duplicates", "[merge_sort_coo]") {
 /* #region binary_search_coo */
 TEST_CASE("Binary Search COO - Simple Case", "[binary_search_coo]") {
     COOIndices<int> indices = {std::make_unique<int[]>(5), std::make_unique<int[]>(5)};
-    
+
     int row_data[] = {1, 2, 2, 3, 4};
     int col_data[] = {1, 2, 3, 4, 5};
 
@@ -309,13 +298,13 @@ TEST_CASE("Binary Search COO - Simple Case", "[binary_search_coo]") {
     SECTION("Search for an existing entry") {
         std::array<int, 2> target = {2, 2};
         std::size_t pos = binary_search_coo(indices, target, 0, 5);
-        CHECK(pos == 1);  // The target {2, 2} is at position 1
+        CHECK(pos == 1); // The target {2, 2} is at position 1
     }
 
     SECTION("Search for a new entry") {
         std::array<int, 2> target = {3, 3};
         std::size_t pos = binary_search_coo(indices, target, 0, 5);
-        CHECK(pos == 3);  // The target {3, 3} would be inserted at position 3
+        CHECK(pos == 3); // The target {3, 3} would be inserted at position 3
     }
 }
 
@@ -331,19 +320,19 @@ TEST_CASE("Binary Search COO - Edge Cases", "[binary_search_coo]") {
     SECTION("Search for the smallest entry") {
         std::array<int, 2> target = {1, 1};
         std::size_t pos = binary_search_coo(indices, target, 0, 6);
-        CHECK(pos == 0);  // The target {1, 1} is at position 0
+        CHECK(pos == 0); // The target {1, 1} is at position 0
     }
 
     SECTION("Search for the largest entry") {
         std::array<int, 2> target = {5, 5};
         std::size_t pos = binary_search_coo(indices, target, 0, 6);
-        CHECK(pos == 6);  // The target {5, 5} would be inserted at position 6
+        CHECK(pos == 6); // The target {5, 5} would be inserted at position 6
     }
 
     SECTION("Search for a mid-range non-existent entry") {
         std::array<int, 2> target = {2, 3};
         std::size_t pos = binary_search_coo(indices, target, 0, 6);
-        CHECK(pos == 4);  // The target {2, 3} would be inserted at position 4
+        CHECK(pos == 4); // The target {2, 3} would be inserted at position 4
     }
 }
 
@@ -381,21 +370,24 @@ TEST_CASE("Parallel Merge Sorted COOs - Basic Merge", "[parallel_merge_sorted_co
     std::copy(n_val1_data, n_val1_data + 2, n_values[0].get());
     std::copy(n_val2_data, n_val2_data + 2, n_values[1].get());
 
-    std::size_t duplicates = parallel_merge_sorted_coos(
-        m_indices, m_values, n_indices, n_values, c_indices, c_values, 3, 2, 4);
+    std::size_t duplicates = parallel_merge_sorted_coos(m_indices, m_values, n_indices, n_values,
+                                                        c_indices, c_values, 3, 2, 4);
 
     int expected_rows[] = {1, 2, 3, 4, 5};
     int expected_cols[] = {1, 2, 3, 4, 5};
     float expected_vals1[] = {1.0, 2.0, 3.0, 4.0, 5.0};
     float expected_vals2[] = {10.0, 20.0, 30.0, 40.0, 50.0};
 
-    CHECK(duplicates == 0);  // No duplicates expected
-    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 5), std::vector<int>(expected_rows, expected_rows + 5));
-    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 5), std::vector<int>(expected_cols, expected_cols + 5));
-    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 5), std::vector<float>(expected_vals1, expected_vals1 + 5));
-    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 5), std::vector<float>(expected_vals2, expected_vals2 + 5));
+    CHECK(duplicates == 0); // No duplicates expected
+    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 5),
+                       std::vector<int>(expected_rows, expected_rows + 5));
+    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 5),
+                       std::vector<int>(expected_cols, expected_cols + 5));
+    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 5),
+                       std::vector<float>(expected_vals1, expected_vals1 + 5));
+    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 5),
+                       std::vector<float>(expected_vals2, expected_vals2 + 5));
 }
-
 
 TEST_CASE("Parallel Merge Sorted COOs - With Duplicates", "[parallel_merge_sorted_coos]") {
     COOIndices<int> m_indices = {std::make_unique<int[]>(3), std::make_unique<int[]>(3)};
@@ -427,32 +419,35 @@ TEST_CASE("Parallel Merge Sorted COOs - With Duplicates", "[parallel_merge_sorte
     std::copy(n_val1_data, n_val1_data + 3, n_values[0].get());
     std::copy(n_val2_data, n_val2_data + 3, n_values[1].get());
 
-    std::size_t duplicates = parallel_merge_sorted_coos(
-        m_indices, m_values, n_indices, n_values, c_indices, c_values, 3, 3, 4);
+    std::size_t duplicates = parallel_merge_sorted_coos(m_indices, m_values, n_indices, n_values,
+                                                        c_indices, c_values, 3, 3, 4);
 
     int expected_rows[] = {1, 2, 3, 4};
     int expected_cols[] = {1, 2, 3, 4};
     float expected_vals1[] = {1.0, 4.0, 6.0, 4.0};
     float expected_vals2[] = {10.0, 40.0, 60.0, 40.0};
 
-    CHECK(duplicates == 2);  // Two duplicates expected
-    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 4), std::vector<int>(expected_rows, expected_rows + 4));
-    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 4), std::vector<int>(expected_cols, expected_cols + 4));
-    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 4), std::vector<float>(expected_vals1, expected_vals1 + 4));
-    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 4), std::vector<float>(expected_vals2, expected_vals2 + 4));
+    CHECK(duplicates == 2); // Two duplicates expected
+    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 4),
+                       std::vector<int>(expected_rows, expected_rows + 4));
+    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 4),
+                       std::vector<int>(expected_cols, expected_cols + 4));
+    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 4),
+                       std::vector<float>(expected_vals1, expected_vals1 + 4));
+    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 4),
+                       std::vector<float>(expected_vals2, expected_vals2 + 4));
 }
 
 /* #endregion */
 
 /* #region bottom_k_indices */
 
-
 TEST_CASE("Bottom K Indices Test", "[bottom_k_indices]") {
     SECTION("Basic test with k less than size") {
         float values[] = {5, 3, 8, 4, 2, 7, 1, 6};
         std::vector<size_t> result = bottom_k_indices(values, 8, 3, 4);
-        std::vector<size_t> expected = {6, 4, 1};  // indices of 1, 2, 3
-        
+        std::vector<size_t> expected = {6, 4, 1}; // indices of 1, 2, 3
+
         CHECK(result.size() == 3);
         CHECK_VECTOR_EQUAL(result, expected);
     }
@@ -460,17 +455,18 @@ TEST_CASE("Bottom K Indices Test", "[bottom_k_indices]") {
     SECTION("k equals size") {
         float values[] = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
         std::vector<size_t> result = bottom_k_indices(values, 10, 10, 4);
-        std::vector<size_t> expected = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0};  // indices of 0 to 9 in reverse order
-        
+        std::vector<size_t> expected = {9, 8, 7, 6, 5,
+                                        4, 3, 2, 1, 0}; // indices of 0 to 9 in reverse order
+
         CHECK(result.size() == 10);
         CHECK_VECTOR_EQUAL(result, expected);
     }
 
     SECTION("k greater than size") {
         float values[] = {10, 20, 30};
-        std::vector<size_t> result = bottom_k_indices(values, 3, 5, 4);  // k is larger than size
-        std::vector<size_t> expected = {0, 1, 2};  // should return all indices
-        
+        std::vector<size_t> result = bottom_k_indices(values, 3, 5, 4); // k is larger than size
+        std::vector<size_t> expected = {0, 1, 2};                       // should return all indices
+
         CHECK(result.size() == 3);
         CHECK_VECTOR_EQUAL(result, expected);
     }
@@ -478,8 +474,8 @@ TEST_CASE("Bottom K Indices Test", "[bottom_k_indices]") {
     SECTION("k equals 1") {
         float values[] = {50, 40, 30, 20, 10};
         std::vector<size_t> result = bottom_k_indices(values, 5, 1, 4);
-        std::vector<size_t> expected = {4};  // index of 10
-        
+        std::vector<size_t> expected = {4}; // index of 10
+
         CHECK(result.size() == 1);
         CHECK_VECTOR_EQUAL(result, expected);
     }
@@ -494,8 +490,9 @@ TEST_CASE("Bottom K Indices Test", "[bottom_k_indices]") {
     SECTION("Array with all same elements") {
         float values[] = {2.5, 2.5, 2.5, 2.5, 2.5};
         std::vector<size_t> result = bottom_k_indices(values, 5, 3, 4);
-        std::vector<size_t> expected = {0, 1, 2};  // Any 3 indices are valid here since all values are equal
-        
+        std::vector<size_t> expected = {
+            0, 1, 2}; // Any 3 indices are valid here since all values are equal
+
         CHECK(result.size() == 3);
         CHECK_VECTOR_EQUAL(result, expected);
     }
@@ -503,8 +500,8 @@ TEST_CASE("Bottom K Indices Test", "[bottom_k_indices]") {
     SECTION("Negative numbers") {
         float values[] = {-5, -3, -8, -4, -2, -6, -1, -7};
         std::vector<size_t> result = bottom_k_indices(values, 8, 3, 4);
-        std::vector<size_t> expected = {2, 7, 5};  // indices of -1, -2, -3
-        
+        std::vector<size_t> expected = {2, 7, 5}; // indices of -1, -2, -3
+
         CHECK(result.size() == 3);
         CHECK_VECTOR_EQUAL(result, expected);
     }
@@ -538,10 +535,14 @@ TEST_CASE("COO Subtract Bottom K - Basic Test", "[coo_subtract_bottom_k]") {
     float expected_vals1[] = {3.0, 2.0, 1.0};
     float expected_vals2[] = {30.0, 40.0, 50.0};
 
-    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3), std::vector<int>(expected_rows, expected_rows + 3));
-    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3), std::vector<int>(expected_cols, expected_cols + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3), std::vector<float>(expected_vals1, expected_vals1 + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3), std::vector<float>(expected_vals2, expected_vals2 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3),
+                       std::vector<int>(expected_rows, expected_rows + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3),
+                       std::vector<int>(expected_cols, expected_cols + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3),
+                       std::vector<float>(expected_vals1, expected_vals1 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3),
+                       std::vector<float>(expected_vals2, expected_vals2 + 3));
 }
 
 TEST_CASE("COO Subtract Bottom K - Using First Value Array", "[coo_subtract_bottom_k]") {
@@ -562,22 +563,28 @@ TEST_CASE("COO Subtract Bottom K - Using First Value Array", "[coo_subtract_bott
     BiValues<float> c_values = {std::make_unique<float[]>(3), std::make_unique<float[]>(3)};
 
     // Here we specify to use the first (index 0) value array for bottom-k selection
-    coo_subtract_bottom_k<decltype(indices), decltype(values), 0>(indices, values, c_indices, c_values, 5, 2, 2);
+    coo_subtract_bottom_k<decltype(indices), decltype(values), 0>(indices, values, c_indices,
+                                                                  c_values, 5, 2, 2);
 
     int expected_rows[] = {2, 3, 4};
     int expected_cols[] = {2, 3, 4};
     float expected_vals1[] = {3.0, 4.0, 5.0};
     float expected_vals2[] = {30.0, 40.0, 50.0};
 
-    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3), std::vector<int>(expected_rows, expected_rows + 3));
-    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3), std::vector<int>(expected_cols, expected_cols + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3), std::vector<float>(expected_vals1, expected_vals1 + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3), std::vector<float>(expected_vals2, expected_vals2 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3),
+                       std::vector<int>(expected_rows, expected_rows + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3),
+                       std::vector<int>(expected_cols, expected_cols + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3),
+                       std::vector<float>(expected_vals1, expected_vals1 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3),
+                       std::vector<float>(expected_vals2, expected_vals2 + 3));
 }
 
 TEST_CASE("COO Subtract Bottom K - TriValues", "[coo_subtract_bottom_k]") {
     COOIndices<int> indices = {std::make_unique<int[]>(5), std::make_unique<int[]>(5)};
-    TriValues<float> values = {std::make_unique<float[]>(5), std::make_unique<float[]>(5), std::make_unique<float[]>(5)};
+    TriValues<float> values = {std::make_unique<float[]>(5), std::make_unique<float[]>(5),
+                               std::make_unique<float[]>(5)};
 
     int row_data[] = {0, 1, 2, 3, 4};
     int col_data[] = {0, 1, 2, 3, 4};
@@ -592,7 +599,8 @@ TEST_CASE("COO Subtract Bottom K - TriValues", "[coo_subtract_bottom_k]") {
     std::copy(val3_data, val3_data + 5, values[2].get());
 
     COOIndices<int> c_indices = {std::make_unique<int[]>(3), std::make_unique<int[]>(3)};
-    TriValues<float> c_values = {std::make_unique<float[]>(3), std::make_unique<float[]>(3), std::make_unique<float[]>(3)};
+    TriValues<float> c_values = {std::make_unique<float[]>(3), std::make_unique<float[]>(3),
+                                 std::make_unique<float[]>(3)};
 
     coo_subtract_bottom_k(indices, values, c_indices, c_values, 5, 2, 2);
 
@@ -602,11 +610,16 @@ TEST_CASE("COO Subtract Bottom K - TriValues", "[coo_subtract_bottom_k]") {
     float expected_vals2[] = {30.0, 40.0, 50.0};
     float expected_vals3[] = {300.0, 400.0, 500.0};
 
-    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3), std::vector<int>(expected_rows, expected_rows + 3));
-    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3), std::vector<int>(expected_cols, expected_cols + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3), std::vector<float>(expected_vals1, expected_vals1 + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3), std::vector<float>(expected_vals2, expected_vals2 + 3));
-    CHECK_VECTOR_EQUAL(vec(c_values[2].get(), 3), std::vector<float>(expected_vals3, expected_vals3 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[0].get(), 3),
+                       std::vector<int>(expected_rows, expected_rows + 3));
+    CHECK_VECTOR_EQUAL(vec(c_indices[1].get(), 3),
+                       std::vector<int>(expected_cols, expected_cols + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[0].get(), 3),
+                       std::vector<float>(expected_vals1, expected_vals1 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[1].get(), 3),
+                       std::vector<float>(expected_vals2, expected_vals2 + 3));
+    CHECK_VECTOR_EQUAL(vec(c_values[2].get(), 3),
+                       std::vector<float>(expected_vals3, expected_vals3 + 3));
 }
 
 /* #endregion */

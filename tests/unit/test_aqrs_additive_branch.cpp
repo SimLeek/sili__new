@@ -40,15 +40,20 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
-static const std::size_t N = 3;  // all three test matrices are 3x3
+static const std::size_t N = 3; // all three test matrices are 3x3
 
 // Builds a fully-connected N x N layer with FIXED (non-live, never
 // re-quantized during these tests) weight codes taken directly from
@@ -59,10 +64,11 @@ static Weights make_fixed_dense_layer(const std::vector<float>& w_q_values) {
     Weights w;
     std::vector<SIZE_TYPE> ptrs(N + 1);
     std::vector<SIZE_TYPE> idx(N * N);
-    std::vector<float> imp(N * N, 1.0f);  // nonzero importance -- these are LIVE synapses
+    std::vector<float> imp(N * N, 1.0f); // nonzero importance -- these are LIVE synapses
     for (std::size_t r = 0; r < N; ++r) {
         ptrs[r] = SIZE_TYPE(r * N);
-        for (std::size_t c = 0; c < N; ++c) idx[r * N + c] = SIZE_TYPE(c);
+        for (std::size_t c = 0; c < N; ++c)
+            idx[r * N + c] = SIZE_TYPE(c);
     }
     ptrs[N] = SIZE_TYPE(N * N);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -73,7 +79,10 @@ static Weights make_fixed_dense_layer(const std::vector<float>& w_q_values) {
 
 static float mse(const std::vector<float>& y, const std::vector<float>& target) {
     float s = 0.0f;
-    for (std::size_t i = 0; i < y.size(); ++i) { float d = y[i] - target[i]; s += d * d; }
+    for (std::size_t i = 0; i < y.size(); ++i) {
+        float d = y[i] - target[i];
+        s += d * d;
+    }
     return s / float(y.size());
 }
 
@@ -95,22 +104,27 @@ static float mse(const std::vector<float>& y, const std::vector<float>& target) 
 // throughout even though the optimizer still computes and would
 // otherwise apply a real update.
 static float train(Weights weights, const std::vector<float>& w_star, int n_steps, float lr,
-                    bool freeze_multiplicative = false) {
+                   bool freeze_multiplicative = false) {
     std::vector<float> basis(N * N, 0.0f);
-    for (std::size_t i = 0; i < N; ++i) basis[i * N + i] = 1.0f;
+    for (std::size_t i = 0; i < N; ++i)
+        basis[i * N + i] = 1.0f;
     float final_mse = 0.0f;
     for (int step = 0; step < n_steps; ++step) {
         std::vector<float> y_all(N * N, 0.0f);
         for (std::size_t i = 0; i < N; ++i) {
             std::vector<float> y(N, 0.0f);
-            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), weights, y.data(), 1);
-            for (std::size_t c = 0; c < N; ++c) y_all[i * N + c] = y[c];
+            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N),
+                                                             weights, y.data(), 1);
+            for (std::size_t c = 0; c < N; ++c)
+                y_all[i * N + c] = y[c];
             std::vector<float> dy(N);
-            for (std::size_t c = 0; c < N; ++c) dy[c] = 2.0f * (y[c] - w_star[i * N + c]) / float(N);
+            for (std::size_t c = 0; c < N; ++c)
+                dy[c] = 2.0f * (y[c] - w_star[i * N + c]) / float(N);
             std::vector<float> dx(N, 0.0f), ni(N, 0.0f), ng(N, 0.0f);
-            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(), ni.data(), ng.data(), lr, 1,
-                false, true, 0.999f, 1e-8f, 0.9f, 0.0f, 1e30f);
+            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false,
+                            false>(&basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(),
+                                   ni.data(), ng.data(), lr, 1, false, true, 0.999f, 1e-8f, 0.9f,
+                                   0.0f, 1e30f);
             if (freeze_multiplicative) {
                 for (std::size_t row = 0; row < N; ++row)
                     for (std::size_t k = 0; k < weights.scale_rank; ++k)
@@ -120,7 +134,8 @@ static float train(Weights weights, const std::vector<float>& w_star, int n_step
                         weights.set_output_scale_raw_k(col, k, k == 0 ? 1.0f : 0.0f);
             }
         }
-        if (step == n_steps - 1) final_mse = mse(y_all, w_star);
+        if (step == n_steps - 1)
+            final_mse = mse(y_all, w_star);
     }
     return final_mse;
 }
@@ -129,7 +144,7 @@ static float train(Weights weights, const std::vector<float>& w_star, int n_step
 // whatever multiplicative rank was set on `weights` beforehand.
 static Weights with_multiplicative_only(Weights w, std::size_t scale_rank) {
     w.scale_rank = scale_rank;
-    w.set_additive_rank(0);          // NEW (task #275) -- not implemented yet
+    w.set_additive_rank(0); // NEW (task #275) -- not implemented yet
     return w;
 }
 
@@ -157,14 +172,14 @@ static Weights with_additive_only(Weights w, std::size_t additive_rank) {
     w.scale_rank = 1;
     // multiplicative left at its default (S=1 everywhere -- W_eff==W_q on
     // that branch), only the additive channels are ever trained here.
-    w.set_additive_rank(additive_rank);   // NEW (task #275) -- not implemented yet
+    w.set_additive_rank(additive_rank); // NEW (task #275) -- not implemented yet
     w = seed_additive_u(w, additive_rank);
     return w;
 }
 
 static Weights with_combined(Weights w, std::size_t scale_rank, std::size_t additive_rank) {
     w.scale_rank = scale_rank;
-    w.set_additive_rank(additive_rank);   // NEW (task #275) -- not implemented yet
+    w.set_additive_rank(additive_rank); // NEW (task #275) -- not implemented yet
     w = seed_additive_u(w, additive_rank);
     return w;
 }
@@ -174,16 +189,20 @@ static Weights with_combined(Weights w, std::size_t scale_rank, std::size_t addi
 // cannot fix two independent diagonal spikes without polluting
 // off-diagonal entries. Additive rank-2 should reconstruct both spikes.
 static void test_additive_necessity() {
-    std::vector<float> w_q    = {6.f, 2.f, 2.f,  2.f, 2.f, 2.f,  2.f, 2.f, 6.f};
-    std::vector<float> w_star = {50.f, 2.f, 2.f,  2.f, 2.f, 2.f,  2.f, 2.f, 50.f};
+    std::vector<float> w_q = {6.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 6.f};
+    std::vector<float> w_star = {50.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 50.f};
 
-    float mult_final = train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 3000, 0.05f);
+    float mult_final =
+        train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 3000, 0.05f);
     std::printf("[Test A] multiplicative-only final MSE: %.4f\n", mult_final);
-    CHECK(mult_final > 5.0f, "multiplicative rank-1 should plateau on diagonal outliers (MSE=%.4f)", mult_final);
+    CHECK(mult_final > 5.0f, "multiplicative rank-1 should plateau on diagonal outliers (MSE=%.4f)",
+          mult_final);
 
-    float combined_final = train(with_combined(make_fixed_dense_layer(w_q), 1, 2), w_star, 3000, 0.05f);
+    float combined_final =
+        train(with_combined(make_fixed_dense_layer(w_q), 1, 2), w_star, 3000, 0.05f);
     std::printf("[Test A] multiplicative(1)+additive(2) final MSE: %.6f\n", combined_final);
-    CHECK(combined_final < 0.01f, "additive rank-2 should reconstruct both diagonal spikes (MSE=%.6f)", combined_final);
+    CHECK(combined_final < 0.01f,
+          "additive rank-2 should reconstruct both diagonal spikes (MSE=%.6f)", combined_final);
 }
 
 // ── Test B: Multiplicative Necessity (systematic scale) ─────────────────
@@ -193,16 +212,20 @@ static void test_additive_necessity() {
 // residual leaves real error). Also validates the existing multiplicative
 // mechanism still works -- confirms nothing regresses.
 static void test_multiplicative_necessity() {
-    std::vector<float> w_q    = {2.f, 1.f, 3.f,  1.f, 2.f, 1.f,  3.f, 1.f, 2.f};
-    std::vector<float> w_star = {6.f, 3.f, 9.f,  3.f, 6.f, 3.f,  9.f, 3.f, 6.f};  // 3x w_q
+    std::vector<float> w_q = {2.f, 1.f, 3.f, 1.f, 2.f, 1.f, 3.f, 1.f, 2.f};
+    std::vector<float> w_star = {6.f, 3.f, 9.f, 3.f, 6.f, 3.f, 9.f, 3.f, 6.f}; // 3x w_q
 
-    float mult_final = train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 1500, 0.05f);
+    float mult_final =
+        train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 1500, 0.05f);
     std::printf("[Test B] multiplicative-only final MSE: %.6f\n", mult_final);
-    CHECK(mult_final < 0.01f, "multiplicative rank-1 should learn the uniform 3x scale exactly (MSE=%.6f)", mult_final);
+    CHECK(mult_final < 0.01f,
+          "multiplicative rank-1 should learn the uniform 3x scale exactly (MSE=%.6f)", mult_final);
 
-    float additive_final = train(with_additive_only(make_fixed_dense_layer(w_q), 1), w_star, 3000, 0.05f, true);
+    float additive_final =
+        train(with_additive_only(make_fixed_dense_layer(w_q), 1), w_star, 3000, 0.05f, true);
     std::printf("[Test B] additive-only(1) final MSE: %.4f\n", additive_final);
-    CHECK(additive_final > 1.0f, "additive rank-1 should plateau on the full-rank residual (MSE=%.4f)", additive_final);
+    CHECK(additive_final > 1.0f,
+          "additive rank-1 should plateau on the full-rank residual (MSE=%.4f)", additive_final);
 }
 
 // ── Test C: Combined Cooperation ─────────────────────────────────────────
@@ -210,10 +233,11 @@ static void test_multiplicative_necessity() {
 // Bottom-right corner is an isolated clipped outlier, 0.5 -> 50
 // (additive's job). Neither branch alone fits; both together should.
 static void test_combined_cooperation() {
-    std::vector<float> w_q    = {2.0f, 1.0f, 0.5f,  1.0f, 2.0f, 0.5f,  0.5f, 0.5f, 6.0f};
-    std::vector<float> w_star = {6.0f, 3.0f, 0.5f,  3.0f, 6.0f, 0.5f,  0.5f, 0.5f, 50.0f};
+    std::vector<float> w_q = {2.0f, 1.0f, 0.5f, 1.0f, 2.0f, 0.5f, 0.5f, 0.5f, 6.0f};
+    std::vector<float> w_star = {6.0f, 3.0f, 0.5f, 3.0f, 6.0f, 0.5f, 0.5f, 0.5f, 50.0f};
 
-    float mult_final = train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 2000, 0.05f);
+    float mult_final =
+        train(with_multiplicative_only(make_fixed_dense_layer(w_q), 1), w_star, 2000, 0.05f);
     std::printf("[Test C] multiplicative-only final MSE: %.4f\n", mult_final);
     // Threshold re-tuned against the real converged value (~4.99, confirmed
     // over multiple runs) -- the original >10.0 guess was too high for what
@@ -221,15 +245,20 @@ static void test_combined_cooperation() {
     // clears both the "combined" (<0.01) and "additive-only" (~4.4) arms
     // with margin, so it stays a real discriminating check, not a rubber
     // stamp.
-    CHECK(mult_final > 3.0f, "multiplicative alone should not create the isolated outlier (MSE=%.4f)", mult_final);
+    CHECK(mult_final > 3.0f,
+          "multiplicative alone should not create the isolated outlier (MSE=%.4f)", mult_final);
 
-    float additive_final = train(with_additive_only(make_fixed_dense_layer(w_q), 1), w_star, 2000, 0.05f, true);
+    float additive_final =
+        train(with_additive_only(make_fixed_dense_layer(w_q), 1), w_star, 2000, 0.05f, true);
     std::printf("[Test C] additive-only final MSE: %.4f\n", additive_final);
-    CHECK(additive_final > 1.0f, "additive alone should not fit the coherent 3x block (MSE=%.4f)", additive_final);
+    CHECK(additive_final > 1.0f, "additive alone should not fit the coherent 3x block (MSE=%.4f)",
+          additive_final);
 
-    float combined_final = train(with_combined(make_fixed_dense_layer(w_q), 1, 1), w_star, 2000, 0.05f);
+    float combined_final =
+        train(with_combined(make_fixed_dense_layer(w_q), 1, 1), w_star, 2000, 0.05f);
     std::printf("[Test C] combined final MSE: %.6f\n", combined_final);
-    CHECK(combined_final < 0.01f, "combined branches should fit essentially exactly (MSE=%.6f)", combined_final);
+    CHECK(combined_final < 0.01f, "combined branches should fit essentially exactly (MSE=%.6f)",
+          combined_final);
 }
 
 int main() {

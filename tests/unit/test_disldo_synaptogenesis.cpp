@@ -13,13 +13,13 @@
 
 TEST_CASE("disldo_forward matches dense reference", "[disldo][forward]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     // 3 inputs, 4 outputs: row0->col0(1.5), row0->col2(-2.0), row1->col1(0.5), row2->col3(3.0)
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
 
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(64), std::size_t(64));
@@ -31,8 +31,8 @@ TEST_CASE("disldo_forward matches dense reference", "[disldo][forward]") {
     std::vector<float> input = {1.0f, 0.6f, 2.0f};
     std::vector<float> output(4, 0.0f);
 
-    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 1);
+    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), SIZE_TYPE(1), SIZE_TYPE(3),
+                                                     weights, output.data(), 1);
 
     // Dense reference: out[c] = sum_r W[r,c] * input[r]
     std::vector<float> expected = {1.5f, 0.3f, -2.0f, 6.0f};
@@ -40,14 +40,14 @@ TEST_CASE("disldo_forward matches dense reference", "[disldo][forward]") {
 }
 
 TEST_CASE("disldo_backward dx matches dense reference, weights unchanged at lr=0",
-         "[disldo][backward]") {
+          "[disldo][backward]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
 
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(64), std::size_t(64));
@@ -57,13 +57,13 @@ TEST_CASE("disldo_backward dx matches dense reference, weights unchanged at lr=0
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
     std::vector<float> input = {1.0f, 0.6f, 2.0f};
-    std::vector<float> dy    = {0.3f, -0.5f, 0.2f, 0.4f};
+    std::vector<float> dy = {0.3f, -0.5f, 0.2f, 0.4f};
     std::vector<float> dx(3, 0.0f);
     std::vector<float> in_acc(3, 0.0f), gr_acc(4, 0.0f);
 
-    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        input.data(), SIZE_TYPE(1), SIZE_TYPE(3), dy.data(),
-        weights, dx.data(), in_acc.data(), gr_acc.data(), 0.0f, 1);
+    disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), SIZE_TYPE(1), SIZE_TYPE(3),
+                                                      dy.data(), weights, dx.data(), in_acc.data(),
+                                                      gr_acc.data(), 0.0f, 1);
 
     // Dense reference: dx[r] = sum_c W[r,c] * dy[c]
     // dx[0] = 1.5*0.3 + -2.0*0.2 = 0.05, dx[1] = 0.5*-0.5 = -0.25, dx[2] = 3.0*0.4 = 1.2
@@ -76,8 +76,8 @@ TEST_CASE("disldo_backward dx matches dense reference, weights unchanged at lr=0
 
     auto cur = weights.connections.row_cursor(0);
     cur.advance();
-    const float w0 = ValueAccessor<FP4BiPacked>::get_w(
-        weights.connections.values, weights.connections.layout.elem_start[0]);
+    const float w0 = ValueAccessor<FP4BiPacked>::get_w(weights.connections.values,
+                                                       weights.connections.layout.elem_start[0]);
     CHECK(w0 == Catch::Approx(1.5f));
 }
 
@@ -90,12 +90,12 @@ TEST_CASE("disldo_backward dx matches dense reference, weights unchanged at lr=0
 
 TEST_CASE("delta_csr_row_rebuild actually grows total_nnz on success", "[synaptogenesis]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
 
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(64), std::size_t(64));
@@ -105,29 +105,29 @@ TEST_CASE("delta_csr_row_rebuild actually grows total_nnz on success", "[synapto
     // Row 0 currently has cols {0,2}. Rebuild with an added col=1 -- fits
     // within the 20% growth headroom reserved by delta_csr_from_absolute.
     std::vector<COL_TYPE> new_cols = {0, 1, 2};
-    std::vector<float>    new_w    = {1.5f, 0.0f, -2.0f};
-    std::vector<float>    new_imp  = {0.0f, 20.0f, 0.0f};
+    std::vector<float> new_w = {1.5f, 0.0f, -2.0f};
+    std::vector<float> new_imp = {0.0f, 20.0f, 0.0f};
 
-    const bool ok = delta_csr_row_rebuild<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        dc, 0, new_cols, new_w, new_imp);
+    const bool ok =
+        delta_csr_row_rebuild<SIZE_TYPE, FP4BiPacked, COL_TYPE>(dc, 0, new_cols, new_w, new_imp);
 
     REQUIRE(ok);
-    CHECK(dc.nnz() == 5);              // was silently staying at 4 before the fix
+    CHECK(dc.nnz() == 5); // was silently staying at 4 before the fix
     CHECK(dc.layout.row_nnz(0) == 3);
 }
 
 TEST_CASE("delta_csr_row_rebuild fails cleanly when growth exceeds reserved headroom",
-         "[synaptogenesis]") {
+          "[synaptogenesis]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     // Rows with only 1 synapse each get minimal headroom (by design --
     // growth is meant to be incremental across many synaptogenesis calls,
     // not one large jump on a near-empty row).
     std::vector<SIZE_TYPE> ptrs = {0, 1, 2};
-    std::vector<SIZE_TYPE> idx  = {1, 3};
-    std::vector<float>     w    = {0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {1, 3};
+    std::vector<float> w = {0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f};
 
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(2), std::size_t(4), std::size_t(64), std::size_t(64));
@@ -137,26 +137,26 @@ TEST_CASE("delta_csr_row_rebuild fails cleanly when growth exceeds reserved head
     // Attempt to grow row 0 from 1 to 4 synapses in one step -- should
     // legitimately fail (not enough reserved headroom), not silently no-op.
     std::vector<COL_TYPE> too_many = {0, 1, 2, 3};
-    std::vector<float>    tw(4, 1.0f), ti(4, 0.0f);
+    std::vector<float> tw(4, 1.0f), ti(4, 0.0f);
 
-    const bool ok = delta_csr_row_rebuild<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        dc, 0, too_many, tw, ti);
+    const bool ok =
+        delta_csr_row_rebuild<SIZE_TYPE, FP4BiPacked, COL_TYPE>(dc, 0, too_many, tw, ti);
 
     CHECK_FALSE(ok);
-    CHECK(dc.nnz() == nnz_before);   // must be unchanged, not partially applied
+    CHECK(dc.nnz() == nnz_before); // must be unchanged, not partially applied
 }
 
 // ── delta_csr_build_probes ────────────────────────────────────────────────────
 
 TEST_CASE("delta_csr_build_probes: outer product, top-k, excludes existing",
-         "[synaptogenesis][build_probes]") {
+          "[synaptogenesis][build_probes]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(64), std::size_t(64));
 
@@ -165,10 +165,10 @@ TEST_CASE("delta_csr_build_probes: outer product, top-k, excludes existing",
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
     std::vector<float> input_accum = {5.0f, 0.1f, 3.0f};
-    std::vector<float> grad_accum  = {0.1f, 4.0f, 0.1f, 0.1f};
+    std::vector<float> grad_accum = {0.1f, 4.0f, 0.1f, 0.1f};
 
-    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, input_accum.data(),
+                                                             grad_accum.data(), SIZE_TYPE(3));
 
     REQUIRE(weights.probes.nnz() > 0);
 
@@ -185,22 +185,25 @@ TEST_CASE("delta_csr_build_probes: outer product, top-k, excludes existing",
     bool found_hottest = false;
     auto& pv = *weights.probes.values[0];
     for (std::size_t i = 0; i < pr.size(); ++i)
-        if (pr[i] == 0 && pc[i] == 1) { found_hottest = true; CHECK(pv[i] == Catch::Approx(20.0f)); }
+        if (pr[i] == 0 && pc[i] == 1) {
+            found_hottest = true;
+            CHECK(pv[i] == Catch::Approx(20.0f));
+        }
     CHECK(found_hottest);
 }
 
 TEST_CASE("delta_csr_build_probes: per_row finds candidates global mode starves",
-         "[synaptogenesis][build_probes][per_row]") {
+          "[synaptogenesis][build_probes][per_row]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     // Row 0 already connects to the 3 globally-hottest outputs (cols 0,1,2).
     // Global top-k=3 mode has nothing left to offer row0. Per-row mode looks
     // past those and finds row0 has genuinely new candidates among cols 3,4.
     std::vector<SIZE_TYPE> ptrs = {0, 3, 3};
-    std::vector<SIZE_TYPE> idx  = {0, 1, 2};
-    std::vector<float>     w    = {1.0f, 1.0f, 1.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 1, 2};
+    std::vector<float> w = {1.0f, 1.0f, 1.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(2), std::size_t(5), std::size_t(64), std::size_t(64));
 
@@ -212,21 +215,23 @@ TEST_CASE("delta_csr_build_probes: per_row finds candidates global mode starves"
     weights_perrow.out_degree.assign(5, SIZE_TYPE(0));
 
     std::vector<float> input_accum = {5.0f, 5.0f};
-    std::vector<float> grad_accum  = {10.0f, 9.0f, 8.0f, 1.0f, 0.5f};
+    std::vector<float> grad_accum = {10.0f, 9.0f, 8.0f, 1.0f, 0.5f};
 
     delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         weights_global, input_accum.data(), grad_accum.data(), SIZE_TYPE(3), false);
-    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights_perrow, input_accum.data(), grad_accum.data(), SIZE_TYPE(3), true);
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights_perrow, input_accum.data(),
+                                                             grad_accum.data(), SIZE_TYPE(3), true);
 
     auto count_row0 = [](auto& w) {
         int n = 0;
-        for (auto r : *w.probes.indices[0]) if (r == 0) ++n;
+        for (auto r : *w.probes.indices[0])
+            if (r == 0)
+                ++n;
         return n;
     };
 
-    CHECK(count_row0(weights_global) == 0);   // starved -- confirmed limitation of global mode
-    CHECK(count_row0(weights_perrow) > 0);    // per_row finds cols 3,4
+    CHECK(count_row0(weights_global) == 0); // starved -- confirmed limitation of global mode
+    CHECK(count_row0(weights_perrow) > 0);  // per_row finds cols 3,4
     CHECK(weights_perrow.probes.nnz() >= weights_global.probes.nnz());
 }
 
@@ -236,12 +241,12 @@ TEST_CASE("delta_csr_build_probes: per_row finds candidates global mode starves"
 
 TEST_CASE("compact() is lossless and shrinks reserved headroom", "[memory]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 3, 5, 6};
-    std::vector<SIZE_TYPE> idx  = {0, 5, 12, 2, 9, 20};
-    std::vector<float>     w    = {1.5f, -2.0f, 3.0f, 0.5f, -0.5f, 6.0f};
-    std::vector<float>     imp  = {0.1f, -0.2f, 0.3f, 0.0f, -0.4f, 0.5f};
+    std::vector<SIZE_TYPE> idx = {0, 5, 12, 2, 9, 20};
+    std::vector<float> w = {1.5f, -2.0f, 3.0f, 0.5f, -0.5f, 6.0f};
+    std::vector<float> imp = {0.1f, -0.2f, 0.3f, 0.0f, -0.4f, 0.5f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(25), std::size_t(4096), std::size_t(4096));
 
@@ -260,8 +265,9 @@ TEST_CASE("compact() is lossless and shrinks reserved headroom", "[memory]") {
         std::size_t k = 0;
         while (!c1.at_end() && !c2.at_end()) {
             REQUIRE(c1.advance() == c2.advance());
-            CHECK(ValueAccessor<FP4BiPacked>::get_w(dc.values, dc.layout.elem_start[r]+k) ==
-                 ValueAccessor<FP4BiPacked>::get_w(compacted.values, compacted.layout.elem_start[r]+k));
+            CHECK(ValueAccessor<FP4BiPacked>::get_w(dc.values, dc.layout.elem_start[r] + k) ==
+                  ValueAccessor<FP4BiPacked>::get_w(compacted.values,
+                                                    compacted.layout.elem_start[r] + k));
             ++k;
         }
         REQUIRE(c1.at_end() == c2.at_end());
@@ -273,19 +279,19 @@ TEST_CASE("compact() is lossless and shrinks reserved headroom", "[memory]") {
 }
 
 TEST_CASE("synap_row_step throws (not silently skips) when compact() removed all headroom",
-         "[memory][synaptogenesis][regression]") {
+          "[memory][synaptogenesis][regression]") {
     // After compact(), blank_bytes=0 per row. Synaptogenesis that tries to
     // add connections must throw -- not silently skip. Silently skipping is
     // never correct: the function would report success while not having done
     // what it was asked. The throw tells calling code to call equalizer_step()
     // to redistribute blank from adjacent rows, or to prune more aggressively.
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -294,30 +300,29 @@ TEST_CASE("synap_row_step throws (not silently skips) when compact() removed all
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
     std::vector<float> input_accum = {5.0f, 0.1f, 3.0f};
-    std::vector<float> grad_accum  = {0.1f, 4.0f, 0.1f, 0.1f};
-    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
+    std::vector<float> grad_accum = {0.1f, 4.0f, 0.1f, 0.1f};
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, input_accum.data(),
+                                                             grad_accum.data(), SIZE_TYPE(3));
     REQUIRE(weights.probes.nnz() > 0);
 
     // importance_cutoff=0 and max_row_weights=10 means all existing connections
     // are kept AND probes are attempted -- but blank_bytes=0 after compact(),
     // so the first insertion must throw.
     std::size_t current_row = 0;
-    REQUIRE_THROWS_AS(
-        (delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            weights, current_row, 0.0f, SIZE_TYPE(10))),
-        std::runtime_error);
+    REQUIRE_THROWS_AS((delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+                          weights, current_row, 0.0f, SIZE_TYPE(10))),
+                      std::runtime_error);
 }
 
 TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis works again",
-         "[memory][synaptogenesis][regression]") {
+          "[memory][synaptogenesis][regression]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -325,7 +330,8 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     weights.connections = compact<SIZE_TYPE, FP4BiPacked, COL_TYPE>(dc);
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
-    weights.connections = expand_headroom<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights.connections, 0.5f);
+    weights.connections =
+        expand_headroom<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights.connections, 0.5f);
 
     // Lossless.
     auto c1 = dc.row_cursor(0);
@@ -334,9 +340,9 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     REQUIRE(c1.advance() == c2.advance());
 
     std::vector<float> input_accum = {5.0f, 0.1f, 3.0f};
-    std::vector<float> grad_accum  = {0.1f, 4.0f, 0.1f, 0.1f};
-    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
+    std::vector<float> grad_accum = {0.1f, 4.0f, 0.1f, 0.1f};
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, input_accum.data(),
+                                                             grad_accum.data(), SIZE_TYPE(3));
 
     // Combined (scattered + block4) nnz, not connections.nnz() alone: this
     // 3x4 layer fits entirely inside one block4 tile, so a growth step here
@@ -346,8 +352,8 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
     // block4_maybe_promote.
     const std::size_t nnz_before = weights.connections.nnz() + weights.block4.live_synapses();
     std::size_t current_row = 0;
-    CHECK_NOTHROW(
-        (delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, current_row, 0.0f, SIZE_TYPE(10))));
+    CHECK_NOTHROW((delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+        weights, current_row, 0.0f, SIZE_TYPE(10))));
     CHECK(weights.connections.nnz() + weights.block4.live_synapses() > nnz_before);
 }
 
@@ -359,7 +365,7 @@ TEST_CASE("expand_headroom() restores growth after compact(), synaptogenesis wor
 // point of that design, not just basic correctness.
 
 TEST_CASE("disldo_backward_sparse_grad: dx reaches a row whose input was exactly zero",
-         "[disldo][backward][regression]") {
+          "[disldo][backward][regression]") {
     // The core property this design exists for: a row that "didn't fire"
     // (input==0) must still receive a correct, nonzero dx if its connected
     // output has significant gradient -- proving the upstream layer gets
@@ -367,12 +373,12 @@ TEST_CASE("disldo_backward_sparse_grad: dx reaches a row whose input was exactly
     // nothing to the forward pass. Sparse-input backward could never
     // produce this (the row wouldn't be visited at all).
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -380,13 +386,14 @@ TEST_CASE("disldo_backward_sparse_grad: dx reaches a row whose input was exactly
     weights.connections = dc;
     weights.out_degree.assign(4, SIZE_TYPE(0));
 
-    std::vector<float> input = {1.0f, 0.0f, 2.0f};   // row 1 is exactly zero
+    std::vector<float> input = {1.0f, 0.0f, 2.0f}; // row 1 is exactly zero
 
     CSRInput<SIZE_TYPE, float> dy;
-    dy.rows = 1; dy.cols = 4;
-    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
+    dy.rows = 1;
+    dy.cols = 4;
+    dy.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
     dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{1});
-    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
+    dy.values[0] = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
     disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -403,18 +410,18 @@ TEST_CASE("disldo_backward_sparse_grad: dx reaches a row whose input was exactly
 }
 
 TEST_CASE("disldo_backward_sparse_grad: weight update stays near-static for a row that didn't fire",
-         "[disldo][backward][regression]") {
+          "[disldo][backward][regression]") {
     // Complementary half of the same property: dx reaches the row (above),
     // but the WEIGHT update should still scale with the true input value,
     // staying appropriately small when that value was zero -- no separate
     // handling needed, it falls out of `grad = dy_val * in_val` naturally.
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -424,10 +431,11 @@ TEST_CASE("disldo_backward_sparse_grad: weight update stays near-static for a ro
 
     std::vector<float> input = {1.0f, 0.0f, 2.0f};
     CSRInput<SIZE_TYPE, float> dy;
-    dy.rows = 1; dy.cols = 4;
-    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
+    dy.rows = 1;
+    dy.cols = 4;
+    dy.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1});
     dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{1});
-    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
+    dy.values[0] = std::make_shared<std::vector<float>>(std::vector<float>{0.8f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
     disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -441,18 +449,18 @@ TEST_CASE("disldo_backward_sparse_grad: weight update stays near-static for a ro
 }
 
 TEST_CASE("disldo_backward_sparse_grad matches dense reference when gradient covers everything",
-         "[disldo][backward]") {
+          "[disldo][backward]") {
     // Sanity check: with every output column present in the "sparse"
     // gradient (i.e. it's not really sparse), results must match a plain
     // dense reference exactly -- confirms the merge-based column matching
     // isn't silently dropping or double-counting anything.
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -462,10 +470,12 @@ TEST_CASE("disldo_backward_sparse_grad matches dense reference when gradient cov
 
     std::vector<float> input = {1.0f, 0.6f, 2.0f};
     CSRInput<SIZE_TYPE, float> dy;
-    dy.rows = 1; dy.cols = 4;
-    dy.ptrs[0]    = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 4});
+    dy.rows = 1;
+    dy.cols = 4;
+    dy.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 4});
     dy.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(std::vector<SIZE_TYPE>{0, 1, 2, 3});
-    dy.values[0]  = std::make_shared<std::vector<float>>(std::vector<float>{0.3f, -0.5f, 0.2f, 0.4f});
+    dy.values[0] =
+        std::make_shared<std::vector<float>>(std::vector<float>{0.3f, -0.5f, 0.2f, 0.4f});
 
     std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
     disldo_backward_sparse_grad<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -475,7 +485,6 @@ TEST_CASE("disldo_backward_sparse_grad matches dense reference when gradient cov
     std::vector<float> expected_dx = {0.05f, -0.25f, 1.2f};
     CHECK_VECTOR_ALMOST_EQUAL(dx, expected_dx, 1e-4f);
 }
-
 
 // ── importance_scale / rescale_importance ─────────────────────────────────────
 //
@@ -487,9 +496,9 @@ TEST_CASE("disldo_backward_sparse_grad matches dense reference when gradient cov
 
 TEST_CASE("importance_scale defaults to 1.0, exact backward compat", "[importance_scale]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 1};
-    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<SIZE_TYPE> idx = {0};
     std::vector<float> w = {1.0f}, imp = {0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
@@ -499,11 +508,11 @@ TEST_CASE("importance_scale defaults to 1.0, exact backward compat", "[importanc
 }
 
 TEST_CASE("importance_scale=1.0 loses a true importance of 0.03 entirely (quantizes to 0)",
-         "[importance_scale][regression]") {
+          "[importance_scale][regression]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 1};
-    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<SIZE_TYPE> idx = {0};
     std::vector<float> w = {1.0f}, imp = {0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
@@ -513,33 +522,34 @@ TEST_CASE("importance_scale=1.0 loses a true importance of 0.03 entirely (quanti
     // threshold, so it quantizes straight to 0.
     ValueAccessor<FP4BiPacked>::set(dc.values, 0, 1.0f, 0.03f);
     const float readback = ValueAccessor<FP4BiPacked>::get_imp(dc.values, 0);
-    CHECK(readback == 0.0f);   // confirmed lost, not approximately preserved
+    CHECK(readback == 0.0f); // confirmed lost, not approximately preserved
 }
 
 TEST_CASE("importance_scale=0.01 preserves the same true importance exactly",
-         "[importance_scale][regression]") {
+          "[importance_scale][regression]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 1};
-    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<SIZE_TYPE> idx = {0};
     std::vector<float> w = {1.0f}, imp = {0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
 
-    const float true_imp    = 0.03f;
-    const float scale       = 0.01f;
-    const float stored_target = true_imp / scale;   // 3.0 -- exact FP4_TABLE entry
+    const float true_imp = 0.03f;
+    const float scale = 0.01f;
+    const float stored_target = true_imp / scale; // 3.0 -- exact FP4_TABLE entry
     ValueAccessor<FP4BiPacked>::set(dc.values, 0, 1.0f, stored_target);
 
     const float stored_readback = ValueAccessor<FP4BiPacked>::get_imp(dc.values, 0);
-    CHECK(stored_readback == Catch::Approx(3.0f));   // exact table entry, no rounding loss
+    CHECK(stored_readback == Catch::Approx(3.0f)); // exact table entry, no rounding loss
 
     const float true_readback = stored_readback * scale;
-    CHECK(true_readback == Catch::Approx(0.03f));    // recovers the true value exactly
+    CHECK(true_readback == Catch::Approx(0.03f)); // recovers the true value exactly
 }
 
-TEST_CASE("disldo_backward's importance update actually uses importance_scale, not just the field existing",
-         "[importance_scale][regression]") {
+TEST_CASE("disldo_backward's importance update actually uses importance_scale, not just the field "
+          "existing",
+          "[importance_scale][regression]") {
     // Direct test that the KERNEL respects the scale, not just that the
     // scale can be set and manually decoded (the three tests above).
     //
@@ -559,14 +569,15 @@ TEST_CASE("disldo_backward's importance update actually uses importance_scale, n
     using S = int;
     using COL_TYPE = uint32_t;
     std::vector<S> ptrs = {0, 1};
-    std::vector<S> idx  = {0};
+    std::vector<S> idx = {0};
     std::vector<float> w = {1.0f}, imp = {0.0f};
     auto dc = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
 
     SparseLinearWeightsDelta<S, FP4BiPacked, COL_TYPE> weights;
     weights.connections = dc;
-    weights.set_importance_scale_raw(0, 0.01f);   // fresh layer, nothing to preserve -- direct set is fine
+    weights.set_importance_scale_raw(
+        0, 0.01f); // fresh layer, nothing to preserve -- direct set is fine
     weights.out_degree.assign(1, S(0));
 
     // A single backward pass, dy=0, lr!=0 -- contrib = input*stored_w = 5.0,
@@ -577,24 +588,24 @@ TEST_CASE("disldo_backward's importance update actually uses importance_scale, n
     // ci at scale=1.0 -> 0.025, well below 0.25, would round away to 0 --
     // exactly the scale-dependent behavior this test exists to check.
     std::vector<float> input = {5.0f};
-    std::vector<float> dy    = {0.0f};
+    std::vector<float> dy = {0.0f};
     std::vector<float> dx(1, 0.0f), in_acc(1, 0.0f), gr_acc(1, 0.0f);
     disldo_backward<S, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-        input.data(), S(1), S(1), dy.data(), weights, dx.data(),
-        in_acc.data(), gr_acc.data(), /*learning_rate=*/0.5f, 1);
+        input.data(), S(1), S(1), dy.data(), weights, dx.data(), in_acc.data(), gr_acc.data(),
+        /*learning_rate=*/0.5f, 1);
 
     const float stored = ValueAccessor<FP4BiPacked>::get_imp(
         weights.connections.values, weights.connections.layout.elem_start[0]);
     const float true_imp = stored * weights.get_importance_scale(0);
-    CHECK(true_imp != 0.0f);   // survived, wouldn't have at scale=1.0 for a contribution this small
+    CHECK(true_imp != 0.0f); // survived, wouldn't have at scale=1.0 for a contribution this small
 }
 
 TEST_CASE("rescale_importance preserves the true value across a scale change",
-         "[importance_scale][regression]") {
+          "[importance_scale][regression]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 1};
-    std::vector<SIZE_TYPE> idx  = {0};
+    std::vector<SIZE_TYPE> idx = {0};
     std::vector<float> w = {1.0f}, imp = {0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(1), std::size_t(1), std::size_t(64), std::size_t(64));
@@ -611,10 +622,9 @@ TEST_CASE("rescale_importance preserves the true value across a scale change",
     CHECK(weights.get_importance_scale(0) == Catch::Approx(0.5f));
 
     const float stored_after = ValueAccessor<FP4BiPacked>::get_imp(weights.connections.values, 0);
-    const float true_after   = stored_after * weights.get_importance_scale(0);
-    CHECK(true_after == Catch::Approx(2.0f).margin(0.1f));   // true value preserved, not corrupted
+    const float true_after = stored_after * weights.get_importance_scale(0);
+    CHECK(true_after == Catch::Approx(2.0f).margin(0.1f)); // true value preserved, not corrupted
 }
-
 
 // ── Running L1/L2/max stats + hoyer_importance/hoyer_value ───────────────────
 //
@@ -627,11 +637,11 @@ TEST_CASE("rescale_importance preserves the true value across a scale change",
 
 TEST_CASE("recompute_stats matches a hand-computed reference", "[stats]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -639,13 +649,14 @@ TEST_CASE("recompute_stats matches a hand-computed reference", "[stats]") {
     weights.connections = dc;
     weights.recompute_stats();
 
-    CHECK(weights.value_l1    == Catch::Approx(1.5 + 2.0 + 0.5 + 3.0));
-    CHECK(weights.value_l2_sq == Catch::Approx(1.5*1.5 + 2.0*2.0 + 0.5*0.5 + 3.0*3.0));
+    CHECK(weights.value_l1 == Catch::Approx(1.5 + 2.0 + 0.5 + 3.0));
+    CHECK(weights.value_l2_sq == Catch::Approx(1.5 * 1.5 + 2.0 * 2.0 + 0.5 * 0.5 + 3.0 * 3.0));
     CHECK(weights.value_max_abs == Catch::Approx(3.0f));
 }
 
-TEST_CASE("incremental stats match a fresh recompute after many forward+backward calls pre_existing_failure",
-         "[stats][regression]") {
+TEST_CASE("incremental stats match a fresh recompute after many forward+backward calls "
+          "pre_existing_failure",
+          "[stats][regression]") {
     // Regression test for a real bug found during development: the FP4
     // quantizer rounds to the nearest FP4_TABLE entry, so the value passed
     // to update_*_stats() must be the ACTUAL post-quantization stored value
@@ -653,11 +664,11 @@ TEST_CASE("incremental stats match a fresh recompute after many forward+backward
     // computed -- using the latter caused real, measurable drift starting
     // from the very first update.
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -667,36 +678,38 @@ TEST_CASE("incremental stats match a fresh recompute after many forward+backward
     weights.recompute_stats();
 
     for (int step = 0; step < 15; ++step) {
-        const float a = 0.3f * (step % 5) - 0.6f, b = 0.2f * (step % 7) - 0.5f, c = 0.15f * (step % 3);
+        const float a = 0.3f * (step % 5) - 0.6f, b = 0.2f * (step % 7) - 0.5f,
+                    c = 0.15f * (step % 3);
         std::vector<float> input = {a, b, c};
         std::vector<float> output(4, 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), weights, output.data(), 1);
+        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), SIZE_TYPE(1), SIZE_TYPE(3),
+                                                         weights, output.data(), 1);
 
         std::vector<float> dy = {b, -a, c, a - b};
         std::vector<float> dx(3, 0.0f), in_acc(3, 0.0f), gr_acc(4, 0.0f);
-        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            input.data(), SIZE_TYPE(1), SIZE_TYPE(3), dy.data(), weights, dx.data(),
-            in_acc.data(), gr_acc.data(), 0.3f, 1);
+        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(input.data(), SIZE_TYPE(1), SIZE_TYPE(3),
+                                                          dy.data(), weights, dx.data(),
+                                                          in_acc.data(), gr_acc.data(), 0.3f, 1);
 
         auto weights_copy = weights;
         weights_copy.recompute_stats();
 
-        CHECK(weights.value_l1        == Catch::Approx(weights_copy.value_l1).margin(1e-3));
-        CHECK(weights.value_l2_sq     == Catch::Approx(weights_copy.value_l2_sq).margin(1e-3));
-        CHECK(weights.importance_l1    == Catch::Approx(weights_copy.importance_l1).margin(1e-3));
-        CHECK(weights.importance_l2_sq == Catch::Approx(weights_copy.importance_l2_sq).margin(1e-3));
+        CHECK(weights.value_l1 == Catch::Approx(weights_copy.value_l1).margin(1e-3));
+        CHECK(weights.value_l2_sq == Catch::Approx(weights_copy.value_l2_sq).margin(1e-3));
+        CHECK(weights.importance_l1 == Catch::Approx(weights_copy.importance_l1).margin(1e-3));
+        CHECK(weights.importance_l2_sq ==
+              Catch::Approx(weights_copy.importance_l2_sq).margin(1e-3));
     }
 }
 
 TEST_CASE("max_abs is a monotonic upper bound, exact only after recompute -- documented, not a bug",
-         "[stats]") {
+          "[stats]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -722,11 +735,11 @@ TEST_CASE("max_abs is a monotonic upper bound, exact only after recompute -- doc
 
 TEST_CASE("hoyer_value/hoyer_importance stay in [0,1]", "[stats]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(4096), std::size_t(4096));
 
@@ -736,20 +749,21 @@ TEST_CASE("hoyer_value/hoyer_importance stay in [0,1]", "[stats]") {
 
     const float hv = weights.hoyer_value();
     const float hi = weights.hoyer_importance();
-    CHECK(hv >= 0.0f); CHECK(hv <= 1.0f);
-    CHECK(hi >= 0.0f); CHECK(hi <= 1.0f);
+    CHECK(hv >= 0.0f);
+    CHECK(hv <= 1.0f);
+    CHECK(hi >= 0.0f);
+    CHECK(hi <= 1.0f);
 }
 
-
 TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
-         "[synaptogenesis][integration]") {
+          "[synaptogenesis][integration]") {
     using SIZE_TYPE = int;
-    using COL_TYPE  = uint32_t;
+    using COL_TYPE = uint32_t;
 
     std::vector<SIZE_TYPE> ptrs = {0, 2, 3, 4};
-    std::vector<SIZE_TYPE> idx  = {0, 2, 1, 3};
-    std::vector<float>     w    = {1.5f, -2.0f, 0.5f, 3.0f};
-    std::vector<float>     imp  = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<SIZE_TYPE> idx = {0, 2, 1, 3};
+    std::vector<float> w = {1.5f, -2.0f, 0.5f, 3.0f};
+    std::vector<float> imp = {0.0f, 0.0f, 0.0f, 0.0f};
     auto dc = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         ptrs, idx, w, imp, std::size_t(3), std::size_t(4), std::size_t(64), std::size_t(64));
 
@@ -762,9 +776,9 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
     const std::size_t nnz_before = weights.connections.nnz() + weights.block4.live_synapses();
 
     std::vector<float> input_accum = {5.0f, 0.1f, 3.0f};
-    std::vector<float> grad_accum  = {0.1f, 4.0f, 0.1f, 0.1f};
-    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        weights, input_accum.data(), grad_accum.data(), SIZE_TYPE(3));
+    std::vector<float> grad_accum = {0.1f, 4.0f, 0.1f, 0.1f};
+    delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, input_accum.data(),
+                                                             grad_accum.data(), SIZE_TYPE(3));
 
     REQUIRE(weights.probes.nnz() > 0);
 
@@ -777,8 +791,8 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
     std::size_t current_row = 0;
     for (int i = 0; i < 3; ++i) {
         try {
-            delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-                weights, current_row, 0.0f, SIZE_TYPE(10));
+            delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, current_row, 0.0f,
+                                                                       SIZE_TYPE(10));
         } catch (const std::runtime_error&) {
             // Expected for rows without enough headroom for this much
             // growth in one step -- continue to the next row.
@@ -791,7 +805,7 @@ TEST_CASE("synaptogenesis end-to-end: probes generated and applied grow nnz",
 }
 
 TEST_CASE("load_weights on two separate SparseLinearWeightsDelta layers does not corrupt either",
-         "[load_weights][regression]") {
+          "[load_weights][regression]") {
     // Regression: load_weights was calling delta_csr_from_absolute with
     // idx.size()*8+4096 as the index budget -- a value that can be SMALLER
     // than the actual bytes written by indices_buf.assign(L.byte_start[rows])
@@ -809,11 +823,11 @@ TEST_CASE("load_weights on two separate SparseLinearWeightsDelta layers does not
     // Two independently constructed layers loaded in sequence -- previously
     // the second load_weights corrupted the first layer's nnz.
     auto dc0 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
-        ptrs, std::vector<S>{0, 2}, vals, std::vector<float>{0.0f, 0.0f},
-        std::size_t(2), std::size_t(3), std::size_t(4096), std::size_t(256));
+        ptrs, std::vector<S>{0, 2}, vals, std::vector<float>{0.0f, 0.0f}, std::size_t(2),
+        std::size_t(3), std::size_t(4096), std::size_t(256));
     auto dc1 = delta_csr_from_absolute<S, FP4BiPacked, COL_TYPE>(
-        ptrs, std::vector<S>{1, 0}, vals, std::vector<float>{0.0f, 0.0f},
-        std::size_t(2), std::size_t(3), std::size_t(4096), std::size_t(256));
+        ptrs, std::vector<S>{1, 0}, vals, std::vector<float>{0.0f, 0.0f}, std::size_t(2),
+        std::size_t(3), std::size_t(4096), std::size_t(256));
 
     // Both should have exactly 2 nonzeros, NOT ~32000.
     CHECK(static_cast<int>(dc0.nnz()) == 2);

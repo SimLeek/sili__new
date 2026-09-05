@@ -8,15 +8,15 @@ struct ExampleObject {
     int x;
     ExampleObject() : x(0) {}
     ExampleObject(int val) : x(val) {}
-    ExampleObject(const ExampleObject &) = delete;                     // Make it non-copyable
-    ExampleObject(ExampleObject &&other) : x(other.x) { other.x = 0; } // Support move semantics
+    ExampleObject(const ExampleObject&) = delete;                      // Make it non-copyable
+    ExampleObject(ExampleObject&& other) : x(other.x) { other.x = 0; } // Support move semantics
 };
 
 struct CopyableObject {
     int x;
     CopyableObject() : x(0) {}
     CopyableObject(int val) : x(val) {}
-    CopyableObject(const CopyableObject &) = default; // Make it copyable
+    CopyableObject(const CopyableObject&) = default; // Make it copyable
 };
 
 // Test case 1: Initialization with POD types
@@ -32,13 +32,15 @@ TEST_CASE("unique_vector POD initialization", "[unique_vector]") {
 
 // Test case 2: Initialization with non-POD objects
 TEST_CASE("unique_vector Non-Copyable Object initialization", "[unique_vector]") {
-    REQUIRE_THROWS_AS((sili::unique_vector<ExampleObject>{ExampleObject(1), ExampleObject(2), ExampleObject(3)}),
-                      std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        (sili::unique_vector<ExampleObject>{ExampleObject(1), ExampleObject(2), ExampleObject(3)}),
+        std::invalid_argument);
 }
 
 // Test case 2: Initialization with copyable non-POD objects
 TEST_CASE("unique_vector Copyable Object initialization", "[unique_vector]") {
-    sili::unique_vector<CopyableObject> vec = {CopyableObject(1), CopyableObject(2), CopyableObject(3)};
+    sili::unique_vector<CopyableObject> vec = {CopyableObject(1), CopyableObject(2),
+                                               CopyableObject(3)};
     std::vector<int> expected = {1, 2, 3};
 
     REQUIRE(vec.size() == 3);
@@ -69,7 +71,8 @@ TEST_CASE("unique_vector Move semantics", "[unique_vector]") {
     CHECK_VECTOR_EQUAL(vec2, expected);
 
     // Ensure copy constructor is deleted
-    static_assert(!std::is_copy_constructible<sili::unique_vector<int>>::value, "unique_vector should not be copyable");
+    static_assert(!std::is_copy_constructible<sili::unique_vector<int>>::value,
+                  "unique_vector should not be copyable");
 }
 
 TEST_CASE("unique_vector size", "[unique_vector]") {
@@ -144,7 +147,9 @@ TEST_CASE("unique_vector emplace_back and push_back", "[unique_vector]") {
     REQUIRE(vec[2] == 3);
 
     // Test emplace_back with custom types
-    struct MyStruct { int value; };
+    struct MyStruct {
+        int value;
+    };
     sili::unique_vector<MyStruct> vec2;
     vec2.emplace_back(4);
     REQUIRE(vec2.size() == 1);

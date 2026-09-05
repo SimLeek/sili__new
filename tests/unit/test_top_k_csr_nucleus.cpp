@@ -18,9 +18,14 @@
 #include <random>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
 
@@ -30,10 +35,13 @@ using SIZE_TYPE = int;
 // own logic.
 static double captured_ratio(const std::vector<float>& row, const std::vector<float>& kept) {
     double total = 0.0;
-    for (float v : row) total += static_cast<double>(v) * v;
-    if (total == 0.0) return 0.0;
+    for (float v : row)
+        total += static_cast<double>(v) * v;
+    if (total == 0.0)
+        return 0.0;
     double captured = 0.0;
-    for (float v : kept) captured += static_cast<double>(v) * v;
+    for (float v : kept)
+        captured += static_cast<double>(v) * v;
     return captured / total;
 }
 
@@ -41,29 +49,33 @@ static double captured_ratio(const std::vector<float>& row, const std::vector<fl
 // violate R>=r_target (unless k==0 or k==cols already). Otherwise a
 // kernel could satisfy the invariant by trivially keeping everything.
 static bool is_minimal(const std::vector<float>& row, std::vector<float> kept, float r_target) {
-    if (kept.empty() || kept.size() >= row.size()) return true;
+    if (kept.empty() || kept.size() >= row.size())
+        return true;
     // kept is already row-major/index order, not magnitude order -- find
     // and drop the single smallest-magnitude entry.
     size_t drop = 0;
     for (size_t i = 1; i < kept.size(); ++i)
-        if (std::abs(kept[i]) < std::abs(kept[drop])) drop = i;
+        if (std::abs(kept[i]) < std::abs(kept[drop]))
+            drop = i;
     std::vector<float> smaller = kept;
     smaller.erase(smaller.begin() + drop);
     return captured_ratio(row, smaller) < static_cast<double>(r_target);
 }
 
 static void check_r_target_invariant(const char* name, size_t rows, size_t cols,
-                                      const std::vector<float>& r_targets, unsigned seed) {
+                                     const std::vector<float>& r_targets, unsigned seed) {
     std::vector<float> values(rows * cols);
     std::mt19937 rng(seed);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     for (int num_threads : {1, 4}) {
-        auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), rows, cols, r_targets.data(), num_threads);
+        auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), rows, cols, r_targets.data(),
+                                                       num_threads);
         auto& ptrs = *csr.ptrs[0];
-        auto& idx  = *csr.indices[0];
-        auto& val  = *csr.values[0];
+        auto& idx = *csr.indices[0];
+        auto& val = *csr.values[0];
 
         for (size_t r = 0; r < rows; ++r) {
             std::vector<float> row(values.begin() + r * cols, values.begin() + (r + 1) * cols);
@@ -72,12 +84,12 @@ static void check_r_target_invariant(const char* name, size_t rows, size_t cols,
 
             double R = captured_ratio(row, kept);
             CHECK(R >= static_cast<double>(r_targets[r]) - 1e-6,
-                  "%s (threads=%d) row %zu: R=%.6f < r_target=%.6f (k=%zu/%zu)",
-                  name, num_threads, r, R, r_targets[r], kept.size(), cols);
+                  "%s (threads=%d) row %zu: R=%.6f < r_target=%.6f (k=%zu/%zu)", name, num_threads,
+                  r, R, r_targets[r], kept.size(), cols);
 
             CHECK(is_minimal(row, kept, r_targets[r]),
-                  "%s (threads=%d) row %zu: k=%zu is not minimal for r_target=%.6f",
-                  name, num_threads, r, kept.size(), r_targets[r]);
+                  "%s (threads=%d) row %zu: k=%zu is not minimal for r_target=%.6f", name,
+                  num_threads, r, kept.size(), r_targets[r]);
 
             // indices strictly ascending (row-major CSR convention)
             for (size_t i = 1; i < kept_idx.size(); ++i)
@@ -86,8 +98,8 @@ static void check_r_target_invariant(const char* name, size_t rows, size_t cols,
 
             // every kept value must equal the true dense value at that index
             for (size_t i = 0; i < kept_idx.size(); ++i)
-                CHECK(kept[i] == row[kept_idx[i]],
-                      "%s row %zu: kept value/index mismatch", name, r);
+                CHECK(kept[i] == row[kept_idx[i]], "%s row %zu: kept value/index mismatch", name,
+                      r);
         }
     }
 }
@@ -116,7 +128,8 @@ static void check_edge_cases() {
         std::vector<float> r_target = {1.0f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 5, r_target.data(), 1);
         auto& ptrs = *csr.ptrs[0];
-        CHECK(ptrs[1] - ptrs[0] == 5, "r_target=1.0 must keep all 5 entries, got %d", ptrs[1] - ptrs[0]);
+        CHECK(ptrs[1] - ptrs[0] == 5, "r_target=1.0 must keep all 5 entries, got %d",
+              ptrs[1] - ptrs[0]);
     }
     // One dominant entry: r_target=0.9 should need only that one entry.
     {
@@ -125,8 +138,10 @@ static void check_edge_cases() {
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1);
         auto& ptrs = *csr.ptrs[0];
         auto& idx = *csr.indices[0];
-        CHECK(ptrs[1] - ptrs[0] == 1, "dominant-entry row: expected k=1, got %d", ptrs[1] - ptrs[0]);
-        if (ptrs[1] - ptrs[0] == 1) CHECK(idx[0] == 0, "dominant-entry row: expected index 0 kept, got %d", idx[0]);
+        CHECK(ptrs[1] - ptrs[0] == 1, "dominant-entry row: expected k=1, got %d",
+              ptrs[1] - ptrs[0]);
+        if (ptrs[1] - ptrs[0] == 1)
+            CHECK(idx[0] == 0, "dominant-entry row: expected index 0 kept, got %d", idx[0]);
     }
     // Flat/uniform row: every entry contributes equally, so R_target=0.5
     // over 4 equal-magnitude entries needs k=2 (ties broken consistently,
@@ -136,14 +151,15 @@ static void check_edge_cases() {
         std::vector<float> r_target = {0.5f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1);
         auto& ptrs = *csr.ptrs[0];
-        CHECK(ptrs[1] - ptrs[0] == 2, "uniform row r_target=0.5: expected k=2, got %d", ptrs[1] - ptrs[0]);
+        CHECK(ptrs[1] - ptrs[0] == 2, "uniform row r_target=0.5: expected k=2, got %d",
+              ptrs[1] - ptrs[0]);
     }
     // Per-row independence: two very different rows in the same call must
     // each get their own k, not a shared/global one.
     {
         std::vector<float> values = {
-            100.0f, 1.0f, 1.0f, 1.0f,   // needs k=1 at r_target=0.9
-            1.0f, 1.0f, 1.0f, 1.0f,     // needs k=4 at r_target=0.9 (flat)
+            100.0f, 1.0f, 1.0f, 1.0f, // needs k=1 at r_target=0.9
+            1.0f,   1.0f, 1.0f, 1.0f, // needs k=4 at r_target=0.9 (flat)
         };
         std::vector<float> r_target = {0.9f, 0.9f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 2, 4, r_target.data(), 1);
@@ -162,14 +178,15 @@ static void check_k_min_max_clamp() {
         std::vector<float> values = {5.0f, -4.0f, 1.0f, 0.5f};
         std::vector<float> r_target = {0.0f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1,
-                                                         /*k_min=*/2, /*k_max=*/SIZE_MAX);
+                                                       /*k_min=*/2, /*k_max=*/SIZE_MAX);
         auto& ptrs = *csr.ptrs[0];
         auto& idx = *csr.indices[0];
         CHECK(ptrs[1] - ptrs[0] == 2, "k_min=2 floor: expected k=2, got %d", ptrs[1] - ptrs[0]);
         // must be the two LARGEST-magnitude entries (indices 0 and 1), not arbitrary.
         if (ptrs[1] - ptrs[0] == 2) {
             CHECK(idx[0] == 0 && idx[1] == 1,
-                  "k_min padding should keep the top-magnitude entries, got idx[0]=%d idx[1]=%d", idx[0], idx[1]);
+                  "k_min padding should keep the top-magnitude entries, got idx[0]=%d idx[1]=%d",
+                  idx[0], idx[1]);
         }
     }
     // r_target=1.0 would normally give k=cols -- k_max must force a ceiling.
@@ -177,7 +194,7 @@ static void check_k_min_max_clamp() {
         std::vector<float> values = {5.0f, -4.0f, 1.0f, 0.5f};
         std::vector<float> r_target = {1.0f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1,
-                                                         /*k_min=*/0, /*k_max=*/2);
+                                                       /*k_min=*/0, /*k_max=*/2);
         auto& ptrs = *csr.ptrs[0];
         CHECK(ptrs[1] - ptrs[0] == 2, "k_max=2 ceiling: expected k=2, got %d", ptrs[1] - ptrs[0]);
     }
@@ -186,9 +203,10 @@ static void check_k_min_max_clamp() {
         std::vector<float> values = {0.0f, 0.0f, 0.0f, 0.0f};
         std::vector<float> r_target = {0.5f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1,
-                                                         /*k_min=*/3, /*k_max=*/SIZE_MAX);
+                                                       /*k_min=*/3, /*k_max=*/SIZE_MAX);
         auto& ptrs = *csr.ptrs[0];
-        CHECK(ptrs[1] - ptrs[0] == 0, "all-zero row: k_min cannot manufacture entries, expected k=0, got %d",
+        CHECK(ptrs[1] - ptrs[0] == 0,
+              "all-zero row: k_min cannot manufacture entries, expected k=0, got %d",
               ptrs[1] - ptrs[0]);
     }
     // Default (no clamp) behavior must be unaffected -- same as the
@@ -198,7 +216,8 @@ static void check_k_min_max_clamp() {
         std::vector<float> r_target = {0.9f};
         auto csr = top_k_csr_nucleus<SIZE_TYPE, float>(values.data(), 1, 4, r_target.data(), 1);
         auto& ptrs = *csr.ptrs[0];
-        CHECK(ptrs[1] - ptrs[0] == 1, "default (no clamp): expected k=1, got %d", ptrs[1] - ptrs[0]);
+        CHECK(ptrs[1] - ptrs[0] == 1, "default (no clamp): expected k=1, got %d",
+              ptrs[1] - ptrs[0]);
     }
 }
 
@@ -208,14 +227,16 @@ int main() {
 
     check_r_target_invariant("random rows, r_target=0.5", 8, 32, std::vector<float>(8, 0.5f), 1);
     check_r_target_invariant("random rows, r_target=0.95", 8, 64, std::vector<float>(8, 0.95f), 2);
-    check_r_target_invariant("random rows, r_target=0.05", 16, 48, std::vector<float>(16, 0.05f), 3);
+    check_r_target_invariant("random rows, r_target=0.05", 16, 48, std::vector<float>(16, 0.05f),
+                             3);
 
     // Heterogeneous per-row targets in a single call.
     std::vector<float> mixed_targets = {0.1f, 0.99f, 0.5f, 0.75f, 0.3f, 0.6f, 0.2f, 0.8f};
     check_r_target_invariant("mixed per-row r_target", 8, 40, mixed_targets, 4);
 
     // Larger, above-threshold shape (exercises the #pragma omp path).
-    check_r_target_invariant("large (128x256, r_target=0.8)", 128, 256, std::vector<float>(128, 0.8f), 5);
+    check_r_target_invariant("large (128x256, r_target=0.8)", 128, 256,
+                             std::vector<float>(128, 0.8f), 5);
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

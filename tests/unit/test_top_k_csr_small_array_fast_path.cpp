@@ -19,9 +19,14 @@
 #include <random>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
 
@@ -29,7 +34,8 @@ static void check_thread_count_invariance(const char* name, size_t n, size_t k) 
     std::vector<float> values(n);
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
     std::vector<std::vector<SIZE_TYPE>> results;
     for (int num_threads : {1, 2, 4, 8}) {
@@ -44,18 +50,25 @@ static void check_thread_count_invariance(const char* name, size_t n, size_t k) 
     }
     for (size_t i = 1; i < results.size(); ++i) {
         CHECK(results[i] == results[0],
-              "%s: num_threads variant %zu produced a different index set than num_threads=1 (n=%zu, k=%zu)",
+              "%s: num_threads variant %zu produced a different index set than num_threads=1 "
+              "(n=%zu, k=%zu)",
               name, i, n, k);
     }
 }
 
-static void check_top_k_csr_thread_count_invariance(const char* name, size_t rows, size_t cols, size_t k) {
+static void check_top_k_csr_thread_count_invariance(const char* name, size_t rows, size_t cols,
+                                                    size_t k) {
     std::vector<float> values(rows * cols);
     std::mt19937 rng(7);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    for (auto& v : values) v = dist(rng);
+    for (auto& v : values)
+        v = dist(rng);
 
-    struct Result { std::vector<SIZE_TYPE> row, col; std::vector<float> val; std::vector<SIZE_TYPE> ptrs; };
+    struct Result {
+        std::vector<SIZE_TYPE> row, col;
+        std::vector<float> val;
+        std::vector<SIZE_TYPE> ptrs;
+    };
     std::vector<Result> results;
     for (int num_threads : {1, 2, 4, 8}) {
         auto csr = top_k_csr<SIZE_TYPE, float>(values.data(), rows, cols, k, num_threads);
@@ -73,9 +86,13 @@ static void check_top_k_csr_thread_count_invariance(const char* name, size_t row
         bool vals_match = results[i].val.size() == results[0].val.size();
         if (vals_match) {
             for (size_t j = 0; j < results[i].val.size(); ++j)
-                if (results[i].val[j] != results[0].val[j]) { vals_match = false; break; }
+                if (results[i].val[j] != results[0].val[j]) {
+                    vals_match = false;
+                    break;
+                }
         }
-        CHECK(vals_match, "%s: top_k_csr values diverged across thread counts (variant %zu)", name, i);
+        CHECK(vals_match, "%s: top_k_csr values diverged across thread counts (variant %zu)", name,
+              i);
     }
 }
 

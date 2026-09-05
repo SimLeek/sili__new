@@ -25,10 +25,10 @@
  * @param cond The condition to check.
  * @param msg The message to display if the condition fails.
  */
-#define REQUIRE_MESSAGE(cond, msg)                                                                                     \
-    do {                                                                                                               \
-        INFO(msg);                                                                                                     \
-        REQUIRE(cond);                                                                                                 \
+#define REQUIRE_MESSAGE(cond, msg)                                                                 \
+    do {                                                                                           \
+        INFO(msg);                                                                                 \
+        REQUIRE(cond);                                                                             \
     } while ((void)0, 0)
 /**
  * @def CHECK_MESSAGE(cond, msg)
@@ -36,10 +36,10 @@
  * @param cond The condition to check.
  * @param msg The message to display if the condition fails.
  */
-#define CHECK_MESSAGE(cond, msg)                                                                                       \
-    do {                                                                                                               \
-        INFO(msg);                                                                                                     \
-        CHECK(cond);                                                                                                   \
+#define CHECK_MESSAGE(cond, msg)                                                                   \
+    do {                                                                                           \
+        INFO(msg);                                                                                 \
+        CHECK(cond);                                                                               \
     } while ((void)0, 0)
 
 /**
@@ -73,7 +73,7 @@ template <std::size_t N, std::size_t... Is> struct gen_seq : gen_seq<N - 1, N - 
 template <std::size_t... Is> struct gen_seq<0, Is...> : seq<Is...> {};
 
 template <class Ch, class Tr, class Tuple, std::size_t... Is>
-void print_tuple(std::basic_ostream<Ch, Tr> &os, Tuple const &t, seq<Is...>) {
+void print_tuple(std::basic_ostream<Ch, Tr>& os, Tuple const& t, seq<Is...>) {
     using swallow = int[];
     (void)swallow{0, (void(os << (Is == 0 ? "" : ", ") << std::get<Is>(t)), 0)...};
 }
@@ -81,9 +81,10 @@ void print_tuple(std::basic_ostream<Ch, Tr> &os, Tuple const &t, seq<Is...>) {
 /** @endcond */
 
 // forward declarations
-template <class Ch, class Tr, class T> std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::vector<T> &p);
+template <class Ch, class Tr, class T>
+std::ostream& operator<<(std::basic_ostream<Ch, Tr>& o, const std::vector<T>& p);
 template <class Ch, class Tr, class S, class T>
-std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::pair<S, T> &p);
+std::ostream& operator<<(std::basic_ostream<Ch, Tr>& o, const std::pair<S, T>& p);
 
 /**
  * @brief Streams a tuple to an ostream.
@@ -96,7 +97,8 @@ std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::pair<S, T> &p
  * @return The output stream.
  */
 template <class Ch, class Tr, class... Args>
-auto operator<<(std::basic_ostream<Ch, Tr> &os, std::tuple<Args...> const &t) -> std::basic_ostream<Ch, Tr> & {
+auto operator<<(std::basic_ostream<Ch, Tr>& os, std::tuple<Args...> const& t)
+    -> std::basic_ostream<Ch, Tr>& {
     os << "(";
     aux::print_tuple(os, t, aux::gen_seq<sizeof...(Args)>());
     return os << ")";
@@ -114,7 +116,7 @@ auto operator<<(std::basic_ostream<Ch, Tr> &os, std::tuple<Args...> const &t) ->
  * @return The output stream.
  */
 template <class Ch, class Tr, class S, class T>
-std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::pair<S, T> &p) {
+std::ostream& operator<<(std::basic_ostream<Ch, Tr>& o, const std::pair<S, T>& p) {
     return o << "(" << p.first << ", " << p.second << ")";
 }
 
@@ -129,7 +131,7 @@ std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::pair<S, T> &p
  * @return The output stream.
  */
 template <class Ch, class Tr, class T>
-std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::vector<T> &p) {
+std::ostream& operator<<(std::basic_ostream<Ch, Tr>& o, const std::vector<T>& p) {
     o << "{ ";
     for (auto v : p) {
         o << v << " ";
@@ -152,8 +154,9 @@ std::ostream &operator<<(std::basic_ostream<Ch, Tr> &o, const std::vector<T> &p)
  * @return Reference to the diff vector.
  */
 template <typename VecA, typename VecB>
-inline typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value, VecA>::type
-vector_diff(const VecA &a, const VecB &b, VecA diff=VecA()) {
+inline typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value,
+                               VecA>::type
+vector_diff(const VecA& a, const VecB& b, VecA diff = VecA()) {
     std::set_symmetric_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(diff));
     return diff;
 }
@@ -171,9 +174,8 @@ vector_diff(const VecA &a, const VecB &b, VecA diff=VecA()) {
  * @param epsilon Tolerance for non-zero check (default: numeric_limits<T>::epsilon()).
  */
 template <typename T>
-void getNonzeroIndicesAndValues(const std::vector<T> &d,
-                                std::vector<size_t> &nonzero_indices,
-                                std::vector<T> &nonzero_values,
+void getNonzeroIndicesAndValues(const std::vector<T>& d, std::vector<size_t>& nonzero_indices,
+                                std::vector<T>& nonzero_values,
                                 double epsilon = std::numeric_limits<T>::epsilon()) {
     for (size_t i = 0; i < d.size(); ++i) {
         if constexpr (std::is_signed<T>::value) {
@@ -181,7 +183,7 @@ void getNonzeroIndicesAndValues(const std::vector<T> &d,
                 nonzero_indices.push_back(i);
                 nonzero_values.push_back(d[i]);
             }
-        }else{
+        } else {
             if (d[i] > epsilon) {
                 nonzero_indices.push_back(i);
                 nonzero_values.push_back(d[i]);
@@ -206,10 +208,10 @@ void getNonzeroIndicesAndValues(const std::vector<T> &d,
  * @return String describing the differences.
  */
 template <typename VecA, typename VecB, typename T = typename VecA::value_type>
-typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value, std::string>::type vector_diff_string(
-    const VecA &a,
-    const VecB &b,
-    double epsilon = std::numeric_limits<T>::epsilon()) {
+typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<VecB>::value,
+                        std::string>::type
+vector_diff_string(const VecA& a, const VecB& b,
+                   double epsilon = std::numeric_limits<T>::epsilon()) {
     std::ostringstream oss;
     oss << "Vector A: " << a << "\n";
     oss << "Vector B: " << b << "\n";
@@ -223,7 +225,8 @@ typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<
         oss << "Diff values: " << nonzero_values;
     } else {
         std::vector<T> diff;
-        std::set_symmetric_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(diff));
+        std::set_symmetric_difference(a.begin(), a.end(), b.begin(), b.end(),
+                                      std::back_inserter(diff));
         oss << "Diff: " << vector_diff(a, b);
     }
     return oss.str();
@@ -242,8 +245,7 @@ typename std::enable_if<is_supported_vector<VecA>::value && is_supported_vector<
  * @return True if vectors are almost equal, false otherwise.
  */
 template <class T, class U>
-bool almost_equal(const std::vector<T> &a,
-                  const std::vector<U> &b,
+bool almost_equal(const std::vector<T>& a, const std::vector<U>& b,
                   double epsilon = std::numeric_limits<T>::epsilon()) {
     // Check if both vectors are of the same size
     if (a.size() != b.size()) {
@@ -270,7 +272,9 @@ bool almost_equal(const std::vector<T> &a,
  * @param size Size of the array.
  * @return A std::vector with the array elements.
  */
-template <typename T> std::vector<T> vec(T *arr, size_t size) { return std::vector<T>(arr, arr + size); }
+template <typename T> std::vector<T> vec(T* arr, size_t size) {
+    return std::vector<T>(arr, arr + size);
+}
 
 /**
  * @defgroup VectorMacros Vector Comparison Macros
@@ -317,56 +321,56 @@ template <typename T> std::vector<T> vec(T *arr, size_t size) { return std::vect
 
 /** @} */
 
-#define CHECK_VECTOR_EQUAL(a, b)                                                                                       \
-    do {                                                                                                               \
-        INFO(vector_diff_string(a, b, 0));                                                                             \
-        bool success = a == b;                                                                                         \
-        CHECK(success);                                                                                                \
+#define CHECK_VECTOR_EQUAL(a, b)                                                                   \
+    do {                                                                                           \
+        INFO(vector_diff_string(a, b, 0));                                                         \
+        bool success = a == b;                                                                     \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
-#define CHECK_VECTOR_ALMOST_EQUAL_3(a, b, e)                                                                           \
-    do {                                                                                                               \
-        INFO(vector_diff_string(a, b, e));                                                                             \
-        bool success = almost_equal(a, b, e);                                                                          \
-        CHECK(success);                                                                                                \
+#define CHECK_VECTOR_ALMOST_EQUAL_3(a, b, e)                                                       \
+    do {                                                                                           \
+        INFO(vector_diff_string(a, b, e));                                                         \
+        bool success = almost_equal(a, b, e);                                                      \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
-#define CHECK_VECTOR_ALMOST_EQUAL_2(a, b)                                                                              \
-    do {                                                                                                               \
-        INFO(vector_diff_string(a, b));                                                                                \
-        bool success = almost_equal(a, b);                                                                             \
-        CHECK(success);                                                                                                \
+#define CHECK_VECTOR_ALMOST_EQUAL_2(a, b)                                                          \
+    do {                                                                                           \
+        INFO(vector_diff_string(a, b));                                                            \
+        bool success = almost_equal(a, b);                                                         \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
 #define CHECK_VECTOR_ALMOST_EQUAL_x(x, a, b, e, FUNC, ...) FUNC
 
-#define CHECK_VECTOR_ALMOST_EQUAL(...)                                                                                 \
-    CHECK_VECTOR_ALMOST_EQUAL_x(                                                                                       \
-        , ##__VA_ARGS__, CHECK_VECTOR_ALMOST_EQUAL_3(__VA_ARGS__), CHECK_VECTOR_ALMOST_EQUAL_2(__VA_ARGS__), )
+#define CHECK_VECTOR_ALMOST_EQUAL(...)                                                             \
+    CHECK_VECTOR_ALMOST_EQUAL_x(, ##__VA_ARGS__, CHECK_VECTOR_ALMOST_EQUAL_3(__VA_ARGS__),         \
+                                CHECK_VECTOR_ALMOST_EQUAL_2(__VA_ARGS__), )
 
-#define REQUIRE_VECTOR_EQUAL(a, b)                                                                                     \
-    do {                                                                                                               \
-        INFO(vector_diff_string(a, b));                                                                                \
-        bool success = a == b;                                                                                         \
-        REQUIRE(success);                                                                                              \
+#define REQUIRE_VECTOR_EQUAL(a, b)                                                                 \
+    do {                                                                                           \
+        INFO(vector_diff_string(a, b));                                                            \
+        bool success = a == b;                                                                     \
+        REQUIRE(success);                                                                          \
     } while ((void)0, 0)
 
-#define CHECK_NESTED_VECTOR_EQUAL(a, b)                                                                                \
-    do {                                                                                                               \
-        REQUIRE(a.size() == b.size());                                                                                 \
-        for (size_t i = 0; i < a.size(); ++i) {                                                                        \
-            INFO("Mismatch at index " << i);                                                                           \
-            CHECK_VECTOR_EQUAL(a[i], b[i]);                                                                            \
-        }                                                                                                              \
+#define CHECK_NESTED_VECTOR_EQUAL(a, b)                                                            \
+    do {                                                                                           \
+        REQUIRE(a.size() == b.size());                                                             \
+        for (size_t i = 0; i < a.size(); ++i) {                                                    \
+            INFO("Mismatch at index " << i);                                                       \
+            CHECK_VECTOR_EQUAL(a[i], b[i]);                                                        \
+        }                                                                                          \
     } while ((void)0, 0)
 
-#define REQUIRE_NESTED_VECTOR_EQUAL(a, b)                                                                              \
-    do {                                                                                                               \
-        REQUIRE(a.size() == b.size());                                                                                 \
-        for (size_t i = 0; i < a.size(); ++i) {                                                                        \
-            INFO("Mismatch at index " << i);                                                                           \
-            REQUIRE_VECTOR_EQUAL(a[i], b[i]);                                                                          \
-        }                                                                                                              \
+#define REQUIRE_NESTED_VECTOR_EQUAL(a, b)                                                          \
+    do {                                                                                           \
+        REQUIRE(a.size() == b.size());                                                             \
+        for (size_t i = 0; i < a.size(); ++i) {                                                    \
+            INFO("Mismatch at index " << i);                                                       \
+            REQUIRE_VECTOR_EQUAL(a[i], b[i]);                                                      \
+        }                                                                                          \
     } while ((void)0, 0)
 
 /**
@@ -385,13 +389,11 @@ template <typename T> std::vector<T> vec(T *arr, size_t size) { return std::vect
  * @return String with difference details.
  */
 template <typename T>
-std::string csr_diff_string(const sparse_struct<size_t, CSRPointers<size_t>, CSRIndices<size_t>, UnaryValues<T>>& csr,
-                            const std::vector<size_t>& expected_ptrs,
-                            const std::vector<size_t>& expected_indices,
-                            const std::vector<T>& expected_values,
-                            size_t expected_rows,
-                            size_t expected_cols,
-                            double epsilon = std::numeric_limits<T>::epsilon()) {
+std::string csr_diff_string(
+    const sparse_struct<size_t, CSRPointers<size_t>, CSRIndices<size_t>, UnaryValues<T>>& csr,
+    const std::vector<size_t>& expected_ptrs, const std::vector<size_t>& expected_indices,
+    const std::vector<T>& expected_values, size_t expected_rows, size_t expected_cols,
+    double epsilon = std::numeric_limits<T>::epsilon()) {
     std::ostringstream oss;
     oss << "CSR rows: " << csr.rows << ", Expected rows: " << expected_rows << "\n";
     oss << "CSR cols: " << csr.cols << ", Expected cols: " << expected_cols << "\n";
@@ -421,13 +423,11 @@ std::string csr_diff_string(const sparse_struct<size_t, CSRPointers<size_t>, CSR
  * @return True if matches within tolerance, false otherwise.
  */
 template <typename T>
-bool csr_almost_equal(const sparse_struct<size_t, CSRPointers<size_t>, CSRIndices<size_t>, UnaryValues<T>>& csr,
-                        const std::vector<size_t>& expected_ptrs,
-                        const std::vector<size_t>& expected_indices,
-                        const std::vector<T>& expected_values,
-                        size_t expected_rows,
-                        size_t expected_cols,
-                        double epsilon = std::numeric_limits<T>::epsilon()) {
+bool csr_almost_equal(
+    const sparse_struct<size_t, CSRPointers<size_t>, CSRIndices<size_t>, UnaryValues<T>>& csr,
+    const std::vector<size_t>& expected_ptrs, const std::vector<size_t>& expected_indices,
+    const std::vector<T>& expected_values, size_t expected_rows, size_t expected_cols,
+    double epsilon = std::numeric_limits<T>::epsilon()) {
     if (csr.rows != expected_rows || csr.cols != expected_cols) {
         return false;
     }
@@ -459,7 +459,8 @@ bool csr_almost_equal(const sparse_struct<size_t, CSRPointers<size_t>, CSRIndice
  */
 
 /**
- * @def CHECK_CSR_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols)
+ * @def CHECK_CSR_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows,
+ * expected_cols)
  * @brief Checks exact equality of a CSR structure.
  * @param csr The CSR structure.
  * @param expected_ptrs Expected pointers.
@@ -470,7 +471,8 @@ bool csr_almost_equal(const sparse_struct<size_t, CSRPointers<size_t>, CSRIndice
  */
 
 /**
- * @def CHECK_CSR_ALMOST_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, [epsilon])
+ * @def CHECK_CSR_ALMOST_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows,
+ * expected_cols, [epsilon])
  * @brief Checks if a CSR structure is almost equal within tolerance.
  * @param csr The CSR structure.
  * @param expected_ptrs Expected pointers.
@@ -483,31 +485,44 @@ bool csr_almost_equal(const sparse_struct<size_t, CSRPointers<size_t>, CSRIndice
 
 /** @} */
 
-#define CHECK_CSR_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols) \
-    do { \
-        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, 0)); \
-        bool success = csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, 0); \
-        CHECK(success); \
+#define CHECK_CSR_EQUAL(csr, expected_ptrs, expected_indices, expected_values, expected_rows,      \
+                        expected_cols)                                                             \
+    do {                                                                                           \
+        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, \
+                             expected_cols, 0));                                                   \
+        bool success = csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values,     \
+                                        expected_rows, expected_cols, 0);                          \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
-#define CHECK_CSR_ALMOST_EQUAL_3(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, epsilon) \
-    do { \
-        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, epsilon)); \
-        bool success = csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, epsilon); \
-        CHECK(success); \
+#define CHECK_CSR_ALMOST_EQUAL_3(csr, expected_ptrs, expected_indices, expected_values,            \
+                                 expected_rows, expected_cols, epsilon)                            \
+    do {                                                                                           \
+        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, \
+                             expected_cols, epsilon));                                             \
+        bool success = csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values,     \
+                                        expected_rows, expected_cols, epsilon);                    \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
-#define CHECK_CSR_ALMOST_EQUAL_2(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols) \
-    do { \
-        using ValueType = std::remove_reference_t<decltype(csr.values[0][0])>; \
-        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, std::numeric_limits<ValueType>::epsilon())); \
-        bool success = csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, std::numeric_limits<ValueType>::epsilon()); \
-        CHECK(success); \
+#define CHECK_CSR_ALMOST_EQUAL_2(csr, expected_ptrs, expected_indices, expected_values,            \
+                                 expected_rows, expected_cols)                                     \
+    do {                                                                                           \
+        using ValueType = std::remove_reference_t<decltype(csr.values[0][0])>;                     \
+        INFO(csr_diff_string(csr, expected_ptrs, expected_indices, expected_values, expected_rows, \
+                             expected_cols, std::numeric_limits<ValueType>::epsilon()));           \
+        bool success =                                                                             \
+            csr_almost_equal(csr, expected_ptrs, expected_indices, expected_values, expected_rows, \
+                             expected_cols, std::numeric_limits<ValueType>::epsilon());            \
+        CHECK(success);                                                                            \
     } while ((void)0, 0)
 
- #define CHECK_CSR_ALMOST_EQUAL_x(x, csr, expected_ptrs, expected_indices, expected_values, expected_rows, expected_cols, epsilon, FUNC, ...) FUNC
+#define CHECK_CSR_ALMOST_EQUAL_x(x, csr, expected_ptrs, expected_indices, expected_values,         \
+                                 expected_rows, expected_cols, epsilon, FUNC, ...)                 \
+    FUNC
 
-#define CHECK_CSR_ALMOST_EQUAL(...) \
-        CHECK_CSR_ALMOST_EQUAL_x(, ##__VA_ARGS__, CHECK_CSR_ALMOST_EQUAL_3(__VA_ARGS__), CHECK_CSR_ALMOST_EQUAL_2(__VA_ARGS__))
+#define CHECK_CSR_ALMOST_EQUAL(...)                                                                \
+    CHECK_CSR_ALMOST_EQUAL_x(, ##__VA_ARGS__, CHECK_CSR_ALMOST_EQUAL_3(__VA_ARGS__),               \
+                             CHECK_CSR_ALMOST_EQUAL_2(__VA_ARGS__))
 
 #endif

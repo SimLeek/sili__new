@@ -23,8 +23,8 @@
 #include <random>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static double best_of(int reps, const std::function<void()>& fn) {
     fn();
@@ -32,7 +32,9 @@ static double best_of(int reps, const std::function<void()>& fn) {
     for (int i = 0; i < reps; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
         fn();
-        best = std::min(best, std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
+        best = std::min(
+            best,
+            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count());
     }
     return best;
 }
@@ -72,7 +74,8 @@ int main(int argc, char** argv) {
     std::vector<SIZE_TYPE> x_idx;
     std::vector<float> x_vals;
     for (int i = 0; i < n_in; ++i) {
-        if (!keep(rng)) continue;
+        if (!keep(rng))
+            continue;
         const float v = data_dist(rng);
         x_dense[i] = v;
         x_idx.push_back(i);
@@ -81,28 +84,34 @@ int main(int argc, char** argv) {
     const double real_density = double(x_idx.size()) / n_in;
 
     CSRInput<SIZE_TYPE, float> x_sparse;
-    x_sparse.rows = 1; x_sparse.cols = n_in;
+    x_sparse.rows = 1;
+    x_sparse.cols = n_in;
     x_sparse.ptrs[0] = std::make_shared<std::vector<SIZE_TYPE>>(
         std::vector<SIZE_TYPE>{0, static_cast<SIZE_TYPE>(x_idx.size())});
     x_sparse.indices[0] = std::make_shared<std::vector<SIZE_TYPE>>(x_idx);
-    x_sparse.values[0]  = std::make_shared<std::vector<float>>(x_vals);
+    x_sparse.values[0] = std::make_shared<std::vector<float>>(x_vals);
 
     std::vector<float> y_dense(n_out);
-    const double dense_ms = best_of(reps, [&]() {
-        std::fill(y_dense.begin(), y_dense.end(), 0.0f);
-        disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_dense.data(), 1, n_in, weights, y_dense.data(), 0.0f, num_cpus);
-    }) * 1e3;
+    const double dense_ms =
+        best_of(reps,
+                [&]() {
+                    std::fill(y_dense.begin(), y_dense.end(), 0.0f);
+                    disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+                        x_dense.data(), 1, n_in, weights, y_dense.data(), 0.0f, num_cpus);
+                }) *
+        1e3;
 
     std::vector<float> y_sparse(n_out);
-    const double sparse_ms = best_of(reps, [&]() {
-        std::fill(y_sparse.begin(), y_sparse.end(), 0.0f);
-        sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-            x_sparse, weights, y_sparse.data(), 0.0f, num_cpus);
-    }) * 1e3;
+    const double sparse_ms = best_of(reps,
+                                     [&]() {
+                                         std::fill(y_sparse.begin(), y_sparse.end(), 0.0f);
+                                         sisldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
+                                             x_sparse, weights, y_sparse.data(), 0.0f, num_cpus);
+                                     }) *
+                             1e3;
 
-    std::printf("density=%.3f (real=%.3f) num_cpus=%d n_tiles=%zu\n",
-                density, real_density, num_cpus, weights.block4.n_tiles());
+    std::printf("density=%.3f (real=%.3f) num_cpus=%d n_tiles=%zu\n", density, real_density,
+                num_cpus, weights.block4.n_tiles());
     std::printf("  dense (disldo_forward):        %.4f ms\n", dense_ms);
     std::printf("  sparse (sisldo_forward b4):  %.4f ms\n", sparse_ms);
     std::printf("  speedup (dense/sparse): %.2fx %s\n", dense_ms / sparse_ms,

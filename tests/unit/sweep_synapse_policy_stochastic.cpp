@@ -73,8 +73,8 @@
 #include <vector>
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static const std::size_t N = 8;
 static const std::size_t N_STEPS = 3000;
@@ -82,7 +82,8 @@ static const float LR = 0.05f;
 
 static std::vector<float> permutation_target(std::size_t n) {
     std::vector<float> t(n * n, 0.0f);
-    for (std::size_t i = 0; i < n; ++i) t[i * n + (i + 1) % n] = 0.37f;
+    for (std::size_t i = 0; i < n; ++i)
+        t[i * n + (i + 1) % n] = 0.37f;
     return t;
 }
 
@@ -93,7 +94,8 @@ static Weights make_dense_layer(std::size_t n) {
     std::vector<float> wv(n * n, 0.0f), imp(n * n, 0.0f);
     for (std::size_t r = 0; r < n; ++r) {
         ptrs[r] = SIZE_TYPE(r * n);
-        for (std::size_t c = 0; c < n; ++c) idx[r * n + c] = SIZE_TYPE(c);
+        for (std::size_t c = 0; c < n; ++c)
+            idx[r * n + c] = SIZE_TYPE(c);
     }
     ptrs[n] = SIZE_TYPE(n * n);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -102,49 +104,69 @@ static Weights make_dense_layer(std::size_t n) {
     return w;
 }
 
-struct RunResult { float max_after_200; float final_sse; float mean_last_10pct; float max_abs_y_final; bool ever_frozen; };
+struct RunResult {
+    float max_after_200;
+    float final_sse;
+    float mean_last_10pct;
+    float max_abs_y_final;
+    bool ever_frozen;
+};
 
 template <template <typename> class SynapsePolicyT>
-static RunResult run_arm(float min_decay_frac, float max_abs_delta, unsigned seed_offset, float lr = LR) {
+static RunResult run_arm(float min_decay_frac, float max_abs_delta, unsigned seed_offset,
+                         float lr = LR) {
     Weights weights = make_dense_layer(N);
     const std::vector<float> target = permutation_target(N);
     std::vector<float> basis(N * N, 0.0f);
-    for (std::size_t i = 0; i < N; ++i) basis[i * N + i] = 1.0f;
+    for (std::size_t i = 0; i < N; ++i)
+        basis[i * N + i] = 1.0f;
 
     float max_after_200 = 0.0f;
     std::vector<float> last_10pct_sse;
     const std::size_t last_10pct_start = N_STEPS - N_STEPS / 10;
     float final_sse = 0.0f, max_abs_y_final = 0.0f;
-    bool ever_frozen_after_warmup = true;  // starts true, cleared the first time we see real movement past step 500
+    bool ever_frozen_after_warmup =
+        true; // starts true, cleared the first time we see real movement past step 500
 
     for (std::size_t step = 0; step < N_STEPS; ++step) {
         for (std::size_t i = 0; i < N; ++i) {
             std::vector<float> y(N, 0.0f);
-            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), weights, y.data(), 1);
+            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N),
+                                                             weights, y.data(), 1);
             std::vector<float> dy(N);
-            for (std::size_t c = 0; c < N; ++c) dy[c] = 2.0f * (y[c] - target[i * N + c]);
+            for (std::size_t c = 0; c < N; ++c)
+                dy[c] = 2.0f * (y[c] - target[i * N + c]);
             std::vector<float> dx(N, 0.0f), ni(N, 0.0f), ng(N, 0.0f);
-            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, true, SynapsePolicyT>(
-                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(), ni.data(), ng.data(), lr, 1,
-                false, true, 0.999f, 1e-8f, 0.9f, min_decay_frac, max_abs_delta);
+            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false,
+                            true, SynapsePolicyT>(
+                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), weights, dx.data(), ni.data(), ng.data(),
+                lr, 1, false, true, 0.999f, 1e-8f, 0.9f, min_decay_frac, max_abs_delta);
         }
         float sse = 0.0f, max_abs_y = 0.0f;
         for (std::size_t i = 0; i < N; ++i) {
             std::vector<float> y(N, 0.0f);
-            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), weights, y.data(), 1);
+            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N),
+                                                             weights, y.data(), 1);
             for (std::size_t c = 0; c < N; ++c) {
                 max_abs_y = std::max(max_abs_y, std::abs(y[c]));
                 const float d = y[c] - target[i * N + c];
                 sse += d * d;
             }
         }
-        if (step >= 500 && max_abs_y > 1e-6f) ever_frozen_after_warmup = false;
-        if (step >= 200) max_after_200 = std::max(max_after_200, sse);
-        if (step >= last_10pct_start) last_10pct_sse.push_back(sse);
-        if (step == N_STEPS - 1) { final_sse = sse; max_abs_y_final = max_abs_y; }
+        if (step >= 500 && max_abs_y > 1e-6f)
+            ever_frozen_after_warmup = false;
+        if (step >= 200)
+            max_after_200 = std::max(max_after_200, sse);
+        if (step >= last_10pct_start)
+            last_10pct_sse.push_back(sse);
+        if (step == N_STEPS - 1) {
+            final_sse = sse;
+            max_abs_y_final = max_abs_y;
+        }
     }
     float mean_last = 0.0f;
-    for (float v : last_10pct_sse) mean_last += v;
+    for (float v : last_10pct_sse)
+        mean_last += v;
     mean_last /= float(last_10pct_sse.size());
     return {max_after_200, final_sse, mean_last, max_abs_y_final, ever_frozen_after_warmup};
 }
@@ -155,22 +177,24 @@ int main() {
     RunResult plain = run_arm<PlainRMSpropSynapsePolicy>(0.0f, 1e30f, 0);
     std::printf("stochastic plain: max_after_200=%.4f final=%.4f mean_last_10pct=%.4f "
                 "max_abs_y_final=%.4f frozen=%s\n",
-                plain.max_after_200, plain.final_sse, plain.mean_last_10pct,
-                plain.max_abs_y_final, plain.ever_frozen ? "YES" : "no");
+                plain.max_after_200, plain.final_sse, plain.mean_last_10pct, plain.max_abs_y_final,
+                plain.ever_frozen ? "YES" : "no");
 
     // Round 1: broad max_abs_delta grid (raw-space) x min_decay_frac
     // (no-op vs a nonzero-effect value), Bounded policy, stochastic.
     const float min_decay_fracs[] = {0.999f, 0.9995f};
-    const float max_abs_deltas[]  = {0.2f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 12.0f, 16.0f, 20.0f, 24.0f, 32.0f, 1e30f};
+    const float max_abs_deltas[] = {0.2f,  0.5f,  1.0f,  2.0f,  4.0f,  8.0f,
+                                    12.0f, 16.0f, 20.0f, 24.0f, 32.0f, 1e30f};
 
-    std::printf("%12s %12s %14s %10s %16s %14s %8s\n",
-                "min_decay", "max_delta", "max_after_200", "final", "mean_last_10pct", "max_abs_y_fin", "frozen");
+    std::printf("%12s %12s %14s %10s %16s %14s %8s\n", "min_decay", "max_delta", "max_after_200",
+                "final", "mean_last_10pct", "max_abs_y_fin", "frozen");
     for (float mdf : min_decay_fracs) {
         for (float mad : max_abs_deltas) {
             RunResult r = run_arm<BoundedRMSpropSynapsePolicy>(mdf, mad, 0);
-            bool safe = r.max_after_200 < plain.max_after_200 / 100.0f || plain.max_after_200 < 1e-3f;
-            std::printf("%12.4f %12.4f %14.4f %10.4f %16.4f %14.4f %8s %s\n",
-                        mdf, mad, r.max_after_200, r.final_sse, r.mean_last_10pct, r.max_abs_y_final,
+            bool safe =
+                r.max_after_200 < plain.max_after_200 / 100.0f || plain.max_after_200 < 1e-3f;
+            std::printf("%12.4f %12.4f %14.4f %10.4f %16.4f %14.4f %8s %s\n", mdf, mad,
+                        r.max_after_200, r.final_sse, r.mean_last_10pct, r.max_abs_y_final,
                         r.ever_frozen ? "YES" : "no", safe ? "" : "(unsafe-vs-plain)");
         }
     }
@@ -186,19 +210,20 @@ int main() {
     const float lrs[] = {0.02f, 0.05f, 0.2f, 0.5f, 1.0f};
     const float mads_for_lr_sweep[] = {2.0f, 8.0f, 16.0f};
     std::printf("\n=== Round 2: min_decay_frac across multiple lr values ===\n");
-    std::printf("%8s %10s %12s %14s %10s %16s %8s\n",
-                "lr", "max_delta", "min_decay", "max_after_200", "final", "mean_last_10pct", "frozen");
+    std::printf("%8s %10s %12s %14s %10s %16s %8s\n", "lr", "max_delta", "min_decay",
+                "max_after_200", "final", "mean_last_10pct", "frozen");
     for (float lr : lrs) {
         RunResult plain_lr = run_arm<PlainRMSpropSynapsePolicy>(0.0f, 1e30f, 0, lr);
-        std::printf("%8.3f %10s %12s %14.4f %10.4f %16.4f %8s   (plain reference)\n",
-                    lr, "-", "-", plain_lr.max_after_200, plain_lr.final_sse, plain_lr.mean_last_10pct,
+        std::printf("%8.3f %10s %12s %14.4f %10.4f %16.4f %8s   (plain reference)\n", lr, "-", "-",
+                    plain_lr.max_after_200, plain_lr.final_sse, plain_lr.mean_last_10pct,
                     plain_lr.ever_frozen ? "YES" : "no");
         for (float mad : mads_for_lr_sweep) {
             for (float mdf : min_decay_fracs) {
                 RunResult r = run_arm<BoundedRMSpropSynapsePolicy>(mdf, mad, 0, lr);
-                bool safe = r.max_after_200 < plain_lr.max_after_200 / 100.0f || plain_lr.max_after_200 < 1e-3f;
-                std::printf("%8.3f %10.4f %12.4f %14.4f %10.4f %16.4f %8s %s\n",
-                            lr, mad, mdf, r.max_after_200, r.final_sse, r.mean_last_10pct,
+                bool safe = r.max_after_200 < plain_lr.max_after_200 / 100.0f ||
+                            plain_lr.max_after_200 < 1e-3f;
+                std::printf("%8.3f %10.4f %12.4f %14.4f %10.4f %16.4f %8s %s\n", lr, mad, mdf,
+                            r.max_after_200, r.final_sse, r.mean_last_10pct,
                             r.ever_frozen ? "YES" : "no", safe ? "" : "(unsafe-vs-plain)");
             }
         }

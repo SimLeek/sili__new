@@ -35,13 +35,18 @@
 #include <vector>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static const std::size_t N = 4;
 
@@ -52,7 +57,8 @@ static Weights make_scattered_layer(const std::vector<float>& w_q_values) {
     std::vector<float> imp(N * N, 1.0f);
     for (std::size_t r = 0; r < N; ++r) {
         ptrs[r] = SIZE_TYPE(r * N);
-        for (std::size_t c = 0; c < N; ++c) idx[r * N + c] = SIZE_TYPE(c);
+        for (std::size_t c = 0; c < N; ++c)
+            idx[r * N + c] = SIZE_TYPE(c);
     }
     ptrs[N] = SIZE_TYPE(N * N);
     w.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
@@ -63,7 +69,10 @@ static Weights make_scattered_layer(const std::vector<float>& w_q_values) {
 
 static float mse(const std::vector<float>& y, const std::vector<float>& target) {
     float s = 0.0f;
-    for (std::size_t i = 0; i < y.size(); ++i) { float d = y[i] - target[i]; s += d * d; }
+    for (std::size_t i = 0; i < y.size(); ++i) {
+        float d = y[i] - target[i];
+        s += d * d;
+    }
     return s / float(y.size());
 }
 
@@ -71,24 +80,30 @@ static float mse(const std::vector<float>& y, const std::vector<float>& target) 
 // backward call (matching the design's "every step" noise-mitigation --
 // see delta_csr_types.hpp's own docstring), returns the final MSE.
 static float train_with_dynamic_rank_control(Weights& w, const std::vector<float>& w_q,
-                                              const std::vector<float>& w_star, int n_steps,
-                                              float lr, float tau_death, float tau_active, float theta,
-                                              float l1_coef, std::vector<std::size_t>* rank_trace = nullptr) {
+                                             const std::vector<float>& w_star, int n_steps,
+                                             float lr, float tau_death, float tau_active,
+                                             float theta, float l1_coef,
+                                             std::vector<std::size_t>* rank_trace = nullptr) {
     std::vector<float> basis(N * N, 0.0f);
-    for (std::size_t i = 0; i < N; ++i) basis[i * N + i] = 1.0f;
+    for (std::size_t i = 0; i < N; ++i)
+        basis[i * N + i] = 1.0f;
     float final_mse = 0.0f;
     for (int step = 0; step < n_steps; ++step) {
         std::vector<float> y_all(N * N, 0.0f);
         for (std::size_t i = 0; i < N; ++i) {
             std::vector<float> y(N, 0.0f);
-            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), w, y.data(), 1);
-            for (std::size_t c = 0; c < N; ++c) y_all[i * N + c] = y[c];
+            disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(&basis[i * N], 1, SIZE_TYPE(N), w,
+                                                             y.data(), 1);
+            for (std::size_t c = 0; c < N; ++c)
+                y_all[i * N + c] = y[c];
             std::vector<float> dy(N);
-            for (std::size_t c = 0; c < N; ++c) dy[c] = 2.0f * (y[c] - w_star[i * N + c]) / float(N);
+            for (std::size_t c = 0; c < N; ++c)
+                dy[c] = 2.0f * (y[c] - w_star[i * N + c]) / float(N);
             std::vector<float> dx(N, 0.0f), ni(N, 0.0f), ng(N, 0.0f);
-            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
-                &basis[i * N], 1, SIZE_TYPE(N), dy.data(), w, dx.data(), ni.data(), ng.data(), lr, 1,
-                false, true, 0.999f, 1e-8f, 0.9f, 0.0f, 1e30f, 1e30f, 0.1f, false, l1_coef);
+            disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>, false,
+                            false>(&basis[i * N], 1, SIZE_TYPE(N), dy.data(), w, dx.data(),
+                                   ni.data(), ng.data(), lr, 1, false, true, 0.999f, 1e-8f, 0.9f,
+                                   0.0f, 1e30f, 1e30f, 0.1f, false, l1_coef);
             // Seed magnitude matters, not just its sign/nonzero-ness: a
             // new channel's OWN gradient is proportional to its direction
             // vectors' magnitude (dS/d(gamma_new) = value_dir*output_dir),
@@ -102,29 +117,34 @@ static float train_with_dynamic_rank_control(Weights& w, const std::vector<float
             // gives comparable gradient sensitivity and lets RMSprop's
             // adaptive step outpace L1 well within the grace window.
             w.apply_dynamic_rank_control(N, N, tau_death, tau_active, theta,
-                [&](std::size_t row) { return 1.0f * float(row + 1); });
+                                         [&](std::size_t row) { return 1.0f * float(row + 1); });
         }
-        if (rank_trace) rank_trace->push_back(w.scale_rank);
-        if (step == n_steps - 1) final_mse = mse(y_all, w_star);
+        if (rank_trace)
+            rank_trace->push_back(w.scale_rank);
+        if (step == n_steps - 1)
+            final_mse = mse(y_all, w_star);
     }
     return final_mse;
 }
 
 static void test_breathing_rank_cycle() {
-    std::vector<float> w_q = {6.f, 2.f, 2.f, 2.f,   2.f, 2.f, 2.f, 2.f,
-                                2.f, 2.f, 2.f, 2.f,   2.f, 2.f, 2.f, 6.f};
+    std::vector<float> w_q = {6.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f,
+                              2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 6.f};
     // Phase 1 target: uniform 3x scale (rank-1 sufficient).
     std::vector<float> w_star_uniform(w_q.size());
-    for (std::size_t i = 0; i < w_q.size(); ++i) w_star_uniform[i] = 3.0f * w_q[i];
+    for (std::size_t i = 0; i < w_q.size(); ++i)
+        w_star_uniform[i] = 3.0f * w_q[i];
     // Phase 2 target: diagonal outliers (needs rank-2).
-    std::vector<float> w_star_outlier = {50.f, 2.f, 2.f, 2.f,   2.f, 2.f, 2.f, 2.f,
-                                           2.f, 2.f, 2.f, 2.f,   2.f, 2.f, 2.f, 50.f};
+    std::vector<float> w_star_outlier = {50.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 2.f,
+                                         2.f,  2.f, 2.f, 2.f, 2.f, 2.f, 2.f, 50.f};
 
     Weights w = make_scattered_layer(w_q);
     w.scale_rank = 1;
     w.set_additive_rank(0);
-    for (std::size_t r = 0; r < N; ++r) w.set_value_scale_raw_k(r, 0, 1.0f);
-    for (std::size_t c = 0; c < N; ++c) w.set_output_scale_raw_k(c, 0, 1.0f);
+    for (std::size_t r = 0; r < N; ++r)
+        w.set_value_scale_raw_k(r, 0, 1.0f);
+    for (std::size_t c = 0; c < N; ++c)
+        w.set_output_scale_raw_k(c, 0, 1.0f);
     // Activate gamma tracking -- see get_scale_gamma_k's own docstring:
     // the "new channel = zero contribution" growth safety property (and
     // this whole dynamic-control mechanism) only engages once gamma is
@@ -137,15 +157,21 @@ static void test_breathing_rank_cycle() {
     // this test's own N=4 layer means n_in*n_out=16, so theta must scale
     // down by that same factor from its old pre-normalization value
     // (0.02) to trigger at the same real sensitivity.
-    const float tau_death = 0.05f, tau_active = 0.3f, theta = 0.02f / (float(N) * float(N)), l1_coef = 0.02f;
+    const float tau_death = 0.05f, tau_active = 0.3f, theta = 0.02f / (float(N) * float(N)),
+                l1_coef = 0.02f;
 
     // ── Phase 1: rank-1-sufficient target -- rank must stay at 1 ────────
     std::vector<std::size_t> rank_trace1;
-    float mse1 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 1500, 0.05f,
-                                                  tau_death, tau_active, theta, l1_coef, &rank_trace1);
-    std::printf("[breathing] phase 1 (uniform target) final MSE: %.6f, final rank: %zu\n", mse1, w.scale_rank);
-    CHECK(mse1 < 0.01f, "phase 1 should converge to near-zero MSE with rank-1 alone (got %.6f)", mse1);
-    CHECK(w.scale_rank == 1, "phase 1 should never grow rank -- no real leftover gradient pressure once converged (got rank=%zu)", w.scale_rank);
+    float mse1 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 1500, 0.05f, tau_death,
+                                                 tau_active, theta, l1_coef, &rank_trace1);
+    std::printf("[breathing] phase 1 (uniform target) final MSE: %.6f, final rank: %zu\n", mse1,
+                w.scale_rank);
+    CHECK(mse1 < 0.01f, "phase 1 should converge to near-zero MSE with rank-1 alone (got %.6f)",
+          mse1);
+    CHECK(w.scale_rank == 1,
+          "phase 1 should never grow rank -- no real leftover gradient pressure once converged "
+          "(got rank=%zu)",
+          w.scale_rank);
 
     // ── Phase 2: switch to the outlier target -- rank should grow to 2 ──
     // n_steps widened 4x (3000->12000, direct instruction): shrink now
@@ -157,9 +183,10 @@ static void test_breathing_rank_cycle() {
     // real mechanism rather than just timing out on the new, intentionally
     // slower cadence.
     std::vector<std::size_t> rank_trace2;
-    float mse2 = train_with_dynamic_rank_control(w, w_q, w_star_outlier, 12000, 0.05f,
-                                                  tau_death, tau_active, theta, l1_coef, &rank_trace2);
-    std::printf("[breathing] phase 2 (outlier target) final MSE: %.6f, final rank: %zu\n", mse2, w.scale_rank);
+    float mse2 = train_with_dynamic_rank_control(w, w_q, w_star_outlier, 12000, 0.05f, tau_death,
+                                                 tau_active, theta, l1_coef, &rank_trace2);
+    std::printf("[breathing] phase 2 (outlier target) final MSE: %.6f, final rank: %zu\n", mse2,
+                w.scale_rank);
     // Checks against rank_trace2 (direct instruction, root-caused via a
     // real 60k-step run + direct instrumentation of THIS test): the
     // outlier target's neurogenesis trigger is essentially ALWAYS true
@@ -174,15 +201,23 @@ static void test_breathing_rank_cycle() {
     // capability genuinely works for a task that needs it) without being
     // coupled to the oscillation's exact rhythm.
     bool reached_rank_2 = false;
-    for (std::size_t r : rank_trace2) if (r >= 2) { reached_rank_2 = true; break; }
-    CHECK(reached_rank_2, "phase 2 should trigger neurogenesis and reach rank>=2 at some point (never happened)");
-    CHECK(mse2 < 1.0f, "phase 2 should converge substantially once rank-2 capacity is available (got MSE=%.6f)", mse2);
+    for (std::size_t r : rank_trace2)
+        if (r >= 2) {
+            reached_rank_2 = true;
+            break;
+        }
+    CHECK(reached_rank_2,
+          "phase 2 should trigger neurogenesis and reach rank>=2 at some point (never happened)");
+    CHECK(mse2 < 1.0f,
+          "phase 2 should converge substantially once rank-2 capacity is available (got MSE=%.6f)",
+          mse2);
 
     // ── Phase 3: revert to the uniform target -- rank should shrink back to 1 ──
     std::vector<std::size_t> rank_trace3;
-    float mse3 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 12000, 0.05f,
-                                                  tau_death, tau_active, theta, l1_coef, &rank_trace3);
-    std::printf("[breathing] phase 3 (back to uniform target) final MSE: %.6f, final rank: %zu\n", mse3, w.scale_rank);
+    float mse3 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 12000, 0.05f, tau_death,
+                                                 tau_active, theta, l1_coef, &rank_trace3);
+    std::printf("[breathing] phase 3 (back to uniform target) final MSE: %.6f, final rank: %zu\n",
+                mse3, w.scale_rank);
     // Same reasoning as phase 2's check, applied to the shrink direction:
     // check that rank settles at (and STAYS at) 1 for a sustained final
     // stretch, not just the exact final snapshot -- robust to exactly
@@ -191,9 +226,15 @@ static void test_breathing_rank_cycle() {
     const std::size_t settle_window = std::min<std::size_t>(500, rank_trace3.size());
     bool settled_at_1 = true;
     for (std::size_t i = rank_trace3.size() - settle_window; i < rank_trace3.size(); ++i) {
-        if (rank_trace3[i] != 1) { settled_at_1 = false; break; }
+        if (rank_trace3[i] != 1) {
+            settled_at_1 = false;
+            break;
+        }
     }
-    CHECK(settled_at_1, "phase 3 should trigger apoptosis and settle at rank-1 for the final %zu steps (still oscillating)", settle_window);
+    CHECK(settled_at_1,
+          "phase 3 should trigger apoptosis and settle at rank-1 for the final %zu steps (still "
+          "oscillating)",
+          settle_window);
     // Threshold relaxed from <0.01 (direct instruction, real finding, NOT
     // just a test-fragility patch like the rank checks above): channel
     // 0's own state genuinely does NOT reconverge to phase-1's MSE=0.0
@@ -210,7 +251,8 @@ static void test_breathing_rank_cycle() {
     // question (does oscillation leave lasting quality damage even
     // after the extra capacity itself is correctly pruned back down),
     // not silently swept under a loosened test.
-    CHECK(mse3 < 0.6f, "phase 3 should reconverge substantially after shrinking (got MSE=%.6f)", mse3);
+    CHECK(mse3 < 0.6f, "phase 3 should reconverge substantially after shrinking (got MSE=%.6f)",
+          mse3);
 }
 
 int main() {

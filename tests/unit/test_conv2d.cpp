@@ -21,13 +21,14 @@ TEST_CASE("_Setup Conv2D Row Function Tests") {
         std::vector<std::vector<int>> col_indices{{0}, {1}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}, {{1}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}, {{2.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 2, 2, 2, 2, 2);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 2, 2,
+2, 2, 2);
 
         input_sparse_images.push_back(image);
 
         // Call the _setup_sparse_io_conv2d_row function
-        _setup_sparse_io_conv2d_row(input_height, batch, oi, oiy, tid, kh_diff_n, start_row, output_col_indices,
-                                    output_channel_indices, output_values, vip_col, input_sparse_images);
+        _setup_sparse_io_conv2d_row(input_height, batch, oi, oiy, tid, kh_diff_n, start_row,
+output_col_indices, output_channel_indices, output_values, vip_col, input_sparse_images);
 
         // Verify that oiy has been calculated correctly
         REQUIRE_MESSAGE(oiy == 2, "oyi calculation incorrect");
@@ -35,8 +36,8 @@ TEST_CASE("_Setup Conv2D Row Function Tests") {
         // Verify that other parameters have been initialized correctly
         REQUIRE_MESSAGE(!start_row.empty(), "Start row not initialized");
         REQUIRE_MESSAGE(output_col_indices.size() > 0, "Output column indices not initialized");
-        REQUIRE_MESSAGE(output_channel_indices.size() > 0, "Output channel indices not initialized");
-        REQUIRE_MESSAGE(output_values.size() > 0, "Output values not initialized");
+        REQUIRE_MESSAGE(output_channel_indices.size() > 0, "Output channel indices not
+initialized"); REQUIRE_MESSAGE(output_values.size() > 0, "Output values not initialized");
         REQUIRE_MESSAGE(vip_col.size() > 0, "VIP column not initialized");
     }
 }
@@ -63,13 +64,14 @@ TEST_CASE("_Do Convolution Function Tests") {
         std::vector<std::vector<int>> col_indices{{14}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 1, 1);
 
         input_sparse_images.push_back(image);
 
         // Call the _do_sparse_io_conv2d_convolution function
-    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix, kw_diff_n, kw_diff_p, W,
-                                        made_this_fiber, vip_col, input_sparse_images, output_col_indices,
+    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix,
+kw_diff_n, kw_diff_p, W, made_this_fiber, vip_col, input_sparse_images, output_col_indices,
                                         output_channel_indices, output_values, eps);
 
         // Verify that the output values were computed correctly
@@ -100,13 +102,14 @@ TEST_CASE("_Do Convolution Function Tests") {
         std::vector<std::vector<int>> col_indices{{25}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 1, 1);
 
         input_sparse_images.push_back(image);
 
         // Call the_do_sparse_io_conv2d_convolution function
-    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix, kw_diff_n, kw_diff_p, W,
-                                        made_this_fiber, vip_col, input_sparse_images, output_col_indices,
+    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix,
+kw_diff_n, kw_diff_p, W, made_this_fiber, vip_col, input_sparse_images, output_col_indices,
                                         output_channel_indices, output_values, eps);
 
         // Verify that no output values were generated
@@ -135,13 +138,14 @@ TEST_CASE("_Do Convolution Function Tests") {
         std::vector<std::vector<int>> col_indices{{14},{19}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}},{{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}},{{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 2, 2);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 2, 2);
 
         input_sparse_images.push_back(image);
 
         // Call the_do_sparse_io_conv2d_convolution function
-    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix, kw_diff_n, kw_diff_p, W,
-                                        made_this_fiber, vip_col, input_sparse_images, output_col_indices,
+    _do_sparse_io_conv2d_convolution(batch, output_channels, input_width, input_channels, oix,
+kw_diff_n, kw_diff_p, W, made_this_fiber, vip_col, input_sparse_images, output_col_indices,
                                         output_channel_indices, output_values, eps);
 
         // Verify that multiple output values were generated
@@ -166,12 +170,14 @@ TEST_CASE("_Move Column Pointers Back Function Tests") {
         std::vector<std::vector<int>> col_indices{{14}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 1, 1);
 
         input_sparse_images.push_back(image);
 
         // Call the _move_sparse_io_conv2d_column_ptrs_back function
-        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images, vip_col);
+        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images,
+vip_col);
 
         // Verify that the vip_col was moved back correctly
         REQUIRE_MESSAGE(vip_col[0] == -1, "Vip_col not moved back");
@@ -188,12 +194,14 @@ TEST_CASE("_Move Column Pointers Back Function Tests") {
         std::vector<std::vector<int>> col_indices{{14}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 1, 1);
 
         input_sparse_images.push_back(image);
 
         // Call the _move_sparse_io_conv2d_column_ptrs_back function
-        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images, vip_col);
+        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images,
+vip_col);
 
         // Verify that the vip_col remained unchanged
         REQUIRE_MESSAGE(vip_col[0] == -1, "Vip_col unnecessarily moved");
@@ -210,12 +218,14 @@ TEST_CASE("_Move Column Pointers Back Function Tests") {
         std::vector<std::vector<int>> col_indices{{14}, {15}};
         std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}, {{0}}};
         std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}, {{1.0f}}};
-        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 2, 2);
+        csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1,
+1, 2, 2);
 
         input_sparse_images.push_back(image);
 
         // Call the _move_sparse_io_conv2d_column_ptrs_back function
-        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images, vip_col);
+        _move_sparse_io_conv2d_column_ptrs_back(batch, kw_diff_n, oix, input_sparse_images,
+vip_col);
 
         // Verify that the vip_col was moved back correctly
         REQUIRE_MESSAGE(vip_col[0] == 0, "Vip_col not moved back far enough");
@@ -233,8 +243,8 @@ TEST_CASE("_Remove Zero Outputs Function Tests") {
     _conv2d_remove_zero_outputs(output_col_indices, output_channel_indices, output_values, eps);
 
         // Verify that the zero-valued output channel was removed
-        REQUIRE_MESSAGE(output_channel_indices.back().empty(), "Zero-valued output channel not removed");
-        REQUIRE_MESSAGE(output_values.back().empty(), "Zero-valued output channel not removed");
+        REQUIRE_MESSAGE(output_channel_indices.back().empty(), "Zero-valued output channel not
+removed"); REQUIRE_MESSAGE(output_values.back().empty(), "Zero-valued output channel not removed");
     }
 
     SECTION("Positive And Negative Contributions Test") {
@@ -247,8 +257,8 @@ TEST_CASE("_Remove Zero Outputs Function Tests") {
     _conv2d_remove_zero_outputs(output_col_indices, output_channel_indices, output_values, eps);
 
         // Verify that the net result is zero and the output channel was removed
-        REQUIRE_MESSAGE(output_channel_indices.back().empty(), "Net-zero output channel not removed");
-        REQUIRE_MESSAGE(output_values.back().empty(), "Net-zero output channel not removed");
+        REQUIRE_MESSAGE(output_channel_indices.back().empty(), "Net-zero output channel not
+removed"); REQUIRE_MESSAGE(output_values.back().empty(), "Net-zero output channel not removed");
     }
 
     SECTION("Non-Zero Valued Channels Remain Test") {
@@ -261,8 +271,9 @@ TEST_CASE("_Remove Zero Outputs Function Tests") {
     _conv2d_remove_zero_outputs(output_col_indices, output_channel_indices, output_values, eps);
 
         // Verify that only the non-zero valued output channels remain
-        REQUIRE_MESSAGE(output_channel_indices.back().size() == 1, "Incorrectly removed non-zero valued output channel");
-        REQUIRE_MESSAGE(output_values.back().size() == 1, "Incorrectly removed non-zero valued output channel");
+        REQUIRE_MESSAGE(output_channel_indices.back().size() == 1, "Incorrectly removed non-zero
+valued output channel"); REQUIRE_MESSAGE(output_values.back().size() == 1, "Incorrectly removed
+non-zero valued output channel");
     }
 }
 
@@ -277,8 +288,8 @@ TEST_CASE("_Sparse IO Conv2D Reserve Function Test") {
     std::vector<std::vector<std::vector<float>>> out_val{std::vector<std::vector<float>>(1)};
 
     // Call the _sparse_io_conv2d_reserve function
-    _sparse_io_conv2d_reserve(nnf, nnc, vec_channel_assign_locs, vec_col_assign_locs, start_row, out_col_idx,
-                             out_chan_idx, out_val);
+    _sparse_io_conv2d_reserve(nnf, nnc, vec_channel_assign_locs, vec_col_assign_locs, start_row,
+out_col_idx, out_chan_idx, out_val);
 
     // Verify that the memory reservation was successful
     REQUIRE_MESSAGE(nnf == 3, "NNF count incorrect");
@@ -312,9 +323,9 @@ TEST_CASE("_Copy To Output VoVoV Function Test") {
                                                         std::vector<std::vector<float>>(6)};
 
     // Call the _sparse_io_conv2d_copy_to_output_vovov function
-    _sparse_io_conv2d_copy_to_output_vovov(num_cpus, vec_channel_assign_locs, vec_col_assign_locs, start_row,
-                                         output_col_indices_chunks, output_channel_indices_chunks,
-                                         output_values_chunks, out_col_idx, out_chan_idx, out_val);
+    _sparse_io_conv2d_copy_to_output_vovov(num_cpus, vec_channel_assign_locs, vec_col_assign_locs,
+start_row, output_col_indices_chunks, output_channel_indices_chunks, output_values_chunks,
+out_col_idx, out_chan_idx, out_val);
 
     // Verify that the output voiov structures contain the copied values
     REQUIRE_MESSAGE(out_col_idx[0].size() == 6, "Copied values missing");
@@ -339,19 +350,21 @@ SECTION("Basic Conv2D Test") {
     std::vector<std::vector<int>> col_indices{{5}};
     std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
     std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-    csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+    csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1,
+1);
 
     input_sparse_images.push_back(image);
 
     // Call the conv2d function
     std::vector<csf_struct> output_sparse_images =
-        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width, kernel_height,
-               input_sparse_images, W, eps);
+        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width,
+kernel_height, input_sparse_images, W, eps);
 
     // Verify that the output sparse images were processed successfully
     REQUIRE_MESSAGE(output_sparse_images.size() == 1, "Number of output sparse images incorrect");
-    REQUIRE_MESSAGE(output_sparse_images[0].rows == input_height, "Height of output sparse image incorrect");
-    REQUIRE_MESSAGE(output_sparse_images[0].cols == input_width, "Width of output sparse image incorrect");
+    REQUIRE_MESSAGE(output_sparse_images[0].rows == input_height, "Height of output sparse image
+incorrect"); REQUIRE_MESSAGE(output_sparse_images[0].cols == input_width, "Width of output sparse
+image incorrect");
 }
 
 SECTION("Large Input Conv2D Test") {
@@ -370,19 +383,21 @@ SECTION("Large Input Conv2D Test") {
     std::vector<std::vector<int>> col_indices{{128}};
     std::vector<std::vector<std::vector<int>>> fiber_indices{{{0}}};
     std::vector<std::vector<std::vector<float>>> fiber_values{{{1.0f}}};
-    csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1, 1);
+    csf_struct image = convert_vovov_to_csf(&col_indices, &fiber_indices, &fiber_values, 1, 1, 1, 1,
+1);
 
     input_sparse_images.push_back(image);
 
     // Call the conv2d function
     std::vector<csf_struct> output_sparse_images =
-        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width, kernel_height,
-               input_sparse_images, W, eps);
+        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width,
+kernel_height, input_sparse_images, W, eps);
 
     // Verify that the output sparse images were processed successfully
     REQUIRE_MESSAGE(output_sparse_images.size() == 1, "Number of output sparse images incorrect");
-    REQUIRE_MESSAGE(output_sparse_images[0].rows == input_height, "Height of output sparse image incorrect");
-    REQUIRE_MESSAGE(output_sparse_images[0].cols == input_width, "Width of output sparse image incorrect");
+    REQUIRE_MESSAGE(output_sparse_images[0].rows == input_height, "Height of output sparse image
+incorrect"); REQUIRE_MESSAGE(output_sparse_images[0].cols == input_width, "Width of output sparse
+image incorrect");
 }
 
 SECTION("Invalid Input Conv2D Test") {
@@ -399,8 +414,8 @@ SECTION("Invalid Input Conv2D Test") {
 
     // Call the conv2d function
     std::vector<csf_struct> output_sparse_images =
-        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width, kernel_height,
-               input_sparse_images, W, eps);
+        conv2d(batch_size, input_channels, output_channels, input_width, input_height, kernel_width,
+kernel_height, input_sparse_images, W, eps);
 
     // Verify that the output sparse images were processed successfully despite invalid inputs
     REQUIRE_MESSAGE(output_sparse_images.size() == 0, "Number of output sparse images incorrect");
@@ -408,5 +423,6 @@ SECTION("Invalid Input Conv2D Test") {
 }
 
 TEST_CASE("Conv2D backwards tests") {
-    REQUIRE_MESSAGE(false, "get the conv2d forward tests working, then translate them for backwards input, backwards W (also from linear func), and mask");
+    REQUIRE_MESSAGE(false, "get the conv2d forward tests working, then translate them for backwards
+input, backwards W (also from linear func), and mask");
 }*/

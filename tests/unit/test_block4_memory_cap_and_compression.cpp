@@ -27,29 +27,35 @@
 #include <algorithm>
 
 static int g_fail = 0;
-#define CHECK(cond, fmt, ...) do { \
-    if (!(cond)) { std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); std::fflush(stdout); ++g_fail; } \
-} while (0)
+#define CHECK(cond, fmt, ...)                                                                      \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::printf("FAIL %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__);               \
+            std::fflush(stdout);                                                                   \
+            ++g_fail;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 using SIZE_TYPE = int;
-using COL_TYPE  = uint32_t;
-using Weights   = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
+using COL_TYPE = uint32_t;
+using Weights = SparseLinearWeightsDelta<SIZE_TYPE, FP4BiPacked, COL_TYPE>;
 
 static void check_within_budget(const Weights& weights, int iter) {
     const auto& dc = weights.connections;
     CHECK(dc.layout.total_alloc_bytes() <= dc.max_indices_bytes,
-          "iter %d: scattered indices_buf allocation %zu exceeds budget %zu",
-          iter, dc.layout.total_alloc_bytes(), dc.max_indices_bytes);
-    const std::size_t values_bytes = ValueAccessor<FP4BiPacked>::projected_byte_size(dc.layout.total_alloc_elems());
+          "iter %d: scattered indices_buf allocation %zu exceeds budget %zu", iter,
+          dc.layout.total_alloc_bytes(), dc.max_indices_bytes);
+    const std::size_t values_bytes =
+        ValueAccessor<FP4BiPacked>::projected_byte_size(dc.layout.total_alloc_elems());
     CHECK(values_bytes <= dc.max_values_bytes,
-          "iter %d: scattered values allocation %zu exceeds budget %zu",
-          iter, values_bytes, dc.max_values_bytes);
+          "iter %d: scattered values allocation %zu exceeds budget %zu", iter, values_bytes,
+          dc.max_values_bytes);
     CHECK(weights.block4.indices_buf.size() <= weights.block4.max_indices_bytes,
-          "iter %d: block4 indices_buf allocation %zu exceeds budget %zu",
-          iter, weights.block4.indices_buf.size(), weights.block4.max_indices_bytes);
+          "iter %d: block4 indices_buf allocation %zu exceeds budget %zu", iter,
+          weights.block4.indices_buf.size(), weights.block4.max_indices_bytes);
     CHECK(weights.block4.total_tile_alloc_bytes() <= weights.block4.max_tile_bytes,
-          "iter %d: block4 tile_data allocation %zu exceeds budget %zu",
-          iter, weights.block4.total_tile_alloc_bytes(), weights.block4.max_tile_bytes);
+          "iter %d: block4 tile_data allocation %zu exceeds budget %zu", iter,
+          weights.block4.total_tile_alloc_bytes(), weights.block4.max_tile_bytes);
 }
 
 static void test_memory_cap_never_exceeded_under_stress() {
@@ -60,12 +66,11 @@ static void test_memory_cap_never_exceeded_under_stress() {
     weights.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
         empty_ptrs, {}, {}, {}, n_in, n_out, max_weights * 8 + 4096, max_weights + 64);
     weights.connections.set_limits(
-        max_weights * 8 + 4096,
-        ValueAccessor<FP4BiPacked>::projected_byte_size(max_weights + 64));
+        max_weights * 8 + 4096, ValueAccessor<FP4BiPacked>::projected_byte_size(max_weights + 64));
     weights.block4.init(n_in, n_out);
-    weights.block4.set_limits(
-        max_weights * 8 + 4096,
-        std::max<std::size_t>(4, max_weights / BLOCK4_TILE_SLOTS) * BLOCK4_TILE_SLOTS);
+    weights.block4.set_limits(max_weights * 8 + 4096,
+                              std::max<std::size_t>(4, max_weights / BLOCK4_TILE_SLOTS) *
+                                  BLOCK4_TILE_SLOTS);
     weights.block4.switch_point = 3; // realistic compression setting, not the disabling extreme
     weights.out_degree.assign(n_out, SIZE_TYPE(0));
     weights.recompute_stats();
@@ -80,13 +85,17 @@ static void test_memory_cap_never_exceeded_under_stress() {
     int iters_completed = 0;
 
     for (int i = 0; i < 1500 && !hit_fatal_cap; ++i) {
-        for (auto& v : nia) v = data_dist(rng);
-        for (auto& v : nga) v = data_dist(rng);
-        delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, nia.data(), nga.data(), SIZE_TYPE(10), true);
+        for (auto& v : nia)
+            v = data_dist(rng);
+        for (auto& v : nga)
+            v = data_dist(rng);
+        delta_csr_build_probes<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, nia.data(), nga.data(),
+                                                                 SIZE_TYPE(10), true);
 
         for (int attempt = 0; attempt < 5; ++attempt) {
             try {
-                delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, row, 0.0f, SIZE_TYPE(12));
+                delta_csr_synap_row_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights, row, 0.0f,
+                                                                           SIZE_TYPE(12));
                 break;
             } catch (const std::bad_alloc&) {
                 // The real guarantee under test: a hit here means the
@@ -97,7 +106,8 @@ static void test_memory_cap_never_exceeded_under_stress() {
                 break;
             } catch (const std::runtime_error&) {
                 try {
-                    delta_csr_equalize_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights.connections, row);
+                    delta_csr_equalize_step<SIZE_TYPE, FP4BiPacked, COL_TYPE>(weights.connections,
+                                                                              row);
                 } catch (const std::bad_alloc&) {
                     hit_fatal_cap = true;
                     break;
@@ -106,32 +116,35 @@ static void test_memory_cap_never_exceeded_under_stress() {
         }
         row = (row + 1) % std::size_t(n_in);
 
-        for (auto& v : x) v = data_dist(rng);
-        for (auto& v : dy) v = data_dist(rng);
+        for (auto& v : x)
+            v = data_dist(rng);
+        for (auto& v : dy)
+            v = data_dist(rng);
         std::vector<float> out(n_out, 0.0f), dx(n_in, 0.0f);
         disldo_forward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, weights, out.data(), 2);
-        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, dy.data(), weights, dx.data(),
-                                                            nia.data(), nga.data(), 0.05f, 2, false, true);
+        disldo_backward<SIZE_TYPE, FP4BiPacked, COL_TYPE>(x.data(), 1, n_in, dy.data(), weights,
+                                                          dx.data(), nia.data(), nga.data(), 0.05f,
+                                                          2, false, true);
 
         check_within_budget(weights, i);
         ++iters_completed;
     }
 
     CHECK(iters_completed > 50,
-          "stress loop should run for a meaningful number of iterations before any real cap is hit, got %d",
+          "stress loop should run for a meaningful number of iterations before any real cap is "
+          "hit, got %d",
           iters_completed);
     std::printf("test_memory_cap_never_exceeded_under_stress: %d iterations, hit_fatal_cap=%s, "
                 "final scattered nnz=%zu, block4 tiles=%zu, block4 live synapses=%zu\n",
-                iters_completed, hit_fatal_cap ? "true" : "false",
-                weights.connections.nnz(), weights.block4.n_tiles(), weights.block4.live_synapses());
+                iters_completed, hit_fatal_cap ? "true" : "false", weights.connections.nnz(),
+                weights.block4.n_tiles(), weights.block4.live_synapses());
 }
 
 static void test_real_compression_shrinks_measured_memory() {
     const int n_in = 64, n_out = 64;
     Weights weights;
     weights.connections = delta_csr_from_absolute<SIZE_TYPE, FP4BiPacked, COL_TYPE>(
-        std::vector<SIZE_TYPE>(n_in + 1, 0), {}, {}, {}, n_in, n_out,
-        1u << 20, 1u << 20);
+        std::vector<SIZE_TYPE>(n_in + 1, 0), {}, {}, {}, n_in, n_out, 1u << 20, 1u << 20);
     weights.block4.init(n_in, n_out);
     weights.block4.switch_point = 2; // "many input majority gate" style tiles from the original ask
 
@@ -156,16 +169,19 @@ static void test_real_compression_shrinks_measured_memory() {
     }
 
     const std::size_t n_tiles = weights.block4.n_tiles();
-    CHECK(n_tiles == std::size_t(n_tiles_built), "expected %d distinct tiles, got %zu", n_tiles_built, n_tiles);
+    CHECK(n_tiles == std::size_t(n_tiles_built), "expected %d distinct tiles, got %zu",
+          n_tiles_built, n_tiles);
 
     std::size_t sparse_count = 0;
     for (int t = 0; t < n_tiles_built; ++t) {
         const uint32_t br = uint32_t(t % (n_in / BLOCK4_TILE));
         const uint32_t bc = uint32_t(t / (n_in / BLOCK4_TILE)) % (n_out / BLOCK4_TILE);
-        if (weights.block4.is_sparse(br, bc)) ++sparse_count;
+        if (weights.block4.is_sparse(br, bc))
+            ++sparse_count;
     }
     CHECK(sparse_count == std::size_t(n_tiles_built),
-          "every 2-live tile should have compressed (switch_point=2), got %zu/%d sparse", sparse_count, n_tiles_built);
+          "every 2-live tile should have compressed (switch_point=2), got %zu/%d sparse",
+          sparse_count, n_tiles_built);
 
     const std::size_t used_bytes = weights.block4.total_tile_used_bytes();
     const std::size_t dense_equivalent_bytes = n_tiles * BLOCK4_TILE_SLOTS;
@@ -180,7 +196,8 @@ static void test_real_compression_shrinks_measured_memory() {
 
     const double compression_ratio = double(dense_equivalent_bytes) / double(used_bytes);
     CHECK(compression_ratio >= 3.9,
-          "2-live tiles (4 bytes) vs dense (16 bytes) should compress ~4x, got %.2fx", compression_ratio);
+          "2-live tiles (4 bytes) vs dense (16 bytes) should compress ~4x, got %.2fx",
+          compression_ratio);
 
     // Values must survive -- compression is lossless.
     for (int t = 0; t < n_tiles_built; ++t) {
@@ -225,8 +242,8 @@ static void test_backward_declines_growth_gracefully_under_budget_exhaustion() {
     CHECK(store.is_sparse(0, 0), "setup: tile should size itself sparse immediately");
     const std::size_t before_bytes = store.total_tile_used_bytes();
     CHECK(before_bytes == block4_sparse_packed_len(2),
-          "sanity: 2-live tile should be exactly %zu bytes, got %zu",
-          block4_sparse_packed_len(2), before_bytes);
+          "sanity: 2-live tile should be exactly %zu bytes, got %zu", block4_sparse_packed_len(2),
+          before_bytes);
 
     store.set_limits(std::numeric_limits<std::size_t>::max(), store.total_tile_alloc_bytes());
 
@@ -250,8 +267,7 @@ static void test_backward_declines_growth_gracefully_under_budget_exhaustion() {
         auto h = store.find(0, 0);
         CHECK(h.at(0, 0) == 0x11 && h.at(0, 1) == 0x22,
               "original values must survive a declined-growth destructor");
-        CHECK(h.at(0, 2) == 0,
-              "the declined write itself must not have been persisted");
+        CHECK(h.at(0, 2) == 0, "the declined write itself must not have been persisted");
     }
     std::printf("test_backward_declines_growth_gracefully_under_budget_exhaustion: "
                 "dropped_growth_events=%llu, no exception thrown\n",
