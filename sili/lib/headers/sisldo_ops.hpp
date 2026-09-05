@@ -299,10 +299,11 @@ void sisldo_forward(
                     // a rank-1-quantized layer run through forward_sparse silently
                     // dropped its column scale entirely, reconstructing only stored_w *
                     // val_scale instead of the true value.
-                    const value_type  val_scale = weights.get_value_scale(in_idx);
-                    const value_type  out_scale = weights.get_output_scale(out_idx);
-                    const value_type  combined_scale = val_scale * out_scale;
-                    const value_type  wval      = wval_stored * combined_scale;   // -> true units
+                    // Rank-N scale (see scale_rank's own docstring,
+                    // delta_csr_types.hpp) -- reduces to the exact
+                    // original val_scale*out_scale at scale_rank==1,
+                    // matching disldo_forward's identical replacement.
+                    const value_type  wval      = wval_stored * weights.get_scale(in_idx, out_idx);   // -> true units
                     const value_type  contrib   = wval * in_val;
 
                     thread_output[batch_offset + out_idx] += contrib;
@@ -512,21 +513,52 @@ void sisldo_forward(
                                     static_cast<uint32_t>(br), bc, elem_pos, byte_pos);
                                 const uint8_t* tdata = tile.raw_data();
 
+                                // Zero-skip (task: top_k4 sparsity work):
+                                // `local[]` holds this window's 4 gathered
+                                // input values -- until now, every li was
+                                // decoded and multiplied regardless of
+                                // whether local[li]==0, so sparsifying the
+                                // input (top-k or otherwise) was a silent
+                                // no-op on a block4-resident layer, only
+                                // the OUTER window-admission check (line
+                                // ~439, row_nnz_b4>0) ever skipped work.
+                                // Window-level early-out: if every gathered
+                                // value in this window is exactly zero
+                                // (either because the input was already
+                                // zero there, or a sparsification step
+                                // zeroed all 4), skip the lj/li decode+
+                                // accumulate loops below entirely -- the
+                                // walk bookkeeping above (elem_pos/byte_pos/
+                                // bc_cursor) has already run and must not be
+                                // skipped (later windows' incremental walk
+                                // depends on it), only the real per-slot
+                                // decode work is saved here.
+                                if (local[0] == value_type(0) && local[1] == value_type(0) &&
+                                    local[2] == value_type(0) && local[3] == value_type(0)) {
+                                    continue;
+                                }
+
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     const std::size_t col = static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
                                     if (col >= out_cols) continue;
-                                    const value_type out_scale = weights.get_output_scale(col);
 
                                     value_type acc = value_type(0);
                                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                                         const std::size_t row =
                                             static_cast<std::size_t>(br) * BLOCK4_TILE + li;
                                         if (row >= num_inputs) continue;
+                                        // Per-li skip: a zeroed gathered input
+                                        // contributes nothing regardless of the
+                                        // weight -- skip its decode too, not
+                                        // just the multiply-accumulate.
+                                        if (local[li] == value_type(0)) continue;
                                         const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
                                         if (byte == 0) continue;
                                         const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        // Rank-N scale, matching disldo_forward's
+                                        // block4 phase and the scattered fix above.
                                         const value_type w_true =
-                                            w_decoded * weights.get_value_scale(row) * out_scale;
+                                            w_decoded * weights.get_scale(row, col);
                                         acc += w_true * local[li];
                                     }
                                     thread_output[batch_offset + col] += acc;
@@ -545,6 +577,43 @@ void sisldo_forward(
                 const value_type* s = all_b4_outputs.data() + static_cast<std::size_t>(t) * num_outputs;
                 for (std::size_t i = 0; i < num_outputs; ++i)
                     output[i] += s[i];
+            }
+        }
+    }
+
+    // ── AQRS additive branch ────────────────────────────────────────────────
+    //
+    // Direct port of disldo_forward's identical section (linear_disldo.hpp),
+    // adapted for sparse input: the P[k] projection walks the CSR's nonzero
+    // entries instead of a dense row scan -- functionally identical, since
+    // the dense version already skips iv==0 entries. The second pass
+    // (P -> output) is unchanged (dense over out_cols, no sparsity to
+    // exploit there -- every output column can receive a nonzero additive
+    // contribution regardless of which synapses are live). No-op at the
+    // default additive_rank==0.
+    if (weights.additive_rank > 0) {
+        std::vector<value_type> proj(
+            static_cast<std::size_t>(input_tensor.rows) * weights.additive_rank, value_type(0));
+        for (SIZE_TYPE b = 0; b < input_tensor.rows; ++b) {
+            const SIZE_TYPE batch_start = (*input_tensor.ptrs[0])[b];
+            const SIZE_TYPE batch_end   = (*input_tensor.ptrs[0])[b + 1];
+            value_type* p_row = proj.data() + static_cast<std::size_t>(b) * weights.additive_rank;
+            for (SIZE_TYPE i = batch_start; i < batch_end; ++i) {
+                const SIZE_TYPE  r  = (*input_tensor.indices[0])[i];
+                const value_type iv = (*input_tensor.values[0])[i];
+                if (iv == value_type(0)) continue;
+                for (std::size_t k = 0; k < weights.additive_rank; ++k)
+                    p_row[k] += weights.get_additive_u_k(static_cast<std::size_t>(r), k) * iv;
+            }
+        }
+        for (SIZE_TYPE b = 0; b < input_tensor.rows; ++b) {
+            const value_type* p_row = proj.data() + static_cast<std::size_t>(b) * weights.additive_rank;
+            value_type* out_row = output + static_cast<std::size_t>(b) * out_cols;
+            for (std::size_t c = 0; c < out_cols; ++c) {
+                value_type acc = value_type(0);
+                for (std::size_t k = 0; k < weights.additive_rank; ++k)
+                    acc += weights.get_additive_gamma_k(k) * weights.get_additive_v_k(c, k) * p_row[k];
+                out_row[c] += acc;
             }
         }
     }
@@ -586,7 +655,25 @@ void sisldo_forward(
 // row regardless of its own value) -- sparse input would only ever cover
 // the first.
 
-template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
+// Template-parameter parity with linear_disldo.hpp::disldo_backward (task
+// #100, "[Deferred] Apply same template params to sisldo_ops.hpp backward
+// functions"): ScalePolicy/StochasticRounding/SynapsePolicyT, in the same
+// order disldo_backward uses (DeferredScaleWrite deliberately scoped out --
+// orthogonal to this function's actual callers). This closes two real gaps
+// at once: (1) synapse_kwargs (max_abs_delta/max_ci/min_decay_frac/
+// scale_invariant) previously could not reach backward_sparse at all, no
+// matter what a caller passed; (2) the scattered AND block4 phases below
+// were both keeping their weight-update math in TRUE-WEIGHT space while
+// storing back into CODE space via `new_w / combined_scale` -- the same
+// ~1/S^2-scale-direction bug class found and fixed in FP8's block4
+// backward earlier (see project_fp8_block4_scale_bug). Porting to
+// disldo_backward's own code-space convention (quant += update_cw(...),
+// S properly threaded as a real per-synapse scale rather than implicitly
+// inverted) fixes this identically here.
+template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
+          typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
+          bool StochasticRounding = true,
+          template <typename> class SynapsePolicyT = BoundedRMSpropSynapsePolicy>
 void disldo_backward_sparse_grad(
     const typename ValueAccessor<VALUES_TYPE>::value_type* input,   // dense [batch, n_inputs]
     SIZE_TYPE batch,
@@ -600,9 +687,14 @@ void disldo_backward_sparse_grad(
     bool         lr_per_row_nnz = false,
     bool         damp_by_importance = true,
     typename ValueAccessor<VALUES_TYPE>::value_type   beta2 = 0.999f,
-    typename ValueAccessor<VALUES_TYPE>::value_type   eps = 1e-8f)
+    typename ValueAccessor<VALUES_TYPE>::value_type   eps = 1e-8f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   min_decay_frac = 0.0f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   max_abs_delta = 1e30f,
+    typename ValueAccessor<VALUES_TYPE>::value_type   max_ci = 1e30f,
+    bool         scale_invariant = false)
 {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
     const auto& L = dc.layout;
     const std::size_t n_inputs = L.rows;
@@ -616,13 +708,71 @@ void disldo_backward_sparse_grad(
             neuron_grad_accum[(*out_grad_sparse.indices[0])[j]] +=
                 std::abs((*out_grad_sparse.values[0])[j]);
 
-    // Hoisted out of the dc.empty() branch below (used by the block4 phase
-    // too, which -- same bug/fix as sisldo_forward -- must NOT be
-    // skipped just because the scattered side has zero nnz.
-    if (weights.value_scale.size() < n_inputs)
-        weights.value_scale.resize(n_inputs, value_type(1));
-    if (weights.value_scale_importance.size() < n_inputs)
-        weights.value_scale_importance.resize(n_inputs, value_type(0));
+    // AQRS neurogenesis-trigger normalization fix (direct instruction,
+    // sili_peridot JOURNAL.md 2026-08-31): scale_gamma's own merge-walk
+    // (og_ptr against out_grad_sparse, below) and additive_gamma's dP/
+    // dgamma computation (further down) both only accumulate contributions
+    // from out_grad_sparse's SURVIVING columns -- this function is only
+    // ever called when dy is genuinely sparse (dy_sparsity_p set; see this
+    // function's own "only sparse-gradient backward variant" docstring
+    // above), so those sums are structurally smaller than the dense case by
+    // roughly the surviving fraction. grad_norm_divisor below (both gamma
+    // branches) was n_inputs*out_cols unconditionally, with nothing to
+    // compensate -- confirmed via a real 20k-step run: input_sparsity_p/
+    // dy_sparsity_p=0.5 pinned every layer's AQRS rank at 1 the entire
+    // curriculum (933-mutation isolation run with dy dense again grew ranks
+    // normally, same seed/everything else). Scale grad_norm_divisor by the
+    // ACTUAL observed dy density for this call, not the nominal p -- self-
+    // corrects for graded per-row schedules too, not just a uniform p.
+    const SIZE_TYPE dy_total_nnz = batch > 0
+        ? (*out_grad_sparse.ptrs[0])[batch] - (*out_grad_sparse.ptrs[0])[0]
+        : SIZE_TYPE(0);
+    const value_type dy_density = (batch > 0 && out_cols > 0)
+        ? std::max(static_cast<value_type>(dy_total_nnz) /
+                   (static_cast<value_type>(batch) * static_cast<value_type>(out_cols)),
+                   value_type(1e-6))
+        : value_type(1);
+
+    // ── AQRS rank-N scale scaffolding ───────────────────────────────────────
+    //
+    // Direct port of disldo_backward's identical scaffolding
+    // (linear_disldo.hpp) -- see its own comments for the full rationale.
+    // Shared by both the scattered phase below and the block4 phase further
+    // down, hence computed here rather than inside either guarded block.
+    const std::size_t rank = weights.scale_rank;
+    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * out_cols * rank, value_type(0));
+    std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * out_cols * rank, value_type(0));
+    const bool output_scale_trainable = weights.output_scale_is_trainable;
+    // AQRS gamma's own gradient (task #273/#283 parity) -- layer-wide, not
+    // per-row/col, so sized num_cpus*rank (not num_cpus*out_cols*rank like
+    // t_col_grad above).
+    std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
+    std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
+
+    // Pre-size value_scale/output_scale to n_inputs*rank / out_cols*rank --
+    // see disldo_backward's identical pre-sizing comment (linear_disldo.hpp)
+    // for the real bug this exact backfill pattern fixes (a uniform 1.0
+    // fill would put every new rank component in permanent lockstep with
+    // k==0; only k==0 gets the transparent-default 1.0, k>=1 starts at the
+    // neutral 0.0).
+    if (weights.value_scale.size() < n_inputs * rank) {
+        const std::size_t old_size = weights.value_scale.size();
+        weights.value_scale.resize(n_inputs * rank, value_type(0));
+        for (std::size_t idx = old_size; idx < weights.value_scale.size(); ++idx)
+            if (idx % rank == 0) weights.value_scale[idx] = value_type(1);
+    }
+    if (weights.output_scale.size() < out_cols * rank) {
+        const std::size_t old_size = weights.output_scale.size();
+        weights.output_scale.resize(out_cols * rank, value_type(0));
+        for (std::size_t idx = old_size; idx < weights.output_scale.size(); ++idx)
+            if (idx % rank == 0) weights.output_scale[idx] = value_type(1);
+    }
+    if (weights.value_scale_importance.size() < n_inputs * rank)
+        weights.value_scale_importance.resize(n_inputs * rank, value_type(0));
+    if (weights.output_scale_importance.size() < out_cols * rank)
+        weights.output_scale_importance.resize(out_cols * rank, value_type(0));
+    if (weights.value_scale_step.size() < n_inputs * rank)
+        weights.value_scale_step.resize(n_inputs * rank, 0);
 
     // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do"
     // -- see sisldo_forward's identical fix/comment. A layer can be
@@ -641,18 +791,24 @@ void disldo_backward_sparse_grad(
     double total_sum_sq_new_i  = 0.0, total_sum_sq_old_i  = 0.0;
     value_type total_max_new_i = value_type(0);
 
-    // value_scale gradient: serial per-row vector accumulated across batches
-    // (within each batch's parallel for, each r is unique per thread, so
-    // += into scale_grad_sums[r] is race-free; across batch iterations the
-    // outer loop is serial, so also race-free). Applied once after all
-    // batches -- "sum first, then apply lr" per conversation.
-    std::vector<double> scale_grad_sums(n_inputs, 0.0);
+    // value_scale gradient: serial per-(row,k) vector accumulated across
+    // batches (within each batch's parallel for, each r is unique per
+    // thread, so += into scale_grad_sums_rank[r*rank+k] is race-free;
+    // across batch iterations the outer loop is serial, so also race-free).
+    // Applied once after all batches -- "sum first, then apply lr" per
+    // conversation. NOTE: unlike disldo_backward (row-outer/batch-inner,
+    // so its own scale_grad_sum_rank is a small per-row-local vector reset
+    // every row), this function nests batch OUTER / row INNER -- a given
+    // row is visited once per SEPARATE batch iteration, not all at once --
+    // so this accumulator must persist across the whole `for (batch)` loop,
+    // indexed by the full (row,k) pair, not just k.
+    std::vector<double> scale_grad_sums_rank(n_inputs * rank, 0.0);
     // Parallel forward-contribution accumulator, mirroring
-    // disldo_backward's scale_grad_sum_contrib (linear_disldo.hpp) --
+    // disldo_backward's scale_grad_sum_rank_contrib (linear_disldo.hpp) --
     // same additive (square-then-sum) combination, now applied here too
     // since this function shares the same value_scale/value_scale_importance
     // arrays and was previously the one path left using plain g^2.
-    std::vector<double> scale_grad_sums_contrib(n_inputs, 0.0);
+    std::vector<double> scale_grad_sums_rank_contrib(n_inputs * rank, 0.0);
 
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
@@ -686,18 +842,31 @@ void disldo_backward_sparse_grad(
             SIZE_TYPE  og_ptr   = og_start;   // fresh per row -- each row does its own merge
             value_type dx_accum = value_type(0);
             const value_type imp_scale = weights.get_importance_scale(r);
-            const value_type val_scale = weights.get_value_scale(r);
+
+            // Per-thread rank-N accumulator lambdas -- mirrors
+            // disldo_backward's mcol_at/mgamma_at exactly (linear_disldo.hpp).
+            const int tid = omp_get_thread_num();
+            value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+            auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& { return mcol_base[col_ * rank + k]; };
+            value_type* mcol_contrib_base = t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+            auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& { return mcol_contrib_base[col_ * rank + k]; };
+            value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+            value_type* mgamma_contrib_base = t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at_contrib = [&](std::size_t k) -> value_type& { return mgamma_contrib_base[k]; };
 
             for (std::size_t e = 0; e < nnz_this_row; ++e) {
                 const COL_TYPE    col = cursor.advance();
                 const std::size_t vb  = L.elem_start[r] + e;
-                const value_type  w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                // BUG FIX: out_scale/output_importance_scale were never read
-                // here, unlike disldo_backward's identical row*col
-                // combination -- see sisldo_forward's matching fix.
-                const value_type  out_scale = weights.get_output_scale(col);
-                const value_type  combined_scale = val_scale * out_scale;
-                const value_type  w        = w_stored * combined_scale;   // -> true units
+                const value_type  cw_orig = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                // S: real per-synapse scale, rank-N (reduces to the exact
+                // original val_scale*out_scale at scale_rank==1), matching
+                // disldo_backward's own `S = weights.get_scale(r, col)`.
+                // Threading S through SynapsePolicy::update_cw (instead of
+                // the old true-weight-space `new_w / combined_scale` store)
+                // is what fixes the ~1/S^2 bug noted above.
+                const value_type  S = weights.get_scale(r, col);
+                const value_type  w = cw_orig * S;   // -> true units, for dx only
 
                 // Merge-advance (both this row's columns and the gradient's
                 // columns are sorted ascending) -- O(nnz_this_row + grad_nnz)
@@ -713,11 +882,12 @@ void disldo_backward_sparse_grad(
                 dx_accum += w * dy_val;   // weight-only -- reaches this row regardless of in_val
 
                 if (learning_rate != value_type(0)) {
+                    const value_type out_scale = weights.get_output_scale(col);
                     const value_type out_imp_scale = weights.get_output_importance_scale(col);
                     const value_type combined_imp_scale = imp_scale * out_imp_scale;
                     const value_type grad = dy_val * in_val;   // scales with true input value
-                    const value_type stored_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                    value_type imp = stored_imp * combined_imp_scale;   // -> true units
+                    const value_type ci_orig = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    value_type ci = ci_orig * combined_imp_scale;   // -> true units
                     // Additive contrib combination, mirroring disldo_backward's
                     // own `ci` update (linear_disldo.hpp) -- see its docstring
                     // for the full rationale (square-then-sum, not sum-then-
@@ -727,28 +897,43 @@ void disldo_backward_sparse_grad(
                     // is the true (pre-update) weight, same role as
                     // cw_orig there.
                     const value_type contrib = in_val * w;
-                    imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
-                    const value_type new_w = w + (damp_by_importance
-                        ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
-                        : (-effective_lr * grad));
-                    ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, new_w / combined_scale, imp / combined_imp_scale);
+                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                    value_type quant = cw_orig;   // code-space accumulator, matches disldo_backward
+                    quant += SynapsePolicy::update_cw(grad, ci, S, effective_lr, eps,
+                                                       damp_by_importance, max_abs_delta, scale_invariant);
+                    if constexpr (StochasticRounding) {
+                        ValueAccessor<VALUES_TYPE>::set_stochastic_live(dc.values, vb, quant, ci / combined_imp_scale);
+                    } else {
+                        ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant, ci / combined_imp_scale);
+                    }
                     const value_type actual_imp = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                     batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
-                    batch_sum_abs_old_i += std::abs(static_cast<double>(stored_imp));
+                    batch_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
                     batch_sum_sq_new_i  += static_cast<double>(actual_imp) * actual_imp;
-                    batch_sum_sq_old_i  += static_cast<double>(stored_imp) * stored_imp;
+                    batch_sum_sq_old_i  += static_cast<double>(ci_orig) * ci_orig;
                     batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
-                    // value_scale gradient: stored_w * out_scale[col] * dy_val * in_val
-                    // (true_w = stored_w * val_scale * out_scale, so val_scale's own
-                    // gradient holds out_scale fixed -- see disldo_backward's comment).
-                    // Raw (pre-lr) gradient contribution -- scale_eff_lr is
-                    // applied once at the end instead of folded in here, so
-                    // the RMSprop importance below tracks true g^2, not
-                    // (lr*g)^2 (see disldo_backward's identical convention).
-                    scale_grad_sums[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
-                                          * (dy_val * in_val);
-                    scale_grad_sums_contrib[r] += static_cast<double>(w_stored) * static_cast<double>(out_scale)
-                                          * static_cast<double>(contrib);
+
+                    // dL/d(value_scale_k(r,k)) = grad * quant_floor *
+                    // output_scale_k(col,k) * gamma_k, for EACH component k
+                    // -- direct port of disldo_backward's identical loop
+                    // (linear_disldo.hpp:1025-1054), including quant_floor's
+                    // zero-escape gating (only cw_orig==0 substitutes the
+                    // small positive epsilon; every other value uses itself
+                    // directly, exact and signed).
+                    const value_type quant_floor = (cw_orig == value_type(0)) ? value_type(0.1f) : cw_orig;
+                    for (std::size_t k = 0; k < rank; ++k) {
+                        const value_type out_scale_k = weights.get_output_scale_k(col, k);
+                        const value_type val_scale_k = weights.get_value_scale_k(r, k);
+                        const value_type gamma_k = weights.get_scale_gamma_k(k);
+                        scale_grad_sums_rank[r * rank + k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k)
+                                              * static_cast<double>(gamma_k) * grad;
+                        mcol_at(col, k) += quant_floor * val_scale_k * gamma_k * grad;
+                        mgamma_at(k) += quant_floor * val_scale_k * out_scale_k * grad;
+                        scale_grad_sums_rank_contrib[r * rank + k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k)
+                                              * static_cast<double>(gamma_k) * static_cast<double>(contrib);
+                        mcol_at_contrib(col, k) += quant_floor * val_scale_k * gamma_k * contrib;
+                        mgamma_at_contrib(k) += quant_floor * val_scale_k * out_scale_k * contrib;
+                    }
                 }
             }
             input_gradients[b * n_inputs + r] += dx_accum;
@@ -764,36 +949,24 @@ void disldo_backward_sparse_grad(
             total_sum_abs_new_i, total_sum_abs_old_i,
             total_sum_sq_new_i,  total_sum_sq_old_i, total_max_new_i);
 
-        // Apply value_scale gradient once per row, after ALL batches.
-        // scale_grad_sums[r] holds the RAW (pre-lr) gradient sum now (see
-        // the accumulation site above) -- scale_eff_lr is recomputed here
-        // and applied once, same RMSprop pattern as disldo_backward's
-        // matching update in linear_disldo.hpp.
+        // Apply value_scale gradient once per (row,k), after ALL batches.
+        // scale_grad_sums_rank[r*rank+k] holds the RAW (pre-lr) gradient sum
+        // now (see the accumulation site above) -- scale_eff_lr is
+        // recomputed here and applied once, matching disldo_backward's
+        // !DeferredScaleWrite (rank-N) branch exactly (linear_disldo.hpp:
+        // 1093-1100).
         for (std::size_t r = 0; r < n_inputs; ++r) {
-            if (scale_grad_sums[r] == 0.0 && scale_grad_sums_contrib[r] == 0.0) continue;
             const std::size_t nnz_this_row = L.row_nnz(r);
             if (nnz_this_row == 0) continue;
             const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_this_row);
-            const value_type g_agg = static_cast<value_type>(scale_grad_sums[r]);
-            const value_type contrib_agg = static_cast<value_type>(scale_grad_sums_contrib[r]);
-            value_type& vs_imp = weights.value_scale_importance[r];
-            // Square-then-sum (g_agg^2+contrib_agg^2), matching
-            // RMSpropScalePolicy::update's own combination -- see its
-            // docstring (delta_csr_types.hpp) for why sum-then-square is
-            // unsafe here (a large-magnitude disagreement between g_agg
-            // and contrib_agg could collapse the denominator toward zero
-            // and explode the step).
-            const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
-            // Same Adam-style bias correction as RMSpropScalePolicy::update
-            // (delta_csr_types.hpp) -- shares the SAME value_scale_importance
-            // array as disldo_backward's scattered/block4 paths, so it needs
-            // the same fix for the same cold-start reason.
-            uint32_t& step = weights.get_value_scale_step_k(r, 0);
-            ++step;
-            const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
-            const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
-            vs_imp = new_vs_imp;
-            weights.value_scale[r] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
+            for (std::size_t k = 0; k < rank; ++k) {
+                if (scale_grad_sums_rank[r * rank + k] == 0.0 && scale_grad_sums_rank_contrib[r * rank + k] == 0.0) continue;
+                const value_type g_agg = static_cast<value_type>(scale_grad_sums_rank[r * rank + k]);
+                const value_type contrib_agg = static_cast<value_type>(scale_grad_sums_rank_contrib[r * rank + k]);
+                ScalePolicy::update(weights.value_scale[r * rank + k], weights.value_scale_importance[r * rank + k],
+                                    g_agg, scale_eff_lr, beta2, eps, contrib_agg,
+                                    &weights.get_value_scale_step_k(r, k), scale_invariant);
+            }
         }
     }
     } // closes if (!dc.empty())
@@ -844,10 +1017,15 @@ void disldo_backward_sparse_grad(
             // share a row), and different batches' parallel regions
             // never overlap in time (each is fully joined before the
             // next begins) -- see comment above.
-            std::vector<double> row_scale_grad_sums(n_inputs, 0.0);
+            // Rank-N (task #331): sized n_inputs*rank, indexed [row*rank+k],
+            // mirroring the scattered path's scale_grad_sums_rank above --
+            // safe to write directly here too (same row-exclusive-ownership
+            // argument as row_scale_grad_sums used to make for its rank-1
+            // form).
+            std::vector<double> row_scale_grad_sums_rank(n_inputs * rank, 0.0);
             // Parallel forward-contribution accumulator -- see the scattered
             // path's scale_grad_sums_contrib above for the full rationale.
-            std::vector<double> row_scale_grad_sums_contrib(n_inputs, 0.0);
+            std::vector<double> row_scale_grad_sums_rank_contrib(n_inputs * rank, 0.0);
 
             double b4_total_sum_abs_new = 0.0, b4_total_sum_abs_old = 0.0;
             double b4_total_sum_sq_new  = 0.0, b4_total_sum_sq_old  = 0.0;
@@ -875,8 +1053,20 @@ void disldo_backward_sparse_grad(
                     const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
 
                     value_type dx_accum[BLOCK4_TILE]                = {0, 0, 0, 0};
-                    double     row_grad_local[BLOCK4_TILE]          = {0, 0, 0, 0};
-                    double     row_grad_local_contrib[BLOCK4_TILE]  = {0, 0, 0, 0};
+
+                    // Per-thread rank-N accumulator lambdas -- same pattern
+                    // as the scattered path's mcol_at/mgamma_at (this loop
+                    // is itself the `#pragma omp parallel for` over br, so
+                    // tid is stable for this whole br's work).
+                    const int tid = omp_get_thread_num();
+                    value_type* mcol_base = t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+                    auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& { return mcol_base[col_ * rank + k]; };
+                    value_type* mcol_contrib_base = t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+                    auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& { return mcol_contrib_base[col_ * rank + k]; };
+                    value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+                    auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+                    value_type* mgamma_contrib_base = t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+                    auto mgamma_at_contrib = [&](std::size_t k) -> value_type& { return mgamma_contrib_base[k]; };
 
                     if (learning_rate == value_type(0)) {
                         // Read-only: no writes anywhere in this row, so no
@@ -915,15 +1105,16 @@ void disldo_backward_sparse_grad(
                                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                                     const std::size_t row = br * BLOCK4_TILE + li;
                                     if (row >= n_inputs) continue;
-                                    const value_type val_scale = weights.get_value_scale(row);
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         if (dy_local[lj] == value_type(0)) continue;
                                         const std::size_t col = window_lo + lj;
                                         if (col >= out_cols) continue;
                                         const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
                                         const value_type w_decoded = FP4_TABLE[byte & 0xFu];
-                                        const value_type out_scale = weights.get_output_scale(col);
-                                        const value_type w = w_decoded * val_scale * out_scale;
+                                        // Rank-N (task #331): matches the scattered
+                                        // read-only path's `S = weights.get_scale(r, col)`.
+                                        const value_type S = weights.get_scale(row, col);
+                                        const value_type w = w_decoded * S;
                                         dx_accum[li] += w * dy_local[lj];
                                     }
                                 }
@@ -972,7 +1163,6 @@ void disldo_backward_sparse_grad(
                                     const std::size_t row = br * BLOCK4_TILE + li;
                                     if (row >= n_inputs) continue;
                                     const value_type in_val    = input[static_cast<std::size_t>(b) * n_inputs + row];
-                                    const value_type val_scale = weights.get_value_scale(row);
                                     const value_type imp_scale = weights.get_importance_scale(row);
                                     const value_type effective_lr = lr_per_row_nnz
                                         ? learning_rate / static_cast<value_type>(nnz_row)
@@ -989,9 +1179,13 @@ void disldo_backward_sparse_grad(
 
                                         const uint8_t byte = scratch[Block4Tile::slot_index(li, lj)];
                                         const value_type w_decoded      = FP4_TABLE[byte & 0xFu];
-                                        const value_type out_scale      = weights.get_output_scale(col);
-                                        const value_type combined_scale = val_scale * out_scale;
-                                        const value_type w               = w_decoded * combined_scale;
+                                        // Rank-N (task #331): S = weights.get_scale(row, col),
+                                        // matching the scattered write path's identical swap --
+                                        // threading S through SynapsePolicy::update_cw (code-space)
+                                        // instead of the old true-weight-space `new_w /
+                                        // combined_scale` store fixes the ~1/S^2 bug here too.
+                                        const value_type S               = weights.get_scale(row, col);
+                                        const value_type w               = w_decoded * S;
                                         const value_type dy_val          = dy_local[lj];
                                         dx_accum[li] += w * dy_val;
 
@@ -999,17 +1193,17 @@ void disldo_backward_sparse_grad(
                                         const value_type combined_imp_scale = imp_scale * out_imp_scale;
                                         const value_type imp_decoded = FP4_TABLE[(byte >> 4) & 0xFu];
                                         const value_type grad = dy_val * in_val;
-                                        value_type imp = imp_decoded * combined_imp_scale;
+                                        value_type ci = imp_decoded * combined_imp_scale;
                                         // Additive contrib combination, matching
                                         // the scattered path above -- see its
                                         // comment for the full rationale. w is
                                         // the true (pre-update) weight decoded
                                         // just above.
                                         const value_type contrib = in_val * w;
-                                        imp = beta2 * imp + (value_type(1) - beta2) * (grad * grad + contrib * contrib);
-                                        const value_type new_w = w + (damp_by_importance
-                                            ? (-effective_lr * grad) / (std::sqrt(imp) + eps)
-                                            : (-effective_lr * grad));
+                                        ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                                        value_type quant = w_decoded;   // code-space accumulator, matches disldo_backward
+                                        quant += SynapsePolicy::update_cw(grad, ci, S, effective_lr, eps,
+                                                                           damp_by_importance, max_abs_delta, scale_invariant);
                                         // was_live gate -- see
                                         // linear_disldo.hpp's was_live4/
                                         // was_live4_8 declaration comments for
@@ -1023,12 +1217,17 @@ void disldo_backward_sparse_grad(
                                         // column happened to have gradient
                                         // signal this step.
                                         const bool was_live = (byte != 0);
-                                        const uint8_t new_w_code   = was_live
-                                            ? fp4_quantize_stochastic_live(new_w / combined_scale)
-                                            : fp4_quantize_stochastic(new_w / combined_scale);
-                                        const uint8_t new_imp_code = was_live
-                                            ? fp4_quantize_stochastic_live_nonneg(imp / combined_imp_scale)
-                                            : fp4_quantize_stochastic(imp / combined_imp_scale);
+                                        const value_type imp_ratio = ci / combined_imp_scale;
+                                        uint8_t new_w_code, new_imp_code;
+                                        if constexpr (StochasticRounding) {
+                                            new_w_code   = was_live ? fp4_quantize_stochastic_live(quant)
+                                                                    : fp4_quantize_stochastic(quant);
+                                            new_imp_code = was_live ? fp4_quantize_stochastic_live_nonneg(imp_ratio)
+                                                                    : fp4_quantize_stochastic(imp_ratio);
+                                        } else {
+                                            new_w_code   = was_live ? fp4_quantize_live(quant)     : fp4_quantize(quant);
+                                            new_imp_code = was_live ? fp4_quantize_live(imp_ratio) : fp4_quantize(imp_ratio);
+                                        }
                                         scratch[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
                                         dirty = true;
 
@@ -1040,10 +1239,30 @@ void disldo_backward_sparse_grad(
                                         batch_sum_sq_old  += static_cast<double>(stored_imp) * stored_imp;
                                         batch_max_new = std::max(batch_max_new, std::abs(actual_imp));
 
-                                        row_grad_local[li] += static_cast<double>(w_decoded)
-                                            * static_cast<double>(out_scale) * (dy_val * in_val);
-                                        row_grad_local_contrib[li] += static_cast<double>(w_decoded)
-                                            * static_cast<double>(out_scale) * static_cast<double>(contrib);
+                                        // Rank-N (task #331): per-k gradient accumulation, direct
+                                        // port of the scattered write path's identical loop above
+                                        // (same quant_floor zero-escape gating, same mcol_at/
+                                        // mgamma_at targets -- both phases' contributions land in
+                                        // the SAME shared t_col_grad/t_gamma_grad buffers, reduced
+                                        // once together after block4 closes). Written straight into
+                                        // row_scale_grad_sums_rank (no local intermediate needed):
+                                        // this br exclusively owns `row` for the whole function, so
+                                        // the direct += is race-free, same argument this section's
+                                        // own comment already makes for dx/importance-stat writes.
+                                        const value_type quant_floor = (w_decoded == value_type(0)) ? value_type(0.1f) : w_decoded;
+                                        for (std::size_t k = 0; k < rank; ++k) {
+                                            const value_type out_scale_k = weights.get_output_scale_k(col, k);
+                                            const value_type val_scale_k = weights.get_value_scale_k(row, k);
+                                            const value_type gamma_k = weights.get_scale_gamma_k(k);
+                                            row_scale_grad_sums_rank[row * rank + k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k)
+                                                                  * static_cast<double>(gamma_k) * grad;
+                                            mcol_at(col, k) += quant_floor * val_scale_k * gamma_k * grad;
+                                            mgamma_at(k) += quant_floor * val_scale_k * out_scale_k * grad;
+                                            row_scale_grad_sums_rank_contrib[row * rank + k] += static_cast<double>(quant_floor) * static_cast<double>(out_scale_k)
+                                                                  * static_cast<double>(gamma_k) * static_cast<double>(contrib);
+                                            mcol_at_contrib(col, k) += quant_floor * val_scale_k * gamma_k * contrib;
+                                            mgamma_at_contrib(k) += quant_floor * val_scale_k * out_scale_k * contrib;
+                                        }
                                     }
                                 }
                                 if (dirty)
@@ -1072,10 +1291,6 @@ void disldo_backward_sparse_grad(
                         const std::size_t row = br * BLOCK4_TILE + li;
                         if (row >= n_inputs) continue;
                         input_gradients[static_cast<std::size_t>(b) * n_inputs + row] += dx_accum[li];
-                        if (learning_rate != value_type(0)) {
-                            row_scale_grad_sums[row] += row_grad_local[li];
-                            row_scale_grad_sums_contrib[row] += row_grad_local_contrib[li];
-                        }
                     }
                 } // br
 
@@ -1090,30 +1305,213 @@ void disldo_backward_sparse_grad(
                     b4_total_sum_sq_new,  b4_total_sum_sq_old, b4_total_max_new);
 
                 for (std::size_t row = 0; row < n_inputs; ++row) {
-                    if (row_scale_grad_sums[row] == 0.0 && row_scale_grad_sums_contrib[row] == 0.0) continue;
                     // nnz_row for this row's block-row -- same derivation as
                     // the accumulation loop above (row_nnz_b4 * BLOCK4_TILE).
                     const std::size_t br = row / BLOCK4_TILE;
                     const std::size_t nnz_row = (br < BL4.rows ? BL4.row_nnz(br) : 0) * BLOCK4_TILE;
                     if (nnz_row == 0) continue;
                     const value_type scale_eff_lr = learning_rate / static_cast<value_type>(nnz_row);
-                    const value_type g_agg = static_cast<value_type>(row_scale_grad_sums[row]);
-                    const value_type contrib_agg = static_cast<value_type>(row_scale_grad_sums_contrib[row]);
-                    value_type& vs_imp = weights.value_scale_importance[row];
-                    // Square-then-sum -- see the scattered path's identical
-                    // fix above / RMSpropScalePolicy's docstring
-                    // (delta_csr_types.hpp) for why sum-then-square is unsafe.
-                    const value_type new_vs_imp = beta2 * vs_imp + (value_type(1) - beta2) * (g_agg * g_agg + contrib_agg * contrib_agg);
-                    // Same bias correction as the scattered path's identical
-                    // update above -- SAME value_scale_step counter (shared
-                    // per-row across scattered and block4, matching
-                    // disldo_backward's own shared value_scale/importance).
-                    uint32_t& step = weights.get_value_scale_step_k(row, 0);
-                    ++step;
-                    const value_type bias_correction = value_type(1) - std::pow(beta2, static_cast<value_type>(step));
-                    const value_type vs_imp_hat = bias_correction > value_type(0) ? new_vs_imp / bias_correction : new_vs_imp;
-                    vs_imp = new_vs_imp;
-                    weights.value_scale[row] -= scale_eff_lr * g_agg / (std::sqrt(vs_imp_hat) + eps);
+                    // Rank-N (task #331): per-(row,k) apply, direct port of
+                    // the scattered path's identical final loop above. SAME
+                    // value_scale_step counter (shared per-row/k across
+                    // scattered and block4, matching disldo_backward's own
+                    // shared value_scale/importance).
+                    for (std::size_t k = 0; k < rank; ++k) {
+                        if (row_scale_grad_sums_rank[row * rank + k] == 0.0 && row_scale_grad_sums_rank_contrib[row * rank + k] == 0.0) continue;
+                        const value_type g_agg = static_cast<value_type>(row_scale_grad_sums_rank[row * rank + k]);
+                        const value_type contrib_agg = static_cast<value_type>(row_scale_grad_sums_rank_contrib[row * rank + k]);
+                        ScalePolicy::update(weights.value_scale[row * rank + k], weights.value_scale_importance[row * rank + k],
+                                            g_agg, scale_eff_lr, beta2, eps, contrib_agg,
+                                            &weights.get_value_scale_step_k(row, k), scale_invariant);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── output_scale's own gradient reduction ───────────────────────────────
+    //
+    // Direct port of disldo_backward's identical block (linear_disldo.hpp)
+    // -- reduces t_col_grad/t_col_grad_contrib across every thread, once per
+    // (col,k), then applies via the same ScalePolicy. Placed AFTER both the
+    // scattered phase above AND the block4 phase just above (both phases'
+    // mcol_at contributions land in the SAME shared t_col_grad buffer,
+    // matching disldo_backward's own placement) -- reducing any earlier
+    // would silently drop block4's own contribution.
+    if (learning_rate != value_type(0) && output_scale_trainable) {
+        for (std::size_t c = 0; c < out_cols; ++c) {
+            const std::size_t deg = c < weights.out_degree.size()
+                ? static_cast<std::size_t>(weights.out_degree[c]) : 0;
+            if (deg == 0) continue;
+            const value_type col_eff_lr = learning_rate / static_cast<value_type>(deg);
+            for (std::size_t k = 0; k < rank; ++k) {
+                double col_grad_sum = 0.0, col_grad_sum_contrib = 0.0;
+                for (int t = 0; t < num_cpus; ++t) {
+                    col_grad_sum += t_col_grad[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
+                    col_grad_sum_contrib += t_col_grad_contrib[static_cast<std::size_t>(t) * out_cols * rank + c * rank + k];
+                }
+                const value_type g_agg = static_cast<value_type>(col_grad_sum);
+                const value_type contrib_agg = static_cast<value_type>(col_grad_sum_contrib);
+                ScalePolicy::update(weights.output_scale[c * rank + k], weights.output_scale_importance[c * rank + k],
+                                    g_agg, col_eff_lr, beta2, eps, contrib_agg,
+                                    &weights.get_output_scale_step_k(c, k), scale_invariant);
+            }
+        }
+    }
+
+    // ── AQRS scale_gamma's own update ───────────────────────────────────────
+    //
+    // Direct port of disldo_backward's identical block (linear_disldo.hpp),
+    // including the EMA/dynamic-rank-control tracking call
+    // (update_scale_gamma_ema_k) -- that method itself already lives on
+    // `weights` (shared with the dense path), this just needs to feed it
+    // the same per-k inputs disldo_backward does.
+    if (learning_rate != value_type(0) && weights.scale_gamma_is_trainable) {
+        std::vector<value_type> g_agg_by_k(rank);
+        for (std::size_t k = 0; k < rank; ++k) {
+            double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
+            for (int t = 0; t < num_cpus; ++t) {
+                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * rank + k];
+                gamma_grad_sum_contrib += t_gamma_grad_contrib[static_cast<std::size_t>(t) * rank + k];
+            }
+            const value_type g_agg = static_cast<value_type>(gamma_grad_sum);
+            const value_type contrib_agg = static_cast<value_type>(gamma_grad_sum_contrib);
+            g_agg_by_k[k] = g_agg;
+            weights.set_scale_gamma_raw_k(k, weights.get_scale_gamma_k(k));
+            ScalePolicy::update(weights.scale_gamma[k], weights.get_scale_gamma_state_k(k),
+                                g_agg, learning_rate, beta2, eps, contrib_agg,
+                                &weights.get_scale_gamma_step_k(k), false);
+        }
+        value_type gamma_l1_sum = value_type(0);
+        for (std::size_t k = 0; k < rank; ++k) gamma_l1_sum += std::fabs(weights.scale_gamma[k]);
+        const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols) * dy_density;
+        for (std::size_t k = 0; k < rank; ++k) {
+            const value_type abs_gamma_k = std::fabs(weights.scale_gamma[k]);
+            const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+            weights.update_scale_gamma_ema_k(k, abs_gamma_k, share_k,
+                                             std::fabs(g_agg_by_k[k]) / grad_norm_divisor);
+        }
+    }
+
+    // ── AQRS additive branch backward ───────────────────────────────────────
+    //
+    // Direct port of disldo_backward's identical section (linear_disldo.hpp)
+    // -- genuinely independent of the sparse/block4 structure above (same
+    // reasoning as forward's additive branch), computed as its own self-
+    // contained pass. No-op at the default additive_rank==0. `input` is
+    // already dense (this function's own design); `out_grad_sparse` is the
+    // one place this needs real adaptation from disldo_backward's dense
+    // `output_grad` scans -- both the dP projection AND dV's own gradient
+    // walk it once via its CSR instead of a dense scan over n_out (the
+    // dense version already skips zero entries either way, so this is the
+    // same computation, just walking the nonzero set directly).
+    if (weights.additive_rank > 0) {
+        const std::size_t r_o = weights.additive_rank;
+        std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* in_row = input + static_cast<std::size_t>(b) * n_inputs;
+            value_type* p_row = P.data() + static_cast<std::size_t>(b) * r_o;
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                const value_type iv = in_row[r];
+                if (iv == value_type(0)) continue;
+                for (std::size_t k = 0; k < r_o; ++k)
+                    p_row[k] += weights.get_additive_u_k(r, k) * iv;
+            }
+        }
+        // dP[b,k] = sum_c V(c,k)*dy[b,c] -- CSR walk over out_grad_sparse
+        // instead of disldo_backward's dense `for c in n_out` scan.
+        std::vector<value_type> dP(static_cast<std::size_t>(batch) * r_o, value_type(0));
+        // dV_accum[c,k] = sum_b dy[b,c]*P[b,k] -- built in the SAME CSR walk
+        // (both need the same (b,c,dy) triples), avoiding a second O(n_out)
+        // dense scan disldo_backward's own dV loop does.
+        std::vector<value_type> dV_accum(out_cols * r_o, value_type(0));
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+            const SIZE_TYPE og_end   = (*out_grad_sparse.ptrs[0])[b + 1];
+            value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            const value_type* p_row = P.data() + static_cast<std::size_t>(b) * r_o;
+            for (SIZE_TYPE i = og_start; i < og_end; ++i) {
+                const std::size_t c  = static_cast<std::size_t>((*out_grad_sparse.indices[0])[i]);
+                const value_type  dy = (*out_grad_sparse.values[0])[i];
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    dp_row[k] += weights.get_additive_v_k(c, k) * dy;
+                    dV_accum[c * r_o + k] += dy * p_row[k];
+                }
+            }
+        }
+        // dX = sum_k U(r,k) * gamma_k * dP_raw[b,k] -- direct port,
+        // disldo_backward's identical formula (linear_disldo.hpp).
+        for (SIZE_TYPE b = 0; b < batch; ++b) {
+            const value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
+            value_type* dx_row = input_gradients + static_cast<std::size_t>(b) * n_inputs;
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                value_type acc = value_type(0);
+                for (std::size_t k = 0; k < r_o; ++k)
+                    acc += weights.get_additive_gamma_k(k) * weights.get_additive_u_k(r, k) * dp_row[k];
+                dx_row[r] += acc;
+            }
+        }
+        if (learning_rate != value_type(0)) {
+            // dU[r,k] = gamma_k * sum_b dP_raw[b,k]*X[b,r] -- direct port.
+            for (std::size_t r = 0; r < n_inputs; ++r) {
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    value_type dU_rk = value_type(0);
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const value_type iv = input[static_cast<std::size_t>(b) * n_inputs + r];
+                        if (iv == value_type(0)) continue;
+                        dU_rk += dP[static_cast<std::size_t>(b) * r_o + k] * iv;
+                    }
+                    dU_rk *= weights.get_additive_gamma_k(k);
+                    if (dU_rk == value_type(0)) continue;
+                    value_type u_val = weights.get_additive_u_k(r, k);
+                    AdamScalePolicy<value_type>::update(
+                        u_val, weights.get_additive_u_state_k(r, k), weights.get_additive_u_momentum_k(r, k),
+                        dU_rk, learning_rate, value_type(0.9f), beta2, eps, &weights.get_additive_u_step_k(r, k));
+                    weights.set_additive_u_raw_k(r, k, u_val);
+                }
+            }
+            // dV[c,k] = gamma_k * dV_accum[c,k] -- already reduced above via
+            // the CSR walk, no dense scan needed here (unlike
+            // disldo_backward's own dV loop, which re-scans output_grad
+            // densely per (c,k) since it never had a sparse dy to walk).
+            for (std::size_t c = 0; c < out_cols; ++c) {
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    value_type dV_ck = dV_accum[c * r_o + k] * weights.get_additive_gamma_k(k);
+                    if (dV_ck == value_type(0)) continue;
+                    value_type v_val = weights.get_additive_v_k(c, k);
+                    AdamScalePolicy<value_type>::update(
+                        v_val, weights.get_additive_v_state_k(c, k), weights.get_additive_v_momentum_k(c, k),
+                        dV_ck, learning_rate, value_type(0.9f), beta2, eps, &weights.get_additive_v_step_k(c, k));
+                    weights.set_additive_v_raw_k(c, k, v_val);
+                }
+            }
+
+            // additive_gamma's own update -- direct port, including its own
+            // EMA/dynamic-rank-control tracking call
+            // (update_additive_gamma_ema_k), same shared-method pattern as
+            // scale_gamma's above.
+            if (weights.additive_gamma_is_trainable) {
+                std::vector<value_type> dgamma_by_k(r_o);
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    double dgamma_sum = 0.0;
+                    for (SIZE_TYPE b = 0; b < batch; ++b)
+                        dgamma_sum += static_cast<double>(P[static_cast<std::size_t>(b) * r_o + k]) *
+                                      static_cast<double>(dP[static_cast<std::size_t>(b) * r_o + k]);
+                    const value_type dgamma_k = static_cast<value_type>(dgamma_sum);
+                    dgamma_by_k[k] = dgamma_k;
+                    weights.set_additive_gamma_raw_k(k, weights.get_additive_gamma_k(k));
+                    ScalePolicy::update(weights.additive_gamma[k], weights.get_additive_gamma_state_k(k),
+                                        dgamma_k, learning_rate, beta2, eps, value_type(0),
+                                        &weights.get_additive_gamma_step_k(k), false);
+                }
+                value_type gamma_l1_sum = value_type(0);
+                for (std::size_t k = 0; k < r_o; ++k) gamma_l1_sum += std::fabs(weights.additive_gamma[k]);
+                const value_type grad_norm_divisor = static_cast<value_type>(n_inputs) * static_cast<value_type>(out_cols) * dy_density;
+                for (std::size_t k = 0; k < r_o; ++k) {
+                    const value_type abs_gamma_k = std::fabs(weights.additive_gamma[k]);
+                    const value_type share_k = gamma_l1_sum > value_type(0) ? abs_gamma_k / gamma_l1_sum : value_type(0);
+                    weights.update_additive_gamma_ema_k(k, abs_gamma_k, share_k,
+                                                        std::fabs(dgamma_by_k[k]) / grad_norm_divisor);
                 }
             }
         }

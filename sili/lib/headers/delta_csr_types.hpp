@@ -281,8 +281,10 @@ struct ValueAccessor<FP4BiPacked> {
     }
 
     static std::size_t projected_byte_size(std::size_t n) {
-        return n; 
+        return n;
     }
+
+    static std::size_t size(const FP4BiPacked& v) { return v[0].size(); }
 };
 
 /// Trait to handle FP8BiValues -- one full byte per value (weight,
@@ -343,6 +345,8 @@ struct ValueAccessor<FP8BiValues> {
     static std::size_t projected_byte_size(std::size_t n) {
         return n * 2;  // 1 byte weight + 1 byte importance per element
     }
+
+    static std::size_t size(const FP8BiValues& v) { return v.weights.size(); }
 };
 
 /// Fallback standard vector equivalent for floats (e.g. CSRSynapsesV uses)
@@ -399,7 +403,90 @@ struct ValueAccessor<DeltaCSRBiValues<T>> {
     static std::size_t projected_byte_size(std::size_t n) {
         return n * sizeof(T) * 2;
     }
+
+    static std::size_t size(const DeltaCSRBiValues<T>& v) { return v.weights.size(); }
 };
+
+// ── Amortized decoupled decay + running stats ───────────────────────────────
+//
+// Generic over VALUES_TYPE (fp32/DeltaCSRBiValues, FP4BiPacked, FP8BiValues)
+// via ValueAccessor -- direct instruction to make this work across all three
+// layer storage types, not just DISLDOLayerV. Touches `chunk_size` synapses
+// per call via a persistent rolling cursor supplied by the caller (never
+// scans the whole layer in one call -- same amortization shape as
+// synap_row_step's own per-row cursor). decay_factor is the caller's job to
+// derive (see Python side): 2^(-cycle_length/H) for a chosen half-life H in
+// real training STEPS, where cycle_length = ceil(nnz/chunk_size), since a
+// given synapse is only actually touched once per cycle_length steps.
+//
+// Decays the WEIGHT only (importance is a significance signal, not a
+// magnitude to shrink) via get_imp+set_live, preserving each VALUES_TYPE's
+// own never-0 live-quantize invariant where one exists (FP4/FP8) and
+// passing through unchanged where it's meaningless (fp32's plain float
+// storage already treats exact 0.0 as legitimate). For FP4/FP8 this decay
+// is lower marginal value than for fp32: raw codes are already
+// magnitude-bounded by a small fixed decode table and cannot blow up the
+// way a plain float can -- the real FP4/FP8 blow-up path is the SCALE
+// vector, already covered by apply_scale_overflow_guard -- but the running
+// stats remain useful there for uniform health monitoring across all three
+// storage types, and decaying a healthy nonzero code toward the table's
+// smaller entries is harmless.
+//
+// Returns the stats fields (mean_abs/rms/max_abs/n) only for a
+// just-FINISHED cycle (accumulators reset after being read via the
+// caller's own sum_abs/sum_sq/max_abs/n references); cycle_complete=false
+// means "still mid-cycle" -- the caller should treat the numeric fields as
+// stale/undefined in that case (this function still zeroes nothing, but
+// callers should gate on cycle_complete rather than reading them).
+struct AmortizedDecayStats {
+    double      mean_abs       = 0.0;
+    double      rms            = 0.0;
+    double      max_abs        = 0.0;
+    std::size_t n              = 0;
+    bool        cycle_complete = false;
+};
+
+template <typename VALUES_TYPE, typename V>
+AmortizedDecayStats apply_amortized_decay_stats(
+    VALUES_TYPE& values, std::size_t& cursor,
+    double& sum_abs, double& sum_sq, double& max_abs, std::size_t& n,
+    std::size_t chunk_size, V decay_factor)
+{
+    using VA = ValueAccessor<VALUES_TYPE>;
+    const std::size_t total = VA::size(values);
+    bool cycle_complete = false;
+    if (total > 0) {
+        for (std::size_t i = 0; i < chunk_size; ++i) {
+            if (cursor >= total) cursor = 0;
+            const V w      = static_cast<V>(VA::get_w(values, cursor));
+            const V imp    = static_cast<V>(VA::get_imp(values, cursor));
+            const V new_w  = static_cast<V>(w * decay_factor);
+            VA::set_live(values, cursor, new_w, imp);
+            const double aw = std::abs(static_cast<double>(new_w));
+            sum_abs += aw;
+            sum_sq  += aw * aw;
+            if (aw > max_abs) max_abs = aw;
+            ++n;
+            ++cursor;
+            if (cursor >= total) {
+                cycle_complete = true;
+                cursor = 0;
+            }
+        }
+    } else {
+        cycle_complete = true;
+    }
+    AmortizedDecayStats out;
+    out.cycle_complete = cycle_complete;
+    if (cycle_complete && n > 0) {
+        out.mean_abs = sum_abs / static_cast<double>(n);
+        out.rms      = std::sqrt(sum_sq / static_cast<double>(n));
+        out.max_abs  = max_abs;
+        out.n        = n;
+        sum_abs = 0.0; sum_sq = 0.0; max_abs = 0.0; n = 0;
+    }
+    return out;
+}
 
 // ── Scale-update policies ─────────────────────────────────────────────────────
 //
@@ -2237,7 +2324,7 @@ public:
     // so a channel could apoptose then immediately regrow (or vice
     // versa) every few calls -- 1464 mutations in 3000 steps, observed
     // directly. Gating BOTH apoptosis and neurogenesis behind "at least
-    // grace_period_steps calls since the LAST mutation of either kind"
+    // some number of calls since the LAST mutation of either kind"
     // gives every mutation a real minimum window to matter before the
     // branch can change again, regardless of how large gamma's raw
     // gradient turns out to be. Passed by reference and owned by the
@@ -2247,22 +2334,45 @@ public:
     // constructed layer's first-ever qualifying mutation isn't blocked
     // by a phantom cooldown; guarded against wraparound since a long
     // idle run would otherwise increment past UINT32_MAX.
+    //
+    // grow_grace_period_steps / shrink_grace_period_steps: kept as two
+    // independent knobs (originally split to fix a real 60k-step-run
+    // regression where shrink fired on essentially the same cadence as
+    // growth, destroying accumulated low-rank structure -- e.g.
+    // additive_rank 32->1 -- far faster than it took to build). Per
+    // direct instruction and a biology literature check (see the
+    // per-BRANCH callers below, apply_dynamic_rank_control and
+    // apply_additive_dynamic_rank_control, for the citations and the
+    // real magnitude): the well-evidenced asymmetry is actually
+    // CROSS-branch (scale/multiplicative branch vs. additive branch
+    // should run on very different overall cadences), not WITHIN a
+    // branch (formation vs. elimination rates for a single mechanism
+    // are roughly comparable in the literature). So each branch now
+    // defaults these two to the SAME value (symmetric within the
+    // branch) while the two branches' own defaults differ by ~100x.
+    // The parameters stay independently settable for callers who want
+    // within-branch asymmetry too; nothing here prevents it.
     static bool apply_dynamic_rank_control_generic(std::size_t rank, std::size_t min_rank,
-                                                     std::size_t max_rank, uint32_t grace_period_steps,
+                                                     std::size_t max_rank,
+                                                     uint32_t grow_grace_period_steps,
+                                                     uint32_t shrink_grace_period_steps,
                                                      uint32_t& calls_since_mutation,
                                                      AgeFn age_of, ApoptoseCheckFn should_apoptose,
                                                      NeurogenesisCheckFn should_neurogenesis,
                                                      DoApoptoseFn do_apoptose, DoNeurogenesisFn do_neurogenesis) {
         if (calls_since_mutation < UINT32_MAX) ++calls_since_mutation;
-        if (calls_since_mutation < grace_period_steps) return false;
-        for (std::size_t k = 0; k < rank; ++k) {
-            if (rank > min_rank && age_of(k) >= grace_period_steps && should_apoptose(k)) {
-                do_apoptose(k);
-                calls_since_mutation = 0;
-                return true;
+        const uint32_t min_grace = std::min(grow_grace_period_steps, shrink_grace_period_steps);
+        if (calls_since_mutation < min_grace) return false;
+        if (calls_since_mutation >= shrink_grace_period_steps) {
+            for (std::size_t k = 0; k < rank; ++k) {
+                if (rank > min_rank && age_of(k) >= shrink_grace_period_steps && should_apoptose(k)) {
+                    do_apoptose(k);
+                    calls_since_mutation = 0;
+                    return true;
+                }
             }
         }
-        if (rank < max_rank && should_neurogenesis()) {
+        if (calls_since_mutation >= grow_grace_period_steps && rank < max_rank && should_neurogenesis()) {
             do_neurogenesis();
             calls_since_mutation = 0;
             return true;
@@ -2311,13 +2421,30 @@ public:
     // correction counter -- reused here as a free age signal, not a new
     // field) exceeds grace_period_steps. Default ~1/(1-0.98), matching
     // the EMA's own natural warm-up window at the default decay=0.98.
+    //
+    // 50/50 (symmetric grow/shrink, direct instruction + biology check):
+    // this branch is the per-synapse multiplicative (Hadamard-like)
+    // scale envelope -- the direct analog of a dendritic spine sitting
+    // "at the base of the synapse". In vivo two-photon imaging of adult
+    // cortical spines shows formation and elimination happening on
+    // COMPARABLE timescales at steady state -- e.g. adult barrel cortex
+    // shows ~1.5% spines formed vs. ~2.1% eliminated over 3 days
+    // (Holtmaat et al., "Transient and Persistent Dendritic Spines in
+    // the Neocortex In Vivo", Neuron 2005 -- see also Grutzendler et
+    // al., "Long-term dendritic spine stability in the adult cortex",
+    // Nature 2002) -- not the large asymmetry a bigger shrink-only
+    // grace period would imply. The real, well-evidenced asymmetry
+    // (see apply_additive_dynamic_rank_control below) is between THIS
+    // branch and the additive branch, not within this branch.
     template <typename SeedFn>
     inline bool apply_dynamic_rank_control(std::size_t n_rows, std::size_t n_cols,
                                             value_type tau_death, value_type tau_active,
                                             value_type theta, SeedFn new_channel_seed,
-                                            uint32_t grace_period_steps = 50) {
+                                            uint32_t grow_grace_period_steps = 50,
+                                            uint32_t shrink_grace_period_steps = 50) {
         return apply_dynamic_rank_control_generic(
-            scale_rank, /*min_rank=*/std::size_t(1), scale_rank_max, grace_period_steps,
+            scale_rank, /*min_rank=*/std::size_t(1), scale_rank_max,
+            grow_grace_period_steps, shrink_grace_period_steps,
             scale_rank_calls_since_mutation,
             [&](std::size_t k) { return k < scale_gamma_step.size() ? scale_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return scale_gamma_should_apoptose(k, tau_death); },
@@ -2347,14 +2474,43 @@ public:
     // additive branch has no legacy always-on component to preserve
     // (additive_rank itself already defaults to 0, fully opt-in), so
     // apoptosis is free to shrink it all the way back off.
+    //
+    // 5000/5000 -- ~100x the scale branch's own 50/50 (direct
+    // instruction + biology check, replacing an earlier un-derived 4x
+    // guess): this branch is a whole-layer low-rank correction driven
+    // by the SAME gamma-EMA machinery integrated across the entire
+    // layer, structurally closer to a neuron sensing its own aggregate
+    // ("global") state than to any one synapse -- matching, per direct
+    // instruction, the biological distinction between fast local
+    // Hebbian-like synaptic change and slow whole-cell homeostatic
+    // plasticity. Hebbian/STDP synaptic changes are induced on the
+    // timescale of seconds to minutes; genuine homeostatic synaptic
+    // scaling (the compensatory, whole-cell response to a sustained
+    // activity change) needs on the order of 24-48 hours of sustained
+    // change before it manifests (Turrigiano and colleagues' classic
+    // activity-blockade experiments; see also Zenke & Gerstner,
+    // "Hebbian plasticity requires compensatory processes on multiple
+    // timescales", Phil. Trans. R. Soc. B, 2017, for the general
+    // "temporal paradox" framing of fast Hebbian vs. slow homeostatic
+    // timescales as a real, load-bearing separation, not an
+    // implementation detail). Minutes vs. 24-48h is roughly a
+    // 100x-3000x separation depending which endpoints are compared --
+    // 100x is the conservative end of that range, chosen so the
+    // additive branch can still mutate at all within realistic training
+    // budgets rather than being effectively frozen; the ratio is a real,
+    // independently tunable parameter specifically so it can be swept
+    // and tested against real training outcomes rather than treated as
+    // settled by this comment.
     template <typename SeedUFn, typename SeedVFn>
     inline bool apply_additive_dynamic_rank_control(std::size_t n_rows, std::size_t n_cols,
                                                      value_type tau_death, value_type tau_active,
                                                      value_type theta, SeedUFn new_channel_seed_u,
                                                      SeedVFn new_channel_seed_v,
-                                                     uint32_t grace_period_steps = 50) {
+                                                     uint32_t grow_grace_period_steps = 5000,
+                                                     uint32_t shrink_grace_period_steps = 5000) {
         return apply_dynamic_rank_control_generic(
-            additive_rank, /*min_rank=*/std::size_t(0), additive_rank_max, grace_period_steps,
+            additive_rank, /*min_rank=*/std::size_t(0), additive_rank_max,
+            grow_grace_period_steps, shrink_grace_period_steps,
             additive_rank_calls_since_mutation,
             [&](std::size_t k) { return k < additive_gamma_step.size() ? additive_gamma_step[k] : uint32_t(0); },
             [&](std::size_t k) { return additive_gamma_should_apoptose(k, tau_death); },

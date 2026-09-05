@@ -22,6 +22,24 @@
 #include <vector>
 #include <type_traits>
 
+// Below this element count, #pragma omp parallel's own thread-team
+// fork/join synchronization cost (barrier + wake-from-idle -- NOT fresh
+// OS thread creation, libgomp keeps a persistent pool, but the
+// rendezvous is still paid on every region entry) exceeds the entire
+// serial cost of the work many times over. Confirmed directly, even with
+// a fully warmed pool (50 discarded warmup calls first): CSR.from_dense
+// on a single 256-element activation row cost 403us at num_cpus=4 vs
+// 53us at num_cpus=1 -- a ~7.5x tax for rendezvous on essentially no
+// work. This swamps block4's own genuine 1.6-2.35x kernel-level speedup
+// for any caller that sparsifies small per-row arrays repeatedly (e.g.
+// an RNN's per-step activation sparsification, sili_peridot's
+// ToyTileRecurrenceRMT). Used by top_k_indices/top_k_csr/to_csr below to
+// skip straight to a serial loop under this size, in favor of the
+// #pragma omp path only once there's enough real work to amortize the
+// rendezvous cost -- same algorithm/output either way, not a behavior
+// change.
+constexpr size_t SILI_OMP_SMALL_THRESHOLD = 4096;
+
 template <class SIZE_TYPE>
 using CSRPointers = std::array<std::shared_ptr<std::vector<SIZE_TYPE>>, 1>;
 
@@ -150,7 +168,11 @@ sparse_struct<
 
     // Allocate accumulators for parallel histogram accumulation
     SIZE_TYPE *accum = new SIZE_TYPE[a_coo.rows]();
-    if (num_cpus > 1) {
+    // nnz-size guard (see SILI_OMP_SMALL_THRESHOLD's own docstring above)
+    // -- num_cpus>1 alone isn't a sufficient reason to pay a real
+    // #pragma omp parallel rendezvous when nnz itself is tiny (e.g. a
+    // single sparsified activation row's own top-k output).
+    if (num_cpus > 1 && nnz >= SILI_OMP_SMALL_THRESHOLD) {
         SIZE_TYPE *thr_accum = new SIZE_TYPE[num_cpus * a_coo.rows];
         std::fill(thr_accum, thr_accum + num_cpus * a_coo.rows, 0);
 
@@ -185,12 +207,27 @@ sparse_struct<
     std::vector<SIZE_TYPE> *ptrs = new std::vector<SIZE_TYPE>(num_rows + 1);
     SIZE_TYPE scan_a = 0;
 
-    // Parallel scan to compute row pointers
+    // Parallel scan to compute row pointers. Unlike the histogram pass
+    // above, this had no num_cpus/size guard at all -- `#pragma omp
+    // parallel for simd` with no num_threads() clause ignores the
+    // caller's num_cpus entirely and always uses the OpenMP runtime's
+    // own default team size, so it always paid the small-region
+    // rendezvous tax regardless of caller intent. num_rows+1 is almost
+    // always tiny relative to SILI_OMP_SMALL_THRESHOLD for this
+    // function's real callers (one row per online activation), so gate
+    // it the same way.
+    if (static_cast<size_t>(num_rows) + 1 >= SILI_OMP_SMALL_THRESHOLD) {
     #pragma omp parallel for simd reduction(inscan, + : scan_a)
     for (SIZE_TYPE i = 0; i <= num_rows; i++) {
         (*ptrs)[i] = scan_a;
         #pragma omp scan exclusive(scan_a)
         {
+            scan_a += accum[i];
+        }
+    }
+    } else {
+        for (SIZE_TYPE i = 0; i <= num_rows; i++) {
+            (*ptrs)[i] = scan_a;
             scan_a += accum[i];
         }
     }
@@ -408,9 +445,6 @@ template <typename SIZE_TYPE, typename VALUE_TYPE>
 std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, int num_threads) {
     if (k > size) k = size;
 
-    size_t chunk_size = (size + num_threads - 1) / num_threads;
-    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> thread_pairs(num_threads);
-
     // BUG FIX: this compared raw signed value (a.second > b.second), not
     // magnitude -- for zero-mean data (e.g. any post-RMSNorm activation)
     // that keeps only the largest POSITIVE entries and discards every
@@ -424,6 +458,23 @@ std::vector<SIZE_TYPE> top_k_indices(VALUE_TYPE *values, size_t size, size_t k, 
     auto by_magnitude = [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
         return std::abs(a.second) > std::abs(b.second);
     };
+
+    if (size < SILI_OMP_SMALL_THRESHOLD || num_threads <= 1) {
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> pairs;
+        pairs.reserve(size);
+        for (size_t i = 0; i < size; ++i)
+            pairs.emplace_back(static_cast<SIZE_TYPE>(i), values[i]);
+        size_t final_k = std::min(k, pairs.size());
+        std::partial_sort(pairs.begin(), pairs.begin() + final_k, pairs.end(), by_magnitude);
+        std::vector<SIZE_TYPE> indices;
+        indices.reserve(final_k);
+        for (size_t i = 0; i < final_k; ++i)
+            indices.push_back(pairs[i].first);
+        return indices;
+    }
+
+    size_t chunk_size = (size + num_threads - 1) / num_threads;
+    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> thread_pairs(num_threads);
 
     #pragma omp parallel num_threads(num_threads)
     {
@@ -480,12 +531,25 @@ top_k_csr(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
     SIZE_TYPE* c_ptr = col_vec->data();
     VALUE_TYPE* v_ptr = val_vec->data();
 
-    #pragma omp parallel for num_threads(num_threads)
-    for (size_t i = 0; i < actual_k; ++i) {
-        SIZE_TYPE flat_idx = top_k[i];
-        r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
-        c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
-        v_ptr[i] = values[flat_idx];
+    // Same small-array fast path as top_k_indices above -- see its own
+    // comment for the full rationale (this remap is a second, separate
+    // #pragma omp region, so it pays the same fork/join tax again if
+    // left unconditional).
+    if (actual_k < SILI_OMP_SMALL_THRESHOLD || num_threads <= 1) {
+        for (size_t i = 0; i < actual_k; ++i) {
+            SIZE_TYPE flat_idx = top_k[i];
+            r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
+            c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
+            v_ptr[i] = values[flat_idx];
+        }
+    } else {
+        #pragma omp parallel for num_threads(num_threads)
+        for (size_t i = 0; i < actual_k; ++i) {
+            SIZE_TYPE flat_idx = top_k[i];
+            r_ptr[i] = static_cast<SIZE_TYPE>(flat_idx / cols);
+            c_ptr[i] = static_cast<SIZE_TYPE>(flat_idx % cols);
+            v_ptr[i] = values[flat_idx];
+        }
     }
 
     // Step 4: Wrap into your struct types
@@ -500,6 +564,185 @@ top_k_csr(VALUE_TYPE *values, size_t rows, size_t cols, size_t k, int num_thread
         ptrs, indices, coo_values, rows, cols, actual_k);
 
     return to_csr(coo_result, num_threads);
+}
+
+// Genuine per-row top-k: row r independently keeps its own top-k_per_row[r]
+// largest-magnitude entries. NOT equivalent to top_k_csr above (that k is
+// spent GLOBALLY across the whole flattened rows*cols array) -- this is a
+// different selection, needed for graded per-row density schedules (e.g.
+// sili_peridot's step_cached query-step credit assignment, where each row
+// corresponds to a content position and gets its own density). Was
+// previously a pure-Python/numpy per-row argpartition loop
+// (sili/sparse_rnn.py's _graded_top_k_csr) -- moved here because that loop
+// ran on every query/backward step and dominated the step's own cost once
+// measured against a real curriculum run (use_tile_cache=1 measured
+// SLOWER than the plain step() baseline, not the expected speedup).
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr_graded(VALUE_TYPE *values, size_t rows, size_t cols,
+                  const SIZE_TYPE *k_per_row, int num_threads) {
+    std::vector<SIZE_TYPE> row_offset(rows + 1, 0);
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE k = k_per_row[r];
+        if (k < 0) k = 0;
+        if (static_cast<size_t>(k) > cols) k = static_cast<SIZE_TYPE>(cols);
+        row_offset[r + 1] = row_offset[r] + k;
+    }
+    size_t total = static_cast<size_t>(row_offset[rows]);
+
+    std::vector<SIZE_TYPE> indices(total);
+    std::vector<VALUE_TYPE> out_values(total);
+
+    auto by_magnitude = [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+        return std::abs(a.second) > std::abs(b.second);
+    };
+
+    // Same small-region guard as top_k_indices/top_k_csr above -- per-row
+    // work here is O(cols), usually a single layer's own width, so
+    // #pragma omp parallel's fork/join rendezvous can easily exceed the
+    // whole serial cost. Only parallelize once total work justifies it.
+    bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
+
+    #pragma omp parallel for num_threads(num_threads) if(use_omp) schedule(dynamic)
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE k = static_cast<SIZE_TYPE>(row_offset[r + 1] - row_offset[r]);
+        if (k == 0) continue;
+        const VALUE_TYPE* row = values + r * cols;
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> pairs;
+        pairs.reserve(cols);
+        for (size_t c = 0; c < cols; ++c)
+            pairs.emplace_back(static_cast<SIZE_TYPE>(c), row[c]);
+        std::partial_sort(pairs.begin(), pairs.begin() + k, pairs.end(), by_magnitude);
+        // Row-major/ascending-column convention, matching top_k_csr's own
+        // merge_sort_coo step -- the selected k entries need re-sorting by
+        // index since partial_sort above ordered them by magnitude.
+        std::sort(pairs.begin(), pairs.begin() + k,
+                  [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                      return a.first < b.first;
+                  });
+        SIZE_TYPE base = row_offset[r];
+        for (SIZE_TYPE i = 0; i < k; ++i) {
+            indices[base + i] = pairs[i].first;
+            out_values[base + i] = pairs[i].second;
+        }
+    }
+
+    std::vector<SIZE_TYPE> ptrs(row_offset.begin(), row_offset.end());
+    return make_csr_input<SIZE_TYPE, VALUE_TYPE>(
+        static_cast<SIZE_TYPE>(rows), static_cast<SIZE_TYPE>(cols),
+        std::move(ptrs), std::move(indices), std::move(out_values));
+}
+
+// Nucleus/energy-threshold top-k: row r independently keeps the SMALLEST
+// number of its own largest-magnitude entries whose captured squared-
+// magnitude ratio
+//     R(v, k) = sum(v_topk^2) / sum(v^2)
+// is >= r_target_per_row[r]. k is a CONSEQUENCE of r_target and the row's
+// actual data, not a fixed constant -- same math as Eckart-Young truncated-
+// SVD captured-variance / LLM nucleus (top-p) sampling, applied to squared
+// magnitude instead of softmax probability (see sili_peridot/JOURNAL.md's
+// "nucleus/energy-threshold top-k math" design note). A fully-zero row or
+// r_target<=0 has nothing to capture and keeps k=0; r_target>=1 (or a
+// floating-point rounding shortfall right at the boundary) keeps every
+// entry -- both handled as explicit fallbacks below, not accidents of the
+// loop shape.
+//
+// k_min/k_max (default 0/SIZE_MAX, i.e. no-op) clamp the R_target-derived
+// k AFTER the fact -- direct instruction: R_target alone can degenerate to
+// k=0 (a fully-dead row/synapse-update-starved layer, bad regardless of
+// how little energy that row happened to carry) or to near-100% density
+// (bad on hardware that specifically wants a bounded, e.g. ~10%, density
+// ceiling). Applied per row against that row's own actual entry count
+// (min(k_max,cols)), not globally. k_min padding pulls from the SAME
+// magnitude-sorted order already computed for the R_target selection --
+// still "next largest by magnitude," not arbitrary -- so a clamped row
+// degrades gracefully to plain top-k instead of picking randomly.
+template <typename SIZE_TYPE, typename VALUE_TYPE>
+sparse_struct<SIZE_TYPE, CSRPointers<SIZE_TYPE>, CSRIndices<SIZE_TYPE>, UnaryValues<VALUE_TYPE>>
+top_k_csr_nucleus(VALUE_TYPE *values, size_t rows, size_t cols,
+                   const VALUE_TYPE *r_target_per_row, int num_threads,
+                   size_t k_min = 0, size_t k_max = SIZE_MAX) {
+    std::vector<SIZE_TYPE> k_per_row(rows, 0);
+    std::vector<std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>>> kept_rows(rows);
+
+    bool use_omp = (num_threads > 1 && rows * cols >= SILI_OMP_SMALL_THRESHOLD);
+
+    #pragma omp parallel for num_threads(num_threads) if(use_omp) schedule(dynamic)
+    for (size_t r = 0; r < rows; ++r) {
+        const VALUE_TYPE* row = values + r * cols;
+        VALUE_TYPE r_target = r_target_per_row[r];
+
+        double total_sq = 0.0;
+        for (size_t c = 0; c < cols; ++c)
+            total_sq += static_cast<double>(row[c]) * static_cast<double>(row[c]);
+
+        std::vector<std::pair<SIZE_TYPE, VALUE_TYPE>> pairs;
+        // Sort whenever there's real data to pick from AND either R_target
+        // or a k_min floor could want some of it -- k_min padding pulls
+        // from this same magnitude-sorted list (see docstring above), so
+        // it must exist even when r_target alone would pick k=0.
+        if (total_sq > 0.0 && (r_target > VALUE_TYPE(0) || k_min > 0)) {
+            pairs.reserve(cols);
+            for (size_t c = 0; c < cols; ++c)
+                pairs.emplace_back(static_cast<SIZE_TYPE>(c), row[c]);
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                          return std::abs(a.second) > std::abs(b.second);
+                      });
+
+            size_t chosen = 0;
+            if (r_target > VALUE_TYPE(0)) {
+                double target_sq = static_cast<double>(r_target) * total_sq;
+                chosen = cols;  // fallback: r_target>=1 or a rounding
+                                // shortfall right at the boundary -- keep
+                                // everything rather than under-shoot.
+                double cum = 0.0;
+                for (size_t i = 0; i < cols; ++i) {
+                    cum += static_cast<double>(pairs[i].second) * static_cast<double>(pairs[i].second);
+                    if (cum >= target_sq) { chosen = i + 1; break; }
+                }
+            }
+
+            // Hardware-driven density floor/ceiling, applied AFTER the
+            // R_target-derived choice, against this row's own actual
+            // entry count -- a totally-informationless row still can't
+            // manufacture k_min nonzero entries beyond what it has.
+            size_t eff_k_min = std::min(k_min, pairs.size());
+            size_t eff_k_max = std::min(k_max, pairs.size());
+            if (chosen < eff_k_min) chosen = eff_k_min;
+            if (chosen > eff_k_max) chosen = eff_k_max;
+
+            pairs.resize(chosen);
+            // Row-major/ascending-column convention, matching top_k_csr_
+            // graded's own re-sort step -- the selected entries need
+            // re-ordering by index since they were chosen by magnitude.
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const std::pair<SIZE_TYPE, VALUE_TYPE>& a, const std::pair<SIZE_TYPE, VALUE_TYPE>& b) {
+                          return a.first < b.first;
+                      });
+        }
+        k_per_row[r] = static_cast<SIZE_TYPE>(pairs.size());
+        kept_rows[r] = std::move(pairs);
+    }
+
+    std::vector<SIZE_TYPE> row_offset(rows + 1, 0);
+    for (size_t r = 0; r < rows; ++r) row_offset[r + 1] = row_offset[r] + k_per_row[r];
+    size_t total = static_cast<size_t>(row_offset[rows]);
+
+    std::vector<SIZE_TYPE> indices(total);
+    std::vector<VALUE_TYPE> out_values(total);
+    for (size_t r = 0; r < rows; ++r) {
+        SIZE_TYPE base = row_offset[r];
+        for (size_t i = 0; i < kept_rows[r].size(); ++i) {
+            indices[base + i] = kept_rows[r][i].first;
+            out_values[base + i] = kept_rows[r][i].second;
+        }
+    }
+
+    std::vector<SIZE_TYPE> ptrs(row_offset.begin(), row_offset.end());
+    return make_csr_input<SIZE_TYPE, VALUE_TYPE>(
+        static_cast<SIZE_TYPE>(rows), static_cast<SIZE_TYPE>(cols),
+        std::move(ptrs), std::move(indices), std::move(out_values));
 }
 
 // ── csr_union ─────────────────────────────────────────────────────────────

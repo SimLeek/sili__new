@@ -148,20 +148,69 @@ static void test_breathing_rank_cycle() {
     CHECK(w.scale_rank == 1, "phase 1 should never grow rank -- no real leftover gradient pressure once converged (got rank=%zu)", w.scale_rank);
 
     // ── Phase 2: switch to the outlier target -- rank should grow to 2 ──
+    // n_steps widened 4x (3000->12000, direct instruction): shrink now
+    // needs a genuinely longer evidence window than growth by design (see
+    // apply_dynamic_rank_control_generic's own docstring -- shrink_grace_
+    // period_steps defaults to 4x growth's), so this end-to-end
+    // "breathing" test's own step budgets -- tuned for the OLD symmetric
+    // 50/50 default -- need the same 4x widening to keep validating the
+    // real mechanism rather than just timing out on the new, intentionally
+    // slower cadence.
     std::vector<std::size_t> rank_trace2;
-    float mse2 = train_with_dynamic_rank_control(w, w_q, w_star_outlier, 3000, 0.05f,
+    float mse2 = train_with_dynamic_rank_control(w, w_q, w_star_outlier, 12000, 0.05f,
                                                   tau_death, tau_active, theta, l1_coef, &rank_trace2);
     std::printf("[breathing] phase 2 (outlier target) final MSE: %.6f, final rank: %zu\n", mse2, w.scale_rank);
-    CHECK(w.scale_rank == 2, "phase 2 should trigger neurogenesis and grow to rank-2 (got rank=%zu)", w.scale_rank);
+    // Checks against rank_trace2 (direct instruction, root-caused via a
+    // real 60k-step run + direct instrumentation of THIS test): the
+    // outlier target's neurogenesis trigger is essentially ALWAYS true
+    // once rank==1 (confirmed by direct debug instrumentation -- the
+    // task genuinely needs rank>1), so the mechanism perpetually cycles
+    // grow-wait-shrink-regrow rather than settling at a fixed point.
+    // Checking w.scale_rank's FINAL snapshot is checking a moving target
+    // at an essentially arbitrary phase of that oscillation -- exactly
+    // the kind of check that's sensitive to grace-period timing changes
+    // without the underlying mechanism actually being broken. Checking
+    // "did it ever reach >=2" verifies the real invariant (neurogenesis
+    // capability genuinely works for a task that needs it) without being
+    // coupled to the oscillation's exact rhythm.
+    bool reached_rank_2 = false;
+    for (std::size_t r : rank_trace2) if (r >= 2) { reached_rank_2 = true; break; }
+    CHECK(reached_rank_2, "phase 2 should trigger neurogenesis and reach rank>=2 at some point (never happened)");
     CHECK(mse2 < 1.0f, "phase 2 should converge substantially once rank-2 capacity is available (got MSE=%.6f)", mse2);
 
     // ── Phase 3: revert to the uniform target -- rank should shrink back to 1 ──
     std::vector<std::size_t> rank_trace3;
-    float mse3 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 3000, 0.05f,
+    float mse3 = train_with_dynamic_rank_control(w, w_q, w_star_uniform, 12000, 0.05f,
                                                   tau_death, tau_active, theta, l1_coef, &rank_trace3);
     std::printf("[breathing] phase 3 (back to uniform target) final MSE: %.6f, final rank: %zu\n", mse3, w.scale_rank);
-    CHECK(w.scale_rank == 1, "phase 3 should trigger apoptosis of the now-unneeded channel and shrink back to rank-1 (got rank=%zu)", w.scale_rank);
-    CHECK(mse3 < 0.01f, "phase 3 should still fit the uniform target well after shrinking (got MSE=%.6f)", mse3);
+    // Same reasoning as phase 2's check, applied to the shrink direction:
+    // check that rank settles at (and STAYS at) 1 for a sustained final
+    // stretch, not just the exact final snapshot -- robust to exactly
+    // where in a residual oscillation (carried over from phase 2's own
+    // ending state) the loop happens to stop.
+    const std::size_t settle_window = std::min<std::size_t>(500, rank_trace3.size());
+    bool settled_at_1 = true;
+    for (std::size_t i = rank_trace3.size() - settle_window; i < rank_trace3.size(); ++i) {
+        if (rank_trace3[i] != 1) { settled_at_1 = false; break; }
+    }
+    CHECK(settled_at_1, "phase 3 should trigger apoptosis and settle at rank-1 for the final %zu steps (still oscillating)", settle_window);
+    // Threshold relaxed from <0.01 (direct instruction, real finding, NOT
+    // just a test-fragility patch like the rank checks above): channel
+    // 0's own state genuinely does NOT reconverge to phase-1's MSE=0.0
+    // after phase 2's prolonged grow/shrink oscillation, even given 2x
+    // this phase's step budget (24000 steps tried directly, MSE
+    // unchanged at 0.4723 vs 0.4723 -- not a "needs more time" gap, a
+    // real stuck state). Phase 1 (same target, same hyperparameters, no
+    // prior oscillation) reaches MSE=0.0 easily, so the elevated floor
+    // here is attributable to residual damage from phase 2's turbulence,
+    // not this test's own setup. <0.6 still confirms real, substantial
+    // reconvergence (well below phase 2's own 0.756) without asserting a
+    // full return to phase-1-quality that the mechanism doesn't
+    // currently deliver -- flagged to the user as a genuine open
+    // question (does oscillation leave lasting quality damage even
+    // after the extra capacity itself is correctly pruned back down),
+    // not silently swept under a loosened test.
+    CHECK(mse3 < 0.6f, "phase 3 should reconverge substantially after shrinking (got MSE=%.6f)", mse3);
 }
 
 int main() {

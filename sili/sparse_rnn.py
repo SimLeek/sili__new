@@ -52,10 +52,13 @@ from the old design, not an oversight.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
+import time as _diag_time
 import numpy as np
 import sili._cpu as _cpu
+
+_DIAG_TIMING: dict = {}
 
 from sili.module import Module
 from sili.tensor import Tensor, _acc
@@ -81,7 +84,8 @@ class CSR(NamedTuple):
     @staticmethod
     def from_dense(x: np.ndarray, p: float = 0.03, num_cpus: int = 4) -> "CSR":
         """
-        Build CSR keeping the top-k entries by magnitude, k = max(1, round(cols * p)).
+        Build CSR keeping the top-k entries by magnitude PER ROW,
+        k = max(1, round(cols * p)).
         x : float32 [cols] or [batch, cols]
 
         Independent top-k -- use ONLY when no prior sparsification decision
@@ -93,7 +97,8 @@ class CSR(NamedTuple):
         x2d = x[np.newaxis, :] if x.ndim == 1 else x
         x2d = np.asarray(x2d, dtype=np.float32)
         k   = max(1, int(x2d.shape[1] * p))
-        ptrs, indices, values = _cpu.dense_to_top_k_csr(x2d, k, num_cpus)
+        ptrs, indices, values = _graded_top_k_csr(
+            x2d, np.full(x2d.shape[0], k, dtype=np.int32), num_cpus)
         return CSR(ptrs, indices, values, rows=x2d.shape[0], cols=x2d.shape[1])
 
     @staticmethod
@@ -231,6 +236,18 @@ class _SparseLayerBase(Module):
         would raise AttributeError from self._c if the backend lacks
         it, rather than silently no-op)."""
         self._c.magnitude_rescale_output(target, correction_rate, scale_invariant)
+
+    def apply_amortized_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """Passthrough to the real C++ apply_amortized_l2_decay (see
+        delta_csr_types.hpp's apply_amortized_decay_stats docstring for
+        the full mechanism -- amortized decoupled weight decay + rolling
+        health stats via a persistent per-layer cursor). Unlike
+        magnitude_rescale_output, EVERY backend (fp32/FP4/FP8) has this
+        bound -- it's ValueAccessor-generic, so no hasattr guard is
+        needed here. decay_factor is the caller's job to derive from a
+        target half-life (in real training steps) and this layer's own
+        nnz -- see ToyTileRecurrenceRMT.apply_amortized_l2_decay."""
+        return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
 
     def state_dict(self) -> dict:
         return {
@@ -528,18 +545,36 @@ def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> Non
 
 
 def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
-    """Default scale_rank_max/additive_rank_max (task #295): the cap at
-    which, if every layer's rank grew all the way to it, the AQRS scale
-    envelope's own parameter count would roughly match one dense fp32
-    matrix of the same shape -- direct instruction's own worked example:
-    32x32 -> 1024 fp32-equivalent elements -> 1024/4 (fp4 bytes-per-fp32)
-    = 256 -> 256/32 = 8, so cap = min(n_in, n_out) // 4. Only an exact
-    match for square layers; non-square layers get a smaller,
-    min-dimension-driven cap -- a conservative default, not a precisely
-    derived one (per-layer/per-model tuning is still expected on top,
-    hence scale_rank_max/additive_rank_max being real constructor
-    overrides here rather than a hardcoded formula call)."""
-    return max(1, min(n_inputs, n_outputs) // 4)
+    """Default scale_rank_max/additive_rank_max, derived from actual
+    storage cost (direct instruction, superseding task #295's cruder
+    min(n_in,n_out)//4 heuristic -- that formula wasn't checked against
+    real byte counts and, confirmed via a real 60k-step run, let ranks
+    grow well past the point where the low-rank envelope uses MORE
+    memory than the dense fp32 matrix it exists to avoid).
+
+    value_scale/output_scale/additive_u/additive_v/scale_gamma/
+    additive_gamma are all stored as plain fp32 (no quantization on the
+    rank-N components themselves, confirmed in cpu_backend.cpp/
+    delta_csr_types.hpp) -- each rank-1 channel of the scale branch
+    costs 4*(n_inputs+n_outputs+1) bytes (row vector + col vector +
+    1 gamma scalar), same formula for the additive branch. The base
+    fp4-quantized weight matrix (weight+importance packed 2-per-byte)
+    costs n_inputs*n_outputs*1 byte regardless of rank.
+
+    The cap here is the largest per-branch rank K such that BOTH
+    branches growing to K simultaneously still costs no more, combined
+    with the base weights, than a plain dense fp32 matrix of the same
+    shape (n_inputs*n_outputs*4 bytes) -- i.e. AQRS is only ever
+    memory-neutral-or-cheaper than "why not just use dense fp32",
+    never a net loss. Splits the remaining budget (after the fp4 base)
+    evenly between the scale and additive branches since both draw
+    from the same underlying justification and neither is
+    structurally more important than the other."""
+    base_bytes = n_inputs * n_outputs * 1
+    fp32_dense_bytes = n_inputs * n_outputs * 4
+    remaining_budget = max(0, fp32_dense_bytes - base_bytes)
+    per_channel_bytes = 4 * (n_inputs + n_outputs + 1)
+    return max(1, int((remaining_budget / 2) // per_channel_bytes))
 
 
 def _seed_scale_rank(c, rank: int, n_inputs: int, n_outputs: int,
@@ -800,6 +835,74 @@ def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     return per_row
 
 
+def _graded_top_k_csr(dy2d: np.ndarray, k_per_row,
+                      num_cpus: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """GENUINELY per-row top-k selection: row r independently keeps its
+    own top-k_per_row[r] largest-magnitude entries. Lets a caller grade
+    gradient density by row (e.g. by how far back in time a row's
+    content is, for step_cached's query-step credit-assignment design;
+    see conversation/JOURNAL.md).
+
+    Was a pure-Python/numpy per-row argpartition loop -- moved to a real
+    C++ kernel (`_cpu.dense_to_graded_top_k_csr`, csr.hpp's
+    `top_k_csr_graded`) after a live 20k-step curriculum comparison
+    showed this loop running on every query/backward step dominated the
+    step's own cost: use_tile_cache=1 (which relies on this function)
+    measured SLOWER (5.1 steps/sec) than the plain step() baseline (6.6
+    steps/sec) instead of the expected speedup from caching. This
+    Python wrapper is kept only so existing callers/tests (that expect
+    this exact name/signature) don't need to change.
+
+    IMPORTANT, found the hard way (see JOURNAL.md /
+    project_dy_sparsity_p_validated_speedup.md's correction): this is
+    NOT equivalent to `_cpu.dense_to_top_k_csr(dy2d, k, cpus)` with a
+    uniform k, even at matching average density. That function's `k` is
+    spent GLOBALLY across the WHOLE flattened `rows*cols` array (via
+    `top_k_indices(values, rows*cols, k, ...)` in csr.hpp), not per row
+    -- a row can end up with zero surviving entries there, purely by
+    losing the global competition, no matter what k is requested. Don't
+    "verify" this function by comparing its output against
+    dy_sparsity_p's existing path; they answer different questions."""
+    rows, cols = dy2d.shape
+    k_arr = np.array([min(int(k), cols) for k in k_per_row], dtype=np.int32)
+    dy2d_f32 = np.ascontiguousarray(dy2d, dtype=np.float32)
+    ptrs, indices, values = _cpu.dense_to_graded_top_k_csr(dy2d_f32, k_arr, num_cpus)
+    return ptrs, indices, values
+
+
+def _nucleus_top_k_csr(x2d: np.ndarray, r_target, num_cpus: int = 4,
+                        k_min: int = 0, k_max: Optional[int] = None
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Nucleus/energy-threshold top-k: row r independently keeps the
+    SMALLEST set of its own top-|v| entries whose captured squared-
+    magnitude ratio R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target[r].
+    k is a CONSEQUENCE of r_target and the row's own data, not a fixed
+    constant -- see sili_peridot/JOURNAL.md's "nucleus/energy-threshold
+    top-k math" design note for the full derivation (same math as
+    truncated-SVD captured-variance / LLM nucleus (top-p) sampling
+    applied to squared magnitude instead of softmax probability).
+
+    r_target: scalar (applied to every row) or per-row array/list.
+
+    k_min/k_max: hardware-driven density floor/ceiling applied to the
+    R_target-derived k AFTER the fact (direct instruction -- R_target
+    alone can degenerate to k=0, a fully-dead row, or to near-100%
+    density on hardware that wants a bounded ceiling). k_min padding
+    pulls from the same magnitude-sorted order the R_target selection
+    already computed, so a clamped row degrades to plain top-k rather
+    than picking arbitrarily; an all-zero row can't manufacture k_min
+    entries out of nothing and stays at k=0 regardless."""
+    rows, cols = x2d.shape
+    if np.isscalar(r_target):
+        r_arr = np.full(rows, float(r_target), dtype=np.float32)
+    else:
+        r_arr = np.asarray(r_target, dtype=np.float32)
+    x2d_f32 = np.ascontiguousarray(x2d, dtype=np.float32)
+    ptrs, indices, values = _cpu.dense_to_nucleus_top_k_csr(
+        x2d_f32, r_arr, num_cpus, k_min=k_min, k_max=(-1 if k_max is None else int(k_max)))
+    return ptrs, indices, values
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -839,7 +942,10 @@ class DISLDOLayer(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True,
+                dy_sparsity_p: Optional[float] = None,
+                dy_sparsity_schedule: Optional[List[float]] = None,
+                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
         # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
         # the C++ side's own tuned production defaults" -- kept as
         # Optional here rather than hardcoding the production floats a
@@ -872,12 +978,33 @@ class DISLDOLayer(_SparseLayerBase):
         # (Activity-Dependent Structural Plasticity) importance update on
         # every call, independent of whether a backward() would ever
         # follow. Real weight/importance updates now happen ONLY in
-        # backward_dense, below.
+        # backward_dense/backward_sparse, below.
+        #
+        # CSR-typed input (task #334/Phase 5): NOT a new sparse_input bool
+        # -- the caller controls forward-input density entirely by
+        # whether x.data IS a CSR (Tensor.is_csr), matching the EXISTING
+        # precedent at SparseRNNCell.forward() (this same file, ~line
+        # 2453: `if not isinstance(state.data, CSR): ... CSR.from_dense(...)`)
+        # in the opposite direction. A dense np.ndarray/Tensor here is a
+        # completely unchanged code path -- zero behavior change for
+        # every existing caller who never builds a CSR.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)
-        was_1d = x_np.ndim == 1
-        out_np = self._c.forward_dense(x_np)
+        if x.is_csr:
+            csr    = x.data
+            was_1d = csr.rows == 1
+            # backward_sparse's own dense-input design (see its docstring)
+            # needs the real dense x regardless of forward's own path --
+            # reconstruct it here once, thread it through the closure
+            # explicitly (same fix as SISLDOLayer.forward(), task #333 --
+            # never read a cached last_input off the C++ side).
+            x_dense = csr.to_dense()
+            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np    = np.asarray(x.data, dtype=np.float32)
+            was_1d  = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np  = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # requires_grad=False: this output is never meant to be
@@ -896,12 +1023,68 @@ class DISLDOLayer(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                # x_np passed straight back in from this closure's own
-                # scope -- same as every other op's _backward, no engine
-                # -side cache/ordering to manage (see backward_dense's
-                # own docstring in cpu_backend.cpp).
-                dx = self._c.backward_dense(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                             damp_by_importance=damp_by_importance, **extra)
+                # dy_sparsity_p (task #334/Phase 5): genuinely independent
+                # axis from x's own type (disldo_backward_sparse_grad's own
+                # signature takes a dense x + sparse dy -- confirmed
+                # distinct from forward's input-sparsity axis). None
+                # (default) keeps today's exact dense-dy behavior via
+                # backward_dense, matching x_dense's own 2-D [batch,cols]
+                # shape either path took above.
+                if dy_sparsity_schedule is not None:
+                    # Per-row graded density (task: query-step credit
+                    # assignment for step_cached, see conversation) --
+                    # overrides the scalar dy_sparsity_p when both are
+                    # given. len(dy_sparsity_schedule) must match the
+                    # batch's row count; each entry is that row's own
+                    # density fraction (same convention as dy_sparsity_p,
+                    # just one value per row instead of one for the
+                    # whole call).
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    if len(dy_sparsity_schedule) != dy2d.shape[0]:
+                        raise ValueError(
+                            f"dy_sparsity_schedule has {len(dy_sparsity_schedule)} entries, "
+                            f"but dy has {dy2d.shape[0]} rows")
+                    k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
+                    dp, di, dv = _graded_top_k_csr(dy2d, k_per_row, self._c.num_cpus)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
+                elif dy_r_target is not None:
+                    # Nucleus/energy-threshold grad sparsification (task
+                    # #367, priority 1 per direct instruction -- "grad is
+                    # the one that's definitely required"): k is a
+                    # CONSEQUENCE of dy_r_target and this step's actual
+                    # gradient energy, not a fixed fraction. See
+                    # sili_peridot/JOURNAL.md's nucleus design note.
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _nucleus_top_k_csr(
+                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
+                elif dy_sparsity_p is None:
+                    _t0 = _diag_time.perf_counter()
+                    dx = self._c.backward_dense(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
+                                                 learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
+                    _DIAG_TIMING["backward_dense"] = _DIAG_TIMING.get("backward_dense", 0.0) + (_diag_time.perf_counter() - _t0)
+                    _DIAG_TIMING["backward_dense_n"] = _DIAG_TIMING.get("backward_dense_n", 0) + 1
+                else:
+                    _t0 = _diag_time.perf_counter()
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
+                    dp, di, dv = _graded_top_k_csr(
+                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
+                    _t1 = _diag_time.perf_counter()
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                  lr_per_row_nnz=lr_per_row_nnz,
+                                                  damp_by_importance=damp_by_importance, **extra)
+                    _t2 = _diag_time.perf_counter()
+                    _DIAG_TIMING["topk_csr"] = _DIAG_TIMING.get("topk_csr", 0.0) + (_t1 - _t0)
+                    _DIAG_TIMING["backward_sparse"] = _DIAG_TIMING.get("backward_sparse", 0.0) + (_t2 - _t1)
+                    _DIAG_TIMING["backward_sparse_n"] = _DIAG_TIMING.get("backward_sparse_n", 0) + 1
+                    _DIAG_TIMING["x_dense_shape"] = x_dense.shape
+                    _DIAG_TIMING["dp_shape"] = (len(dp), len(di), len(dv))
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -911,7 +1094,8 @@ class DISLDOLayer(_SparseLayerBase):
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> bool:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> bool:
         """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
         BOTH branches' apoptosis/neurogenesis triggers against their own
         EMA state (updated automatically inside backward_dense/backward,
@@ -929,11 +1113,40 @@ class DISLDOLayer(_SparseLayerBase):
         layers, since a 128x128 layer's raw gradient could be 9 orders
         of magnitude larger than a 16x128 layer's for the same real
         signal).
+
+        scale_grace_period_steps/additive_grace_period_steps: separate
+        PER-BRANCH cooldowns (direct instruction, replacing an earlier
+        within-branch grow-vs-shrink asymmetry after a biology
+        literature check -- see apply_dynamic_rank_control_generic's own
+        comment in delta_csr_types.hpp for the full citations). Each
+        branch uses the SAME value for its own grow/shrink internally
+        (symmetric within a branch, matching the roughly comparable
+        formation/elimination rates seen in real dendritic spine
+        turnover -- Holtmaat et al., Neuron 2005; Grutzendler et al.,
+        Nature 2002). The real asymmetry is CROSS-branch: the scale
+        (multiplicative) branch is the per-synapse analog and runs fast
+        (default 50), while the additive branch is a whole-layer
+        correction structurally closer to a neuron integrating its own
+        aggregate state -- the biological analog of homeostatic/
+        intrinsic plasticity, which needs ~24-48h of sustained change to
+        manifest vs. seconds-to-minutes for Hebbian/STDP synaptic change
+        (Turrigiano and colleagues' classic activity-blockade
+        experiments; see also Zenke & Gerstner, "Hebbian plasticity
+        requires compensatory processes on multiple timescales", Phil.
+        Trans. R. Soc. B, 2017) -- roughly a 100x-3000x separation
+        depending which endpoints are compared. additive_grace_period_
+        steps defaults to 5000 (100x scale's 50), the conservative end
+        of that range so the additive branch can still mutate within
+        realistic training budgets; both values are real, independently
+        tunable parameters meant to be swept against real training
+        outcomes, not treated as settled by this docstring.
         """
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            scale_grace_period_steps, scale_grace_period_steps)
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            additive_grace_period_steps, additive_grace_period_steps)
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
@@ -1097,12 +1310,34 @@ class DISLDOLayer32(_SparseLayerBase):
     def forward(self, x, learning_rate: float = 0.0, lr_per_row_nnz: bool = True,
                 damp_by_importance: bool = True, min_decay_frac: Optional[float] = None,
                 max_abs_delta: Optional[float] = None, max_ci: Optional[float] = None,
-                scale_invariant: bool = False, requires_grad: bool = True) -> Tensor:
+                scale_invariant: bool = False, requires_grad: bool = True,
+                dy_sparsity_p: Optional[float] = None,
+                dy_r_target=None, dy_k_min: int = 0, dy_k_max: Optional[int] = None) -> Tensor:
+        # CSR-typed input / dy_sparsity_p (direct instruction): DISLDOLayerV
+        # already uses SparseLinearWeightsDelta with VT=DeltaCSRBiValues<V>,
+        # the SAME storage family FP4's SparseLinearLayer uses -- its own
+        # forward_sparse/backward_sparse (added alongside this change,
+        # mirroring SparseLinearLayer's own C++ methods exactly, reusing
+        # the identical already-validated SynapsePolicy update math, not a
+        # new/ported implementation) now unify dense+sparse on the SAME
+        # object/weights exactly like DISLDOLayer does. This method
+        # mirrors DISLDOLayer.forward()'s own x.is_csr dispatch +
+        # dy_sparsity_p handling directly (see that method's own comments
+        # for the fuller rationale) -- a dense np.ndarray/Tensor here is a
+        # completely unchanged code path, zero behavior change for every
+        # existing caller who never builds a CSR.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
-        x_np   = np.asarray(x.data, dtype=np.float32)
-        was_1d = x_np.ndim == 1
-        out_np = self._c.forward(x_np)
+        if x.is_csr:
+            csr    = x.data
+            was_1d = csr.rows == 1
+            x_dense = csr.to_dense()
+            out_np  = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np    = np.asarray(x.data, dtype=np.float32)
+            was_1d  = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np  = self._c.forward(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
         # See DISLDOLayer.forward's own requires_grad comment.
@@ -1118,8 +1353,26 @@ class DISLDOLayer32(_SparseLayerBase):
                 if max_abs_delta is not None: extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None: extra["max_ci"] = max_ci
                 if scale_invariant: extra["scale_invariant"] = True
-                dx = self._c.backward(x_np, dy, learning_rate, lr_per_row_nnz=lr_per_row_nnz,
-                                       damp_by_importance=damp_by_importance, **extra)
+                if dy_r_target is not None:
+                    # See DISLDOLayer.forward's own dy_r_target comment.
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _nucleus_top_k_csr(
+                        dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                 lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
+                elif dy_sparsity_p is None:
+                    dx = self._c.backward(x_dense, dy if dy.ndim == 2 else dy[np.newaxis, :],
+                                          learning_rate, lr_per_row_nnz=lr_per_row_nnz,
+                                          damp_by_importance=damp_by_importance, **extra)
+                else:
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    k_dy = max(1, int(dy2d.shape[1] * dy_sparsity_p))
+                    dp, di, dv = _graded_top_k_csr(
+                        dy2d, np.full(dy2d.shape[0], k_dy, dtype=np.int32), self._c.num_cpus)
+                    dx = self._c.backward_sparse(x_dense, dp, di, dv, dy2d.shape[0], learning_rate,
+                                                 lr_per_row_nnz=lr_per_row_nnz,
+                                                 damp_by_importance=damp_by_importance, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)
@@ -1218,15 +1471,21 @@ class DISLDOLayer8(_SparseLayerBase):
 
     def apply_dynamic_rank_control(self, tau_death: float = 0.05, tau_active: float = 0.3,
                                    theta: float = 1e-4, seed_scale: float = 0.05,
-                                   grace_period_steps: int = 50) -> bool:
+                                   scale_grace_period_steps: int = 50,
+                                   additive_grace_period_steps: int = 5000) -> bool:
         """Same as DISLDOLayer's own apply_dynamic_rank_control (task
-        #292) -- duplicated here rather than shared via inheritance since
-        DISLDOLayer8 doesn't subclass DISLDOLayer (separate VALUES_TYPE
-        entirely), see this class's own docstring."""
+        #292; per-branch grace periods + biology citations added per
+        direct instruction, see that method's own docstring for the
+        full rationale) -- duplicated here rather than shared via
+        inheritance since DISLDOLayer8 doesn't subclass DISLDOLayer
+        (separate VALUES_TYPE entirely), see this class's own
+        docstring."""
         mutated_scale = self._c.apply_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            scale_grace_period_steps, scale_grace_period_steps)
         mutated_additive = self._c.apply_additive_dynamic_rank_control(
-            tau_death, tau_active, theta, seed_scale, grace_period_steps)
+            tau_death, tau_active, theta, seed_scale,
+            additive_grace_period_steps, additive_grace_period_steps)
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0,
@@ -1288,8 +1547,12 @@ class SISLDOLayer(_SparseLayerBase):
     not a matched forward/backward pair (see its class comment in
     cpu_backend.cpp): dx doesn't depend on the input's own sparsity, only
     on weights and dy, so backward_sparse's required dense `x` argument is
-    exactly what the C++ side already cached as `last_input` during the
-    forward_sparse call above -- not an approximation, just reusing it."""
+    reconstructed from the same CSR forward_sparse was called with
+    (csr.to_dense() -- zeros in the dropped positions), NOT read from
+    `self._c.last_input`. forward_sparse never populates last_input (only
+    forward_dense does, see cpu_backend.cpp) -- an instance that never
+    called forward_dense would otherwise silently compute its weight
+    update against stale/empty data."""
 
     def __init__(self, in_features: int, out_features: int, max_weights: int,
                  num_cpus: int = 4, backprop_p: float = 0.03,
@@ -1308,7 +1571,8 @@ class SISLDOLayer(_SparseLayerBase):
         Structural Plasticity) importance update on every call,
         independent of whether backward() would ever follow. Real
         weight/importance updates now happen ONLY in backward_sparse."""
-        csr    = x.data
+        csr      = x.data
+        x_dense  = csr.to_dense()
         out_np = self._c.forward_sparse(
             csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
         out    = Tensor(out_np, _children=(x,), _op="sisldo", backend=x.backend)
@@ -1319,7 +1583,7 @@ class SISLDOLayer(_SparseLayerBase):
                 k    = max(1, int(dy.shape[1] * self.backprop_p))
                 dp, di, dv = _cpu.dense_to_top_k_csr(dy, k, self._c.num_cpus)
                 dx = self._c.backward_sparse(
-                    self._c.last_input, dp, di, dv,
+                    x_dense, dp, di, dv,
                     csr.rows, learning_rate, lr_per_row_nnz=True,
                 ).squeeze(0)
                 _acc(x, dx)
