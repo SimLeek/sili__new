@@ -44,18 +44,17 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Weight file loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_weights(path: str) -> Dict[str, torch.Tensor]:
+
+def load_weights(path: str) -> dict[str, torch.Tensor]:
     """
     Load a flat {name: tensor} state dict from a .bin or .safetensors file.
 
@@ -84,7 +83,7 @@ def load_weights(path: str) -> Dict[str, torch.Tensor]:
     raise ValueError(f"Cannot interpret object of type {type(obj)}")
 
 
-def load_weights_sharded(directory: str) -> Dict[str, torch.Tensor]:
+def load_weights_sharded(directory: str) -> dict[str, torch.Tensor]:
     """
     Load and merge all shards found in a directory.
 
@@ -95,16 +94,16 @@ def load_weights_sharded(directory: str) -> Dict[str, torch.Tensor]:
     Returns a single merged state dict (all shards in CPU memory).
     """
     d = Path(directory)
-    shards: List[Path] = sorted(
-        list(d.glob("model-*-of-*.safetensors")) +
-        list(d.glob("pytorch_model-*-of-*.bin")) +
-        list(d.glob("model.safetensors")) +
-        list(d.glob("pytorch_model.bin"))
+    shards: list[Path] = sorted(
+        list(d.glob("model-*-of-*.safetensors"))
+        + list(d.glob("pytorch_model-*-of-*.bin"))
+        + list(d.glob("model.safetensors"))
+        + list(d.glob("pytorch_model.bin"))
     )
     if not shards:
         raise FileNotFoundError(f"No model weight files found in {directory}")
 
-    merged: Dict[str, torch.Tensor] = {}
+    merged: dict[str, torch.Tensor] = {}
     for shard in shards:
         print(f"  [load shard]  {shard.name}")
         merged.update(load_weights(str(shard)))
@@ -115,7 +114,8 @@ def load_weights_sharded(directory: str) -> Dict[str, torch.Tensor]:
 #  Architecture detection
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_family(state_dict: Dict[str, torch.Tensor]) -> str:
+
+def detect_family(state_dict: dict[str, torch.Tensor]) -> str:
     """
     Classify the model family from parameter name patterns.
 
@@ -165,7 +165,7 @@ def detect_family(state_dict: Dict[str, torch.Tensor]) -> str:
     return "unknown"
 
 
-def _count_layers(state_dict: Dict[str, torch.Tensor], prefix_re: str) -> int:
+def _count_layers(state_dict: dict[str, torch.Tensor], prefix_re: str) -> int:
     """Count the number of unique integer indices matching a prefix pattern."""
     indices = set()
     pat = re.compile(prefix_re)
@@ -180,6 +180,7 @@ def _count_layers(state_dict: Dict[str, torch.Tensor], prefix_re: str) -> int:
 #  LLaMA family
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class _LlamaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -193,6 +194,7 @@ class _LlamaRMSNorm(nn.Module):
 
 class _LlamaRotaryEmbedding(nn.Module):
     """RoPE — recomputed on the fly, no stored parameters."""
+
     def __init__(self, dim: int, max_seq: int = 4096, base: int = 10000):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
@@ -218,28 +220,33 @@ def _apply_rotary(q, k, cos, sin):
 
 
 class _LlamaAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: Optional[int],
-                 head_dim: Optional[int], max_seq: int,
-                 rope_theta: float = 10000.0):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int | None,
+        head_dim: int | None,
+        max_seq: int,
+        rope_theta: float = 10000.0,
+    ):
         super().__init__()
-        self.n_heads    = n_heads
+        self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads or n_heads
-        self.head_dim   = head_dim or (d_model // n_heads)
-        self.groups     = n_heads // self.n_kv_heads   # GQA groups
+        self.head_dim = head_dim or (d_model // n_heads)
+        self.groups = n_heads // self.n_kv_heads  # GQA groups
 
         kv_dim = self.n_kv_heads * self.head_dim
         self.q_proj = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, kv_dim, bias=False)
         self.v_proj = nn.Linear(d_model, kv_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-        self.rope   = _LlamaRotaryEmbedding(self.head_dim, max_seq=max_seq, base=rope_theta)
+        self.rope = _LlamaRotaryEmbedding(self.head_dim, max_seq=max_seq, base=rope_theta)
 
-    def forward(self, x: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         cos, sin = self.rope(T, x.device)
 
-        q = self.q_proj(x).view(B, T, self.n_heads,    self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         q, k = _apply_rotary(q, k, cos[:, :, :T, :], sin[:, :, :T, :])
@@ -249,7 +256,7 @@ class _LlamaAttention(nn.Module):
             k = k.repeat_interleave(self.groups, dim=1)
             v = v.repeat_interleave(self.groups, dim=1)
 
-        scale  = math.sqrt(self.head_dim)
+        scale = math.sqrt(self.head_dim)
         scores = torch.matmul(q, k.transpose(-2, -1)) / scale
         # Causal mask
         causal = torch.full((T, T), float("-inf"), device=x.device).triu(1)
@@ -257,7 +264,7 @@ class _LlamaAttention(nn.Module):
         if attention_mask is not None:
             scores = scores + attention_mask
         attn = F.softmax(scores, dim=-1)
-        out  = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, -1)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, -1)
         return self.o_proj(out)
 
 
@@ -265,7 +272,7 @@ class _LlamaMLP(nn.Module):
     def __init__(self, d_model: int, intermediate: int):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, intermediate, bias=False)
-        self.up_proj   = nn.Linear(d_model, intermediate, bias=False)
+        self.up_proj = nn.Linear(d_model, intermediate, bias=False)
         self.down_proj = nn.Linear(intermediate, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -273,18 +280,24 @@ class _LlamaMLP(nn.Module):
 
 
 class _LlamaBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: Optional[int],
-                 head_dim: Optional[int], intermediate: int, max_seq: int,
-                 rms_eps: float = 1e-5, rope_theta: float = 10000.0):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int | None,
+        head_dim: int | None,
+        intermediate: int,
+        max_seq: int,
+        rms_eps: float = 1e-5,
+        rope_theta: float = 10000.0,
+    ):
         super().__init__()
-        self.input_layernorm       = _LlamaRMSNorm(d_model, rms_eps)
-        self.self_attn             = _LlamaAttention(d_model, n_heads, n_kv_heads,
-                                                     head_dim, max_seq, rope_theta)
+        self.input_layernorm = _LlamaRMSNorm(d_model, rms_eps)
+        self.self_attn = _LlamaAttention(d_model, n_heads, n_kv_heads, head_dim, max_seq, rope_theta)
         self.post_attention_layernorm = _LlamaRMSNorm(d_model, rms_eps)
-        self.mlp                   = _LlamaMLP(d_model, intermediate)
+        self.mlp = _LlamaMLP(d_model, intermediate)
 
-    def forward(self, x: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + self.self_attn(self.input_layernorm(x), attention_mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -297,24 +310,35 @@ class LlamaModel(nn.Module):
     Covers: LLaMA 1/2/3, Mistral 7B, Mixtral (dense path), Qwen2, Phi-3,
     DeepSeek-V2 (dense), Gemma (uses GeGLU but same weight names).
     """
-    def __init__(self, vocab_size: int, d_model: int, n_layers: int,
-                 n_heads: int, n_kv_heads: Optional[int], head_dim: Optional[int],
-                 intermediate: int, max_seq: int = 4096, rms_eps: float = 1e-5,
-                 tie_embeddings: bool = False, rope_theta: float = 10000.0):
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        n_kv_heads: int | None,
+        head_dim: int | None,
+        intermediate: int,
+        max_seq: int = 4096,
+        rms_eps: float = 1e-5,
+        tie_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+    ):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList([
-            _LlamaBlock(d_model, n_heads, n_kv_heads, head_dim,
-                        intermediate, max_seq, rms_eps, rope_theta)
-            for _ in range(n_layers)
-        ])
-        self.norm   = _LlamaRMSNorm(d_model, rms_eps)
+        self.layers = nn.ModuleList(
+            [
+                _LlamaBlock(d_model, n_heads, n_kv_heads, head_dim, intermediate, max_seq, rms_eps, rope_theta)
+                for _ in range(n_layers)
+            ]
+        )
+        self.norm = _LlamaRMSNorm(d_model, rms_eps)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
             x = layer(x, attention_mask)
@@ -323,9 +347,9 @@ class LlamaModel(nn.Module):
 
 
 def _infer_llama_hparams(
-    sd: Dict[str, torch.Tensor],
-    rms_eps: Optional[float] = None,
-    rope_theta: Optional[float] = None,
+    sd: dict[str, torch.Tensor],
+    rms_eps: float | None = None,
+    rope_theta: float | None = None,
 ) -> dict:
     """
     Infer LLaMA hyperparameters from weight shapes.
@@ -360,6 +384,7 @@ def _infer_llama_hparams(
     # Try head_dim = d_model // round(q_out / (k_out / round(k_out/d_model)))
     # Simpler: find the GCD pattern
     from math import gcd
+
     head_dim = gcd(q_out, k_out)
     # Make sure head_dim is sensible (at least 16, divides both evenly)
     for hd in [128, 64, 96, 80, 256, 32, 16]:
@@ -367,7 +392,7 @@ def _infer_llama_hparams(
             head_dim = hd
             break
 
-    n_heads    = q_out // head_dim
+    n_heads = q_out // head_dim
     n_kv_heads = k_out // head_dim
 
     # intermediate from gate_proj
@@ -376,21 +401,27 @@ def _infer_llama_hparams(
 
     # rms_eps / rope_theta: not recoverable from weights alone -- use the
     # caller-supplied config value if given, else the plain LLaMA default.
-    rms_eps    = 1e-5 if rms_eps is None else rms_eps
+    rms_eps = 1e-5 if rms_eps is None else rms_eps
     rope_theta = 10000.0 if rope_theta is None else rope_theta
 
     # tie_embeddings: check if lm_head.weight is absent (tied)
     tie = not any("lm_head.weight" in k for k in sd)
 
-    return dict(
-        vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
-        n_heads=n_heads, n_kv_heads=n_kv_heads, head_dim=head_dim,
-        intermediate=intermediate, rms_eps=rms_eps, tie_embeddings=tie,
-        rope_theta=rope_theta,
-    )
+    return {
+        "vocab_size": vocab_size,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "intermediate": intermediate,
+        "rms_eps": rms_eps,
+        "tie_embeddings": tie,
+        "rope_theta": rope_theta,
+    }
 
 
-def load_hf_config(path: str) -> Optional[dict]:
+def load_hf_config(path: str) -> dict | None:
     """
     Look for a HuggingFace ``config.json`` next to (or inside) a checkpoint
     path and return it parsed, or ``None`` if not found. ``path`` may be a
@@ -409,6 +440,7 @@ def load_hf_config(path: str) -> Optional[dict]:
 #  GPT-2 family
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class _GPT2Attention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, max_seq: int = 2048):
         super().__init__()
@@ -421,26 +453,26 @@ class _GPT2Attention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.c_attn(x)                                       # [B,T,3C]
+        qkv = self.c_attn(x)  # [B,T,3C]
         q, k, v = qkv.split(C, dim=-1)
 
         def split_heads(t):
             return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
-        scale  = math.sqrt(self.head_dim)
+        scale = math.sqrt(self.head_dim)
         scores = torch.matmul(q, k.transpose(-2, -1)) / scale
         causal = torch.full((T, T), float("-inf"), device=x.device).triu(1)
         scores = scores + causal
-        attn   = F.softmax(scores, dim=-1)
-        out    = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, C)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, C)
         return self.c_proj(out)
 
 
 class _GPT2MLP(nn.Module):
     def __init__(self, d_model: int, intermediate: int):
         super().__init__()
-        self.c_fc   = nn.Linear(d_model, intermediate)
+        self.c_fc = nn.Linear(d_model, intermediate)
         self.c_proj = nn.Linear(intermediate, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -450,10 +482,10 @@ class _GPT2MLP(nn.Module):
 class _GPT2Block(nn.Module):
     def __init__(self, d_model: int, n_heads: int, intermediate: int, max_seq: int):
         super().__init__()
-        self.ln_1  = nn.LayerNorm(d_model)
-        self.attn  = _GPT2Attention(d_model, n_heads, max_seq)
-        self.ln_2  = nn.LayerNorm(d_model)
-        self.mlp   = _GPT2MLP(d_model, intermediate)
+        self.ln_1 = nn.LayerNorm(d_model)
+        self.attn = _GPT2Attention(d_model, n_heads, max_seq)
+        self.ln_2 = nn.LayerNorm(d_model)
+        self.mlp = _GPT2MLP(d_model, intermediate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
@@ -463,31 +495,30 @@ class _GPT2Block(nn.Module):
 
 class GPT2Model(nn.Module):
     """Reconstructed GPT-2 style decoder (GPT-2, GPT-Neo, CodeGen, SantaCoder)."""
-    def __init__(self, vocab_size: int, d_model: int, n_layers: int,
-                 n_heads: int, intermediate: int, max_seq: int = 2048):
+
+    def __init__(
+        self, vocab_size: int, d_model: int, n_layers: int, n_heads: int, intermediate: int, max_seq: int = 2048
+    ):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, d_model)
         self.wpe = nn.Embedding(max_seq, d_model)
-        self.h   = nn.ModuleList([
-            _GPT2Block(d_model, n_heads, intermediate, max_seq)
-            for _ in range(n_layers)
-        ])
-        self.ln_f  = nn.LayerNorm(d_model)
+        self.h = nn.ModuleList([_GPT2Block(d_model, n_heads, intermediate, max_seq) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
         # GPT-2 ties lm_head to wte
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T = input_ids.shape
-        pos  = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        x    = self.wte(input_ids) + self.wpe(pos)
+        _B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        x = self.wte(input_ids) + self.wpe(pos)
         for block in self.h:
             x = block(x)
         x = self.ln_f(x)
         return self.lm_head(x)
 
 
-def _infer_gpt2_hparams(sd: Dict[str, torch.Tensor]) -> dict:
+def _infer_gpt2_hparams(sd: dict[str, torch.Tensor]) -> dict:
     embed = sd.get("transformer.wte.weight")
     if embed is None:
         embed = sd.get("wte.weight")
@@ -496,10 +527,7 @@ def _infer_gpt2_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     # c_attn is [d_model, 3*d_model] (Conv1D stores transposed)
     c_attn = next(v for k, v in sd.items() if "c_attn.weight" in k)
     # Conv1D weight shape is [in, out] — opposite of nn.Linear
-    if c_attn.shape[0] == d_model:
-        three_d = c_attn.shape[1]
-    else:
-        three_d = c_attn.shape[0]
+    c_attn.shape[1] if c_attn.shape[0] == d_model else c_attn.shape[0]
     # three_d = 3*d_model confirms d_model; n_heads from layernorm or heuristic
     # Usual GPT-2 ratios: 64 dims / head
     n_heads = d_model // 64
@@ -515,26 +543,32 @@ def _infer_gpt2_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     if wpe is None:
         wpe = sd.get("wpe.weight")
     max_seq = wpe.shape[0] if wpe is not None else 2048
-    return dict(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
-                n_heads=n_heads, intermediate=intermediate, max_seq=max_seq)
+    return {
+        "vocab_size": vocab_size,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "intermediate": intermediate,
+        "max_seq": max_seq,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BERT family
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class _BERTAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
-        self.n_heads  = n_heads
+        self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.query = nn.Linear(d_model, d_model)
-        self.key   = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
-        self.out   = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, C = x.shape
 
         def split(t):
@@ -545,21 +579,20 @@ class _BERTAttention(nn.Module):
         if attention_mask is not None:
             scores = scores + attention_mask
         attn = F.softmax(scores, dim=-1)
-        out  = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, C)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, C)
         return self.out(out)
 
 
 class _BERTLayer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, intermediate: int):
         super().__init__()
-        self.attention   = _BERTAttention(d_model, n_heads)
-        self.attn_norm   = nn.LayerNorm(d_model)
+        self.attention = _BERTAttention(d_model, n_heads)
+        self.attn_norm = nn.LayerNorm(d_model)
         self.intermediate = nn.Linear(d_model, intermediate)
         self.output_dense = nn.Linear(intermediate, d_model)
-        self.output_norm  = nn.LayerNorm(d_model)
+        self.output_norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.attn_norm(x + self.attention(x, attention_mask))
         x = self.output_norm(x + self.output_dense(F.gelu(self.intermediate(x))))
         return x
@@ -567,29 +600,35 @@ class _BERTLayer(nn.Module):
 
 class BERTModel(nn.Module):
     """Reconstructed BERT-family encoder (BERT, RoBERTa, DistilBERT, ELECTRA)."""
-    def __init__(self, vocab_size: int, d_model: int, n_layers: int,
-                 n_heads: int, intermediate: int, max_seq: int = 512,
-                 type_vocab_size: int = 2):
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        intermediate: int,
+        max_seq: int = 512,
+        type_vocab_size: int = 2,
+    ):
         super().__init__()
-        self.word_embeddings     = nn.Embedding(vocab_size, d_model)
+        self.word_embeddings = nn.Embedding(vocab_size, d_model)
         self.position_embeddings = nn.Embedding(max_seq, d_model)
         self.token_type_embeddings = nn.Embedding(type_vocab_size, d_model)
-        self.emb_norm   = nn.LayerNorm(d_model)
-        self.encoder    = nn.ModuleList([
-            _BERTLayer(d_model, n_heads, intermediate) for _ in range(n_layers)
-        ])
+        self.emb_norm = nn.LayerNorm(d_model)
+        self.encoder = nn.ModuleList([_BERTLayer(d_model, n_heads, intermediate) for _ in range(n_layers)])
         self.pooler = nn.Linear(d_model, d_model)
 
-    def forward(self, input_ids: torch.Tensor,
-                token_type_ids: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, T = input_ids.shape
-        pos  = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        tt   = token_type_ids if token_type_ids is not None \
-               else torch.zeros_like(input_ids)
-        x = (self.word_embeddings(input_ids)
-             + self.position_embeddings(pos)
-             + self.token_type_embeddings(tt))
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        _B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        tt = token_type_ids if token_type_ids is not None else torch.zeros_like(input_ids)
+        x = self.word_embeddings(input_ids) + self.position_embeddings(pos) + self.token_type_embeddings(tt)
         x = self.emb_norm(x)
         # Extend attention mask: [B,1,1,T] → additive bias
         if attention_mask is not None:
@@ -602,14 +641,14 @@ class BERTModel(nn.Module):
         return x
 
 
-def _infer_bert_hparams(sd: Dict[str, torch.Tensor]) -> dict:
+def _infer_bert_hparams(sd: dict[str, torch.Tensor]) -> dict:
     # BERT uses bert.embeddings.word_embeddings.weight or just
     # embeddings.word_embeddings.weight
     embed = next(v for k, v in sd.items() if "word_embeddings.weight" in k)
     vocab_size, d_model = embed.shape
     n_layers = _count_layers(sd, r"layer\.(\d+)\.")
-    q_weight = next(v for k, v in sd.items() if "attention.self.query.weight" in k)
-    n_heads = d_model // (d_model // 12)   # BERT standard: 64 per head
+    next(v for k, v in sd.items() if "attention.self.query.weight" in k)
+    n_heads = d_model // (d_model // 12)  # BERT standard: 64 per head
     for nh in [16, 12, 8, 4]:
         if d_model % nh == 0:
             n_heads = nh
@@ -618,9 +657,14 @@ def _infer_bert_hparams(sd: Dict[str, torch.Tensor]) -> dict:
     intermediate = inter.shape[0]
     pos = next((v for k, v in sd.items() if "position_embeddings.weight" in k), None)
     max_seq = pos.shape[0] if pos is not None else 512
-    return dict(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
-                n_heads=n_heads, intermediate=intermediate, max_seq=max_seq)
-
+    return {
+        "vocab_size": vocab_size,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "intermediate": intermediate,
+        "max_seq": max_seq,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -653,52 +697,50 @@ def _infer_bert_hparams(sd: Dict[str, torch.Tensor]) -> dict:
 #  model.norm.*                       — final LM RMSNorm
 #  lm_head.*                          — vocabulary projection
 
+
 class _Qwen3VLPatchEmbed(nn.Module):
     """Project image patches to vision embedding dimension via Conv2d."""
-    def __init__(self, in_chans: int, embed_dim: int,
-                 patch_h: int = 14, patch_w: int = 14):
+
+    def __init__(self, in_chans: int, embed_dim: int, patch_h: int = 14, patch_w: int = 14):
         super().__init__()
-        self.proj = nn.Conv2d(in_chans, embed_dim,
-                              kernel_size=(patch_h, patch_w),
-                              stride=(patch_h, patch_w))
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
         self.patch_h = patch_h
         self.patch_w = patch_w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]  →  [B, N_patches, embed_dim]
-        x = self.proj(x)                         # [B, D, H/ph, W/pw]
-        return x.flatten(2).transpose(1, 2)      # [B, N, D]
+        x = self.proj(x)  # [B, D, H/ph, W/pw]
+        return x.flatten(2).transpose(1, 2)  # [B, N, D]
 
 
 class _Qwen3VLViTAttention(nn.Module):
     """Fused QKV self-attention used inside the vision encoder."""
+
     def __init__(self, embed_dim: int, n_heads: int):
         super().__init__()
-        self.n_heads  = n_heads
+        self.n_heads = n_heads
         self.head_dim = embed_dim // n_heads
-        self.scale    = self.head_dim ** -0.5
-        self.qkv      = nn.Linear(embed_dim, 3 * embed_dim, bias=True)
-        self.proj     = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.scale = self.head_dim**-0.5
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=True)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=True)
 
-    def forward(self, x: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = (self.qkv(x)
-               .reshape(B, N, 3, self.n_heads, self.head_dim)
-               .permute(2, 0, 3, 1, 4))          # [3, B, H, N, D]
+        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)  # [3, B, H, N, D]
         q, k, v = qkv.unbind(0)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         if attn_mask is not None:
             scores = scores + attn_mask
         attn = F.softmax(scores, dim=-1)
-        out  = torch.matmul(attn, v)             # [B, H, N, D]
-        out  = out.transpose(1, 2).reshape(B, N, C)
+        out = torch.matmul(attn, v)  # [B, H, N, D]
+        out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out)
 
 
 class _Qwen3VLViTMLP(nn.Module):
     """Two-layer GELU MLP inside the vision encoder (NOT SwiGLU)."""
+
     def __init__(self, embed_dim: int, intermediate: int):
         super().__init__()
         self.fc1 = nn.Linear(embed_dim, intermediate)
@@ -712,9 +754,9 @@ class _Qwen3VLViTBlock(nn.Module):
     def __init__(self, embed_dim: int, n_heads: int, intermediate: int):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn  = _Qwen3VLViTAttention(embed_dim, n_heads)
+        self.attn = _Qwen3VLViTAttention(embed_dim, n_heads)
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp   = _Qwen3VLViTMLP(embed_dim, intermediate)
+        self.mlp = _Qwen3VLViTMLP(embed_dim, intermediate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
@@ -730,21 +772,26 @@ class _Qwen3VLVisionEncoder(nn.Module):
     Uses standard full-attention (no causal mask, no RoPE — the 2D M-RoPE
     is applied inside the LM decoder when vision + text tokens are merged).
     """
-    def __init__(self, in_chans: int, embed_dim: int, depth: int,
-                 n_heads: int, intermediate: int,
-                 patch_h: int = 14, patch_w: int = 14):
+
+    def __init__(
+        self,
+        in_chans: int,
+        embed_dim: int,
+        depth: int,
+        n_heads: int,
+        intermediate: int,
+        patch_h: int = 14,
+        patch_w: int = 14,
+    ):
         super().__init__()
         self.patch_embed = _Qwen3VLPatchEmbed(in_chans, embed_dim, patch_h, patch_w)
-        self.blocks = nn.ModuleList([
-            _Qwen3VLViTBlock(embed_dim, n_heads, intermediate)
-            for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList([_Qwen3VLViTBlock(embed_dim, n_heads, intermediate) for _ in range(depth)])
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(pixel_values)
         for blk in self.blocks:
             x = blk(x)
-        return x                 # [B, N_patches, vision_embed_dim]
+        return x  # [B, N_patches, vision_embed_dim]
 
 
 class _Qwen3VLMerger(nn.Module):
@@ -755,7 +802,8 @@ class _Qwen3VLMerger(nn.Module):
     with indices 0, 2, 4 in the saved weight dict (the odd indices are
     the activation functions, which have no weights).
     """
-    def __init__(self, vision_dim: int, lm_dim: int, hidden: Optional[int] = None):
+
+    def __init__(self, vision_dim: int, lm_dim: int, hidden: int | None = None):
         super().__init__()
         hidden = hidden or lm_dim
         self.mlp = nn.Sequential(
@@ -786,29 +834,30 @@ class Qwen3VLModel(nn.Module):
     lm_*       : language model hyperparameters (Qwen3/LLaMA-style)
     merger_*   : vision→LM projection hyperparameters
     """
+
     def __init__(
         self,
         # Vision encoder
         vision_embed_dim: int,
-        vision_depth:     int,
-        vision_n_heads:   int,
-        vision_inter:     int,
-        patch_h:          int,
-        patch_w:          int,
-        in_chans:         int,
+        vision_depth: int,
+        vision_n_heads: int,
+        vision_inter: int,
+        patch_h: int,
+        patch_w: int,
+        in_chans: int,
         # Merger
-        merger_hidden:    int,
+        merger_hidden: int,
         # LM decoder
-        vocab_size:       int,
-        d_model:          int,
-        n_layers:         int,
-        n_heads:          int,
-        n_kv_heads:       Optional[int],
-        head_dim:         Optional[int],
-        intermediate:     int,
-        max_seq:          int = 32768,
-        rms_eps:          float = 1e-6,
-        tie_embeddings:   bool = False,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        n_kv_heads: int | None,
+        head_dim: int | None,
+        intermediate: int,
+        max_seq: int = 32768,
+        rms_eps: float = 1e-6,
+        tie_embeddings: bool = False,
     ):
         super().__init__()
         self.visual = _Qwen3VLVisionEncoder(
@@ -846,14 +895,14 @@ class Qwen3VLModel(nn.Module):
         pixel_values : [B, C, H, W]
         returns      : [B, N_patches, d_model]  — ready to interleave with text
         """
-        vt = self.visual(pixel_values)          # [B, N, vision_embed_dim]
-        return self.visual_merger(vt)           # [B, N, d_model]
+        vt = self.visual(pixel_values)  # [B, N, vision_embed_dim]
+        return self.visual_merger(vt)  # [B, N, d_model]
 
     def forward(
         self,
-        input_ids:       torch.Tensor,
-        attention_mask:  Optional[torch.Tensor] = None,
-        pixel_values:    Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Text-only or image+text forward.
@@ -871,13 +920,15 @@ class Qwen3VLModel(nn.Module):
         x = self.model.embed_tokens(input_ids)  # [B, T, d_model]
 
         if pixel_values is not None:
-            vision_tokens = self.encode_image(pixel_values)   # [B, N, d_model]
+            vision_tokens = self.encode_image(pixel_values)  # [B, N, d_model]
             x = torch.cat([vision_tokens, x], dim=1)
             # Extend attention mask if provided
             if attention_mask is not None:
                 vision_ones = torch.ones(
-                    attention_mask.shape[0], vision_tokens.shape[1],
-                    dtype=attention_mask.dtype, device=attention_mask.device
+                    attention_mask.shape[0],
+                    vision_tokens.shape[1],
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
                 )
                 attention_mask = torch.cat([vision_ones, attention_mask], dim=1)
 
@@ -887,7 +938,7 @@ class Qwen3VLModel(nn.Module):
         return self.model.lm_head(x)
 
 
-def _infer_qwen3vl_hparams(sd: Dict[str, torch.Tensor]) -> dict:
+def _infer_qwen3vl_hparams(sd: dict[str, torch.Tensor]) -> dict:
     """Infer Qwen2-VL / Qwen3-VL hyperparameters from weight shapes."""
 
     # ── Vision encoder ────────────────────────────────────────────────────────
@@ -896,24 +947,22 @@ def _infer_qwen3vl_hparams(sd: Dict[str, torch.Tensor]) -> dict:
         patch_proj = next(v for k, v in sd.items() if "patch_embed.proj.weight" in k)
     # Conv2d weight: [out_channels, in_channels, kH, kW]
     vision_embed_dim = int(patch_proj.shape[0])
-    in_chans         = int(patch_proj.shape[1])
-    patch_h          = int(patch_proj.shape[2])
-    patch_w          = int(patch_proj.shape[3])
+    in_chans = int(patch_proj.shape[1])
+    patch_h = int(patch_proj.shape[2])
+    patch_w = int(patch_proj.shape[3])
 
     vision_depth = _count_layers(sd, r"visual\.blocks\.(\d+)\.")
 
     # QKV weight is [3*embed_dim, embed_dim]
-    qkv_w = next(v for k, v in sd.items() if "visual.blocks" in k and "attn.qkv.weight" in k)
-    vision_n_heads = max(h for h in [8, 12, 16, 24, 32]
-                         if vision_embed_dim % h == 0 and vision_embed_dim // h >= 32)
+    next(v for k, v in sd.items() if "visual.blocks" in k and "attn.qkv.weight" in k)
+    vision_n_heads = max(h for h in [8, 12, 16, 24, 32] if vision_embed_dim % h == 0 and vision_embed_dim // h >= 32)
 
     # ViT MLP intermediate
     fc1_w = next(v for k, v in sd.items() if "visual.blocks" in k and "mlp.fc1.weight" in k)
     vision_inter = int(fc1_w.shape[0])
 
     # ── Merger ────────────────────────────────────────────────────────────────
-    merger_w0 = next((v for k, v in sd.items()
-                      if "visual.merger" in k and ".0.weight" in k), None)
+    merger_w0 = next((v for k, v in sd.items() if "visual.merger" in k and ".0.weight" in k), None)
     merger_hidden = int(merger_w0.shape[0]) if merger_w0 is not None else vision_embed_dim * 2
 
     # ── LM decoder (same as LLaMA) ────────────────────────────────────────────
@@ -924,47 +973,43 @@ def _infer_qwen3vl_hparams(sd: Dict[str, torch.Tensor]) -> dict:
 
     n_layers = _count_layers(sd, r"model\.layers\.(\d+)\.")
 
-    q_weight = next(v for k, v in sd.items()
-                    if "model.layers" in k and "self_attn.q_proj.weight" in k)
-    k_weight = next(v for k, v in sd.items()
-                    if "model.layers" in k and "self_attn.k_proj.weight" in k)
+    q_weight = next(v for k, v in sd.items() if "model.layers" in k and "self_attn.q_proj.weight" in k)
+    k_weight = next(v for k, v in sd.items() if "model.layers" in k and "self_attn.k_proj.weight" in k)
     q_out, k_out = q_weight.shape[0], k_weight.shape[0]
 
-    head_dim = next(hd for hd in [128, 64, 96, 80, 256, 32]
-                    if q_out % hd == 0 and k_out % hd == 0)
-    n_heads    = q_out // head_dim
+    head_dim = next(hd for hd in [128, 64, 96, 80, 256, 32] if q_out % hd == 0 and k_out % hd == 0)
+    n_heads = q_out // head_dim
     n_kv_heads = k_out // head_dim
 
-    gate = next(v for k, v in sd.items()
-                if "model.layers" in k and "mlp.gate_proj.weight" in k)
+    gate = next(v for k, v in sd.items() if "model.layers" in k and "mlp.gate_proj.weight" in k)
     intermediate = int(gate.shape[0])
 
     tie = not any("lm_head.weight" in k for k in sd)
     # Qwen3 uses eps=1e-6 by default (tighter than LLaMA's 1e-5)
     rms_eps = 1e-6
 
-    return dict(
-        vision_embed_dim=vision_embed_dim,
-        vision_depth=vision_depth,
-        vision_n_heads=vision_n_heads,
-        vision_inter=vision_inter,
-        patch_h=patch_h,
-        patch_w=patch_w,
-        in_chans=in_chans,
-        merger_hidden=merger_hidden,
-        vocab_size=vocab_size,
-        d_model=d_model,
-        n_layers=n_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        head_dim=head_dim,
-        intermediate=intermediate,
-        rms_eps=rms_eps,
-        tie_embeddings=tie,
-    )
+    return {
+        "vision_embed_dim": vision_embed_dim,
+        "vision_depth": vision_depth,
+        "vision_n_heads": vision_n_heads,
+        "vision_inter": vision_inter,
+        "patch_h": patch_h,
+        "patch_w": patch_w,
+        "in_chans": in_chans,
+        "merger_hidden": merger_hidden,
+        "vocab_size": vocab_size,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "intermediate": intermediate,
+        "rms_eps": rms_eps,
+        "tie_embeddings": tie,
+    }
 
 
-def _remap_qwen3vl_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def _remap_qwen3vl_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """
     Remap HuggingFace Qwen3-VL keys to our module tree.
 
@@ -992,13 +1037,13 @@ def _remap_qwen3vl_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # Strip outer "model." wrapper that HF adds around the whole thing
         nk = k
         if nk.startswith("model.visual."):
-            nk = nk[len("model."):]          # → visual.*
+            nk = nk[len("model.") :]  # → visual.*
         # visual.merger → visual_merger
         if nk.startswith("visual.merger.mlp."):
             # visual.merger.mlp.0.weight → visual_merger.mlp.0.weight
-            nk = "visual_merger.mlp." + nk[len("visual.merger.mlp."):]
+            nk = "visual_merger.mlp." + nk[len("visual.merger.mlp.") :]
         elif nk.startswith("visual.merger."):
-            nk = "visual_merger." + nk[len("visual.merger."):]
+            nk = "visual_merger." + nk[len("visual.merger.") :]
         # lm_head lives at model.lm_head in our tree
         if nk == "lm_head.weight":
             nk = "model.lm_head.weight"
@@ -1009,6 +1054,7 @@ def _remap_qwen3vl_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Generic fallback
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class GenericStateModule(nn.Module):
     """
@@ -1022,12 +1068,13 @@ class GenericStateModule(nn.Module):
         for name, p in model.named_parameters():
             print(name, p.shape)
     """
-    def __init__(self, state_dict: Dict[str, torch.Tensor]):
+
+    def __init__(self, state_dict: dict[str, torch.Tensor]):
         super().__init__()
         # nn.ParameterDict requires string keys without dots; store as a flat
         # dict via register_buffer so the tensors are tracked without the
         # key-naming restriction
-        self._param_names: List[str] = []
+        self._param_names: list[str] = []
         for i, (name, tensor) in enumerate(state_dict.items()):
             self.register_buffer(f"_p{i}", tensor)
             self._param_names.append(name)
@@ -1048,15 +1095,17 @@ class GenericStateModule(nn.Module):
 #  Key remapping
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _remap_keys(sd: Dict[str, torch.Tensor], family: str) -> Dict[str, torch.Tensor]:
+
+def _remap_keys(sd: dict[str, torch.Tensor], family: str) -> dict[str, torch.Tensor]:
     """
     Strip common HuggingFace wrapper prefixes so keys match our module layout.
 
     HuggingFace saves weights as "model.layers.0...." or "transformer.h.0...."
     but our nn.Module trees are rooted directly at the equivalent submodule.
     """
+
     def _strip(name: str, prefix: str) -> str:
-        return name[len(prefix):] if name.startswith(prefix) else name
+        return name[len(prefix) :] if name.startswith(prefix) else name
 
     if family == "qwen3vl":
         return _remap_qwen3vl_keys(sd)
@@ -1072,8 +1121,7 @@ def _remap_keys(sd: Dict[str, torch.Tensor], family: str) -> Dict[str, torch.Ten
     return sd
 
 
-def _load_into(model: nn.Module, sd: Dict[str, torch.Tensor],
-               strict: bool = False) -> None:
+def _load_into(model: nn.Module, sd: dict[str, torch.Tensor], strict: bool = False) -> None:
     """
     Load state dict with informative mismatch reporting.
 
@@ -1091,11 +1139,12 @@ def _load_into(model: nn.Module, sd: Dict[str, torch.Tensor],
 #  Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def reconstruct_model(
     path: str,
     strict: bool = False,
     device: str = "cpu",
-    hf_config: Optional[dict] = None,
+    hf_config: dict | None = None,
 ) -> nn.Module:
     """
     Load a .bin or .safetensors weight file and return a runnable nn.Module.
@@ -1141,7 +1190,7 @@ def reconstruct_model(
         _load_into(model, _remap_keys(sd, "qwen3vl"), strict)
 
     elif family == "llama":
-        rms_eps    = (hf_config or {}).get("rms_norm_eps")
+        rms_eps = (hf_config or {}).get("rms_norm_eps")
         rope_theta = (hf_config or {}).get("rope_theta")
         hp = _infer_llama_hparams(sd, rms_eps=rms_eps, rope_theta=rope_theta)
         _print_hparams(hp, family)
@@ -1183,19 +1232,22 @@ def show_arch(path: str) -> None:
     hf_config = load_hf_config(path)
     print(f"\nFamily   : {family}")
     print(f"Tensors  : {len(sd)}")
-    print(f"config.json : {'found, values below override shape-inferred guesses for rms_eps/rope_theta' if hf_config else 'not found -- rms_eps/rope_theta fall back to plain LLaMA defaults'}")
-    print(f"\nParameter summary (name  →  shape):")
+    print(
+        f"config.json : {'found, values below override shape-inferred guesses for rms_eps/rope_theta' if hf_config else 'not found -- rms_eps/rope_theta fall back to plain LLaMA defaults'}"
+    )
+    print("\nParameter summary (name  →  shape):")
     for name, t in list(sd.items())[:40]:
         print(f"  {name:<60}  {tuple(t.shape)}")
     if len(sd) > 40:
-        print(f"  … and {len(sd)-40} more")
+        print(f"  … and {len(sd) - 40} more")
 
     if family == "qwen3vl":
         hp = _infer_qwen3vl_hparams(sd)
-        print(f"\nInferred hparams:")
-        for k, v in hp.items(): print(f"  {k:<24} = {v}")
+        print("\nInferred hparams:")
+        for k, v in hp.items():
+            print(f"  {k:<24} = {v}")
     elif family == "llama":
-        rms_eps    = (hf_config or {}).get("rms_norm_eps")
+        rms_eps = (hf_config or {}).get("rms_norm_eps")
         rope_theta = (hf_config or {}).get("rope_theta")
         hp = _infer_llama_hparams(sd, rms_eps=rms_eps, rope_theta=rope_theta)
         print(f"\nInferred hparams: {hp}")
@@ -1211,21 +1263,18 @@ def show_arch(path: str) -> None:
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Reconstruct a runnable nn.Module from a .bin/.safetensors file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input",       help=".bin / .safetensors file or shard directory")
-    p.add_argument("--save",      default=None, metavar="PATH",
-                   help="Save the reconstructed module with torch.save()")
-    p.add_argument("--show-arch", action="store_true",
-                   help="Print parameter names and inferred hparams, then exit")
-    p.add_argument("--device",    default="cpu",
-                   help="Target device  (default: cpu)")
-    p.add_argument("--strict",    action="store_true",
-                   help="Strict key matching when loading weights")
+    p.add_argument("input", help=".bin / .safetensors file or shard directory")
+    p.add_argument("--save", default=None, metavar="PATH", help="Save the reconstructed module with torch.save()")
+    p.add_argument("--show-arch", action="store_true", help="Print parameter names and inferred hparams, then exit")
+    p.add_argument("--device", default="cpu", help="Target device  (default: cpu)")
+    p.add_argument("--strict", action="store_true", help="Strict key matching when loading weights")
     args = p.parse_args()
 
     if args.show_arch:

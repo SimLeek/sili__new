@@ -27,13 +27,25 @@ echo "── python ────────────────────
 [ "$FIX" -eq 1 ] && ruff check --fix sili tests tools >/dev/null 2>&1
 hard  "ruff check"          ruff check sili tests tools
 hard  "ruff format"         ruff format --check sili tests tools
-hard  "mypy (strict)"       mypy sili
 hard  "bandit"              bandit -r sili -c .bandit -q
 [ "$FIX" -eq 1 ] && codespell -w -q2 sili tests docs README.md >/dev/null 2>&1
 hard  "codespell"           codespell --skip "*.sst,*.safetensors" sili tests docs README.md
 hard  "deptry"              deptry .
+# Advisory, not a hard gate: 468 pre-existing errors across 14 files in
+# sili/ (never annotated before this lint setup existed) would otherwise
+# block every future commit touching those files. Promote to hard once
+# sili/ is actually clean.
+advisory "mypy (strict)"       mypy sili
+advisory "pydoclint"           pydoclint --style=numpy --check-return-types=False sili
 advisory "vulture (dead code)"   vulture sili tools --min-confidence 80
 advisory "radon (complexity)"    radon cc sili -s -nb --min B
+# Whole-tree baseline scan (NOT scoped to changed files, unlike the hooks
+# above and unlike clang-tidy's readability-function-size which only runs
+# on changed files) -- catches pre-existing giant functions like
+# disldo_backward (2403 lines, CCN=251, linear_disldo.hpp) that a
+# per-commit hook would never surface since nobody's editing that file
+# right now. Run this manually / in CI, not just on diffs.
+advisory "lizard (function length/complexity, whole tree)" lizard sili tools -w
 
 echo "── shell ───────────────────────────────────────────────"
 mapfile -t sh_files < <(find tests docs -name '*.sh' 2>/dev/null)

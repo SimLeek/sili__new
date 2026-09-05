@@ -33,16 +33,16 @@ Pixtral's patch_conv.weight) are kept DENSE, not pruned -- see the ndim==2
 branch below for the full rationale (small-in-every-dimension tensors don't
 sparsify well; also deferred to later-todo alongside MoE).
 """
+
 from __future__ import annotations
+
 import json
 import os
 import re
-from typing import Dict, List, Optional
 
 import torch
 
-
-_SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9._-]')
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _tensor_path(out_dir: str, name: str) -> str:
@@ -72,8 +72,8 @@ def _iter_shards(model_dir: str):
     idx_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(idx_path):
         with open(idx_path) as f:
-            weight_map: Dict[str, str] = json.load(f)["weight_map"]
-        by_shard: Dict[str, List[str]] = {}
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        by_shard: dict[str, list[str]] = {}
         for name, shard in weight_map.items():
             by_shard.setdefault(shard, []).append(name)
         for shard, names in sorted(by_shard.items()):
@@ -83,15 +83,12 @@ def _iter_shards(model_dir: str):
         if not os.path.exists(single):
             cands = [f for f in os.listdir(model_dir) if f.endswith(".safetensors")]
             if len(cands) != 1:
-                raise FileNotFoundError(
-                    f"No index.json and no unique .safetensors in {model_dir}")
+                raise FileNotFoundError(f"No index.json and no unique .safetensors in {model_dir}")
             single = os.path.join(model_dir, cands[0])
         yield single, None  # None -> enumerate keys from the file itself
 
 
-def streaming_sparsify(model_dir: str, out_dir: str,
-                       threshold: Optional[float] = None,
-                       verbose: bool = True) -> dict:
+def streaming_sparsify(model_dir: str, out_dir: str, threshold: float | None = None, verbose: bool = True) -> dict:
     """
     Phase 1: per-tensor prune -> CSR -> disk. Never holds more than one
     tensor in memory. Resumable: names already in manifest.json are skipped.
@@ -106,8 +103,10 @@ def streaming_sparsify(model_dir: str, out_dir: str,
       {name: {orig_shape, csr_shape|None, nnz, numel, layout, dtype}}
     """
     from safetensors import safe_open
+
     if threshold is None:
         from sili.conversion.sparse_prune import default_min_abs_param
+
         threshold = default_min_abs_param()
 
     os.makedirs(os.path.join(out_dir, "tensors"), exist_ok=True)
@@ -123,7 +122,7 @@ def streaming_sparsify(model_dir: str, out_dir: str,
         tmp = manifest_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(manifest, f)
-        os.replace(tmp, manifest_path)   # atomic on POSIX
+        os.replace(tmp, manifest_path)  # atomic on POSIX
 
     n_done = 0
     for shard_path, names in _iter_shards(model_dir):
@@ -132,17 +131,14 @@ def streaming_sparsify(model_dir: str, out_dir: str,
             for name in keys:
                 if name in manifest and _tensor_file_ok(_tensor_path(out_dir, name)):
                     continue
-                t = f.get_tensor(name)                     # ONE tensor in RAM
+                t = f.get_tensor(name)  # ONE tensor in RAM
                 orig_shape = list(t.shape)
-                entry = {"orig_shape": orig_shape, "numel": t.numel(),
-                         "dtype": str(t.dtype)}
+                entry = {"orig_shape": orig_shape, "numel": t.numel(), "dtype": str(t.dtype)}
                 if t.ndim == 2:
                     t = t.float()
                     t = t * (t.abs() >= threshold)
                     csr = t.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
-                    entry.update(layout="csr",
-                                 csr_shape=list(csr.shape),
-                                 nnz=int(csr.values().numel()))
+                    entry.update(layout="csr", csr_shape=list(csr.shape), nnz=int(csr.values().numel()))
                     torch.save(csr, _tensor_path(out_dir, name))
                     del csr
                 else:
@@ -162,8 +158,7 @@ def streaming_sparsify(model_dir: str, out_dir: str,
                     #       actually pays off).
                     # Deferred to later-todo alongside MoE expert-merge; see
                     # docs/requirements_vlm_streaming_rtac.md section 7.
-                    entry.update(layout="dense", csr_shape=None,
-                                 nnz=int((t != 0).sum().item()))
+                    entry.update(layout="dense", csr_shape=None, nnz=int((t != 0).sum().item()))
                     torch.save(t.float(), _tensor_path(out_dir, name))
                 del t
                 manifest[name] = entry
@@ -171,16 +166,17 @@ def streaming_sparsify(model_dir: str, out_dir: str,
                 if n_done % 25 == 0:
                     flush_manifest()
                     if verbose:
-                        print(f"[streaming]  {len(manifest)} tensors done "
-                              f"(last: {name}, nnz={entry['nnz']})")
+                        print(f"[streaming]  {len(manifest)} tensors done (last: {name}, nnz={entry['nnz']})")
     flush_manifest()
     manifest["_meta"] = manifest.get("_meta", {})
     manifest["_meta"].update(threshold=threshold, model_dir=model_dir)
     flush_manifest()
     if verbose:
         total_nnz = sum(e["nnz"] for k, e in manifest.items() if k != "_meta")
-        print(f"[streaming]  phase 1 complete: {len(manifest)-1} tensors, "
-              f"total nnz={total_nnz:,}, threshold={threshold:.5f}")
+        print(
+            f"[streaming]  phase 1 complete: {len(manifest) - 1} tensors, "
+            f"total nnz={total_nnz:,}, threshold={threshold:.5f}"
+        )
     return manifest
 
 
@@ -192,30 +188,32 @@ def estimate_suffix_bytes(manifest: dict, prefix: str, suffix: str) -> int:
     for name, e in manifest.items():
         if name == "_meta" or not pat.match(name):
             continue
-        total += e["nnz"] * 8            # value fp32 + col int32
+        total += e["nnz"] * 8  # value fp32 + col int32
         rows += (e["csr_shape"] or e["orig_shape"])[0]
-    return total + (rows + 1) * 8        # crow ptrs
+    return total + (rows + 1) * 8  # crow ptrs
 
 
-def streaming_fold_suffix(out_dir: str, prefix: str, suffix: str,
-                          n_layers: int, mem_budget_gb: float = 8.0,
-                          verbose: bool = True):
+def streaming_fold_suffix(
+    out_dir: str, prefix: str, suffix: str, n_layers: int, mem_budget_gb: float = 8.0, verbose: bool = True
+):
     """
     Phase 2: sequentially load one suffix across layers and stack into a
     FoldedBlockDescriptor. If the manifest-predicted footprint exceeds
     mem_budget_gb, returns a LIST of per-layer descriptors (n_folds=1 each)
     instead of one stacked descriptor -- degraded but functional (--no-stack).
     """
-    from sili.conversion.rnn_fold import (FoldedBlockDescriptor,
-                                          stack_csr_vertical)
+    from sili.conversion.rnn_fold import FoldedBlockDescriptor, stack_csr_vertical
+
     with open(os.path.join(out_dir, "manifest.json")) as f:
         manifest = json.load(f)
 
     est = estimate_suffix_bytes(manifest, prefix, suffix)
-    over_budget = est > mem_budget_gb * (1024 ** 3)
+    over_budget = est > mem_budget_gb * (1024**3)
     if verbose:
-        print(f"[streaming]  fold {prefix}*{suffix}: predicted "
-              f"{est/1e9:.2f} GB ({'PER-LAYER fallback' if over_budget else 'stacked'})")
+        print(
+            f"[streaming]  fold {prefix}*{suffix}: predicted "
+            f"{est / 1e9:.2f} GB ({'PER-LAYER fallback' if over_budget else 'stacked'})"
+        )
 
     def load(i):
         name = f"{prefix}{i}{suffix}"
@@ -227,10 +225,13 @@ def streaming_fold_suffix(out_dir: str, prefix: str, suffix: str,
     def make_desc(csr_list, indices):
         stacked = stack_csr_vertical(csr_list) if len(csr_list) > 1 else csr_list[0]
         return FoldedBlockDescriptor(
-            n_folds=len(csr_list), block_indices=indices,
+            n_folds=len(csr_list),
+            block_indices=indices,
             stacked_weights={suffix: stacked},
             out_dims={suffix: int(csr_list[0].shape[0])},
-            band_half_widths={suffix: None}, prefix=prefix)
+            band_half_widths={suffix: None},
+            prefix=prefix,
+        )
 
     if over_budget:
         return [make_desc([load(i)], [i]) for i in range(n_layers)]

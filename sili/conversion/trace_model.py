@@ -38,27 +38,25 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import textwrap
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
-
+from torch import nn
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Helpers shared with rnn_fold / sparse_prune
 # ══════════════════════════════════════════════════════════════════════════════
 
-_BLOCK_RE = re.compile(r'^(.*?\.)(\d+)(\..+)$')
+_BLOCK_RE = re.compile(r"^(.*?\.)(\d+)(\..+)$")
 
-def _parse_block_key(name: str) -> Optional[Tuple[str, int, str]]:
+
+def _parse_block_key(name: str) -> tuple[str, int, str] | None:
     m = _BLOCK_RE.match(name)
     if m is None:
         return None
     return m.group(1), int(m.group(2)), m.group(3)
+
 
 def _safe(name: str) -> str:
     """Convert a dotted parameter name to a safe Python identifier."""
@@ -69,59 +67,79 @@ def _safe(name: str) -> str:
 #  Layer descriptor
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class LayerDesc:
     """Everything known about one tensor in the payload."""
-    __slots__ = ("name", "shape", "fmt", "sparsity", "block_idx",
-                 "block_prefix", "suffix", "not_impl", "not_impl_reason",
-                 "ndim")
+
+    __slots__ = (
+        "block_idx",
+        "block_prefix",
+        "fmt",
+        "name",
+        "ndim",
+        "not_impl",
+        "not_impl_reason",
+        "shape",
+        "sparsity",
+        "suffix",
+    )
 
     def __init__(self, name: str, shape: tuple, fmt: str, sparsity: float = 0.0):
-        self.name     = name
-        self.shape    = shape
-        self.fmt      = fmt          # "sparse" | "dense" | "folded"
+        self.name = name
+        self.shape = shape
+        self.fmt = fmt  # "sparse" | "dense" | "folded"
         self.sparsity = sparsity
-        self.ndim     = len(shape)
+        self.ndim = len(shape)
 
         parsed = _parse_block_key(name)
         if parsed:
             self.block_prefix, self.block_idx, self.suffix = parsed
         else:
             self.block_prefix = None
-            self.block_idx    = None
-            self.suffix       = name
+            self.block_idx = None
+            self.suffix = name
 
         # Mark layers that will definitely raise NotImplementedError
-        self.not_impl        = False
+        self.not_impl = False
         self.not_impl_reason = ""
         self._classify_not_impl()
 
     def _classify_not_impl(self) -> None:
         n = self.name.lower()
-        s = self.suffix.lower() if self.suffix else ""
+        self.suffix.lower() if self.suffix else ""
 
         # Embedding tables — row lookup, not matmul
         if "embed_tokens" in n or "word_embed" in n or "wte" in n:
-            self.not_impl        = True
+            self.not_impl = True
             self.not_impl_reason = "embedding lookup (F.embedding, not matmul)"
             return
 
         # Patch / position embeddings
         if "patch_embed" in n or "pos_embed" in n or "position_embed" in n:
-            self.not_impl        = True
+            self.not_impl = True
             self.not_impl_reason = "non-linear conv / positional embed"
             return
 
         # LayerNorm / RMSNorm — no sparse kernel
-        if any(t in n for t in ("layernorm", "layer_norm", "rmsnorm",
-                                  "input_layernorm", "post_attention_layernorm",
-                                  "norm.weight", "norm.bias")):
-            self.not_impl        = True
+        if any(
+            t in n
+            for t in (
+                "layernorm",
+                "layer_norm",
+                "rmsnorm",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "norm.weight",
+                "norm.bias",
+            )
+        ):
+            self.not_impl = True
             self.not_impl_reason = "layer normalisation (no sparse mean/var kernel)"
             return
 
         # LM head — usually large and tied; softmax output is always dense
         if "lm_head" in n:
-            self.not_impl        = True
+            self.not_impl = True
             self.not_impl_reason = "lm_head projection + softmax (output is dense)"
             return
 
@@ -143,20 +161,22 @@ class LayerDesc:
 #  Structural tracer — builds LayerDesc list from payload
 # ══════════════════════════════════════════════════════════════════════════════
 
-def structural_trace(payload: dict) -> List[LayerDesc]:
+
+def structural_trace(payload: dict) -> list[LayerDesc]:
     """
     Walk sparse_state_dict and folded_blocks to produce an ordered list of
     LayerDesc objects.  No forward() execution required.
     """
     ssd = payload.get("sparse_state_dict", payload)
-    descs: List[LayerDesc] = []
+    descs: list[LayerDesc] = []
 
     def _nat_key(s):
-        return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s)]
+        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+
     for name in sorted(ssd.keys(), key=_nat_key):
         entry = ssd[name]
         if isinstance(entry, dict):
-            csr   = entry.get("csr")
+            csr = entry.get("csr")
             dense = entry.get("dense")
             if dense is None:
                 dense = entry.get("raw")
@@ -170,17 +190,17 @@ def structural_trace(payload: dict) -> List[LayerDesc]:
             else:
                 shape = ()
             if csr is not None:
-                nnz      = int(csr.values().numel())
-                n_elem   = shape[0] * shape[1] if len(shape) >= 2 else 1
+                nnz = int(csr.values().numel())
+                n_elem = shape[0] * shape[1] if len(shape) >= 2 else 1
                 sparsity = 1.0 - nnz / n_elem if n_elem > 0 else 0.0
-                fmt      = "sparse"
+                fmt = "sparse"
             else:
                 sparsity = 0.0
-                fmt      = "dense"
+                fmt = "dense"
         elif isinstance(entry, torch.Tensor):
-            shape    = tuple(entry.shape)
+            shape = tuple(entry.shape)
             sparsity = 0.0
-            fmt      = "sparse" if entry.layout == torch.sparse_csr else "dense"
+            fmt = "sparse" if entry.layout == torch.sparse_csr else "dense"
         else:
             continue
 
@@ -188,13 +208,13 @@ def structural_trace(payload: dict) -> List[LayerDesc]:
 
     # Folded blocks — add as a single descriptor per group
     for fd in payload.get("folded_blocks", []):
-        prefix      = fd.get("prefix", "")
-        n_folds     = fd.get("n_folds", 1)
+        prefix = fd.get("prefix", "")
+        n_folds = fd.get("n_folds", 1)
         block_range = fd.get("block_indices", [])
         for suffix, csr in fd.get("stacked_weights", {}).items():
-            shape    = tuple(csr.shape) if isinstance(csr, torch.Tensor) else ()
-            nnz      = int(csr.values().numel()) if isinstance(csr, torch.Tensor) else 0
-            n_elem   = shape[0] * shape[1] if len(shape) >= 2 else 1
+            shape = tuple(csr.shape) if isinstance(csr, torch.Tensor) else ()
+            nnz = int(csr.values().numel()) if isinstance(csr, torch.Tensor) else 0
+            n_elem = shape[0] * shape[1] if len(shape) >= 2 else 1
             sparsity = 1.0 - nnz / n_elem if n_elem > 0 else 0.0
             fake_name = f"{prefix}{block_range[0]}{suffix}__folded_{n_folds}"
             d = LayerDesc(fake_name, shape, "folded", sparsity)
@@ -207,7 +227,8 @@ def structural_trace(payload: dict) -> List[LayerDesc]:
 #  FX symbolic tracer (optional, requires original model)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fx_trace(model: nn.Module, example_inputs: dict) -> Optional[object]:
+
+def fx_trace(model: nn.Module, example_inputs: dict) -> object | None:
     """
     Attempt torch.fx symbolic trace.  Returns a GraphModule or None on failure.
 
@@ -215,16 +236,17 @@ def fx_trace(model: nn.Module, example_inputs: dict) -> Optional[object]:
     (anything that would raise NotImplementedError) as opaque call_module
     nodes rather than failing the trace.
     """
-    from torch.fx import Tracer, GraphModule
+    from torch.fx import GraphModule, Tracer
 
     class _PermissiveTracer(Tracer):
         """Treat every nn.Module as a leaf so we never enter forward()."""
+
         def is_leaf_module(self, m: nn.Module, qualname: str) -> bool:
             return True
 
     tracer = _PermissiveTracer()
-    dummy  = example_inputs.get("input_ids", torch.zeros(1, 32, dtype=torch.long))
-    graph  = tracer.trace(model, concrete_args={"input_ids": dummy})
+    dummy = example_inputs.get("input_ids", torch.zeros(1, 32, dtype=torch.long))
+    graph = tracer.trace(model, concrete_args={"input_ids": dummy})
     return GraphModule(model, graph)
 
 
@@ -232,17 +254,18 @@ def fx_trace(model: nn.Module, example_inputs: dict) -> Optional[object]:
 #  Block grouper
 # ══════════════════════════════════════════════════════════════════════════════
 
-def group_into_blocks(descs: List[LayerDesc]) -> List[Tuple[Optional[int], List[LayerDesc]]]:
+
+def group_into_blocks(descs: list[LayerDesc]) -> list[tuple[int | None, list[LayerDesc]]]:
     """
     Group LayerDesc list into (block_index_or_None, [LayerDesc]) pairs.
 
     Layers with the same block_prefix and block_idx are grouped together.
     Layers outside any block (embeddings, final norm, lm_head) have index None.
     """
-    groups: List[Tuple[Optional[int], List[LayerDesc]]] = []
-    cur_idx   : Optional[int]  = "UNSET"  # type: ignore
-    cur_prefix: Optional[str]  = None
-    cur_group : List[LayerDesc] = []
+    groups: list[tuple[int | None, list[LayerDesc]]] = []
+    cur_idx: int | None = "UNSET"  # type: ignore
+    cur_prefix: str | None = None
+    cur_group: list[LayerDesc] = []
 
     for d in descs:
         key = (d.block_prefix, d.block_idx)
@@ -251,21 +274,21 @@ def group_into_blocks(descs: List[LayerDesc]) -> List[Tuple[Optional[int], List[
             # Not in any block — flush current, emit as standalone
             if cur_group:
                 groups.append((cur_idx if cur_idx != "UNSET" else None, cur_group))
-                cur_group  = []
-                cur_idx    = "UNSET"  # type: ignore
+                cur_group = []
+                cur_idx = "UNSET"  # type: ignore
                 cur_prefix = None
             groups.append((None, [d]))
 
         elif cur_idx == "UNSET" or key == (cur_prefix, cur_idx):
-            cur_idx    = d.block_idx
+            cur_idx = d.block_idx
             cur_prefix = d.block_prefix
             cur_group.append(d)
 
         else:
             groups.append((cur_idx, cur_group))
-            cur_idx    = d.block_idx
+            cur_idx = d.block_idx
             cur_prefix = d.block_prefix
-            cur_group  = [d]
+            cur_group = [d]
 
     if cur_group:
         groups.append((cur_idx if cur_idx != "UNSET" else None, cur_group))
@@ -277,6 +300,7 @@ def group_into_blocks(descs: List[LayerDesc]) -> List[Tuple[Optional[int], List[
 #  Example input inference
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def infer_example_inputs(payload: dict) -> dict:
     """
     Infer reasonable example input shapes from the payload's weight tensors.
@@ -285,7 +309,7 @@ def infer_example_inputs(payload: dict) -> dict:
     """
     ssd = payload.get("sparse_state_dict", {})
 
-    def _shape(name_fragment: str) -> Optional[tuple]:
+    def _shape(name_fragment: str) -> tuple | None:
         for k, v in ssd.items():
             if name_fragment in k:
                 if isinstance(v, dict):
@@ -296,30 +320,30 @@ def infer_example_inputs(payload: dict) -> dict:
 
     # Vocab size + d_model from embedding
     embed_shape = _shape("embed_tokens.weight") or _shape("wte.weight")
-    vocab_size  = embed_shape[0] if embed_shape else 32000
-    d_model     = embed_shape[1] if embed_shape and len(embed_shape) > 1 else 4096
-    seq_len     = 32
+    vocab_size = embed_shape[0] if embed_shape else 32000
+    d_model = embed_shape[1] if embed_shape and len(embed_shape) > 1 else 4096
+    seq_len = 32
 
     # Vision inputs?  Look for patch embed conv weight
     patch_shape = _shape("patch_embed.proj.weight")
-    has_vision  = patch_shape is not None
+    has_vision = patch_shape is not None
     if has_vision and len(patch_shape) >= 2:
-        in_chans   = patch_shape[1] if len(patch_shape) >= 4 else 3
-        patch_h    = patch_shape[-2] if len(patch_shape) >= 4 else 14
-        patch_w    = patch_shape[-1] if len(patch_shape) >= 4 else 14
-        img_h      = patch_h * 16
-        img_w      = patch_w * 16
+        in_chans = patch_shape[1] if len(patch_shape) >= 4 else 3
+        patch_h = patch_shape[-2] if len(patch_shape) >= 4 else 14
+        patch_w = patch_shape[-1] if len(patch_shape) >= 4 else 14
+        img_h = patch_h * 16
+        img_w = patch_w * 16
     else:
         in_chans, img_h, img_w = 3, 448, 448
 
     inputs = {
         "vocab_size": vocab_size,
-        "d_model":    d_model,
-        "seq_len":    seq_len,
+        "d_model": d_model,
+        "seq_len": seq_len,
         "has_vision": has_vision,
-        "in_chans":   in_chans,
-        "img_h":      img_h,
-        "img_w":      img_w,
+        "in_chans": in_chans,
+        "img_h": img_h,
+        "img_w": img_w,
     }
     return inputs
 
@@ -328,11 +352,12 @@ def infer_example_inputs(payload: dict) -> dict:
 #  Code generator
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _layer_comment(d: LayerDesc, indent: int = 4) -> str:
-    pad   = " " * indent
+    pad = " " * indent
     shape = str(d.shape)
-    ann   = d.annotation
-    line  = f"{pad}#  {d.name:<60} {shape:<22} {ann}"
+    ann = d.annotation
+    line = f"{pad}#  {d.name:<60} {shape:<22} {ann}"
     if d.not_impl:
         line += f"\n{pad}#     reason: {d.not_impl_reason}"
     return line
@@ -347,13 +372,10 @@ def _detect_block_config(groups):
 
     Returns a dict of config values used when emitting transformer_block().
     """
-    attn_sfx = ("q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
-                "query", "key", "value", "in_proj")
-    norm_sfx = ("input_layernorm", "post_attention_layernorm",
-                "layernorm", "layer_norm", "rmsnorm")
+    norm_sfx = ("input_layernorm", "post_attention_layernorm", "layernorm", "layer_norm", "rmsnorm")
 
     cfg = {
-        "pre_norm":  "input_layernorm.weight",
+        "pre_norm": "input_layernorm.weight",
         "post_norm": "post_attention_layernorm.weight",
         "has_swiglu": False,
         "has_gqa": False,
@@ -362,10 +384,9 @@ def _detect_block_config(groups):
     for bidx, bdescs in groups:
         if bidx is None:
             continue
-        norms = [d.suffix.lstrip(".") for d in bdescs
-                 if any(k in d.suffix for k in norm_sfx)]
+        norms = [d.suffix.lstrip(".") for d in bdescs if any(k in d.suffix for k in norm_sfx)]
         if len(norms) >= 1:
-            cfg["pre_norm"]  = norms[0]
+            cfg["pre_norm"] = norms[0]
         if len(norms) >= 2:
             cfg["post_norm"] = norms[1]
 
@@ -376,7 +397,7 @@ def _detect_block_config(groups):
             cfg["has_gqa"] = q_shape[0] != k_shape[0]
 
         cfg["has_swiglu"] = any("gate_proj" in d.suffix for d in bdescs)
-        break   # only need block 0
+        break  # only need block 0
 
     return cfg
 
@@ -384,9 +405,9 @@ def _detect_block_config(groups):
 def generate_trace_file(
     payload,
     output_path,
-    sparse_path    = "model_sparse.pt",
-    original_model = None,
-    gm             = None,
+    sparse_path="model_sparse.pt",
+    original_model=None,
+    gm=None,
 ):
     """
     Write the trace file.
@@ -397,29 +418,26 @@ def generate_trace_file(
         model.py  -- SiliModel: embed -> block loop -> norm -> lm_head
         run.py    -- weight loading, example inputs, inference harness
     """
-    from datetime import datetime
 
-    descs  = structural_trace(payload)
+    descs = structural_trace(payload)
     groups = group_into_blocks(descs)
-    inp    = infer_example_inputs(payload)
-    cfg    = _detect_block_config(groups)
+    inp = infer_example_inputs(payload)
+    cfg = _detect_block_config(groups)
 
-    block_indices = sorted(
-        set(d.block_idx for d in descs if d.block_idx is not None), key=int
-    )
-    n_blocks   = len(block_indices)
+    block_indices = sorted({d.block_idx for d in descs if d.block_idx is not None}, key=int)
+    n_blocks = len(block_indices)
     has_vision = inp["has_vision"]
-    vocab      = inp["vocab_size"]
-    d_model    = inp["d_model"]
-    seq_len    = inp["seq_len"]
-    in_chans   = inp["in_chans"]
-    img_h      = inp["img_h"]
-    img_w      = inp["img_w"]
+    vocab = inp["vocab_size"]
+    d_model = inp["d_model"]
+    seq_len = inp["seq_len"]
+    in_chans = inp["in_chans"]
+    img_h = inp["img_h"]
+    img_w = inp["img_w"]
     has_swiglu = cfg["has_swiglu"]
-    has_gqa    = cfg["has_gqa"]
-    pre_norm   = cfg["pre_norm"]
-    post_norm  = cfg["post_norm"]
-    now        = datetime.now().strftime("%Y-%m-%d %H:%M")
+    has_gqa = cfg["has_gqa"]
+    pre_norm = cfg["pre_norm"]
+    post_norm = cfg["post_norm"]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     L = []
     e = L.append
@@ -441,9 +459,7 @@ def generate_trace_file(
     # =========================================================================
     # File header
     # =========================================================================
-    vision_note = (
-        f"yes  ({in_chans}ch  {img_h}x{img_w})" if has_vision else "no"
-    )
+    vision_note = f"yes  ({in_chans}ch  {img_h}x{img_w})" if has_vision else "no"
     lines(
         "#!/usr/bin/env python3",
         '"""',
@@ -484,7 +500,8 @@ def generate_trace_file(
     # SECTION 1 -- OPS  (just imports -- sili provides the implementations)
     # =========================================================================
     section(
-        "SECTION 1 -- OPS", "ops.py",
+        "SECTION 1 -- OPS",
+        "ops.py",
         "All leaf ops are imported from sili.",
         "If something is missing, add it to sili and re-run -- no edits needed here.",
     )
@@ -517,12 +534,11 @@ def generate_trace_file(
     # =========================================================================
 
     # Collect the first block's weight list for the docstring
-    first_block_descs = next(
-        (bd for bi, bd in groups if bi is not None), []
-    )
+    first_block_descs = next((bd for bi, bd in groups if bi is not None), [])
 
     section(
-        "SECTION 2 -- BLOCKS", "blocks.py",
+        "SECTION 2 -- BLOCKS",
+        "blocks.py",
         "Single transformer_block() covers all N blocks -- they share the same",
         "architecture; only their weights differ.  SiliModel passes the right",
         "weight dict for each index via self._w(i).",
@@ -539,9 +555,9 @@ def generate_trace_file(
         "    # Weight keys expected in w:",
     )
     for d in first_block_descs:
-        key    = d.suffix.lstrip(".")
+        key = d.suffix.lstrip(".")
         layout = "CSR" if d.fmt == "sparse" else "dense"
-        e(f"    #   {key:<50} {str(d.shape):<22} [{layout}]")
+        e(f"    #   {key:<50} {d.shape!s:<22} [{layout}]")
     lines(
         "",
         f"    # -- Pre-attention norm  (key: '{pre_norm}')",
@@ -592,7 +608,8 @@ def generate_trace_file(
     # SECTION 3 -- MODEL
     # =========================================================================
     section(
-        "SECTION 3 -- MODEL", "model.py",
+        "SECTION 3 -- MODEL",
+        "model.py",
         "SiliModel orchestrates embed -> block loop -> norm -> lm_head.",
         "self.sparse  : {name: SparseLinear}  CSR weights from sparse_prune",
         "self.dense   : {name: Tensor}         dense weights (norms, embeds)",
@@ -701,7 +718,8 @@ def generate_trace_file(
     # SECTION 4 -- RUN
     # =========================================================================
     section(
-        "SECTION 4 -- RUN", "run.py",
+        "SECTION 4 -- RUN",
+        "run.py",
         "Weight loading, example inputs, and inference harness.",
         "For training: add a loss function and call sili's backward() here.",
     )
@@ -767,10 +785,10 @@ def generate_trace_file(
 
 
 def generate_for_runtime(
-    payload:       dict,
-    sparse_path:   str,
-    output_path:   Optional[str] = None,
-    original_model: Optional[nn.Module] = None,
+    payload: dict,
+    sparse_path: str,
+    output_path: str | None = None,
+    original_model: nn.Module | None = None,
 ) -> str:
     """
     Generate a trace file for a sparse_prune / rnn_fold payload.
@@ -789,13 +807,13 @@ def generate_for_runtime(
     Path of the generated file (str).
     """
     if output_path is None:
-        stem        = Path(sparse_path).stem
+        stem = Path(sparse_path).stem
         output_path = str(Path(sparse_path).parent / f"{stem}_trace.py")
 
     gm = None
     if original_model is not None:
         inp = infer_example_inputs(payload)
-        gm  = fx_trace(original_model, {"input_ids": torch.zeros(1, inp["seq_len"], dtype=torch.long)})
+        gm = fx_trace(original_model, {"input_ids": torch.zeros(1, inp["seq_len"], dtype=torch.long)})
 
     generate_trace_file(
         payload=payload,
@@ -811,19 +829,17 @@ def generate_for_runtime(
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Generate a runnable traced forward skeleton from a sparse payload.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input",       help="sparse_prune / rnn_fold .pt payload")
-    p.add_argument("-o", "--output", default=None,
-                   help="Output .py path  (default: <input>_trace.py)")
-    p.add_argument("--original",  default=None, metavar="PATH",
-                   help="Original model path for FX-assisted node ordering")
-    p.add_argument("--run",       action="store_true",
-                   help="Execute the generated file immediately after writing")
+    p.add_argument("input", help="sparse_prune / rnn_fold .pt payload")
+    p.add_argument("-o", "--output", default=None, help="Output .py path  (default: <input>_trace.py)")
+    p.add_argument("--original", default=None, metavar="PATH", help="Original model path for FX-assisted node ordering")
+    p.add_argument("--run", action="store_true", help="Execute the generated file immediately after writing")
     args = p.parse_args()
 
     payload = torch.load(args.input, map_location="cpu", weights_only=False)
@@ -831,6 +847,7 @@ def main() -> None:
     original_model = None
     if args.original:
         import model_reconstruct as mr
+
         original_model = mr.reconstruct_model(args.original)
 
     out = generate_for_runtime(
@@ -843,6 +860,7 @@ def main() -> None:
 
     if args.run:
         import subprocess
+
         print(f"[trace_model]  Running {out} ...\n")
         subprocess.run([sys.executable, out])
 

@@ -78,14 +78,15 @@ CLI
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 try:
     # Package-qualified import ONLY. A previous version of this block did
@@ -102,7 +103,8 @@ try:
     # sys.modules naturally deduplicate the extension regardless of import
     # order, which is also required for tools that walk the whole `sili`
     # package tree (pdoc, Sphinx autodoc) without controlling import order.
-    from sili import _cpu as _sili_cpu   # SparseLinearLayer, hoyer_score, dense_to_csr
+    from sili import _cpu as _sili_cpu  # SparseLinearLayer, hoyer_score, dense_to_csr
+
     _SILI_AVAILABLE = True
 except ImportError:
     _sili_cpu = None
@@ -116,10 +118,10 @@ except ImportError:
 # Captures: (prefix_before_index, block_index_str, suffix_after_index)
 # Example: "model.layers.3.self_attn.q_proj.weight"
 #          → ("model.layers.", "3", ".self_attn.q_proj.weight")
-_BLOCK_RE = re.compile(r'^(.*?\.)(\d+)(\..+)$')
+_BLOCK_RE = re.compile(r"^(.*?\.)(\d+)(\..+)$")
 
 
-def _parse_block_key(name: str) -> Optional[Tuple[str, int, str]]:
+def _parse_block_key(name: str) -> tuple[str, int, str] | None:
     """
     Split a parameter name into (prefix, block_index, suffix).
 
@@ -136,9 +138,9 @@ def _parse_block_key(name: str) -> Optional[Tuple[str, int, str]]:
 
 
 def detect_repeated_block_groups(
-    state_dict: Dict[str, torch.Tensor],
+    state_dict: dict[str, torch.Tensor],
     min_group_size: int = 2,
-) -> List[Tuple[str, List[int]]]:
+) -> list[tuple[str, list[int]]]:
     """
     Find runs of consecutive blocks that share identical parameter structure.
 
@@ -180,7 +182,7 @@ def detect_repeated_block_groups(
     latent bug and are fixed alongside this function).
     """
     # Gather {(prefix, block_index): {suffix: shape}}
-    block_params: Dict[Tuple[str, int], Dict[str, torch.Size]] = defaultdict(dict)
+    block_params: dict[tuple[str, int], dict[str, torch.Size]] = defaultdict(dict)
     for name, tensor in state_dict.items():
         parsed = _parse_block_key(name)
         if parsed is None:
@@ -195,16 +197,16 @@ def detect_repeated_block_groups(
 
     # Process each prefix's index range independently -- two families must
     # never merge into one group even if their index ranges overlap.
-    prefixes = sorted({p for p, _ in block_params.keys()})
-    groups: List[Tuple[str, List[int]]] = []
+    prefixes = sorted({p for p, _ in block_params})
+    groups: list[tuple[str, list[int]]] = []
 
     for prefix in prefixes:
-        indices = sorted(i for p, i in block_params.keys() if p == prefix)
-        current_group: List[int] = [indices[0]]
+        indices = sorted(i for p, i in block_params if p == prefix)
+        current_group: list[int] = [indices[0]]
 
-        for prev_i, cur_i in zip(indices, indices[1:]):
-            consecutive = (cur_i == prev_i + 1)
-            same_shape  = block_params[(prefix, prev_i)] == block_params[(prefix, cur_i)]
+        for prev_i, cur_i in itertools.pairwise(indices):
+            consecutive = cur_i == prev_i + 1
+            same_shape = block_params[(prefix, prev_i)] == block_params[(prefix, cur_i)]
             if consecutive and same_shape:
                 current_group.append(cur_i)
             else:
@@ -219,8 +221,8 @@ def detect_repeated_block_groups(
 
 
 def report_block_groups(
-    state_dict: Dict[str, torch.Tensor],
-    groups: List[Tuple[str, List[int]]],
+    state_dict: dict[str, torch.Tensor],
+    groups: list[tuple[str, list[int]]],
 ) -> None:
     """Print a human-readable summary of detected fold groups."""
     if not groups:
@@ -236,15 +238,17 @@ def report_block_groups(
         # block family that happens to share the same index (see
         # detect_repeated_block_groups docstring).
         suffixes = sorted(
-            suffix for name in state_dict
-            if (parsed := _parse_block_key(name)) is not None
-            and parsed[0] == prefix and parsed[1] == sample_idx
+            suffix
+            for name in state_dict
+            if (parsed := _parse_block_key(name)) is not None and parsed[0] == prefix and parsed[1] == sample_idx
             for suffix in [parsed[2]]
         )
         # Find Q/K/V projections
-        attn_params = [s for s in suffixes if any(t in s for t in
-                       ('q_proj', 'k_proj', 'v_proj', 'query', 'key', 'value',
-                        'c_attn', 'in_proj'))]
+        attn_params = [
+            s
+            for s in suffixes
+            if any(t in s for t in ("q_proj", "k_proj", "v_proj", "query", "key", "value", "c_attn", "in_proj"))
+        ]
 
         print(f"  Group {g_idx}: prefix='{prefix}'  blocks {group[0]}–{group[-1]}  ({n} blocks to fold into 1)")
         print(f"    Parameters per block : {len(suffixes)}")
@@ -256,7 +260,8 @@ def report_block_groups(
 #  CSR vertical stacking
 # ══════════════════════════════════════════════════════════════════════════════
 
-def stack_csr_vertical(csr_list: List[torch.Tensor]) -> torch.Tensor:
+
+def stack_csr_vertical(csr_list: list[torch.Tensor]) -> torch.Tensor:
     """
     Vertically stack N CSR matrices of shape [out_i, in] into one [Σout_i, in].
 
@@ -280,32 +285,32 @@ def stack_csr_vertical(csr_list: List[torch.Tensor]) -> torch.Tensor:
     if len(csr_list) == 1:
         return csr_list[0]
 
-    all_values      = []
+    all_values = []
     all_col_indices = []
-    crow_parts      = []
-    nnz_offset      = 0
-    total_rows      = 0
+    crow_parts = []
+    nnz_offset = 0
+    total_rows = 0
 
     for csr in csr_list:
-        vals  = csr.values()
-        cols  = csr.col_indices()
-        crows = csr.crow_indices()          # length = n_rows + 1
+        vals = csr.values()
+        cols = csr.col_indices()
+        crows = csr.crow_indices()  # length = n_rows + 1
 
         all_values.append(vals)
         all_col_indices.append(cols)
 
         if total_rows == 0:
-            crow_parts.append(crows)        # include the leading 0
+            crow_parts.append(crows)  # include the leading 0
         else:
             # Skip the leading 0; offset all entries by nnz accumulated so far
             crow_parts.append(crows[1:] + nnz_offset)
 
         nnz_offset += vals.numel()
-        total_rows += crows.numel() - 1     # n_rows = len(crow_indices) - 1
+        total_rows += crows.numel() - 1  # n_rows = len(crow_indices) - 1
 
-    stacked_values      = torch.cat(all_values)
+    stacked_values = torch.cat(all_values)
     stacked_col_indices = torch.cat(all_col_indices)
-    stacked_crow        = torch.cat(crow_parts)
+    stacked_crow = torch.cat(crow_parts)
 
     n_cols = csr_list[0].shape[1]
 
@@ -325,13 +330,13 @@ def slice_csr_rows(csr: torch.Tensor, row_start: int, row_end: int) -> torch.Ten
     CSR row slicing is O(nnz_in_slice) — we only materialise the needed rows.
     Returns a float32 dense tensor of shape [row_end - row_start, n_cols].
     """
-    crow  = csr.crow_indices()
-    cols  = csr.col_indices()
-    vals  = csr.values()
+    crow = csr.crow_indices()
+    cols = csr.col_indices()
+    vals = csr.values()
     n_col = csr.shape[1]
 
     nnz_start = int(crow[row_start].item())
-    nnz_end   = int(crow[row_end].item())
+    nnz_end = int(crow[row_end].item())
 
     slice_vals = vals[nnz_start:nnz_end]
     slice_cols = cols[nnz_start:nnz_end]
@@ -340,7 +345,9 @@ def slice_csr_rows(csr: torch.Tensor, row_start: int, row_end: int) -> torch.Ten
 
     n_rows = row_end - row_start
     csr_slice = torch.sparse_csr_tensor(
-        slice_crow, slice_cols, slice_vals,
+        slice_crow,
+        slice_cols,
+        slice_vals,
         size=(n_rows, n_col),
         dtype=csr.dtype,
     )
@@ -352,11 +359,12 @@ def slice_csr_rows(csr: torch.Tensor, row_start: int, row_end: int) -> torch.Ten
 #  Attention banding
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def make_banded_attention_mask(
     seq_len: int,
     band_half_width: int,
     device: torch.device = torch.device("cpu"),
-    dtype: torch.dtype   = torch.float32,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
     Build an additive attention mask that restricts each query position to
@@ -395,8 +403,8 @@ def make_banded_attention_mask(
     -------
     Additive bias tensor of shape [seq_len, seq_len].
     """
-    q_pos = torch.arange(seq_len, device=device).unsqueeze(1)   # [L, 1]
-    k_pos = torch.arange(seq_len, device=device).unsqueeze(0)   # [1, L]
+    q_pos = torch.arange(seq_len, device=device).unsqueeze(1)  # [L, 1]
+    k_pos = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, L]
     blocked = (q_pos - k_pos).abs() > band_half_width
     mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
     mask.masked_fill_(blocked, float("-inf"))
@@ -424,6 +432,7 @@ def infer_seq_len_from_attn_weight(
 #  Folded block descriptor
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class FoldedBlockDescriptor:
     """
     All metadata needed to execute one folded block at inference time.
@@ -439,22 +448,23 @@ class FoldedBlockDescriptor:
     skip_connection_outputs : if True, average per-step outputs instead of returning
                               final accumulated state (see RNNFoldedBlock.forward)
     """
+
     def __init__(
         self,
-        n_folds:                 int,
-        block_indices:           List[int],
-        stacked_weights:         Dict[str, torch.Tensor],
-        out_dims:                Dict[str, int],
-        band_half_widths:        Dict[str, Optional[int]],
-        prefix:                  str,
+        n_folds: int,
+        block_indices: list[int],
+        stacked_weights: dict[str, torch.Tensor],
+        out_dims: dict[str, int],
+        band_half_widths: dict[str, int | None],
+        prefix: str,
         skip_connection_outputs: bool = False,
     ):
-        self.n_folds                 = n_folds
-        self.block_indices           = block_indices
-        self.stacked_weights         = stacked_weights
-        self.out_dims                = out_dims
-        self.band_half_widths        = band_half_widths
-        self.prefix                  = prefix
+        self.n_folds = n_folds
+        self.block_indices = block_indices
+        self.stacked_weights = stacked_weights
+        self.out_dims = out_dims
+        self.band_half_widths = band_half_widths
+        self.prefix = prefix
         self.skip_connection_outputs = skip_connection_outputs
 
     def fold_weight(self, suffix: str, fold_step: int) -> torch.Tensor:
@@ -464,10 +474,10 @@ class FoldedBlockDescriptor:
         Slices rows [fold_step * out_dim : (fold_step+1) * out_dim] from the
         stacked CSR matrix and densifies them.
         """
-        csr     = self.stacked_weights[suffix]
+        csr = self.stacked_weights[suffix]
         out_dim = self.out_dims[suffix]
         r_start = fold_step * out_dim
-        r_end   = r_start + out_dim
+        r_end = r_start + out_dim
         return slice_csr_rows(csr, r_start, r_end)
 
     def fold_weight_csr(self, suffix: str, fold_step: int) -> torch.Tensor:
@@ -482,20 +492,20 @@ class FoldedBlockDescriptor:
         ascending column order within rows -- the stacked CSR may have unsorted
         column indices depending on how the original weights were stored.
         """
-        csr     = self.stacked_weights[suffix]
+        csr = self.stacked_weights[suffix]
         out_dim = self.out_dims[suffix]
         r_start = fold_step * out_dim
-        r_end   = r_start + out_dim
-        crow    = csr.crow_indices()
-        cols    = csr.col_indices()
-        vals    = csr.values()
-        n_col   = csr.shape[1]
+        r_end = r_start + out_dim
+        crow = csr.crow_indices()
+        cols = csr.col_indices()
+        vals = csr.values()
+        n_col = csr.shape[1]
         nnz_start = int(crow[r_start].item())
-        nnz_end   = int(crow[r_end].item())
+        nnz_end = int(crow[r_end].item())
         slice_crow = crow[r_start : r_end + 1] - nnz_start
         csr_slice = torch.sparse_csr_tensor(
-            slice_crow, cols[nnz_start:nnz_end], vals[nnz_start:nnz_end],
-            size=(out_dim, n_col), dtype=csr.dtype)
+            slice_crow, cols[nnz_start:nnz_end], vals[nnz_start:nnz_end], size=(out_dim, n_col), dtype=csr.dtype
+        )
         # Ensure sorted column indices (required by delta-CSR kernels).
         # Round-trip through COO with coalesce() is the portable PyTorch way.
         return csr_slice.to_sparse().coalesce().to_sparse_csr()
@@ -504,8 +514,8 @@ class FoldedBlockDescriptor:
         self,
         suffix: str,
         seq_len: int,
-        device:  torch.device = torch.device("cpu"),
-    ) -> Optional[torch.Tensor]:
+        device: torch.device = torch.device("cpu"),
+    ) -> torch.Tensor | None:
         """
         Return the banded attention mask for a Q/K/V parameter, or None if
         this parameter is not an attention projection or banding is disabled.
@@ -522,20 +532,18 @@ class FoldedBlockDescriptor:
             f"  Parameters : {len(self.stacked_weights)}",
         ]
         for suffix, csr in self.stacked_weights.items():
-            od  = self.out_dims[suffix]
-            bw  = self.band_half_widths.get(suffix)
+            od = self.out_dims[suffix]
+            bw = self.band_half_widths.get(suffix)
             bw_str = f"  band±{bw}" if bw is not None else ""
             nnz = int(csr.values().numel())
-            lines.append(
-                f"  {suffix:<45} stacked={tuple(csr.shape)}  "
-                f"nnz={nnz:,}  fold_out={od}{bw_str}"
-            )
+            lines.append(f"  {suffix:<45} stacked={tuple(csr.shape)}  nnz={nnz:,}  fold_out={od}{bw_str}")
         return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Reference inference module
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class RNNFoldedBlock(nn.Module):
     """
@@ -599,9 +607,9 @@ class RNNFoldedBlock(nn.Module):
 
     def _apply_block(
         self,
-        x:        torch.Tensor,                     # [batch, seq, d_model]
-        weights:  Dict[str, torch.Tensor],           # {suffix: dense weight}
-        masks:    Dict[str, Optional[torch.Tensor]], # {suffix: attn mask | None}
+        x: torch.Tensor,  # [batch, seq, d_model]
+        weights: dict[str, torch.Tensor],  # {suffix: dense weight}
+        masks: dict[str, torch.Tensor | None],  # {suffix: attn mask | None}
     ) -> torch.Tensor:
         """
         Override this in architecture-specific subclasses.
@@ -616,24 +624,22 @@ class RNNFoldedBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        device  = x.device
+        device = x.device
         seq_len = x.shape[1] if x.ndim == 3 else x.shape[0]
 
-        state    = torch.zeros_like(x)
+        state = torch.zeros_like(x)
         suffixes = list(self.desc.stacked_weights.keys())
 
         # Collect per-step outputs when skip_connection_outputs is enabled.
         # The state update is identical in both modes — only the return value
         # differs (final state vs. mean of all per-step outputs).
-        step_outputs: List[torch.Tensor] = []
+        step_outputs: list[torch.Tensor] = []
 
         for fold_step in range(self.desc.n_folds):
-            weights = {s: self.desc.fold_weight(s, fold_step).to(device)
-                       for s in suffixes}
-            masks   = {s: self.desc.attention_mask(s, seq_len, device)
-                       for s in suffixes}
-            out    = self._apply_block(x + state, weights, masks)
-            state  = state + out
+            weights = {s: self.desc.fold_weight(s, fold_step).to(device) for s in suffixes}
+            masks = {s: self.desc.attention_mask(s, seq_len, device) for s in suffixes}
+            out = self._apply_block(x + state, weights, masks)
+            state = state + out
 
             if self.desc.skip_connection_outputs:
                 step_outputs.append(out)
@@ -681,9 +687,9 @@ class SiliBlock(RNNFoldedBlock):
 
     def __init__(
         self,
-        descriptor:   "FoldedBlockDescriptor",
+        descriptor: FoldedBlockDescriptor,
         learning_rate: float = 0.01,
-        num_cpus:      int   = 4,
+        num_cpus: int = 4,
     ):
         if not _SILI_AVAILABLE:
             raise ImportError(
@@ -691,7 +697,7 @@ class SiliBlock(RNNFoldedBlock):
                 "Build it with setup.py or cmake before using SiliBlock."
             )
         super().__init__(descriptor)
-        self._lr       = learning_rate
+        self._lr = learning_rate
         self._num_cpus = num_cpus
 
         # ONE SparseLinearLayer per suffix -- loaded with the FULL stacked
@@ -711,9 +717,10 @@ class SiliBlock(RNNFoldedBlock):
         # weight-matrix orientation) -- transpose before loading so the layer
         # has n_inputs=in_dim, n_outputs=n_folds*out_dim.
         import numpy as np
+
         # FP4 table largest magnitude -- scale each row so its max maps here.
         _FP4_MAX = 6.0
-        self._layers: Dict[str, object] = {}
+        self._layers: dict[str, object] = {}
         for suffix, csr in descriptor.stacked_weights.items():
             # csr.t() is metadata-only (CSC relabelling, no densify, no
             # nnz-proportional copy); .to_sparse_csr() does the real (but
@@ -723,13 +730,12 @@ class SiliBlock(RNNFoldedBlock):
             # materialize (see sparse_rnn.py's FoldedLayer.from_descriptor,
             # which had the identical bug).
             csr_t = csr.t().to_sparse_csr()
-            n_in  = int(csr_t.shape[0])   # in_dim
-            n_out = int(csr_t.shape[1])   # n_folds * out_dim
-            nnz   = int(csr_t.values().numel())
-            layer = _sili_cpu.SparseLinearLayer(
-                n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
+            n_in = int(csr_t.shape[0])  # in_dim
+            n_out = int(csr_t.shape[1])  # n_folds * out_dim
+            nnz = int(csr_t.values().numel())
+            layer = _sili_cpu.SparseLinearLayer(n_in, n_out, int(nnz * 1.2) + 64, num_cpus)
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
-            idx  = csr_t.col_indices().numpy().astype(np.int32)
+            idx = csr_t.col_indices().numpy().astype(np.int32)
             vals = csr_t.values().float().numpy().copy()
 
             # Per-row value scaling (per conversation): the stacked matrix
@@ -764,12 +770,13 @@ class SiliBlock(RNNFoldedBlock):
 
     def _forward_one_suffix(
         self,
-        layer:  object,   # SparseLinearLayer
-        x:      "np.ndarray",
-        lr:     float,
-    ) -> "np.ndarray":
+        layer: object,  # SparseLinearLayer
+        x: np.ndarray,
+        lr: float,
+    ) -> np.ndarray:
         """Forward with hoyer_score dispatch. x=[batch,n_in] -> [batch,n_folds*out_dim]."""
         import numpy as np
+
         x2d = x.reshape(1, -1).astype(np.float32)
         if _sili_cpu.hoyer_score(x2d)["hoyer_score"] > self.hoyer_threshold:
             ptrs, idx, vals = _sili_cpu.dense_to_csr(x2d, 0.0)
@@ -778,10 +785,10 @@ class SiliBlock(RNNFoldedBlock):
 
     def _backward_one_suffix(
         self,
-        layer:  object,   # SparseLinearLayer
-        dy:     "np.ndarray",
-        lr:     float,
-    ) -> "np.ndarray":
+        layer: object,  # SparseLinearLayer
+        dy: np.ndarray,
+        lr: float,
+    ) -> np.ndarray:
         """
         Backward through one SparseLinearLayer. lr_per_row_nnz always True.
 
@@ -791,21 +798,20 @@ class SiliBlock(RNNFoldedBlock):
         gradient is dense.
         """
         import numpy as np
+
         dy2d = dy.reshape(1, -1).astype(np.float32)
         if _sili_cpu.hoyer_score(dy2d)["hoyer_score"] > self.hoyer_threshold:
-            x_last = layer.last_input   # None if no forward run yet
+            x_last = layer.last_input  # None if no forward run yet
             if x_last is not None:
                 ptrs, idx, vals = _sili_cpu.dense_to_csr(dy2d, 0.0)
-                return layer.backward_sparse(
-                    x_last, ptrs, idx, vals,
-                    batch=1, learning_rate=lr, lr_per_row_nnz=True)
+                return layer.backward_sparse(x_last, ptrs, idx, vals, batch=1, learning_rate=lr, lr_per_row_nnz=True)
         return layer.backward_dense(dy2d, lr, lr_per_row_nnz=True)
 
     def backward_sili(
         self,
-        dy:  "torch.Tensor",
-        lr:  float = 0.0,
-    ) -> "torch.Tensor":
+        dy: torch.Tensor,
+        lr: float = 0.0,
+    ) -> torch.Tensor:
         """
         Backward pass through the entire folded RNN block.
 
@@ -827,32 +833,33 @@ class SiliBlock(RNNFoldedBlock):
         dx shape: [batch, in_dim]   (same as forward input x)
         """
         import numpy as np
-        device  = dy.device
-        dy_np   = dy.detach().cpu().float().numpy()
-        batch   = dy_np.shape[0]
+
+        device = dy.device
+        dy_np = dy.detach().cpu().float().numpy()
+        batch = dy_np.shape[0]
         out_dim = next(iter(self.desc.out_dims.values()))
 
         # (1) Broadcast dy through the fold reshape+sum.
         # Forward:   raw[batch, n_folds*out_dim] -> sum(axis=1) -> [batch, out_dim]
         # Backward:  dy[batch, out_dim] -> tile to [batch, n_folds, out_dim]
         #            -> flatten to [batch, n_folds*out_dim]
-        dy_raw = np.tile(
-            dy_np.reshape(batch, 1, out_dim),
-            (1, self.desc.n_folds, 1)
-        ).reshape(batch, self.desc.n_folds * out_dim).astype(np.float32)
+        dy_raw = (
+            np.tile(dy_np.reshape(batch, 1, out_dim), (1, self.desc.n_folds, 1))
+            .reshape(batch, self.desc.n_folds * out_dim)
+            .astype(np.float32)
+        )
 
         # (2) Each suffix sees the same dy_raw; accumulate dx across suffixes.
-        dx_parts = [self._backward_one_suffix(layer, dy_raw, lr)
-                    for layer in self._layers.values()]
+        dx_parts = [self._backward_one_suffix(layer, dy_raw, lr) for layer in self._layers.values()]
         dx_np = sum(dx_parts).reshape(batch, -1)
 
         return torch.from_numpy(dx_np).to(device)
 
     def forward_sili(
         self,
-        x:   "torch.Tensor",
-        lr:  float = 0.0,
-    ) -> "torch.Tensor":
+        x: torch.Tensor,
+        lr: float = 0.0,
+    ) -> torch.Tensor:
         """
         Single forward pass through the entire folded RNN block.
 
@@ -873,13 +880,11 @@ class SiliBlock(RNNFoldedBlock):
         exactly the ones that contribute meaningfully -- the sum only has
         nonzero terms for active connections.
         """
-        import numpy as np
-        device  = x.device
-        x_np    = x.detach().cpu().float().numpy()
+        device = x.device
+        x_np = x.detach().cpu().float().numpy()
 
         # One call per suffix -- each produces [1, n_folds * out_dim]
-        out_parts = [self._forward_one_suffix(layer, x_np, lr)
-                     for layer in self._layers.values()]
+        out_parts = [self._forward_one_suffix(layer, x_np, lr) for layer in self._layers.values()]
         # Sum suffix contributions (Q, K, V, MLP etc. all write to state)
         raw_np = sum(out_parts)  # [1, n_folds * out_dim]
 
@@ -888,8 +893,8 @@ class SiliBlock(RNNFoldedBlock):
         # out_dim is the hidden_dim of the original per-layer weights.
         # Pick the out_dim from any suffix (they all agree for compatible blocks).
         out_dim = next(iter(self.desc.out_dims.values()))
-        batch   = raw_np.shape[0]
-        summed  = raw_np.reshape(batch, self.desc.n_folds, out_dim).sum(axis=1)
+        batch = raw_np.shape[0]
+        summed = raw_np.reshape(batch, self.desc.n_folds, out_dim).sum(axis=1)
 
         return torch.from_numpy(summed).to(device)
 
@@ -904,9 +909,7 @@ class SiliBlock(RNNFoldedBlock):
 
 # Parameter suffix patterns that identify attention projections (Q, K, V).
 # The attention band mask is applied only to these.
-_ATTN_SUFFIXES = re.compile(
-    r'(q_proj|k_proj|v_proj|query|key|value|c_attn|in_proj)\.(weight|bias)$'
-)
+_ATTN_SUFFIXES = re.compile(r"(q_proj|k_proj|v_proj|query|key|value|c_attn|in_proj)\.(weight|bias)$")
 
 
 def _is_attention_param(suffix: str) -> bool:
@@ -914,11 +917,11 @@ def _is_attention_param(suffix: str) -> bool:
 
 
 def fold_block_group(
-    group:                    List[int],
-    state_dict:               Dict[str, torch.Tensor],
-    prefix:                   str,
-    band_half_width_override: Optional[int] = None,
-    skip_connection_outputs:  bool = False,
+    group: list[int],
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    band_half_width_override: int | None = None,
+    skip_connection_outputs: bool = False,
 ) -> FoldedBlockDescriptor:
     """
     Fold a group of consecutive identical blocks into a FoldedBlockDescriptor.
@@ -948,27 +951,24 @@ def fold_block_group(
     # tower block 0 has the same bare index as its language block 0). This
     # is the same root-cause bug fixed in detect_repeated_block_groups and
     # report_block_groups above; see that docstring for the full story.
-    suffixes: List[str] = sorted(
+    suffixes: list[str] = sorted(
         parsed[2]
         for name in state_dict
-        if (parsed := _parse_block_key(name)) is not None
-        and parsed[0] == prefix and parsed[1] == sample_idx
+        if (parsed := _parse_block_key(name)) is not None and parsed[0] == prefix and parsed[1] == sample_idx
     )
 
-    stacked_weights:  Dict[str, torch.Tensor]       = {}
-    out_dims:         Dict[str, int]                 = {}
-    band_half_widths: Dict[str, Optional[int]]       = {}
+    stacked_weights: dict[str, torch.Tensor] = {}
+    out_dims: dict[str, int] = {}
+    band_half_widths: dict[str, int | None] = {}
 
     for suffix in suffixes:
-        per_block_csr: List[torch.Tensor] = []
+        per_block_csr: list[torch.Tensor] = []
 
         for block_idx in group:
             param_name = f"{prefix}{block_idx}{suffix}"
             raw = state_dict.get(param_name)
             if raw is None:
-                raise KeyError(
-                    f"Expected parameter '{param_name}' not found in state_dict"
-                )
+                raise KeyError(f"Expected parameter '{param_name}' not found in state_dict")
 
             # Accept either a raw CSR tensor or a dict entry from sparse_prune.py.
             # sparse_prune.py's "raw" key is NOT only used for true scalars/
@@ -1005,8 +1005,7 @@ def fold_block_group(
                     tensor = t.to_sparse(sparse_dim=2).coalesce().to_sparse_csr()
                 else:
                     raise ValueError(
-                        f"dict entry for '{param_name}' has neither 'csr' nor "
-                        f"'raw' key: {sorted(raw.keys())}"
+                        f"dict entry for '{param_name}' has neither 'csr' nor 'raw' key: {sorted(raw.keys())}"
                     )
             elif isinstance(raw, torch.Tensor) and raw.layout == torch.sparse_csr:
                 tensor = raw
@@ -1026,10 +1025,10 @@ def fold_block_group(
             per_block_csr.append(tensor)
 
         stacked = stack_csr_vertical(per_block_csr)
-        out_dim = int(per_block_csr[0].shape[0])   # rows of a single block's matrix
+        out_dim = int(per_block_csr[0].shape[0])  # rows of a single block's matrix
 
         stacked_weights[suffix] = stacked
-        out_dims[suffix]        = out_dim
+        out_dims[suffix] = out_dim
 
         # Determine attention band half-width
         if _is_attention_param(suffix):
@@ -1042,21 +1041,21 @@ def fold_block_group(
             band_half_widths[suffix] = None
 
     return FoldedBlockDescriptor(
-        n_folds                 = n_folds,
-        block_indices           = group,
-        stacked_weights         = stacked_weights,
-        out_dims                = out_dims,
-        band_half_widths        = band_half_widths,
-        prefix                  = prefix,
-        skip_connection_outputs = skip_connection_outputs,
+        n_folds=n_folds,
+        block_indices=group,
+        stacked_weights=stacked_weights,
+        out_dims=out_dims,
+        band_half_widths=band_half_widths,
+        prefix=prefix,
+        skip_connection_outputs=skip_connection_outputs,
     )
 
 
 def fold_sparse_payload(
-    payload:                  dict,
-    min_group_size:           int = 2,
-    band_half_width_override: Optional[int] = None,
-    skip_connection_outputs:  bool = False,
+    payload: dict,
+    min_group_size: int = 2,
+    band_half_width_override: int | None = None,
+    skip_connection_outputs: bool = False,
 ) -> dict:
     """
     Top-level function: take a sparse_prune.py payload and fold repeated blocks.
@@ -1093,7 +1092,7 @@ def fold_sparse_payload(
     ssd = payload.get("sparse_state_dict", payload)
 
     # Build a flat {name: tensor} view for detection
-    flat: Dict[str, torch.Tensor] = {}
+    flat: dict[str, torch.Tensor] = {}
     for name, entry in ssd.items():
         if isinstance(entry, dict):
             csr = entry.get("csr")
@@ -1114,15 +1113,16 @@ def fold_sparse_payload(
     # reverse lookup by bare index, which was ambiguous whenever two block
     # families (e.g. a VLM's language and vision towers) share an index range.
 
-    folded_descriptors: List[dict] = []
+    folded_descriptors: list[dict] = []
     removed_names: set = set()
 
     for prefix, group in groups:
-        print(f"[rnn_fold]  Folding blocks {group[0]}–{group[-1]} "
-              f"(n={len(group)}, prefix='{prefix}')")
+        print(f"[rnn_fold]  Folding blocks {group[0]}–{group[-1]} (n={len(group)}, prefix='{prefix}')")
 
         desc = fold_block_group(
-            group, flat, prefix,
+            group,
+            flat,
+            prefix,
             band_half_width_override=band_half_width_override,
             skip_connection_outputs=skip_connection_outputs,
         )
@@ -1144,20 +1144,21 @@ def fold_sparse_payload(
         for block_idx in group:
             for name in list(flat.keys()):
                 parsed = _parse_block_key(name)
-                if (parsed and parsed[0] == prefix and parsed[1] == block_idx
-                        and parsed[2] in folded_suffixes):
+                if parsed and parsed[0] == prefix and parsed[1] == block_idx and parsed[2] in folded_suffixes:
                     removed_names.add(name)
 
         # Serialise descriptor for the payload
-        folded_descriptors.append({
-            "n_folds":                 desc.n_folds,
-            "block_indices":           desc.block_indices,
-            "prefix":                  desc.prefix,
-            "stacked_weights":         desc.stacked_weights,
-            "out_dims":                desc.out_dims,
-            "band_half_widths":        desc.band_half_widths,
-            "skip_connection_outputs": desc.skip_connection_outputs,
-        })
+        folded_descriptors.append(
+            {
+                "n_folds": desc.n_folds,
+                "block_indices": desc.block_indices,
+                "prefix": desc.prefix,
+                "stacked_weights": desc.stacked_weights,
+                "out_dims": desc.out_dims,
+                "band_half_widths": desc.band_half_widths,
+                "skip_connection_outputs": desc.skip_connection_outputs,
+            }
+        )
 
     # Build cleaned sparse_state_dict (without folded params)
     cleaned_ssd = {k: v for k, v in ssd.items() if k not in removed_names}
@@ -1178,27 +1179,21 @@ def fold_sparse_payload(
     def _real_nnz(t: torch.Tensor) -> int:
         if t.layout == torch.sparse_csr:
             return int(t.values().numel())
-        return int((t != 0).sum().item())   # dense/strided: count real nonzeros
+        return int((t != 0).sum().item())  # dense/strided: count real nonzeros
 
-    original_nnz = sum(
-        _real_nnz(flat[n]) for n in removed_names if n in flat
-    )
-    folded_nnz = sum(
-        int(csr.values().numel())
-        for fd in folded_descriptors
-        for csr in fd["stacked_weights"].values()
-    )
+    original_nnz = sum(_real_nnz(flat[n]) for n in removed_names if n in flat)
+    folded_nnz = sum(int(csr.values().numel()) for fd in folded_descriptors for csr in fd["stacked_weights"].values())
 
     result = dict(payload)
     result["sparse_state_dict"] = cleaned_ssd
-    result["folded_blocks"]     = folded_descriptors
+    result["folded_blocks"] = folded_descriptors
     result["rnn_fold_meta"] = {
-        "n_groups":               len(groups),
-        "total_blocks_folded":    sum(len(g) for g in groups),
-        "params_removed":         len(removed_names),
-        "original_nnz":           original_nnz,
-        "folded_nnz":             folded_nnz,
-        "nnz_unchanged":          original_nnz == folded_nnz,  # stacking is lossless
+        "n_groups": len(groups),
+        "total_blocks_folded": sum(len(g) for g in groups),
+        "params_removed": len(removed_names),
+        "original_nnz": original_nnz,
+        "folded_nnz": folded_nnz,
+        "nnz_unchanged": original_nnz == folded_nnz,  # stacking is lossless
         "skip_connection_outputs": skip_connection_outputs,
     }
 
@@ -1216,8 +1211,6 @@ def _print_fold_summary(meta: dict) -> None:
     print(f"  Nonzeros (post-fold)   : {meta['folded_nnz']:,}")
     print(f"  Lossless stacking      : {meta['nnz_unchanged']}")
     print("─" * 60)
-
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1265,15 +1258,15 @@ we extend the input dimension so the layer now accepts cat(x, state) as input:
 
 # Parameter name fragments that indicate non-projection weights to skip.
 _RNN_ALL_SKIP_SUFFIXES = re.compile(
-    r'\.(bias|weight_g|weight_v|running_mean|running_var|num_batches_tracked'
-    r'|ln_[0-9]|layer_norm|layernorm|norm|embed|pos_emb|position_embed'
-    r'|wpe|wte)$',
+    r"\.(bias|weight_g|weight_v|running_mean|running_var|num_batches_tracked"
+    r"|ln_[0-9]|layer_norm|layernorm|norm|embed|pos_emb|position_embed"
+    r"|wpe|wte)$",
     re.IGNORECASE,
 )
 
 # Embedding weight names often contain these substrings regardless of suffix.
 _RNN_ALL_SKIP_NAMES = re.compile(
-    r'embed|positional|lm_head|cls_token|patch_embed',
+    r"embed|positional|lm_head|cls_token|patch_embed",
     re.IGNORECASE,
 )
 
@@ -1293,7 +1286,7 @@ def _is_rnn_all_eligible(name: str, shape: torch.Size) -> bool:
         return False
     if len(shape) == 2:
         return shape[0] > 1 and shape[1] > 1
-    if len(shape) == 4:           # conv: [out_c, in_c, kH, kW]
+    if len(shape) == 4:  # conv: [out_c, in_c, kH, kW]
         return shape[0] > 1 and shape[1] > 1
     return False
 
@@ -1340,8 +1333,7 @@ def _extend_dense_conv(t: torch.Tensor, extra_in_channels: int) -> torch.Tensor:
     by appending zero input-channel slices.
     """
     kH, kW = t.shape[2], t.shape[3]
-    zeros = torch.zeros(t.shape[0], extra_in_channels, kH, kW,
-                        dtype=t.dtype, device=t.device)
+    zeros = torch.zeros(t.shape[0], extra_in_channels, kH, kW, dtype=t.dtype, device=t.device)
     return torch.cat([t, zeros], dim=1)
 
 
@@ -1357,16 +1349,15 @@ class RNNAllLayerInfo:
     rec_dim       : recurrent dimension = output dim (= out for linear, out_c for conv)
     is_conv       : True if this is a conv weight (4-D), False for linear (2-D)
     """
-    def __init__(self, name: str, original_shape: torch.Size,
-                 ff_dim: int, rec_dim: int, is_conv: bool):
-        self.name           = name
-        self.original_shape = original_shape
-        self.ff_dim         = ff_dim
-        self.rec_dim        = rec_dim
-        self.is_conv        = is_conv
 
-    def state_shape(self, batch: int = 1, seq: int = 1,
-                    spatial_h: int = 1, spatial_w: int = 1) -> tuple:
+    def __init__(self, name: str, original_shape: torch.Size, ff_dim: int, rec_dim: int, is_conv: bool):
+        self.name = name
+        self.original_shape = original_shape
+        self.ff_dim = ff_dim
+        self.rec_dim = rec_dim
+        self.is_conv = is_conv
+
+    def state_shape(self, batch: int = 1, seq: int = 1, spatial_h: int = 1, spatial_w: int = 1) -> tuple:
         """
         Runtime state shape for this layer.
 
@@ -1379,8 +1370,9 @@ class RNNAllLayerInfo:
 
     def __repr__(self) -> str:
         kind = "conv" if self.is_conv else "linear"
-        return (f"RNNAllLayerInfo({kind}  {self.name}  "
-                f"{tuple(self.original_shape)} → ff={self.ff_dim} rec={self.rec_dim})")
+        return (
+            f"RNNAllLayerInfo({kind}  {self.name}  {tuple(self.original_shape)} → ff={self.ff_dim} rec={self.rec_dim})"
+        )
 
 
 def apply_rnn_all_to_payload(payload: dict) -> dict:
@@ -1406,17 +1398,17 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
     """
     ssd = payload.get("sparse_state_dict", payload)
 
-    layer_infos: List[RNNAllLayerInfo] = []
+    layer_infos: list[RNNAllLayerInfo] = []
     new_ssd = {}
 
     n_extended = 0
-    n_skipped  = 0
+    n_skipped = 0
     extra_cols_total = 0
 
     COL = 56
     header = f"  {'Parameter':<{COL}} {'Original':>16} {'Extended':>16}  rec_dim"
-    sep    = "─" * len(header)
-    print(f"\n[rnn_all]  Extending layers to per-layer RNN cells …")
+    sep = "─" * len(header)
+    print("\n[rnn_all]  Extending layers to per-layer RNN cells …")
     print(f"\n{header}")
     print(sep)
 
@@ -1424,12 +1416,13 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
         # ── Unwrap entry format from sparse_prune.py ─────────────────────────
         is_sparse_entry = isinstance(entry, dict)
         if is_sparse_entry:
-            csr      = entry.get("csr")
-            raw      = entry.get("raw")
-            shape    = entry.get("shape", csr.shape if csr is not None
-                                  else (raw.shape if raw is not None else None))
+            csr = entry.get("csr")
+            raw = entry.get("raw")
+            shape = entry.get("shape", csr.shape if csr is not None else (raw.shape if raw is not None else None))
         elif isinstance(entry, torch.Tensor):
-            csr, raw, shape = (entry, None, entry.shape)                 if entry.layout == torch.sparse_csr                 else (None, entry, entry.shape)
+            csr, raw, shape = (
+                (entry, None, entry.shape) if entry.layout == torch.sparse_csr else (None, entry, entry.shape)
+            )
         else:
             new_ssd[name] = entry
             n_skipped += 1
@@ -1447,15 +1440,14 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
             n_skipped += 1
             continue
 
-        is_conv  = len(shape_ts) == 4
-        out_dim  = int(shape_ts[0])           # output channels / rows
-        in_dim   = int(shape_ts[1])           # input channels / cols
-        rec_dim  = out_dim                    # recurrent dim = output dim
+        is_conv = len(shape_ts) == 4
+        out_dim = int(shape_ts[0])  # output channels / rows
+        in_dim = int(shape_ts[1])  # input channels / cols
+        rec_dim = out_dim  # recurrent dim = output dim
 
         if is_conv:
             # Conv: extended shape [out_c, in_c+rec, kH, kW]
-            new_shape = torch.Size([out_dim, in_dim + rec_dim,
-                                    shape_ts[2], shape_ts[3]])
+            new_shape = torch.Size([out_dim, in_dim + rec_dim, shape_ts[2], shape_ts[3]])
         else:
             # Linear: extended shape [out, in+rec]
             new_shape = torch.Size([out_dim, in_dim + rec_dim])
@@ -1464,20 +1456,20 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
         if csr is not None and csr.layout == torch.sparse_csr and not is_conv:
             # Sparse linear: widen column count, no new nonzeros
             new_tensor = _extend_csr_columns(csr, rec_dim)
-            new_entry  = {"csr": new_tensor, "shape": new_shape}
+            new_entry = {"csr": new_tensor, "shape": new_shape}
             extra_cols_total += rec_dim
         elif raw is not None and not is_conv:
             # Dense linear (inside sparse_prune entry or plain tensor)
             new_tensor = _extend_dense_columns(raw.float(), rec_dim)
-            new_entry  = {"csr": None, "shape": new_shape, "raw": new_tensor}
+            new_entry = {"csr": None, "shape": new_shape, "raw": new_tensor}
         elif raw is not None and is_conv:
             new_tensor = _extend_dense_conv(raw.float(), rec_dim)
-            new_entry  = {"csr": None, "shape": new_shape, "raw": new_tensor}
+            new_entry = {"csr": None, "shape": new_shape, "raw": new_tensor}
         elif csr is not None and is_conv:
             # Conv stored as 2-D CSR (rows=out_c, cols=in_c*kH*kW): treat as
             # linear with in_dim = in_c*kH*kW, extend that
             new_tensor = _extend_csr_columns(csr, rec_dim)
-            new_entry  = {"csr": new_tensor, "shape": new_shape}
+            new_entry = {"csr": new_tensor, "shape": new_shape}
             extra_cols_total += rec_dim
         else:
             new_ssd[name] = entry
@@ -1501,32 +1493,29 @@ def apply_rnn_all_to_payload(payload: dict) -> dict:
         layer_infos.append(info)
         n_extended += 1
 
-        print(
-            f"  {name:<{COL}} {str(tuple(shape_ts)):>16} "
-            f"{str(tuple(new_shape)):>16}  {rec_dim}"
-        )
+        print(f"  {name:<{COL}} {tuple(shape_ts)!s:>16} {tuple(new_shape)!s:>16}  {rec_dim}")
 
     print(sep)
     print(f"\n[rnn_all]  {n_extended} layers extended,  {n_skipped} skipped")
     print(f"           extra recurrent columns (sparse, zero-init): {extra_cols_total:,}")
-    print(f"           new nonzero count added: 0  (synaptogenesis grows these)")
+    print("           new nonzero count added: 0  (synaptogenesis grows these)")
 
     result = dict(payload)
     result["sparse_state_dict"] = new_ssd
     result["rnn_all_layers"] = [
         {
-            "name":           li.name,
+            "name": li.name,
             "original_shape": list(li.original_shape),
-            "ff_dim":         li.ff_dim,
-            "rec_dim":        li.rec_dim,
-            "is_conv":        li.is_conv,
+            "ff_dim": li.ff_dim,
+            "rec_dim": li.rec_dim,
+            "is_conv": li.is_conv,
         }
         for li in layer_infos
     ]
     result["rnn_all_meta"] = {
-        "n_extended":         n_extended,
-        "n_skipped":          n_skipped,
-        "extra_rec_cols":     extra_cols_total,
+        "n_extended": n_extended,
+        "n_skipped": n_skipped,
+        "extra_rec_cols": extra_cols_total,
         "new_nonzeros_added": 0,
     }
     return result
@@ -1556,11 +1545,9 @@ class RNNAllStateBuffer:
         buf.reset()
     """
 
-    def __init__(self, layer_metas: List[dict], device: torch.device = torch.device("cpu")):
-        self._states: Dict[str, Optional[torch.Tensor]] = {
-            m["name"]: None for m in layer_metas
-        }
-        self._infos: Dict[str, dict] = {m["name"]: m for m in layer_metas}
+    def __init__(self, layer_metas: list[dict], device: torch.device = torch.device("cpu")):
+        self._states: dict[str, torch.Tensor | None] = {m["name"]: None for m in layer_metas}
+        self._infos: dict[str, dict] = {m["name"]: m for m in layer_metas}
         self.device = device
 
     def reset(self) -> None:
@@ -1605,12 +1592,13 @@ class RNNAllStateBuffer:
 
     def __repr__(self) -> str:
         initialized = sum(1 for v in self._states.values() if v is not None)
-        return (f"RNNAllStateBuffer({len(self._states)} layers, "
-                f"{initialized} initialized, device={self.device})")
+        return f"RNNAllStateBuffer({len(self._states)} layers, {initialized} initialized, device={self.device})"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Standalone entry point (folds an already-pruned sparse payload)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def _load_payload(path: str) -> dict:
     """Load either a sparse_prune.py payload or a raw state dict."""
@@ -1624,7 +1612,7 @@ def _load_payload(path: str) -> dict:
         except ImportError:
             sys.exit("pip install safetensors")
         sd = load_file(str(p))
-        return {"sparse_state_dict": {k: v for k, v in sd.items()}}
+        return {"sparse_state_dict": dict(sd.items())}
 
     obj = torch.load(str(p), map_location="cpu", weights_only=False)
 
@@ -1635,11 +1623,11 @@ def _load_payload(path: str) -> dict:
     # Plain state dict or checkpoint
     if isinstance(obj, dict):
         sd = obj.get("state_dict", obj)
-        return {"sparse_state_dict": {k: v for k, v in sd.items()}}
+        return {"sparse_state_dict": dict(sd.items())}
 
     if hasattr(obj, "state_dict"):
         sd = dict(obj.state_dict())
-        return {"sparse_state_dict": {k: v for k, v in sd.items()}}
+        return {"sparse_state_dict": dict(sd.items())}
 
     sys.exit(f"Cannot interpret loaded object of type {type(obj)}")
 
@@ -1650,26 +1638,46 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("input",  nargs="?",  help="sparse_prune.py output (.pt) or raw model")
-    p.add_argument("-o", "--output",     default=None,
-                   help="Output .pt path  (default: <input>_folded.pt)")
-    p.add_argument("--show-groups",      action="store_true",
-                   help="Detect and print block groups, then exit")
-    p.add_argument("--min-group-size",   type=int, default=2, metavar="N",
-                   help="Minimum consecutive identical blocks to fold  (default: 2)")
-    p.add_argument("--band-width",       type=int, default=None, metavar="N",
-                   help="Override attention band half-width  (default: infer from weight shape)")
-    p.add_argument("--also-prune",       action="store_true",
-                   help="Run sparse_prune.sparsify_model() on input before folding")
-    p.add_argument("--bits",             type=int, default=32, choices=[32,16,8,4,2],
-                   help="Quantization bits for pruning threshold (used with --also-prune)")
-    p.add_argument("--skip-outputs",     action="store_true",
-                   help="Average per-fold-step outputs instead of returning final "
-                        "accumulated state (skip-connection outputs / pyramidal pooling)")
-    p.add_argument("--rnn-all",          action="store_true",
-                   help="Extend every linear/conv weight with a zero-sparse recurrent "
-                        "input block, making each op a per-layer RNN cell. "
-                        "No new nonzeros at conversion time; synaptogenesis fills them.")
+    p.add_argument("input", nargs="?", help="sparse_prune.py output (.pt) or raw model")
+    p.add_argument("-o", "--output", default=None, help="Output .pt path  (default: <input>_folded.pt)")
+    p.add_argument("--show-groups", action="store_true", help="Detect and print block groups, then exit")
+    p.add_argument(
+        "--min-group-size",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Minimum consecutive identical blocks to fold  (default: 2)",
+    )
+    p.add_argument(
+        "--band-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override attention band half-width  (default: infer from weight shape)",
+    )
+    p.add_argument(
+        "--also-prune", action="store_true", help="Run sparse_prune.sparsify_model() on input before folding"
+    )
+    p.add_argument(
+        "--bits",
+        type=int,
+        default=32,
+        choices=[32, 16, 8, 4, 2],
+        help="Quantization bits for pruning threshold (used with --also-prune)",
+    )
+    p.add_argument(
+        "--skip-outputs",
+        action="store_true",
+        help="Average per-fold-step outputs instead of returning final "
+        "accumulated state (skip-connection outputs / pyramidal pooling)",
+    )
+    p.add_argument(
+        "--rnn-all",
+        action="store_true",
+        help="Extend every linear/conv weight with a zero-sparse recurrent "
+        "input block, making each op a per-layer RNN cell. "
+        "No new nonzeros at conversion time; synaptogenesis fills them.",
+    )
     args = p.parse_args()
 
     if args.input is None:
@@ -1684,8 +1692,8 @@ def main() -> None:
         except ImportError:
             sys.exit("sparse_prune.py must be in the same directory or on PYTHONPATH")
         print("[rnn_fold]  Running sparse_prune first …")
-        # Re-use sparsify_model internals: get a flat state dict, prune, repack
-        flat_sd: Dict[str, torch.Tensor] = {}
+        # Reuse sparsify_model internals: get a flat state dict, prune, repack
+        flat_sd: dict[str, torch.Tensor] = {}
         for k, v in payload["sparse_state_dict"].items():
             if isinstance(v, torch.Tensor):
                 flat_sd[k] = v
@@ -1700,7 +1708,7 @@ def main() -> None:
         print(f"[rnn_fold]  Pruned {len(pruned_ssd)} tensors  (threshold={threshold:.4e})\n")
 
     if args.show_groups:
-        flat: Dict[str, torch.Tensor] = {}
+        flat: dict[str, torch.Tensor] = {}
         for name, entry in payload["sparse_state_dict"].items():
             if isinstance(entry, dict):
                 t = entry.get("csr")
@@ -1738,9 +1746,7 @@ def main() -> None:
     if args.rnn_all:
         out_suffix += "_rnnall"
 
-    out_path = args.output or str(
-        Path(args.input).parent / (Path(args.input).stem + out_suffix + ".pt")
-    )
+    out_path = args.output or str(Path(args.input).parent / (Path(args.input).stem + out_suffix + ".pt"))
     torch.save(working, out_path)
     print(f"\n[saved]  {out_path}")
 

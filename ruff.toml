@@ -42,3 +42,34 @@ max-locals = 40
 # a known-broken legacy test file is a separate, deliberate task, not
 # a side effect of adding pre-commit hooks.
 "tests/unit/python/test_sili_pre_existing_failures.py" = ["NPY002", "RUF002", "RUF003", "S306", "SIM115", "PLC0415", "E402", "PLW0177"]
+
+# sili/ (the production package) had never been linted before this setup.
+# 138 findings survive after --fix/--unsafe-fixes + the handful of real
+# bugs fixed directly (F821 undefined `np`, B904 missing `raise...from`,
+# I001 import order, F401 side-effect import). Left as an explicit,
+# reviewed bypass rather than mass-editing the hottest file in the repo
+# (linear_disldo.hpp's Python counterparts) blind (task #386):
+#  - PLC0415 (39): deliberate lazy imports (avoid heavy/optional deps --
+#    torch, etc. -- at module import time)
+#  - E701/E702 (32): compact one-line if/semicolon style used throughout;
+#    stylistic, zero functional risk either way, not worth a 32-site diff
+#  - C901/PLR0912 (18): pre-existing complexity in already-tested,
+#    working numeric code; see the separate lizard baseline-scan finding
+#    (disldo_backward: 2403 lines, CCN=251) -- real debt, but a dedicated
+#    refactor, not a lint-pass side effect
+#  - RUF001/RUF002 (10): ambiguous-unicode findings are box-drawing
+#    characters in ASCII-art docstring diagrams (─│┌┐└┘), not code
+#  - ARG001/ARG002 (10): unused args kept for interface/callback parity
+#  - ERA001 (6): "commented-out code" findings are worked-example snippets
+#    inside docstrings, not dead code
+#  - PLW2901/PLW0603 (4): deliberate loop-var reassignment / module-global
+#    state in a couple of hot-path spots
+#  - E402 (3): sys.path.insert-before-import pattern in scripts
+#  - B008 (3): torch.device("cpu") as a default arg -- standard, safe
+#    idiomatic PyTorch (immutable, cheap, evaluated once at def time)
+#  - S603 (2): subprocess calls with a fixed, non-attacker-controlled arg
+#    list (matches the existing S607-equivalent precedent above)
+#  - PLW1510 (2): subprocess.run without check= where the caller inspects
+#    .returncode itself
+#  - E741 (2): ambiguous single-letter names in tight numeric loops
+"sili/**/*.py" = ["PLC0415", "E701", "E702", "C901", "PLR0912", "RUF001", "RUF002", "ARG001", "ARG002", "ERA001", "PLW2901", "PLW0603", "E402", "B008", "S603", "PLW1510", "E741"]
