@@ -66,7 +66,7 @@ repos:
         # conversion/streaming_prune.py
         # 30.4%,
         # lib/headers/sparse_struct.hpp 38.1% (21-line file, N/A in
-        # practice), lib/headers/fp4quant.hpp 35.7%, lib/headers/fp8quant.hpp 32.5%.
+        # practice), lib/headers/fp8quant.hpp 32.5%.
         # Also 3 one-off benchmark
         # scripts (mostly header-comment-driven, never covered by this
         # hook before it applied repo-wide):
@@ -95,8 +95,9 @@ repos:
         # under 30%. conversion/prune_sensitivity.py did the same to
         # docs/research/prune_sensitivity.rst, 39.9% -> under 30%.
         # conversion/rnn_fold.py did the same to docs/research/rnn_fold.rst,
-        # 38.0% -> under 30%.
-        exclude: ^(tests/|sili/__init__\.py|sili/conversion/streaming_prune\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp)
+        # 38.0% -> under 30%. lib/headers/fp4quant.hpp did the same to
+        # docs/research/fp4quant.rst, 36.2% -> under 30%.
+        exclude: ^(tests/|sili/__init__\.py|sili/conversion/streaming_prune\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)
