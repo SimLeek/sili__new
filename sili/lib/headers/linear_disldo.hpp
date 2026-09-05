@@ -21,17 +21,11 @@
 
 // ── DISLDO: Dense Input, Sparse Linear, Dense Output ─────────────────────────
 //
-// Generic over VALUES_TYPE via ValueAccessor -- works identically for
-// FP4BiPacked (default, 4-bit) and DeltaCSRBiValues<float> (32-bit fallback),
-// matching sisldo_forward (the SISLDO/sparse-input forward equivalent
-// in sisldo_ops.hpp) and delta_csr_synap_row_step / delta_csr_build_probes,
-// which already use this same pattern.
-//
-// Supersedes the previous float32/absolute-CSR disldo_forward/disldo_backward
-// (which never used DeltaCSRLayout/FP4BiPacked at all -- see conversation).
-// Dense-input walk is embarrassingly parallel by input row, unlike the
-// sparse-input SISLDO path which needs a work-offset table to balance
-// threads across a variable-density CSR batch.
+// Generic over VALUES_TYPE via ValueAccessor (FP4BiPacked / 32-bit
+// fallback). Dense-input walk is embarrassingly parallel by input row,
+// unlike the sparse-input SISLDO path (sisldo_ops.hpp), which needs a
+// work-offset table to balance threads across a variable-density CSR
+// batch. See docs/research/linear_disldo.rst for background.
 
 // ── forward ───────────────────────────────────────────────────────────────────
 
@@ -44,26 +38,14 @@
  * @param output         [batch x out_cols] accumulated into (caller zeroes first).
  * @param num_cpus       OpenMP thread count.
  *
- * No learning_rate parameter -- forward used to run its own gradient-free
- * ADSP-style (Activity-Dependent Structural Plasticity) importance update
- * whenever a nonzero learning_rate was passed, independently of whether a
- * matching backward_dense() call would ever follow. Not Hebbian learning
- * (no VALUE changes here, only the importance/wiring-strength signal --
- * closer to activity-driven synaptic sprouting/pruning than to a weight
- * update). Confirmed as a real footgun (traced directly: fired on every
- * forward call including ones with no corresponding gradient, e.g. every
- * non-query tick of an online RNN, measurably corrupting training at low
- * learning rates independent of any real task signal). Importance is now
- * updated ONLY by disldo_backward(), coupled to a real gradient, same
- * principle as weight updates always having been backward-only. REMOVED,
- * not just disabled -- a caller that still wants an unconditional
- * activity-correlation signal should build that explicitly, not get it
- * silently bundled into every forward pass.
+ * No learning_rate parameter -- forward is pure computation, no side
+ * effects. Importance updates happen only in disldo_backward(), coupled
+ * to a real gradient (see docs/research/linear_disldo.rst for why a
+ * gradient-free forward-side importance update was removed).
  *
  * NOTE (test): output must equal the dense matmul input @ W_dense where
  * W_dense[r,c] = weight of synapse (r->c). Same reference check used
- * for sisldo_forward and for this session's standalone disldo_ops.hpp
- * (see conversation) -- both passed it.
+ * for sisldo_forward and disldo_ops.hpp.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input, SIZE_TYPE batch,
@@ -78,11 +60,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     const std::size_t n_out = L.cols;
     const std::size_t ost = static_cast<std::size_t>(batch) * n_out;
 
-    // dc.empty() no longer means "nothing to do": block4 (below) may hold
-    // live synapses even when the scattered CSR is empty (e.g. everything
-    // in a small/dense layer promoted). L.rows/L.cols stay valid either
-    // way (set at construction, independent of nnz), so skipping just this
-    // block is safe.
+    // dc.empty() no longer means "nothing to do" -- block4 below may still
+    // hold live synapses. See docs/research/linear_disldo.rst.
     if (!dc.empty()) {
         std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
 
@@ -102,9 +81,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     const COL_TYPE col = cursor.advance();
                     const std::size_t vb = L.elem_start[r] + e;
                     const value_type w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                    // Rank-N scale (see scale_rank's own docstring) -- reduces
-                    // to the exact original val_scale*out_scale at scale_rank==1.
-                    const value_type w = w_stored * weights.get_scale(r, col); // -> true units
+                    const value_type w =
+                        w_stored * weights.get_scale(r, col); // rank-N scale -> true units
 
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
@@ -125,55 +103,23 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     } // !dc.empty()
 
     // block4 contribution -- same shared per-row value_scale/output_scale
-    // as the scattered path above (see block4.hpp: this is the whole point
-    // of NOT giving block4 its own separate scale, unlike the prototype).
-    // No gather here: within an active tile, position IS the column, a
-    // fixed compile-time-known offset -- see block4.hpp / BLOCK4_NOTES.md
-    // for the real, measured SIMD benefit this gets on this machine that
-    // the scattered loop above never can (GCC: "complicated access
-    // pattern", confirmed via -fopt-info-vec, never auto-vectorizes).
-    //
+    // as the scattered path above. No gather: within an active tile,
+    // position IS the column (fixed compile-time offset), which is what
+    // lets this SIMD where the scattered loop above can't. See
+    // docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
-        // Row-major cursor walk isn't parallel-for-friendly directly (same
-        // reason the old hash-map iteration wasn't); collect (br,bc,elem_pos)
-        // TRIPLES once per call (not Block4Tile pointers/handles -- a
-        // handle can't be pre-collected across the parallel region since
-        // it's move-only, RAII, and per-tile compress/decompress decisions
-        // must happen within ONE thread's ownership of ONE tile at a time;
-        // each thread constructs its own handle fresh, inside the loop
-        // body below, from these coordinates). elem_pos is the tile's
-        // index into block4's own address space (this walk already knows
-        // it -- block_layout.elem_start[br]+bk -- for free); byte_pos is
-        // its position in block4's flat variable-length tile_data buffer
-        // (see block4.hpp -- a tile's byte length varies with its live
-        // count when sparse, so unlike elem_pos this can't be derived by
-        // simple arithmetic, only by walking the row and summing each
-        // preceding tile's real length, which this collection loop is
-        // already doing). Both are passed to Block4Store::at_index() so
-        // the hot loop below doesn't redo an O(row_nnz) coordinate
-        // re-scan per tile via find(). That redundant second scan
-        // (discover a tile here, then re-discover it again via find()'s
-        // own raw_find()) measured as the dominant real cost of this loop
-        // at batch=1 -- see conversation: batch=1 has too little per-tile
-        // compute (16 FLOPs) to amortize even one such scan, let alone two.
-        // Persistent scratch (Block4Store::scratch_tile_br/bc/elem/byte),
-        // not a fresh vector every call -- see block4.hpp: batch=1
-        // real-time calls can't amortize repeated heap allocation of
-        // these the way a large training batch could.
+        // Collect (br,bc,elem_pos,byte_pos) tuples once per call before the
+        // parallel region -- row-major cursor walk isn't parallel-for
+        // friendly, and a Block4Tile handle is move-only/RAII so it can't
+        // be pre-collected across threads. See docs/research/linear_disldo.rst.
         std::vector<uint32_t>& tile_br = weights.block4.scratch_tile_br;
         std::vector<uint32_t>& tile_bc = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back(): push_back's
-        // per-call capacity check (branch + increment) is real, measured
-        // exclusive cost at this scale (~49k push_back calls across the 3
-        // vectors on a fully block4-resident 512x512 layer -- confirmed
-        // via callgrind: switching to scratch buffers alone barely moved
-        // this cost, since reused capacity still pays the per-push_back
-        // check every call regardless of allocation). resize() is a single
-        // capacity check for the whole vector; the fill loop below then
-        // writes through plain indexed stores.
+        // per-call capacity check is measured exclusive cost at this scale.
+        // See docs/research/linear_disldo.rst.
         tile_br.resize(n_b4);
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
@@ -195,31 +141,12 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
-        // Per-thread private output buffers, same pattern as the scattered
-        // path's t_out above -- necessary, not optional: two tiles that
-        // share a block-COLUMN (different block-rows, i.e. different input
-        // rows feeding the same output columns) write to the same output
-        // positions, so parallelizing freely over tiles without this would
-        // race exactly the way the scattered path's own scatter-write
-        // would without t_out.
+        // Per-thread private output buffers -- necessary, not optional:
+        // two tiles sharing a block-column write to the same output
+        // positions. See docs/research/linear_disldo.rst.
         std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
-        // Hoisted out of the loop condition below -- measured, not
-        // assumed: tile_br.size() was being re-evaluated on every single
-        // loop iteration instead of once (confirmed via callgrind: 8.78%
-        // of this function's total instruction count was spent purely
-        // inside std::vector::size(), on a fully block4-resident
-        // 512x512 layer -- the compiler apparently couldn't prove
-        // tile_br's size is loop-invariant across the omp-outlined
-        // function boundary, so it re-read _M_finish - _M_start on
-        // every iteration instead of hoisting it). A plain local
-        // variable is trivially provably invariant. NOTE: correct and a
-        // real instruction-count win, but measured (isolated-process
-        // methodology) as NOT moving wall-clock time noticeably --
-        // apparently absorbed by the CPU's own execution resources
-        // (same pattern already seen once for the vector-allocation-
-        // churn fix). Kept anyway: real, harmless, zero-risk, and
-        // instruction count reductions are not guaranteed irrelevant on
-        // every CPU/compiler this code will ever run on.
+        // Hoisted loop bound -- measured instruction-count win (no
+        // wall-clock effect). See docs/research/linear_disldo.rst.
         const int64_t n_tiles_local = int64_t(n_b4);
 #pragma omp parallel num_threads(num_cpus)
         {
@@ -228,68 +155,29 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
 #pragma omp for schedule(static)
             for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
                 const uint32_t br = tile_br[std::size_t(row_ti)], bc = tile_bc[std::size_t(row_ti)];
-                // const: routes .at() through the const overload, which
-                // does NOT mark the handle dirty -- forward is read-only,
-                // so a sparse tile's destructor should do nothing here
-                // (no wasted re-pack of unchanged content). at_index(): the
-                // collection loop above already knows this tile's exact
-                // storage position, so skip find()'s redundant O(row_nnz)
-                // re-scan (see collection loop's comment).
+                // const: routes .at() through the const overload (no dirty
+                // mark, forward is read-only). at_index() reuses the
+                // coordinates the collection loop above already resolved.
                 const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(row_ti)],
                                                           tile_byte[std::size_t(row_ti)]);
-                // Resolved ONCE per tile instead of once per .at() call
-                // (16 calls/tile below otherwise, each re-branching on
-                // whether this tile is sparse-packed -- a property that
-                // can't change mid-tile). See Block4TileHandle::raw_data().
+                // Resolved once per tile, not once per .at() call. See
+                // Block4TileHandle::raw_data().
                 const uint8_t* tdata = tile.raw_data();
-                // Decode this column's whole 4-wide weight vector via
-                // block4_vec_decode_fp4 (fp4quant.hpp's bit-shift
-                // formula, not FP4_TABLE[code]'s 4 separate gathers --
-                // see fp4quant.hpp's header comment); the remaining
-                // per-row scale multiply/clamp stays scalar
-                // (get_value_scale(row) itself isn't a SIMD operation).
-                //
-                // NOTE (measured, not assumed): an isolated microbenchmark
-                // suggested scalar FP4_TABLE decode should win here too
-                // (same as backward's decode, below) -- but swapping it
-                // in for THIS specific loop measurably regressed the
-                // real disldo_forward benchmark at batch=1 (~1.71x ->
-                // ~1.55x speedup vs scattered CSR at 100% density,
-                // reproduced consistently across repeats), unlike
-                // backward where the same swap was a real, consistent
-                // win. Reverted here; kept for backward. Compiler
-                // codegen interactions with the surrounding code
-                // apparently differ enough between the two functions
-                // that the isolated test's result didn't transfer --
-                // trust the real benchmark over the isolated one. See
-                // TODO_DUAL_BLOCK4.md's Part C.
-                //
-                // LJ templated (compile-time constant), not a runtime
-                // `for (lj...)` loop: -fopt-info-vec confirmed GCC could
-                // not vectorize the runtime version at all -- "loop nest
-                // containing two or more consecutive inner loops cannot
-                // be vectorized" (the li-decode loop followed by the
-                // b-batch loop, both nested inside the lj loop). A
-                // per-LJ templated lambda gives the compiler 4 SEPARATE,
-                // independent instantiations instead of one loop nest it
-                // has to reason about jointly -- each with a compile-time-
-                // known column offset, matching the pattern already used
-                // for the decode step's own 4-way unroll. See
-                // TODO_DUAL_BLOCK4.md's Part C for the measured effect.
+                // Decode via block4_vec_decode_fp4 (bit-shift), not
+                // FP4_TABLE[code] gathers -- and LJ is templated
+                // (compile-time constant), not a runtime loop, since GCC
+                // could not vectorize the runtime version at all. See
+                // docs/research/linear_disldo.rst for the measured
+                // rationale, including why the scalar-table result that
+                // helped backward's decode did NOT transfer here.
                 auto process_col = [&]<uint32_t LJ>() {
                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + LJ;
                     if (col >= n_out)
                         return;
 
-                    // FP8 dispatch: Block4Tile8's layout is a full byte/
-                    // slot (no nibble mask) and decodes via E4M3
-                    // (fp8quant.hpp/block4_vec_decode_fp8), not FP4's
-                    // table-driven bit-shift codec -- the ONLY thing that
-                    // differs from the FP4 branch below; everything past
-                    // this point (row-scale multiply, batch accumulation)
-                    // is identical float32 math regardless of storage
-                    // width, per direct instruction. FP4 branch is
-                    // byte-for-byte the pre-existing code, untouched.
+                    // FP8 dispatch: Block4Tile8 is a full byte/slot (no
+                    // nibble mask), decoded via E4M3 -- the only thing that
+                    // differs from the FP4 branch below.
                     Block4Vec w_decoded;
                     if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                         const Block4VecU w_codes = {
@@ -315,10 +203,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                         if (row < n_in) {
-                            // Rank-N scale (see scale_rank's own
-                            // docstring) -- reduces to the exact original
-                            // val_scale*out_scale at scale_rank==1.
-                            w4[li] = w_decoded_arr[li] * weights.get_scale(row, col);
+                            w4[li] =
+                                w_decoded_arr[li] * weights.get_scale(row, col); // rank-N scale
                             row_idx[li] = row;
                         } else {
                             w4[li] = value_type(0);
@@ -349,29 +235,11 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         }
     }
 
-    // output_scale/value_scale importance are no longer touched here --
-    // see this function's own docstring: forward is pure now, importance
-    // updates only ever happen in disldo_backward, coupled to a real
-    // gradient.
-
-    // ── AQRS additive branch (task #276, gamma wired in at task #289,
-    // see sili_peridot/AQRS_DESIGN.md) ── A[row,col] = sum_k gamma_k *
-    // additive_u_k(row,k)*additive_v_k(col,k), ADDED (not Hadamard
-    // -multiplied against quant like the scale_rank branch above) to
-    // the effective weight. Genuinely independent of the sparse/block4
-    // structure above -- it's a dense low-rank correction that touches
-    // every output regardless of which synapses happen to be live, so
-    // it's computed as its own small pass rather than woven into either
-    // per-synapse loop. Fused per Theorem 11 (never materializes the
-    // n_in x n_out A matrix): project the input down to additive_rank
-    // dimensions via additive_u, then back up to n_out via additive_v --
-    // O(batch * additive_rank * (n_in + n_out)), cheap as long as
-    // additive_rank << min(n_in, n_out). No-op (skipped entirely) at the
-    // default additive_rank==0, matching value_scale/output_scale's own
-    // "unconfigured component contributes nothing" convention. gamma_k
-    // itself defaults to 1.0 (see get_additive_gamma_k's own docstring)
-    // so this multiply is transparent for every caller that's never
-    // touched gamma.
+    // AQRS additive branch (task #276, gamma at #289): A[row,col] =
+    // sum_k gamma_k * additive_u_k(row,k) * additive_v_k(col,k), summed
+    // into the effective weight. Fused per Theorem 11 (never materializes
+    // the n_in x n_out A matrix). No-op at additive_rank==0. See
+    // docs/research/linear_disldo.rst.
     if (weights.additive_rank > 0) {
         std::vector<value_type> proj(static_cast<std::size_t>(batch) * weights.additive_rank,
                                      value_type(0));
@@ -419,103 +287,25 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
  * @param learning_rate     Update step.
  * @param num_cpus          Thread count.
  * @param damp_by_importance When true (default): the weight update is
- *        divided by (sqrt(ci)+eps), where ci is an RMSprop-style
- *        exponential moving average of g^2 (decayed, magnitude-only) --
- *        a per-synapse adaptive-learning-rate effect, same one extra
- *        scalar of state per synapse this always used, just tracking a
- *        different quantity. When false: the raw (-effective_lr * g)
- *        step is applied directly, with no damping -- ci is still
- *        tracked/updated identically either way (importance stays
- *        meaningful for pruning/synaptogenesis decisions regardless),
- *        only its use as a WEIGHT-UPDATE damping factor is toggled.
- *        Exists specifically so a caller can A/B this mechanism against
- *        itself on the same kernel -- see sili_peridot's/sili__new's
- *        importance-damping-as-optimizer integration test.
- *
- *        REPLACED (see conversation/JOURNAL.md), not just retuned: the
- *        previous formula (ci -= g*effective_lr, an undecayed running
- *        SUM of SIGNED gradient, divide by 1+|ci|) was confirmed via a
- *        real ablation to converge no better than plain SGD -- it has a
- *        structural blind spot where sign-oscillating (noisy) gradient
- *        pressure CANCELS in the sum, so damping barely engages exactly
- *        when it should. A dense-Tensor RMSprop control (one scalar of
- *        state per parameter, decayed g^2, no momentum/second buffer)
- *        reached essentially full-Adam convergence quality on the same
- *        task at the same storage budget -- this formula ports that
- *        result in, still one scalar/synapse, no new storage.
- * @param beta2  Decay rate for ci's g^2 EMA (default 0.999, matching
- *        this project's own AdamOptimizer convention). Only used when
- *        damp_by_importance is true.
- * @param eps    Numerical floor added to sqrt(ci) so a synapse with zero
- *        accumulated gradient magnitude doesn't produce a divide-by-zero
- *        (matches Adam's own eps convention, default 1e-8).
+ *        divided by (sqrt(ci)+eps), an RMSprop-style EMA of g^2. When
+ *        false: the raw (-effective_lr * g) step is applied, undamped;
+ *        ci is still tracked either way. See docs/research/linear_disldo.rst
+ *        for why this replaced an earlier signed-sum formula.
+ * @param beta2  Decay rate for ci's g^2 EMA (default 0.999). Only used
+ *        when damp_by_importance is true.
+ * @param eps    Numerical floor added to sqrt(ci) (matches Adam's eps
+ *        convention, default 1e-8).
  *
  * NOTE (test): with learning_rate=0, input_grad must equal W_dense^T @ output_grad
  * per batch sample, weights/importance unchanged. Same reference check as
  * delta_csr_backward.
+ *
+ * Template params ScalePolicy/DeferredScaleWrite/StochasticRounding/
+ * SynapsePolicyT and the ordering of the trailing scalar params
+ * (l1_coef last) are constrained by existing callers' positional template
+ * args -- see docs/research/linear_disldo.rst for the full rationale
+ * and why SynapsePolicyT specifically must be template-template.
  */
-// ScalePolicy / DeferredScaleWrite: swappable value_scale/output_scale
-// update, added to compare real update rules against a toy Python
-// fake-quantize simulation's closed-form full-layer refit -- see
-// ScalePolicy's own docstring (delta_csr_types.hpp) and
-// sili_peridot/JOURNAL.md's 2026-08-09 tile-recurrence entries. Both
-// parameters default to exactly today's behavior so every existing
-// caller (SparseLinearLayer, SparseLinearLayer8, DISLDOLayerV, etc.)
-// is unaffected without any changes on their part.
-//
-// SCOPE: covers the SCATTERED path only (this function's per-row loop
-// below and the shared output_scale reduction at the end). Block4's
-// own internal value_scale update (further down, inside
-// `if (weights.block4.n_tiles() > 0)`) is intentionally left
-// untouched by both parameters -- real future work, not started here;
-// see [[project_hybrid_precision_plan]] (sili_peridot memory) /
-// JOURNAL.md for why this scope was chosen (block4 promotion only
-// fires from synaptogenesis, so scattered-only already covers every
-// layer that hasn't triggered growth yet).
-// StochasticRounding (default true, current behavior): scattered-path
-// weight/importance stores use ValueAccessor::set_stochastic (unbiased
-// dithered rounding, real per-step noise) when true, or the deterministic
-// nearest-neighbour ValueAccessor::set (fp4_quantize/fp8 equivalent, zero
-// added noise) when false. Scoped to the scattered path only, same as
-// ScalePolicy/DeferredScaleWrite above -- block4's dense-tile SIMD
-// quantize_stochastic calls are untouched (real follow-up, not yet needed:
-// no toy config here triggers block4 promotion). Built to test whether
-// real FP4's per-step dithered rounding, not value_scale staleness, is
-// what makes it collapse to chance where a deterministic-rounding fp32
-// shadow control (sili_peridot's fixed_digit_residual_quantize /
-// TrueMultiDigitLayer's simulate_quantize) succeeds by a wide margin --
-// see sili_peridot/JOURNAL.md.
-// SynapsePolicy: swappable per-synapse `ci` update (update_ci) + weight-delta
-// computation (update_cw) -- see PlainRMSpropSynapsePolicy/
-// BoundedRMSpropSynapsePolicy's own docstrings (delta_csr_types.hpp) for
-// the full root-cause story (late-training RMSprop divergence once ci
-// decays down to match a shrinking residual gradient, found via direct
-// trace on DISLDOLayer32; an lr-decay schedule "fixes" it by eventually
-// freezing the whole network, incompatible with this project's lifelong-
-// learning goal, hence a stationary per-synapse floor+clip instead).
-// Defaults to BoundedRMSpropSynapsePolicy (see its own docstring,
-// delta_csr_types.hpp, for the tuned production defaults: max_abs_delta,
-// max_ci real; min_decay_frac a true no-op). PlainRMSpropSynapsePolicy
-// remains available for explicit opt-in and as the bit-identical
-// reference the fix was checked against. min_decay_frac/max_abs_delta/
-// max_ci are all inert (ignored) under Plain; all three only matter once
-// a caller is on BoundedRMSpropSynapsePolicy.
-//
-// Template-TEMPLATE parameter (not a fully-instantiated `typename
-// SynapsePolicy = Policy<value_type>` like ScalePolicy above), because
-// this function's SIMD sites need the SAME chosen policy (Plain or
-// Bounded) instantiated at Block4Vec, not just value_type -- one caller-
-// visible choice, two internal instantiations (`SynapsePolicy` and
-// `SynapsePolicyVec` aliases below), rather than requiring every caller
-// to specify the policy twice. Placed LAST in the template parameter
-// list, not next to ScalePolicy -- existing callers across the test
-// suite explicitly specify template args positionally up through
-// DeferredScaleWrite/StochasticRounding (e.g.
-// `disldo_backward<S, FP4BiPacked, COL_TYPE, RMSpropScalePolicy<float>,
-// false, false>`); inserting a new parameter anywhere before those would
-// silently shift every one of those positional args onto the wrong
-// parameter (confirmed directly: doing this broke the build with
-// "expected a class template, got 'false'").
 template <
     typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
     typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
@@ -538,29 +328,17 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                      typename ValueAccessor<VALUES_TYPE>::value_type max_ci = 1e30f,
                      typename ValueAccessor<VALUES_TYPE>::value_type zero_escape_eps = 0.1f,
                      bool scale_invariant = false,
-                     // AQRS gamma's L1 penalty coefficient (task #273/#283, Theorem 8) --
-                     // 0 (default) disables it entirely, matching every existing call
-                     // site's behavior unchanged. Appended LAST, after scale_invariant, so
-                     // no existing positional call site anywhere in the codebase shifts --
-                     // see this function's own template-parameter docstring above for why
-                     // that ordering discipline matters here specifically.
+                     // AQRS gamma's L1 penalty coefficient (task #273/#283, Theorem 8).
+                     // 0 (default) disables it. Appended LAST for positional-arg safety
+                     // -- see this function's own docstring above.
                      typename ValueAccessor<VALUES_TYPE>::value_type l1_coef = 0.0f) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
-    // Same chosen policy (SynapsePolicyT), instantiated at both widths --
-    // scalar sites use SynapsePolicy, Block4Vec SIMD sites use
-    // SynapsePolicyVec. See this function's own template-parameter
-    // docstring above for why SynapsePolicyT is a template-template
-    // parameter rather than a fully-instantiated type like ScalePolicy.
     using SynapsePolicy = SynapsePolicyT<value_type>;
     using SynapsePolicyVec = SynapsePolicyT<Block4Vec>;
-    // Only meaningful when DeferredScaleWrite -- a touched scattered
-    // entry's true-units (cw, ci) get cached here instead of stored
-    // immediately, and are written out via set_stochastic only after
-    // BOTH value_scale[row] and output_scale[col] are finalized for
-    // this whole call (output_scale's own reduction runs last, after
-    // every row AND after block4 -- see the end of this function).
-    // Always constructed via full brace-init at its one push_back call
-    // site below (never member-by-member) -- false positive.
+    // Only meaningful when DeferredScaleWrite: a touched scattered entry's
+    // true-units (cw, ci) get cached here instead of stored immediately,
+    // written out only once value_scale/output_scale are finalized for
+    // this whole call. See docs/research/linear_disldo.rst.
     struct DeferredScaleWriteEntry {
         // cppcheck-suppress uninitMemberVarNoCtor
         std::size_t vb;
@@ -586,61 +364,29 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             neuron_grad_accum[c] += std::abs(output_grad[static_cast<std::size_t>(b) * n_out + c]);
     }
 
-    // Previously an early return here when both storages were empty --
-    // removed: the dead-row value_scale bootstrap pass (near the end of
-    // this function) needs to run precisely in that case (a genuinely
-    // fresh zero-synapse-init layer), so this can no longer be a pure
-    // early-exit. Everything below is already independently guarded
-    // (`if (!dc.empty())`, `if (weights.block4.n_tiles() > 0)`) and
-    // degrades to safe no-ops when both are empty -- this was an
-    // optimization for the doubly-empty case, not a correctness
-    // requirement, so removing it only costs a little extra harmless
-    // work in that case, not correctness.
+    // No early return when both storages are empty: the dead-row
+    // value_scale bootstrap pass (near the end) needs to run precisely
+    // in that case. See docs/research/linear_disldo.rst.
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
     std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
-    // output_scale's own gradient, symmetric to value_scale's: a column
-    // can be touched by many rows, spread across threads by the outer
-    // #pragma omp for (over rows) -- each thread accumulates into its own
-    // [n_out]-sized slice, reduced after the parallel region (same
-    // pattern as t_dx above). Only applied if output_scale_is_trainable
-    // (set by set_output_scale_raw) -- not a size check, since the resize
-    // below runs unconditionally for safe reads regardless of mode.
-    // Shared between the scattered loop below AND block4's own loop
-    // further down -- both write into the same buffer (per-thread-private
-    // slices, indexed by their own tid), summed once at the very end.
+    // output_scale's own gradient (symmetric to value_scale's), shared
+    // between the scattered loop and block4's own loop, per-thread-private
+    // slices reduced once at the end. Only applied if output_scale_is_trainable.
     const std::size_t rank = weights.scale_rank;
     // Persistent per-instance heap scratch (task #295) backing block4's
-    // SIMD backward path's per-rank-component accumulators -- grows
-    // (never shrinks automatically) to fit `rank`/`num_cpus`, a cheap
-    // no-op once already large enough. See ScaleRankScratch's own
-    // docstring, delta_csr_types.hpp, for the full rationale (replaces
-    // the old compile-time SCALE_RANK_MAX=4 stack-array cap).
+    // SIMD backward path's per-rank-component accumulators.
     weights.scale_rank_scratch.ensure(static_cast<std::size_t>(num_cpus), rank, BLOCK4_TILE);
-    // Thin 2D view over a flat scratch buffer -- op[k] returns a
-    // value_type* row pointer, exactly matching the syntax (and the
-    // block4_vec_load/store call convention) the old fixed-size 2D
-    // stack arrays (out_scale_k4[SCALE_RANK_MAX][BLOCK4_TILE] etc.) used,
-    // so every existing use site below is a drop-in replacement (task
-    // #295).
+    // Thin 2D view over a flat scratch buffer, drop-in for the old
+    // fixed-size 2D stack arrays (task #295).
     struct Flat2DView {
         value_type* base;
         std::size_t stride;
         inline value_type* operator[](std::size_t k) const { return base + k * stride; }
     };
-    // AQRS gamma (task #273/#283): layer-wide, doesn't vary by row/col/
-    // tile, so fetched ONCE here rather than per-row like value_scale_k/
-    // output_scale_k -- shared by the scattered loop below AND every
-    // block4 sub-path (FP4 SIMD/scalar, FP8 SIMD/scalar) further down.
-    // Deliberately NOT baked into value_scale_k8/out_scale_k4 (etc.)'s own
-    // local caches -- gamma's OWN gradient needs the PURE (un-multiplied)
-    // value_direction_k*output_direction_k product, and baking gamma into
-    // either side would make recovering that require dividing by gamma_k,
-    // fragile exactly at gamma_k=0 (the most common case, since gamma
-    // defaults to 0 for any channel beyond the always-on k=0). Applied as
-    // an explicit extra factor at each of value_scale's/output_scale's own
-    // gradient accumulation sites instead, matching the scattered path's
-    // own style exactly (see its identical comment above).
+    // AQRS gamma (task #273/#283): layer-wide, fetched once rather than
+    // per-row. See docs/research/linear_disldo.rst for why it's not baked
+    // into the direction caches.
     std::vector<value_type> gamma_k_arr(rank);
     for (std::size_t k = 0; k < rank; ++k)
         gamma_k_arr[k] = weights.get_scale_gamma_k(k);
@@ -648,49 +394,27 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                        value_type(0));
     // Parallel forward-contribution accumulator, same shape/layout as
     // t_col_grad -- mirrors the per-synapse ci fix (contrib=x*w combined
-    // additively with g into the RMSprop second moment, see
-    // sili__new/lean_proofs/importance_signal_information_gain/
-    // SiliImportanceProof/ImportanceSignalInformationGain.lean,
-    // Joint.combined_signal_strictly_informative) up one level: value_scale/
-    // output_scale's own importance (scale_state) is the SAME kind of
-    // RMSprop second-moment accumulator as ci, just aggregated over a row/
-    // column instead of a single synapse -- no principled reason for it to
-    // skip the same combination.
+    // Additive-signal forward-contribution accumulator, same combination
+    // rationale as per-synapse ci (Joint.combined_signal_strictly_informative)
+    // applied one level up. See docs/research/linear_disldo.rst.
     std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * n_out * rank,
                                                value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
-    // AQRS gamma's own gradient (task #273/#283): dL/d(gamma_k) = sum over
-    // every (row,col) touched this call of quant_floor * value_direction_k
-    // (row) * output_direction_k(col) * g -- a LAYER-WIDE scalar per k, not
-    // per-row/col like value_scale/output_scale's own gradients, so this is
-    // sized num_cpus*rank (not num_cpus*n_out*rank like t_col_grad above).
+    // AQRS gamma's own gradient (task #273/#283): layer-wide scalar per k,
+    // not per-row/col, so sized num_cpus*rank.
     std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
-    // Same combined-signal (g + contrib=x*w) treatment as value_scale/
-    // output_scale's own importance above -- see t_col_grad_contrib's own
-    // comment for the full rationale.
     std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank,
                                                  value_type(0));
 
-    // Pre-size value_scale/output_scale (now n_in*rank / n_out*rank, see
-    // scale_rank's own docstring) so that direct indexed writes from
-    // within the parallel region are safe (resize would race if called
-    // per-thread).
+    // Pre-size value_scale/output_scale (n_in*rank / n_out*rank) before the
+    // parallel region so direct indexed writes are safe.
     //
-    // CORRECTED (real bug, found via writing test_aqrs_rank_growth_shrink.cpp
-    // -- see conversation): a uniform `resize(..., value_type(1))` fill
-    // backfills EVERY newly-appended slot with 1.0, not just the k==0 ones
-    // -- but get_value_scale_k/get_output_scale_k's own documented default
-    // is k==0 -> 1.0, k>=1 -> 0.0 (an untrained extra rank component must
-    // be a pure no-op). Confirmed via direct probe: growing scale_rank from
-    // 1 to 2 mid-training made the new k=1 channel start IDENTICAL to k=0
-    // (both 1.0), so it received identical gradients every step by
-    // symmetry and stayed in permanent lockstep with k=0 -- effectively a
-    // scaled rank-1, not real rank-2 capacity. Fix: resize with a neutral
-    // 0 fill, then explicitly set only the k==0 slots in the newly-added
-    // range to 1.0 -- matches reshuffle_rank_array's own scale_default
-    // lambda (set_scale_rank, delta_csr_types.hpp), just applied to a
-    // straight append instead of a rank-changing reshuffle.
+    // A uniform resize(..., value_type(1)) fill would backfill EVERY
+    // appended slot with 1.0, not just k==0, forcing any grown rank
+    // component into permanent lockstep with k==0 instead of real extra
+    // capacity -- see docs/research/linear_disldo.rst. Resize with 0
+    // fill instead, then explicitly set only the k==0 slots to 1.0.
     if (weights.value_scale.size() < n_in * rank) {
         const std::size_t old_size = weights.value_scale.size();
         weights.value_scale.resize(n_in * rank, value_type(0));
@@ -711,18 +435,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         weights.output_scale_importance.resize(n_out * rank, value_type(0));
     if (weights.value_scale_momentum.size() < n_in * rank)
         weights.value_scale_momentum.resize(n_in * rank, value_type(0));
-    // value_scale_step was missing from this pre-sizing list -- a real,
-    // confirmed bug (found via AddressSanitizer, not guessed): get_value_
-    // scale_step_k's own lazy .resize() runs completely unguarded (no
-    // lock at all, unlike block4's tile_data), called directly from every
-    // row inside the #pragma omp parallel region below. Two threads
-    // touching a not-yet-grown index at the same time race on the SAME
-    // vector's resize/reallocation -- confirmed as a genuine heap-use-
-    // after-free (ASan: thread reading value_scale_step[idx] while
-    // another thread's resize() had already freed the old buffer).
-    // Pre-sizing here, same as value_scale_importance right above (same
-    // n_in*rank shape, same reason), makes the lazy-resize branch in
-    // get_value_scale_step_k dead in the normal case.
+    // Bug fix, found via AddressSanitizer: value_scale_step was missing
+    // from this pre-sizing list, so get_value_scale_step_k's own lazy
+    // unguarded resize() raced across threads (real heap-use-after-free).
+    // See docs/research/linear_disldo.rst.
     if (weights.value_scale_step.size() < n_in * rank)
         weights.value_scale_step.resize(n_in * rank, 0);
 
@@ -731,12 +447,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         {
             const int tid = omp_get_thread_num();
             value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
-            // Per-component now: mcol[col*rank+k]. Indexing helper local to
-            // this thread, rank captured from the enclosing scope.
-            // (false positive on all m*_base pointers below: cppcheck can't
-            // trace that they're mutated indirectly through the m*_at
-            // lambdas, which return mutable references derived from
-            // indexing them -- e.g. mcol_at(col,k) += ...)
+            // mcol[col*rank+k]. False positive on all m*_base pointers
+            // below: cppcheck can't trace mutation through the m*_at
+            // lambdas' returned references.
             // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
                 t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
@@ -762,16 +475,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             if constexpr (DeferredScaleWrite)
                 mdeferred = &t_deferred[static_cast<std::size_t>(tid)];
 
-            // Per-thread importance stats accumulators -- see disldo_forward's
-            // comment and update_importance_stats()'s THREAD SAFETY note.
-            // Value stats (update_value_stats_aggregate) are intentionally NOT
-            // tracked here: stored weight values are only changed by backward,
-            // but value_scale is learned directly via gradient descent (see the
-            // scale_eff_lr update below), so there's no Hoyer-based adaptive
-            // policy decision that needs live weight stats between explicit
-            // recompute_stats() calls. Importance stats ARE needed in backward
-            // because importance gets gradient updates here (backward) as well as
-            // activity-correlation updates in forward_dense() (forward).
+            // Per-thread importance stats accumulators -- see
+            // update_importance_stats()'s THREAD SAFETY note. Value stats
+            // aren't tracked here since value_scale is learned via gradient
+            // descent directly, not a Hoyer-based policy decision.
             double local_sum_abs_new_i = 0.0, local_sum_abs_old_i = 0.0;
             double local_sum_sq_new_i = 0.0, local_sum_sq_old_i = 0.0;
             value_type local_max_new_i = value_type(0);
@@ -781,50 +488,30 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 const std::size_t nnz_this_row = L.row_nnz(r);
                 if (nnz_this_row == 0)
                     continue;
-                // lr_row/nnz_this_row (per conversation): a row with more
-                // synapses gets more simultaneous per-synapse nudges each
-                // backward pass, so the AGGREGATE shift in that row's behavior
-                // scales roughly with nnz_this_row for a fixed learning_rate --
-                // dividing by nnz_this_row keeps the aggregate update comparable
-                // across rows regardless of connection count (matters here
-                // specifically because synaptogenesis makes nnz_this_row
-                // genuinely vary within one layer). The layer-wide equivalent
-                // (lr_layer/total_nnz) needs no kernel support at all -- a
-                // caller can just pre-divide learning_rate by layer.nnz
-                // themselves, since that quantity doesn't vary within a call.
+                // lr_per_row_nnz: normalizes the aggregate per-row update
+                // against synaptogenesis-driven nnz variation. See
+                // docs/research/linear_disldo.rst.
                 const value_type effective_lr =
                     lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_this_row)
                                    : learning_rate;
 
-                // value_scale gradient ALWAYS divides by nnz_this_row,
-                // independent of lr_per_row_nnz. Reason: scale_grad_sum
-                // accumulates nnz_this_row*batch contributions (one per
-                // synapse per batch sample), so it's approximately
-                // nnz_this_row * batch * average_contribution. Dividing by
-                // nnz_this_row normalizes that back to the average, matching
-                // the semantics of a gradient on a single scalar parameter
-                // (not a vector of n weights).
+                // value_scale gradient ALWAYS divides by nnz_this_row
+                // (independent of lr_per_row_nnz), normalizing its
+                // nnz_this_row*batch-term accumulator back to a single
+                // scalar parameter's gradient semantics.
                 const value_type scale_eff_lr =
                     learning_rate / static_cast<value_type>(nnz_this_row);
 
                 auto cursor = dc.row_cursor(r);
                 const value_type imp_scale = weights.get_importance_scale(r);
                 const value_type val_scale = weights.get_value_scale(r);
-                // value_scale gradient: sum first across ALL (synapse, batch)
-                // pairs for this row, then apply lr ONCE. See conversation:
-                // applying lr per-individual-contribution inside the innermost
-                // loop risks each increment falling below ULP(value_scale) in
-                // float32 and disappearing. The double accumulator + single
-                // application avoids that. scale_grad_sum (single double) is
-                // the DeferredScaleWrite-only path's accumulator (component 0
-                // only, see that branch's own scope note); scale_grad_sum_rank
-                // is the non-deferred path's per-component accumulator.
+                // Sum first across ALL (synapse, batch) pairs, apply lr
+                // ONCE (avoids per-contribution increments disappearing
+                // below float32 ULP). scale_grad_sum: DeferredScaleWrite's
+                // component-0-only accumulator; scale_grad_sum_rank:
+                // non-deferred path's per-component accumulator.
                 double scale_grad_sum = 0.0;
                 std::vector<double> scale_grad_sum_rank(rank, 0.0);
-                // Parallel forward-contribution accumulators, mirroring
-                // scale_grad_sum/scale_grad_sum_rank -- see t_col_grad_contrib's
-                // own comment above (same additive-combination rationale, one
-                // level up from per-synapse ci).
                 double scale_grad_sum_contrib = 0.0;
                 std::vector<double> scale_grad_sum_rank_contrib(rank, 0.0);
                 for (std::size_t e = 0; e < nnz_this_row; ++e) {
@@ -841,37 +528,17 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     value_type ci = ci_orig * combined_imp_scale; // -> true units
 
                     if constexpr (DeferredScaleWrite) {
-                        // UNCHANGED, old true-units-round-trip formula --
-                        // value_scale[r]/output_scale[col] finalize AFTER
-                        // this loop (value_scale right below, output_scale in
-                        // the shared reduction at the very end of this
-                        // function), so eagerly multiplying the code's own
-                        // step by a not-yet-finalized combined_scale (the
-                        // "new" formula below) would reintroduce exactly the
-                        // staleness DeferredScaleWrite exists to avoid. Needs
-                        // its own separate treatment to get the zero-escape
-                        // property too -- not done here, so a DeferredScaleWrite
-                        // layer (SparseLinearLayerResync et al) does NOT yet
-                        // get deterministic-rounding zero-escape; only the
-                        // default (non-deferred) SparseLinearLayer/
-                        // SparseLinearLayerDeterministic do.
-                        // cw_start: FIXED for the whole batch loop below --
-                        // matches a real mini-batch optimizer's own contract
-                        // (gradient computed against ONE parameter snapshot,
-                        // exactly one step taken after). Confirmed as a real
-                        // bug this session (see conversation): the previous
-                        // version mutated `cw`/`ci` INSIDE this loop, once per
-                        // batch row, so row b's own contrib/dx used row
-                        // (b-1)'s already-applied update instead of a
-                        // consistent snapshot -- b sequential mini-steps
-                        // instead of one real step, and even dx (the
-                        // gradient flowing to the PREVIOUS layer) was computed
-                        // against a moving target. g_agg/contrib_agg are
-                        // per-synapse scalar locals (stack, not a matrix-sized
-                        // buffer) summed across the batch, mirroring the
-                        // torch reference's own `x_sum = x.sum(dim=0)`
-                        // aggregation exactly (by linearity, sum_b(iv_b*cw) ==
-                        // cw*sum_b(iv_b) since cw_start is constant here).
+                        // True-units round-trip formula: this branch's
+                        // value_scale/output_scale aren't finalized until
+                        // after this loop, so it can't use the direct-quant
+                        // chain-rule update below (would reintroduce the
+                        // staleness DeferredScaleWrite exists to avoid) --
+                        // and doesn't get deterministic-rounding zero-escape
+                        // either. cw_start: FIXED
+                        // snapshot for the whole batch loop, g_agg/contrib_agg
+                        // aggregated across it, ONE update applied after --
+                        // see docs/research/linear_disldo.rst for the real
+                        // batch-aggregation bug this fixes.
                         const value_type cw_start = cw_orig * combined_scale;
                         double g_agg = 0.0, contrib_agg = 0.0;
                         for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -880,63 +547,15 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 output_grad[static_cast<std::size_t>(b) * n_out + col];
                             const value_type g = dyv * iv;
                             if (learning_rate != value_type(0)) {
-                                // Additive combination of the backward
-                                // sensitivity signal (g = dy*x) with a forward
-                                // contribution signal (contrib = x*w): proved to
-                                // strictly improve the importance estimate's
-                                // information about the synapse's true
-                                // importance whenever the two are not
-                                // conditionally independent given it -- see
-                                // sili__new/lean_proofs/importance_signal_information_gain/
-                                // SiliImportanceProof/ImportanceSignalInformationGain.lean,
-                                // theorem Joint.combined_signal_strictly_informative
-                                // (built on Joint.entropy_le_condEntropy,
-                                // H(Θ|X,Y) ≤ H(Θ|X)). Additive, not multiplicative,
-                                // so ci still updates from contrib alone even
-                                // when g=0 (e.g. a zero-gradient backward call),
-                                // instead of reintroducing the old quant=0-forever
-                                // deadlock a multiplicative gate would cause.
-                                //
-                                // SQUARE first, THEN sum -- g^2+contrib^2, not
-                                // (g+contrib)^2. ci is the DIVISOR of the weight
-                                // update's step size (see cw's own update just
-                                // below), so its job is safety: never let the
-                                // denominator collapse toward zero while the
-                                // numerator (g) stays large. Sum-then-square
-                                // fails exactly that: when g and contrib are
-                                // large and near-opposite in sign (a real,
-                                // common case -- a synapse whose current value
-                                // and the task's error signal are pulling
-                                // against each other), (g+contrib)^2 can
-                                // collapse toward zero even though BOTH signals
-                                // are individually large, making the step
-                                // -effective_lr*g/(sqrt(ci)+eps) explode --
-                                // the same class of instability the value_scale
-                                // bias-correction fix elsewhere in this file
-                                // closes, just triggered by cancellation
-                                // instead of cold start (see conversation).
-                                // Square-then-sum is bounded below by
-                                // max(g,contrib)^2 regardless of sign, so a
-                                // large-magnitude disagreement still damps the
-                                // step (correctly -- a synapse under real
-                                // contention needs protecting from a jumpy
-                                // update, not less of it) instead of amplifying
-                                // it. This still captures the additive-signal
-                                // information-gain property the Lean proof
-                                // establishes (Joint.combined_signal_strictly_
-                                // informative, cited above) -- that proof is
-                                // about combining the two signals being more
-                                // informative than either alone in the
-                                // abstract, it does not prescribe sum-before-
-                                // square as the numeric encoding.
+                                // Additive g+contrib combination, square-then-sum
+                                // -- see docs/research/linear_disldo.rst
+                                // (Joint.combined_signal_strictly_informative).
                                 const value_type contrib = iv * cw_start;
                                 g_agg += static_cast<double>(g);
                                 contrib_agg += static_cast<double>(contrib);
                                 scale_grad_sum += static_cast<double>(cw_orig) *
                                                   static_cast<double>(out_scale) * g;
                                 mcol_at(col, 0) += cw_orig * val_scale * g;
-                                // Parallel forward-contribution accumulation --
-                                // see scale_grad_sum_contrib's own comment above.
                                 scale_grad_sum_contrib += static_cast<double>(cw_orig) *
                                                           static_cast<double>(out_scale) * contrib;
                                 mcol_at_contrib(col, 0) += cw_orig * val_scale * contrib;
@@ -945,8 +564,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         }
                         value_type cw = cw_start;
                         if (learning_rate != value_type(0)) {
-                            // ONE update, using the batch-aggregated g/contrib
-                            // -- see cw_start's own comment above for why.
+                            // ONE update, using the batch-aggregated g/contrib.
                             ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
                                                           static_cast<value_type>(contrib_agg),
                                                           beta2, min_decay_frac, max_ci);
@@ -954,17 +572,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 static_cast<value_type>(g_agg), ci, value_type(1), effective_lr,
                                 eps, damp_by_importance, max_abs_delta, scale_invariant);
                             // Defer the store until value_scale[r] AND
-                            // output_scale[col] are BOTH finalized for this
-                            // call -- storing now would use the stale
-                            // pre-update scale, exactly the bug this parameter
-                            // exists to fix. Stats use the pre-store
-                            // true-units `ci` directly as a stand-in for the
-                            // post-quantization readback (the real stored
-                            // code doesn't exist yet when the write is
-                            // deferred) -- a documented approximation,
-                            // harmless since these stats are purely
-                            // observational and unused by anything in a
-                            // no-synaptogenesis training loop.
+                            // output_scale[col] are both finalized. See
+                            // docs/research/linear_disldo.rst.
                             mdeferred->push_back(DeferredScaleWriteEntry{vb, cw, ci, r, col});
                             local_sum_abs_new_i += std::abs(static_cast<double>(ci));
                             local_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
@@ -973,38 +582,15 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             local_max_new_i = std::max(local_max_new_i, std::abs(ci));
                         }
                     } else {
-                        // NEW formula: quant (the stored CODE) is the primary
-                        // optimized quantity now, updated DIRECTLY via
-                        // dL/d(quant) = g * S(row,col) -- proper chain rule on
-                        // true_w = quant * S -- instead of the old true-units
-                        // round-trip (cw += ...; new_code = cw / combined_scale),
-                        // which DIVIDED by the scale, backwards: made a LARGER
-                        // scale SHRINK the per-call code step instead of
-                        // growing it. This version is unconditionally nonzero
-                        // given S != 0, so quant can escape exactly 0 without
-                        // needing stochastic rounding, no matter how small
-                        // learning_rate is, given enough persistent-signal
-                        // steps (each value_scale component keeps growing
-                        // under the same signal, per its own update just
-                        // below, giving quant ever more leverage over time).
-                        // S = weights.get_scale(r,col), a sum over `rank`
-                        // outer-product components (rank=1 reproduces the
-                        // exact original val_scale*out_scale).
+                        // Direct-quant chain rule: dL/d(quant) = g * S(row,col)
+                        // on true_w = quant*S, replacing the old true-units
+                        // round-trip that divided by S (backwards). S =
+                        // weights.get_scale(r,col), summed over `rank`
+                        // components. See docs/research/linear_disldo.rst.
                         const value_type S = weights.get_scale(r, col);
-                        // cw_start: FIXED for the whole batch loop -- see the
-                        // DeferredScaleWrite branch's identical cw_start
-                        // comment above for the full rationale (real bug this
-                        // session: quant/ci/cw were mutated mid-loop, once per
-                        // batch row, so g_agg/contrib_agg replace that with
-                        // the standard "aggregate over the batch, take ONE
-                        // step" contract every real optimizer expects).
-                        // quant_floor is likewise computed ONCE from cw_orig
-                        // (not the live-updating quant) for the same reason --
-                        // still exact/signed for every already-escaped
-                        // synapse, matching the zero_escape_eps rationale just
-                        // below, now evaluated against the TRUE pre-call state
-                        // instead of a value some earlier batch row already
-                        // perturbed.
+                        // cw_start/quant_floor: FIXED snapshots for the whole
+                        // batch loop -- see the DeferredScaleWrite branch's
+                        // identical cw_start comment above.
                         const value_type cw_start = cw_orig * S;
                         const value_type quant_floor =
                             (cw_orig == value_type(0)) ? zero_escape_eps : cw_orig;
@@ -1015,78 +601,26 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 output_grad[static_cast<std::size_t>(b) * n_out + col];
                             const value_type g = dyv * iv;
                             if (learning_rate != value_type(0)) {
-                                // RMSprop-style: ci = decayed EMA of g^2 (magnitude-only,
-                                // recency-weighted), damp by sqrt(ci)+eps instead of 1+|ci|
-                                // -- see this function's own docstring for why.
-                                //
-                                // Additive combination with the forward
-                                // contribution signal (contrib = x*w): see the
-                                // DeferredScaleWrite branch above (same fix,
-                                // same theorem) for the full rationale --
-                                // sili__new/lean_proofs/importance_signal_information_gain/
-                                // SiliImportanceProof/ImportanceSignalInformationGain.lean,
-                                // Joint.combined_signal_strictly_informative.
+                                // RMSprop-style ci, additive g+contrib
+                                // combination -- see this function's own
+                                // docstring and docs/research/linear_disldo.rst.
                                 const value_type contrib = iv * cw_start;
                                 g_agg += static_cast<double>(g);
                                 contrib_agg += static_cast<double>(contrib);
-                                // dL/d(value_scale_k(r,k)) = g * quant *
-                                // output_scale_k(col,k), for EACH component k
-                                // (out_scale_k held fixed within its own term,
-                                // holding every OTHER component fixed too --
-                                // partial derivative of a sum of independent
-                                // outer products). Vanishes EXACTLY at quant=0
-                                // for every k simultaneously, which is exactly
-                                // the case that needs to escape.
-                                //
-                                // CORRECTED (real bug, found via conversation --
-                                // see conversation for the full trace): the
-                                // floor must be GATED on quant==0, not applied
-                                // unconditionally as `zero_escape_eps +
-                                // |quant|`. The unconditional version silently
-                                // discarded quant's sign on EVERY synapse, not
-                                // just stuck-at-zero ones -- for any nonzero
-                                // quant (the overwhelming majority once
-                                // training gets going, including every
-                                // non-zero-init synapse from the very first
-                                // step), it fed the ALWAYS-POSITIVE quant_floor
-                                // into a formula whose correct gradient is
-                                // SIGNED. That's not a small epsilon bias, it's
-                                // wholesale directional corruption of every
-                                // trained synapse's contribution to
-                                // value_scale/output_scale's gradient --
-                                // confirmed as the root cause of a real,
-                                // reproducible failure: zero-init models
-                                // produced predictions and eval_acc BIT
-                                // -IDENTICAL to a completely untrained model
-                                // after 15000 real training steps, energy and
-                                // rank-N included (see
-                                // sili_peridot/scripts/zeroinit_minimal_repro.py).
-                                // Only quant==0 (the genuinely-stuck case,
-                                // where the correct gradient truly is zero and
-                                // sign is legitimately undefined/free -- this
-                                // part of the original reasoning was correct,
-                                // just applied too broadly) substitutes the
-                                // small positive epsilon; every other quant
-                                // value uses itself directly, exact and signed
-                                // (quant_floor itself now computed once, fixed,
-                                // before this loop -- see its own comment above).
+                                // dL/d(value_scale_k(r,k)) = g*quant*
+                                // output_scale_k(col,k), vanishing exactly at
+                                // quant=0. quant_floor gates the zero-escape
+                                // substitution on quant==0 specifically (not
+                                // unconditionally) -- see
+                                // docs/research/linear_disldo.rst for the real
+                                // sign-corruption bug this fixes.
                                 for (std::size_t k = 0; k < rank; ++k) {
-                                    // AQRS gamma (task #273/#283): out_scale_k/
-                                    // val_scale_k above are pure DIRECTION
-                                    // (value_scale_k/output_scale_k's getters
-                                    // are never gamma-baked -- only get_scale()
-                                    // combines direction*gamma, for the S/
-                                    // weight-update math elsewhere). Each of
-                                    // value_scale's and output_scale's OWN
-                                    // gradient needs an explicit gamma_k factor
-                                    // (dS/d(value_direction_k)=gamma_k*
-                                    // output_direction_k, and symmetrically for
-                                    // output_direction_k) since neither
-                                    // scale_grad_sum_rank[k] nor mcol_at(col,k)
-                                    // otherwise sees gamma at all. gamma_k's
-                                    // OWN gradient (dS/d(gamma_k)=value_
-                                    // direction_k*output_direction_k) is a NEW,
-                                    // layer-wide (not per-row/col) accumulator.
+                                    // AQRS gamma (task #273/#283): direction
+                                    // caches are never gamma-baked, so each
+                                    // gradient site needs an explicit gamma_k
+                                    // factor; gamma's own gradient uses the
+                                    // pure direction product. See
+                                    // docs/research/linear_disldo.rst.
                                     const value_type out_scale_k =
                                         weights.get_output_scale_k(col, k);
                                     const value_type val_scale_k = weights.get_value_scale_k(r, k);
@@ -1142,13 +676,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 }
                 if (learning_rate != value_type(0)) {
                     // Scale update via the swappable policy (default
-                    // RMSpropScalePolicy reproduces this exact formula) --
-                    // see ScalePolicy's own docstring, delta_csr_types.hpp.
-                    // DeferredScaleWrite still only updates component 0
-                    // (scale_grad_sum, the old single-double accumulator) --
-                    // rank>1 is only meaningful for the non-deferred branch
-                    // above (scale_grad_sum_rank), matching that branch's own
-                    // scope note.
+                    // RMSpropScalePolicy). DeferredScaleWrite only updates
+                    // component 0 (rank>1 is non-deferred-only).
                     if constexpr (!DeferredScaleWrite) {
                         for (std::size_t k = 0; k < rank; ++k) {
                             const value_type g_agg_k =
@@ -1185,57 +714,33 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     } // !dc.empty()
 
     // block4 backward: dx + inline weight/importance update, mirroring the
-    // scattered loop above but keyed by tile instead of CSR row. Same
-    // shared value_scale/output_scale as forward and the scattered path
-    // (see block4.hpp) -- moving a synapse between representations stays
-    // a lossless byte copy, so its gradient math must stay consistent too.
-    //
-    // Race note: the scattered loop above parallelizes over ROWS, so each
-    // row (and thus each row's value_scale/value_scale_importance update)
-    // is owned by exactly one thread. Here we parallelize over TILES, and
-    // two different tiles can share the same block-ROW (different block-
-    // columns) -- so a row's value_scale gradient can now be touched by
-    // more than one thread concurrently. Fixed the same way output_scale's
-    // gradient already is in this function: per-thread-private accumulator
-    // buffers (t_row_grad, indexed like t_col_grad), reduced serially once
-    // after the parallel region, instead of applying the update inline.
-    //
-    // KNOWN SIMPLIFICATION (documented, not a bug): if a row has BOTH
-    // scattered and block4 synapses, its value_scale gets two sequential
-    // gradient steps (the scattered loop's own step above, then block4's
-    // step below) rather than one combined step over the true total nnz.
-    // Mathematically this is just two successive descent steps, not an
-    // incorrect one -- acceptable for a first working version; revisit if
-    // the comparison script (TODO_DUAL_BLOCK4.md) shows it matters.
+    // scattered loop but keyed by tile instead of CSR row, sharing the
+    // same value_scale/output_scale. Parallelized over TILES (not rows),
+    // so a row's value_scale gradient can be touched by more than one
+    // thread -- fixed via per-thread-private accumulators (t_row_grad),
+    // reduced once after the parallel region. Known, documented
+    // simplification: a row live in BOTH representations gets two
+    // sequential gradient steps, not a bug. See
+    // docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
         // row_ti_start: cumulative tile count per block-row, needed to
-        // split the row-partitioned parallel loop below (each thread's
-        // #pragma omp for chunk is a contiguous BLOCK-ROW range, but tile
-        // COUNTS per row vary, so row_ti_start[br]..row_ti_start[br+1]
-        // gives each row's tile-count window within that chunk -- NOT
-        // storage offsets: since the row-workspace rewrite (see
-        // conversation), tile byte/elem positions are tracked entirely
-        // within each row's own RowWorkspace, snapshotted fresh per row,
-        // not precomputed globally here (a global precompute was the
-        // root of the byte_pos-staleness class of bugs this rewrite
-        // closes -- see Block4Store::RowWorkspace's comment).
+        // split the row-partitioned parallel loop below. NOT storage
+        // offsets -- since the row-workspace rewrite, tile byte/elem
+        // positions live entirely within each row's own RowWorkspace,
+        // snapshotted fresh per row. See docs/research/linear_disldo.rst.
         std::vector<std::size_t>& row_ti_start = weights.block4.scratch_row_ti_start;
         const auto& BL4 = weights.block4.block_layout;
         row_ti_start.resize(BL4.rows + 1);
 
-        // Per-row slot count across ALL block4 tiles touching that row
-        // (not just one tile), needed for both lr_per_row_nnz and the
-        // unconditional scale_eff_lr normalization. Every tile contributes
-        // exactly BLOCK4_TILE slots per row it covers -- dense, no
-        // per-slot scan needed (see block4.hpp: a live tile's slots are
-        // all real synapses, weight=0.0 included).
+        // Per-row slot count across ALL block4 tiles touching that row,
+        // needed for lr_per_row_nnz and scale_eff_lr normalization. Every
+        // tile contributes exactly BLOCK4_TILE slots per row it covers.
         std::vector<uint32_t>& row_live_count = weights.block4.scratch_row_live_count;
         row_live_count.assign(n_in, 0);
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
-            row_ti_start[br] = ti; // written unconditionally -- an empty
-            // row (n_bc==0) still needs a valid (empty) [start,start)
-            // range for the parallel loop's row-partitioned split below.
+            row_ti_start[br] = ti; // written unconditionally: an empty row
+            // still needs a valid (empty) [start,start) range below.
             const std::size_t n_bc = BL4.row_nnz(br);
             ti += n_bc;
             if (n_bc == 0)
@@ -1251,10 +756,6 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
 
         std::vector<double>& t_row_grad = weights.block4.scratch_row_grad;
         t_row_grad.assign(static_cast<std::size_t>(num_cpus) * n_in * rank, 0.0);
-        // Parallel forward-contribution accumulator, same shape/layout as
-        // t_row_grad -- mirrors t_col_grad_contrib's own rationale
-        // (additive combination, one level up from per-synapse ci; see
-        // that array's own comment above this function).
         std::vector<double> t_row_grad_contrib(static_cast<std::size_t>(num_cpus) * n_in * rank,
                                                0.0);
 
@@ -1262,13 +763,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         {
             const int tid = omp_get_thread_num();
             value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
-            // t_col_grad/t_row_grad are laid out [thread][col or row][k]
-            // (see their sizing above/at this function's top). Both the
-            // FP4 and FP8 block4 branches below are full rank-N -- they
-            // loop k<rank and write every component through these same
-            // accessors; there is no separate rank-1-strided pointer,
-            // which would alias incorrectly against this same buffer once
-            // rank>1.
+            // t_col_grad/t_row_grad laid out [thread][col or row][k]; both
+            // FP4/FP8 block4 branches below are full rank-N.
             // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
                 t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
@@ -1292,15 +788,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             auto mrow_at_contrib = [&](std::size_t row, std::size_t k) -> double& {
                 return mrow_contrib_base[row * rank + k];
             };
-            // AQRS gamma (task #273/#283) -- block4 gets its OWN parallel
-            // region (separate from the scattered path's, above), so
+            // AQRS gamma: block4 gets its OWN parallel region, so
             // mgamma_at/mgamma_at_contrib need their own tid-scoped
-            // closures here too, reading from the SAME t_gamma_grad/
-            // t_gamma_grad_contrib buffers (declared once, outside both
-            // parallel regions, at this function's top) that the scattered
-            // path's own mgamma_at uses -- both regions' threads
-            // accumulate into the same shared array, reduced together once
-            // after both parallel regions close.
+            // closures, reading from the SAME t_gamma_grad/
+            // t_gamma_grad_contrib buffers the scattered path uses --
+            // both regions accumulate into the same shared array, reduced
+            // together once after both close.
             // cppcheck-suppress constVariablePointer
             value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
             auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
@@ -1311,82 +804,23 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 return mgamma_contrib_base[k];
             };
 
-// Partitioned BY BLOCK-ROW, not by flat tile index -- each
-// thread exclusively owns every tile in the rows it's
-// assigned, processed sequentially within that row (the
-// inner `for (ti...)` below), so no two threads ever touch
-// the same row's tile_data concurrently. This is what makes
-// it safe for a tile's handle to resize (real sparse<->dense
-// transitions, driven by real content) inside this parallel
-// region at all -- see block4_resize_tile_in_row's comment:
-// resizing ONE tile shifts every LATER tile in ITS OWN row,
-// which is exactly the memory a same-row thread already owns
-// exclusively, never memory another thread could be reading
-// or writing. (Real budget exhaustion during that resize is
-// handled by declining the growth, not throwing -- see
-// ~Block4TileHandle()'s comment -- so there's no exception-
-// across-the-parallel-region-boundary concern here either.)
-// schedule(static): row widths CAN vary a lot (some rows have
-// far more live tiles than others), which in principle makes
-// static's flat contiguous split load-balance worse than
-// schedule(dynamic)/schedule(guided) once num_cpus > 1 --
-// tried both, measured worse in practice: their real
-// per-chunk dispatch overhead showed up as a real backward
-// slowdown at high tile density even at num_cpus=1
-// (scripts/bench_block4_vs_dense_fp4.cpp: dynamic/guided both
-// measured ~1.69x speedup over the dense floor at 100% fill,
-// vs ~1.97x for static -- worse than even the pre-this-fix
-// documented baseline of ~1.88x), where there's no actual
-// load-balancing benefit to buy that overhead with in the
-// first place. Revisit if a real, measured multi-thread
-// workload with genuinely lopsided row widths shows static's
-// imbalance actually costing more wall-clock time than this.
+// Partitioned BY BLOCK-ROW, not flat tile index: each thread
+// exclusively owns every tile in its assigned rows, so a
+// tile's handle can safely resize (real sparse<->dense
+// transitions) inside this parallel region. schedule(static)
+// measured to beat dynamic/guided here despite uneven row
+// widths -- see docs/research/linear_disldo.rst.
 #pragma omp for schedule(static)
             for (std::size_t br = 0; br < BL4.rows; ++br) {
                 if (row_ti_start[br] == row_ti_start[br + 1])
                     continue; // empty row
-                // BUG FIX (see conversation): the OLD version of this loop read
-                // and wrote each tile directly through the shared store (via
-                // at_index()'s fast path), relying only on row-exclusive thread
-                // ownership for safety. That protects against two threads
-                // touching the SAME row, but NOT against a DIFFERENT row's
-                // growth: growing row X past its own current headroom shifts
-                // tbyte_start/tbyte_end -- and physically MEMMOVES the tile
-                // BYTES themselves -- for every row after X, including
-                // whatever row this thread owns. Confirmed via ASan as a real,
-                // reproducible heap-use-after-free / negative-size memmove
-                // even with tile_data's capacity pre-reserved (which only
-                // fixes buffer REALLOCATION, a separate hazard) and even with
-                // a lock guarding concurrent growers (which only fixes two
-                // growers racing each other, not a grower racing this row's
-                // reader). See disldo_backward_sparse_grad's identical fix
-                // in sisldo_ops.hpp for the full writeup.
-                //
-                // Fix: snapshot this row into a thread-private workspace
-                // ONCE, do all reads/writes against that private copy, then
-                // merge back in one row-exclusive step at the end (evicting
-                // lowest-importance synapses if this row grew past its own
-                // existing headroom rather than shifting anything else -- see
-                // Block4Store::merge_row_workspace's comment). This makes the
-                // cross-row-shift hazard structurally unreachable rather than
-                // merely less likely: no row growing through this workspace
-                // path ever calls the shared store's cross-row-shifting
-                // resize at all. Used UNCONDITIONALLY (even when
-                // learning_rate == 0, which never actually writes anything
-                // back) rather than branching read-only vs writing: dx doesn't
-                // depend on whether writes happen, this keeps a single tested
-                // code path instead of two, and it stays correct even if some
-                // OTHER concurrent caller on the same store is writing at the
-                // same time.
-                // process_tile: the per-tile gradient math (SIMD batch loop,
-                // stochastic requantize) extracted into a lambda so the
-                // read-only and writing branches below share EXACTLY one
-                // implementation instead of two copies that could drift
-                // apart -- only how `tdata` is SOURCED differs between them,
-                // never the math. Every write inside is already gated by
-                // `learning_rate != value_type(0)` (unchanged from before
-                // this split), so calling this from the read-only branch is
-                // provably a no-op write-wise, not just assumed safe.
+                // Row-workspace snapshot fixes a real cross-row memmove
+                // hazard (a different row's growth could memmove this
+                // row's bytes mid-read) -- see
+                // docs/research/linear_disldo.rst. process_tile: shared
+                // between the read-only and writing branches below so
+                // they can't drift apart; every write inside is gated by
+                // learning_rate != 0.
                 auto process_tile = [&](uint32_t bc, uint8_t* tdata) -> bool {
                     bool tile_dirty = false;
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
@@ -1403,98 +837,25 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                            : learning_rate;
 
                         // Decode this row's whole 4-wide column vector ONCE,
-                        // outside the batch loop: table lookups and the
-                        // get_output_scale()/get_output_importance_scale()
-                        // calls (both branch on col bounds) block
-                        // auto-vectorization if left inside it, and none
-                        // depend on b. The batch loop itself can't vectorize
-                        // across b -- cw4/ci4 carry a genuine sequential
-                        // per-sample update across b (online SGD within the
-                        // call, not a reduction) -- but each of the 4 COLUMNS
-                        // is independent of the others, so the inner loop over
-                        // lj at each b is a real, branch-free, gather-free
-                        // 4-wide vectorization target instead.
-                        // Decode both the weight and importance codes for all
-                        // BLOCK4_TILE columns via plain FP4_TABLE[code] lookups,
-                        // NOT block4_vec_decode_fp4's SIMD bit-shift formula.
-                        // NOT a "SIMD loses to scalar" finding -- that was
-                        // checked properly and is FALSE: fp4_decode_bits()
-                        // (the true scalar equivalent of the SIMD formula,
-                        // same bit-shift algorithm, just unvectorized) is
-                        // measurably the WORST of the three options here
-                        // (~1.6x slower than either alternative in the full
-                        // backward benchmark), confirming SIMD genuinely beats
-                        // scalar bit-shift decode, consistent with this
-                        // codebase's earlier documented finding
-                        // (TODO_DUAL_BLOCK4.md) and not contradicted by
-                        // anything here. What DOES win, measured in the real
-                        // disldo_backward benchmark (not just an isolated
-                        // microbenchmark, which misleadingly suggested a
-                        // bigger and differently-shaped effect than the real
-                        // one -- see TODO_DUAL_BLOCK4.md's Part C) is
-                        // FP4_TABLE[code] specifically -- a different decode
-                        // ALGORITHM (branchless array lookup vs bit-field
-                        // reconstruction), not a SIMD-vs-scalar swap. Real,
-                        // reproducible ~6% win over the SIMD bit-shift version
-                        // for backward specifically (3 repeats each, clean
-                        // non-overlapping ranges); forward showed the OPPOSITE
-                        // (SIMD bit-shift wins there, kept as-is above) --
-                        // the two functions' surrounding code apparently
-                        // interacts with this choice differently enough that
-                        // the same swap doesn't transfer between them.
-                        // Unconditional, before the per-lj bounds check below,
-                        // since decoding an out-of-bounds column's byte is
-                        // harmless (the branch below discards it).
+                        // outside the batch loop (avoids blocking
+                        // auto-vectorization; the batch loop itself can't
+                        // vectorize across b, but the 4 columns are
+                        // independent, giving the inner lj loop a real
+                        // 4-wide target). FP4_TABLE[code] lookup, not
+                        // block4_vec_decode_fp4's SIMD bit-shift formula --
+                        // measured ~6% win for backward specifically
+                        // (opposite of forward's finding). See
+                        // docs/research/linear_disldo.rst.
                         if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
                             // FP8 (E4M3) block4 weight+importance update.
-                            // MEASURED (scripts/bench_block4_fp8_simd.cpp,
-                            // 512x512 100%-dense block4, best-of-200,
-                            // -O3 -ffast-math -march=native), not assumed:
-                            //   batch=1:  full-SIMD 0.0060s vs plain-scalar
-                            //             0.0048s -- SIMD LOST (~20% slower).
-                            //   batch=1:  scalar decode+encode + SIMD
-                            //             accumulate-only ~= plain-scalar
-                            //             (0.0048s, no measurable win OR
-                            //             loss -- batch=1 means the SIMD
-                            //             accumulate loop's own inner `for
-                            //             (b<batch)` only runs once, so it
-                            //             never gets to amortize its setup
-                            //             cost against reused decoded state).
-                            //   batch=32: scalar decode+encode + SIMD
-                            //             accumulate 0.0227s vs plain-scalar
-                            //             0.0298s -- SIMD WON (~24% faster),
-                            //             confirmed via objdump that this is
-                            //             real 128-bit packed SIMD (vmulps/
-                            //             vrsqrtps/vaddps on xmm registers)
-                            //             inside this exact lambda, not
-                            //             GCC auto-vectorizing scalar code.
-                            // Conclusion: block4_vec_decode_fp8/
-                            // block4_vec_quantize_stochastic_fp8 (the SIMD
-                            // decode/encode built and tested alongside
-                            // disldo_forward's own block4 section) measurably
-                            // LOSE here -- E4M3's 256-code space makes their
-                            // subnormal/NaN-lane scalar-correction fallback
-                            // (block4.hpp) real, non-negligible overhead that
-                            // FP4's simpler E2M1 (16 codes) never pays. So:
-                            // scalar fp8_decode_bits/fp8_quantize_stochastic
-                            // for decode/encode (matching FP4's own empirical
-                            // finding for backward, now independently
-                            // confirmed true for FP8 too, not just assumed to
-                            // transfer), SIMD (Block4Vec) kept ONLY for the
-                            // batch-loop accumulation math -- identical to
-                            // FP4's own accumulate loop once weight/
-                            // importance are decoded to float, and the one
-                            // piece that measurably earns its complexity at
-                            // realistic (>1) batch sizes.
+                            // Measured (scripts/bench_block4_fp8_simd.cpp):
+                            // full SIMD LOSES at batch=1 (E4M3's subnormal/
+                            // NaN-lane scalar-correction fallback is real
+                            // overhead FP4 never pays), scalar decode/encode
+                            // + SIMD accumulate-only WINS at batch=32. See
+                            // docs/research/linear_disldo.rst.
                             if constexpr (std::is_same_v<value_type, float> &&
                                           !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
-                                // bit-shift for backward specifically") against
-                                // FP8's real measured numbers -- first SIMD-
-                                // decode version measured slower than the plain
-                                // scalar fallback (0.0060s vs 0.0048s/call,
-                                // 512x512 100%-dense block4, 200-rep best-of),
-                                // this is checking whether decode specifically
-                                // is the cause before reverting the whole path.
                                 const value_type w_decoded_arr8[BLOCK4_TILE] = {
                                     fp8_decode_bits(tdata[Block4Tile8::slot_index(li, 0)]),
                                     fp8_decode_bits(tdata[Block4Tile8::slot_index(li, 1)]),
@@ -1533,26 +894,11 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     combined_imp_scale4_8[BLOCK4_TILE];
                                 value_type cw4_8[BLOCK4_TILE], ci4_8[BLOCK4_TILE],
                                     cw_orig4_8[BLOCK4_TILE];
-                                // was_live4_8[lj]: TRUE only if this cell already
-                                // held a genuine synapse (weight OR importance
-                                // byte nonzero) BEFORE this backward call.
-                                // col_valid4_8 is just col<n_out -- block4 tiles
-                                // are DENSE 4x4 blocks touched at every in-bounds
-                                // (li,lj), including cells that were never a real
-                                // synapse (block4's own "no synapse here" IS
-                                // weight==importance==0, unlike scattered CSR's
-                                // structural absence -- see block4_count_live/
-                                // block4_sparse_pack's identical `dense[i]!=0`
-                                // criterion). The never-zero live quantizer must
-                                // ONLY protect an ALREADY-established synapse
-                                // from rounding back to the dead code -- applying
-                                // it unconditionally to every col_valid4_8 cell
-                                // would force every touched-but-never-connected
-                                // cell permanently "live", corrupting block4's
-                                // own sparse/dense repacking (confirmed directly:
-                                // caused test_disldo_block4_backward's whole tile
-                                // to zero out via a corrupted live-count/repack --
-                                // see conversation).
+                                // was_live4_8[lj]: TRUE only if this cell held a
+                                // genuine synapse BEFORE this call -- gates the
+                                // never-zero live quantizer so it never
+                                // permanently "births" a never-connected cell.
+                                // See docs/research/linear_disldo.rst.
                                 bool was_live4_8[BLOCK4_TILE];
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
@@ -1572,26 +918,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     col4_8[lj] = col;
                                     const value_type out_imp_scale =
                                         weights.get_output_importance_scale(col);
-                                    // S(row,col) = sum_k value_scale_k*output_scale_k
-                                    // -- see FP4 branch's identical get_scale
-                                    // comment (mirrors it exactly). cw4_8 is now
-                                    // CODE-SPACE (same convention as FP4's
-                                    // quant4/quant_orig4, NOT the true-weight-
-                                    // scaled representation this used to hold --
-                                    // see conversation: keeping cw4_8 in true
-                                    // units while update_cw's RMSprop-normalized
-                                    // delta is ~S-independent (magnitude ~eff_lr
-                                    // regardless of S) meant the later `/
-                                    // combined_scale4_8` at write time amplified
-                                    // every step by 1/S instead of damping it by
-                                    // S the way FP4's convention does, blowing
-                                    // up explosively for any layer with small
-                                    // output_scale (e.g. a wide dense layer's
-                                    // fan-in-corrected scale). Every use of
-                                    // cw4_8/cw_start4_8 as a TRUE weight (contrib,
-                                    // dx, update_cw's S argument) below now
-                                    // multiplies by combined_scale4_8 explicitly,
-                                    // matching FP4's quant_start4[lj]*S pattern.
+                                    // S(row,col) = sum_k value_scale_k*output_scale_k.
+                                    // cw4_8 is CODE-SPACE (matches FP4's quant4
+                                    // convention) -- keeping it in true units
+                                    // instead caused a real 1/S blowup at write
+                                    // time for small output_scale. See
+                                    // docs/research/linear_disldo.rst.
                                     combined_scale4_8[lj] = weights.get_scale(row, col);
                                     combined_imp_scale4_8[lj] = imp_scale * out_imp_scale;
                                     cw_orig4_8[lj] = w_decoded_arr8[lj];
@@ -1651,34 +983,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
                                     const Block4Vec max_abs_delta_v =
                                         block4_vec_broadcast(max_abs_delta);
-                                    // cw_start_v: FIXED for the whole batch loop
-                                    // -- see the scattered path's identical
-                                    // cw_start comment for the full rationale
-                                    // (real bug this session: cw_v/ci_v were
-                                    // mutated mid-loop, once per batch row).
-                                    // g_agg_v/contrib_agg_v are Block4Vec
-                                    // (16-byte) stack locals, not a matrix
-                                    // -sized buffer.
+                                    // cw_start_v/S_v: FIXED snapshots for the
+                                    // whole batch loop -- see the scattered
+                                    // path's identical cw_start comment.
                                     const Block4Vec cw_start_v = block4_vec_load(cw4_8);
                                     Block4Vec ci_v = block4_vec_load(ci4_8);
                                     const Block4Vec cw_orig_v = block4_vec_load(cw_orig4_8);
-                                    // S_v: code-space -> true-weight conversion
-                                    // factor, matching FP4's scalar S -- see
-                                    // this tile's decode-site comment above for
-                                    // the full rationale.
                                     const Block4Vec S_v = block4_vec_load(combined_scale4_8);
-                                    // mcol_acc_v_k8/mcol_acc_v_k8_contrib are
-                                    // the only TRUE cross-batch accumulators
-                                    // here (value_scale_k_v8/out_scale_k_v8
-                                    // were plain caches of a broadcast/load
-                                    // already available from value_scale_k8/
-                                    // out_scale_k4_8 -- recomputed inline at
-                                    // each use below instead, cheap SIMD ops,
-                                    // no need to cache them). Backed by scratch
-                                    // (task #295), load-accumulate-store each
-                                    // batch iteration instead of a live
-                                    // Block4Vec register array across
-                                    // iterations.
+                                    // mcol_acc_raw8 are the only TRUE
+                                    // cross-batch accumulators here; backed by
+                                    // scratch (task #295).
                                     value_type* mcol_acc_raw8 =
                                         srs.mcol_acc_raw.data() + tid_rank_tile;
                                     value_type* mcol_acc_raw8_contrib =
@@ -1702,25 +1016,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                             col_base8);
                                         const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
                                         if (training) {
-                                            // Additive forward-contribution
-                                            // combination -- see the scattered
-                                            // path's identical fix for the full
-                                            // rationale and the proved theorem
-                                            // (Joint.combined_signal_strictly_informative).
+                                            // Additive g+contrib combination --
+                                            // see the scattered path's fix.
                                             const Block4Vec contrib_v =
                                                 cw_start_v * S_v * block4_vec_broadcast(iv);
                                             g_agg_v += g_v;
                                             contrib_agg_v += contrib_v;
                                             for (std::size_t k = 0; k < rank; ++k) {
-                                                // AQRS gamma (task #273/#283):
-                                                // out_scale_k_v8/value_scale_k_v8 are pure
-                                                // DIRECTION (never gamma-baked -- see gamma_k_arr's
-                                                // own docstring above for why). value_scale's own
-                                                // gradient (mrow_local8_k) and output_scale's own
-                                                // gradient (mcol_acc_v_k8) each need an explicit
-                                                // gamma_k factor; gamma's own gradient
-                                                // (mgamma_local8_k) uses the PURE direction
-                                                // product, no gamma factor.
+                                                // AQRS gamma: direction caches
+                                                // never gamma-baked, explicit
+                                                // gamma_k factor per site.
                                                 const Block4Vec value_scale_k_v8 =
                                                     block4_vec_broadcast(value_scale_k8[k]);
                                                 const Block4Vec out_scale_k_v8 =
@@ -1779,13 +1084,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     }
                                 } else {
                                     // Boundary tile-column: scalar bounds-checked
-                                    // fallback, matching the FP4 branch's own.
-                                    // cw_start4_8/g_agg4_8/contrib_agg4_8: FIXED
-                                    // per-lj snapshot + aggregators for the
-                                    // whole batch loop -- see the scattered
-                                    // path's identical cw_start comment for the
-                                    // full rationale. 3 small (BLOCK4_TILE=4
-                                    // element) stack arrays, not matrix-sized.
+                                    // fallback. cw_start4_8/g_agg4_8/contrib_agg4_8:
+                                    // FIXED per-lj snapshots for the whole batch
+                                    // loop -- see the scattered path's cw_start
+                                    // comment.
                                     value_type cw_start4_8[BLOCK4_TILE];
                                     double g_agg4_8[BLOCK4_TILE] = {0.0};
                                     double contrib_agg4_8[BLOCK4_TILE] = {0.0};
@@ -1804,18 +1106,13 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                             col4_8[lj]];
                                             const value_type g = dyv * iv;
                                             if (learning_rate != value_type(0)) {
-                                                // Additive forward-contribution
-                                                // combination -- see the
-                                                // scattered path's identical fix
-                                                // (Joint.combined_signal_strictly_informative).
+                                                // Additive g+contrib combination.
                                                 const value_type contrib =
                                                     iv * (cw_start4_8[lj] * combined_scale4_8[lj]);
                                                 g_agg4_8[lj] += static_cast<double>(g);
                                                 contrib_agg4_8[lj] += static_cast<double>(contrib);
                                                 for (std::size_t k = 0; k < rank; ++k) {
-                                                    // AQRS gamma (task #273/#283) -- see the SIMD
-                                                    // branch's identical comment above for the full
-                                                    // rationale.
+                                                    // AQRS gamma -- see above.
                                                     mrow_local8_k[k] +=
                                                         static_cast<double>(cw_orig4_8[lj]) *
                                                         static_cast<double>(out_scale_k4_8[k][lj]) *
@@ -1933,13 +1230,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 }
                             } else {
                                 // Hypothetical non-float value_type (never
-                                // actually instantiated -- see the FP4 branch's
-                                // identical comment below): plain scalar,
-                                // per-lj-sequential fallback, same math as the
-                                // SIMD path above, previously the ONLY FP8
-                                // implementation before this SIMD pass -- kept
-                                // here rather than deleted, matching FP4's own
-                                // precedent for this exact fallback slot.
+                                // actually instantiated): plain scalar
+                                // per-lj-sequential fallback, same math as
+                                // the SIMD path above.
                                 std::vector<value_type> value_scale_k8_fb(rank);
                                 for (std::size_t k = 0; k < rank; ++k)
                                     value_scale_k8_fb[k] = weights.get_value_scale_k(row, k);
@@ -1977,16 +1270,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                             output_grad[static_cast<std::size_t>(b) * n_out + col];
                                         const value_type g = dyv * iv;
                                         if (learning_rate != value_type(0)) {
-                                            // Additive forward-contribution
-                                            // combination -- see the scattered
-                                            // path's identical fix
-                                            // (Joint.combined_signal_strictly_informative).
+                                            // Additive g+contrib combination.
                                             const value_type contrib = iv * cw_start;
                                             g_agg += static_cast<double>(g);
                                             contrib_agg += static_cast<double>(contrib);
                                             for (std::size_t k = 0; k < rank; ++k) {
-                                                // AQRS gamma -- see the SIMD branch's identical
-                                                // comment above.
+                                                // AQRS gamma -- see above.
                                                 mrow_local_k[k] +=
                                                     static_cast<double>(cw_orig) *
                                                     static_cast<double>(out_scale_k8_fb[k]) *
@@ -2083,34 +1372,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         std::size_t col4[BLOCK4_TILE];
                         bool col_valid4[BLOCK4_TILE];
                         value_type combined_scale4[BLOCK4_TILE], combined_imp_scale4[BLOCK4_TILE];
-                        // quant4: the stored CODE itself -- now the primary
-                        // optimized quantity (see the batch loop below), NOT
-                        // true units like the old cw4 was. ci4 stays in true
-                        // (importance) units, unrelated to this fix. quant_orig4
-                        // is an immutable snapshot of quant4's call-entry value
-                        // (quant4 itself mutates across the batch loop below),
-                        // used for the forward-contribution signal
-                        // (contrib = x*quant_orig) -- mirrors FP8's cw_orig4_8.
+                        // quant4: the stored CODE, now the primary optimized
+                        // quantity (not true units). quant_orig4: immutable
+                        // snapshot of its call-entry value, for contrib.
                         value_type quant4[BLOCK4_TILE], ci4[BLOCK4_TILE], quant_orig4[BLOCK4_TILE];
-                        // out_scale_k4[k][lj]: per-rank-component output_scale,
-                        // needed for value_scale_k's own gradient below.
                         const Flat2DView out_scale_k4{
                             weights.scale_rank_scratch.out_scale_k.data() +
                                 static_cast<std::size_t>(tid) * rank * BLOCK4_TILE,
                             BLOCK4_TILE};
-                        // was_live4[lj]: see was_live4_8's declaration comment
-                        // (FP8 branch above) for the full rationale -- CORRECTED
-                        // from this loop's own former comment ("every slot is a
-                        // real synapse... no liveness check"), which was true
-                        // and harmless under the OLD quantizer (an untouched
-                        // slot's delta is 0, and plain fp4_quantize(0)==0
-                        // preserved blank status) but is NOT harmless once the
-                        // WRITE uses the never-zero live quantizer -- that would
-                        // permanently "birth" a synapse at every col_valid4
-                        // position regardless of whether gradient signal ever
-                        // touched it, corrupting block4's own sparse/dense
-                        // repacking (confirmed directly via
-                        // test_disldo_block4_backward -- see conversation).
+                        // was_live4[lj]: same gating as was_live4_8 (FP8
+                        // branch above). See docs/research/linear_disldo.rst.
                         bool was_live4[BLOCK4_TILE];
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                             const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
@@ -2266,63 +1537,21 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         col_base);
                                     const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
                                     if (training) {
-                                        // RMSprop-style: decayed EMA of g^2, damp by
-                                        // sqrt(ci)+eps -- see disldo_backward's own
-                                        // docstring for why (matches the scattered
-                                        // per-synapse path above exactly).
-                                        //
-                                        // Additive forward-contribution
-                                        // combination (contrib = x*quant_orig) --
-                                        // see the scattered path's identical fix
-                                        // for the full rationale and the proved
-                                        // theorem
-                                        // (Joint.combined_signal_strictly_informative,
-                                        // sili__new/lean_proofs/importance_signal_information_gain/
-                                        // SiliImportanceProof/ImportanceSignalInformationGain.lean).
-                                        // FIXED snapshot for the whole batch --
-                                        // see quant_start_v's own comment above.
+                                        // RMSprop-style ci, additive g+contrib
+                                        // combination -- see disldo_backward's
+                                        // own docstring and
+                                        // docs/research/linear_disldo.rst.
                                         const Block4Vec contrib_v =
                                             (quant_start_v * combined_scale_v) *
                                             block4_vec_broadcast(iv);
                                         g_agg_v += g_v;
                                         contrib_agg_v += contrib_v;
-                                        // quant_floor: real signed quant for
-                                        // value_scale_k/output_scale_k's own
-                                        // gradient, EXCEPT exactly at quant==0
-                                        // (genuinely stuck, correct gradient
-                                        // truly is zero, sign legitimately
-                                        // free) where zero_escape_eps
-                                        // substitutes a floor instead -- see
-                                        // disldo_backward's scattered-path
-                                        // comment for the full correctness
-                                        // trace (CORRECTED: the old
-                                        // unconditional `eps+|quant|` discarded
-                                        // sign on every nonzero synapse, not
-                                        // just stuck ones -- confirmed as the
-                                        // root cause of a real zero-init
-                                        // training failure). No whole-vector
-                                        // compare-and-select op available for
-                                        // Block4Vec (same reason block4_vec_sqrt
-                                        // above is a plain per-lane loop, not a
-                                        // SIMD intrinsic) -- correctness first,
-                                        // matches that precedent exactly.
-                                        // quant's OWN update above needs no
-                                        // floor at all (S is nonzero-driven,
-                                        // never multiplies a vanishing quant
-                                        // factor into itself).
-                                        // mrow_local_k accumulates in DOUBLE, one
-                                        // horizontal-sum per (b,k) -- matches the
-                                        // pre-SIMD code's own double-precision
-                                        // accumulation exactly (unlike mcol,
-                                        // which is float-precision, matching the
-                                        // original scalar code -- see this
-                                        // block's own precision note below;
-                                        // quant_floor_v itself now computed once,
-                                        // fixed, before this loop.
+                                        // quant_floor: signed quant, except at
+                                        // quant==0 where zero_escape_eps
+                                        // substitutes -- see
+                                        // docs/research/linear_disldo.rst.
                                         for (std::size_t k = 0; k < rank; ++k) {
-                                            // AQRS gamma -- see the scattered path's identical
-                                            // comment (near gamma_k_arr's own declaration) for the
-                                            // full rationale.
+                                            // AQRS gamma -- see above.
                                             const Block4Vec value_scale_k_v =
                                                 block4_vec_broadcast(value_scale_k[k]);
                                             const Block4Vec out_scale_k_v =
@@ -2479,13 +1708,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 }
                             }
                         } else {
-                            // Hypothetical non-float value_type (never actually
-                            // instantiated in this codebase -- see the comment
-                            // above): the bounds-checked array form, correct
-                            // for both the full-tile and boundary cases via
-                            // col_valid4 either way, so no full_tile_cols split
-                            // needed here at all. Identical math to the
-                            // boundary branch above.
+                            // Hypothetical non-float value_type (never
+                            // actually instantiated): bounds-checked array
+                            // form, identical math to the boundary branch
+                            // above.
                             value_type quant_start4[BLOCK4_TILE], quant_floor4[BLOCK4_TILE];
                             double g_agg4[BLOCK4_TILE] = {0.0}, contrib_agg4[BLOCK4_TILE] = {0.0};
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
@@ -2506,14 +1732,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     const value_type g = dyv * iv;
                                     const value_type S = combined_scale4[lj];
                                     if (learning_rate != value_type(0)) {
-                                        // Additive forward-contribution
-                                        // combination -- see the scattered
-                                        // path's identical fix
-                                        // (Joint.combined_signal_strictly_informative).
-                                        // contrib/quant_floor use FIXED
-                                        // batch-start snapshots -- see the
-                                        // scattered path's cw_start comment
-                                        // for the full rationale.
+                                        // Additive g+contrib combination,
+                                        // FIXED batch-start snapshots.
                                         const value_type contrib = iv * (quant_start4[lj] * S);
                                         g_agg4[lj] += static_cast<double>(g);
                                         contrib_agg4[lj] += static_cast<double>(contrib);
@@ -2561,30 +1781,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     static_cast<value_type>(mgamma_local_k_contrib[k]);
                             }
                             if constexpr (!StochasticRounding) {
-                                // Deterministic: NOT gated by the SIMD fast path above --
-                                // no deterministic block4_vec_quantize_fp4 SIMD kernel
-                                // exists yet (only block4_vec_quantize_stochastic_fp4
-                                // does), so this always uses the scalar fp4_quantize()
-                                // codec, mirroring the scattered-CSR path's own
-                                // if constexpr (StochasticRounding) branch above.
-                                // Correctness first -- a SIMD deterministic variant
-                                // would be a reasonable follow-up perf optimization,
-                                // not needed for SparseLinearLayerDeterministic to
-                                // actually BE deterministic, which this fixes: before
-                                // this, block4 (dense/promoted) synapses ALWAYS used
-                                // fp4_quantize_stochastic() here regardless of the
-                                // StochasticRounding template parameter, silently
-                                // making "Deterministic" layers non-deterministic
-                                // whenever they touched block4 storage (confirmed via
-                                // a standalone C++ repro: back-to-back runs of the
-                                // exact same binary gave different final nnz purely
-                                // from this unseeded/uncontrolled stochastic rounding,
-                                // with NO memory corruption or uninitialized reads
-                                // involved -- valgrind memcheck came back clean).
-                                // quant4[lj] is stored directly, no division --
-                                // it's already the code (see the chain-rule fix
-                                // above); importance still needs its own ratio,
-                                // unaffected by this fix.
+                                // Deterministic: no SIMD deterministic kernel
+                                // exists yet, so always scalar fp4_quantize().
+                                // Real non-determinism bug fixed here (block4
+                                // used to always stochastic-round regardless
+                                // of StochasticRounding) -- see
+                                // docs/research/linear_disldo.rst.
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     if (!col_valid4[lj])
                                         continue;
@@ -2610,25 +1812,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                  !SILI_BLOCK4_FORCE_SCALAR_BACKWARD) {
                                 if (full_tile_cols) {
                                     // Per-lane scalar quantize gated on
-                                    // was_live4[lj] (see its declaration comment
-                                    // above) -- NOT the SIMD
-                                    // block4_vec_quantize_stochastic_fp4_live
-                                    // kernel here, since that applies the same
-                                    // choice uniformly to all 4 lanes and can't
-                                    // express "some lanes live, some not" without
-                                    // a mask-blend this correctness fix doesn't
-                                    // need yet (accumulation above stays fully
-                                    // vectorized; only the encode step is
-                                    // scalarized). quant4 is already the code to
-                                    // encode (no division -- see the chain-rule
-                                    // fix above); importance still needs its own
-                                    // ratio. Safe to divide combined_imp_scale4
-                                    // unconditionally here (unlike the scalar
-                                    // fallback's per-lj guard) -- full_tile_cols
-                                    // means every lane is valid, so
-                                    // combined_imp_scale4 is never the
-                                    // invalid-lane 0 that would make this a 0/0
-                                    // division.
+                                    // was_live4[lj] -- not the SIMD live-encode
+                                    // kernel, which can't express "some lanes
+                                    // live, some not" without a mask-blend.
                                     uint8_t new_w_codes[BLOCK4_TILE], new_imp_codes[BLOCK4_TILE];
                                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                         const value_type imp_ratio =
@@ -2715,7 +1901,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     // the row-workspace snapshot+merge-back entirely, since
                     // it would just copy the row's bytes in and back out
                     // unchanged -- measured real overhead for zero benefit
-                    // when nothing is ever written (see conversation).
+                    // when nothing is ever written.
                     auto bc_cursor = weights.block4.row_cursor(br);
                     std::size_t elem_pos = BL4.elem_start[br];
                     std::size_t byte_pos = weights.block4.tile_byte_start[br];
@@ -3152,29 +2338,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         }
     }
 
-    // ── AQRS additive branch backward (task #277, see sili_peridot/
-    // AQRS_DESIGN.md) -- differentiates disldo_forward's own additive
-    // -branch block. Genuinely independent of the sparse/block4 structure
-    // above (same reasoning as forward), computed as its own self
-    // -contained pass. No-op at the default additive_rank==0.
-    //
-    // Forward recap: P[b,k] = sum_r U[r,k]*X[b,r]; Y[b,c] += sum_k
-    // V[c,k]*P[b,k]. Standard backprop through that:
-    //   dV[c,k]  = sum_b dY[b,c]*P[b,k]
-    //   dP[b,k]  = sum_c dY[b,c]*V[c,k]
-    //   dU[r,k]  = sum_b dP[b,k]*X[b,r]
-    //   dX[b,r] += sum_k dP[b,k]*U[r,k]
-    // P is NOT cached from forward (this function has no access to
-    // forward's locals, and this codebase's own convention elsewhere is
-    // to recompute from `input` rather than carry hidden state across the
-    // forward/backward call boundary) -- recomputed here from `input`
-    // directly, cheap given additive_rank is small.
-    //
-    // Adam-style default (AdamScalePolicy, delta_csr_types.hpp) applied
-    // per component AFTER the whole-batch gradient is aggregated (dU_rk/
-    // dV_ck below sum over every sample in the batch first) -- matches
-    // how every other per-scale update in this function works (one
-    // update per call, not once per batch sample).
+    // AQRS additive branch backward (task #277): differentiates
+    // disldo_forward's additive-branch block, its own self-contained pass.
+    // No-op at additive_rank==0. P is NOT cached from forward -- recomputed
+    // from `input` directly. See docs/research/linear_disldo.rst.
     if (weights.additive_rank > 0) {
         const std::size_t r_o = weights.additive_rank;
         std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
@@ -3272,7 +2439,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         // default. Uses the function's generic `ScalePolicy` template
         // param (same RMSprop-style, momentum-free policy scale_gamma
         // itself uses) -- NOT AdamScalePolicy, despite additive_u/v using
-        // Adam. Found via a real test failure (see conversation): Adam's
+        // Adam. Found via a real test failure: Adam's
         // momentum overshoots the L1-created zero fixed point (Theorem
         // 8), driving gamma persistently negative instead of settling
         // exactly at 0. gamma needs the SAME exact-zero-fixed-point
