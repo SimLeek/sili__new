@@ -1,37 +1,9 @@
-"""
-streaming_prune.py -- layer-by-layer model conversion for RAM-limited boxes.
-
-TOP PRIORITY (see docs/requirements_vlm_streaming_rtac.md section 3): the
-conversion must run on the same 32-96 GB machine that runs the model. A 24B
-bf16 checkpoint is ~48 GB; whole-state-dict loading is marginal at 96 GB and
-impossible at 32. safetensors' safe_open loads ONE tensor at a time, which
-makes two-phase streaming trivial:
-
-  Phase 1  streaming_sparsify: for each tensor (across shards), load -> prune
-           -> CSR -> save to out_dir/tensors/<name>.pt -> free. Peak memory =
-           one dense tensor + its CSR (largest 24B tensor: down_proj, 671 MB
-           fp32). Resumable via manifest.json.
-
-  Phase 2  streaming_fold_suffix: load ONE parameter suffix across all layers
-           sequentially and stack. Peak = that suffix's total CSR nnz.
-           down_proj x40 at density d is ~54 GB * d -- so d=0.10 fits 32 GB
-           but d=0.50 does not. When the manifest-predicted nnz exceeds
-           mem_budget_gb, falls back to per-layer descriptors (n_folds=1
-           each, no stacking) instead of OOMing.
-
-Initial implementation. Resume is a real fsck, not a bare existence check:
-_tensor_file_ok() calls torch.load() on the existing file before trusting it,
-so a truncated file from a process killed mid-write (crash, OOM-kill) gets
-regenerated instead of silently accepted -- a plain os.path.exists() check
-would pass for such a file and corrupt the pipeline much later, at
-streaming_fold_suffix time, with a far less obvious error.
-
-Follow-up edge cases (requirements doc section 7): gated-repo auth,
-tied-weight dedup (resolved as a non-issue, see requirements doc section
-1.2), MoE expert-merge (later TODO). Conv-kernel tensors (ndim > 2, e.g.
-Pixtral's patch_conv.weight) are kept DENSE, not pruned -- see the ndim==2
-branch below for the full rationale (small-in-every-dimension tensors don't
-sparsify well; also deferred to later-todo alongside MoE).
+"""Layer-by-layer model conversion for RAM-limited boxes: two-phase
+streaming (per-tensor sparsify, then per-suffix fold) so peak memory
+never holds a full state dict. See docs/research/streaming_prune.rst
+for the design rationale (streaming_prune.two_phase_architecture), the
+resume-fsck design (streaming_prune.resume_fsck_rationale), and why
+conv-kernel tensors stay dense (streaming_prune.conv_kernel_dense_rationale).
 """
 
 from __future__ import annotations
@@ -50,13 +22,8 @@ def _tensor_path(out_dir: str, name: str) -> str:
 
 
 def _tensor_file_ok(path: str) -> bool:
-    """
-    fsck for a single tensor file: existence alone is not enough. A process
-    killed mid-write (e.g. torch.save interrupted by a crash or OOM-kill)
-    leaves a truncated file that os.path.exists() reports as present but
-    torch.load() cannot parse. Resume must not silently trust such a file --
-    that would leave a corrupted entry in place until it fails much later
-    (mid streaming_fold_suffix, with a much less obvious error).
+    """fsck for a single tensor file -- existence alone is not enough.
+    See docs/research/streaming_prune.rst:streaming_prune.resume_fsck_rationale.
     """
     if not os.path.exists(path):
         return False
@@ -142,22 +109,9 @@ def streaming_sparsify(model_dir: str, out_dir: str, threshold: float | None = N
                     torch.save(csr, _tensor_path(out_dir, name))
                     del csr
                 else:
-                    # ndim <= 1 (norms, biases) or ndim > 2 (conv kernels, e.g.
-                    # patch_conv.weight (1024,3,14,14) in the Pixtral vision
-                    # tower): kept DENSE, not pruned. Two reasons, not one:
-                    #   (a) small in every dimension -- prior sparsification
-                    #       attempts on vision-tower-scale tensors found they
-                    #       don't sparsify well (density stays high relative
-                    #       to the text stack's 5120x5120 matrices), so the
-                    #       CSR overhead isn't worth it even where it's
-                    #       technically possible;
-                    #   (b) CSR is 2-D only, so ndim>2 would need a reshape
-                    #       to (out, -1) first, adding a reconstruction step
-                    #       for no proven benefit at this size (~600K params
-                    #       vs the ~21M-scale text matrices where sparsity
-                    #       actually pays off).
-                    # Deferred to later-todo alongside MoE expert-merge; see
-                    # docs/requirements_vlm_streaming_rtac.md section 7.
+                    # ndim <= 1 (norms, biases) or ndim > 2 (conv kernels): kept
+                    # DENSE, not pruned. See docs/research/streaming_prune.rst:
+                    # streaming_prune.conv_kernel_dense_rationale.
                     entry.update(layout="dense", csr_shape=None, nnz=int((t != 0).sum().item()))
                     torch.save(t.float(), _tensor_path(out_dir, name))
                 del t

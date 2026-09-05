@@ -1,21 +1,10 @@
-"""
-energy_dynamics.py
-──────────────────
-Homeostatic energy dynamics for sili neural networks.
+"""Homeostatic energy dynamics for sili neural networks.
 
-h is kept in the autograd graph throughout via straight-through gating:
-  - Normal kept neurons:  h * gate        gradient flows through normally
-  - Fired neurons:        constant 2.0    no gradient through h_out for this
-                                          path — aux_loss reaches h directly
-                                          via new_energy_t = c - gamma*h (step 6)
-  - Shutoff neurons:      constant (e+2)  same as fired — aux_loss path active
-  - Suppressed neurons:   zero            no gradient
-
-energy is plain numpy — running state, not a learned parameter.
-The caller owns batch iteration; do not pass batched tensors here.
-
-See PROOFS.md for the full mathematical treatment, and CITATIONS.md (repo
-root) for the external work referenced by name in this file's docstrings.
+energy is plain numpy — running state, not a learned parameter. The
+caller owns batch iteration; do not pass batched tensors here. See
+PROOFS.md for the full mathematical treatment, CITATIONS.md (repo
+root) for external work referenced by name below, and
+docs/research/energy.rst for the design-tradeoff research narrative.
 """
 
 from __future__ import annotations
@@ -25,235 +14,68 @@ import numpy as np
 from sili.module import Module
 from sili.tensor import Tensor, gather
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Core function
-# ══════════════════════════════════════════════════════════════════════════════
+# Core function
 
 
 def _apply_energy_dynamics(
     h: Tensor,
     energy: np.ndarray,
-    drive: float,  # delta  — baseline energy accumulation rate
-    activation_cost: float,  # gamma  — energy drain per unit |h|
-    precision: float,  # lambda_kl — sparsity enforcement strength
-    density: float,  # beta   — target activation density
-    exploration: float = 0.001,  # sigma  — per-neuron energy noise std
-    setpoint: float = 1.0,  # tau    — homeostatic comfort zone target
-    activation_threshold: float = 1e-4,  # dead zone threshold (architectural)
-    reactivity: float = 0.01,  # alpha  — homeostatic correction gain
-    p: float = 0.05,  # HARD CEILING on active neuron fraction
-    fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
-    fire_cost: float | None = None,  # opt-in: firing drains this much (overrides 2*gamma)
-    fire_wake_gradient: float | None = None,  # opt-in: guaranteed-magnitude gradient into h at fired positions
-    wake_sign: np.ndarray
-    | None = None,  # per-position +-1, same shape as h.ravel(); required if fire_wake_gradient is set
-    rng: np.random.Generator | None = None,  # opt-in: seeded source for the exploration noise draw below
-    wake_gate_steps: int | None = None,  # opt-in: recency threshold gating the whole mechanism below
-    steps_since_fired: np.ndarray | None = None,  # caller-owned per-neuron recency counter, same shape as h
+    drive: float,
+    activation_cost: float,
+    precision: float,
+    density: float,
+    exploration: float = 0.001,
+    setpoint: float = 1.0,
+    activation_threshold: float = 1e-4,
+    reactivity: float = 0.01,
+    p: float = 0.05,
+    fire_reset_to_zero: bool = False,
+    fire_cost: float | None = None,
+    fire_wake_gradient: float | None = None,
+    wake_sign: np.ndarray | None = None,
+    rng: np.random.Generator | None = None,
+    wake_gate_steps: int | None = None,
+    steps_since_fired: np.ndarray | None = None,
 ) -> tuple[Tensor, np.ndarray, Tensor, float, np.ndarray, np.ndarray]:
-    """
-    Apply continuous energy dynamics, returning an updated Tensor in the
-    autograd graph.
+    """Apply continuous energy dynamics, returning an updated Tensor in
+    the autograd graph. See docs/research/energy.rst for the full design
+    rationale behind every non-obvious parameter below (anchors named in
+    parens).
 
     Parameters
     ----------
-    h             : hidden state Tensor, any shape
-    energy        : per-neuron energy, plain numpy, same shape as h
-    drive         : baseline energy drift — sets metabolic tempo
-    activation_cost: energy drain per unit |h| — neural efficiency
-    precision     : KL sparsity enforcement strength (lambda_kl). Population
-                    -level control loop: pushes the ACHIEVED active fraction
-                    (rho, a population statistic) toward density (beta) via
-                    a KL term with no gradient to h (discrete mask) — this is
-                    a "how many are active" loop, blind to which neurons.
-                    Distinct from reactivity below; the two are not
-                    interchangeable knobs on the same thing.
-    density       : target activation density / sparsity setpoint (beta) —
-                    the actual LEARNED sparsity should usually land below p
-                    on its own, driven down by this term (plus shutoff/forced
-                    -firing) competing against whatever task objective is
-                    training the network — see p's docstring for why this
-                    must stay clearly below p, not close to or above it.
-    exploration   : per-neuron energy noise std.
-                    Must stay < drive/2 during waking — crossing this boundary
-                    enters the hallucination / REM regime (intentional in DREAM,
-                    forbidden during waking operation). Also, independent of
-                    that regime boundary: exploration is what breaks symmetry
-                    between otherwise-identical neurons (same drive, same
-                    activation_cost, same initial energy) — without it,
-                    ties in the top-p competition are resolved by array order
-                    rather than by any signal, so every "identical" neuron
-                    would fire in lockstep instead of the population
-                    differentiating over time.
-    setpoint      : homeostatic comfort zone target
-    activation_threshold : activation dead zone — values at or below this are
-                    zeroed for energy-accounting purposes (named for what it
-                    protects — the boundary between "active" and "not" — not
-                    for the KL mechanism, which is a separate, population
-                    -level pressure that happens to also consume this value).
-    reactivity    : homeostatic correction gain (alpha). Per-neuron control
-                    loop: pushes each neuron's own new_energy_t toward
-                    setpoint (tau) via a quadratic loss WITH a gradient to h
-                    (the linear surrogate) — a "how comfortable is this
-                    specific neuron" loop. See precision above for the
-                    contrasting population-level loop; both land in the same
-                    aux_loss scalar but are not the same mechanism and don't
-                    substitute for each other.
-    p             : HARD CEILING on active neuron fraction — a hardware/
-                    telemetry-driven compute-limit ceiling (thermal, battery,
-                    update-rate), NOT a tuning knob for learning quality and
-                    NOT the thing that should shape learned sparsity. Never
-                    exceeded under any condition — including fire events and
-                    pain signals. Exceeding p risks GPU thermal runaway,
-                    battery overdraw, and update-rate collapse (30-60hz ->
-                    2-5hz) that causes physical instability in motor-control
-                    regions. Set jointly by:
-                      - PFC (cognitive load target)
-                      - GPU/CPU temperature monitors (thermal throttle)
-                      - Battery level + distance to charger (power reserve)
-                    MUST sit clearly above density (roughly 5-10x, e.g.
-                    p=0.05 with density=0.01) so KL/shutoff/forced-firing —
-                    not this hard ceiling — are what the network actually
-                    has to satisfy while also chasing its task objective.
-                    Set p this low (or lower) only when genuinely resource
-                    -constrained; see EnergyDynamics.__init__'s
-                    `density <= p * 0.8` assertion, which exists because this
-                    relationship was previously (silently) inverted.
-    fire_reset_to_zero : opt-in (default False, preserves existing behavior
-                    exactly). When True, a fire event sets e <- 0.0 instead
-                    of the default e <- e - 2*gamma refractory drain. Per
-                    direct design discussion: the default drain is tiny
-                    relative to `drive` whenever the opposing continuous
-                    term (gamma*|h|) is small (e.g. a cold, near-zero-init
-                    population) -- the population can climb back to
-                    threshold and re-fire within a handful of steps,
-                    degenerating from "rare recovery event" into
-                    near-continuous forced-firing that saturates the
-                    downstream output to a near-constant value regardless
-                    of real input. Firing is a discrete, metabolically
-                    distinct event from normal continuous operation
-                    (biologically: an action potential), so a hard reset is
-                    a more direct model than a small linear drain. Does NOT
-                    weaken Theorem 6(a) (Ω = {|e|<=2} positively invariant)
-                    -- that proof only requires the post-fire update to
-                    strictly reduce |e|, which e<-0 satisfies unconditionally
-                    (energy-proofs.md). Mutually exclusive with fire_cost.
-    fire_cost       : opt-in (default None, preserves existing behavior).
-                    If set, a fire event subtracts this fixed amount instead
-                    of 2*gamma -- e.g. a large fire_cost models "firing is
-                    metabolically much more expensive than the linear
-                    activation_cost accounting used elsewhere" without fully
-                    resetting to zero. Ignored if fire_reset_to_zero=True.
-    fire_wake_gradient : opt-in (default None). Adds `fire_wake_gradient *
-                    wake_sign * h` at KEPT-FIRED positions only, whose
-                    gradient is exactly `fire_wake_gradient * wake_sign`
-                    there regardless of h's value -- a hard, deterministic
-                    magnitude, unlike energy_loss's gradient (depends on
-                    `new_energy_t - setpoint`). Caller must size this to
-                    clear whatever downstream quantization floor applies
-                    (this module has no visibility into layer-specific
-                    scale) -- tune empirically against a direct before/after
-                    weight measurement, not by derivation.
-    wake_sign       : required if fire_wake_gradient is set. Precomputed
-                    +-1 array, same length as h.ravel(), fixed per position
-                    so fired neurons don't all get pushed the same
-                    direction every time. EnergyDynamics.forward derives
-                    this once from a fixed seed and reuses it; direct
-                    callers must supply their own.
-    rng             : opt-in (default None, preserves exact existing
-                    behavior: draws from bare global numpy RNG state).
-                    The exploration noise draw below previously had no
-                    way to be seeded at all -- confirmed directly this
-                    makes energy-enabled runs genuinely non-reproducible
-                    run-to-run even with an otherwise identical config
-                    (task RNG, FP4 rounding RNG, and everything else
-                    seeded), since whatever consumed global numpy state
-                    earlier in the process shifts this draw. Pass a
-                    seeded np.random.Generator (matching DISLDOLayer's
-                    own rng= convention) for reproducible comparisons.
-    wake_gate_steps : opt-in (default None, preserves exact existing
-                    behavior). Gates the WHOLE per-neuron mechanism, not
-                    just drive. Neurons whose steps_since_fired (see
-                    below) has reached or passed this many calls without
-                    firing ("stale") get the full computation below
-                    (drive, noise, drain, fire/shutoff eligibility, the
-                    top-p competition, and energy_loss's gradient
-                    pressure) exactly as if wake_gate_steps were None.
-                    Neurons that HAVE fired within the last
-                    wake_gate_steps calls ("awake") are excluded from
-                    ALL of that entirely: their energy stays frozen at
-                    its input value, they never enter fire/shutoff or
-                    the top-p competition, they contribute nothing to
-                    energy_loss, and h_out=h for them exactly -- as if
-                    they were never passed through EnergyDynamics this
-                    call. Distinct from the population-level `p`/
-                    `density` knobs (which shape the aggregate active
-                    fraction, not which specific neurons) and from
-                    fire_wake_gradient (a one-off gradient at fire time,
-                    not an ongoing state change). Proposed to address
-                    the classic dead-neuron problem generally (not just
-                    zero-init specifically): a neuron that hasn't fired
-                    in a long time keeps getting pushed toward
-                    threshold, while a recently-active one is left alone
-                    entirely to settle. IMPORTANT: two earlier, narrower
-                    versions of this were tried and rejected -- (1) a
-                    multiplicative BOOST on drive for stale neurons
-                    (drive * multiplier > 1), and (2) masking ONLY drive
-                    to 0 for awake neurons while leaving noise, drain,
-                    thresholds, and energy_loss's gradient pressure
-                    active for them. BOTH confirmed directly to cause
-                    the same sustained-divergence failure (grad_norm
-                    climbing to NaN by roughly step 1600) at every
-                    tested gate value -- masking drive alone isn't
-                    enough; the ENTIRE mechanism must be gated. Do not
-                    reintroduce either narrower version without
-                    re-verifying stability.
-    stagger_wake_init : opt-in (default False). Only meaningful with
-                    wake_gate_steps set. steps_since_fired resets to
-                    all-zeros on every shape change (see forward()) --
-                    with nothing having fired yet (e.g. all-zero-init),
-                    every neuron reaches "stale" on the exact same step
-                    (step == wake_gate_steps), so the whole population
-                    becomes fire-eligible simultaneously instead of the
-                    intended staggered wake-up. When True, initializes
-                    steps_since_fired to a uniform random draw over
-                    [0, wake_gate_steps) instead, spreading first
-                    eligibility across the first wake_gate_steps calls.
-                    Uses `rng` if given, else RandomState(wake_seed) --
-                    same convention as wake_sign's own seeded draw.
-    steps_since_fired : caller-owned per-neuron counter (same shape as
-                    h), required if wake_gate_steps is set. Incremented
-                    every call, reset to 0 wherever a neuron actually
-                    fired-and-was-kept this call. EnergyDynamics.forward
-                    owns this as running state (like self.energy);
-                    direct callers of this function must persist and
-                    pass back the returned new_steps_since_fired
-                    themselves.
+    h : hidden state Tensor, any shape. energy : per-neuron energy,
+    plain numpy, same shape as h. drive : baseline energy drift
+    (metabolic tempo). activation_cost : energy drain per unit |h|.
+    precision : KL sparsity strength (lambda_kl), population-level loop
+    (``apply_energy_dynamics.precision_vs_reactivity``). density :
+    target density (beta), must stay below p
+    (``apply_energy_dynamics.p_vs_density``). exploration : per-neuron
+    noise std, must stay < drive/2, breaks top-p-tie symmetry. setpoint
+    : comfort zone target (tau). activation_threshold : dead zone
+    threshold. reactivity : per-neuron correction gain (alpha)
+    (``apply_energy_dynamics.precision_vs_reactivity``). p : hard
+    ceiling on active fraction, a compute limit, not a sparsity target
+    (``apply_energy_dynamics.p_vs_density``). fire_reset_to_zero :
+    opt-in, e<-0.0 on fire instead of refractory drain
+    (``apply_energy_dynamics.fire_reset_to_zero``), exclusive with
+    fire_cost. fire_cost : opt-in fixed fire-drain amount. fire_wake_gradient
+    : opt-in guaranteed-magnitude gradient at fired positions
+    (``apply_energy_dynamics.fire_wake_gradient``). wake_sign : required
+    if fire_wake_gradient set, precomputed +-1 array. rng : opt-in
+    seeded source for exploration noise (``apply_energy_dynamics.rng_seeding_bug``).
+    wake_gate_steps : opt-in recency threshold gating the WHOLE
+    mechanism (``apply_energy_dynamics.wake_gate_steps``).
+    stagger_wake_init : opt-in, randomizes initial steps_since_fired
+    (``apply_energy_dynamics.stagger_wake_init``). steps_since_fired :
+    caller-owned recency counter, required if wake_gate_steps is set.
 
     Returns
     -------
-    h_out      : updated Tensor, same shape, still in autograd graph
-    new_energy : updated energy array, same shape as input energy
-    aux_loss   : Tensor scalar. Call .backward() directly when this is the only
-                 signal (early training, DREAM mode), or add to task loss first.
-                 Gradient flows to h via energy_loss -> new_energy_t -> h
-                 (linear surrogate, no abs — see step 6 for full proof).
-    actual_p   : fraction of neurons active after all gating. May differ
-                 slightly from p at small region sizes due to integer rounding.
-                 Return to PFC / thermal / battery for closed-loop feedback.
-    kept_indices : int32 array, flat (raveled) indices into h's original
-                 shape of every position gating kept alive (normal + fired +
-                 shutoff-but-kept), sorted ascending. This IS the gate
-                 decision energy already made — the intended source for
-                 building a sparse (CSR) representation of h for the next
-                 consumer, using h's PRE-gating values at these indices
-                 (not h_out's post-gating fire/shutoff constants), rather
-                 than re-deriving sparsity via an independent top-k pass
-                 that could disagree with what energy actually decided.
-    new_steps_since_fired : updated recency counter, same shape as h
-                 (always returned, even when wake_gate_steps is None --
-                 harmless to ignore, cheap to compute, and lets a caller
-                 start tracking recency before deciding to gate on it).
+    h_out, new_energy, aux_loss (see
+    ``apply_energy_dynamics.aux_loss_zero_init_escape``), actual_p,
+    kept_indices (see ``apply_energy_dynamics.kept_indices``),
+    new_steps_since_fired.
     """
 
     original_shape = h.shape
@@ -265,29 +87,18 @@ def _apply_energy_dynamics(
     h_np = np.asarray(h.data, dtype=dtype).ravel()
     energy_flat = np.asarray(energy, dtype=dtype).ravel().copy()
 
-    # ── 1. Dead zone ─────────────────────────────────────────────────────────
+    # ── 1. Dead zone ──────────────────────────────────────────────────
     alive = np.abs(h_np) > activation_threshold
-    h_dz = h_np * alive  # zeroed copy for energy computation
+    h_dz = h_np * alive
 
-    # ── 2. Energy update ─────────────────────────────────────────────────────
-    # drive     — deterministic drift (every neuron, every step)
-    # noise     — decorrelated per-neuron stochastic variation
-    # |h_dz|   — active representation drains energy
-    # Constraint: exploration must stay below drive/2 during waking
-    #             to remain in curiosity regime, not hallucination regime.
+    # ── 2. Energy update ─────────────────────────────────────────────
     noise_src = rng if rng is not None else np.random
     noise = noise_src.normal(0.0, exploration, size=(n,)).astype(dtype)
 
-    # Per-neuron recency GATE -- see wake_gate_steps' own docstring.
-    # steps_since_fired defaults to all-zeros (everybody "awake", not
-    # stale) rather than requiring the caller to pre-populate it, so a
-    # fresh EnergyDynamics with wake_gate_steps set starts everyone
-    # masked-off on step 1 rather than treating an unpopulated counter
-    # as universally stale. `stale` gates the WHOLE mechanism below
-    # (thresholds, top-p competition, energy update, energy_loss), not
-    # just drive -- awake_drive_scale computed here would be moot: any
-    # drive value for an awake neuron gets discarded anyway once its
-    # energy is frozen back to its input value in step 3.
+    # steps_since_fired defaults to all-zeros (everyone "awake") so a
+    # fresh EnergyDynamics with wake_gate_steps set starts masked-off,
+    # not universally stale. See
+    # docs/research/energy.rst:apply_energy_dynamics.wake_gate_steps.
     ssf_flat = (
         np.asarray(steps_since_fired, dtype=np.int64).ravel()
         if steps_since_fired is not None
@@ -296,27 +107,11 @@ def _apply_energy_dynamics(
     stale = (ssf_flat >= wake_gate_steps) if wake_gate_steps is not None else np.ones(n, dtype=bool)
     new_energy = energy_flat + drive + noise - activation_cost * np.abs(h_dz)
 
-    # ── 3. Hard thresholds (integrate-and-fire) ──────────────────────────────
-    # Shutoff resolved first — frees budget slots before fire claims them.
-    # See PROOFS.md Theorems 2 and 6.
-    #
-    # wake_gate_steps GATES THE WHOLE MECHANISM, not just drive -- per
-    # direct correction ("the whole energy function was supposed to be
-    # gated with that mask"). An awake_drive_scale=0.0 boost/mask applied
-    # to drive ALONE still leaves noise, the |h| drain, fire/shutoff
-    # threshold crossings, AND energy_loss's ongoing gradient pressure
-    # all fully active for "awake" neurons -- confirmed directly this
-    # still causes the same sustained-divergence failure mode (grad_norm
-    # climbing to NaN by step ~1600 in a controlled repro) as the
-    # original >1 multiplier version. Awake neurons (steps_since_fired <
-    # wake_gate_steps) must be excluded from fire/shutoff eligibility,
-    # from the top-p competition, from contributing to energy_loss, and
-    # their own energy state must stay FROZEN at its input value -- i.e.
-    # treated as if they were never passed through EnergyDynamics at all
-    # this call, a pure h_out=h passthrough. Only STALE neurons
-    # (steps_since_fired >= wake_gate_steps) get the full mechanism.
-    # (`stale` itself computed above, alongside the energy update.)
-
+    # ── 3. Hard thresholds (integrate-and-fire) ──────────────────────
+    # Shutoff resolved first -- frees budget slots before fire claims
+    # them. See PROOFS.md Theorems 2 and 6, and
+    # docs/research/energy.rst:apply_energy_dynamics.wake_gate_steps
+    # for why `stale` gates the whole mechanism below, not just drive.
     fire_mask = (new_energy >= 2.0) & stale
     shutoff_mask = (new_energy <= -2.0) & stale
 
@@ -337,12 +132,11 @@ def _apply_energy_dynamics(
     # not even subject to drive/noise/drain, until they go stale.
     new_energy = np.where(stale, new_energy, energy_flat)
 
-    # ── 4. Hard-ceiling top_p gate ───────────────────────────────────────────
-    # p is a HARD CEILING — no condition may exceed it.
-    # Priority: highest-energy fired neurons first, then highest-|h| others.
-    # Suppressed fired neurons keep elevated energy and queue for next step.
-    # Restricted to the STALE population -- awake neurons never compete
-    # for a kept slot at all; they always pass through (see step 5).
+    # ── 4. Hard-ceiling top_p gate ────────────────────────────────────
+    # p is a HARD CEILING -- see
+    # docs/research/energy.rst:apply_energy_dynamics.p_vs_density.
+    # Priority: highest-energy fired neurons, then highest-|h| others.
+    # Suppressed fired neurons keep elevated energy, queue for next step.
     n_stale = int(stale.sum())
     k = max(1, round(p * n_stale)) if n_stale > 0 else 0
 
@@ -365,15 +159,10 @@ def _apply_energy_dynamics(
         else:
             kept_nfire = np.empty(0, dtype=int)
 
-    # ── 5. Build differentiable h_out ────────────────────────────────────────
-    #
-    # Normal kept  ->  h * gate        gradient flows through
-    # Fired        ->  + 2.0 const     constant: threshold event, not h value
-    # Shutoff      ->  + (e+2) const   constant: threshold event, not h value
-    # Suppressed   ->  zero            no contribution
-    #
-    # Gate is a straight-through estimator over the kept positions.
-    # _coerce in Tensor handles numpy arrays so operators work directly.
+    # Build differentiable h_out: normal kept -> h*gate (gradient flows);
+    # fired/shutoff kept -> additive const (threshold event, not h value);
+    # suppressed -> zero. Gate is a straight-through estimator; _coerce
+    # handles numpy operands.
 
     shutoff_in_kept = (
         np.intersect1d(kept_nfire, np.where(shutoff_mask)[0]) if len(kept_nfire) > 0 else np.empty(0, dtype=int)
@@ -384,10 +173,7 @@ def _apply_energy_dynamics(
     gate_np = np.zeros(n, dtype=dtype)
     if len(normal_kept) > 0:
         gate_np[normal_kept] = 1.0
-    # Awake neurons (excluded from the whole stale-only fire/shutoff/top-p
-    # apparatus above) always pass through unmodified -- h_out=h exactly,
-    # as if EnergyDynamics weren't applied to them at all this call.
-    gate_np[~stale] = 1.0
+    gate_np[~stale] = 1.0  # awake neurons: pure passthrough, h_out=h
 
     const_np = np.zeros(n, dtype=dtype)
     if len(kept_fire) > 0:
@@ -397,42 +183,10 @@ def _apply_energy_dynamics(
 
     h_out = h * gate_np.reshape(original_shape) + const_np.reshape(original_shape)
 
-    # ── 6. aux_loss as a Tensor ───────────────────────────────────────────────
-    #
+    # ── 6. aux_loss as a Tensor ────────────────────────────────────────
     # Setting loss = aux_loss for every layer is sufficient for training.
-    # Proof for the chain  x ->[ED]-> x_out ->[W]-> y ->[ED]:
-    #
-    #   c_j          = e_j + drive + noise_j       (independent of h)
-    #   new_energy_t = c_j - activation_cost * y_j (linear surrogate)
-    #   energy_loss  = (alpha/2) * sum((new_energy_t_j - tau)^2)
-    #
-    #   d(loss)/d(W_ji) = alpha * (new_energy_t_j - tau) * (-gamma) * x_out_i
-    #
-    # Zero-init escape — two independent mechanisms:
-    #   1. Each layer's own aux_loss: d(loss)/d(h) = alpha*(c-gamma*h-tau)*(-gamma)
-    #      c ~ drive at init, so (drive-tau) ~ -0.85 != 0 from step 1 onward.
-    #      This reaches upstream weights immediately, before any firing.
-    #   2. Fire-together-wire-together: once neurons fire (~2.0/drive ~ 14 steps),
-    #      x_out_i = 2.0 makes d(aux_loss_y)/d(W_ji) non-zero for the NEXT layer.
-    #      These two mechanisms are complementary, not the same path.
-    #
-    # Zero-loss target is new_energy_t = tau (the homeostatic setpoint).
-    # Push direction and magnitude depend on running energy history — not
-    # just sign(h) — producing genuine homeostatic drive rather than simple
-    # weight decay. In RNNs/agents the network can learn to take actions that
-    # bring future inputs into the comfort zone.
-    #
-    # Learning rule: x_out_i fires AND y_j needs more drain -> W_ji grows.
-    # (fire together, wire together)
-    #
-    # Physical energy update still uses np.abs(h_dz) — only the gradient
-    # path changes. kl_loss has no h-gradient (discrete mask); added as a
-    # plain float, _coerce promotes it when summed with energy_loss.
-
-    # Scoped to the STALE population (n_stale, not n) -- awake neurons are
-    # outside this call's energy accounting entirely (see wake_gate_steps'
-    # docstring), matching k's own scoping above. Falls back to the whole
-    # population when wake_gate_steps is None (n_stale == n then).
+    # See docs/research/energy.rst:apply_energy_dynamics.aux_loss_zero_init_escape
+    # for the full proof and the two independent zero-init-escape paths.
     n_active = (
         len(normal_kept)
         + len(kept_fire)
@@ -447,44 +201,17 @@ def _apply_energy_dynamics(
     rho = float(np.clip(actual_p, 1e-5, 1.0 - 1e-5))
     kl_val = float(precision * (rho * np.log(rho / density) + (1.0 - rho) * np.log((1.0 - rho) / (1.0 - density))))
 
-    # Physical energy uses |h| (always positive drain, unchanged).
-    # Loss tensor uses h directly (linear surrogate) — removes the sign(h)
-    # factor that kills gradients at zero init.
-    # Quadratic form targets exactly setpoint (tau) for zero loss:
-    #
-    #   L_j = (alpha/2) * (new_energy_t_j - tau)^2
-    #
-    #   d(L)/d(W_ji) = alpha * (new_energy_t_j - tau) * (-gamma) * x_out_i
-    #
-    # At zero init: new_energy_t_j ~ drive, so (drive - tau) is a non-zero
-    # constant (e.g. 0.15 - 1.0 = -0.85), giving non-zero gradients immediately.
-    # The zero-crossing is at new_energy_t = tau — the homeostatic setpoint.
-    # Push direction depends on history (running energy) and upstream activity,
-    # not just on the sign of h, which produces richer dynamics in RNNs/agents.
-
-    # Human note: this actually pulls e to t, not |e| to t. To pull |e| to t, we would need
-    # energy_loss = (reactivity / 2.0) * (new_energy_t.abs() - setpoint).pow(2).sum()
-    # but that's complicated. Doing that would allow neurons at e=t to fire rapidly
-    # and go to e=-t quickly, but there doesn't seem to be much actual benefit to that.
-
-    # Restricted to STALE positions via gather (true topological exclusion),
-    # NOT `expr * stale_mask` -- confirmed directly this matters, not just
-    # style: L1-sparsity's own known unbounded-output tendency can push
-    # abs(h) large enough at an AWAKE position (never corrected by any
-    # energy mechanism while masked off) that (new_energy_t-setpoint)**2
-    # overflows to inf in float32 -- and `inf * 0.0 == nan`, so a plain
-    # multiplicative mask does NOT protect against contamination; the nan
-    # poisons the whole .sum() and thus the ENTIRE aux_loss gradient, for
-    # every parameter, awake or stale. gather() never evaluates abs(h) at
-    # excluded positions in the first place, so this can't happen no
-    # matter how large an awake neuron's h grows.
+    # Loss tensor uses h directly (linear surrogate), not |h| -- removes
+    # the sign(h) factor that kills gradients at zero init. Restricted to
+    # STALE positions via gather() (true topological exclusion), NOT
+    # `expr * stale_mask` -- a plain multiplicative mask does NOT protect
+    # against inf*0.0==nan contamination from an overflowed awake-position
+    # term. See docs/research/energy.rst:apply_energy_dynamics.gather_not_mask.
     stale_idx = np.where(stale)[0]
     if len(stale_idx) > 0:
         c_stale_np = (energy_flat + drive + noise)[stale_idx]
         c_stale_t = Tensor(c_stale_np.astype(dtype), backend=h.backend)
         h_stale = gather(h, stale_idx)
-        # Abs backward in sili is defined in every backend with `grad[a == 0.0] = 1.0`
-        # in pytorch, you would use `h_abs = torch.where(h == 0, h, torch.abs(h))` and then use h_abs instead of abs(h)
         new_energy_t_stale = c_stale_t - activation_cost * abs(h_stale)
         energy_loss = (reactivity / 2.0) * ((new_energy_t_stale - setpoint) ** 2).sum()
     else:
@@ -492,10 +219,7 @@ def _apply_energy_dynamics(
     aux_loss = kl_val + energy_loss  # float + Tensor -> Tensor via _coerce
 
     # Guaranteed-magnitude gradient at kept-fired positions -- see
-    # fire_wake_gradient's own docstring. Deliberately separate from
-    # energy_loss above (whose gradient depends on new_energy_t - setpoint,
-    # not a hard guarantee): `(h * wake_gate).sum()` backprops exactly
-    # `wake_gate` into h regardless of h's actual value.
+    # docs/research/energy.rst:apply_energy_dynamics.fire_wake_gradient.
     if fire_wake_gradient is not None and len(kept_fire) > 0:
         assert wake_sign is not None, "wake_sign is required when fire_wake_gradient is set"
         wake_sign_flat = np.asarray(wake_sign, dtype=dtype).ravel()
@@ -504,12 +228,8 @@ def _apply_energy_dynamics(
         wake_gate_t = Tensor(wake_gate_np.reshape(original_shape), backend=h.backend)
         aux_loss = aux_loss + (h * wake_gate_t).sum()
 
-    # kept_indices: the gate decision energy already made, exposed so a
-    # caller can build a CSR straight from it (indices here, values from
-    # PRE-gating h_np at these same positions) instead of re-deriving
-    # sparsity via an independent top-k pass that could disagree with what
-    # energy actually decided. Sorted ascending -- CSR requires sorted
-    # per-row indices.
+    # kept_indices: the gate decision energy already made. See
+    # docs/research/energy.rst:apply_energy_dynamics.kept_indices.
     kept_indices = np.sort(
         np.concatenate(
             [
@@ -530,9 +250,7 @@ def _apply_energy_dynamics(
     return (h_out, new_energy.reshape(energy.shape), aux_loss, actual_p, kept_indices, new_steps_since_fired)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Module wrapper
-# ══════════════════════════════════════════════════════════════════════════════
+# Module wrapper
 
 
 class EnergyDynamics(Module):
@@ -556,33 +274,33 @@ class EnergyDynamics(Module):
 
     def __init__(
         self,
-        drive: float,  # delta  — metabolic tempo
-        activation_cost: float,  # gamma  — neural efficiency
-        precision: float,  # lambda_kl — sparsity enforcement
-        density: float,  # beta   — target activation density
-        exploration: float = 0.001,  # sigma  — per-neuron noise
-        setpoint: float = 1.0,  # tau    — comfort zone target
-        activation_threshold: float = 1e-4,  # dead zone threshold
-        reactivity: float = 0.01,  # alpha  — homeostatic gain
-        p: float = 0.05,  # hard ceiling on active fraction
-        fire_reset_to_zero: bool = False,  # opt-in: firing resets e to 0.0
-        fire_cost: float | None = None,  # opt-in: firing drains this much
-        fire_wake_gradient: float | None = None,  # opt-in: guaranteed-magnitude gradient at fired positions
-        wake_seed: int = 0,  # seeds the fixed per-position wake_sign pattern
-        rng: np.random.Generator | None = None,  # opt-in: seeded source for the exploration noise draw
-        wake_gate_steps: int | None = None,  # opt-in: per-neuron recency threshold gating the whole mechanism
-        stagger_wake_init: bool = False,  # opt-in: randomize initial steps_since_fired instead of uniform zero
+        drive: float,
+        activation_cost: float,
+        precision: float,
+        density: float,
+        exploration: float = 0.001,
+        setpoint: float = 1.0,
+        activation_threshold: float = 1e-4,
+        reactivity: float = 0.01,
+        p: float = 0.05,
+        fire_reset_to_zero: bool = False,
+        fire_cost: float | None = None,
+        fire_wake_gradient: float | None = None,
+        wake_seed: int = 0,
+        rng: np.random.Generator | None = None,
+        wake_gate_steps: int | None = None,
+        stagger_wake_init: bool = False,
     ):
+        """Same parameters as _apply_energy_dynamics (drive=delta,
+        activation_cost=gamma, precision=lambda_kl, density=beta,
+        exploration=sigma, setpoint=tau, reactivity=alpha) -- see that
+        function's docstring for full semantics."""
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, (
             "activation_cost (gamma) must be positive and <= 4.0"
         )
         assert 0.0 < density < 1.0, "density (beta) must be in (0, 1)"
         assert 0.0 < p <= 1.0, "p must be in (0, 1]"
-        # p is a hardware/telemetry compute-limit ceiling, not a sparsity
-        # target -- it must sit clearly above density so KL/shutoff/forced
-        # -firing (not this hard ceiling) are what actually shapes learned
-        # sparsity. This relationship was previously (silently) invertible;
-        # this assert exists specifically to catch that, not just document it.
+        # See docs/research/energy.rst:apply_energy_dynamics.p_vs_density.
         assert density <= p * 0.8, (
             f"density ({density}) must stay comfortably below p ({p}) -- "
             f"p is a hardware/telemetry compute-limit ceiling that should "
@@ -612,26 +330,16 @@ class EnergyDynamics(Module):
         self.wake_gate_steps = None if wake_gate_steps is None else int(wake_gate_steps)
         self.stagger_wake_init = bool(stagger_wake_init)
 
-        # Running state — numpy, not a Tensor, not a learned parameter
+        # Running state -- numpy, not a Tensor, not a learned parameter
         self.energy: np.ndarray | None = None
-        # Per-neuron recency counter for wake_gate_steps -- same shape
-        # as energy, lazily (re)initialized alongside it.
         self.steps_since_fired: np.ndarray | None = None
-        # Lazily built on first forward() call, once h's shape is known --
-        # a fixed +-1 pattern per position, seeded (not global RNG) so it's
-        # reproducible and doesn't consume the project's own seeded
-        # stochastic-rounding RNG stream.
+        # Seeded (not global RNG), lazily built on first forward().
         self._wake_sign: np.ndarray | None = None
 
         # Cached for inspection / logging
         self.aux_loss: Tensor | None = None
         self.actual_p: float = 0.0
-        # The gate decision from the most recent forward() -- flat indices
-        # into h's shape, sorted ascending. See _apply_energy_dynamics's
-        # kept_indices docstring: the intended source for building a CSR of
-        # h for a downstream consumer (indices here, values from that
-        # forward's PRE-gating h), rather than a separate independent top-k
-        # pass that could disagree with this decision.
+        # See docs/research/energy.rst:apply_energy_dynamics.kept_indices.
         self.kept_indices: np.ndarray | None = None
 
     def parameters(self) -> list:
@@ -652,22 +360,17 @@ class EnergyDynamics(Module):
         """
         Parameters
         ----------
-        h : Tensor, any shape — no batch dimension, caller iterates batches
-        density_override : if given, used in place of self.density for this
-                    call only (self.density is left unchanged). Intended for
-                    a caller-computed dynamic KL target -- e.g. derived from
-                    a measured recurrent-only branching ratio (see
-                    sili.energy.BranchingRatioTracker) rather than a fixed
-                    config value. EnergyDynamics itself has no opinion on how
-                    this value is computed; passing None (the default)
-                    reproduces the exact fixed-density behavior of every
-                    existing caller.
+        h : Tensor, any shape -- no batch dimension, caller iterates batches.
+        density_override : used in place of self.density for this call
+            only, e.g. a dynamic KL target derived from a measured
+            branching ratio (see BranchingRatioTracker). None (default)
+            reproduces the fixed-density behavior of every existing caller.
 
         Returns
         -------
-        h_out    : updated Tensor, in autograd graph
-        aux_loss : Tensor scalar — add to task loss or .backward() directly
-        actual_p : achieved active fraction — feed to PFC / thermal / battery
+        h_out : updated Tensor, in autograd graph.
+        aux_loss : Tensor scalar -- add to task loss or .backward() directly.
+        actual_p : achieved active fraction -- feed to PFC / thermal / battery.
         """
         if self.energy is None or self.energy.shape != h.shape:
             # Reset energy on shape change (e.g. body switch, region resize)
@@ -716,42 +419,14 @@ class EnergyDynamics(Module):
         return h_out, self.aux_loss, self.actual_p
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BranchingRatioTracker
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 class BranchingRatioTracker:
-    """
-    Estimate the branching ratio m of a self-propagating activity process
-    from a scalar activity count fed in once per step.
-
-    Background: a[t+1] = m*a[t] + h models activity as a branching process
-    with immigration -- m is the self-propagation (recurrent) factor, h an
-    external drive. m in [0.97, 0.99] ("near-critical") is the intended
-    healthy operating band for a genuinely self-sustaining recurrent
-    pathway; m near 0 means activity is being carried entirely by fresh
-    external drive each step, with no real recurrent memory.
-
-    Identifiability note (why this exists as its own tracker, not a stat
-    computed on SparseRNNCell's combined h): if fed the COMBINED activity
-    of input_proj(obs) + recurrent(state), this estimate cannot distinguish
-    "the recurrent pathway genuinely self-propagates" from "fresh input
-    alone keeps activity in-band while the recurrent branching factor is
-    silently 0" -- both produce statistically identical activity sequences
-    once mixed. Feed this tracker recurrent(state)'s OWN activity, measured
-    BEFORE it's summed with input_proj(obs)'s contribution, to get a
-    meaningful answer. See SparseRNNCell.forward for the split measurement
-    this is meant to be used with.
-
-    Estimator: single-lag OLS slope of a[t+1] on a[t] over a sliding window
-    -- a simplified, single-lag version of the multistep-regression (MR)
-    estimator (Wilting & Priesemann) that method is otherwise named after;
-    this implementation does not do the multi-lag extrapolation MR uses to
-    correct for subsampling bias, which matters more at large scale than it
-    does for the per-region window sizes this is intended for. Treat
-    branching_ratio() as a useful trend/regime indicator, not a
-    publication-grade MR estimate.
+    """Estimate the branching ratio m of a self-propagating activity
+    process from a scalar activity count fed in once per step. Feed it
+    recurrent(state)'s OWN activity, not combined activity (see
+    SparseRNNCell.forward). See
+    docs/research/energy.rst:branching_ratio_tracker.model for the
+    branching-with-immigration model, the identifiability rationale,
+    and the OLS estimator's relationship to the MR estimator.
     """
 
     def __init__(self, window: int = 200):
@@ -783,12 +458,10 @@ class BranchingRatioTracker:
         return m
 
     def avalanche_sizes(self) -> list:
-        """Consecutive-nonzero-activity run lengths from the current
-        history window -- a power-law-tail in this distribution is the
-        actual falsifiable signature of self-organized criticality (Bak,
-        Tang & Wiesenfeld 1987; Beggs & Plenz 2003), independent of whether
-        branching_ratio() alone looks healthy. Log/plot externally; this
-        just extracts the runs."""
+        """Consecutive-nonzero-activity run lengths -- see
+        docs/research/energy.rst:branching_ratio_tracker.model for why a
+        power-law tail here is the falsifiable SOC signature. Log/plot
+        externally; this just extracts the runs."""
         sizes, current = [], 0
         for a in self._history:
             if a > 0:
@@ -805,32 +478,14 @@ class BranchingRatioTracker:
 
 
 class EMABranchingRatioTracker:
-    """
-    EMA-based streaming variant of BranchingRatioTracker -- same OLS-slope
-    estimator (see that class's docstring for the branching-with-
-    immigration model and the identifiability reason this needs
-    recurrent-only activity, not combined activity), but its regression
-    statistics (mean(a), mean(a_next), mean(a*a_next), mean(a^2)) are
-    exponentially-weighted running estimates instead of a hard sliding
-    window. O(1) memory (no history buffer) instead of O(window).
-
-    The `alpha` decay rate is the direct tradeoff BranchingRatioTracker's
-    `window` only offers indirectly: large alpha = fast response to a
-    changing regime but noisy/short effective memory; small alpha = smooth
-    long-term trend but slow to notice a real regime shift. Unlike a hard
-    window, older observations are smoothly discounted rather than
-    dropped outright at a fixed cutoff. Want BOTH a fast and a long-term
-    read at once? Run two instances side by side at different alphas
-    (e.g. alpha=0.2 "fast" + alpha=0.02 "slow") rather than looking for a
-    single-instance dual-timescale mode -- composition over a wider
-    single-class API, and it keeps each instance's semantics simple.
-
-    Does NOT implement avalanche_sizes() -- that check inherently needs a
-    retained sequence of raw activity values (consecutive-nonzero run
-    lengths), which an O(1) EMA state cannot reconstruct by construction.
-    Use BranchingRatioTracker (run one alongside, if wanted) for that
-    check -- this is exactly the "have both EMA and windowed" case, not a
-    reason to avoid EMA for the branching-ratio estimate itself.
+    """EMA-based streaming variant of BranchingRatioTracker -- same
+    OLS-slope estimator, but regression statistics are exponentially-
+    weighted running estimates instead of a hard sliding window: O(1)
+    memory instead of O(window). Does NOT implement avalanche_sizes()
+    (needs a retained raw sequence an EMA state can't reconstruct) --
+    run a BranchingRatioTracker alongside if that's needed. See
+    docs/research/energy.rst:branching_ratio_tracker.model for the
+    `alpha` vs. `window` tradeoff and the underlying model.
     """
 
     def __init__(self, alpha: float = 0.05):
@@ -882,26 +537,20 @@ class EMABranchingRatioTracker:
         self._n_pairs = 0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Column-averaging loss
-# ══════════════════════════════════════════════════════════════════════════════
+# Column-averaging loss
 
 
 def column_averaging_loss(h_out: Tensor, target: Tensor, n_folds: int, weight: float = 1.0, indices=None) -> Tensor:
-    """
-    weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where column_i
-    is the set of n_folds neurons tracking input index i.
-
-    Takes h_out (energy-gated), not the pre-gating h -- a column member
-    EnergyDynamics suppresses should hurt this loss, not be invisible to
-    it, so the network has to satisfy energy management and prediction
-    jointly. Combine with EnergyDynamics's aux_loss via
+    """weight * mean_i( (mean_t(column_i[t]) - target[i])^2 ), where
+    column_i is the set of n_folds neurons tracking input index i. Takes
+    h_out (energy-gated), not the pre-gating h, so a column member
+    EnergyDynamics suppresses hurts this loss rather than being
+    invisible to it. Combine with EnergyDynamics's aux_loss via
     sili.tensor.combine_losses.
 
-    indices: optional int array, len n_folds*input_size, selecting which
-    flat positions of a larger h_out form the column block (position
-    indices[t*input_size+i] = column i's neuron at fold-step t). None
-    (default) requires h_out to be exactly that size.
+    indices: optional, len n_folds*input_size, selects which flat
+    positions of a larger h_out form the column block. None (default)
+    requires h_out to be exactly that size.
     """
     input_size = target.shape[0]
     expected = n_folds * input_size

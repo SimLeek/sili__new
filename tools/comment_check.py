@@ -167,6 +167,7 @@ def main() -> int:  # noqa: C901 -- a diff-line-state-machine reads clearer flat
 
     if findings == 0:
         print(f"comment_check: clean ({path or 'no comments in diff'})")
+        return 0
     return 1
 
 

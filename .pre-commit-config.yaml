@@ -61,29 +61,42 @@ repos:
         # deciding what moves to a research .md vs. stays inline is a
         # real editorial call, not a lint-pass side effect). Percentages
         # below are post-clang-format (task #386 followup):
-        # rl_utils.py 52.5%, sparse_rnn.py 43.0%, __init__.py 66.7%
-        # (3-line file, N/A in practice), energy.py 54.8%,
-        # conversion/rnn_fold.py 38.0%, conversion/streaming_prune.py
-        # 30.4%, conversion/prune_sensitivity.py 39.9%,
+        # __init__.py 66.7%
+        # (3-line file, N/A in practice),
         # lib/headers/sparse_struct.hpp 38.1% (21-line file, N/A in
-        # practice), lib/headers/linear_disldo.hpp 44.5%,
-        # lib/headers/fp4quant.hpp 35.7%, lib/headers/fp8quant.hpp 32.5%,
-        # lib/headers/delta_csr_types.hpp 45.1%. Also 3 one-off benchmark
-        # scripts (mostly header-comment-driven, never covered by this
-        # hook before it applied repo-wide):
-        # scripts/bench_block4_vs_dense_fp4.cpp 31.1%,
-        # scripts/bench_block4_memory_and_compression.cpp 40.2%,
-        # scripts/bench_block4_fp8_simd.cpp 42.3%.
+        # practice).
         # cppcheck-remediation pass (task #386 followup): lib/headers/scan.hpp
         # 44.7% (down to a single real 47-line function after removing dead
-        # code -- same "tiny file, N/A in practice" case as sparse_struct.hpp
-        # above), lib/headers/sisldo_ops.hpp 30.1% (justified cppcheck-suppress
-        # comments nudged it barely back over the same razor's-edge threshold
-        # noted below as "dropped below 30% after clang-format"),
-        # lib/headers/hoyer_sparsify.hpp 30.3% (155-line file, justified
-        # cppcheck-suppress comments on 4 struct fields -- same razor's-edge
-        # case as sisldo_ops.hpp above).
-        exclude: ^(tests/|sili/rl_utils\.py|sili/sparse_rnn\.py|sili/__init__\.py|sili/energy\.py|sili/conversion/rnn_fold\.py|sili/conversion/streaming_prune\.py|sili/conversion/prune_sensitivity\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/linear_disldo\.hpp|sili/lib/headers/fp4quant\.hpp|sili/lib/headers/fp8quant\.hpp|sili/lib/headers/delta_csr_types\.hpp|sili/lib/headers/scan\.hpp|sili/lib/headers/sisldo_ops\.hpp|sili/lib/headers/hoyer_sparsify\.hpp|scripts/bench_block4_vs_dense_fp4\.cpp|scripts/bench_block4_memory_and_compression\.cpp|scripts/bench_block4_fp8_simd\.cpp)
+        # code -- same "tiny file, N/A in practice" case as sparse_struct.hpp above).
+        # task #389 (comment-to-research-doc pass): lib/headers/linear_disldo.hpp
+        # moved its research narrative to docs/research/linear_disldo.rst and
+        # dropped from 44.5% to under 30% -- removed from this list. energy.py
+        # did the same to docs/research/energy.rst, 54.8% -> under 30%.
+        # rl_utils.py did the same to docs/research/rl_utils.rst, 52.5% ->
+        # under 30%. lib/headers/delta_csr_types.hpp did the same to
+        # docs/research/delta_csr_types.rst, 45.2% -> under 30%.
+        # sparse_rnn.py did the same to docs/research/sparse_rnn.rst, 43.0% -> under 30%.
+        # scripts/bench_block4_fp8_simd.cpp did the same to
+        # docs/research/bench_block4_fp8_simd.rst, 42.3% -> under 30%.
+        # scripts/bench_block4_memory_and_compression.cpp did the same to
+        # docs/research/bench_block4_memory_and_compression.rst, 40.2% ->
+        # under 30%. conversion/prune_sensitivity.py did the same to
+        # docs/research/prune_sensitivity.rst, 39.9% -> under 30%.
+        # conversion/rnn_fold.py did the same to docs/research/rnn_fold.rst,
+        # 38.0% -> under 30%. lib/headers/fp4quant.hpp did the same to
+        # docs/research/fp4quant.rst, 36.2% -> under 30%. lib/headers/fp8quant.hpp
+        # did the same to docs/research/fp8quant.rst, 32.5% -> under 30%.
+        # scripts/bench_block4_vs_dense_fp4.cpp did the same to
+        # docs/research/bench_block4_vs_dense_fp4.rst, 31.1% -> under 30%.
+        # conversion/streaming_prune.py did the same to
+        # docs/research/streaming_prune.rst, 30.4% -> under 30%.
+        # lib/headers/hoyer_sparsify.hpp did the same to
+        # docs/research/hoyer_sparsify.rst, 30.3% -> under 30% (the 4
+        # cppcheck-suppress comments on HoyerSparsifyRow's fields stayed
+        # untouched -- those are lint-tooling directives, not narrative).
+        # lib/headers/sisldo_ops.hpp did the same to docs/research/sisldo_ops.rst,
+        # 30.3% -> under 30% (the 8 cppcheck-suppress comments stayed untouched).
+        exclude: ^(tests/|sili/__init__\.py|sili/lib/headers/sparse_struct\.hpp|sili/lib/headers/scan\.hpp)
 
       - id: pytest-fast
         name: pytest (fast suite, <10s -- excludes integration/pre_existing_failure)

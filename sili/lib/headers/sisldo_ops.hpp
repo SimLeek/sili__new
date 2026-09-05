@@ -1,13 +1,7 @@
 #ifndef __SISLDO_OPS_HPP_
 #define __SISLDO_OPS_HPP_
 
-// Split out of sparse_struct.hpp (see conversation). Whole-structure memory
-// operations (compact/expand_headroom -- opposite operations, see their own
-// docstrings) and the actual forward/backward computation: sisldo_forward
-// (SISLDO -- sparse input) and disldo_backward_sparse_grad (dense input,
-// sparse gradient -- deliberately NOT sparse input; see its own docstring
-// for why sparse-input backward permanently loses the ability to correct
-// "didn't fire & should have").
+// See docs/research/sisldo_ops.rst:sisldo_ops.file_split_context.
 
 #include "delta_csr_types.hpp"
 #include "delta_csr_memory.hpp"
@@ -16,30 +10,8 @@
 
 /**
  * @brief Repack a DeltaCSRWeights so every row occupies exactly its active
- * bytes/elements, zero inter-row blank space -- both the index buffer
- * (byte_start/byte_end) AND the values buffer (elem_start/elem_end) are
- * separate growth-headroom axes and both get compacted here.
- *
- * delta_csr_from_absolute()'s reserved headroom (the blank_fraction fixed
- * earlier this session) is correct and necessary for a LIVE, training
- * model -- rows need O(1) append room for synaptogenesis. For a freshly
- * converted or long-since-pruned model being saved/measured for
- * deployment, that headroom is pure unused padding that nnz()/
- * total_alloc_bytes() otherwise count as consumed. Use compact() before
- * saving/measuring; call reserve_indices()/reserve_values() again after
- * loading if this model is about to resume training rather than just be
- * measured or deployed.
- *
- * Generic over VALUES_TYPE via ValueAccessor -- one implementation for both
- * FP4BiPacked and DeltaCSRBiValues<float>, matching the rest of this file's
- * pattern (sisldo_forward/backward/build_probes/synap_row_step).
- *
- * NOTE (test): must be lossless -- decode every synapse from the input and
- * the output (column indices via row_cursor, weight/importance via
- * ValueAccessor::get_w/get_imp), compare row by row; must match exactly.
- * Also verify total_alloc_bytes()/total_alloc_elems() strictly decrease (or
- * stay equal) after compacting a delta_csr_from_absolute()-constructed
- * layer, and that a second compact() call is idempotent (sizes unchanged).
+ * bytes/elements, zero inter-row blank space (both index and values
+ * buffers). See docs/research/sisldo_ops.rst:compact.headroom_removal.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>
@@ -97,32 +69,9 @@ compact(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc) {
 // ── expand ─────────────────────────────────────────────────────────────────────
 
 /**
- * @brief Opposite of compact(): restore growth headroom to a DeltaCSRWeights
- * that has none (or not enough) -- typically because compact() removed it.
- *
- * Reuses delta_csr_from_absolute()'s already-tested headroom-reservation
- * logic (extract to absolute CSR via delta_csr_to_absolute, then rebuild)
- * rather than duplicating it. blank_fraction is the SAME parameter
- * delta_csr_from_absolute takes -- 0.2 (20%) restores the same headroom a
- * freshly-converted layer gets by default; pass a larger value before a
- * synaptogenesis-heavy phase, smaller if memory is tight and only modest
- * growth is expected.
- *
- * NOTE (test): after compact() then expand(), row_rebuild/synap_row_step
- * must succeed on rows that failed immediately post-compact (this is the
- * actual bug this function exists to let callers work around -- see
- * conversation, "silent failure is the worst case"). Also verify expand()
- * is lossless (same content as compact() already checks).
- *
- * Behavior note: expand() NORMALIZES headroom to exactly blank_fraction of
- * current content size -- it does not add blank_fraction on top of
- * whatever headroom the input already had (delta_csr_to_absolute extracts
- * only the actual synapses, not existing slack, so there's nothing to add
- * to). Calling expand() on an already-roomy layer with a smaller
- * blank_fraction than it currently has will shrink its headroom, same as
- * compact() would, just not all the way to zero. Consistent with compact()
- * normalizing to exactly 0% -- expand() normalizes to exactly
- * blank_fraction, not "at least blank_fraction."
+ * @brief Opposite of compact(): restore growth headroom to a
+ * DeltaCSRWeights that has none (or not enough).
+ * See docs/research/sisldo_ops.rst:expand_headroom.budget_propagation_bug.
  */
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>
@@ -134,16 +83,8 @@ expand_headroom(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
     delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, ptrs, idx, w, imp);
 
     const std::size_t n = idx.size();
-    // Propagate the INPUT dc's own hard limits through -- without this,
-    // the freshly-constructed result below starts with DEFAULT
-    // (unbounded) limits, so it can grow arbitrarily past whatever
-    // budget the caller originally set via set_limits(), regardless of
-    // how small n*(1+blank_fraction) is relative to it. A real, measured
-    // bug (see delta_csr_from_absolute's own comment): nnz reached 127x
-    // the intended max_weights budget in a synaptogenesis stress test
-    // before this fix, since repeated expand_headroom() calls each
-    // silently re-based the cap on current content instead of the
-    // original budget.
+    // Propagate the INPUT dc's own hard limits through -- see
+    // docs/research/sisldo_ops.rst:expand_headroom.budget_propagation_bug.
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, dc.layout.rows, dc.layout.cols,
         n * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
@@ -151,11 +92,8 @@ expand_headroom(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
         dc.max_indices_bytes, dc.max_values_bytes);
 }
 
-// Like expand_headroom() but sizes the total budget for at least
-// min_nnz_per_row connections per row. Use before synaptogenesis on a
-// freshly loaded layer, then call equalizer_step() for each row to
-// redistribute the budget evenly. After a full equalization pass each row
-// has total_budget/rows = min_nnz_per_row elements of reserved headroom.
+// Like expand_headroom() but sizes for a minimum per-row connection count.
+// See docs/research/sisldo_ops.rst:expand_headroom_to.per_row_budget.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>
 expand_headroom_to(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
@@ -167,11 +105,7 @@ expand_headroom_to(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
     const std::size_t rows = dc.layout.rows;
     const std::size_t n = idx.size();
     const std::size_t budget = std::max(n, rows * min_nnz_per_row);
-    // See expand_headroom()'s identical comment -- propagate the INPUT
-    // dc's own hard limits through. If min_nnz_per_row*rows genuinely
-    // exceeds the layer's original max_weights budget, this now
-    // correctly throws std::bad_alloc instead of silently granting more
-    // than was ever configured.
+    // See docs/research/sisldo_ops.rst:expand_headroom_to.per_row_budget.
     return delta_csr_from_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(
         ptrs, idx, w, imp, rows, dc.layout.cols,
         budget * (1.0 + blank_fraction) * (uleb128_max_bytes<COL_TYPE>() + 1) + 4096,
@@ -180,15 +114,8 @@ expand_headroom_to(const DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& dc,
 }
 // ── Forward pass ─────────────────────────────────────────────────────────────
 
-// No learning_rate parameter -- matches disldo_forward's own fix (see
-// linear_disldo.hpp's disldo_forward docstring for the full rationale):
-// this used to run a gradient-free ADSP-style (Activity-Dependent
-// Structural Plasticity) importance update whenever a nonzero
-// learning_rate was passed, unconditionally on whether a matching
-// backward call would ever follow. Real footgun, confirmed via direct
-// tracing on the DISLDO sibling -- REMOVED here too, not just disabled.
-// Importance updates only ever happen in a backward pass now, coupled to
-// a real gradient.
+// No learning_rate parameter, deliberately -- see
+// docs/research/sisldo_ops.rst:sisldo_forward.no_learning_rate_param.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void sisldo_forward(
     const CSRInput<SIZE_TYPE, typename ValueAccessor<VALUES_TYPE>::value_type>& input_tensor,
@@ -198,16 +125,8 @@ void sisldo_forward(
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     auto& dc = weights.connections;
 
-    // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do" --
-    // a layer can be entirely block4-resident (dc.empty() == true) and still
-    // have real work below in the block4 phase. Historically this function
-    // returned here unconditionally, which silently skipped the block4
-    // phase too for any all-block4 layer (found via a benchmark reporting
-    // an implausible, density-independent ~0.0001ms for the sparse path --
-    // it was hitting this return before ever reaching block4 code). L's
-    // rows/cols come from dc.layout's shape, which stays valid even when
-    // nnz is 0 (set at construction, e.g. delta_csr_from_absolute), so it's
-    // safe to keep using L below regardless of dc.empty().
+    // dc.empty() does NOT mean "nothing to do" -- see
+    // docs/research/sisldo_ops.rst:sisldo_forward.dc_empty_block4_bug.
     const auto& L = dc.layout;
     const std::size_t out_cols = L.cols;
     const std::size_t num_outputs = static_cast<std::size_t>(input_tensor.rows) * out_cols;
@@ -286,20 +205,10 @@ void sisldo_forward(
                         const std::size_t wptr = L.elem_start[in_idx] + elem_offset;
                         const value_type wval_stored =
                             ValueAccessor<VALUES_TYPE>::get_w(dc.values, wptr);
-                        // Scale lookups per-synapse, not hoisted: in_idx (the row) varies
-                        // within this loop (work-offset iteration, not a simple per-row
-                        // loop) -- unlike disldo_forward/backward, can't fix it once per
-                        // outer iteration.
-                        // BUG FIX: out_scale/output_importance_scale (per-column, e.g. from
-                        // FoldedLayer.from_descriptor's value_scale_mode="rank1") were never
-                        // read here, unlike disldo_forward's identical row*col combination --
-                        // a rank-1-quantized layer run through forward_sparse silently
-                        // dropped its column scale entirely, reconstructing only stored_w *
-                        // val_scale instead of the true value.
-                        // Rank-N scale (see scale_rank's own docstring,
-                        // delta_csr_types.hpp) -- reduces to the exact
-                        // original val_scale*out_scale at scale_rank==1,
-                        // matching disldo_forward's identical replacement.
+                        // Per-synapse scale lookup (not hoisted -- in_idx varies within
+                        // this loop). Rank-N scale; fixes a real bug where output_scale
+                        // was silently dropped. See
+                        // docs/research/sisldo_ops.rst:sisldo_forward.output_scale_read_bug.
                         const value_type wval =
                             wval_stored * weights.get_scale(in_idx, out_idx); // -> true units
                         const value_type contrib = wval * in_val;
@@ -338,43 +247,8 @@ void sisldo_forward(
             original_contributions_output[i] += all_contributions[i];
 
     // ── block4 contribution ─────────────────────────────────────────────────
-    //
-    // Real, previously-silent bug this closes: everything above only ever
-    // touches weights.connections (the scattered CSR side) -- block4-
-    // resident synapses (created automatically by ordinary synaptogenesis,
-    // see block4_maybe_promote) were NEVER read here at all, so a layer
-    // with any block4 tiles gave silently wrong output through
-    // forward_sparse(). block4 is FP4-specific (see block4.hpp), hence the
-    // if constexpr guard -- this whole section compiles to nothing for any
-    // other VALUES_TYPE.
-    //
-    // Read-only, same as disldo_forward's own block4 loop
-    // (linear_disldo.hpp): forward does NOT update per-synapse block4
-    // weight/importance inline (that's a documented, pre-existing gap --
-    // see disldo_forward's "KNOWN GAP" comment -- not something this
-    // change is expected to newly fix), so no learning_rate handling is
-    // needed here, only decode + multiply + accumulate.
-    //
-    // Design A (see TODO_DUAL_BLOCK4.md / conversation): reuses the exact
-    // work_offsets/chunk/w_start/w_end shape the scattered pass above
-    // already uses, one level up -- over ACTIVE windows (block-rows with
-    // >=1 nonzero input AND >=1 live block4 tile) instead of over
-    // individual scattered synapses. A window's real "work" is its block4
-    // tile count (weights.block4.block_layout.row_nnz(br)), mirroring how
-    // the scattered pre-pass above sizes work by L.row_nnz(in_idx).
-    // Explicitly a first, measured-not-assumed choice -- see the
-    // investigation this same commit's benchmark records: if the serial
-    // gather pre-pass turns out to dominate at realistic densities,
-    // Design B (direct per-active-window binary search, no pre-pass) is
-    // the documented fallback, not a hypothetical.
-    //
-    // PRECONDITION: input_tensor's indices, within each batch row, must be
-    // ascending (standard CSR convention) -- required for the gather to
-    // find a window's up-to-4 entries via one contiguous scan instead of a
-    // search. top_k()'s own output is sorted by magnitude, not index --
-    // callers must run sort_indices() (parallel.hpp) first if their input
-    // came from there. Not re-checked/enforced here (same convention the
-    // scattered pass above already silently assumes).
+    // Real bug fixed: block4-resident synapses were never read here. See
+    // docs/research/sisldo_ops.rst:sisldo_forward.block4_gather_design.
     if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
         if (weights.block4.n_tiles() > 0) {
             const auto& BL4 = weights.block4.block_layout;
@@ -382,10 +256,7 @@ void sisldo_forward(
             std::vector<value_type> all_b4_outputs(static_cast<std::size_t>(num_cpus) * num_outputs,
                                                    value_type(0));
 
-            // Per-batch scratch, reused across batches (not reallocated
-            // per batch) -- same reasoning as block4.hpp's own persistent
-            // scratch buffers: batch=1 real-time calls can't amortize
-            // repeated heap allocation.
+            // Per-batch scratch, reused across batches (not reallocated per batch).
             std::vector<SIZE_TYPE> win_br;           // active window's block-row index
             std::vector<value_type> win_vals;        // flat, 4 per window: win_vals[4*w + li]
             std::vector<SIZE_TYPE> win_work_offsets; // cumulative block4 tile count per window
@@ -418,12 +289,8 @@ void sisldo_forward(
                             const SIZE_TYPE window_hi =
                                 window_lo + static_cast<SIZE_TYPE>(BLOCK4_TILE);
 
-                            // Gather every entry in [i, batch_nnz) that
-                            // still falls in this SAME window -- sorted
-                            // input means these are exactly the entries
-                            // contiguous from i (see PRECONDITION above),
-                            // so this is a single forward scan, not a
-                            // search.
+                            // Gather this window's entries -- sorted input means a
+                            // single forward scan, not a search.
                             value_type local[4] = {value_type(0), value_type(0), value_type(0),
                                                    value_type(0)};
                             SIZE_TYPE j = i;
@@ -481,19 +348,8 @@ void sisldo_forward(
                                     &win_vals[static_cast<std::size_t>(wi) * 4];
 
                                 if (wi != last_wi) {
-                                    // Walk from this row's start, tracking
-                                    // elem_pos/byte_pos as we go (mirrors
-                                    // disldo_forward's collection loop) --
-                                    // avoids find()'s redundant O(row_nnz)
-                                    // rescan below: it did the SAME walk
-                                    // twice per tile (once here via the
-                                    // cursor, once again inside find()'s
-                                    // raw_find), measured as the dominant
-                                    // real overhead vs. dense at high
-                                    // density (2.7x slower than dense for
-                                    // identical tile-work at density=0.9,
-                                    // serial pre-pass itself <1% of total
-                                    // time -- see conversation/benchmark).
+                                    // Incremental walk avoids find()'s redundant rescan. See
+                                    // docs/research/sisldo_ops.rst:sisldo_forward.block4_incremental_walk_perf.
                                     bc_cursor =
                                         weights.block4.row_cursor(static_cast<std::size_t>(br));
                                     elem_pos = BL4.elem_start[br];
@@ -510,36 +366,13 @@ void sisldo_forward(
                                 }
                                 const uint32_t bc = bc_cursor.advance();
 
-                                // const at_index(): the walk above already
-                                // knows this tile's exact storage position
-                                // -- skip find()'s redundant rescan (see
-                                // comment above). Read-only, does not mark
-                                // the handle dirty, same as disldo_forward's
-                                // own block4 loop.
+                                // Read-only lookup, does not mark the handle dirty.
                                 const auto tile = weights.block4.at_index(static_cast<uint32_t>(br),
                                                                           bc, elem_pos, byte_pos);
                                 const uint8_t* tdata = tile.raw_data();
 
-                                // Zero-skip (task: top_k4 sparsity work):
-                                // `local[]` holds this window's 4 gathered
-                                // input values -- until now, every li was
-                                // decoded and multiplied regardless of
-                                // whether local[li]==0, so sparsifying the
-                                // input (top-k or otherwise) was a silent
-                                // no-op on a block4-resident layer, only
-                                // the OUTER window-admission check (line
-                                // ~439, row_nnz_b4>0) ever skipped work.
-                                // Window-level early-out: if every gathered
-                                // value in this window is exactly zero
-                                // (either because the input was already
-                                // zero there, or a sparsification step
-                                // zeroed all 4), skip the lj/li decode+
-                                // accumulate loops below entirely -- the
-                                // walk bookkeeping above (elem_pos/byte_pos/
-                                // bc_cursor) has already run and must not be
-                                // skipped (later windows' incremental walk
-                                // depends on it), only the real per-slot
-                                // decode work is saved here.
+                                // Window-level zero-skip -- see
+                                // docs/research/sisldo_ops.rst:sisldo_forward.block4_zero_skip.
                                 if (local[0] == value_type(0) && local[1] == value_type(0) &&
                                     local[2] == value_type(0) && local[3] == value_type(0)) {
                                     continue;
@@ -557,18 +390,14 @@ void sisldo_forward(
                                             static_cast<std::size_t>(br) * BLOCK4_TILE + li;
                                         if (row >= num_inputs)
                                             continue;
-                                        // Per-li skip: a zeroed gathered input
-                                        // contributes nothing regardless of the
-                                        // weight -- skip its decode too, not
-                                        // just the multiply-accumulate.
+                                        // Per-li skip: zeroed input needs no decode.
                                         if (local[li] == value_type(0))
                                             continue;
                                         const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
                                         if (byte == 0)
                                             continue;
                                         const value_type w_decoded = FP4_TABLE[byte & 0xFu];
-                                        // Rank-N scale, matching disldo_forward's
-                                        // block4 phase and the scattered fix above.
+                                        // Rank-N scale.
                                         const value_type w_true =
                                             w_decoded * weights.get_scale(row, col);
                                         acc += w_true * local[li];
@@ -582,9 +411,7 @@ void sisldo_forward(
                 }
             }
 
-            // Sum EVERY thread's private slice, not just thread 0's --
-            // mirrors disldo_forward's own identical final block4
-            // reduction (linear_disldo.hpp).
+            // Sum EVERY thread's private slice, not just thread 0's.
             for (int t = 0; t < num_cpus; ++t) {
                 const value_type* s =
                     all_b4_outputs.data() + static_cast<std::size_t>(t) * num_outputs;
@@ -594,16 +421,8 @@ void sisldo_forward(
         }
     }
 
-    // ── AQRS additive branch ────────────────────────────────────────────────
-    //
-    // Direct port of disldo_forward's identical section (linear_disldo.hpp),
-    // adapted for sparse input: the P[k] projection walks the CSR's nonzero
-    // entries instead of a dense row scan -- functionally identical, since
-    // the dense version already skips iv==0 entries. The second pass
-    // (P -> output) is unchanged (dense over out_cols, no sparsity to
-    // exploit there -- every output column can receive a nonzero additive
-    // contribution regardless of which synapses are live). No-op at the
-    // default additive_rank==0.
+    // ── AQRS additive branch ─────────────────────────────────────────────────
+    // See docs/research/sisldo_ops.rst:sisldo_forward.additive_branch_port.
     if (weights.additive_rank > 0) {
         std::vector<value_type> proj(
             static_cast<std::size_t>(input_tensor.rows) * weights.additive_rank, value_type(0));
@@ -636,56 +455,14 @@ void sisldo_forward(
 }
 
 // delta_csr_backward (sparse input + sparse gradient) removed here -- see
-// conversation. Confirmed wrong design: sparse input in backward permanently
-// loses the ability to correct "didn't fire & should have" (a row not in the
-// sparse input representation has no computational path to receive gradient
-// at all, regardless of how strong the signal is). Only "fired & shouldn't
-// have" could ever be fixed. Replaced by disldo_backward_sparse_grad
-// below (dense input, sparse gradient) -- the only sparse-gradient backward
-// variant that should exist. Confirmed zero real callers before removal
-// (only this file's own definition matched a search for "delta_csr_backward(").
+// docs/research/sisldo_ops.rst:sisldo_ops.delta_csr_backward_removed.
 
-// ── Backward pass (dense input, sparse gradient) ────────────────────────────
-//
-// Per conversation: this is the ONLY sparse-gradient backward variant --
-// there is deliberately no sparse-INPUT backward. Input is always dense
-// here (available regardless of which forward path was used, since
-// sparsification never destroys the underlying dense array). Only the
-// GRADIENT toggles sparse/dense, matching the actual performance
-// bottleneck (backward's cost is dominated by the gradient side, forward's
-// by the activation side -- these are independent axes, not mirror images
-// of each other).
-//
-// Why dense input specifically (not just "simpler to implement"):
-// dx[r] = sum_c W[r,c]*dy[c] depends only on weights and the gradient, not
-// on input[r] itself -- so a row whose OWN activation was zero/near-zero
-// this pass still gets a correct dx, correctly telling whatever produced
-// this input "you should have fired more here." A sparse-input design
-// would skip that row entirely (it's not in the sparse representation at
-// all), permanently losing the ability to correct this. The weight update
-// DOES scale with input[r] (via `grad = dy_val * in_val`), so it naturally
-// stays small for rows that didn't fire -- appropriately conservative,
-// without needing to skip the row. Net effect: dense input covers both
-// "fired & shouldn't have" (weight update, scales with the real input
-// value) and "didn't fire & should have" (dx, weight-only, reaches the
-// row regardless of its own value) -- sparse input would only ever cover
-// the first.
+// ── Backward pass (dense input, sparse gradient) ─────────────────────────────
+// See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.dense_input_rationale.
 
-// Template-parameter parity with linear_disldo.hpp::disldo_backward (task
-// #100, "[Deferred] Apply same template params to sisldo_ops.hpp backward
-// functions"): ScalePolicy/StochasticRounding/SynapsePolicyT, in the same
-// order disldo_backward uses (DeferredScaleWrite deliberately scoped out --
-// orthogonal to this function's actual callers). This closes two real gaps
-// at once: (1) synapse_kwargs (max_abs_delta/max_ci/min_decay_frac/
-// scale_invariant) previously could not reach backward_sparse at all, no
-// matter what a caller passed; (2) the scattered AND block4 phases below
-// were both keeping their weight-update math in TRUE-WEIGHT space while
-// storing back into CODE space via `new_w / combined_scale` -- the same
-// ~1/S^2-scale-direction bug class found and fixed in FP8's block4
-// backward earlier (see project_fp8_block4_scale_bug). Porting to
-// disldo_backward's own code-space convention (quant += update_cw(...),
-// S properly threaded as a real per-synapse scale rather than implicitly
-// inverted) fixes this identically here.
+// Template-parameter parity with disldo_backward (task #100); also fixes a
+// true-weight-space vs. code-space scale bug. See
+// docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.template_parity_and_scale_space_bug.
 template <
     typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t,
     typename ScalePolicy = RMSpropScalePolicy<typename ValueAccessor<VALUES_TYPE>::value_type>,
@@ -722,22 +499,8 @@ void disldo_backward_sparse_grad(
             neuron_grad_accum[(*out_grad_sparse.indices[0])[j]] +=
                 std::abs((*out_grad_sparse.values[0])[j]);
 
-    // AQRS neurogenesis-trigger normalization fix (direct instruction,
-    // sili_peridot JOURNAL.md 2026-08-31): scale_gamma's own merge-walk
-    // (og_ptr against out_grad_sparse, below) and additive_gamma's dP/
-    // dgamma computation (further down) both only accumulate contributions
-    // from out_grad_sparse's SURVIVING columns -- this function is only
-    // ever called when dy is genuinely sparse (dy_sparsity_p set; see this
-    // function's own "only sparse-gradient backward variant" docstring
-    // above), so those sums are structurally smaller than the dense case by
-    // roughly the surviving fraction. grad_norm_divisor below (both gamma
-    // branches) was n_inputs*out_cols unconditionally, with nothing to
-    // compensate -- confirmed via a real 20k-step run: input_sparsity_p/
-    // dy_sparsity_p=0.5 pinned every layer's AQRS rank at 1 the entire
-    // curriculum (933-mutation isolation run with dy dense again grew ranks
-    // normally, same seed/everything else). Scale grad_norm_divisor by the
-    // ACTUAL observed dy density for this call, not the nominal p -- self-
-    // corrects for graded per-row schedules too, not just a uniform p.
+    // AQRS neurogenesis-trigger normalization fix -- see
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.dy_density_normalization_fix.
     const SIZE_TYPE dy_total_nnz =
         batch > 0 ? (*out_grad_sparse.ptrs[0])[batch] - (*out_grad_sparse.ptrs[0])[0]
                   : SIZE_TYPE(0);
@@ -748,31 +511,21 @@ void disldo_backward_sparse_grad(
                        value_type(1e-6))
             : value_type(1);
 
-    // ── AQRS rank-N scale scaffolding ───────────────────────────────────────
-    //
-    // Direct port of disldo_backward's identical scaffolding
-    // (linear_disldo.hpp) -- see its own comments for the full rationale.
-    // Shared by both the scattered phase below and the block4 phase further
-    // down, hence computed here rather than inside either guarded block.
+    // ── AQRS rank-N scale scaffolding ─────────────────────────────────────────
+    // See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.rank_backfill_pattern.
     const std::size_t rank = weights.scale_rank;
     std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * out_cols * rank,
                                        value_type(0));
     std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * out_cols * rank,
                                                value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
-    // AQRS gamma's own gradient (task #273/#283 parity) -- layer-wide, not
-    // per-row/col, so sized num_cpus*rank (not num_cpus*out_cols*rank like
-    // t_col_grad above).
+    // AQRS gamma's own gradient (task #273/#283 parity) -- layer-wide, sized num_cpus*rank.
     std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
     std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank,
                                                  value_type(0));
 
-    // Pre-size value_scale/output_scale to n_inputs*rank / out_cols*rank --
-    // see disldo_backward's identical pre-sizing comment (linear_disldo.hpp)
-    // for the real bug this exact backfill pattern fixes (a uniform 1.0
-    // fill would put every new rank component in permanent lockstep with
-    // k==0; only k==0 gets the transparent-default 1.0, k>=1 starts at the
-    // neutral 0.0).
+    // Pre-size value_scale/output_scale -- backfill pattern, see
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.rank_backfill_pattern.
     if (weights.value_scale.size() < n_inputs * rank) {
         const std::size_t old_size = weights.value_scale.size();
         weights.value_scale.resize(n_inputs * rank, value_type(0));
@@ -794,40 +547,19 @@ void disldo_backward_sparse_grad(
     if (weights.value_scale_step.size() < n_inputs * rank)
         weights.value_scale_step.resize(n_inputs * rank, 0);
 
-    // NOTE: dc.empty() (zero scattered nnz) does NOT mean "nothing to do"
-    // -- see sisldo_forward's identical fix/comment. A layer can be
-    // entirely block4-resident and still have real work in the block4
-    // phase below, appended after this guarded block instead of an
-    // unconditional early return.
+    // dc.empty() does NOT mean "nothing to do" -- see sisldo_forward.dc_empty_block4_bug above.
     if (!dc.empty()) {
-        // Importance stats accumulators across batches -- each batch's
-        // #pragma omp parallel for is a SEPARATE parallel region (re-created
-        // every batch iteration), so reduction() handles within-one-batch
-        // thread-safety and these accumulate each batch's reduced total for one
-        // final call after the whole loop. Value stats (update_value_stats_
-        // aggregate) are intentionally NOT tracked here -- see disldo_backward's
-        // comment for the same reasoning.
+        // Importance stats accumulators across batches -- see
+        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.batch_outer_row_inner_layout.
         double total_sum_abs_new_i = 0.0, total_sum_abs_old_i = 0.0;
         double total_sum_sq_new_i = 0.0, total_sum_sq_old_i = 0.0;
         value_type total_max_new_i = value_type(0);
 
-        // value_scale gradient: serial per-(row,k) vector accumulated across
-        // batches (within each batch's parallel for, each r is unique per
-        // thread, so += into scale_grad_sums_rank[r*rank+k] is race-free;
-        // across batch iterations the outer loop is serial, so also race-free).
-        // Applied once after all batches -- "sum first, then apply lr" per
-        // conversation. NOTE: unlike disldo_backward (row-outer/batch-inner,
-        // so its own scale_grad_sum_rank is a small per-row-local vector reset
-        // every row), this function nests batch OUTER / row INNER -- a given
-        // row is visited once per SEPARATE batch iteration, not all at once --
-        // so this accumulator must persist across the whole `for (batch)` loop,
-        // indexed by the full (row,k) pair, not just k.
+        // value_scale gradient accumulator layout differs from disldo_backward's
+        // (batch-outer/row-inner here) -- see
+        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.batch_outer_row_inner_layout.
         std::vector<double> scale_grad_sums_rank(n_inputs * rank, 0.0);
-        // Parallel forward-contribution accumulator, mirroring
-        // disldo_backward's scale_grad_sum_rank_contrib (linear_disldo.hpp) --
-        // same additive (square-then-sum) combination, now applied here too
-        // since this function shares the same value_scale/value_scale_importance
-        // arrays and was previously the one path left using plain g^2.
+        // Parallel forward-contribution accumulator, mirroring disldo_backward's own.
         std::vector<double> scale_grad_sums_rank_contrib(n_inputs * rank, 0.0);
 
         for (SIZE_TYPE b = 0; b < batch; ++b) {
@@ -846,26 +578,19 @@ void disldo_backward_sparse_grad(
                 if (nnz_this_row == 0)
                     continue;
                 const value_type in_val = input[b * n_inputs + r];
-                // lr_row/nnz_this_row -- see disldo_backward's comment for the
-                // full reasoning (a row with more synapses gets more simultaneous
-                // per-synapse nudges each pass, so dividing by nnz_this_row keeps
-                // the aggregate weight update comparable across rows of different
-                // connection counts).
+                // lr/nnz_this_row keeps updates comparable across rows of different
+                // connection counts.
                 const value_type effective_lr =
                     lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_this_row)
                                    : learning_rate;
-                // value_scale's own scale_eff_lr (= learning_rate/nnz_this_row,
-                // ALWAYS, independent of lr_per_row_nnz -- see disldo_backward's
-                // comment) is applied once after all batches now, not folded in
-                // per-synapse -- see the final application loop below.
+                // value_scale's own scale_eff_lr is applied once after all batches (see below).
 
                 auto cursor = dc.row_cursor(r);
                 SIZE_TYPE og_ptr = og_start; // fresh per row -- each row does its own merge
                 value_type dx_accum = value_type(0);
                 const value_type imp_scale = weights.get_importance_scale(r);
 
-                // Per-thread rank-N accumulator lambdas -- mirrors disldo_backward's
-                // mcol_at/mgamma_at exactly (linear_disldo.hpp).
+                // Per-thread rank-N accumulator lambdas.
                 const int tid = omp_get_thread_num();
                 // cppcheck-suppress constVariablePointer -- false positive, mutated indirectly via
                 // the m*_at lambdas below (see linear_disldo.hpp's mcol_base for the full
@@ -896,18 +621,12 @@ void disldo_backward_sparse_grad(
                     const COL_TYPE col = cursor.advance();
                     const std::size_t vb = L.elem_start[r] + e;
                     const value_type cw_orig = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                    // S: real per-synapse scale, rank-N (reduces to the exact
-                    // original val_scale*out_scale at scale_rank==1), matching
-                    // disldo_backward's own `S = weights.get_scale(r, col)`.
-                    // Threading S through SynapsePolicy::update_cw (instead of
-                    // the old true-weight-space `new_w / combined_scale` store)
-                    // is what fixes the ~1/S^2 bug noted above.
+                    // S: real per-synapse scale, rank-N. See
+                    // template_parity_and_scale_space_bug above.
                     const value_type S = weights.get_scale(r, col);
                     const value_type w = cw_orig * S; // -> true units, for dx only
 
-                    // Merge-advance (both this row's columns and the gradient's
-                    // columns are sorted ascending) -- O(nnz_this_row + grad_nnz)
-                    // per row, not a search per synapse.
+                    // Merge-advance, O(nnz_this_row + grad_nnz) per row.
                     while (og_ptr < og_end &&
                            (*out_grad_sparse.indices[0])[og_ptr] < static_cast<SIZE_TYPE>(col))
                         ++og_ptr;
@@ -926,14 +645,8 @@ void disldo_backward_sparse_grad(
                         const value_type ci_orig =
                             ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
                         value_type ci = ci_orig * combined_imp_scale; // -> true units
-                        // Additive contrib combination, mirroring disldo_backward's
-                        // own `ci` update (linear_disldo.hpp) -- see its docstring
-                        // for the full rationale (square-then-sum, not sum-then-
-                        // square: a large-magnitude disagreement between grad
-                        // and contrib must still damp the step, not collapse
-                        // the denominator toward zero and explode it). w here
-                        // is the true (pre-update) weight, same role as
-                        // cw_orig there.
+                        // Additive contrib combination -- see
+                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.merge_scan_design.
                         const value_type contrib = in_val * w;
                         ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac,
                                                       max_ci);
@@ -957,13 +670,8 @@ void disldo_backward_sparse_grad(
                         batch_sum_sq_old_i += static_cast<double>(ci_orig) * ci_orig;
                         batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
 
-                        // dL/d(value_scale_k(r,k)) = grad * quant_floor *
-                        // output_scale_k(col,k) * gamma_k, for EACH component k
-                        // -- direct port of disldo_backward's identical loop
-                        // (linear_disldo.hpp:1025-1054), including quant_floor's
-                        // zero-escape gating (only cw_orig==0 substitutes the
-                        // small positive epsilon; every other value uses itself
-                        // directly, exact and signed).
+                        // dL/d(value_scale_k) -- see merge_scan_design in
+                        // docs/research/sisldo_ops.rst.
                         const value_type quant_floor =
                             (cw_orig == value_type(0)) ? value_type(0.1f) : cw_orig;
                         for (std::size_t k = 0; k < rank; ++k) {
@@ -1003,11 +711,6 @@ void disldo_backward_sparse_grad(
                                                       total_max_new_i);
 
             // Apply value_scale gradient once per (row,k), after ALL batches.
-            // scale_grad_sums_rank[r*rank+k] holds the RAW (pre-lr) gradient sum
-            // now (see the accumulation site above) -- scale_eff_lr is
-            // recomputed here and applied once, matching disldo_backward's
-            // !DeferredScaleWrite (rank-N) branch exactly (linear_disldo.hpp:
-            // 1093-1100).
             for (std::size_t r = 0; r < n_inputs; ++r) {
                 const std::size_t nnz_this_row = L.row_nnz(r);
                 if (nnz_this_row == 0)
@@ -1032,59 +735,17 @@ void disldo_backward_sparse_grad(
     } // closes if (!dc.empty())
 
     // ── block4 contribution ─────────────────────────────────────────────────
-    //
-    // Real, previously-silent bug this closes: same as sisldo_forward's
-    // (see its comment) -- block4-resident synapses were never touched by
-    // this function at all. FP4-specific (block4 is FP4-only), hence the
-    // if constexpr guard.
-    //
-    // Gather design: mirrors the scattered loop above's own merge-scan
-    // (row_cursor + og_ptr walking forward through sorted out_grad_sparse),
-    // applied one level up -- per TILE (4 output columns) instead of per
-    // synapse. PRECONDITION: out_grad_sparse's indices, within each batch
-    // row, must be ascending (same convention sisldo_forward's input
-    // requires -- see its comment).
-    //
-    // Parallelized by BLOCK-ROW (br), not by tile -- unlike disldo_backward
-    // (which partitions by flat tile index and therefore needs cross-thread
-    // accumulator buffers, since two different tiles can share a block-row
-    // when they differ only in block-column), here each br owns exactly 4
-    // unique input rows (br*4..br*4+3) that NO OTHER br ever touches, and a
-    // thread processes one br's tiles serially within itself -- so
-    // value_scale/dx/importance-stat writes for those 4 rows can go
-    // straight into shared (non-per-thread) accumulators with no race,
-    // simpler than disldo_backward's scheme. This also gives the same row-
-    // exclusive-ownership safety a block4 tile resize needs (see
-    // block4_resize_tile_in_row's comment) for free.
-    //
-    // Correctness-first scalar port (matches sisldo_forward's own choice
-    // not to bring over disldo_forward/backward's Block4Vec SIMD machinery
-    // immediately) -- revisit with real profiling if a benchmark shows this
-    // is a bottleneck, same as forward's documented approach.
-    //
-    // KNOWN SIMPLIFICATION (documented, not a bug, mirrors disldo_backward's
-    // identical one): a row with both scattered and block4 synapses gets
-    // two sequential value_scale gradient steps (this section's own, after
-    // the scattered section's own above) rather than one combined step.
+    // See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_backward_design.
     if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
         if (weights.block4.n_tiles() > 0) {
             const auto& BL4 = weights.block4.block_layout;
             const std::size_t tiles_r = BL4.rows;
 
-            // Safe to write directly (no per-thread buffer / final
-            // reduction needed): each row is exclusively owned by one
-            // br across the WHOLE function (br = row/4, no two br's
-            // share a row), and different batches' parallel regions
-            // never overlap in time (each is fully joined before the
-            // next begins) -- see comment above.
-            // Rank-N (task #331): sized n_inputs*rank, indexed [row*rank+k],
-            // mirroring the scattered path's scale_grad_sums_rank above --
-            // safe to write directly here too (same row-exclusive-ownership
-            // argument as row_scale_grad_sums used to make for its rank-1
-            // form).
+            // Safe to write directly (row-exclusive br ownership, see
+            // block4_backward_design above). Rank-N (task #331), sized
+            // n_inputs*rank, indexed [row*rank+k].
             std::vector<double> row_scale_grad_sums_rank(n_inputs * rank, 0.0);
-            // Parallel forward-contribution accumulator -- see the scattered
-            // path's scale_grad_sums_contrib above for the full rationale.
+            // Parallel forward-contribution accumulator (see scattered path above).
             std::vector<double> row_scale_grad_sums_rank_contrib(n_inputs * rank, 0.0);
 
             double b4_total_sum_abs_new = 0.0, b4_total_sum_abs_old = 0.0;
@@ -1106,18 +767,12 @@ void disldo_backward_sparse_grad(
                     const std::size_t row_nnz_b4 = BL4.row_nnz(br);
                     if (row_nnz_b4 == 0)
                         continue;
-                    // Total live slots across ALL of this row's tiles this
-                    // call -- every tile contributes exactly BLOCK4_TILE
-                    // slots per row it covers (dense, weight=0.0 included,
-                    // see block4.hpp), mirrors disldo_backward's
-                    // row_live_count.
+                    // Total live slots across ALL of this row's tiles this call.
                     const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
 
                     value_type dx_accum[BLOCK4_TILE] = {0, 0, 0, 0};
 
-                    // Per-thread rank-N accumulator lambdas -- same pattern as the scattered path's
-                    // mcol_at/mgamma_at (this loop is itself the `#pragma omp parallel for` over
-                    // br, so tid is stable for this whole br's work).
+                    // Per-thread rank-N accumulator lambdas (tid stable across this br's work).
                     const int tid = omp_get_thread_num();
                     // cppcheck-suppress constVariablePointer
                     value_type* mcol_base =
@@ -1143,11 +798,8 @@ void disldo_backward_sparse_grad(
                     };
 
                     if (learning_rate == value_type(0)) {
-                        // Read-only: no writes anywhere in this row, so no
-                        // resize can ever happen -- the plain shared-store
-                        // at_index() path has no concurrency hazard at all
-                        // here (see Block4Store::RowWorkspace's comment on
-                        // why that hazard is specifically about growth).
+                        // Read-only path, no concurrency hazard. See
+                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
                         auto bc_cursor = weights.block4.row_cursor(br);
                         std::size_t elem_pos = BL4.elem_start[br];
                         std::size_t byte_pos = weights.block4.tile_byte_start[br];
@@ -1192,8 +844,7 @@ void disldo_backward_sparse_grad(
                                             continue;
                                         const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
                                         const value_type w_decoded = FP4_TABLE[byte & 0xFu];
-                                        // Rank-N (task #331): matches the scattered
-                                        // read-only path's `S = weights.get_scale(r, col)`.
+                                        // Rank-N, matches the scattered read-only path.
                                         const value_type S = weights.get_scale(row, col);
                                         const value_type w = w_decoded * S;
                                         dx_accum[li] += w * dy_local[lj];
@@ -1204,13 +855,8 @@ void disldo_backward_sparse_grad(
                             ++elem_pos;
                         }
                     } else {
-                        // Writing: use a row-local workspace so growth never
-                        // touches shared tile_data/tbyte_start/tbyte_end
-                        // until a single row-exclusive merge-back at the
-                        // end -- see Block4Store::RowWorkspace's comment
-                        // for why the plain shared-store path (find()-free
-                        // or not) is NOT safe here under concurrent
-                        // per-row-owning threads, confirmed via ASan.
+                        // Writing path -- row-local workspace, ASan-confirmed hazard. See
+                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
                         auto ws = weights.block4.snapshot_row(br);
                         SIZE_TYPE og_ptr = og_start;
                         std::size_t local_pos = 0;
@@ -1289,11 +935,8 @@ void disldo_backward_sparse_grad(
                                             FP4_TABLE[(byte >> 4) & 0xFu];
                                         const value_type grad = dy_val * in_val;
                                         value_type ci = imp_decoded * combined_imp_scale;
-                                        // Additive contrib combination, matching
-                                        // the scattered path above -- see its
-                                        // comment for the full rationale. w is
-                                        // the true (pre-update) weight decoded
-                                        // just above.
+                                        // Additive contrib combination, matching the scattered path
+                                        // above.
                                         const value_type contrib = in_val * w;
                                         ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
                                                                       min_decay_frac, max_ci);
@@ -1303,17 +946,7 @@ void disldo_backward_sparse_grad(
                                             grad, ci, S, effective_lr, eps, damp_by_importance,
                                             max_abs_delta, scale_invariant);
                                         // was_live gate -- see
-                                        // linear_disldo.hpp's was_live4/
-                                        // was_live4_8 declaration comments for
-                                        // the full rationale: `byte` here is
-                                        // the PRE-update packed byte, still
-                                        // untouched at this point -- a cell
-                                        // that was never a real synapse
-                                        // (byte==0) must stay allowed to
-                                        // round back to 0, not be forced
-                                        // permanently live just because this
-                                        // column happened to have gradient
-                                        // signal this step.
+                                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
                                         const bool was_live = (byte != 0);
                                         const value_type imp_ratio = ci / combined_imp_scale;
                                         uint8_t new_w_code, new_imp_code;
@@ -1351,15 +984,8 @@ void disldo_backward_sparse_grad(
                                             std::max(batch_max_new, std::abs(actual_imp));
 
                                         // Rank-N (task #331): per-k gradient accumulation, direct
-                                        // port of the scattered write path's identical loop above
-                                        // (same quant_floor zero-escape gating, same mcol_at/
-                                        // mgamma_at targets -- both phases' contributions land in
-                                        // the SAME shared t_col_grad/t_gamma_grad buffers, reduced
-                                        // once together after block4 closes). Written straight into
-                                        // row_scale_grad_sums_rank (no local intermediate needed):
-                                        // this br exclusively owns `row` for the whole function, so
-                                        // the direct += is race-free, same argument this section's
-                                        // own comment already makes for dx/importance-stat writes.
+                                        // port of the scattered write path above. Race-free: this
+                                        // br exclusively owns `row` for the whole function.
                                         const value_type quant_floor = (w_decoded == value_type(0))
                                                                            ? value_type(0.1f)
                                                                            : w_decoded;
@@ -1397,13 +1023,8 @@ void disldo_backward_sparse_grad(
                                 block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_local_pos]);
                         } // tiles in this row
 
-                        // Merge back -- evicts lowest-|true-importance|
-                        // synapses only if this row genuinely grew past its
-                        // own current headroom (see merge_row_workspace's
-                        // comment). True importance uses the SAME per-row/
-                        // per-col scale lookups as above, per conversation
-                        // (raw 4-bit codes alone aren't enough resolution
-                        // to rank meaningfully).
+                        // Merge back -- see
+                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
                         weights.block4.merge_row_workspace(
                             br, ws,
                             [&](std::size_t ev_row, std::size_t ev_col,
@@ -1439,19 +1060,15 @@ void disldo_backward_sparse_grad(
                                                           b4_total_sum_sq_old, b4_total_max_new);
 
                 for (std::size_t row = 0; row < n_inputs; ++row) {
-                    // nnz_row for this row's block-row -- same derivation as
-                    // the accumulation loop above (row_nnz_b4 * BLOCK4_TILE).
+                    // nnz_row for this row's block-row (same derivation as above).
                     const std::size_t br = row / BLOCK4_TILE;
                     const std::size_t nnz_row = (br < BL4.rows ? BL4.row_nnz(br) : 0) * BLOCK4_TILE;
                     if (nnz_row == 0)
                         continue;
                     const value_type scale_eff_lr =
                         learning_rate / static_cast<value_type>(nnz_row);
-                    // Rank-N (task #331): per-(row,k) apply, direct port of
-                    // the scattered path's identical final loop above. SAME
-                    // value_scale_step counter (shared per-row/k across
-                    // scattered and block4, matching disldo_backward's own
-                    // shared value_scale/importance).
+                    // Rank-N (task #331): per-(row,k) apply, direct port of the scattered path
+                    // above.
                     for (std::size_t k = 0; k < rank; ++k) {
                         if (row_scale_grad_sums_rank[row * rank + k] == 0.0 &&
                             row_scale_grad_sums_rank_contrib[row * rank + k] == 0.0)
@@ -1471,15 +1088,9 @@ void disldo_backward_sparse_grad(
         }
     }
 
-    // ── output_scale's own gradient reduction ───────────────────────────────
-    //
-    // Direct port of disldo_backward's identical block (linear_disldo.hpp)
-    // -- reduces t_col_grad/t_col_grad_contrib across every thread, once per
-    // (col,k), then applies via the same ScalePolicy. Placed AFTER both the
-    // scattered phase above AND the block4 phase just above (both phases'
-    // mcol_at contributions land in the SAME shared t_col_grad buffer,
-    // matching disldo_backward's own placement) -- reducing any earlier
-    // would silently drop block4's own contribution.
+    // ── output_scale's own gradient reduction ─────────────────────────────────
+    // See
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.output_scale_and_gamma_reduction.
     if (learning_rate != value_type(0) && output_scale_trainable) {
         for (std::size_t c = 0; c < out_cols; ++c) {
             const std::size_t deg =
@@ -1506,13 +1117,9 @@ void disldo_backward_sparse_grad(
         }
     }
 
-    // ── AQRS scale_gamma's own update ───────────────────────────────────────
-    //
-    // Direct port of disldo_backward's identical block (linear_disldo.hpp),
-    // including the EMA/dynamic-rank-control tracking call
-    // (update_scale_gamma_ema_k) -- that method itself already lives on
-    // `weights` (shared with the dense path), this just needs to feed it
-    // the same per-k inputs disldo_backward does.
+    // ── AQRS scale_gamma's own update ──────────────────────────────────────────
+    // See
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.output_scale_and_gamma_reduction.
     if (learning_rate != value_type(0) && weights.scale_gamma_is_trainable) {
         std::vector<value_type> g_agg_by_k(rank);
         for (std::size_t k = 0; k < rank; ++k) {
@@ -1544,18 +1151,8 @@ void disldo_backward_sparse_grad(
         }
     }
 
-    // ── AQRS additive branch backward ───────────────────────────────────────
-    //
-    // Direct port of disldo_backward's identical section (linear_disldo.hpp)
-    // -- genuinely independent of the sparse/block4 structure above (same
-    // reasoning as forward's additive branch), computed as its own self-
-    // contained pass. No-op at the default additive_rank==0. `input` is
-    // already dense (this function's own design); `out_grad_sparse` is the
-    // one place this needs real adaptation from disldo_backward's dense
-    // `output_grad` scans -- both the dP projection AND dV's own gradient
-    // walk it once via its CSR instead of a dense scan over n_out (the
-    // dense version already skips zero entries either way, so this is the
-    // same computation, just walking the nonzero set directly).
+    // ── AQRS additive branch backward ──────────────────────────────────────────
+    // See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.additive_branch_backward.
     if (weights.additive_rank > 0) {
         const std::size_t r_o = weights.additive_rank;
         std::vector<value_type> P(static_cast<std::size_t>(batch) * r_o, value_type(0));
@@ -1570,12 +1167,9 @@ void disldo_backward_sparse_grad(
                     p_row[k] += weights.get_additive_u_k(r, k) * iv;
             }
         }
-        // dP[b,k] = sum_c V(c,k)*dy[b,c] -- CSR walk over out_grad_sparse
-        // instead of disldo_backward's dense `for c in n_out` scan.
+        // dP[b,k] = sum_c V(c,k)*dy[b,c] -- CSR walk over out_grad_sparse.
         std::vector<value_type> dP(static_cast<std::size_t>(batch) * r_o, value_type(0));
-        // dV_accum[c,k] = sum_b dy[b,c]*P[b,k] -- built in the SAME CSR walk
-        // (both need the same (b,c,dy) triples), avoiding a second O(n_out)
-        // dense scan disldo_backward's own dV loop does.
+        // dV_accum[c,k] = sum_b dy[b,c]*P[b,k] -- built in the SAME CSR walk as dP.
         std::vector<value_type> dV_accum(out_cols * r_o, value_type(0));
         for (SIZE_TYPE b = 0; b < batch; ++b) {
             const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
@@ -1591,8 +1185,7 @@ void disldo_backward_sparse_grad(
                 }
             }
         }
-        // dX = sum_k U(r,k) * gamma_k * dP_raw[b,k] -- direct port,
-        // disldo_backward's identical formula (linear_disldo.hpp).
+        // dX = sum_k U(r,k) * gamma_k * dP_raw[b,k] -- direct port.
         for (SIZE_TYPE b = 0; b < batch; ++b) {
             const value_type* dp_row = dP.data() + static_cast<std::size_t>(b) * r_o;
             value_type* dx_row = input_gradients + static_cast<std::size_t>(b) * n_inputs;
@@ -1626,10 +1219,7 @@ void disldo_backward_sparse_grad(
                     weights.set_additive_u_raw_k(r, k, u_val);
                 }
             }
-            // dV[c,k] = gamma_k * dV_accum[c,k] -- already reduced above via
-            // the CSR walk, no dense scan needed here (unlike
-            // disldo_backward's own dV loop, which re-scans output_grad
-            // densely per (c,k) since it never had a sparse dy to walk).
+            // dV[c,k] = gamma_k * dV_accum[c,k] -- already reduced above via the CSR walk.
             for (std::size_t c = 0; c < out_cols; ++c) {
                 for (std::size_t k = 0; k < r_o; ++k) {
                     value_type dV_ck = dV_accum[c * r_o + k] * weights.get_additive_gamma_k(k);
@@ -1644,10 +1234,7 @@ void disldo_backward_sparse_grad(
                 }
             }
 
-            // additive_gamma's own update -- direct port, including its own
-            // EMA/dynamic-rank-control tracking call
-            // (update_additive_gamma_ema_k), same shared-method pattern as
-            // scale_gamma's above.
+            // additive_gamma's own update -- direct port, see additive_branch_backward above.
             if (weights.additive_gamma_is_trainable) {
                 std::vector<value_type> dgamma_by_k(r_o);
                 for (std::size_t k = 0; k < r_o; ++k) {

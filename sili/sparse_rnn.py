@@ -6,48 +6,17 @@ carry no Tensor parameters — their weights live in a real _cpu.SparseLinearLay
 and are updated INLINE during backward, not via a separate optimizer step.
 parameters() returns [] for these.
 
-Forward flow in SparseRNNCell
-------------------------------
+Forward flow in SparseRNNCell::
+
     obs   (Tensor) ──[DISLDOLayer]────────────────────────────► Tensor
     state (Tensor) ──[CSR.from_dense]──[SISLDOLayer]──────────► Tensor
                                                   sum ──[EnergyDynamics]──► h_out
 
-    h_out.data → CSR cached inside the cell for the next step's recurrent pass.
-
-Backward / training
---------------------
-Weight VALUE updates are inline, not a separate optimizer.step(): DISLDOLayer/
-SISLDOLayer.forward(x, learning_rate) store learning_rate and their _backward
-closure calls SparseLinearLayer.backward_dense/backward_sparse with it
-directly — gradient computation AND the weight update happen together, during
-aux_loss.backward()/loss.backward() itself. This is required to keep memory
-bounded (no separate accumulate-then-apply buffer held between calls) — the
-old two-phase "compute gradient, then separately .step(lr)" convention this
-module used to assume was actually wrong for this system, not merely
-unimplemented.
-
-    BPTT=1 (default):
-        agent.train_step(obs)   # detaches state, forward(learning_rate=self.lr), aux_loss.backward()
-
-    Multi-step BPTT:
-        for obs in episode:
-            action = agent(obs, learning_rate=0.0)   # state stays in graph, no update during rollout
-            ...
-        loss.backward()                              # inline weight updates fire here
-        agent.state = agent.state.detach()
-
-Only structural growth (synaptogenesis: build_probes + synap_step +
-equalizer_step) is a genuinely separate call, since it changes which synapses
-exist rather than updating a value. It's cheap and O(1)-ish by design —
-SparseRNNAgent.step() calls it every online step, not on an "every N steps"
-cadence (a periodic throttle would reintroduce the lag spikes this stepwise
-design exists to avoid). There is no importance-decay call in this API
-generation — importance already settles via the ADSP-style activity-correlation
-tracking inside forward/backward, and a separate periodic decay interacting
-correctly with FP4-quantized stored values would need more care than a simple
-multiply (values only resolve to FP4 granularity, and large-error entries
-already get squeezed out through ongoing training) — a deliberate difference
-from the old design, not an oversight.
+Weight VALUE updates happen inline inside backward, not via a separate
+optimizer.step() -- required to keep memory bounded. Structural growth
+(synaptogenesis) is the one genuinely separate call. See
+docs/research/sparse_rnn.rst:sparse_rnn.module_overview for the full
+design rationale (BPTT modes, why no periodic importance decay).
 """
 
 from __future__ import annotations
@@ -107,21 +76,14 @@ class CSR(NamedTuple):
         """
         Build a single-row CSR directly from an already-decided set of kept
         column indices (e.g. EnergyDynamics.kept_indices) and a dense array
-        to pull values from at those indices.
-
-        This is the "unify the two sparsification passes" path (see
-        sili.energy._apply_energy_dynamics's kept_indices docstring): when a
-        prior energy-gating decision already exists for this activation,
-        build the CSR from THAT decision instead of from_dense's independent
-        top-k, which could disagree with it.
+        to pull values from at those indices -- the "unify the two
+        sparsification passes" path: prefer this over from_dense's
+        independent top-k whenever a prior gating decision already exists.
 
         kept_indices  : int array, sorted ascending, indices into values_source
-        values_source : float32 [cols] -- values are read from HERE at
-                        kept_indices. Pass the PRE-gating activation (e.g.
-                        the h fed INTO an EnergyDynamics call), not that
-                        call's h_out -- h_out's fired/shutoff positions hold
-                        energy-derived constants (2.0, e+2), not the real
-                        activation magnitude the gate decided to keep.
+        values_source : float32 [cols]. Pass the PRE-gating activation, not
+                        h_out -- h_out's fired/shutoff positions hold
+                        energy-derived constants, not the real magnitude.
         cols          : full (dense) width this row represents
         """
         kept_indices = np.asarray(kept_indices, dtype=np.int32)
@@ -217,33 +179,16 @@ class _SparseLayerBase(Module):
         max_prune_per_step: int = 8,
     ):
         """Structural growth + memory rebalancing -- the only call here
-        that ISN'T inline with forward/backward, since it changes which
-        synapses exist rather than updating a value. No learning_rate:
-        growth isn't a value update. Meant to be called every online
-        step (cheap, O(1)-ish by design) -- see module docstring for why
-        an "every N steps" cadence would be wrong here.
+        that isn't inline with forward/backward, since it changes which
+        synapses exist rather than updating a value. Meant to be called
+        every online step.
 
-        importance_eps is a READ-time-only "ghost" floor -- NEVER
-        written to storage anywhere. It floors an EXISTING synapse's
-        stored importance ONLY for synap_step's importance_cutoff
-        comparison -- a synapse whose real, ongoing-training importance
-        has decayed to exactly the FP4 zero code (a real, discrete
-        quantization bucket many independently-decaying synapses can
-        land on simultaneously -- FP4's smallest nonzero magnitude is
-        0.5, so 0 is a wide, common landing bucket) isn't automatically
-        "below cutoff" the instant it gets there. Does NOT affect
-        removal-priority sort order or capacity-driven
-        (keep > max_row_weights) pruning, and does NOT affect
-        build_probes at all -- a freshly-grown synapse is stored with
-        whatever its REAL probe score is (input_accum*grad_accum,
-        often exactly 0 for a row with no activity yet); this floor
-        just stops it being evicted purely for reading as 0 on its
-        first subsequent visit, giving real backprop time to move it.
+        importance_eps: read-time-only floor on importance_cutoff
+        comparisons in synap_step, never written to storage. See
+        docs/research/sparse_rnn.rst:sparse_layer_base.synaptogenesis_importance_eps_ghost_floor.
 
-        max_prune_per_step: caps how many connections THIS row's call
-        may remove at once, regardless of why they tied for lowest
-        importance -- a safety ceiling (default rarely binds), not a
-        throttle on ordinary capacity trimming."""
+        max_prune_per_step: safety ceiling on removals per row per call
+        (default rarely binds)."""
         self._c.build_probes(k)
         self._c.synap_step(
             importance_cutoff, max_row_weights, max_prune_per_step=max_prune_per_step, importance_eps=importance_eps
@@ -251,28 +196,16 @@ class _SparseLayerBase(Module):
         self._c.equalizer_step()
 
     def magnitude_rescale_output(self, target: float, correction_rate: float, scale_invariant: bool = False) -> None:
-        """Passthrough to the real C++ magnitude_rescale_output (see
-        delta_csr_types.hpp's own docstring). Not every backend has
-        this bound -- e.g. the fp32 DISLDOLayerV backend has no scale
-        concept to rescale -- so callers sweeping this on/off across
-        mixed precisions should guard with
-        `hasattr(layer._c, "magnitude_rescale_output")` (the wrapped
-        C++ object, NOT this Python wrapper -- this method itself
-        exists on every _SparseLayerBase subclass via inheritance and
-        would raise AttributeError from self._c if the backend lacks
-        it, rather than silently no-op)."""
+        """Passthrough to the real C++ magnitude_rescale_output. Not every
+        backend has this bound (e.g. fp32 DISLDOLayerV has no scale to
+        rescale) -- guard with hasattr(layer._c, "magnitude_rescale_output")."""
         self._c.magnitude_rescale_output(target, correction_rate, scale_invariant)
 
     def apply_amortized_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
-        """Passthrough to the real C++ apply_amortized_l2_decay (see
-        delta_csr_types.hpp's apply_amortized_decay_stats docstring for
-        the full mechanism -- amortized decoupled weight decay + rolling
-        health stats via a persistent per-layer cursor). Unlike
-        magnitude_rescale_output, EVERY backend (fp32/FP4/FP8) has this
-        bound -- it's ValueAccessor-generic, so no hasattr guard is
-        needed here. decay_factor is the caller's job to derive from a
-        target half-life (in real training steps) and this layer's own
-        nnz -- see ToyTileRecurrenceRMT.apply_amortized_l2_decay."""
+        """Passthrough to the real C++ apply_amortized_l2_decay (amortized
+        decoupled weight decay + rolling health stats via a persistent
+        per-layer cursor). Bound on every backend. decay_factor is derived
+        by the caller from a target half-life and this layer's nnz."""
         return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
 
     def state_dict(self) -> dict:
@@ -284,20 +217,16 @@ class _SparseLayerBase(Module):
         }
 
     def load_state_dict(self, d: dict):
-        # SparseLinearLayer.load_weights takes (ptrs, indices, weights) --
-        # no importance array in this API generation. A loaded layer's
-        # importance starts fresh and rebuilds through subsequent
-        # training, rather than being restored from the saved value.
+        # load_weights takes (ptrs, indices, weights) only -- no importance
+        # array in this API generation; a loaded layer's importance starts
+        # fresh and rebuilds through subsequent training.
         self._c.load_weights(
             d["ptrs"].astype(np.int32),
             d["indices"].astype(np.int32),
             d["weights"].astype(np.float32),
         )
-        # load_weights is a tight/exact-fit load, no spare per-row byte
-        # headroom -- a subsequent synap_step would immediately raise
-        # ("ran out of blank space") without this. Restore growth room
-        # to this layer's configured per-row cap, same as a fresh
-        # pre-seeded layer already has (see _preseed_random_sparse).
+        # load_weights is a tight/exact-fit load with no spare per-row
+        # headroom -- restore growth room or a subsequent synap_step raises.
         max_row_weights = getattr(self, "_max_row_weights", None)
         if max_row_weights is not None:
             self._c.equalize_to_capacity(max_row_weights)
@@ -306,45 +235,21 @@ class _SparseLayerBase(Module):
 def _preseed_random_sparse(
     c, n_inputs: int, n_outputs: int, max_weights: int, rng: np.random.Generator | None = None
 ) -> int:
-    """A freshly-constructed SparseLinearLayer has zero connections and
-    produces literal all-zero output until synaptogenesis grows some.
-    NOT strictly required when EnergyDynamics is in the loop (as it is
-    for SparseRNNCell): its forced-firing (energy accumulates via
-    `drive` alone, independent of input/weights, until a neuron crosses
-    the fire threshold and outputs a forced constant) already gives an
-    all-zero-weight layer a real, if slower, way to bootstrap activity
-    and a gradient signal to grow from -- closer to RL-style forced
-    exploration than a dead end. This is purely an optimization for a
-    faster/more immediate initial bootstrap (useful in tests, or
-    whenever waiting several steps for forced-firing to kick in isn't
-    wanted) via a standard random-sparse-init pattern -- not a
-    requirement.
+    """Bootstrap a freshly-constructed (zero-connection) SparseLinearLayer
+    with a random-sparse init, an optimization for faster initial activity
+    (not strictly required -- EnergyDynamics's forced-firing can bootstrap
+    an all-zero layer on its own, just slower). Also reserves per-row
+    growth headroom via equalize_to_capacity, called AFTER load_weights
+    (order matters -- see anchor below).
 
-    Also calls equalize_to_capacity so later synap_step calls have
-    per-row headroom to grow into -- synap_step raises if a row's
-    pre-allocated space is already full, and load_weights' own
-    allocation is a tight/exact fit with no spare room. (Not
-    expand_headroom_to -- despite its docstring promising per-row
-    headroom after a full equalizer_step pass, that didn't hold up
-    empirically here; equalize_to_capacity, called AFTER load_weights,
-    is what actually works.)
+    CSR rows are INPUTS, columns are OUTPUTS.
 
-    CSR rows are INPUTS, columns are OUTPUTS (disldo_forward iterates
-    `for r in range(n_inputs)`, each row's nonzero entries its output
-    connections) -- see linear_disldo.hpp.
+    `rng`: defaults to fresh OS entropy (np.random.default_rng()), NOT
+    affected by np.random.seed(). Pass an explicit
+    np.random.default_rng(seed) for reproducible wiring in tests.
 
-    `rng`: defaults to `np.random.default_rng()` (fresh OS entropy,
-    genuinely non-reproducible by design -- NOT affected by
-    `np.random.seed()`, which only controls the legacy global
-    `RandomState`, not this Generator API). Pass an explicit
-    `np.random.default_rng(seed)` to get reproducible wiring for tests
-    -- direct request: keep true randomness as the default, only make
-    it OVERRIDABLE, not seeded-by-default.
+    See docs/research/sparse_rnn.rst:preseed_random_sparse.bootstrap_rationale_and_capacity_order.
     """
-    # load_weights is a tight/exact-fit encode regardless of any prior
-    # allocation -- equalize_to_capacity must be called AFTER it, not
-    # before, or the headroom gets compacted away immediately (verified
-    # empirically).
     per_row = max(2, max_weights // max(1, n_inputs))
     if rng is None:
         rng = np.random.default_rng()
@@ -359,20 +264,12 @@ def _preseed_random_sparse(
         values[row * k : (row + 1) * k] = rng.standard_normal(k).astype(np.float32) * scale
         ptrs[row + 1] = ptrs[row] + k
     if hasattr(c, "equalize_to_capacity"):
-        # SparseLinearLayer (FP4) convention -- 3-arg load_weights,
-        # equalize_to_capacity grows per-row headroom for later
-        # synaptogenesis.
+        # SparseLinearLayer (FP4) convention -- 3-arg load_weights.
         c.load_weights(ptrs, indices, values)
         c.equalize_to_capacity(per_row)
     else:
-        # DISLDOLayerV (32-bit DeltaCSRBiValues<float> fallback) --
-        # identical disldo_forward/backward math, no FP4 quantization.
-        # No equalize_to_capacity binding (no growth-headroom use case
-        # here -- this class exists for isolating FP4 quantization
-        # itself as a variable, not for synaptogenesis experiments) and
-        # load_weights takes an explicit importance array (zeros: fresh
-        # connections start with no accumulated importance, matching
-        # the FP4 class's own default).
+        # DISLDOLayerV (32-bit fallback) -- no equalize_to_capacity
+        # binding, and load_weights takes an explicit importance array.
         importance = np.zeros_like(values)
         c.load_weights(ptrs, indices, values, importance)
     return per_row
@@ -380,46 +277,14 @@ def _preseed_random_sparse(
 
 def _overflow_guard_array(arr: np.ndarray, clip: float, near: float, coef: float) -> np.ndarray:
     """Elementwise, context-free correction for one AQRS scale/additive
-    channel array (value_scale, output_scale, additive_u, additive_v --
-    task #295 follow-up / task #286 "virtual neuron" exposure). Real bug
-    this fixes: get_scale()'s combined envelope S(row,col) = sum_k
-    gamma_k*value_scale_k*output_scale_k is an UNCLAMPED sum
-    (delta_csr_types.hpp) -- raising scale_rank_max/additive_rank_max
-    past the old hardcoded 4 let a real fp8 MQAR curriculum run's
-    per-channel scale values grow unbounded, overflowing S in the
-    forward pass and NaN-collapsing training (confirmed: the NaN onset
-    lined up exactly with a rank mutation on q_proj, see conversation).
-
-    Two parts, deliberately NOT a plain hard clip alone (direct
-    instruction: a hard clip's backward either gives zero gradient or
-    gradient computed from the wrong post-clip value once a channel is
-    pinned at the boundary -- neither tells upstream training "shrink
-    this"):
-
-    1. Auto-correcting shrink: once |value| exceeds `near`, subtract a
-       nudge proportional to the excess, always pointing back toward
-       zero -- exactly the gradient of a 0.5*coef*relu(|x|-near)^2
-       hinge-squared penalty, applied directly as a value-space
-       correction (these channels are C++-internal RMSprop-optimized
-       state, not Python Tensor autograd leaves, so there's no
-       backward pass to inject an extra gradient INTO -- this achieves
-       the same corrective effect one call later, which is sufficient
-       since S is fully rebuilt from these stored values every forward
-       call; nothing is lost by correcting between steps instead of
-       mid-forward).
-    2. Hard clip to `clip` as the final numerical-safety net (and
-       np.nan_to_num first, since a value that's ALREADY NaN/Inf
-       wouldn't be fixed by np.clip alone -- np.clip(nan,...)==nan).
-
-    `near` should sit comfortably below `clip` so the corrective nudge
-    has room to act before the hard clip ever engages. Per-channel, not
-    aggregate-S (direct instruction: chose this over clipping S itself)
-    -- each element is corrected independently with no knowledge of
-    other channels, so applying this as one vectorized numpy pass over
-    the whole array is exactly equivalent to "run the same correction
-    once per channel" (direct instruction) without the GIL/threading
-    cost of a literal per-element callback inside the hot C++ OpenMP
-    forward/backward loops."""
+    channel array (value_scale, output_scale, additive_u, additive_v).
+    Two parts: (1) an auto-correcting shrink once |value| exceeds `near`
+    (a hinge-squared penalty applied directly in value-space, since these
+    are C++-internal RMSprop state, not autograd leaves) and (2) a hard
+    clip to `clip` as the final numerical-safety net (nan_to_num first).
+    `near` should sit comfortably below `clip`. Per-channel, not
+    aggregate-S. See
+    docs/research/sparse_rnn.rst:overflow_guard_array.two_part_correction_design."""
     x = np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=clip, neginf=-clip)
     excess = np.maximum(np.abs(x) - near, 0.0)
     corrected = x - coef * excess * np.sign(x)
@@ -428,92 +293,17 @@ def _overflow_guard_array(arr: np.ndarray, clip: float, near: float, coef: float
 
 def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np.ndarray:
     """Ongoing (every-step) diversity penalty for one AQRS channel array
-    (value_scale, output_scale, additive_u, additive_v -- direct
-    instruction: preferred over residual-targeted growth, since an
-    init-time-only fix doesn't stop channels drifting back toward
-    redundancy as training continues, whereas this is a per-step force).
+    (value_scale, output_scale, additive_u, additive_v). Standard
+    soft-orthogonality regularizer, gradient step on
+    sum_{k1!=k2}(cos(M_k1,M_k2))^2 -- correlation of DIRECTION only.
+    Computed in NORMALIZED (unit-direction) space so the correction stays
+    LINEAR in each channel's own magnitude, not cubic (a raw-magnitude
+    version was a real bug -- see anchor). Gram's diagonal is zeroed
+    (only cross-channel correlation is penalized; AQRS's own gamma_k
+    already controls magnitude separately). rank<=1 is a no-op.
 
-    Real problem this addresses: nothing else in the AQRS design
-    prevents two rank channels from converging to duplicate directions
-    -- neurogenesis's own health check (abs_gamma_k/grad_ema) is purely
-    magnitude-based, so a channel that's redundant with another reads
-    as "healthy" (real gradient, real magnitude) even though it adds no
-    new capacity. l1_sparsity_coef (sili_peridot) doesn't help either --
-    it penalizes the SUMMED output after every channel's already been
-    combined, with no visibility into the per-channel decomposition.
-
-    Standard soft-orthogonality regularizer, applied as a direct
-    gradient-descent step on Σ_{k1≠k2}(cos(M_k1,M_k2))^2 -- correlation
-    of DIRECTION only, magnitude excluded (see the "why not the
-    diagonal identity term" note below).
-
-    Real bug found running this against live training (real MQAR
-    curriculum, see conversation): the FIRST version of this function
-    used raw (non-normalized) columns, computing G=M^T@M and stepping
-    M -= coef*M@G_offdiag directly. For real channel magnitudes in the
-    10s-100s (exactly the range apply_scale_overflow_guard's own near/
-    clip thresholds exist to handle), G entries scale as O(n*mag^2)
-    and the correction scales as O(rank*n*mag^3) -- CUBIC in magnitude.
-    Every synthetic test used near-unit-magnitude vectors, where this
-    is negligible; against real training it exploded, and because
-    apply_channel_orthogonality_penalty was called AFTER apply_scale_
-    overflow_guard in the training loop, nothing sanitized the result
-    before it was stored -- NaN-collapsed a real fp8 run at step 12650,
-    even earlier than the original unguarded-envelope bug this whole
-    mechanism exists downstream of (task #295's own NaN, at step
-    38166). Confirmed by direct calculation before touching the fix:
-    n=128, clip=200, rank=32 gives a correction on the order of 1e10,
-    nowhere near "a small per-step nudge."
-
-    Fix: do the whole computation in NORMALIZED (unit-direction) space,
-    which is also the conceptually correct fix, not just a numerical
-    patch -- since the intent was always "penalize direction, not
-    magnitude" (see below), operating on unit vectors makes that
-    literal instead of incidental. u_k = M_k/||M_k||; gram = U^T@U has
-    entries bounded in [-1,1] (cosine similarities); the correction
-    direction u@gram_offdiag is then bounded by O(rank) regardless of
-    M's raw scale; the actual step re-scales that bounded direction by
-    each channel's OWN norm (||M_k||*coef*correction_dir), so the
-    update stays LINEAR in magnitude, not cubic, while still moving
-    faster for a channel that's already larger (a natural,
-    scale-consistent step size, not an arbitrary fixed one). A
-    near-zero-norm channel is guarded by max(norm, 1e-6) in the
-    denominator -- deliberately not a "there's now a NaN so patch it"
-    reflex, this floor makes the whole computation provably finite
-    (Cauchy-Schwarz bounds every normalized component by 1) rather
-    than relying on a defensive nan_to_num to catch what the raw-scale
-    version couldn't.
-
-    Gram's diagonal is zeroed (a channel's own norm isn't penalized,
-    only its correlation with OTHERS) -- this is the off-diagonal part
-    of the classic ||M^T@M - I||^2 soft-orthogonality loss; the
-    diagonal identity term (which would additionally push every
-    channel toward UNIT norm) is deliberately excluded, since AQRS's
-    own gamma_k already exists specifically to control channel
-    magnitude separately from direction -- including it here would
-    fight gamma for the same job.
-
-    Cheap (O(rank^2*n)) since it only depends on the CURRENT parameter
-    values, not on any batch's dy/x -- unlike residual-targeted
-    growth, needs no new C++ state or hot-loop hook, which is why this
-    was chosen over that design (direct instruction: "sounds easier").
-
-    rank<=1 is a natural no-op (single channel, no off-diagonal terms
-    exist), matching every other AQRS mechanism's own "no-op at the
-    degenerate rank" convention -- deliberately not special-cased.
-
-    Known, accepted limitation: if two channels are ever EXACTLY
-    identical (a genuine float tie, not just highly correlated), the
-    correction each receives is identical too (scale-invariant --
-    cosine similarity can't change), so this can only shrink an exact
-    tie uniformly, never truly separate it -- a symmetric fixed point
-    of the pairwise-correlation objective. Not expected to matter in
-    practice: growth already seeds new channels with independent
-    random noise (_seed_scale_rank/_seed_additive_rank's own
-    symmetry-breaking), so real channels essentially never reach an
-    exact float tie; this penalty's actual job is stopping the
-    ONGOING drift of already-distinct channels toward redundancy
-    during training, which it does regardless."""
+    See
+    docs/research/sparse_rnn.rst:orthogonality_penalty_array.normalized_space_bug."""
     if rank <= 1:
         return flat
     n = flat.size // rank
@@ -528,12 +318,9 @@ def _orthogonality_penalty_array(flat: np.ndarray, rank: int, coef: float) -> np
 
 
 def _apply_channel_orthogonality_penalty(c, coef: float) -> None:
-    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
-    DISLDOLayer8's apply_channel_orthogonality_penalty -- see
-    _orthogonality_penalty_array's own docstring for the full
-    rationale. Same "skip when empty" convention as
-    _apply_scale_overflow_guard (additive_u/v are empty at
-    additive_rank==0)."""
+    """Shared impl for DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8's
+    apply_channel_orthogonality_penalty. Skips additive_u/v when empty
+    (additive_rank==0)."""
     scale_rank = c.get_scale_rank()
     vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
     if vs.size:
@@ -551,12 +338,8 @@ def _apply_channel_orthogonality_penalty(c, coef: float) -> None:
 
 
 def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> None:
-    """Shared implementation for DISLDOLayer/DISLDOLayerDeterministic/
-    DISLDOLayer8's apply_scale_overflow_guard -- see
-    _overflow_guard_array's own docstring for the full rationale.
-    Applies to all four AQRS channel arrays (skips additive_u/v when
-    additive_rank==0, matching every other AQRS call site's own "no-op
-    at rank 0" convention)."""
+    """Shared impl for DISLDOLayer/DISLDOLayerDeterministic/DISLDOLayer8's
+    apply_scale_overflow_guard. Skips additive_u/v when additive_rank==0."""
     vs = np.asarray(c.get_value_scale_raw_vector(), dtype=np.float32)
     if vs.size:
         c.set_value_scale_raw_vector(_overflow_guard_array(vs, clip, near, coef).tolist())
@@ -573,30 +356,10 @@ def _apply_scale_overflow_guard(c, clip: float, near: float, coef: float) -> Non
 
 def _default_rank_cap(n_inputs: int, n_outputs: int) -> int:
     """Default scale_rank_max/additive_rank_max, derived from actual
-    storage cost (direct instruction, superseding task #295's cruder
-    min(n_in,n_out)//4 heuristic -- that formula wasn't checked against
-    real byte counts and, confirmed via a real 60k-step run, let ranks
-    grow well past the point where the low-rank envelope uses MORE
-    memory than the dense fp32 matrix it exists to avoid).
-
-    value_scale/output_scale/additive_u/additive_v/scale_gamma/
-    additive_gamma are all stored as plain fp32 (no quantization on the
-    rank-N components themselves, confirmed in cpu_backend.cpp/
-    delta_csr_types.hpp) -- each rank-1 channel of the scale branch
-    costs 4*(n_inputs+n_outputs+1) bytes (row vector + col vector +
-    1 gamma scalar), same formula for the additive branch. The base
-    fp4-quantized weight matrix (weight+importance packed 2-per-byte)
-    costs n_inputs*n_outputs*1 byte regardless of rank.
-
-    The cap here is the largest per-branch rank K such that BOTH
-    branches growing to K simultaneously still costs no more, combined
-    with the base weights, than a plain dense fp32 matrix of the same
-    shape (n_inputs*n_outputs*4 bytes) -- i.e. AQRS is only ever
-    memory-neutral-or-cheaper than "why not just use dense fp32",
-    never a net loss. Splits the remaining budget (after the fp4 base)
-    evenly between the scale and additive branches since both draw
-    from the same underlying justification and neither is
-    structurally more important than the other."""
+    storage cost: the largest per-branch rank K such that both branches
+    growing to K simultaneously still cost no more, combined with the
+    base fp4 weights, than a plain dense fp32 matrix of the same shape.
+    See docs/research/sparse_rnn.rst:default_rank_cap.byte_budget_derivation."""
     base_bytes = n_inputs * n_outputs * 1
     fp32_dense_bytes = n_inputs * n_outputs * 4
     remaining_budget = max(0, fp32_dense_bytes - base_bytes)
@@ -608,23 +371,11 @@ def _seed_scale_rank(
     c, rank: int, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None, scale: float = 0.05
 ) -> None:
     """Sets scale_rank on the C++ layer and seeds components k>=1 (both
-    value_scale_k and output_scale_k) with small random values. Required:
-    per scale_rank's own docstring (delta_csr_types.hpp), k>=1 defaults to
-    0.0 on BOTH sides -- a genuine chicken-and-egg deadlock where neither
-    factor can ever get a nonzero gradient on its own unless at least one
-    side starts nonzero. rank=1 is a no-op (nothing to seed, matches the
-    original single-component behavior exactly).
-
-    Loop order matters here, not just cosmetically: set_value_scale_raw_k/
-    set_output_scale_raw_k lazily resize+fill new slots with 1.0 (the
-    correct default for component 0), so as long as every row's k=0 slot
-    gets touched by that fill BEFORE this function's own k>=1 writes land
-    (true here: row-major, k ascending from 1, one index at a time --
-    each row's k=0 slot is always filled-by-resize immediately before this
-    row's own k=1 write), every component-0 slot ends up correctly at 1.0
-    without ever being written explicitly. Do not reorder these loops
-    (e.g. column-major, or k descending) without re-verifying that still
-    holds.
+    value_scale_k and output_scale_k) with small random values -- both
+    default to 0.0, a chicken-and-egg deadlock otherwise. rank=1 is a
+    no-op. Loop order matters (row-major, k ascending) -- do not reorder
+    without re-verifying. See
+    docs/research/sparse_rnn.rst:seed_scale_rank.chicken_egg_deadlock.
     """
     if rank <= 1:
         return
@@ -644,23 +395,11 @@ def _seed_additive_rank(
 ) -> None:
     """Sets additive_rank on the C++ layer and seeds EVERY component
     (k=0..rank-1, unlike _seed_scale_rank's k>=1) with small independent
-    random values on BOTH additive_u and additive_v.
-
-    Same chicken-and-egg deadlock as _seed_scale_rank, just additive
-    instead of multiplicative: disldo_backward's dU_rk depends on dP,
-    which is zero whenever every additive_v_k is zero (dP[b,k] = sum_c
-    dy*V[c,k]); symmetrically dV_ck depends on P, which is zero whenever
-    every additive_u_k is zero. additive_rank's own default (0.0 for both
-    U and V, see set_additive_rank's reshuffle in delta_csr_types.hpp) is
-    correct for k that's never been grown, but a caller growing rank at
-    construction time needs at least one side nonzero on every new
-    channel, same reasoning as scale_rank's k>=1 case -- seeding BOTH
-    sides independently is simplest and mirrors _seed_scale_rank exactly.
-
-    Unlike scale_rank, there's no k==0 "always on baseline channel" to
-    preserve -- additive_rank==0 is a true, fully transparent no-op (see
-    disldo_forward's own `if (weights.additive_rank > 0)` guard), so
-    every channel from k=0 gets seeded here, not just k>=1.
+    random values on both additive_u and additive_v -- same
+    chicken-and-egg deadlock as _seed_scale_rank, additive instead of
+    multiplicative. No k==0 baseline channel to preserve here
+    (additive_rank==0 is a true no-op), so every channel is seeded. See
+    docs/research/sparse_rnn.rst:seed_scale_rank.chicken_egg_deadlock.
     """
     if rank <= 0:
         return
@@ -676,36 +415,14 @@ def _seed_additive_rank(
 
 
 def _activate_gamma_tracking(c, additive_rank: int) -> None:
-    """Turns on EMA tracking for BOTH branches' gamma (task #292), which
-    is what makes apply_dynamic_rank_control/apply_additive_dynamic_rank_
-    control's Theorem 10 triggers actually evaluate against real,
-    updating signal instead of permanently-zero EMA state.
-
-    Gamma's own EMA only updates inside disldo_backward's gamma-update
-    block, itself gated on scale_gamma_is_trainable/additive_gamma_is_
-    trainable (opt-in flags, see get_scale_gamma_k's own docstring,
-    sili__new's delta_csr_types.hpp) -- set true only once set_scale_
-    gamma_raw_k/set_additive_gamma_raw_k has been called at least once.
-    Neither _seed_scale_rank nor _seed_additive_rank above ever touches
-    gamma, so a layer constructed via those alone has gamma tracking
-    permanently OFF regardless of scale_rank/additive_rank -- this is
-    the explicit "opt in" step, matching test_aqrs_dynamic_rank_control_
-    integration.cpp's own convention (see get_scale_gamma_k's docstring:
-    "explicitly touch gamma at k=0 BEFORE growing -- this is what puts
-    gamma into active use").
-
-    Writes gamma_k(0)=1.0 for BOTH branches -- the exact same value
-    get_scale_gamma_k's own lazy default already returns (transparent,
-    zero behavior change), and additive_gamma_k(0) likewise defaults
-    transparently to 1.0 (see that function's own corrected-default
-    docstring) -- so this call activates tracking WITHOUT perturbing
-    anything the layer was already computing. additive branch only gets
-    activated if additive_rank>0 (a rank-0 additive branch has no
-    channel 0 to touch, and apply_additive_dynamic_rank_control's own
-    neurogenesis trigger structurally can't fire from rank 0 anyway --
-    see GammaEMATracker::should_neurogenesis's own rank==0 guard -- so a
-    caller wanting the additive branch to ever grow under dynamic
-    control must seed it at rank>=1 up front, same as scale_rank).
+    """Turns on EMA tracking for both branches' gamma -- required for
+    apply_dynamic_rank_control's Theorem 10 triggers to evaluate against
+    real signal instead of permanently-zero EMA state. Neither
+    _seed_scale_rank nor _seed_additive_rank touches gamma, so this is
+    the explicit opt-in step. Writes gamma_k(0)=1.0 for both branches
+    (same as the lazy default -- transparent, no behavior change).
+    Additive branch only activated if additive_rank>0. See
+    docs/research/sparse_rnn.rst:activate_gamma_tracking.opt_in_design.
     """
     if hasattr(c, "set_scale_gamma_raw_k"):
         c.set_scale_gamma_raw_k(0, 1.0)
@@ -716,90 +433,29 @@ def _activate_gamma_tracking(c, additive_rank: int) -> None:
 def _preseed_dense(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None, quantize_fn=None) -> int:
     """Fully dense counterpart to `_preseed_random_sparse` -- every
     (input, output) pair connected, loaded straight into block4 via
-    `load_dense_codes` (sili__new's `block4_load_dense`, see its own
-    docstring for the loading-vs-quantization design split). Added per
-    direct request to test whether this project's usual random-SPARSE
-    "echo network" preseed is itself a significant source of seed
-    -to-seed accuracy variance in toy comparisons (reservoir-computing
-    -style connectivity-draw sensitivity), independent of whatever else
-    is being compared (base, bits, etc.).
+    `load_dense_codes`. `quantize_fn` defaults to `_cpu.fp4_quantize_array`
+    but is a parameter so a caller can swap in a different scheme.
 
-    `quantize_fn`: defaults to `_cpu.fp4_quantize_array` (this class's
-    VALUES_TYPE). Kept as a parameter, not hardcoded, so a caller can
-    swap in a different quantization scheme (rank-1 scale fit, etc.)
-    without this function needing to change -- matches
-    block4_load_dense's own loading/quantization separation.
-
-    IMPORTANT, found directly while verifying this (two real bugs, both
-    fixed, in order):
-
-    1. Init scale can NOT just be `_preseed_random_sparse`'s own
-       `1/sqrt(k)` fan-in scaling carried over naively into the RAW
-       quantized value. FP4 (E2M1) has a FIXED absolute zero-rounding
-       floor (~0.25, independent of layer width) -- at typical toy
-       widths (state_width=128, `1/sqrt(128)~=0.09`), nearly EVERY
-       drawn value would quantize to code 0 ("not live"), silently
-       collapsing "dense init" back down to mostly-empty regardless of
-       what was intended. Confirmed empirically: raw scale=0.3 gave
-       only 23/64 live codes on an 8x8 test matrix; scale=1.5-2.0 gave
-       ~90%+ live.
-
-    2. Using a FIXED raw scale (1.5) WITHOUT any compensating fan-in
-       correction elsewhere is ALSO wrong, just in the opposite
-       direction -- confirmed empirically on the real curriculum: every
-       one of base=4/6/12/24 collapsed to pure CHANCE (mean_acc~0.094,
-       std~0.003 across 3 seeds), identically regardless of base. Root
-       cause: `output[c] = sum_r input[r] * weight[r,c]` -- its variance
-       scales with the number of ROWS feeding column `c` (that
-       column's fan-in, i.e. its live-connection count across rows),
-       not the row's own width. Sparse's k=5 connections/row at scale
-       `1/sqrt(5)` keep that sum's variance ~1 (properly normalized);
-       dense's ~128 connections/column at raw scale 1.5 give variance
-       ~128*1.5^2~=288, almost certainly saturating whatever clip/
-       RMSNorm sits downstream and destroying the learning signal the
-       same way no matter what `base` is -- exactly explaining why
-       every dense arm gave identical numbers.
-
-       IMPORTANT CORRECTION (per direct review): the first fix applied
-       this correction via per-ROW `value_scale` scaled by `1/sqrt
-       (n_outputs)` -- the WRONG axis. It only happened to produce a
-       working number in testing because q/k/v/o_proj are square
-       (n_inputs==n_outputs), making the wrong-axis correction
-       numerically coincide with the right one there; it would have
-       been wrong for lm_head (16x10, not square). Also computed from
-       the ASSUMED `n_outputs`/`n_inputs`, not the REAL post
-       -quantization live count -- wrong whenever problem 1's
-       zero-code collisions leave a row/column short of full density
-       (as they do here: confirmed ~87.5% actual density at scale=1.5,
-       not 100%).
-
-    Fix: after loading, compute the REAL per-column live count
-    directly from `weight_codes` (code 0 = not live, same convention
-    `block4_load_dense`/every other block4 path already uses -- no
-    assumption about density), and apply a fan-in-correcting
-    `output_scale` PER COLUMN via `set_output_scale_raw` as METADATA
-    (documented pattern: `true_w = stored_w * value_scale[row] *
-    output_scale[col]`, "set directly WITHOUT re-encoding stored
-    weights") -- output_scale is the per-COLUMN half of that product,
-    matching the axis the variance actually depends on. `output_scale[c]
-    = 1/(raw_scale * sqrt(col_nnz[c]))` reproduces the same
-    effectively-normalized weight distribution `_preseed_random_sparse`
-    already produces for a k-wide row, generalized to each column's
-    OWN real fan-in rather than an assumed uniform width. `value_scale`
-    (per-row) is left at its default 1.0 -- this correction lives
-    entirely on the column axis, matching the math above.
+    Uses a fixed raw scale (not fan-in-scaled to n_inputs) plus a
+    per-column `output_scale` correction fit to the REAL post-quantization
+    live count -- two real bugs (FP4's zero-rounding floor silently
+    killing most of a naively-scaled dense init, then an uncorrected
+    fixed scale collapsing training to chance) were found and fixed here.
+    See docs/research/sparse_rnn.rst:preseed_dense.two_real_bugs for the
+    derivation and the wrong-axis correction that was also caught and
+    fixed.
     """
     if rng is None:
         rng = np.random.default_rng()
     if quantize_fn is None:
         quantize_fn = _cpu.fp4_quantize_array
-    scale = 1.5  # fixed, not fan-in-scaled -- keeps codes representable, see docstring point 1
+    scale = 1.5  # fixed, not fan-in-scaled -- keeps codes representable
     dense = rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale
     weight_codes = quantize_fn(dense.flatten())
     importance_codes = np.zeros(n_inputs * n_outputs, dtype=np.uint8)
     c.load_dense_codes(weight_codes, importance_codes)
     # Fan-in correction via output_scale metadata, from REAL per-column
-    # live counts (code 0 = not live) -- see docstring point 2.
+    # live counts (code 0 = not live).
     live = weight_codes.reshape(n_inputs, n_outputs) != 0
     col_nnz = live.sum(axis=0)
     output_scale = 1.0 / (scale * np.sqrt(np.maximum(col_nnz, 1)))
@@ -810,18 +466,13 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | 
 
 def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None) -> int:
     """Fully dense counterpart to `_preseed_random_sparse`, for storage
-    types with no block4 support (DeltaCSRBiValues<float>/DISLDOLayerV
-    -- `_preseed_dense`'s own `load_dense_codes`/block4 path doesn't
-    exist for this VALUES_TYPE). Every (input, output) pair connected
-    via plain scattered CSR instead -- no quantization floor to correct
-    for (unlike `_preseed_dense`'s FP4-specific scale-correction dance,
-    see its own docstring), so this is just standard fan-in-normalized
-    (1/sqrt(n_inputs)) Gaussian init, matching ordinary Xavier/Kaiming
-    convention for a fully-connected linear layer. Caller MUST have
-    constructed `c` with max_weights >= n_inputs*n_outputs -- unlike
-    block4's dense path (a separate allocation, unbounded by the
-    scattered-CSR max_weights budget), this genuinely needs that much
-    scattered-CSR storage since there's no other place to put it."""
+    types with no block4 support (DeltaCSRBiValues<float>/DISLDOLayerV).
+    Every (input, output) pair connected via plain scattered CSR -- no
+    quantization floor to correct for, so plain fan-in-normalized
+    (1/sqrt(n_inputs)) Gaussian init (ordinary Xavier/Kaiming). Caller
+    MUST construct `c` with max_weights >= n_inputs*n_outputs. See
+    docs/research/sparse_rnn.rst:preseed_dense.two_real_bugs (last
+    paragraph)."""
     if rng is None:
         rng = np.random.default_rng()
     scale = 1.0 / np.sqrt(max(1, n_inputs))
@@ -835,57 +486,24 @@ def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int, rng: np.random.Ge
 
 def _preseed_empty(c, n_inputs: int, n_outputs: int, max_weights: int) -> int:
     """The genuinely-designed zero-weight-init: NO connections at all
-    (nnz=0), not a dense grid pre-loaded with weight=0 (see
-    _preseed_random_sparse's own docstring -- "a freshly-constructed
-    SparseLinearLayer has zero connections... this is purely an
-    optimization for a faster bootstrap, not a requirement"). Real
-    synapses are meant to be created by synaptogenesis()
-    (build_probes/synap_step/equalizer_step), each starting with a real
-    nonzero value the first time it's grown in -- not by gradient
-    -nudging a pre-existing zero. Per direct correction: pre-loading
-    weight=0/importance=1 into every slot (this project's earlier
-    `all_zero_init` mechanism) is a different, synthetic experimental
-    arm, not this one -- it has its own failure mode (an eps-shaped
-    backprop term can decay that seeded importance back toward 0) that
-    doesn't apply here since nothing exists to decay.
-
-    Only reserves per-row growth headroom via equalize_to_capacity --
-    safe to call directly on a fresh, never-load_weights'd layer
-    (unlike after _preseed_random_sparse's load_weights call, which
-    would immediately compact any headroom back away -- see that
-    function's own docstring)."""
+    (nnz=0), not a dense grid pre-loaded with weight=0 -- real synapses
+    are created by synaptogenesis() instead. Only reserves per-row growth
+    headroom via equalize_to_capacity, safe to call directly on a fresh,
+    never-load_weights'd layer. See
+    docs/research/sparse_rnn.rst:preseed_empty.design_vs_zero_grid."""
     per_row = max(2, max_weights // max(1, n_inputs))
     c.equalize_to_capacity(per_row)
     return per_row
 
 
 def _graded_top_k_csr(dy2d: np.ndarray, k_per_row, num_cpus: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """GENUINELY per-row top-k selection: row r independently keeps its
-    own top-k_per_row[r] largest-magnitude entries. Lets a caller grade
-    gradient density by row (e.g. by how far back in time a row's
-    content is, for step_cached's query-step credit-assignment design;
-    see conversation/JOURNAL.md).
-
-    Was a pure-Python/numpy per-row argpartition loop -- moved to a real
-    C++ kernel (`_cpu.dense_to_graded_top_k_csr`, csr.hpp's
-    `top_k_csr_graded`) after a live 20k-step curriculum comparison
-    showed this loop running on every query/backward step dominated the
-    step's own cost: use_tile_cache=1 (which relies on this function)
-    measured SLOWER (5.1 steps/sec) than the plain step() baseline (6.6
-    steps/sec) instead of the expected speedup from caching. This
-    Python wrapper is kept only so existing callers/tests (that expect
-    this exact name/signature) don't need to change.
-
-    IMPORTANT, found the hard way (see JOURNAL.md /
-    project_dy_sparsity_p_validated_speedup.md's correction): this is
-    NOT equivalent to `_cpu.dense_to_top_k_csr(dy2d, k, cpus)` with a
-    uniform k, even at matching average density. That function's `k` is
-    spent GLOBALLY across the WHOLE flattened `rows*cols` array (via
-    `top_k_indices(values, rows*cols, k, ...)` in csr.hpp), not per row
-    -- a row can end up with zero surviving entries there, purely by
-    losing the global competition, no matter what k is requested. Don't
-    "verify" this function by comparing its output against
-    dy_sparsity_p's existing path; they answer different questions."""
+    """Genuinely per-row top-k selection: row r independently keeps its
+    own top-k_per_row[r] largest-magnitude entries. Backed by a real C++
+    kernel (`_cpu.dense_to_graded_top_k_csr`) -- NOT equivalent to
+    `_cpu.dense_to_top_k_csr(dy2d, k, cpus)` with a uniform k, even at
+    matching average density, since that spends k GLOBALLY across the
+    flattened array, not per row. See
+    docs/research/sparse_rnn.rst:graded_top_k_csr.python_to_cpp_migration."""
     _rows, cols = dy2d.shape
     k_arr = np.array([min(int(k), cols) for k in k_per_row], dtype=np.int32)
     dy2d_f32 = np.ascontiguousarray(dy2d, dtype=np.float32)
@@ -898,23 +516,15 @@ def _nucleus_top_k_csr(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Nucleus/energy-threshold top-k: row r independently keeps the
     SMALLEST set of its own top-|v| entries whose captured squared-
-    magnitude ratio R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target[r].
-    k is a CONSEQUENCE of r_target and the row's own data, not a fixed
-    constant -- see sili_peridot/JOURNAL.md's "nucleus/energy-threshold
-    top-k math" design note for the full derivation (same math as
-    truncated-SVD captured-variance / LLM nucleus (top-p) sampling
-    applied to squared magnitude instead of softmax probability).
+    magnitude ratio R(v,k) = sum(v_topk^2)/sum(v^2) is >= r_target[r]. k
+    is a CONSEQUENCE of r_target and the row's own data, not a fixed
+    constant (same math as truncated-SVD captured-variance / nucleus
+    sampling on squared magnitude).
 
-    r_target: scalar (applied to every row) or per-row array/list.
-
-    k_min/k_max: hardware-driven density floor/ceiling applied to the
-    R_target-derived k AFTER the fact (direct instruction -- R_target
-    alone can degenerate to k=0, a fully-dead row, or to near-100%
-    density on hardware that wants a bounded ceiling). k_min padding
-    pulls from the same magnitude-sorted order the R_target selection
-    already computed, so a clamped row degrades to plain top-k rather
-    than picking arbitrarily; an all-zero row can't manufacture k_min
-    entries out of nothing and stays at k=0 regardless."""
+    r_target: scalar or per-row array/list.
+    k_min/k_max: hardware-driven density floor/ceiling applied after the
+    fact; an all-zero row stays at k=0 regardless. See
+    docs/research/sparse_rnn.rst:nucleus_top_k_csr.r_target_math."""
     rows, _cols = x2d.shape
     if np.isscalar(r_target):
         r_arr = np.full(rows, float(r_target), dtype=np.float32)
@@ -990,58 +600,19 @@ class DISLDOLayer(_SparseLayerBase):
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
     ) -> Tensor:
-        # min_decay_frac/max_abs_delta/max_ci: None (default) means "use
-        # the C++ side's own tuned production defaults" -- kept as
-        # Optional here rather than hardcoding the production floats a
-        # second time in Python, so there is still exactly one source of
-        # truth (cpu_backend.cpp's kSynapsePolicy* constants) even though
-        # this wrapper now exposes them for quick per-call experiments
-        # (e.g. testing max_abs_delta=huge to effectively disable the
-        # clip) without a C++ rebuild.
-        #
-        # forward_dense/backward_dense always return [batch, cols] --
-        # even for a bare 1-D [cols] input, batch is implicitly 1, but
-        # the OUTPUT shape stays 2-D regardless. Squeeze that back out
-        # when the input was 1-D so a single online sample round-trips
-        # to 1-D, matching this class's own no-batch-dimension
-        # docstring; leave genuinely 2-D (batched) input alone.
-        #
-        # lr_per_row_nnz default True preserves prior behavior (was
-        # hardcoded) -- exists at all because it was previously
-        # unreachable from this wrapper: `learning_rate` silently meant
-        # "learning_rate / row_degree", not the literal rate passed in.
-        # That normalization exists to keep aggregate row updates
-        # comparable when synaptogenesis makes degree vary WITHIN a
-        # layer -- at uniform density (no synaptogenesis, or a
-        # deliberately dense/parameter-matched layer) it does nothing
-        # but silently shrink the effective rate by the row's degree.
-        # Pass False for a literal, degree-independent learning rate.
-        #
-        # forward_dense no longer takes learning_rate at all (see
-        # JOURNAL.md) -- it used to run its own gradient-free ADSP-style
-        # (Activity-Dependent Structural Plasticity) importance update on
-        # every call, independent of whether a backward() would ever
-        # follow. Real weight/importance updates now happen ONLY in
-        # backward_dense/backward_sparse, below.
-        #
-        # CSR-typed input (task #334/Phase 5): NOT a new sparse_input bool
-        # -- the caller controls forward-input density entirely by
-        # whether x.data IS a CSR (Tensor.is_csr), matching the EXISTING
-        # precedent at SparseRNNCell.forward() (this same file, ~line
-        # 2453: `if not isinstance(state.data, CSR): ... CSR.from_dense(...)`)
-        # in the opposite direction. A dense np.ndarray/Tensor here is a
-        # completely unchanged code path -- zero behavior change for
-        # every existing caller who never builds a CSR.
+        # See docs/research/sparse_rnn.rst:disldo_layer_forward.design_notes
+        # for the rationale behind min_decay_frac/max_abs_delta/max_ci
+        # defaulting to None, the 1-D squeeze convention, lr_per_row_nnz,
+        # and CSR-typed-input dispatch below.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
             csr = x.data
             was_1d = csr.rows == 1
-            # backward_sparse's own dense-input design (see its docstring)
-            # needs the real dense x regardless of forward's own path --
-            # reconstruct it here once, thread it through the closure
-            # explicitly (same fix as SISLDOLayer.forward(), task #333 --
-            # never read a cached last_input off the C++ side).
+            # backward_sparse needs the real dense x regardless of
+            # forward's own path -- reconstruct it once, thread it
+            # through the closure explicitly (never read a cached
+            # last_input off the C++ side).
             x_dense = csr.to_dense()
             out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
         else:
@@ -1051,10 +622,8 @@ class DISLDOLayer(_SparseLayerBase):
             out_np = self._c.forward_dense(x_np)
         if was_1d:
             out_np = out_np.squeeze(0)
-        # requires_grad=False: this output is never meant to be
-        # backpropagated (e.g. a pure eval/inference-only rollout) --
-        # skip building the graph node entirely (ordinary torch.no_grad()
-        # -style opt-out), matching every other op's Tensor convention.
+        # requires_grad=False: skip building the graph node entirely
+        # (torch.no_grad()-style opt-out).
         if not requires_grad:
             return Tensor(out_np, backend=x.backend)
         out = Tensor(out_np, _children=(x,), _op="disldo", backend=x.backend)
@@ -1071,22 +640,10 @@ class DISLDOLayer(_SparseLayerBase):
                     extra["max_ci"] = max_ci
                 if scale_invariant:
                     extra["scale_invariant"] = True
-                # dy_sparsity_p (task #334/Phase 5): genuinely independent
-                # axis from x's own type (disldo_backward_sparse_grad's own
-                # signature takes a dense x + sparse dy -- confirmed
-                # distinct from forward's input-sparsity axis). None
-                # (default) keeps today's exact dense-dy behavior via
-                # backward_dense, matching x_dense's own 2-D [batch,cols]
-                # shape either path took above.
+                # dy_sparsity_p/dy_sparsity_schedule/dy_r_target: see
+                # docs/research/sparse_rnn.rst:disldo_layer_forward.dy_sparsity_schedule_and_nucleus_grad
                 if dy_sparsity_schedule is not None:
-                    # Per-row graded density (task: query-step credit
-                    # assignment for step_cached, see conversation) --
-                    # overrides the scalar dy_sparsity_p when both are
-                    # given. len(dy_sparsity_schedule) must match the
-                    # batch's row count; each entry is that row's own
-                    # density fraction (same convention as dy_sparsity_p,
-                    # just one value per row instead of one for the
-                    # whole call).
+                    # Per-row graded density, overrides scalar dy_sparsity_p.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     if len(dy_sparsity_schedule) != dy2d.shape[0]:
                         raise ValueError(
@@ -1107,12 +664,9 @@ class DISLDOLayer(_SparseLayerBase):
                         **extra,
                     )
                 elif dy_r_target is not None:
-                    # Nucleus/energy-threshold grad sparsification (task
-                    # #367, priority 1 per direct instruction -- "grad is
-                    # the one that's definitely required"): k is a
-                    # CONSEQUENCE of dy_r_target and this step's actual
-                    # gradient energy, not a fixed fraction. See
-                    # sili_peridot/JOURNAL.md's nucleus design note.
+                    # Nucleus/energy-threshold grad sparsification -- k is
+                    # a CONSEQUENCE of dy_r_target and this step's actual
+                    # gradient energy, not a fixed fraction.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
                     dx = self._c.backward_sparse(
@@ -1179,50 +733,18 @@ class DISLDOLayer(_SparseLayerBase):
         scale_grace_period_steps: int = 50,
         additive_grace_period_steps: int = 5000,
     ) -> bool:
-        """AQRS Theorem 10 dynamic rank control (task #292) -- evaluates
-        BOTH branches' apoptosis/neurogenesis triggers against their own
-        EMA state (updated automatically inside backward_dense/backward,
-        see disldo_backward's own gamma update block) and performs at
-        most one mutation PER BRANCH this call (so up to two total: one
-        multiplicative, one additive). Call once per training step, after
-        backward -- matches test_aqrs_dynamic_rank_control_integration.cpp's
-        own "breathing" integration test convention exactly, just from
-        Python. Returns True if either branch actually mutated.
+        """AQRS Theorem 10 dynamic rank control -- evaluates both branches'
+        apoptosis/neurogenesis triggers against their own EMA state
+        (updated automatically inside backward) and performs at most one
+        mutation PER BRANCH per call. Call once per training step, after
+        backward. Returns True if either branch mutated.
 
-        theta's default (1e-4, task #294 fix) is tuned against the
-        gradient normalized by layer size (n_in*n_out) -- NOT the old
-        pre-normalization raw scale (which used to require theta~0.02
-        and made the trigger meaningless across differently-shaped
-        layers, since a 128x128 layer's raw gradient could be 9 orders
-        of magnitude larger than a 16x128 layer's for the same real
-        signal).
-
-        scale_grace_period_steps/additive_grace_period_steps: separate
-        PER-BRANCH cooldowns (direct instruction, replacing an earlier
-        within-branch grow-vs-shrink asymmetry after a biology
-        literature check -- see apply_dynamic_rank_control_generic's own
-        comment in delta_csr_types.hpp for the full citations). Each
-        branch uses the SAME value for its own grow/shrink internally
-        (symmetric within a branch, matching the roughly comparable
-        formation/elimination rates seen in real dendritic spine
-        turnover -- Holtmaat et al., Neuron 2005; Grutzendler et al.,
-        Nature 2002). The real asymmetry is CROSS-branch: the scale
-        (multiplicative) branch is the per-synapse analog and runs fast
-        (default 50), while the additive branch is a whole-layer
-        correction structurally closer to a neuron integrating its own
-        aggregate state -- the biological analog of homeostatic/
-        intrinsic plasticity, which needs ~24-48h of sustained change to
-        manifest vs. seconds-to-minutes for Hebbian/STDP synaptic change
-        (Turrigiano and colleagues' classic activity-blockade
-        experiments; see also Zenke & Gerstner, "Hebbian plasticity
-        requires compensatory processes on multiple timescales", Phil.
-        Trans. R. Soc. B, 2017) -- roughly a 100x-3000x separation
-        depending which endpoints are compared. additive_grace_period_
-        steps defaults to 5000 (100x scale's 50), the conservative end
-        of that range so the additive branch can still mutate within
-        realistic training budgets; both values are real, independently
-        tunable parameters meant to be swept against real training
-        outcomes, not treated as settled by this docstring.
+        theta's default (1e-4) is tuned against gradient normalized by
+        layer size (n_in*n_out). scale_grace_period_steps/
+        additive_grace_period_steps are separate per-branch cooldowns --
+        the additive branch defaults 100x longer (5000 vs 50), a
+        biological homeostatic-vs-Hebbian-timescale analog. See
+        docs/research/sparse_rnn.rst:disldo_layer.apply_dynamic_rank_control_theorem10.
         """
         mutated_scale = self._c.apply_dynamic_rank_control(
             tau_death, tau_active, theta, seed_scale, scale_grace_period_steps, scale_grace_period_steps
@@ -1233,40 +755,22 @@ class DISLDOLayer(_SparseLayerBase):
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0, coef: float = 0.1) -> None:
-        """AQRS scale/additive channel numerical-safety pass (task #295
-        follow-up) -- see _overflow_guard_array's own docstring for the
-        full rationale. Call once per training step, any time after
-        backward (order relative to apply_dynamic_rank_control doesn't
-        matter -- this corrects VALUES, that mutates RANK, independent
-        concerns). Cheap: 4 bulk array round-trips per call, not
-        n*rank individual accessor calls."""
+        """AQRS scale/additive channel numerical-safety pass -- see
+        _overflow_guard_array. Call once per training step, any time
+        after backward (independent of apply_dynamic_rank_control)."""
         _apply_scale_overflow_guard(self._c, clip, near, coef)
 
     def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
-        """AQRS channel-diversity pass -- see
-        _orthogonality_penalty_array's own docstring for the full
-        rationale (keeps rank channels from converging to duplicate
-        directions, on an ONGOING per-step basis, chosen over
-        residual-targeted growth since that only affects init and
-        channels can still drift back toward redundancy afterward).
-        Call once per training step, any time after backward
-        (independent of apply_scale_overflow_guard/apply_dynamic_rank_
-        control -- diversity, numerical safety, and rank mutation are
-        three separate concerns)."""
+        """AQRS channel-diversity pass -- see _orthogonality_penalty_array.
+        Call once per training step, any time after backward (independent
+        of apply_scale_overflow_guard/apply_dynamic_rank_control)."""
         _apply_channel_orthogonality_penalty(self._c, coef)
 
 
 class DISLDOLayerResync(DISLDOLayer):
-    """Real DISLDOLayer (true C++ FP4 storage, not a fake-quantize
-    simulation) with the DeferredScaleWrite fix applied -- the FP4
-    counterpart of DISLDOLayer8Resync. Plain DISLDOLayer/SparseLinearLayer
-    used the DEFAULT ScalePolicy/DeferredScaleWrite=false template args
-    (the same stale-code path SparseLinearLayer8Resync was built to fix
-    for FP8), never updated when that fix landed -- see
-    sili_peridot/JOURNAL.md's TrueMultiDigitLayer entry: real FP4
-    per-digit training collapsed to chance while an architecturally
-    identical fp32-shadow control succeeded by a wide margin, which is
-    what prompted checking whether FP4 had this same staleness bug too."""
+    """DISLDOLayer (true C++ FP4 storage) with the DeferredScaleWrite fix
+    applied -- the FP4 counterpart of DISLDOLayer8Resync. See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1281,12 +785,9 @@ class DISLDOLayerResync(DISLDOLayer):
 
 
 class DISLDOLayerNoScale(DISLDOLayer):
-    """Real DISLDOLayer (true C++ FP4 storage) with value_scale/
-    output_scale permanently forced to 1.0 -- never trained, nothing to
-    go stale, direct hardware test of the "zero trained scale" design
-    (sili_peridot's fixed_digit_residual_quantize/TrueMultiDigitLayer
-    work) instead of just fixing the staleness bug. See NoScalePolicy's
-    docstring, delta_csr_types.hpp."""
+    """DISLDOLayer (true C++ FP4 storage) with value_scale/output_scale
+    permanently forced to 1.0 -- never trained, nothing to go stale. See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1301,17 +802,12 @@ class DISLDOLayerNoScale(DISLDOLayer):
 
 
 class DISLDOLayerDeterministic(DISLDOLayer):
-    """Real DISLDOLayer (true C++ FP4 storage), same RMSprop scale handling
-    as plain DISLDOLayer, but the weight/importance store uses deterministic
+    """DISLDOLayer (true C++ FP4 storage), same RMSprop scale handling as
+    plain DISLDOLayer, but weight/importance storage uses deterministic
     nearest-neighbour rounding (fp4_quantize) instead of stochastic dithered
-    rounding (fp4_quantize_stochastic). Isolates rounding noise from any
-    value_scale mechanism -- built after DISLDOLayerResync/NoScale both
-    still collapsed to chance on sili_peridot's out-of-context curriculum,
-    to test whether real FP4's per-step stochastic rounding (not value_scale
-    staleness) is what the deterministic-rounding fp32-shadow controls
-    (fixed_digit_residual_quantize, TrueMultiDigitLayer's simulate_quantize)
-    were actually avoiding. See StochasticRounding's docstring,
-    linear_disldo.hpp."""
+    rounding (fp4_quantize_stochastic) -- isolates rounding noise from the
+    value_scale mechanism. See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1378,11 +874,8 @@ class DISLDOLayerNoScaleDeterministic(DISLDOLayer):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer32 — same DISLDO math, DeltaCSRBiValues<float> (32-bit) instead
-#  of FP4BiPacked -- isolates FP4 quantization itself as a variable, not a
-#  synaptogenesis/production layer (no equalize_to_capacity, no block4
-#  promotion path exercised here). See JOURNAL.md: built specifically to
-#  separate "FP4's coarse quantization noise" from "the importance-damping
-#  update rule" as candidate explanations for DISLDO's training instability.
+#  of FP4BiPacked -- isolates FP4 quantization itself as a variable. See
+#  docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history.
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -1390,27 +883,14 @@ class DISLDOLayer32(_SparseLayerBase):
     """Same disldo_forward/disldo_backward kernels as DISLDOLayer, generic
     over VALUES_TYPE -- this instantiation uses the 32-bit float fallback
     (_cpu.DISLDOLayerV) instead of 4-bit FP4BiPacked. Same call convention
-    as DISLDOLayer (forward(x, learning_rate, lr_per_row_nnz,
-    damp_by_importance)).
+    as DISLDOLayer. Not a production layer: no equalize_to_capacity, no
+    block4 promotion -- pure diagnostic to isolate FP4's coarseness from
+    the update-rule math.
 
-    NOT a general-purpose production layer: no equalize_to_capacity (no
-    growth-headroom use case here), no block4 promotion. Pure diagnostic
-    -- same math, no quantization, to isolate what FP4's coarseness
-    specifically contributes vs. the update-rule math itself.
-
-    dense=True: fully-connected init via `_preseed_dense_scattered` (see
-    its own docstring) -- this VALUES_TYPE (DeltaCSRBiValues<float>) has
-    no block4 support, so unlike DISLDOLayer/DISLDOLayer8's own
-    dense=True (a separate block4 allocation, unbounded by max_weights),
-    this genuinely needs max_weights expanded to cover every
-    (input, output) pair -- done automatically here, caller doesn't need
-    to size max_weights for it. Added because the DEFAULT
-    (_preseed_random_sparse, ~k=max_weights//(2*n_inputs) connections
-    per row) silently gives this class far fewer trainable parameters
-    than a dense=True FP4/FP8 arm or a fully-connected torch reference
-    at the same max_weights budget -- a genuine capacity gap, not a
-    precision or optimizer difference, confirmed as a real contributor
-    to fp32's poor MQAR results before this existed (see conversation)."""
+    dense=True: fully-connected init via `_preseed_dense_scattered` --
+    this VALUES_TYPE has no block4 support, so max_weights is expanded
+    automatically to cover every (input, output) pair. See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1445,19 +925,10 @@ class DISLDOLayer32(_SparseLayerBase):
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
     ) -> Tensor:
-        # CSR-typed input / dy_sparsity_p (direct instruction): DISLDOLayerV
-        # already uses SparseLinearWeightsDelta with VT=DeltaCSRBiValues<V>,
-        # the SAME storage family FP4's SparseLinearLayer uses -- its own
-        # forward_sparse/backward_sparse (added alongside this change,
-        # mirroring SparseLinearLayer's own C++ methods exactly, reusing
-        # the identical already-validated SynapsePolicy update math, not a
-        # new/ported implementation) now unify dense+sparse on the SAME
-        # object/weights exactly like DISLDOLayer does. This method
-        # mirrors DISLDOLayer.forward()'s own x.is_csr dispatch +
-        # dy_sparsity_p handling directly (see that method's own comments
-        # for the fuller rationale) -- a dense np.ndarray/Tensor here is a
-        # completely unchanged code path, zero behavior change for every
-        # existing caller who never builds a CSR.
+        # CSR-typed input / dy_sparsity_p: mirrors DISLDOLayer.forward's
+        # x.is_csr dispatch -- DISLDOLayerV uses the same DeltaCSRBiValues
+        # storage family, so forward_sparse/backward_sparse unify dense+
+        # sparse on the same weights exactly like DISLDOLayer does.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
@@ -1540,25 +1011,14 @@ class DISLDOLayer8(_SparseLayerBase):
     """Same disldo_forward/disldo_backward kernels as DISLDOLayer/
     DISLDOLayer32, generic over VALUES_TYPE -- this instantiation uses
     real 8-bit storage (_cpu.SparseLinearLayer8, OCP MX E4M3 per-value
-    codec, fp8quant.hpp) instead of FP4BiPacked or the 32-bit float
-    fallback. Same call convention as DISLDOLayer/DISLDOLayer32
-    (forward(x, learning_rate, lr_per_row_nnz, damp_by_importance)).
+    codec) instead of FP4BiPacked or the 32-bit fallback. Same call
+    convention as DISLDOLayer/DISLDOLayer32.
 
-    Combined with the existing per-row `value_scale`/per-col
-    `output_scale` (rank-1) mechanism already shared by every
-    DISLDOLayer-family class, this is the concrete "8-bit + rank-1
-    scale, weight AND importance both quantized" scheme validated in
-    sili_peridot's toy-model quantization sweep (three task families,
-    ten configs, never lost to native FP4) -- see sili_peridot's
-    JOURNAL.md for the full writeup this class is built from.
-
-    dense=True uses the block4 dense-tile SIMD path (Block4Tile8/Store8,
-    task #94/#96) via the same load_dense_codes/block4_load_dense
-    machinery DISLDOLayer's own dense=True already uses -- this class's
-    own docstring previously said "no block4 dense-tile SIMD promotion
-    yet" because the PYTHON wrapper never called it, even though the
-    C++/pybind side (SparseLinearLayer8.load_dense_codes) has been
-    ready since #123."""
+    Combined with the existing rank-1 value_scale/output_scale mechanism,
+    this is the "8-bit + rank-1 scale, weight AND importance both
+    quantized" scheme. dense=True uses the block4 dense-tile SIMD path
+    (Block4Tile8/Store8). See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1584,18 +1044,9 @@ class DISLDOLayer8(_SparseLayerBase):
         default_cap = _default_rank_cap(in_features, out_features)
         self._c.set_scale_rank_max(scale_rank_max if scale_rank_max is not None else default_cap)
         self._c.set_additive_rank_max(additive_rank_max if additive_rank_max is not None else default_cap)
-        # scale_rank was never threaded here before -- confirmed missing
-        # (unlike DISLDOLayer/DISLDOLayerDeterministic's own
-        # _seed_scale_rank call) while wiring up a real-engine rank1/rank2
-        # sweep across fp4/fp4_dual/fp8 (sili_peridot task #247); a rank2
-        # FP8 arm would otherwise TypeError immediately.
         _seed_scale_rank(self._c, scale_rank, in_features, out_features, rng)
-        # additive_rank: this is the branch task #280 re-validates against
-        # the fp8 MQAR input-independent-collapse ("mumbling") case -- see
-        # AQRS_DESIGN.md Theorem 3/4 and _seed_additive_rank's own
-        # docstring for why FP8's real-engine collapse (readout going
-        # input-independent) is exactly the scenario this branch exists
-        # to structurally fix.
+        # additive_rank: structurally fixes fp8 MQAR input-independent
+        # collapse ("mumbling") -- see AQRS_DESIGN.md Theorem 3/4.
         _seed_additive_rank(self._c, additive_rank, in_features, out_features, rng)
         if dynamic_rank_control:
             _activate_gamma_tracking(self._c, additive_rank)
@@ -1660,13 +1111,9 @@ class DISLDOLayer8(_SparseLayerBase):
         scale_grace_period_steps: int = 50,
         additive_grace_period_steps: int = 5000,
     ) -> bool:
-        """Same as DISLDOLayer's own apply_dynamic_rank_control (task
-        #292; per-branch grace periods + biology citations added per
-        direct instruction, see that method's own docstring for the
-        full rationale) -- duplicated here rather than shared via
-        inheritance since DISLDOLayer8 doesn't subclass DISLDOLayer
-        (separate VALUES_TYPE entirely), see this class's own
-        docstring."""
+        """Same as DISLDOLayer.apply_dynamic_rank_control -- duplicated
+        (not inherited) since DISLDOLayer8 doesn't subclass DISLDOLayer
+        (separate VALUES_TYPE)."""
         mutated_scale = self._c.apply_dynamic_rank_control(
             tau_death, tau_active, theta, seed_scale, scale_grace_period_steps, scale_grace_period_steps
         )
@@ -1676,31 +1123,22 @@ class DISLDOLayer8(_SparseLayerBase):
         return mutated_scale or mutated_additive
 
     def apply_scale_overflow_guard(self, clip: float = 200.0, near: float = 20.0, coef: float = 0.1) -> None:
-        """Same as DISLDOLayer's own apply_scale_overflow_guard (task
-        #295 follow-up) -- duplicated for the same reason
-        apply_dynamic_rank_control above is (DISLDOLayer8 doesn't
-        subclass DISLDOLayer)."""
+        """Same as DISLDOLayer.apply_scale_overflow_guard -- duplicated,
+        not inherited (DISLDOLayer8 doesn't subclass DISLDOLayer)."""
         _apply_scale_overflow_guard(self._c, clip, near, coef)
 
     def apply_channel_orthogonality_penalty(self, coef: float = 0.01) -> None:
-        """Same as DISLDOLayer's own apply_channel_orthogonality_penalty
-        -- duplicated for the same reason apply_dynamic_rank_control
-        above is (DISLDOLayer8 doesn't subclass DISLDOLayer)."""
+        """Same as DISLDOLayer.apply_channel_orthogonality_penalty --
+        duplicated, not inherited."""
         _apply_channel_orthogonality_penalty(self._c, coef)
 
 
 class DISLDOLayer8Resync(DISLDOLayer8):
-    """Real DISLDOLayer8 (true C++ E4M3 storage, not a fake-quantize
-    simulation) with the DeferredScaleWrite fix: touched entries'
-    stored codes are written out only after value_scale/output_scale
-    are both finalized for the backward() call, instead of immediately
-    under the stale pre-update scale. Direct test of whether that
-    staleness (not the update RULE) explains the real-vs-simulation
-    out-of-context gap found in sili_peridot's toy quantization sweep
-    -- see delta_csr_types.hpp's ScalePolicy docstring and
-    linear_disldo.hpp's disldo_backward for the mechanism, and
-    sili_peridot/JOURNAL.md's 2026-08-09 tile-recurrence entries for
-    the investigation this was built to answer."""
+    """DISLDOLayer8 (true C++ E4M3 storage) with the DeferredScaleWrite
+    fix: touched entries' stored codes are written out only after
+    value_scale/output_scale are both finalized for the backward() call,
+    instead of immediately under the stale pre-update scale. See
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
         self,
@@ -1740,18 +1178,12 @@ class DISLDOLayer8AdaMax(DISLDOLayer8):
 class SISLDOLayer(_SparseLayerBase):
     """Sparse state → state contribution. Input must be a CSR.
 
-    Forward exploits sparse ACTIVATIONS (forward_sparse, skips inactive
-    input rows). Backward exploits a top-k'd sparse GRADIENT
-    (backward_sparse) -- these are independent axes on SparseLinearLayer,
-    not a matched forward/backward pair (see its class comment in
-    cpu_backend.cpp): dx doesn't depend on the input's own sparsity, only
-    on weights and dy, so backward_sparse's required dense `x` argument is
-    reconstructed from the same CSR forward_sparse was called with
-    (csr.to_dense() -- zeros in the dropped positions), NOT read from
-    `self._c.last_input`. forward_sparse never populates last_input (only
-    forward_dense does, see cpu_backend.cpp) -- an instance that never
-    called forward_dense would otherwise silently compute its weight
-    update against stale/empty data."""
+    Forward exploits sparse ACTIVATIONS (forward_sparse); backward exploits
+    a top-k'd sparse GRADIENT (backward_sparse) -- independent axes, not a
+    matched pair. backward_sparse's required dense `x` is reconstructed
+    from the same CSR forward_sparse was called with, NOT read from
+    `self._c.last_input` (which forward_sparse never populates). See
+    docs/research/sparse_rnn.rst:sisldo_layer.dense_x_reconstruction_not_last_input."""
 
     def __init__(
         self,
@@ -1768,14 +1200,8 @@ class SISLDOLayer(_SparseLayerBase):
 
     def forward(self, x: Tensor, learning_rate: float = 0.0) -> Tensor:
         """x.data must be a CSR. grad flows back as a dense ndarray.
-
-        `learning_rate` kept in this wrapper's own signature (matches
-        every other layer's forward() call convention throughout this
-        project) but no longer forwarded to forward_sparse -- it used to
-        run its own gradient-free ADSP-style (Activity-Dependent
-        Structural Plasticity) importance update on every call,
-        independent of whether backward() would ever follow. Real
-        weight/importance updates now happen ONLY in backward_sparse."""
+        `learning_rate` is not forwarded to forward_sparse -- weight/
+        importance updates happen only in backward_sparse."""
         csr = x.data
         x_dense = csr.to_dense()
         out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows).squeeze(0)
@@ -1847,20 +1273,14 @@ def fit_rank1_scale_envelope(row_idx, col_idx, abs_vals, n_rows: int, n_cols: in
     """
     Alternating max-fit producing a rank-1 (outer-product) envelope:
     row_scale[r] * col_scale[c] >= |M[r, c]| for every entry, using
-    O(rows+cols) parameters instead of O(rows*cols). Each update
-    recomputes the exact bound needed against the other side's current
-    estimate (Sinkhorn-style, but max- rather than sum-based).
+    O(rows+cols) parameters instead of O(rows*cols) (Sinkhorn-style, but
+    max- rather than sum-based).
 
     Takes M's nonzero entries as COO-style triplets (row_idx, col_idx,
-    abs_vals), not a dense matrix -- a folded/stacked layer's matrix is
-    too large to densify safely (e.g. mlp.gate_proj folds to
-    [110592, 1536]; converting that to dense once already risked OOM on
-    a real conversion run). Entries not listed are implicitly 0 and
-    never bind the max, so this needs no dense intermediate at all.
-
-    Returns (row_scale, col_scale), float32 -- deliberately not float64
-    (a max/divide fit has no accumulating-sum precision need, and
-    float64 here would double the O(nnz) working set for no benefit).
+    abs_vals), never a dense matrix -- a folded/stacked layer's matrix
+    can be too large to densify safely. Returns (row_scale, col_scale),
+    float32. See
+    docs/research/sparse_rnn.rst:fit_rank1_scale_envelope.coo_no_densify.
     """
     import numpy as np
 
@@ -1884,20 +1304,12 @@ class FoldedLayer(Module):
     Runtime sili layer for a folded transformer block.
 
     All N original transformer layers are stacked into ONE SparseLinearLayer
-    per weight suffix (Q, K, V, MLP, etc.).  A single forward() call replaces
-    N sequential matmuls.  After synaptogenesis, only connections that survived
-    energy-based pruning contribute nonzero terms -- which is why sparsity is
-    what makes the design efficient rather than just wider.
+    per weight suffix (Q, K, V, MLP, etc.). A single forward() call replaces
+    N sequential matmuls. Weights live entirely in C++; parameters() returns
+    [] but the layer IS in the autograd graph via a _backward closure.
 
-    Weights live entirely in C++ (SparseLinearLayer).  parameters() returns []
-    -- nothing here participates in the Tensor autograd as a leaf, but the
-    layer IS in the graph: forward() returns a Tensor with _children=(x,) and
-    a _backward closure that calls backward_dense and uses _acc to accumulate
-    dx back into x.grad.
-
-    No torch dependency in forward/backward.  The from_descriptor() factory
-    method uses torch once at construction time (acceptable: construction is
-    part of the conversion pipeline, not the runtime hot path).
+    No torch dependency in forward/backward -- from_descriptor() uses torch
+    once at construction time only.
 
     Shape contract (same as RNNFoldedBlock.forward):
         input  [batch, in_dim]   -> output [batch, out_dim]
@@ -1936,35 +1348,20 @@ class FoldedLayer(Module):
 
         args:
           max_row_weights -- peak connections per row for synaptogenesis.
-                             0 = n_out (the absolute ceiling). For real models,
-                             pass your expected synaptogenesis peak (e.g. 100
-                             for 2.4% density in a 4096-dim layer) to avoid
-                             allocating space for connections you'll never use.
-          bytes_per_row   -- index byte budget per row.
-                             0 = compute from max_row_weights and the typical
-                             ULEB128 cost for this layer's column range:
-                               typical_bytes = ceil(log2(n_out) / 7)
-                             For n_out <= 128: 1 byte/connection.
-                             For n_out <= 16384: 2 bytes/connection.
-                             The default adds a small margin for net growth per
-                             synaptogenesis step. Pass an explicit value to
-                             override (e.g. worst-case: max_row_weights * 5).
-          value_scale_mode -- "per_row" (default, exact prior behavior): one
-                             value_scale per input row, output_scale left at
-                             its default 1.0. "rank1": also fits a
-                             per-output-column scale (fit_rank1_scale_envelope)
-                             via set_output_scale_raw, gradient-trainable
-                             like value_scale. Prefer "rank1" for real
-                             pretrained-weight conversion.
-          rank1_iters      -- alternating-fit iterations for "rank1" mode
-                             (ignored otherwise); see fit_rank1_scale_envelope.
+                             0 = n_out (the absolute ceiling).
+          bytes_per_row   -- index byte budget per row. 0 = compute from
+                             max_row_weights and the typical ULEB128 cost
+                             for this layer's column range, plus a small
+                             growth margin. Pass explicitly to override.
+          value_scale_mode -- "per_row" (default): one value_scale per
+                             input row. "rank1": also fits a per-output-
+                             column scale (fit_rank1_scale_envelope).
+                             Prefer "rank1" for real pretrained-weight
+                             conversion.
+          rank1_iters      -- alternating-fit iterations for "rank1" mode.
           compact_after_build -- strip equalize_to_capacity's per-row growth
                              headroom right after loading (default True).
-                             Measured on a real checkpoint: dropped 7 suffixes'
-                             combined RSS from ~1.9x to ~1.08x the 2-bytes/param
-                             theoretical minimum. Call expand_headroom_to() on
-                             the built layer before synaptogenesis needs room
-                             to grow again.
+                             See docs/research/sparse_rnn.rst:folded_layer.csr_layout_conversion_no_densify.
         """
         import warnings
 
@@ -1978,26 +1375,16 @@ class FoldedLayer(Module):
 
         layers = {}
         for suffix, csr in descriptor.stacked_weights.items():
-            # csr.t() is a metadata-only relabelling into CSC (no densify,
-            # no nnz-proportional copy) -- but CSC's own ccol_indices/
-            # row_indices are grouped by COLUMN, not the per-ROW grouping
-            # load_weights needs. .to_sparse_csr() does the real (but
-            # nnz-proportional, not densify-proportional) reorganization
-            # into row-major order. NEVER call .to_dense() on a
-            # stacked/folded layer's matrix here -- it can be too large to
-            # safely materialize (e.g. mlp.gate_proj folds to
-            # [110592, 1536]; densifying that alone risked OOM converting
-            # a real checkpoint).
+            # csr.t() + .to_sparse_csr(): metadata-only CSC relabel, then
+            # nnz-proportional reorg into row-major order -- NEVER
+            # .to_dense() here (can be too large to safely materialize).
+            # See docs/research/sparse_rnn.rst:folded_layer.csr_layout_conversion_no_densify.
             csr_t = csr.t().to_sparse_csr()
             n_in = int(csr_t.shape[0])
             n_out = int(csr_t.shape[1])
-            # Budget for the delta-CSR pool: size for the fully-connected
-            # maximum (n_in * n_out), not for current nnz. This is the fixed
-            # total the staggered equalizer_step() will redistribute within --
-            # equalization only moves bytes between rows, never grows the pool.
-            # Sizing for n_in*n_out guarantees every row can hold n_out
-            # connections after a full equalization pass, which is the absolute
-            # ceiling for any max_row_weights value.
+            # Budget sized for the fully-connected maximum (n_in*n_out),
+            # not current nnz -- the fixed total equalizer_step()
+            # redistributes within, never grows.
             budget = n_in * n_out
             layer = _cpu.SparseLinearLayer(n_in, n_out, budget, num_cpus)
             ptrs = csr_t.crow_indices().numpy().astype(np.int32)
@@ -2039,14 +1426,9 @@ class FoldedLayer(Module):
                     layer.set_output_scale_raw(c, col_scales[c])
 
             # Per-row importance_scale: same FP4 representability problem as
-            # value_scale but for importance.
-            # Importance is updated via activity correlation in forward_dense
-            # (magnitude ~ |x| * |h| * lr ~ lr after value scaling).
-            # FP4 minimum nonzero is 0.5, so a raw update of lr=0.01 rounds to 0.
-            # Setting importance_scale = lr / FP4_MAX maps FP4 range to
-            # [-6*lr, +6*lr], making importance updates of order lr representable
-            # from the first step. Weight VALUES are NOT changed in forward_dense;
-            # they are updated only by backward_dense() via the task gradient.
+            # value_scale but for importance (raw lr=0.01 updates round to
+            # 0 under FP4's 0.5 minimum nonzero). See
+            # docs/research/sparse_rnn.rst:folded_layer.csr_layout_conversion_no_densify.
             imp_scale = learning_rate / _FP4_MAX
             for r in range(n_in):
                 layer.set_importance_scale_raw(r, imp_scale)
@@ -2055,11 +1437,9 @@ class FoldedLayer(Module):
             # max_row_weights defaults to n_out (absolute ceiling).
             mrw = max_row_weights if max_row_weights > 0 else n_out
 
-            # bytes_per_row: use the ULEB128 cost for this layer's column range
-            # plus a small margin (~4 bytes) for net growth per step.
-            # ceil(bits_needed / 7) gives bytes per delta for column indices 0..n_out.
-            # This is the TYPICAL cost, not worst-case (uleb128_max=5).
-            # Pass bytes_per_row explicitly to override (e.g. worst-case: mrw*5).
+            # bytes_per_row: typical (not worst-case) ULEB128 cost for this
+            # column range, plus a small growth margin. Pass explicitly to
+            # override (e.g. worst-case: mrw*5).
             if bytes_per_row > 0:
                 bpr = bytes_per_row
             else:
@@ -2097,15 +1477,10 @@ class FoldedLayer(Module):
         x: sili Tensor [batch, in_dim]  (or [in_dim] -- squeezed automatically)
         Returns: sili Tensor [batch, out_dim]
 
-        Wired into sili autograd: calling loss.backward() propagates through
-        this layer automatically. forward_dense(x) [this method] is a pure
-        computation (no learning_rate, no side effects -- see JOURNAL.md:
-        it used to also update IMPORTANCE via activity correlation on every
-        call, independent of whether backward() would ever follow, a real
-        footgun now removed). backward_dense(dy, lr) [_backward, called by
-        loss.backward()] is the only place weight values AND importance
-        ever change, via the task gradient -- that's what enables the
-        network to learn tasks.
+        Wired into sili autograd: loss.backward() propagates through this
+        layer automatically. forward_dense(x) is a pure computation (no
+        side effects); backward_dense(dy, lr), called by loss.backward(),
+        is the only place weight values AND importance change.
         """
         x_np = np.asarray(x.data, dtype=np.float32)
         squeezed = x_np.ndim == 1
@@ -2167,39 +1542,20 @@ class FoldedLayer(Module):
         rows_per_call: int = 0,
     ) -> None:
         """
-        Grow and prune connections across all suffix layers.
+        Grow and prune connections across all suffix layers. Each call to
+        synap_step() advances ONE row of the layer's internal cursor:
+        remove synapses below importance_cutoff, then grow new ones (from
+        the top-k probes) until the row reaches max_row_weights.
 
-        Each call to synap_step() advances ONE row of the layer's internal
-        cursor, deciding for that row: remove synapses whose importance fell
-        below importance_cutoff, then grow new ones (from the top-k probes)
-        until the row reaches max_row_weights.
+        k: probes to build, rule of thumb k ~ 4*max_row_weights.
+        importance_cutoff: FP4 stored-unit threshold (multiply by
+        get_importance_scale(r) for true units).
+        max_row_weights: target connections per row after this sweep.
+        rows_per_call: 0 (default) = full sweep; N > 0 = staggered mode,
+        advancing exactly N rows per call.
 
-        To prune and grow uniformly, the net effect of one full sweep
-        (all n_inputs rows visited) is:
-          - removed: synapses with importance < importance_cutoff
-          - added:   up to max_row_weights - surviving_nnz new synapses
-          - total:   capped at max_row_weights per row (constant if all rows
-                     were already at max_row_weights before pruning)
-
-        args:
-          k                 -- probes to build (how many candidate connections
-                               per row to consider for growth).  Rule of thumb:
-                               k ~ 4 * max_row_weights gives good coverage.
-          importance_cutoff -- prune synapses whose stored importance magnitude
-                               falls below this threshold (in FP4 stored units;
-                               multiply by get_importance_scale(r) for true units)
-          max_row_weights   -- target connections per row after this sweep.
-                               Vary this over time (e.g. sine wave) to test
-                               that the layer can both grow AND shrink.
-          rows_per_call     -- 0 (default) = full sweep (all n_inputs rows);
-                               N > 0 = advance exactly N rows (staggered mode,
-                               useful when called every training step to spread
-                               the work across many steps rather than a single
-                               large pause).
-
-        Call AFTER backward() and BEFORE the next forward().
-        Accumulators are zeroed at the end of each call -- they are valid only
-        for the interval between the last zero_accum and this synaptogenesis call.
+        Call AFTER backward() and BEFORE the next forward(). Accumulators
+        are zeroed at the end of each call.
         """
         for layer in self._sili_layers.values():
             layer.build_probes(k)
@@ -2242,26 +1598,18 @@ class FoldedColumnLayer(FoldedLayer):
     """
     FoldedLayer variant for the column-averaging mechanism: retains the
     pre-sum [n_folds*out_dim] tensor instead of collapsing the fold axis,
-    and pairs it with a `recurrent` layer -- the same input_proj+recurrent
-    split SparseRNNCell uses, built on SparseLinearLayer instead of the
-    currently-broken DISLDOLayer/SISLDOLayer (see TODO.md).
+    paired with a `recurrent` layer (same input_proj+recurrent split
+    SparseRNNCell uses, built on SparseLinearLayer).
 
-    in_proj(x) -- the real pretrained per-fold-step matrices (stacked),
-    plus a build_input_skip_preseed()-unioned band of zero-valued
-    trainable skip connections from input to every fold-depth column.
-
-    recurrent(state) -- build_fold_skip_layer's from-scratch banded
-    matrix mapping this layer's own [n_folds*out_dim] output space back to
-    itself (fold step i -> i+1 and nearby columns), carrying one step's
-    output into the next's input. No pretrained content.
-
-    forward(x, state) = in_proj(x) + recurrent(state), returned as the new
-    state to feed back in next call (mirrors SparseRNNCell's convention).
+    in_proj(x): real pretrained per-fold-step matrices (stacked), plus a
+    zero-valued trainable skip band from input to every fold-depth column.
+    recurrent(state): from-scratch banded matrix mapping this layer's
+    output space back to itself (fold step i -> i+1 and nearby columns).
+    forward(x, state) = in_proj(x) + recurrent(state), the new state.
     state defaults to zero when not given.
 
     Feed forward()'s output to sili.energy.column_averaging_loss, after
-    whatever EnergyDynamics gating the model applies (that function must
-    run on the energy-gated state, not this layer's raw output).
+    EnergyDynamics gating (not this layer's raw output).
     """
 
     @classmethod
@@ -2283,20 +1631,13 @@ class FoldedColumnLayer(FoldedLayer):
         unions a zero-valued input->column skip pre-seed onto every
         suffix's in_proj weights (see build_input_skip_preseed).
 
-        recurrent_bandwidth: forwarded to build_fold_skip_layer as
-        `bandwidth` (None -> that function's own default).
-
-        existing_recurrent / existing_recurrent_prefer: forwarded to
-        build_fold_skip_layer as `existing`/`existing_prefer` -- pass a
-        previously-saved recurrent CSR (e.g.
-        state_dict_to_true_csr(prior_layer.state_dict()["recurrent"])) to
-        preserve trained skip-connection weights across re-runs. None
-        (default) is the "converting a dense LLM" case.
-
-        input_skip_bandwidth: forwarded to build_input_skip_preseed as
-        `bandwidth` per suffix. No `existing` param here -- each suffix's
-        real weights ARE the base the fresh pre-seed unions onto, real
-        values always winning (see _rebuild_layer_with_preseed).
+        recurrent_bandwidth: forwarded to build_fold_skip_layer's `bandwidth`.
+        existing_recurrent/existing_recurrent_prefer: forwarded to
+        build_fold_skip_layer's `existing`/`existing_prefer` -- pass a
+        previously-saved recurrent CSR (state_dict_to_true_csr(...)) to
+        preserve trained skip weights across re-runs.
+        input_skip_bandwidth: forwarded to build_input_skip_preseed's
+        `bandwidth` per suffix -- real weights always win at any overlap.
         """
         obj = super().from_descriptor(
             descriptor,
@@ -2482,20 +1823,11 @@ def state_dict_to_true_csr(d: dict):
 def csr_union(ptrs_a, idx_a, vals_a, ptrs_b, idx_b, vals_b, n_rows: int, prefer: str = "a", num_cpus: int = 4):
     """
     Merge two CSRs of the SAME shape into one holding the union of their
-    nonzero positions. `vals_a`/`vals_b` must already be in true units
-    (not raw FP4 levels -- mixing raw units from differently-scaled
-    sources would be wrong); rescaling happens after the union, once a
-    single per-row scale for the merged row is chosen.
-
-    Where both inputs have an entry at (row, col), `prefer` decides the
-    result: 'a' (default) keeps A, 'b' keeps B, 'sum' adds them.
-
-    Construction/loading time only -- never used in the forward/backward
-    path. See build_fold_skip_layer's `existing` for the concrete case.
-
-    OpenMP-parallel (_cpu.csr_union, see csr.hpp) -- each row is an
-    independent two-pointer merge, so this scales to real model-sized
-    weight matrices instead of a per-row Python loop.
+    nonzero positions. `vals_a`/`vals_b` must already be in TRUE units
+    (not raw FP4 levels). Where both inputs have an entry at (row, col),
+    `prefer` decides the result: 'a' (default) keeps A, 'b' keeps B, 'sum'
+    adds them. Construction/loading time only. OpenMP-parallel
+    (_cpu.csr_union) -- each row is an independent two-pointer merge.
     """
     assert prefer in ("a", "b", "sum")
     return _cpu.csr_union(
@@ -2524,26 +1856,18 @@ def build_fold_skip_layer(
     """
     Sparse layer mapping a FoldedColumnLayer's own [n_folds*out_dim]
     output space back to itself: skip connections between virtual
-    (fold-depth) layers, pre-seeded as a zero-valued banded pattern (see
-    RNNFoldedBlock.forward in conversion/rnn_fold.py for the true fold
-    recurrence this approximates).
+    (fold-depth) layers, pre-seeded as a zero-valued banded pattern
+    (approximates RNNFoldedBlock.forward's fold recurrence).
 
-    bandwidth: connect flat positions r, c whenever abs(r - c) < bandwidth.
-    Default (None) uses out_dim, so one hop reaches the adjacent fold
-    step at any nearby column.
-
-    expected_lr: sets the fallback per-row value_scale (expected_lr /
-    FP4_MAX) for rows whose final values are still all-zero, so gradient
-    updates of that magnitude don't round back to zero under FP4. Rows
-    with real nonzero values (from `existing`) get max_abs/FP4_MAX
-    instead.
-
-    existing: optional (ptrs, idx, vals) CSR, same shape, vals in TRUE
-    units (see csr_union) -- unioned with the fresh band before
-    construction. Pass a previously-trained recurrent CSR to preserve it
-    across re-runs; None (default) is the "converting a dense LLM" case.
-    existing_prefer: csr_union's prefer arg for overlapping positions --
-    default 'b' (existing's trained value wins over the fresh zero).
+    bandwidth: connect flat positions r, c whenever abs(r-c) < bandwidth.
+    Default (None) uses out_dim.
+    expected_lr: fallback per-row value_scale (expected_lr/FP4_MAX) for
+    still-all-zero rows, so gradient updates don't round back to zero
+    under FP4; rows with real nonzero values get max_abs/FP4_MAX instead.
+    existing: optional (ptrs, idx, vals) CSR in TRUE units, unioned with
+    the fresh band before construction, to preserve a previously-trained
+    recurrent CSR across re-runs. existing_prefer: default 'b' (existing's
+    trained value wins over the fresh zero).
     """
     assert n_folds >= 1 and out_dim >= 1
     bw = out_dim if bandwidth is None else bandwidth
@@ -2685,22 +2009,12 @@ def apply_fold_skip(skip_layer, x: Tensor, lr: float = 0.01) -> Tensor:
 class LayerMemoryState:
     """
     Python-side tracker for a SparseLinearLayer's memory equalization cursor.
-
     The C++ equalizer_step() advances an internal row cursor each call; this
-    class mirrors that cursor in Python and provides memory statistics. Use
-    it to integrate equalization into training loops with visibility.
+    class mirrors that cursor in Python and provides memory statistics.
 
-    Normal training loop:
-        mem = LayerMemoryState(sparse_layer)
-        for step in range(n_steps):
-            out = layer(x); loss.backward()
-            synap_schedule.step()
-            mem.step()            # one equalization step per training step
-
-    Synaptogenesis on a row that has no blank space will throw. The throw
-    signals that equalization hasn't caught up yet. Calling mem.step() once
-    per training step ensures blank space is continuously redistributed as
-    synaptogenesis adds and removes connections.
+    Call mem.step() once per training step (after backward, alongside
+    synap_schedule.step()) so blank space is continuously redistributed --
+    synaptogenesis on a row with no blank space will throw otherwise.
     """
 
     def __init__(self, layer):
@@ -2738,30 +2052,12 @@ class LayerMemoryState:
 class SynaptogenesisSchedule:
     """
     Schedule for calling FoldedLayer.synaptogenesis() at regular intervals
-    with a (optionally varying) max_row_weights target.
-
-    Constant connections (default):
-        sched = SynaptogenesisSchedule(layer, base_connections=64,
-                                       every_n_steps=20)
-
-    Sine-wave connections (useful for testing grow/shrink both work):
-        sched = SynaptogenesisSchedule(layer, base_connections=64,
-                                       amplitude=0.3, period=200,
-                                       every_n_steps=20)
-
-    During training:
-        for step, (x, y) in enumerate(data):
-            out  = layer(x)
-            loss = criterion(out, y)
-            loss.backward()
-            sched.step()           # handles synaptogenesis cadence internally
-
-    The sine wave is:
+    with a (optionally varying) max_row_weights target:
         max_row_weights(t) = round(base * (1 + amplitude * sin(2*pi*t/period)))
-
-    With amplitude=0, this is constant at base.  The sine wave exercises both
-    growth (max > base) and pruning (max < base) and is a clean regression:
-    after many full cycles, nnz_total should oscillate around base * n_rows.
+    amplitude=0 (default) is constant at base. A nonzero amplitude exercises
+    both growth and pruning -- a clean regression check (nnz_total should
+    oscillate around base * n_rows over many cycles). Call sched.step()
+    once per training step, after backward.
     """
 
     def __init__(
@@ -2833,44 +2129,23 @@ class SparseRNNCell(Module):
         h             = input_proj(obs) + recurrent_out
         h_out         = energy(h)
 
-    Returns (h_out: Tensor, aux_loss: Tensor, actual_p: float) — h_out (dense)
-    is returned unchanged as the new state, same contract as before, so
-    argmax/save/inspection on it keep working without modification.
+    Returns (h_out: Tensor, aux_loss: Tensor, actual_p: float) -- h_out
+    (dense) is returned unchanged as the new state.
 
-    Unifying the sparsification passes (see energy.kept_indices docstring):
-    the CSR fed into `recurrent()` at the top of the NEXT call is built from
-    THIS call's own energy-gating decision (kept_indices + the PRE-gating h
-    values at those indices) rather than an independent top-k re-derivation
-    that could disagree with it. That decision is cached on the cell
-    (`_prev_kept_indices` / `_prev_h_dense`) rather than smuggled through the
-    state Tensor itself, since state.data must stay dense for argmax/save to
-    keep working, and CSR must not be built from state.data's own values
-    anyway -- state.data (h_out) has fire/shutoff positions flattened to
-    energy-derived constants (2.0, e+2), not the real activation magnitude
-    the gate decided to keep. The cache is invalidated on reset()/whenever
-    the caller hands in a state the cell didn't itself just produce (e.g.
-    after SparseRNNAgent.load()), falling back to CSR.from_dense (the true
-    step-0 path) exactly once until the cell has run again.
+    Unifies the two sparsification passes: the CSR fed into `recurrent()`
+    at the top of the NEXT call is built from THIS call's own energy-gating
+    decision (cached as `_prev_kept_indices`/`_prev_h_dense`), not an
+    independent top-k re-derivation. Cache invalidated on reset()/whenever
+    the caller hands in a state this cell didn't itself just produce.
 
-    Branching-ratio measurement (see energy.BranchingRatioTracker /
-    energy.EMABranchingRatioTracker): recurrent-only activity is measured
-    on recurrent_out BEFORE it's summed with input_proj(obs) -- measuring
-    on the combined h cannot distinguish a genuinely self-propagating
-    recurrent pathway from fresh input alone carrying activity while the
-    recurrent branching factor is silently 0. `branching_tracker` selects
-    which estimator backs `self.branching_recurrent`: "window" (
-    a hard sliding window, also the only one that supports
-    avalanche_sizes() for a SOC power-law-tail check) or "ema" (default, O(1)
-    memory, exponentially-discounted -- prefer this when you want a
-    continuously-updated read with a tunable fast/long-term tradeoff via
-    `branching_ema_alpha`, e.g. for `dynamic_density_from_branching_ratio`
-    reacting promptly to a regime change). Want both a fast EMA read and
-    the avalanche-size check at once? Construct a second tracker yourself
-    (`EMABranchingRatioTracker`/`BranchingRatioTracker` from `sili.energy`)
-    and feed it the same recurrent_out activity this cell already
-    computes each step -- not built into this class, since which
-    additional trackers (if any) matter is a caller decision, not
-    something this cell should hardcode a combination of.
+    Branching-ratio measurement: recurrent-only activity is measured on
+    recurrent_out BEFORE it's summed with input_proj(obs), so a genuinely
+    self-propagating recurrent pathway can be distinguished from input
+    alone carrying activity. `branching_tracker` selects "window" (hard
+    sliding window, supports avalanche_sizes()) or "ema" (default, O(1)
+    memory, tunable via `branching_ema_alpha`).
+
+    See docs/research/sparse_rnn.rst:sparse_rnn_cell.overview.
     """
 
     def __init__(
@@ -2892,21 +2167,13 @@ class SparseRNNCell(Module):
         self.input_proj = DISLDOLayer(n_inputs, state_size, max_weights, num_cpus)
         self.recurrent = SISLDOLayer(state_size, state_size, max_weights, num_cpus, backprop_p=percent_active)
         # density IS the target active fraction; p is a hard compute-limit
-        # ceiling that must sit clearly above it (~5x here), not the thing
-        # that shapes learned sparsity -- see EnergyDynamics's own
-        # `density <= p * 0.8` assertion and its docstring for why. This
-        # inverts what this constructor did before (density used to be
-        # derived FROM percent_active*0.9 while p was set TO percent_active
-        # directly, i.e. density could exceed p*0.8 -- the actual bug).
+        # ceiling clearly above it (~5x). See
+        # docs/research/sparse_rnn.rst:sparse_rnn_cell.density_p_inversion_bug.
         density = min(0.9, percent_active)
         p = min(1.0, percent_active * 5.0)
-        # activation_cost=0.08*r grows unbounded with percent_active (r
-        # scales linearly with it) -- fine for the small percent_active
-        # this formula was tuned around, but a small state legitimately
-        # wants a much higher percent_active to get more than 0-1 active
-        # neurons (e.g. state_size=12), which pushes activation_cost past
-        # EnergyDynamics's own asserted [0.01, 0.5] range. Clamp rather
-        # than let construction fail for that (valid) regime.
+        # activation_cost=0.08*r grows unbounded with percent_active --
+        # clamped to EnergyDynamics's asserted [0.01, 0.5] range so small
+        # states (needing higher percent_active) don't fail construction.
         activation_cost = min(0.5, max(0.01, 0.08 * r))
         self.energy = EnergyDynamics(
             drive=0.08 * percent_active * r,
@@ -2922,14 +2189,9 @@ class SparseRNNCell(Module):
         self.state_size = state_size
         self._percent_active = percent_active
 
-        # Recurrent-only branching-ratio measurement (A6 item 5) and its
-        # optional (default-off) use to nudge the KL density target (A6's
-        # "biggest structural change" -- a first-cut proportional adjustment,
-        # not a first-principles derivation; see energy-params.md). "window"
-        # is the default so existing behavior/callers are unaffected;
-        # "ema" trades the avalanche_sizes() check away for O(1) memory and
-        # a tunable fast/long-term response via branching_ema_alpha -- see
-        # class docstring.
+        # Recurrent-only branching-ratio measurement and its optional
+        # (default-off) use to nudge the KL density target -- see
+        # docs/research/sparse_rnn.rst:sparse_rnn_cell.dynamic_density_nudge.
         if branching_tracker == "window":
             self.branching_recurrent = BranchingRatioTracker(window=branching_window)
         else:
@@ -2947,12 +2209,9 @@ class SparseRNNCell(Module):
     def forward(
         self, obs: Tensor, state: Tensor, learning_rate: float = 0.0, requires_grad: bool = True
     ) -> tuple[Tensor, Tensor, float]:
-        # state.data is a CSR only if the caller explicitly handed us one
-        # (e.g. warm-starting from a saved CSR); the cell's own output is
-        # always dense (see class docstring). Normal path: build the CSR
-        # from this cell's OWN cached gating decision when we have one and
-        # the caller hasn't reset/replaced the state since; otherwise fall
-        # back to the true step-0 independent top-k.
+        # state.data is a CSR only if the caller explicitly handed us one;
+        # normal path builds the CSR from this cell's own cached gating
+        # decision, falling back to independent top-k at true step-0.
         if not isinstance(state.data, CSR):
             if self._prev_kept_indices is not None:
                 state_csr = CSR.from_kept_indices(self._prev_kept_indices, self._prev_h_dense, cols=self.state_size)
@@ -2965,7 +2224,7 @@ class SparseRNNCell(Module):
             state = state_csr.as_tensor(state.backend)
 
         # Measure the recurrent pathway's OWN activity before it's mixed
-        # with input_proj(obs) -- see class docstring / BranchingRatioTracker.
+        # with input_proj(obs) -- see class docstring.
         recurrent_out = self.recurrent(state, learning_rate)
         recurrent_activity = float(
             np.sum(np.abs(np.asarray(recurrent_out.data, dtype=np.float32)) > self.energy.activation_threshold)
@@ -2978,11 +2237,8 @@ class SparseRNNCell(Module):
         if self.dynamic_density_from_branching_ratio:
             m = self.branching_recurrent.branching_ratio()
             if m is not None:
-                # First-cut proportional nudge around the configured base
-                # density, centered on the intended near-critical band
-                # [0.97, 0.99] -- NOT a first-principles derivation from m.
-                # Bounded to +/-2x the base density so a noisy early
-                # estimate can't send the target somewhere degenerate.
+                # First-cut proportional nudge, not a derivation -- see
+                # docs/research/sparse_rnn.rst:sparse_rnn_cell.dynamic_density_nudge.
                 m_target = 0.98
                 density_override = float(
                     np.clip(
@@ -2995,7 +2251,7 @@ class SparseRNNCell(Module):
         new_state, aux_loss, actual_p = self.energy(h, density_override=density_override)
 
         # Cache this call's gating decision for the NEXT call's CSR
-        # construction (pre-gating h, not h_out -- see class docstring).
+        # construction (pre-gating h, not h_out).
         self._prev_kept_indices = self.energy.kept_indices
         self._prev_h_dense = np.asarray(h.data, dtype=np.float32).ravel().copy()
 
@@ -3003,26 +2259,17 @@ class SparseRNNCell(Module):
 
     def reset(self):
         # Invalidate the sparsification-pass cache -- the next state the
-        # caller hands in did NOT come from this cell's own last forward
-        # call (e.g. after an external reset or a loaded checkpoint), so
-        # the cached kept_indices/h_dense no longer describe it.
+        # caller hands in didn't come from this cell's own last forward.
         self._prev_kept_indices = None
         self._prev_h_dense = None
         self.branching_recurrent.reset()
 
     def synaptogenesis(self, k: int, importance_cutoff: float, max_weights: int):
         """Structural growth + memory rebalancing for both sub-layers --
-        see _SparseLayerBase.synaptogenesis. No lr/step/decay here: weight
-        VALUE updates already happened inline during forward()'s
-        backward() closures (see module docstring), and there's no
-        importance-decay call in this API generation.
-
-        max_weights is the TOTAL per-layer budget (same units as what
-        was passed to this cell's own constructor) -- converted to a
-        PER-ROW cap for each sub-layer here (synap_step's actual unit),
-        using each sub-layer's own in_features, since input_proj and
-        recurrent generally have different row counts and a single
-        scalar can't be a correct per-row cap for both at once."""
+        see _SparseLayerBase.synaptogenesis. max_weights is the TOTAL
+        per-layer budget, converted to a PER-ROW cap for each sub-layer
+        here using its own in_features (input_proj/recurrent generally
+        have different row counts)."""
         input_proj_cap = max(1, max_weights // self.input_proj.in_features)
         recurrent_cap = max(1, max_weights // self.recurrent.in_features)
         self.input_proj.synaptogenesis(k, importance_cutoff, input_proj_cap)
@@ -3071,17 +2318,8 @@ class SparseRNNAgent(Module):
         importance_cutoff: float = 0.01,
         synaptogenesis_k: int = 4,
     ):
-        # build_probes(k) generates min(k, n_in) * min(k, n_out) candidate
-        # pairs (top-k input rows outer-producted against top-k output
-        # columns) -- O(k^2), not O(k). Measured directly: on a 1000x1000
-        # layer, k=64 can grow nnz from ~0 to 1000 (full density) in a
-        # SINGLE synap_step call, vs. k=4 growing nnz by only ~16 -- since
-        # this runs every online step (see class/module docstring), a
-        # large k saturates connectivity almost immediately rather than
-        # growing gradually. k=4 (default) or smaller is far more sane
-        # for continuous per-step growth; only raise this if you've
-        # checked the resulting per-step nnz growth against your actual
-        # max_weights budget and step rate.
+        # synaptogenesis_k: build_probes(k) is O(k^2), not O(k) -- see
+        # docs/research/sparse_rnn.rst:sparse_rnn_agent.build_probes_k_scaling.
         assert n_actions <= state_size
 
         self.cell = SparseRNNCell(n_inputs, state_size, max_weights, num_cpus, percent_active)
@@ -3109,8 +2347,8 @@ class SparseRNNAgent(Module):
     def forward(self, obs: Tensor) -> int:
         """Run one step. State stays in the autograd graph (use for multi-step
         BPTT). Threads self.lr into the cell so weight VALUE updates fire
-        inline whenever backward() eventually runs (see module docstring) --
-        forward() itself never updates anything, only backward() does."""
+        inline whenever backward() eventually runs -- forward() itself never
+        updates anything."""
         h_out, aux_loss, actual_p = self.cell(obs, self.state, self.lr)
         self.state = h_out
         self.aux_loss = aux_loss
@@ -3121,20 +2359,13 @@ class SparseRNNAgent(Module):
         """
         BPTT=1 convenience wrapper. Detaches state before forward so gradients
         don't flow across steps, then runs aux_loss.backward() (fires the
-        inline weight-value updates) and step() (structural growth only --
-        weight values are already updated by that point, see module
-        docstring).
+        inline weight-value updates) and step() (structural growth only).
 
         Use aux_loss directly before calling this if you want to add a task loss:
             action   = agent.forward(obs)
             combined = agent.aux_loss + task_loss(action, target)
             combined.backward()
             agent.step()
-
-        The comment below is kept from the original as a design note:
-        Using aux_loss + force-firing rather than a scalar reward can be far
-        more information-rich — touching a hot stove produces a burning
-        sensation where you put your hand, not just a global 'bad' signal.
         """
         self.state = self.state.detach()
         action = self.forward(obs)
@@ -3146,12 +2377,9 @@ class SparseRNNAgent(Module):
 
     def step(self):
         """Structural growth + memory rebalancing only -- weight VALUE
-        updates already happened inline during aux_loss.backward()/
-        loss.backward() (see module docstring). Called every step, not
-        throttled by an "every N steps" cadence: synaptogenesis/
-        equalizer_step are cheap and purpose-built for continuous
-        per-step operation -- throttling them would reintroduce the lag
-        spikes they exist to avoid."""
+        updates already happened inline during backward(). Called every
+        step, not throttled by an "every N steps" cadence (would
+        reintroduce the lag spikes this design avoids)."""
         self.cell.synaptogenesis(self.synaptogenesis_k, self.importance_cutoff, self.max_weights)
         self._step_count += 1
 
