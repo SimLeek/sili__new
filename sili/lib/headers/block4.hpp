@@ -2246,29 +2246,26 @@ inline Block4TileHandle::~Block4TileHandle() {
 
 // ── FP32 dense-tile encoding (Block4Tile32) ──────────────────────────────────
 // Plain float32 counterpart to Block4Tile/Block4Tile8: float32 needs no
-// bit-packing at all (storing/loading a float IS the codec, there is no
-// encode/decode step), so a slot needs a full 4-byte weight + 4-byte
-// importance = 8 bytes, arranged as two contiguous float32 HALVES (weight
-// half [0..63], importance half [64..127]) -- same two-halves convention as
-// Block4Tile8, just 4 bytes/value instead of 1. Because each half is
-// already a flat, contiguous run of float32 values in [local_j*4+local_i]
-// order, block4_vec_load/block4_vec_store (above) can read/write a whole
-// local column of 4 values directly with ZERO decode/encode step -- unlike
-// FP4/FP8, which must bit-unpack a code into a float first. This is what
-// makes the SIMD path in linear_disldo.hpp simpler than FP8's own: there is
-// no scalar-fallback subnormal/NaN-lane split, because there are no codes.
+// bit-packing at all (storing/loading a float IS the codec), so a slot needs
+// a full 4-byte weight + 4-byte importance = 8 bytes, arranged as two
+// contiguous float32 HALVES (weight half [0..63], importance half
+// [64..127]) -- same two-halves convention as Block4Tile8, just 4 bytes/
+// value instead of 1. get/set (not a `float&` reference like Block4Tile's
+// `uint8_t&`) because a raw `reinterpret_cast<float*>` into this
+// `uint8_t` buffer would be a real strict-aliasing violation; get/set use
+// `std::memcpy` instead, matching block4_vec_load/store's own established
+// reinterpretation idiom. Because each half is already a flat, contiguous
+// run of float32 values in [local_j*4+local_i] order, block4_vec_load/
+// block4_vec_store can still read/write a whole local column of 4 values
+// directly with ZERO decode/encode step -- unlike FP4/FP8, which must
+// bit-unpack a code into a float first, this is what makes the SIMD path in
+// linear_disldo.hpp simpler than FP8's own (no scalar-fallback subnormal/
+// NaN-lane split, because there are no codes).
 //
 // block4_row_shift/block4_grow_last_row/block4_ensure_row_headroom/
 // block4_row_insert_tile/block4_row_remove_tile/block4_resize_tile_in_row
 // are pure byte-buffer plumbing (see Block4Tile8's identical comment) --
 // Block4Store32 (further below) reuses every one of them UNCHANGED.
-//
-// get/set (not a `float&` reference like Block4Tile's `uint8_t&`) because a
-// raw `reinterpret_cast<float*>` into a `std::vector<uint8_t>` byte buffer
-// is a real strict-aliasing violation; this codebase's own established
-// convention for exactly this reinterpretation (block4_vec_load/store,
-// above) is always a `std::memcpy`, never a punned pointer -- followed here
-// too, not a new pattern.
 
 constexpr uint32_t BLOCK4_TILE_SLOTS32_BYTES =
     BLOCK4_TILE_SLOTS * 2 * uint32_t(sizeof(float)); // 128: weight half + importance half
