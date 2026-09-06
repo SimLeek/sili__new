@@ -466,13 +466,15 @@ def _preseed_dense(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | 
 
 def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None) -> int:
     """Fully dense counterpart to `_preseed_random_sparse`, for storage
-    types with no block4 support (DeltaCSRBiValues<float>/DISLDOLayerV).
-    Every (input, output) pair connected via plain scattered CSR -- no
-    quantization floor to correct for, so plain fan-in-normalized
-    (1/sqrt(n_inputs)) Gaussian init (ordinary Xavier/Kaiming). Caller
-    MUST construct `c` with max_weights >= n_inputs*n_outputs. See
+    types with no block4 support at all. Every (input, output) pair
+    connected via plain scattered CSR -- no quantization floor to correct
+    for, so plain fan-in-normalized (1/sqrt(n_inputs)) Gaussian init
+    (ordinary Xavier/Kaiming). Caller MUST construct `c` with
+    max_weights >= n_inputs*n_outputs. See
     docs/research/sparse_rnn.rst:preseed_dense.two_real_bugs (last
-    paragraph)."""
+    paragraph). NOT used by DISLDOLayer32/DISLDOLayerV any more -- see
+    `_preseed_dense_fp32`, which loads straight into block4 instead, now
+    that DeltaCSRBiValues<float> has its own block4 support (task #350)."""
     if rng is None:
         rng = np.random.default_rng()
     scale = 1.0 / np.sqrt(max(1, n_inputs))
@@ -481,6 +483,29 @@ def _preseed_dense_scattered(c, n_inputs: int, n_outputs: int, rng: np.random.Ge
     values = rng.standard_normal(n_inputs * n_outputs).astype(np.float32) * scale
     importance = np.zeros(n_inputs * n_outputs, dtype=np.float32)
     c.load_weights(ptrs, indices, values, importance)
+    return n_outputs  # every row is already at max capacity -- nothing left to grow into
+
+
+def _preseed_dense_fp32(c, n_inputs: int, n_outputs: int, rng: np.random.Generator | None = None) -> int:
+    """Fully dense counterpart to `_preseed_random_sparse`, for
+    DeltaCSRBiValues<float>/DISLDOLayerV -- loads straight into block4
+    (`load_dense_values`, backing `block4_load_dense_fp32` in
+    delta_csr_memory.hpp) instead of `_preseed_dense_scattered`'s plain CSR,
+    so a dense fp32 arm gets the SAME SIMD dense-tile forward/backward path
+    FP4/FP8 already had (task #350) -- the real point of a dense arm is to
+    be fast, and a fully-connected matrix trivially fills every 4x4 tile
+    completely, maximizing that benefit.
+
+    No output_scale fan-in correction (unlike `_preseed_dense`'s FP4/FP8
+    version) -- there's no quantization floor here to correct FOR, so
+    ordinary fan-in-normalized (1/sqrt(n_inputs)) Gaussian init is already
+    correct on its own, same as `_preseed_dense_scattered`'s reasoning."""
+    if rng is None:
+        rng = np.random.default_rng()
+    scale = 1.0 / np.sqrt(max(1, n_inputs))
+    weight_values = (rng.standard_normal((n_inputs, n_outputs)).astype(np.float32) * scale).flatten()
+    importance_values = np.zeros(n_inputs * n_outputs, dtype=np.float32)
+    c.load_dense_values(weight_values, importance_values)
     return n_outputs  # every row is already at max capacity -- nothing left to grow into
 
 
@@ -883,13 +908,16 @@ class DISLDOLayer32(_SparseLayerBase):
     """Same disldo_forward/disldo_backward kernels as DISLDOLayer, generic
     over VALUES_TYPE -- this instantiation uses the 32-bit float fallback
     (_cpu.DISLDOLayerV) instead of 4-bit FP4BiPacked. Same call convention
-    as DISLDOLayer. Not a production layer: no equalize_to_capacity, no
-    block4 promotion -- pure diagnostic to isolate FP4's coarseness from
-    the update-rule math.
+    as DISLDOLayer. Growth-driven synaptogenesis (`synap_row_step`) now
+    promotes/demotes into the SAME block4 dense-tile SIMD path FP4/FP8 use
+    (task #350) -- float32 needs no encode/decode step at all, so its block4
+    branch is simpler (and, per its own C++ comment, potentially faster)
+    than either of theirs.
 
-    dense=True: fully-connected init via `_preseed_dense_scattered` --
-    this VALUES_TYPE has no block4 support, so max_weights is expanded
-    automatically to cover every (input, output) pair. See
+    dense=True: fully-connected init via `_preseed_dense_fp32`, straight
+    into block4 (not the scattered CSR path `_preseed_dense_scattered`
+    used before task #350) -- max_weights is still expanded automatically
+    to cover every (input, output) pair. See
     docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
 
     def __init__(
@@ -905,7 +933,7 @@ class DISLDOLayer32(_SparseLayerBase):
             max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
         if dense:
-            self._max_row_weights = _preseed_dense_scattered(self._c, in_features, out_features, rng)
+            self._max_row_weights = _preseed_dense_fp32(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 

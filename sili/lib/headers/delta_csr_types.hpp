@@ -933,6 +933,15 @@ template <typename VALUES_TYPE> struct Block4StoreFor {
 template <> struct Block4StoreFor<FP8BiValues> {
     using type = Block4Store8;
 };
+// DISLDOLayerV's plain-float32 storage (VALUES_TYPE=DeltaCSRBiValues<float>)
+// gets Block4Store32 (block4.hpp) -- float32 needs no bit-packing at all, so
+// this is the simplest of the three Block4Store variants (see that file's
+// own comment on why its SIMD path needs no decode/encode). Every other
+// DeltaCSRBiValues<T> instantiation (e.g. <double>, if one is ever added)
+// keeps the default Block4Store above, unchanged.
+template <> struct Block4StoreFor<DeltaCSRBiValues<float>> {
+    using type = Block4Store32;
+};
 
 // Reshuffles `arr` (currently laid out as entity*old_rank+k) to
 // entity*new_rank+k in place, preserving every existing (entity,k) pair
