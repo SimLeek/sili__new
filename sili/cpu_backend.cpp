@@ -147,6 +147,28 @@ class Block4View8 {
     Block4Store8* store;
 };
 
+// FP32 counterpart to Block4View/Block4View8, for Block4Store32 -- same
+// fields/role, separate class for the same reason Block4View8 is (Block4View
+// is hardcoded to Block4Store&). This is DISLDOLayerV's block4() return type.
+class Block4View32 {
+  public:
+    explicit Block4View32(Block4Store32& s) : store(&s) {}
+    std::size_t tiles() const { return store->n_tiles(); }
+    std::size_t synapses() const { return store->live_synapses(); }
+    uint32_t get_switch_point() const { return store->switch_point; }
+    void set_switch_point(uint32_t v) { store->switch_point = v; }
+    std::uint64_t dropped_growth_events() const { return store->dropped_growth_events; }
+    std::uint64_t row_merge_overflow_events() const { return store->row_merge_overflow_events; }
+    std::uint64_t row_merge_overflow_bytes_dropped() const {
+        return store->row_merge_overflow_bytes_dropped;
+    }
+    std::size_t used_bytes() const { return store->total_tile_used_bytes(); }
+    std::size_t alloc_bytes() const { return store->total_tile_alloc_bytes(); }
+
+  private:
+    Block4Store32* store;
+};
+
 // ── SISLDOLayer ───────────────────────────────────────────────────────────────
 // Sparse Input, Sparse Linear, Dense Output layer.
 //
@@ -1294,6 +1316,18 @@ class DISLDOLayerV {
         // no-op check).
         weights.connections.set_limits(_idx_budget_bytes,
                                        ValueAccessor<VT>::projected_byte_size(_val_budget_nnz));
+        weights.block4.init(static_cast<std::size_t>(n_inputs),
+                            static_cast<std::size_t>(n_outputs));
+        // Same budget-sizing convention as SparseLinearLayer8Impl's
+        // constructor -- tile COUNT budget identical (max_weights synapses
+        // at max fill of BLOCK4_TILE_SLOTS=16/tile), but multiplied by
+        // BLOCK4_TILE_SLOTS32_BYTES (128, a dense FP32 tile's real byte
+        // size) instead of FP8's 32, since that's what set_limits' second
+        // argument actually budgets (tile_data bytes, not tile count).
+        weights.block4.set_limits(
+            static_cast<std::size_t>(max_weights) * 8 + 4096,
+            std::max<std::size_t>(4, static_cast<std::size_t>(max_weights) / BLOCK4_TILE_SLOTS) *
+                BLOCK4_TILE_SLOTS32_BYTES);
         weights.recompute_stats();
         weights.probes.rows = n_inputs;
         weights.probes.cols = n_outputs;
@@ -1307,7 +1341,7 @@ class DISLDOLayerV {
     S nnz() const {
         return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
     }
-    Block4View block4() { return Block4View(weights.block4); }
+    Block4View32 block4() { return Block4View32(weights.block4); }
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
     // explicit backward argument now instead of an engine-side cache.
@@ -1512,6 +1546,21 @@ class DISLDOLayerV {
         py::array_t<S> result((py::ssize_t)op.size());
         std::copy(op.begin(), op.end(), (S*)result.request().ptr);
         return result;
+    }
+
+    // FP32 counterpart to SparseLinearLayer8's load_dense_codes -- see
+    // block4_load_dense_fp32's own docstring (delta_csr_memory.hpp) for why
+    // this takes raw VALUES (`weight_values`/`importance_values`), not
+    // quantization codes: float32 has no code to quantize into. Loads
+    // straight into block4 (weights.connections, the scattered side, is
+    // left at nnz=0), matching load_dense_codes' own "only touch the side
+    // being loaded" convention.
+    void load_dense_values(py::array_t<V> weight_values, py::array_t<V> importance_values) {
+        auto wb = weight_values.request(), ib = importance_values.request();
+        block4_load_dense_fp32<S, COL_TYPE>(weights, (const V*)wb.ptr, (const V*)ib.ptr,
+                                            static_cast<std::size_t>(n_inputs()),
+                                            static_cast<std::size_t>(n_outputs()));
+        weights.recompute_stats();
     }
 };
 
@@ -2037,6 +2086,47 @@ PYBIND11_MODULE(_cpu, m) {
                                &Block4View8::row_merge_overflow_bytes_dropped,
                                "Cumulative bytes of intended row content dropped by"
                                " row_merge_overflow_events, across every occurrence.");
+
+    // ── Block4View32 (FP32 counterpart -- DISLDOLayerV.block4) ──────────────────
+    py::class_<Block4View32>(m, "Block4View32")
+        .def_property_readonly("tiles", &Block4View32::tiles,
+                               "Number of block4 tiles currently promoted -- purely observational.")
+        .def_property_readonly("synapses", &Block4View32::synapses,
+                               "Number of synapses currently living in block4 (subset of nnz) --"
+                               " purely observational.")
+        .def_property("switch_point", &Block4View32::get_switch_point,
+                      &Block4View32::set_switch_point,
+                      "Tiles with <= switch_point live synapses may be packed into the"
+                      " sparse-encoded tile layout instead of staying fully dense (see"
+                      " block4.hpp: Block4Store32::switch_point, Block4Store32::maybe_compress)."
+                      " 0 disables compression entirely. Default BLOCK4_SPARSE_MAX_COUNT32 (14).")
+        .def_property_readonly("dropped_growth_events", &Block4View32::dropped_growth_events,
+                               "Count of backward/promotion value-updates to an existing tile that"
+                               " couldn't be persisted because growing its storage would have"
+                               " exceeded the memory budget -- declined (with the tile keeping its"
+                               " old value), not thrown, so training keeps running. Nonzero means"
+                               " some updates are being silently dropped under the current budget.")
+        .def_property_readonly("row_merge_overflow_events",
+                               &Block4View32::row_merge_overflow_events,
+                               "Count of backward() calls where a row's block4 write-back couldn't"
+                               " fit its full content within the row's existing headroom, even"
+                               " after evicting every low-importance synapse it could. Declined,"
+                               " not thrown -- the row's trailing tiles keep their pre-call"
+                               " content and training keeps running. Nonzero means this layer's"
+                               " max_row_weights genuinely needs expand_headroom_to() with a"
+                               " bigger budget.")
+        .def_property_readonly("row_merge_overflow_bytes_dropped",
+                               &Block4View32::row_merge_overflow_bytes_dropped,
+                               "Cumulative bytes of intended row content dropped by"
+                               " row_merge_overflow_events, across every occurrence.")
+        .def_property_readonly("used_bytes", &Block4View32::used_bytes,
+                               "Real bytes of ACTUAL tile content currently live. Compare against"
+                               " n_in*n_out*4 (float32) to see the real compression ratio at the"
+                               " current sparsity level.")
+        .def_property_readonly("alloc_bytes", &Block4View32::alloc_bytes,
+                               "Current capacity of the tile_data buffer -- used_bytes plus"
+                               " whatever per-row growth headroom is currently reserved but not"
+                               " yet live.");
 
     // ── SparseLinearLayer ───────────────────────────────────────────────────────────
 
@@ -3701,6 +3791,8 @@ PYBIND11_MODULE(_cpu, m) {
         .def_property_readonly("ptrs", &DISLDOLayerV::get_ptrs)
         .def("load_weights", &DISLDOLayerV::load_weights, py::arg("ptrs"), py::arg("indices"),
              py::arg("weights"), py::arg("importance"))
+        .def("load_dense_values", &DISLDOLayerV::load_dense_values, py::arg("weight_values"),
+             py::arg("importance_values"))
         .def_property_readonly("out_degree",
                                [](const DISLDOLayerV& self) {
                                    return py::array_t<DISLDOLayerV::S>(

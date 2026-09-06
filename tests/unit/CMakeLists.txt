@@ -112,13 +112,13 @@ option(ENABLE_FMA "Enable FMA support" ON)
 option(ENABLE_AVX2 "Enable AVX2 support" ON)
 
 if (ENABLE_AVX2)
-    message("Enableing AVX2, FMA, and AVX")
+    message("Enabling AVX2, FMA, and AVX")
     target_compile_options(sili_tests PRIVATE -march=haswell)
 elseif(ENABLE_FMA)
-    message("Enableing FMA and AVX") # and FMA
+    message("Enabling FMA and AVX") # and FMA
     target_compile_options(sili_tests PRIVATE -march=bdver3)
 elseif(ENABLE_AVX)
-    message("Enableing AVX only") # and FMA
+    message("Enabling AVX only") # and FMA
     target_compile_options(sili_tests PRIVATE -march=sandybridge)
 endif()
 
@@ -176,6 +176,10 @@ set(SILI_STANDALONE_TESTS
     test_fp8_block4_store
     test_disldo_block4_fp8
     test_disldo_block4_promotion_fp8
+    test_fp32_block4_sparse_tile
+    test_fp32_block4_store
+    test_disldo_block4_fp32
+    test_disldo_block4_promotion_fp32
     test_never_zero_live_quantize
     test_aqrs_additive_branch
     test_aqrs_rank_growth_shrink

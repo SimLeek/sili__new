@@ -138,8 +138,9 @@ void delta_csr_combined_to_absolute(
     const auto& L = dc.layout;
 
     if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> &&
-                  !std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-        // block4 is FP4/FP8-specific (see block4.hpp) -- always empty otherwise.
+                  !std::is_same_v<VALUES_TYPE, FP8BiValues> &&
+                  !std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+        // block4 is FP4/FP8/FP32-specific (see block4.hpp) -- always empty otherwise.
         delta_csr_to_absolute<SIZE_TYPE, VALUES_TYPE, COL_TYPE>(dc, out_ptrs, out_indices,
                                                                 out_weights, out_importance);
         return;
@@ -195,6 +196,18 @@ void delta_csr_combined_to_absolute(
                                 continue;
                             row_entries.push_back({COL_TYPE(col), fp8_decode_bits(w_byte),
                                                    fp8_decode_bits(imp_byte)});
+                        }
+                    } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                        // No decode -- Block4Tile32 already stores raw floats.
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const float w_val = tile.get_weight(li, lj);
+                            const float imp_val = tile.get_importance(li, lj);
+                            if (w_val == 0.0f && imp_val == 0.0f)
+                                continue;
+                            const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                            if (col >= L.cols)
+                                continue;
+                            row_entries.push_back({COL_TYPE(col), w_val, imp_val});
                         }
                     } else {
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
@@ -589,18 +602,20 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
                           std::size_t row, COL_TYPE col) {
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
-    if constexpr (!is_fp4 && !is_fp8) {
+    constexpr bool is_fp32 = std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>;
+    if constexpr (!is_fp4 && !is_fp8 && !is_fp32) {
         (void)weights;
         (void)row;
-        (void)col; // block4 is FP4/FP8-specific.
+        (void)col; // block4 is FP4/FP8/FP32-specific.
     } else {
         using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
         auto& dc = weights.connections;
         auto& L = dc.layout;
-        // Lazy self-init. Tile-count budget identical for both formats
-        // (max_values_bytes synapses at max fill of BLOCK4_TILE_SLOTS=16/
-        // tile); byte budget differs (BLOCK4_TILE_SLOTS8_BYTES=32/tile for
-        // FP8 vs BLOCK4_TILE_SLOTS=16 for FP4, matching
+        // Lazy self-init. Tile-count budget identical across all three
+        // formats (max_values_bytes synapses at max fill of
+        // BLOCK4_TILE_SLOTS=16/tile); byte budget differs
+        // (BLOCK4_TILE_SLOTS8_BYTES=32/tile for FP8, _SLOTS32_BYTES=128
+        // for FP32, BLOCK4_TILE_SLOTS=16 for FP4, matching
         // SparseLinearLayer8's own identical constructor-time sizing).
         if (weights.block4.block_layout.rows == 0 && L.rows > 0) {
             weights.block4.init(L.rows, L.cols);
@@ -620,11 +635,14 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
             // block4 budget set" too, not "compute something that
             // happens to overflow vector::reserve()."
             constexpr std::size_t kNoLimit = std::numeric_limits<std::size_t>::max();
+            const std::size_t tile_slot_bytes =
+                is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES
+                       : (is_fp32 ? BLOCK4_TILE_SLOTS32_BYTES : BLOCK4_TILE_SLOTS);
             const std::size_t tile_budget =
                 (dc.max_values_bytes == kNoLimit)
                     ? kNoLimit
                     : (std::max<std::size_t>(4, dc.max_values_bytes / BLOCK4_TILE_SLOTS) *
-                       (is_fp8 ? BLOCK4_TILE_SLOTS8_BYTES : BLOCK4_TILE_SLOTS));
+                       tile_slot_bytes);
             weights.block4.set_limits(dc.max_indices_bytes, tile_budget);
         }
         const uint32_t br = uint32_t(row / BLOCK4_TILE);
@@ -658,6 +676,10 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
                         if constexpr (is_fp8) {
                             tile.at_weight(li, lj) = fp8_quantize(w);
                             tile.at_importance(li, lj) = fp8_quantize(imp);
+                        } else if constexpr (is_fp32) {
+                            // No quantization at all -- raw float in, raw float out.
+                            tile.set_weight(li, lj, w);
+                            tile.set_importance(li, lj, imp);
                         } else {
                             tile.at(li, lj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                         }
@@ -712,6 +734,9 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
                 if constexpr (is_fp8) {
                     tile.at_weight(fli, flj) = fp8_quantize(w);
                     tile.at_importance(fli, flj) = fp8_quantize(imp);
+                } else if constexpr (is_fp32) {
+                    tile.set_weight(fli, flj, w);
+                    tile.set_importance(fli, flj, imp);
                 } else {
                     tile.at(fli, flj) = uint8_t(fp4_quantize(w) | (fp4_quantize(imp) << 4));
                 }
@@ -970,13 +995,72 @@ void block4_load_dense(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE
     }
 }
 
+// FP32 counterpart to block4_load_dense() above -- bulk-loads a fully dense
+// n_in x n_out matrix directly into block4 storage. A dedicated function
+// (not a branch bolted onto block4_load_dense) because float32 has no
+// "code" concept at all: the caller passes the actual weight/importance
+// VALUES directly (`const float*`, not `const uint8_t*` quantization
+// codes), so there's no quantize_fn, no output_scale fan-in correction
+// (nothing to correct FOR -- float32 has no quantization floor to escape),
+// and no is_fp4/is_fp8 branching (this function only makes sense for
+// DeltaCSRBiValues<float>). weights.connections (scattered side) is left
+// untouched, same convention as block4_load_dense.
+//
+// Does NOT call block4_expand_headroom() afterward -- same "FP4-only for
+// now" scoping block4_load_dense's own FP8 support has today (see its
+// docstring): a fully-dense load's tiles start (and, for any real
+// Gaussian-initialized weight matrix, essentially always stay) fully live,
+// so every tile packs to its max 128-byte dense size from the very first
+// write and never needs to grow again -- unlike a genuinely SPARSE
+// synaptogenesis-grown layer, headroom slack has no real use case here.
+template <typename SIZE_TYPE, typename COL_TYPE = uint32_t>
+void block4_load_dense_fp32(
+    SparseLinearWeightsDelta<SIZE_TYPE, DeltaCSRBiValues<float>, COL_TYPE>& weights,
+    const float* weight_values, const float* importance_values, std::size_t n_in,
+    std::size_t n_out) {
+    const uint32_t block_rows = uint32_t((n_in + BLOCK4_TILE - 1) / BLOCK4_TILE);
+    const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
+
+    weights.block4.init(n_in, n_out);
+    // See block4_load_dense's identical comment on the indices budget --
+    // same generous per-tile multiple to absorb block4_row_shift cascades
+    // during the row-by-row tile insertion below.
+    const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
+    const std::size_t tile_budget =
+        std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS32_BYTES;
+    weights.block4.set_limits(idx_budget, tile_budget);
+
+    for (uint32_t br = 0; br < block_rows; ++br) {
+        const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+        const std::size_t row_hi = std::min(row_lo + BLOCK4_TILE, n_in);
+        for (uint32_t bc = 0; bc < block_cols; ++bc) {
+            const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+            const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, n_out);
+            auto tile = weights.block4.get_or_create(br, bc);
+            for (std::size_t row = row_lo; row < row_hi; ++row) {
+                const uint32_t li = uint32_t(row - row_lo);
+                for (std::size_t col = col_lo; col < col_hi; ++col) {
+                    const uint32_t lj = uint32_t(col - col_lo);
+                    const std::size_t idx = row * n_out + col;
+                    tile.set_weight(li, lj, weight_values[idx]);
+                    tile.set_importance(li, lj, importance_values[idx]);
+                }
+            }
+            // tile's destructor (scope end) commits scratch_ back to the
+            // store, choosing dense vs sparse-packed encoding -- see
+            // block4_load_dense's identical comment.
+        }
+    }
+}
+
 // Pruning-only hook.
 // Throws if a target row has run out of blank space
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void block4_demote_tile(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
                         uint32_t br, uint32_t bc) {
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !is_fp8) {
+    constexpr bool is_fp32 = std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>;
+    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked> && !is_fp8 && !is_fp32) {
         (void)weights;
         (void)br;
         (void)bc;
@@ -1003,6 +1087,13 @@ void block4_demote_tile(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYP
                             continue;
                         w = fp8_decode_bits(w_byte);
                         imp = fp8_decode_bits(imp_byte);
+                    } else if constexpr (is_fp32) {
+                        const float w_val = tile.get_weight(li, lj);
+                        const float imp_val = tile.get_importance(li, lj);
+                        if (w_val == 0.0f && imp_val == 0.0f)
+                            continue;
+                        w = w_val;
+                        imp = imp_val;
                     } else {
                         const uint8_t byte = tile.at(li, lj);
                         if (byte == 0)
@@ -1083,7 +1174,8 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
     constexpr bool is_fp8 = std::is_same_v<VALUES_TYPE, FP8BiValues>;
-    constexpr bool has_block4 = is_fp4 || is_fp8;
+    constexpr bool is_fp32 = std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>;
+    constexpr bool has_block4 = is_fp4 || is_fp8 || is_fp32;
     auto& dc = weights.connections;
     const auto& L = dc.layout;
     if (L.rows == 0)
@@ -1109,6 +1201,9 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                     if constexpr (is_fp8) {
                         if (tile.at_weight(li, lj) == 0 && tile.at_importance(li, lj) == 0)
+                            continue;
+                    } else if constexpr (is_fp32) {
+                        if (tile.get_weight(li, lj) == 0.0f && tile.get_importance(li, lj) == 0.0f)
                             continue;
                     } else {
                         if (tile.at(li, lj) == 0)
@@ -1148,6 +1243,9 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
             if constexpr (is_fp8) {
                 exist_w[k] = fp8_decode_bits(tile.at_weight(li, lj));
                 exist_imp[k] = fp8_decode_bits(tile.at_importance(li, lj));
+            } else if constexpr (is_fp32) {
+                exist_w[k] = tile.get_weight(li, lj);
+                exist_imp[k] = tile.get_importance(li, lj);
             } else {
                 const uint8_t byte = tile.at(li, lj);
                 exist_w[k] = FP4_TABLE[byte & 0xFu];
@@ -1248,6 +1346,13 @@ bool delta_csr_synap_row_step(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, C
                             (tile.at_weight(li, lj) != 0 || tile.at_importance(li, lj) != 0)) {
                             tile.at_weight(li, lj) = 0;
                             tile.at_importance(li, lj) = 0;
+                            should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
+                        }
+                    } else if constexpr (is_fp32) {
+                        if (tile && (tile.get_weight(li, lj) != 0.0f ||
+                                     tile.get_importance(li, lj) != 0.0f)) {
+                            tile.set_weight(li, lj, 0.0f);
+                            tile.set_importance(li, lj, 0.0f);
                             should_demote = tile.count_live() < BLOCK4_PROMOTE_MIN_LIVE;
                         }
                     } else {
