@@ -588,6 +588,18 @@ class DISLDOLayer(_SparseLayerBase):
         scale_rank_max: int | None = None,
         additive_rank_max: int | None = None,
     ):
+        # dense=True's initial load goes straight into block4 (_preseed_dense
+        # below), which ignores max_weights entirely -- but block4 can later
+        # demote synapses into the SCATTERED array below, which max_weights
+        # DOES cap. A caller-supplied budget too small for that (e.g. a
+        # generic constant meant for genuinely sparse layers) silently
+        # starves demotion under dense mode. Mirrors DISLDOLayer32's same
+        # guard -- see docs/research/sparse_rnn.rst:disldo_layer_variants.
+        # NOT applied to empty_init: that mode's max_weights is a genuine,
+        # intentional sparse growth budget for synaptogenesis
+        # (_preseed_empty sizes per-row headroom from it), not a landmine.
+        if dense:
+            max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.SparseLinearLayer(in_features, out_features, max_weights, num_cpus)
         if empty_init:
             self._max_row_weights = _preseed_empty(self._c, in_features, out_features, max_weights)
@@ -1062,6 +1074,11 @@ class DISLDOLayer8(_SparseLayerBase):
         scale_rank_max: int | None = None,
         additive_rank_max: int | None = None,
     ):
+        # See DISLDOLayer's identical guard (fp4 sibling class) for why:
+        # dense=True's block4 preseed ignores max_weights, but later
+        # block4->scattered demotion doesn't.
+        if dense:
+            max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.SparseLinearLayer8(in_features, out_features, max_weights, num_cpus)
         if dense:
             self._max_row_weights = _preseed_dense(
