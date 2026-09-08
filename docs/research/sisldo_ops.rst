@@ -239,6 +239,108 @@ across batches, not reallocated per batch -- same reasoning as
 ``block4.hpp``'s own persistent scratch buffers: batch=1 real-time calls
 can't amortize repeated heap allocation.
 
+.. _sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8:
+
+``sisldo_forward``/``disldo_backward_sparse_grad``: FP4-only block4 gate
+silently zeroes dense=True fp32/fp8 layers
+------------------------------------------------------------------------
+
+*ID:* ``sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8``
+
+The ``if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>)`` guard on
+both the forward (this file, ~line 252) and backward (~line 739) block4
+branches was a deliberate, documented scoping choice when written --
+block4 itself was FP4-only at the time. Since then, block4 storage grew
+FP8 (``Block4Tile8``/``Store8``, tasks #90-96) and float32
+(``Block4Tile32``/``Store32``, tasks #391-398) variants, and neither of
+those got the same ``if constexpr`` branch. Nobody circled back to widen
+this gate or add a guard against the combination -- it just silently
+compiles to a no-op for those types, exactly as designed for the FP4-only
+case it was written for.
+
+**The consequence that wasn't previously connected**: a layer constructed
+with ``dense=True`` is, by design, 100% block4-resident (the initial load
+goes straight into block4 via ``load_dense_codes``, bypassing
+``max_weights``/scattered storage entirely -- see ``sparse_rnn.py``'s
+``_preseed_dense``/``_preseed_dense_fp32``). For such a layer, at
+``VALUES_TYPE != FP4BiPacked``, this function's scattered-side loop finds
+nothing (0 synapses live there) AND the block4 branch compiles to
+nothing -- so ``forward_sparse``/``backward_sparse`` on a dense=True
+float32 or FP8 layer returns EXACTLY ZERO regardless of input, with no
+error, warning, or NaN to signal it. Found via
+``sili_peridot``: an adaptive-sparsity MQAR curriculum run
+(``dense=True``, ``precision="fp32"``, ``x_r_target=0.9``) showed loss
+frozen bit-for-bit at ``ln(128)=4.852030277252197`` (the exact
+cross-entropy of a uniform 128-way distribution) for 45,000+ steps --
+traced directly to ``DISLDOLayer32.forward``'s CSR-input branch
+returning an all-zero output tensor for a real, well-formed, nonzero
+CSR input (``csr.nnz=9``, ``values.sum=-0.465``).
+
+This means activation-level sparsity (``x_r_target``/``dy_r_target``,
+and the older fixed-fraction ``input_sparsity_p``/``dy_sparsity_p`` --
+both route through this same forward_sparse/sisldo_forward function) has
+never actually worked for ``dense=True`` fp32 or FP8 layers, only for
+FP4. Fix direction: replace the hardcoded ``FP4_TABLE[byte & 0xFu]``
+decode (this file's block4 gather/scatter loops) with the
+type-generic ``ValueAccessor<VALUES_TYPE>`` pattern already used
+throughout the scattered-side code in this same file, mirroring how
+``linear_disldo.hpp``'s DENSE-path block4 kernel was made type-generic
+across FP4/FP8/float32 (tasks #197, #391-398) -- not a new design, a
+generalization of an existing one. Tracked as sili_peridot task #413.
+
+**Update -- fix landed, plus two independent pre-existing bugs found and
+fixed along the way.** ``sisldo_forward`` and
+``disldo_backward_sparse_grad``'s block4 branches are now type-generic
+(``decode_weight``/``decode_importance``/``encode_and_store`` lambdas,
+mirroring ``linear_disldo.hpp``'s ``if constexpr`` dispatch pattern), with
+a new TDD parity gate (``tests/unit/test_sisldo_disldo_parity_fp32.cpp``'s
+``run_config_block4``, ``tests/unit/test_sisldo_disldo_parity_fp8.cpp``,
+new file) asserting the sparse (CSR) path produces bit-close forward
+output, dx, post-update true weights, and full AQRS state matching the
+dense reference path exactly. Getting that gate green surfaced two
+further, genuinely pre-existing bugs unrelated to the FP4-only gate above:
+
+1. ``disldo_backward_sparse_grad``'s row-local workspace byte cursor
+   (``local_pos``) advanced using the bare FP4-only
+   ``block4_stored_tile_len`` free function for every ``VALUES_TYPE``,
+   instead of the type-correct ``..._len8``/``..._len32`` variant
+   (``block4.hpp`` defines three separate, non-interchangeable versions --
+   different tile byte widths and sparse-pack formats per storage type).
+   For any row with more than one live tile, this misaligned every FP8/
+   float32 tile after the first, corrupting decode of subsequent tiles in
+   that row. Fixed with a small type-dispatched ``tile_len_of`` lambda,
+   matching the file's existing ``decode_weight``-style dispatch
+   convention. This one was entirely new code (introduced by this same
+   generalization effort), not a latent bug in previously-shipped code.
+
+2. **Independently pre-existing, unrelated to this file entirely**:
+   ``linear_disldo.hpp``'s FP8 block4 backward write-back (both the SIMD
+   path and its scalar fallback) called ``fp8_quantize_stochastic``/
+   ``fp8_quantize_stochastic_live`` unconditionally, never checking the
+   ``StochasticRounding`` template parameter -- unlike the FP4 and
+   float32 branches in the same function, which already gate correctly.
+   This meant the "dense reference" arm of the new parity test (which
+   passes ``StochasticRounding=false``, expecting deterministic rounding)
+   was silently dithering every FP8 block4 weight write regardless, while
+   the sparse arm (``sisldo_ops.hpp``, correctly gated) rounded
+   deterministically -- producing per-cell divergences on the order of one
+   FP8 quantization step that superficially looked like column-index
+   swaps but were actually independent stochastic-vs-deterministic
+   rounding outcomes on the same underlying value. Fixed by adding the
+   same ``if constexpr (StochasticRounding)`` gate FP4/float32 already
+   have, using ``fp8_quantize``/``fp8_quantize_live`` for the deterministic
+   branch. This bug predates the FP4-only gate fix above entirely and
+   would have affected ANY FP8 block4 caller requesting deterministic
+   rounding, not just the sparse path -- e.g. any test or production
+   caller passing ``StochasticRounding=false`` to ``disldo_backward``
+   directly on a dense=True FP8 layer.
+
+Both fixes are covered by the new parity tests -- ``test_sisldo_disldo_
+parity_fp32``/``test_sisldo_disldo_parity_fp8`` are true bit-close TDD
+gates now (per sili_peridot's explicit directive: "sisldo with csr should
+match disldo with 0 value inputs so we can have bit exact tests"), not
+just loose-property checks. Full suite: 153/153 passing.
+
 .. _sisldo_forward.block4_incremental_walk_perf:
 
 ``sisldo_forward``: incremental tile walk avoids a redundant rescan

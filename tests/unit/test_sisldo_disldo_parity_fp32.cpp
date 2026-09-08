@@ -156,8 +156,117 @@ static void run_config() {
     }
 }
 
+// Block4-resident variant -- the real gap this test file used to have: its
+// own comment above (and the class docstring it was copied from) claimed
+// DISLDOLayer32's dense=True path was "never block4-resident, for this
+// VALUES_TYPE" -- true when this file was first written, but task #350
+// ("Build block4-equivalent dense-tile path for fp32/DISLDOLayerV") later
+// made dense=True go straight into block4 via _preseed_dense_fp32, and this
+// test was never updated to cover that. Direct, real consequence: sisldo_
+// forward/disldo_backward_sparse_grad's block4 branch was gated
+// `if constexpr FP4BiPacked`-only (a real, deliberate, but never-widened
+// scoping decision from when block4 was FP4-only) -- for VALUES_TYPE=float
+// this silently compiled to a no-op, meaning a dense=True fp32 layer fed a
+// CSR-typed (sparse-activation) input returned EXACTLY ZERO output, with no
+// error. Found via a real MQAR curriculum run (loss frozen at ln(128), the
+// exact cross-entropy of a uniform 128-way distribution, for 45,000+ steps).
+// See docs/research/sisldo_ops.rst:
+// sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8.
+static Weights make_weights_block4(const std::vector<float>& dense_w, std::size_t n_in,
+                                   std::size_t n_out) {
+    Weights w;
+    std::vector<SIZE_TYPE> ptrs(n_in + 1, 0);
+    std::vector<SIZE_TYPE> idx;
+    std::vector<float> wv, imp;
+    w.connections = delta_csr_from_absolute<SIZE_TYPE, VT, COL_TYPE>(
+        ptrs, idx, wv, imp, n_in, n_out, std::size_t(64), std::size_t(64));
+    std::vector<float> importance_values(n_in * n_out, 0.0f);
+    block4_load_dense_fp32<SIZE_TYPE, COL_TYPE>(w, dense_w.data(), importance_values.data(), n_in,
+                                                n_out);
+    w.out_degree.assign(n_out, SIZE_TYPE(n_in));
+    w.set_scale_rank(1);
+    w.output_scale_is_trainable = true;
+    return w;
+}
+
+static void run_config_block4() {
+    std::printf("--- config: fp32 (DeltaCSRBiValues<float>) [block4], base ---\n");
+    const std::size_t n_in = 8, n_out = 8; // BLOCK4_TILE-aligned (2x2 tiles)
+
+    std::vector<float> dense_w(n_in * n_out);
+    for (std::size_t i = 0; i < dense_w.size(); ++i)
+        dense_w[i] = 1.0f + 0.07f * float(i % 7);
+
+    std::vector<float> input(n_in, 0.0f), dy(n_out, 0.0f);
+    std::vector<SIZE_TYPE> in_idx, dy_idx;
+    std::vector<float> in_val, dy_val;
+    for (std::size_t r = 0; r < n_in; ++r) {
+        if (r % 3 == 2)
+            continue;
+        const float v = 0.3f + 0.1f * float(r);
+        input[r] = v;
+        in_idx.push_back(SIZE_TYPE(r));
+        in_val.push_back(v);
+    }
+    for (std::size_t c = 0; c < n_out; ++c) {
+        if (c % 4 == 3)
+            continue;
+        const float v = -0.2f + 0.05f * float(c);
+        dy[c] = v;
+        dy_idx.push_back(SIZE_TYPE(c));
+        dy_val.push_back(v);
+    }
+    auto in_csr = make_csr_input<SIZE_TYPE, float>(SIZE_TYPE(1), SIZE_TYPE(n_in),
+                                                   {0, SIZE_TYPE(in_idx.size())}, in_idx, in_val);
+    auto dy_csr = make_csr_input<SIZE_TYPE, float>(SIZE_TYPE(1), SIZE_TYPE(n_out),
+                                                   {0, SIZE_TYPE(dy_idx.size())}, dy_idx, dy_val);
+
+    Weights weights_dense = make_weights_block4(dense_w, n_in, n_out);
+    Weights weights_sparse = make_weights_block4(dense_w, n_in, n_out);
+
+    // ── Forward: outputs must match ────────────────────────────────────────
+    std::vector<float> y_dense(n_out, 0.0f), y_sparse(n_out, 0.0f);
+    disldo_forward<SIZE_TYPE, VT, COL_TYPE>(input.data(), 1, SIZE_TYPE(n_in), weights_dense,
+                                            y_dense.data(), 1);
+    sisldo_forward<SIZE_TYPE, VT, COL_TYPE>(in_csr, weights_sparse, y_sparse.data(), 1);
+    for (std::size_t c = 0; c < n_out; ++c)
+        CHECK(std::abs(y_dense[c] - y_sparse[c]) < 1e-4f,
+              "[block4] forward output[%zu] diverges: dense=%.6f sparse=%.6f", c, y_dense[c],
+              y_sparse[c]);
+
+    // ── Backward: dx must match ────────────────────────────────────────────
+    std::vector<float> dx_dense(n_in, 0.0f), dx_sparse(n_in, 0.0f);
+    std::vector<float> ni_d(n_in, 0.0f), ng_d(n_out, 0.0f);
+    std::vector<float> ni_s(n_in, 0.0f), ng_s(n_out, 0.0f);
+    const float lr = 0.05f;
+    disldo_backward<SIZE_TYPE, VT, COL_TYPE, RMSpropScalePolicy<float>, false, false>(
+        input.data(), 1, SIZE_TYPE(n_in), dy.data(), weights_dense, dx_dense.data(), ni_d.data(),
+        ng_d.data(), lr, 1);
+    disldo_backward_sparse_grad<SIZE_TYPE, VT, COL_TYPE, RMSpropScalePolicy<float>, false>(
+        input.data(), 1, weights_sparse, dy_csr, dx_sparse.data(), ni_s.data(), ng_s.data(), lr, 1);
+
+    for (std::size_t r = 0; r < n_in; ++r)
+        CHECK(std::abs(dx_dense[r] - dx_sparse[r]) < 1e-4f,
+              "[block4] dx[%zu] diverges: dense=%.6f sparse=%.6f", r, dx_dense[r], dx_sparse[r]);
+
+    // ── Post-update true weights must match ────────────────────────────────
+    for (std::size_t r = 0; r < n_in; ++r)
+        for (std::size_t c = 0; c < n_out; ++c) {
+            const uint32_t br = uint32_t(r / 4), bc = uint32_t(c / 4);
+            const uint32_t li = uint32_t(r % 4), lj = uint32_t(c % 4);
+            const float w_dense = weights_dense.block4.find(br, bc).get_weight(li, lj);
+            const float w_sparse = weights_sparse.block4.find(br, bc).get_weight(li, lj);
+            const float true_w_dense = w_dense * weights_dense.get_scale(r, c);
+            const float true_w_sparse = w_sparse * weights_sparse.get_scale(r, c);
+            CHECK(std::abs(true_w_dense - true_w_sparse) < 5e-4f,
+                  "[block4] true weight[%zu][%zu] diverges after update: dense=%.6f sparse=%.6f", r,
+                  c, true_w_dense, true_w_sparse);
+        }
+}
+
 int main() {
     run_config();
+    run_config_block4();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

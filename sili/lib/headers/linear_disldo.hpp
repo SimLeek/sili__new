@@ -903,13 +903,13 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     fp8_decode_bits(tdata[Block4Tile8::slot_index(li, 3)])};
                                 const value_type imp_decoded_arr8[BLOCK4_TILE] = {
                                     fp8_decode_bits(
-                                        tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 0)]),
+                                        tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, 0)]),
                                     fp8_decode_bits(
-                                        tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 1)]),
+                                        tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, 1)]),
                                     fp8_decode_bits(
-                                        tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 2)]),
+                                        tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, 2)]),
                                     fp8_decode_bits(
-                                        tdata[BLOCK4_TILE + Block4Tile8::slot_index(li, 3)])};
+                                        tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, 3)])};
 
                                 // value_scale_k(row,k) -- see FP4 branch's
                                 // identical comment above (mirrors it exactly,
@@ -1220,7 +1220,17 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         // -- see decode's comment above this
                                         // whole branch for the measured
                                         // reasoning (same conclusion applies
-                                        // to encode).
+                                        // to encode). StochasticRounding
+                                        // gate added -- this previously
+                                        // called the _stochastic variants
+                                        // unconditionally, ignoring the
+                                        // template flag entirely (unlike the
+                                        // FP4/FP32 branches, which already
+                                        // gated it); with
+                                        // StochasticRounding=false this
+                                        // silently dithered every write,
+                                        // diverging from sisldo_ops.hpp's
+                                        // correctly-gated scalar path.
                                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                             for (std::size_t k = 0; k < rank; ++k) {
                                                 mcol_at(col4_8[lj], k) += mcol4_8_rank[k][lj];
@@ -1232,16 +1242,31 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                             // declaration comment above: a cell
                                             // that was never a real synapse must
                                             // stay allowed to round to 0.
-                                            if (was_live4_8[lj]) {
-                                                tdata[slot] =
-                                                    fp8_quantize_stochastic_live(cw4_8[lj]);
-                                                tdata[BLOCK4_TILE + slot] =
-                                                    fp8_quantize_stochastic_live_nonneg(
-                                                        ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                            if constexpr (StochasticRounding) {
+                                                if (was_live4_8[lj]) {
+                                                    tdata[slot] =
+                                                        fp8_quantize_stochastic_live(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_stochastic_live_nonneg(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                } else {
+                                                    tdata[slot] =
+                                                        fp8_quantize_stochastic(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_stochastic(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                }
                                             } else {
-                                                tdata[slot] = fp8_quantize_stochastic(cw4_8[lj]);
-                                                tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(
-                                                    ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                if (was_live4_8[lj]) {
+                                                    tdata[slot] = fp8_quantize_live(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_live(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                } else {
+                                                    tdata[slot] = fp8_quantize(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] = fp8_quantize(
+                                                        ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                }
                                             }
                                         }
                                         tile_dirty = true;
@@ -1255,16 +1280,31 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                     mcol4_8_rank_contrib[k][lj];
                                             }
                                             const uint32_t slot = Block4Tile8::slot_index(li, lj);
-                                            if (was_live4_8[lj]) {
-                                                tdata[slot] =
-                                                    fp8_quantize_stochastic_live(cw4_8[lj]);
-                                                tdata[BLOCK4_TILE + slot] =
-                                                    fp8_quantize_stochastic_live_nonneg(
-                                                        ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                            if constexpr (StochasticRounding) {
+                                                if (was_live4_8[lj]) {
+                                                    tdata[slot] =
+                                                        fp8_quantize_stochastic_live(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_stochastic_live_nonneg(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                } else {
+                                                    tdata[slot] =
+                                                        fp8_quantize_stochastic(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_stochastic(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                }
                                             } else {
-                                                tdata[slot] = fp8_quantize_stochastic(cw4_8[lj]);
-                                                tdata[BLOCK4_TILE + slot] = fp8_quantize_stochastic(
-                                                    ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                if (was_live4_8[lj]) {
+                                                    tdata[slot] = fp8_quantize_live(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                        fp8_quantize_live(
+                                                            ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                } else {
+                                                    tdata[slot] = fp8_quantize(cw4_8[lj]);
+                                                    tdata[BLOCK4_TILE_SLOTS + slot] = fp8_quantize(
+                                                        ci4_8[lj] / combined_imp_scale4_8[lj]);
+                                                }
                                             }
                                             tile_dirty = true;
                                         }
@@ -1292,8 +1332,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                     const value_type combined_imp_scale = imp_scale * out_imp_scale;
                                     const value_type cw_orig = fp8_decode_bits(tdata[slot]);
                                     const value_type cw_start = cw_orig * combined_scale;
-                                    value_type ci = fp8_decode_bits(tdata[BLOCK4_TILE + slot]) *
-                                                    combined_imp_scale;
+                                    value_type ci =
+                                        fp8_decode_bits(tdata[BLOCK4_TILE_SLOTS + slot]) *
+                                        combined_imp_scale;
 
                                     std::vector<value_type> mcol_local_k(rank, value_type(0));
                                     std::vector<double> mrow_local_k(rank, 0.0);
@@ -1371,19 +1412,38 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         // still holds the PRE-update bytes here.
                                         const bool was_live =
                                             (cw_orig != value_type(0)) ||
-                                            (fp8_decode_bits(tdata[BLOCK4_TILE + slot]) !=
+                                            (fp8_decode_bits(tdata[BLOCK4_TILE_SLOTS + slot]) !=
                                              value_type(0));
-                                        if (was_live) {
-                                            tdata[slot] =
-                                                fp8_quantize_stochastic_live(cw / combined_scale);
-                                            tdata[BLOCK4_TILE + slot] =
-                                                fp8_quantize_stochastic_live_nonneg(
-                                                    ci / combined_imp_scale);
+                                        // StochasticRounding gate -- see the
+                                        // SIMD branch above for why this was
+                                        // missing (previously always
+                                        // dithered regardless of the
+                                        // template flag).
+                                        if constexpr (StochasticRounding) {
+                                            if (was_live) {
+                                                tdata[slot] = fp8_quantize_stochastic_live(
+                                                    cw / combined_scale);
+                                                tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                    fp8_quantize_stochastic_live_nonneg(
+                                                        ci / combined_imp_scale);
+                                            } else {
+                                                tdata[slot] =
+                                                    fp8_quantize_stochastic(cw / combined_scale);
+                                                tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                    fp8_quantize_stochastic(ci /
+                                                                            combined_imp_scale);
+                                            }
                                         } else {
-                                            tdata[slot] =
-                                                fp8_quantize_stochastic(cw / combined_scale);
-                                            tdata[BLOCK4_TILE + slot] =
-                                                fp8_quantize_stochastic(ci / combined_imp_scale);
+                                            if (was_live) {
+                                                tdata[slot] =
+                                                    fp8_quantize_live(cw / combined_scale);
+                                                tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                    fp8_quantize_live(ci / combined_imp_scale);
+                                            } else {
+                                                tdata[slot] = fp8_quantize(cw / combined_scale);
+                                                tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                    fp8_quantize(ci / combined_imp_scale);
+                                            }
                                         }
                                         tile_dirty = true;
                                     }
