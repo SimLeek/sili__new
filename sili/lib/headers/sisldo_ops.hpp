@@ -249,7 +249,14 @@ void sisldo_forward(
     // ── block4 contribution ─────────────────────────────────────────────────
     // Real bug fixed: block4-resident synapses were never read here. See
     // docs/research/sisldo_ops.rst:sisldo_forward.block4_gather_design.
-    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    // Type-generic since docs/research/sisldo_ops.rst:
+    // sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8 -- this
+    // used to be gated `if constexpr FP4BiPacked` only, silently zeroing
+    // dense=True fp32/fp8 layers (their block4-resident synapses were never
+    // read at all, and never scattered either). No `if constexpr` gate
+    // needed at this level: mirrors disldo_forward's own block4 branch in
+    // linear_disldo.hpp, which was never type-gated in the first place.
+    {
         if (weights.block4.n_tiles() > 0) {
             const auto& BL4 = weights.block4.block_layout;
 
@@ -393,10 +400,40 @@ void sisldo_forward(
                                         // Per-li skip: zeroed input needs no decode.
                                         if (local[li] == value_type(0))
                                             continue;
-                                        const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
-                                        if (byte == 0)
-                                            continue;
-                                        const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        // Type-generic decode -- see
+                                        // docs/research/sisldo_ops.rst:
+                                        // sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8.
+                                        // Read-only (forward never updates
+                                        // block4 weight/importance inline),
+                                        // so this is decode-only, unlike
+                                        // disldo_backward's fuller per-type
+                                        // update branches.
+                                        value_type w_decoded;
+                                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                                            const uint8_t byte =
+                                                tdata[Block4Tile8::slot_index(li, lj)];
+                                            if (byte == 0)
+                                                continue;
+                                            w_decoded = value_type(fp8_decode_bits(byte));
+                                        } else if constexpr (std::is_same_v<
+                                                                 VALUES_TYPE,
+                                                                 DeltaCSRBiValues<float>>) {
+                                            float w;
+                                            std::memcpy(&w,
+                                                        tdata +
+                                                            sizeof(float) *
+                                                                Block4Tile32::slot_index(li, lj),
+                                                        sizeof(w));
+                                            if (w == 0.0f)
+                                                continue;
+                                            w_decoded = value_type(w);
+                                        } else {
+                                            const uint8_t byte =
+                                                tdata[Block4Tile::slot_index(li, lj)];
+                                            if (byte == 0)
+                                                continue;
+                                            w_decoded = FP4_TABLE[byte & 0xFu];
+                                        }
                                         // Rank-N scale.
                                         const value_type w_true =
                                             w_decoded * weights.get_scale(row, col);
@@ -736,7 +773,120 @@ void disldo_backward_sparse_grad(
 
     // ── block4 contribution ─────────────────────────────────────────────────
     // See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_backward_design.
-    if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    // Type-generic since docs/research/sisldo_ops.rst:
+    // sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8 -- this
+    // used to be gated `if constexpr FP4BiPacked` only (like sisldo_forward's
+    // identical gate above), silently zeroing dense=True fp32/fp8 layers'
+    // block4 weight update (dx=0, weights never touched). No `if constexpr`
+    // gate needed at this level, mirroring disldo_backward's own
+    // (never-gated) block4 branch in linear_disldo.hpp.
+    {
+        // Per-tile scratch buffer size differs by storage type (FP4: 1 byte/
+        // slot, dual-nibble weight+importance packed together; FP8: 1 byte/
+        // slot, separate weight/importance halves; float32: 4 bytes/slot,
+        // separate weight/importance halves, no codec).
+        constexpr std::size_t SCRATCH_BYTES = std::is_same_v<VALUES_TYPE, FP8BiValues>
+                                                  ? std::size_t(BLOCK4_TILE_SLOTS8_BYTES)
+                                              : std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>
+                                                  ? std::size_t(BLOCK4_TILE_SLOTS32_BYTES)
+                                                  : std::size_t(BLOCK4_TILE_SLOTS);
+        // Scalar per-(li,lj) decode -- this file's own established
+        // (non-SIMD) convention, unlike linear_disldo.hpp's SIMD Block4Vec
+        // approach; matches sisldo_forward's identical generalization above.
+        auto decode_weight = [](const uint8_t* buf, uint32_t li, uint32_t lj) -> value_type {
+            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                return value_type(fp8_decode_bits(buf[Block4Tile8::slot_index(li, lj)]));
+            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                float w;
+                std::memcpy(&w, buf + sizeof(float) * Block4Tile32::slot_index(li, lj), sizeof(w));
+                return value_type(w);
+            } else {
+                return FP4_TABLE[buf[Block4Tile::slot_index(li, lj)] & 0xFu];
+            }
+        };
+        auto decode_importance = [](const uint8_t* buf, uint32_t li, uint32_t lj) -> value_type {
+            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                return value_type(
+                    fp8_decode_bits(buf[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]));
+            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                float v;
+                std::memcpy(&v,
+                            buf + sizeof(float) *
+                                      (BLOCK4_TILE_SLOTS + Block4Tile32::slot_index(li, lj)),
+                            sizeof(v));
+                return value_type(v);
+            } else {
+                return FP4_TABLE[(buf[Block4Tile::slot_index(li, lj)] >> 4) & 0xFu];
+            }
+        };
+        // Encodes+stores the post-update (weight, importance) pair into
+        // scratch, returning the ACTUAL stored importance (post-rounding)
+        // for the importance-stat accumulators below. was_live gates the
+        // never-zero live quantizer for FP4/FP8 (a real synapse must never
+        // get silently zero-locked by its own quantization floor); float32
+        // has no quantization floor to escape, so no gating needed there
+        // (mirrors disldo_backward's own float32 branch, which drops both
+        // the live-quantize distinction and was_live entirely).
+        auto encode_and_store = [](uint8_t* buf, uint32_t li, uint32_t lj, value_type quant,
+                                   value_type imp_ratio, bool was_live) -> value_type {
+            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                uint8_t new_w_code, new_imp_code;
+                if constexpr (StochasticRounding) {
+                    new_w_code = was_live ? fp8_quantize_stochastic_live(quant)
+                                          : fp8_quantize_stochastic(quant);
+                    new_imp_code = was_live ? fp8_quantize_stochastic_live_nonneg(imp_ratio)
+                                            : fp8_quantize_stochastic(imp_ratio);
+                } else {
+                    new_w_code = was_live ? fp8_quantize_live(quant) : fp8_quantize(quant);
+                    new_imp_code =
+                        was_live ? fp8_quantize_live(imp_ratio) : fp8_quantize(imp_ratio);
+                }
+                buf[Block4Tile8::slot_index(li, lj)] = new_w_code;
+                buf[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)] = new_imp_code;
+                return value_type(fp8_decode_bits(new_imp_code));
+            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                const float new_w = float(quant);
+                const float new_imp = float(imp_ratio);
+                std::memcpy(buf + sizeof(float) * Block4Tile32::slot_index(li, lj), &new_w,
+                            sizeof(new_w));
+                std::memcpy(buf + sizeof(float) *
+                                      (BLOCK4_TILE_SLOTS + Block4Tile32::slot_index(li, lj)),
+                            &new_imp, sizeof(new_imp));
+                return value_type(new_imp);
+            } else {
+                uint8_t new_w_code, new_imp_code;
+                if constexpr (StochasticRounding) {
+                    new_w_code = was_live ? fp4_quantize_stochastic_live(quant)
+                                          : fp4_quantize_stochastic(quant);
+                    new_imp_code = was_live ? fp4_quantize_stochastic_live_nonneg(imp_ratio)
+                                            : fp4_quantize_stochastic(imp_ratio);
+                } else {
+                    new_w_code = was_live ? fp4_quantize_live(quant) : fp4_quantize(quant);
+                    new_imp_code =
+                        was_live ? fp4_quantize_live(imp_ratio) : fp4_quantize(imp_ratio);
+                }
+                buf[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
+                return FP4_TABLE[new_imp_code];
+            }
+        };
+        // Type-dispatched stored-tile-length lookup for the row-local
+        // workspace byte cursor below. Storage layout (and therefore
+        // encoded tile length) differs per VALUES_TYPE -- FP4's
+        // block4_stored_tile_len is NOT interchangeable with FP8's _len8 or
+        // float32's _len32 (different tile byte widths/sparse-pack
+        // formats). Calling the bare FP4 version unconditionally here
+        // previously misaligned `local_pos` for every FP8/float32 tile
+        // after the first in a row, corrupting decode of subsequent tiles.
+        auto tile_len_of = [](bool is_sp, const uint8_t* b) -> std::size_t {
+            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                return block4_stored_tile_len8(is_sp, b);
+            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                return block4_stored_tile_len32(is_sp, b);
+            } else {
+                return block4_stored_tile_len(is_sp, b);
+            }
+        };
+
         if (weights.block4.n_tiles() > 0) {
             const auto& BL4 = weights.block4.block_layout;
             const std::size_t tiles_r = BL4.rows;
@@ -842,8 +992,7 @@ void disldo_backward_sparse_grad(
                                         const std::size_t col = window_lo + lj;
                                         if (col >= out_cols)
                                             continue;
-                                        const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
-                                        const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        const value_type w_decoded = decode_weight(tdata, li, lj);
                                         // Rank-N, matches the scattered read-only path.
                                         const value_type S = weights.get_scale(row, col);
                                         const value_type w = w_decoded * S;
@@ -886,7 +1035,7 @@ void disldo_backward_sparse_grad(
 
                             const std::size_t this_local_pos = local_pos;
                             if (any) {
-                                uint8_t scratch[BLOCK4_TILE_SLOTS];
+                                uint8_t scratch[SCRATCH_BYTES];
                                 weights.block4.unpack_workspace_tile(ws, e, this_local_pos,
                                                                      scratch);
                                 bool dirty = false;
@@ -914,9 +1063,7 @@ void disldo_backward_sparse_grad(
                                         if (col >= out_cols)
                                             continue;
 
-                                        const uint8_t byte =
-                                            scratch[Block4Tile::slot_index(li, lj)];
-                                        const value_type w_decoded = FP4_TABLE[byte & 0xFu];
+                                        const value_type w_decoded = decode_weight(scratch, li, lj);
                                         // Rank-N (task #331): S = weights.get_scale(row, col),
                                         // matching the scattered write path's identical swap --
                                         // threading S through SynapsePolicy::update_cw (code-space)
@@ -932,7 +1079,7 @@ void disldo_backward_sparse_grad(
                                         const value_type combined_imp_scale =
                                             imp_scale * out_imp_scale;
                                         const value_type imp_decoded =
-                                            FP4_TABLE[(byte >> 4) & 0xFu];
+                                            decode_importance(scratch, li, lj);
                                         const value_type grad = dy_val * in_val;
                                         value_type ci = imp_decoded * combined_imp_scale;
                                         // Additive contrib combination, matching the scattered path
@@ -947,29 +1094,17 @@ void disldo_backward_sparse_grad(
                                             max_abs_delta, scale_invariant);
                                         // was_live gate -- see
                                         // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
-                                        const bool was_live = (byte != 0);
+                                        // Equivalent to FP4's old `byte != 0` check: a packed
+                                        // FP4 byte is 0 iff BOTH nibbles decode to 0.0.
+                                        const bool was_live = (w_decoded != value_type(0)) ||
+                                                              (imp_decoded != value_type(0));
                                         const value_type imp_ratio = ci / combined_imp_scale;
-                                        uint8_t new_w_code, new_imp_code;
-                                        if constexpr (StochasticRounding) {
-                                            new_w_code = was_live
-                                                             ? fp4_quantize_stochastic_live(quant)
-                                                             : fp4_quantize_stochastic(quant);
-                                            new_imp_code =
-                                                was_live
-                                                    ? fp4_quantize_stochastic_live_nonneg(imp_ratio)
-                                                    : fp4_quantize_stochastic(imp_ratio);
-                                        } else {
-                                            new_w_code = was_live ? fp4_quantize_live(quant)
-                                                                  : fp4_quantize(quant);
-                                            new_imp_code = was_live ? fp4_quantize_live(imp_ratio)
-                                                                    : fp4_quantize(imp_ratio);
-                                        }
-                                        scratch[Block4Tile::slot_index(li, lj)] =
-                                            uint8_t((new_imp_code << 4) | new_w_code);
+                                        const value_type actual_imp =
+                                            encode_and_store(scratch, li, lj, quant, imp_ratio,
+                                                             was_live) *
+                                            combined_imp_scale;
                                         dirty = true;
 
-                                        const value_type actual_imp =
-                                            FP4_TABLE[new_imp_code] * combined_imp_scale;
                                         const value_type stored_imp =
                                             imp_decoded * combined_imp_scale;
                                         batch_sum_abs_new +=
@@ -1019,20 +1154,31 @@ void disldo_backward_sparse_grad(
                                     weights.block4.commit_dirty_tile_in_workspace(
                                         ws, e, this_local_pos, scratch);
                             }
-                            local_pos +=
-                                block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_local_pos]);
+                            local_pos += tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
                         } // tiles in this row
 
                         // Merge back -- see
                         // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
                         weights.block4.merge_row_workspace(
                             br, ws,
-                            [&](std::size_t ev_row, std::size_t ev_col,
-                                uint8_t ev_imp_code) -> double {
+                            // Generic lambda: each store's own merge_row_workspace passes a
+                            // different eviction-code type (uint8_t for FP4/FP8, float for
+                            // float32 -- see Block4Store32::merge_row_workspace, which has no
+                            // code concept at all to pass).
+                            [&](std::size_t ev_row, std::size_t ev_col, auto ev_imp_raw) -> double {
                                 const value_type imp_scale = weights.get_importance_scale(ev_row);
                                 const value_type out_imp_scale =
                                     weights.get_output_importance_scale(ev_col);
-                                return static_cast<double>(FP4_TABLE[ev_imp_code & 0xFu]) *
+                                value_type decoded_imp;
+                                if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                                    decoded_imp = value_type(fp8_decode_bits(ev_imp_raw));
+                                } else if constexpr (std::is_same_v<VALUES_TYPE,
+                                                                    DeltaCSRBiValues<float>>) {
+                                    decoded_imp = value_type(ev_imp_raw);
+                                } else {
+                                    decoded_imp = FP4_TABLE[ev_imp_raw & 0xFu];
+                                }
+                                return static_cast<double>(decoded_imp) *
                                        static_cast<double>(imp_scale) *
                                        static_cast<double>(out_imp_scale);
                             });
