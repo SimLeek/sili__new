@@ -169,83 +169,132 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 // Resolved once per tile, not once per .at() call. See
                 // Block4TileHandle::raw_data().
                 const uint8_t* tdata = tile.raw_data();
-                // Decode via block4_vec_decode_fp4 (bit-shift), not
-                // FP4_TABLE[code] gathers -- and LJ is templated
-                // (compile-time constant), not a runtime loop, since GCC
-                // could not vectorize the runtime version at all. See
-                // disldo_forward.decode_bitshift_vs_table in
-                // docs/research/linear_disldo.rst for the measured
-                // rationale, including why the scalar-table result that
-                // helped backward's decode did NOT transfer here.
-                auto process_col = [&]<uint32_t LJ>() {
-                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + LJ;
-                    if (col >= n_out)
-                        return;
+                if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                    // AVX2 widening: FP32 has no decode step (Block4Tile32's
+                    // weight half already stores 4 raw, contiguous floats
+                    // per column), and two adjacent columns (LJ0,LJ0+1) are
+                    // laid out back-to-back in tdata (slot_index(li,lj) =
+                    // lj*4+li), so ONE 32-byte memcpy loads BOTH columns'
+                    // weights as a single 8-wide vector. Both columns also
+                    // read the exact same 4 input rows (br*4..br*4+4, fixed
+                    // per tile), so the per-batch dot-product gather is
+                    // shared too -- this turns what was two separate 4-wide
+                    // (128-bit) multiply-accumulates into one 8-wide
+                    // (256-bit) op. See docs/research/linear_disldo.rst:
+                    // disldo_forward.fp32_block4_avx2_column_pairing.
+                    static_assert(BLOCK4_TILE == 4,
+                                  "column pairing below assumes exactly 4 columns (2 pairs)");
+                    auto process_pair = [&]<uint32_t LJ0>() {
+                        constexpr uint32_t LJ1 = LJ0 + 1;
+                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                        const bool have0 = col0 < n_out;
+                        const bool have1 =
+                            col1 < n_out; // have0==false implies have1==false (col1>col0)
+                        if (!have0)
+                            return;
 
-                    // FP8 dispatch: Block4Tile8 is a full byte/slot (no
-                    // nibble mask), decoded via E4M3. FP32 dispatch: no
-                    // decode at all -- Block4Tile32's weight half already
-                    // stores 4 raw, contiguous floats for slots
-                    // (0,LJ)..(3,LJ) (slot_index(li,LJ)=LJ*4+li), so a
-                    // single memcpy IS the load, matching block4_vec_load's
-                    // own "unaligned-safe load" idiom directly instead of
-                    // going through it via a reinterpret_cast<float*> of a
-                    // uint8_t* (that would form a typed pointer to
-                    // dereference indirectly -- this avoids it entirely by
-                    // memcpy'ing straight into the Block4Vec, exactly what
-                    // block4_vec_load's own body does).
-                    Block4Vec w_decoded;
-                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                        const Block4VecU w_codes = {
-                            uint32_t(tdata[Block4Tile8::slot_index(0, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(1, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(2, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(3, LJ)])};
-                        w_decoded = block4_vec_decode_fp8(w_codes);
-                    } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                        std::memcpy(&w_decoded,
-                                    tdata + sizeof(float) * Block4Tile32::slot_index(0, LJ),
-                                    sizeof(w_decoded));
-                    } else {
-                        const Block4VecU w_codes = {
-                            uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
-                        w_decoded = block4_vec_decode_fp4(w_codes);
-                    }
-                    const value_type w_decoded_arr[BLOCK4_TILE] = {
-                        value_type(w_decoded[0]), value_type(w_decoded[1]),
-                        value_type(w_decoded[2]), value_type(w_decoded[3])};
+                        Block8Vec w_decoded8;
+                        std::memcpy(&w_decoded8,
+                                    tdata + sizeof(float) * Block4Tile32::slot_index(0, LJ0),
+                                    sizeof(w_decoded8));
 
-                    value_type w4[BLOCK4_TILE];
-                    std::size_t row_idx[BLOCK4_TILE];
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                        if (row < n_in) {
-                            w4[li] =
-                                w_decoded_arr[li] * weights.get_scale(row, col); // rank-N scale
-                            row_idx[li] = row;
-                        } else {
-                            w4[li] = value_type(0);
-                            row_idx[li] = 0;
+                        std::size_t row_idx[BLOCK4_TILE];
+                        Block8Vec s8;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                            row_idx[li] = row < n_in ? row : 0;
+                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                               : value_type(0);
                         }
-                    }
+                        const Block8Vec w8 = w_decoded8 * s8;
 
-                    for (SIZE_TYPE b = 0; b < batch; ++b) {
-                        value_type acc = value_type(0);
-                        const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
-                            acc += w4[li] * in_row[row_idx[li]];
-                        mo[static_cast<std::size_t>(b) * n_out + col] += acc;
-                    }
-                };
-                process_col.template operator()<0>();
-                process_col.template operator()<1>();
-                process_col.template operator()<2>();
-                process_col.template operator()<3>();
-                static_assert(BLOCK4_TILE == 4,
-                              "process_col above is hand-unrolled for exactly 4 columns");
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type* in_row =
+                                input + static_cast<std::size_t>(b) * in_cols;
+                            Block8Vec in8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const value_type iv = in_row[row_idx[li]];
+                                in8[li] = iv;
+                                in8[li + 4] = iv;
+                            }
+                            const Block8Vec prod = w8 * in8;
+                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                prod[0] + prod[1] + prod[2] + prod[3];
+                            if (have1)
+                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                    prod[4] + prod[5] + prod[6] + prod[7];
+                        }
+                    };
+                    process_pair.template operator()<0>();
+                    process_pair.template operator()<2>();
+                } else {
+                    // Decode via block4_vec_decode_fp4 (bit-shift), not
+                    // FP4_TABLE[code] gathers -- and LJ is templated
+                    // (compile-time constant), not a runtime loop, since GCC
+                    // could not vectorize the runtime version at all. See
+                    // disldo_forward.decode_bitshift_vs_table in
+                    // docs/research/linear_disldo.rst for the measured
+                    // rationale, including why the scalar-table result that
+                    // helped backward's decode did NOT transfer here.
+                    auto process_col = [&]<uint32_t LJ>() {
+                        const std::size_t col = std::size_t(bc) * BLOCK4_TILE + LJ;
+                        if (col >= n_out)
+                            return;
+
+                        // FP8 dispatch: Block4Tile8 is a full byte/slot (no
+                        // nibble mask), decoded via E4M3.
+                        Block4Vec w_decoded;
+                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                            const Block4VecU w_codes = {
+                                uint32_t(tdata[Block4Tile8::slot_index(0, LJ)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(1, LJ)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(2, LJ)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(3, LJ)])};
+                            w_decoded = block4_vec_decode_fp8(w_codes);
+                        } else {
+                            const Block4VecU w_codes = {
+                                uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
+                            w_decoded = block4_vec_decode_fp4(w_codes);
+                        }
+                        const value_type w_decoded_arr[BLOCK4_TILE] = {
+                            value_type(w_decoded[0]), value_type(w_decoded[1]),
+                            value_type(w_decoded[2]), value_type(w_decoded[3])};
+
+                        value_type w4[BLOCK4_TILE];
+                        std::size_t row_idx[BLOCK4_TILE];
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                            if (row < n_in) {
+                                w4[li] =
+                                    w_decoded_arr[li] * weights.get_scale(row, col); // rank-N scale
+                                row_idx[li] = row;
+                            } else {
+                                w4[li] = value_type(0);
+                                row_idx[li] = 0;
+                            }
+                        }
+
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            value_type acc = value_type(0);
+                            const value_type* in_row =
+                                input + static_cast<std::size_t>(b) * in_cols;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                                acc += w4[li] * in_row[row_idx[li]];
+                            mo[static_cast<std::size_t>(b) * n_out + col] += acc;
+                        }
+                    };
+                    process_col.template operator()<0>();
+                    process_col.template operator()<1>();
+                    process_col.template operator()<2>();
+                    process_col.template operator()<3>();
+                    static_assert(BLOCK4_TILE == 4,
+                                  "process_col above is hand-unrolled for exactly 4 columns");
+                }
             }
         }
         for (int t = 0; t < num_cpus; ++t) {

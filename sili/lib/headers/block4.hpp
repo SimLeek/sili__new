@@ -41,6 +41,15 @@ using Block4VecU =
 static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float),
               "Block4Vec width must match BLOCK4_TILE");
 
+// 8-wide (256-bit, AVX2 width) analog of Block4Vec -- combines two
+// block4 tiles'/columns' worth of multiply-accumulate work into one op
+// where they share the same underlying input-row gather (same
+// block-row). Used by disldo_forward's FP32 block4 path; see
+// linear_disldo.hpp: disldo_forward.fp32_block4_avx2_column_pairing.
+using Block8Vec = float __attribute__((__vector_size__(2 * SILI_BLOCK4_TILE_SIZE * sizeof(float))));
+static_assert(sizeof(Block8Vec) == 2 * BLOCK4_TILE * sizeof(float),
+              "Block8Vec width must be double BLOCK4_TILE");
+
 inline Block4Vec block4_vec_load(const float* p) {
     Block4Vec v;
     std::memcpy(&v, p, sizeof(v)); // unaligned-safe load

@@ -233,6 +233,58 @@ branch. Everything past this point (row-scale multiply, batch
 accumulation) is identical float32 math regardless of storage width. The
 FP4 branch is byte-for-byte the pre-existing code, untouched.
 
+.. _disldo_forward.fp32_block4_avx2_column_pairing:
+
+FP32 block4: AVX2 column pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp32_block4_avx2_column_pairing``
+
+Float32 has no decode step at all (``Block4Tile32``'s weight half already
+stores 4 raw, contiguous floats per column), so unlike the FP4/FP8
+branches, there's nothing for a wider decode to buy here -- the real
+SIMD-arithmetic opportunity is the scale-multiply and the per-batch
+dot-product accumulate, both previously plain 4-wide scalar loops.
+
+Two adjacent columns of the SAME tile (``LJ0``, ``LJ0+1``) read the exact
+same 4 input rows (``br*4..br*4+4`` -- fixed per tile) and are laid out
+back-to-back in ``tdata`` (``slot_index(li,lj) = lj*4+li``, so column
+``LJ0``'s 4 floats end exactly where ``LJ0+1``'s begin). That means ONE
+32-byte memcpy loads both columns' weights as a single 8-wide
+``Block8Vec``, the row-scale gather can build one 8-wide scale vector
+(zeroing the upper half when the second column is out of bounds -- true
+whenever ``col0 < col1`` and only ``col0`` survives an ``n_out`` boundary,
+which is the only partial case since ``col1 = col0+1``), and the per-batch
+inner loop gathers the tile's 4 input values ONCE, duplicates them into
+both halves of an 8-wide vector, and does one 256-bit multiply followed
+by a split horizontal sum (lanes 0-3 -> column 0's output, lanes 4-7 ->
+column 1's). ``BLOCK4_TILE == 4`` makes this exact -- two pairs, no
+remainder -- so ``process_pair`` is called with ``LJ0 in {0, 2}``, mirroring
+the existing 4-way ``process_col`` unroll it replaces for this value type
+only (FP4/FP8 keep the original ``process_col`` path, untouched, in the
+``else`` branch).
+
+TDD methodology (see ``tests/unit/test_disldo_block4_fp32_wide_simd.cpp``):
+wrote the test FIRST against the unmodified kernel, correctness checked
+against an independent dense-matmul reference kept permanently in the
+test file (not a kernel toggle -- a ``SILI_BLOCK4_FORCE_SCALAR_*``-style
+compile-time toggle was explicitly rejected for this work, since it's
+unnecessary code that wouldn't be reused), recorded that baseline's timing,
+then modified the kernel in place and re-measured with the same test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function,
+not just SSE). Timing -- 15 before + 15 after binary invocations, randomly
+interleaved to cancel thermal/scheduling drift, each invocation's own
+median-of-200-calls as one sample -- gave before median-of-medians 173990
+ns/call (mean-of-medians 161149) vs after 160920 ns/call (mean-of-medians
+151265): a real but modest ~6-8% speedup, well inside the ~25-30%
+single-run noise band at this size. Not unexpected given how much else is
+already going on in this loop (tile lookup via ``at_index()``,
+``get_scale()``'s rank-N loop, thread-buffer reduction) -- the multiply-
+accumulate was never the whole cost.
+
 .. _disldo_forward.aqrs_additive_branch:
 
 AQRS additive branch
