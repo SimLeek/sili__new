@@ -338,6 +338,30 @@ FP8 backward's larger one, expected below) since the decode step was
 deliberately left untouched here -- the win is entirely from widening the
 same batch-loop arithmetic FP32's forward widening targeted.
 
+**Also tried and REJECTED**: a genuinely 8-wide ``block8_vec_decode_fp8``
+(``Block8VecU`` + a direct 8-lane port of the bit-shift fast path and
+rare-code scalar-correction loop above), gathering both paired columns'
+8 weight bytes in one contiguous load (they're adjacent in ``tdata``,
+same layout the column pairing already exploits) and decoding them
+together instead of calling the 4-wide decode twice. MEASURED WORSE on
+``arch-sandbox`` (15 before/after interleaved): median-of-medians 180730
+ns/call (mean-of-medians 177699) -- slower than even the pre-widening
+baseline (176200), let alone this section's twice-4-wide-decode design
+(133110). Root cause, confirmed by diffing the two versions' compiled
+disassembly: doubling every decode temporary (``s``/``e``/``m``/
+``bits_normal``/the ``codes_arr``/``result_arr`` scratch buffers) from
+128-bit to 256-bit pushed the combined YMM working set -- decode's own
+temporaries plus the pairing logic's own ``s8``/``w8``/``in8``/``prod``
+-- past the 16-register file, forcing spill/reload that outweighed the
+saved call overhead: 55% more stack-spill instructions (280 vs 181) and
+11% more total instructions (1962 vs 1768) in the compiled block4
+function. Reverted; ``block8_vec_decode_fp8``/``Block8VecU`` removed from
+``block4.hpp`` rather than left as unused dead code. Lesson: "pull two
+blocks together" doesn't uniformly help once the combined per-op register
+footprint exceeds what the target actually has -- worth checking via
+disassembly, not just codegen presence, before trusting a "wider must be
+faster" intuition.
+
 .. _disldo_forward.aqrs_additive_branch:
 
 AQRS additive branch
@@ -892,6 +916,52 @@ an all-scattered cross-check plus a post-backward forward probe, baseline
 timing recorded, then the kernel modified and re-measured with the same
 test -- no compile-time toggle added (same "don't add unnecessary code
 that would not be used again" rejection as forward's widening).
+
+.. _disldo_backward.fp8_block4_avx2_row_pairing:
+
+FP8 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp8_block4_avx2_row_pairing``
+
+FP8's existing block4 backward SIMD structure is the exact same shape as
+FP32's (see ``disldo_backward.fp32_block4_avx2_row_pairing`` above), so
+this ports the same row-pairing design (``process_row_pair_fp8``), with
+three real differences from the FP32 port: (1) decode is already SCALAR
+in the existing single-row code (``fp8_decode_bits``, not
+``block4_vec_decode_fp8``) -- measured faster for backward specifically
+(see ``disldo_backward.fp8_simd_measured`` above) -- kept scalar, just 8
+calls instead of 4, no widening attempted (unlike forward's rejected
+8-wide-decode experiment, this path never used a SIMD decode to begin
+with, so there was nothing to "un-widen"); (2) FP8's ``cw``/``ci`` are
+quantized CODE-SPACE values needing ``was_live``-gated encode-on-write
+(FP32 has no quantization floor to escape, so no such gating exists
+there); (3) encode is the existing ``StochasticRounding`` x ``was_live``
+4-way scalar dispatch (``fp8_quantize_live``/``_stochastic_live``/
+``_stochastic``/plain), called once per (row,col) cell -- 8 cells now
+instead of 4, no SIMD encode to widen either.
+
+TDD methodology matches FP32's exactly (see
+``tests/unit/test_disldo_block4_fp8_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked with tolerance
+against an all-scattered layer holding the identical already-quantized
+weights (same ``fp8_decode_bits(code)`` convention as the forward test)
+plus a post-backward forward probe, baseline timing recorded, then the
+kernel modified and re-measured with the same test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vaddps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 12 before + 12 after binary invocations, randomly interleaved,
+each invocation's own median-of-200-calls as one sample -- gave before
+median-of-medians 9673260 ns/call (mean-of-medians 11653644) vs after
+3643525 ns/call (mean-of-medians 4001787): a real **~2.65-2.9x speedup**,
+matching FP32 backward's ~2.7-3.2x (same underlying reason: real per-cell
+RMSprop update plus rank-N AQRS bookkeeping to widen, unlike forward's
+modest ~5.5-8% where decode dominates and was deliberately left
+unwidened -- and where an attempt to widen it anyway was tried and
+measured worse, see ``disldo_forward.fp8_block4_avx2_column_pairing``
+above).
 
 Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
 n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via

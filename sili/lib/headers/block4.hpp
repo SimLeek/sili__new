@@ -393,6 +393,18 @@ inline Block4Vec block4_vec_decode_fp8(Block4VecU codes) {
     return result;
 }
 
+// A genuinely 8-wide block8_vec_decode_fp8 (direct 8-lane port of the
+// 4-wide decode above) was built and MEASURED WORSE for disldo_forward's
+// FP8 block4 column pairing than calling the 4-wide decode twice and
+// combining post-decode: 55% more stack-spill traffic (280 vs 181 spill
+// instructions in the compiled block4 loop) since doubling every decode
+// temporary (s/e/m/bits_normal/codes_arr/result_arr) to 256-bit pushed
+// the combined YMM working set (decode's own temporaries plus the
+// pairing logic's s8/w8/in8/prod) past the register file, forcing
+// spill/reload that outweighed the saved call overhead. Reverted, not
+// adopted -- see disldo_forward.fp8_block4_avx2_column_pairing in
+// docs/research/linear_disldo.rst for the full measured comparison.
+
 // 4-wide fp8_quantize_stochastic (fp8quant.hpp) -- same split as
 // block4_vec_decode_fp8 above: the common normal-range case uses the
 // exact same dithered-carry technique as block4_vec_quantize_stochastic_fp4
