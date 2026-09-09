@@ -228,10 +228,15 @@ FP8 dispatch
 
 ``Block4Tile8``'s layout is a full byte/slot (no nibble mask) and
 decodes via E4M3 (``fp8quant.hpp``/``block4_vec_decode_fp8``), not FP4's
-table-driven bit-shift codec -- the only thing that differs from the FP4
-branch. Everything past this point (row-scale multiply, batch
-accumulation) is identical float32 math regardless of storage width. The
-FP4 branch is byte-for-byte the pre-existing code, untouched.
+table-driven bit-shift codec. Originally the only thing that differed
+from the (then-shared) FP4 branch, with everything past decode (row-scale
+multiply, batch accumulation) identical float32 math regardless of
+storage width -- **partially superseded** by
+``disldo_forward.fp8_block4_avx2_column_pairing`` below: FP8 now has its
+own dedicated ``process_pair8`` branch (column-paired, 8-wide) rather than
+sharing FP4's per-column ``process_col``, though the decode call itself
+(``block4_vec_decode_fp8``) is unchanged. FP4's branch remains the
+original per-column code, untouched.
 
 .. _disldo_forward.fp32_block4_avx2_column_pairing:
 
@@ -284,6 +289,54 @@ single-run noise band at this size. Not unexpected given how much else is
 already going on in this loop (tile lookup via ``at_index()``,
 ``get_scale()``'s rank-N loop, thread-buffer reduction) -- the multiply-
 accumulate was never the whole cost.
+
+.. _disldo_forward.fp8_block4_avx2_column_pairing:
+
+FP8 block4: AVX2 column pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp8_block4_avx2_column_pairing``
+
+Unlike FP32 (no decode step at all -- see
+``disldo_forward.fp32_block4_avx2_column_pairing`` above), FP8 DOES have a
+real 4-wide SIMD decode (``block4_vec_decode_fp8``). Deliberately kept
+UNCHANGED here rather than rewritten 8-wide: it has a hybrid design (a
+whole-vector bit-shift fast path for normal-range codes, plus a per-lane
+scalar correction loop for rare subnormal/NaN-slot codes), and the batch
+loop that follows the decode (running ``batch`` times per tile, vs
+decode's once) is the dominant per-call cost anyway -- same reasoning
+FP32's widening used for its own arithmetic-only case. The two paired
+columns' weight codes are decoded separately via the existing
+``block4_vec_decode_fp8`` (called twice, once per column), then their
+DECODED ``Block4Vec`` results are combined into one ``Block8Vec`` via
+``block8_vec_from_lo_hi`` and fed through the exact same 8-wide
+scale-multiply/batch-accumulate/split-hsum pattern as FP32's
+``process_pair``. New branch ``process_pair8``, split out of what used to
+be a shared FP8/FP4 ``process_col`` (see
+``disldo_forward.fp8_dispatch`` above) -- FP4 keeps that original
+per-column code unchanged in its own ``else`` branch.
+
+TDD methodology matches FP32's exactly (see
+``tests/unit/test_disldo_block4_fp8_wide_simd.cpp``): written first
+against the unmodified kernel, correctness checked with tolerance against
+an all-scattered layer holding the IDENTICAL already-quantized weights
+(scattered's values are ``fp8_decode_bits(code)``, not the pre-
+quantization float, so both arms represent the exact same quantized value
+with no double-quantization mismatch -- matches
+``test_fp8_block4_scattered_divergence.cpp``'s convention), baseline
+timing recorded, then the kernel modified and re-measured with the same
+test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 15 before + 15 after binary invocations, randomly interleaved --
+gave before median-of-medians 176200 ns/call (mean-of-medians 168429) vs
+after 166960 ns/call (mean-of-medians 156001): a real but modest
+**~5.5-8% speedup**, the same magnitude as FP32's forward result (not
+FP8 backward's larger one, expected below) since the decode step was
+deliberately left untouched here -- the win is entirely from widening the
+same batch-loop arithmetic FP32's forward widening targeted.
 
 .. _disldo_forward.aqrs_additive_branch:
 

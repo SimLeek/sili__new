@@ -176,6 +176,7 @@ set(SILI_STANDALONE_TESTS
     test_fp8_block4_sparse_tile
     test_fp8_block4_store
     test_disldo_block4_fp8
+    test_disldo_block4_fp8_wide_simd
     test_disldo_block4_promotion_fp8
     test_fp32_block4_sparse_tile
     test_fp32_block4_store
