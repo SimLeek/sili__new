@@ -764,6 +764,96 @@ rejects a gather-looking ``output_grad[...col4[lj]]`` index as
 index as contiguous -- hence the ``full_tile_cols`` split (whole
 tile-column in bounds) checked once per tile, not per batch element.
 
+.. _disldo_backward.fp32_block4_avx2_row_pairing:
+
+FP32 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp32_block4_avx2_row_pairing``
+
+Backward's counterpart to
+``disldo_forward.fp32_block4_avx2_column_pairing`` (above), on the OTHER axis.
+Forward's existing SIMD width already spans a fixed column's 4 rows, so it
+paired two columns; backward's existing SIMD width spans a fixed row's 4
+columns, so this pairs two adjacent rows (``li``, ``li+1``) of the same
+tile into one 8-wide op, called via a new ``process_row_pair_fp32``
+lambda inside ``process_tile``. Scoped to the common case only -- both
+rows must be live (``row < n_in``, ``row_live_count[row] > 0``) and the
+tile's column range must be fully in-bounds (mirrors ``full_tile_cols32``)
+-- a partial-column tile at the ``n_out`` edge or a dead partner row falls
+back unchanged to the existing single-row path. The outer ``for (li...)``
+loop detects a pairable pair, calls the new lambda, then does an extra
+``++li`` before its own increment/``continue`` to skip the consumed
+``li+1`` -- net advance of 2, not 1.
+
+Per-quantity handling, since backward's math mixes quantities that depend
+on the row, the column, or both:
+
+- ``dy``/``output_scale_k`` depend only on the column -- shared/duplicated
+  across both paired rows' halves of the 8-wide vector
+  (``block8_vec_dup4``), not recomputed per row.
+- The gathered input value, ``value_scale_k``, and ``effective_lr`` depend
+  only on the row -- broadcast per-half (``block8_vec_broadcast_pair``),
+  differing between the two rows.
+- The decoded weight/importance and combined scale genuinely depend on
+  BOTH row and column -- 8 distinct values, no sharing possible. No single
+  contiguous memcpy across rows either (``Block4Tile32::slot_index(li,lj)
+  = lj*4+li`` means fixed-li/varying-lj is already a stride-4 gather, same
+  total loads as two single-row passes) -- the win is the 8-wide
+  ARITHMETIC that follows the loads, not the loads themselves.
+- ``mrow``/``mdx`` are per-ROW reductions -- split via ``block8_vec_lo4``/
+  ``block8_vec_hi4`` (lower 4 lanes -> row0, upper 4 -> row1).
+- ``mcol`` is a per-COLUMN reduction, and a column's identity doesn't
+  depend on which of the two paired rows contributed -- folded via
+  ``block8_vec_fold4`` (elementwise lower+upper) into the SAME 4-wide
+  scratch a single-row pass would have used, no new scratch shape needed.
+- ``mgamma`` is a single layer-wide scalar accumulator -- summed across
+  ALL 8 lanes at once (``block8_vec_hsum``), combining both rows'
+  contributions directly.
+- The RMSprop-style ``ci``/``cw`` update is genuinely per-(row,col) cell
+  (no shared/duplicated lanes to exploit), and no ``Block8Vec``
+  specialization of ``SynapsePolicy`` exists (``PlainRMSpropSynapsePolicy``/
+  ``BoundedRMSpropSynapsePolicy`` are hand-specialized for ``Block4Vec``
+  specifically, using per-lane-loop helpers like ``block4_vec_sqrt`` that
+  don't generalize for free). Rather than write a new 8-wide specialization,
+  the accumulated 8-wide state is split back into two ``Block4Vec`` halves
+  and the EXISTING ``SynapsePolicyVec::update_ci``/``update_cw`` calls run
+  twice. This is a once-per-row-pair cost, not a per-batch one, so it
+  doesn't undo the batch loop's win.
+
+New ``Block8Vec`` helpers added to ``block4.hpp`` for this:
+``block8_vec_load``/``store``/``broadcast``, ``block8_vec_broadcast_pair``
+(different scalar per half), ``block8_vec_dup4`` (same 4-wide vector in
+both halves), ``block8_vec_lo4``/``hi4`` (extract a half),
+``block8_vec_from_lo_hi`` (recombine), ``block8_vec_fold4`` (elementwise
+lower+upper sum), ``block8_vec_hsum`` (all-8 sum) -- all memcpy/literal-
+based, mirroring ``Block4Vec``'s own helpers' style exactly.
+
+TDD methodology (see
+``tests/unit/test_disldo_block4_fp32_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked (with tolerance,
+not bit-exact -- unlike the tiny hand-placed-tile test elsewhere, this
+one's 32-row-dense scale means block4's parallel-thread reduction and
+scattered's sequential walk legitimately sum in different orders) against
+an all-scattered cross-check plus a post-backward forward probe, baseline
+timing recorded, then the kernel modified and re-measured with the same
+test -- no compile-time toggle added (same "don't add unnecessary code
+that would not be used again" rejection as forward's widening).
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 15 before + 15 after binary invocations, randomly interleaved to
+cancel thermal/scheduling drift, each invocation's own median-of-200-calls
+as one sample -- gave before median-of-medians 10967140 ns/call
+(mean-of-medians 13120815) vs after 3400970 ns/call (mean-of-medians
+4785922): a real **~2.7-3.2x speedup**, much larger than forward's modest
+~6-8%. Consistent with expectations going in: forward's FP32 "decode" was
+a no-op memcpy with almost nothing to widen, while backward's per-cell
+RMSprop update plus rank-N AQRS bookkeeping (mrow/mcol/mgamma, gamma
+weighting, contrib terms) is exactly the kind of "lot more stuff going on
+in the SIMD part" that a wider op actually pays off on.
+
 .. _disldo_backward.was_live_gating:
 
 ``was_live`` gating: a real bug from block4's dense-tile semantics

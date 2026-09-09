@@ -50,6 +50,58 @@ using Block8Vec = float __attribute__((__vector_size__(2 * SILI_BLOCK4_TILE_SIZE
 static_assert(sizeof(Block8Vec) == 2 * BLOCK4_TILE * sizeof(float),
               "Block8Vec width must be double BLOCK4_TILE");
 
+inline Block8Vec block8_vec_load(const float* p) {
+    Block8Vec v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+inline void block8_vec_store(float* p, Block8Vec v) {
+    std::memcpy(p, &v, sizeof(v));
+}
+inline Block8Vec block8_vec_broadcast(float x) {
+    return Block8Vec{x, x, x, x, x, x, x, x};
+}
+// Broadcasts one value into the lower BLOCK4_TILE lanes, another into the
+// upper -- used by disldo_backward's row-pairing (linear_disldo.hpp:
+// disldo_backward.fp32_block4_avx2_row_pairing) where a per-row scalar
+// (e.g. an input value or value_scale) differs between the two paired
+// rows but is constant across that row's own 4 columns.
+inline Block8Vec block8_vec_broadcast_pair(float lo, float hi) {
+    return Block8Vec{lo, lo, lo, lo, hi, hi, hi, hi};
+}
+// Duplicates a 4-wide vector into both halves -- used where a quantity is
+// shared between two paired rows (e.g. dy/output_scale_k, which depend
+// only on the column, not the row).
+inline Block8Vec block8_vec_dup4(Block4Vec v) {
+    return Block8Vec{v[0], v[1], v[2], v[3], v[0], v[1], v[2], v[3]};
+}
+inline Block4Vec block8_vec_lo4(Block8Vec v) {
+    Block4Vec r;
+    std::memcpy(&r, &v, sizeof(r));
+    return r;
+}
+inline Block4Vec block8_vec_hi4(Block8Vec v) {
+    Block4Vec r;
+    std::memcpy(&r, reinterpret_cast<const uint8_t*>(&v) + sizeof(Block4Vec), sizeof(r));
+    return r;
+}
+inline Block8Vec block8_vec_from_lo_hi(Block4Vec lo, Block4Vec hi) {
+    Block8Vec r;
+    std::memcpy(&r, &lo, sizeof(lo));
+    std::memcpy(reinterpret_cast<uint8_t*>(&r) + sizeof(lo), &hi, sizeof(hi));
+    return r;
+}
+// Elementwise sum of the lower and upper halves -- used to fold two paired
+// rows' per-COLUMN contributions (mcol) into the same 4-wide accumulator a
+// single-row pass would have used, since a column's identity doesn't
+// depend on which of the two rows contributed to it.
+inline Block4Vec block8_vec_fold4(Block8Vec v) {
+    return Block4Vec{v[0] + v[4], v[1] + v[5], v[2] + v[6], v[3] + v[7]};
+}
+inline float block8_vec_hsum(Block8Vec x) {
+    return x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7];
+}
+
 inline Block4Vec block4_vec_load(const float* p) {
     Block4Vec v;
     std::memcpy(&v, p, sizeof(v)); // unaligned-safe load
