@@ -305,23 +305,26 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     process_pair8.template operator()<0>();
                     process_pair8.template operator()<2>();
                 } else {
-                    // AVX2 widening, genuinely-8-wide gather-then-decode:
-                    // FP4's decode (block4_vec_decode_fp4) is fully
-                    // branchless -- no scalar correction loop/scratch
-                    // arrays, unlike FP8's decode -- so unlike FP8 (whose
-                    // equivalent genuinely-8-wide decode was built and
-                    // MEASURED WORSE from register pressure, see
-                    // disldo_forward.fp8_block4_avx2_column_pairing), this
-                    // WAS ADOPTED here: gathers both columns' 8 masked codes
-                    // into one Block8VecU and decodes with a single
-                    // block8_vec_decode_fp4 call, instead of calling the
-                    // 4-wide decode twice and combining post-decode (that
-                    // twice-4-wide alternative was also built and measured
-                    // slightly SLOWER -- see
+                    // AVX2 widening: FP4's decode (block4_vec_decode_fp4) is
+                    // fully branchless -- no scalar correction loop/scratch
+                    // arrays, unlike FP8's decode. A genuinely 8-wide
+                    // gather-then-decode variant (block8_vec_decode_fp4,
+                    // gathering both columns' 8 masked codes into one
+                    // Block8VecU) was ALSO built and measured on
+                    // arch-sandbox: it looked like a clear win on a local
+                    // laptop (~8% faster) but on arch-sandbox (n=35
+                    // interleaved runs) the two designs were statistically
+                    // indistinguishable (median 154600 vs 151200 ns/call,
+                    // mean 143139 vs 144067 -- within this comparison's own
+                    // run-to-run noise band). So this twice-4-wide-call
+                    // design was kept instead, for simplicity and
+                    // consistency with FP32/FP8's adopted shape: pairs two
+                    // adjacent columns into one 8-wide op by calling the
+                    // 4-wide decode ONCE per column and combining
+                    // post-decode via block8_vec_from_lo_hi. See
                     // disldo_forward.fp4_block4_avx2_column_pairing in
-                    // docs/research/linear_disldo.rst for the real numbers
-                    // and the disassembly comparison confirming FP4 avoids
-                    // most of FP8's spill penalty).
+                    // docs/research/linear_disldo.rst for the full
+                    // local-vs-remote comparison.
                     static_assert(BLOCK4_TILE == 4,
                                   "column pairing below assumes exactly 4 columns (2 pairs)");
                     auto process_pair4 = [&]<uint32_t LJ0>() {
@@ -333,16 +336,22 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         if (!have0)
                             return;
 
-                        const Block8VecU w_codes8 = {
+                        const Block4VecU w_codes0 = {
                             uint32_t(tdata[Block4Tile::slot_index(0, LJ0)] & 0xFu),
                             uint32_t(tdata[Block4Tile::slot_index(1, LJ0)] & 0xFu),
                             uint32_t(tdata[Block4Tile::slot_index(2, LJ0)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(3, LJ0)] & 0xFu),
-                            uint32_t(have1 ? tdata[Block4Tile::slot_index(0, LJ1)] & 0xFu : 0u),
-                            uint32_t(have1 ? tdata[Block4Tile::slot_index(1, LJ1)] & 0xFu : 0u),
-                            uint32_t(have1 ? tdata[Block4Tile::slot_index(2, LJ1)] & 0xFu : 0u),
-                            uint32_t(have1 ? tdata[Block4Tile::slot_index(3, LJ1)] & 0xFu : 0u)};
-                        const Block8Vec w_decoded8 = block8_vec_decode_fp4(w_codes8);
+                            uint32_t(tdata[Block4Tile::slot_index(3, LJ0)] & 0xFu)};
+                        const Block4Vec w_decoded0 = block4_vec_decode_fp4(w_codes0);
+                        Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
+                        if (have1) {
+                            const Block4VecU w_codes1 = {
+                                uint32_t(tdata[Block4Tile::slot_index(0, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(1, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(2, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(3, LJ1)] & 0xFu)};
+                            w_decoded1 = block4_vec_decode_fp4(w_codes1);
+                        }
+                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
 
                         std::size_t row_idx[BLOCK4_TILE];
                         Block8Vec s8;

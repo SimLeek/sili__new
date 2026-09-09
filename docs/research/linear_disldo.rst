@@ -364,8 +364,8 @@ faster" intuition.
 
 .. _disldo_forward.fp4_block4_avx2_column_pairing:
 
-FP4 block4: AVX2 column pairing, genuinely 8-wide decode
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+FP4 block4: AVX2 column pairing, twice-4-wide decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 *ID:* ``disldo_forward.fp4_block4_avx2_column_pairing``
 
@@ -389,38 +389,45 @@ compared, not assumed from the structural difference alone:
    codes in one call, gathered into one ``Block8VecU`` literal instead of
    two separate 4-wide literals.
 
-**RESULT: design 2 (genuinely 8-wide) WON and was adopted** -- the opposite
-outcome from FP8. Measured on this session's local machine (laptop, AMD
-Ryzen 7 3750H, real AVX2 via ``-march=native``, NOT ``arch-sandbox`` -- see
-caveat below): 8-run median-of-medians against ``test_disldo_block4_fp4_wide_simd.cpp``
-(n_in=256/n_out=256/batch=8, 4096 tiles) gave pre-widening baseline
-~319941-340878 ns/call, design 1 (twice-4-wide) ~291513 ns/call, design 2
-(genuinely 8-wide) ~267362 ns/call -- design 2 is **~8% faster than design 1
-and ~21% faster than the pre-widening baseline**. Disassembly of the
-compiled block4 OpenMP-outlined function (objdump, comparing design 1 vs
-design 2 binaries) confirmed the structural hypothesis: going from
-twice-4-wide to genuinely-8-wide costs only 207->231 stack-spill
-instructions (+11.6%) and 1710->1754 total instructions (+2.6%) for FP4,
-vs FP8's 181->280 spills (+55%) and 1768->1962 instructions (+11%) for the
-same before/after comparison -- FP4's branchless decode has no scalar
-correction-loop/scratch-array temporaries to double to 256-bit, so pairing
-its decode 8-wide costs much less register pressure than FP8's hybrid
-decode did. This directly answers the open question from the FP8 section:
-the "genuinely 8-wide gather-then-decode doesn't help" finding does NOT
-generalize to FP4 -- it's specific to FP8's hybrid scalar-correction-loop
-decode design, not an inherent property of gather-then-decode itself.
+**RESULT: design 1 (twice-4-wide) was ADOPTED, after an initial wrong
+call.** A local laptop measurement (AMD Ryzen 7 3750H, real AVX2 via
+``-march=native``) first suggested design 2 was a clear ~8% win (267362 vs
+291513 ns/call, 8-run median-of-medians), corroborated by disassembly
+showing FP4 avoids most of FP8's register-pressure penalty when widened
+this way (only 207->231 stack-spill instructions, +11.6%, going from
+design 1 to design 2, vs FP8's +55% for the analogous comparison) -- so
+design 2 was initially adopted on that basis.
 
-**Caveat**: unlike every other AVX2-widening result in this document
-(which were all measured on ``arch-sandbox``, a dedicated Zen2 AVX2
-machine used specifically for apples-to-apples before/after comparisons),
-this comparison is LOCAL-ONLY -- the session that ran it could not reach
-``arch-sandbox`` over SSH (the direct-link key required a passphrase this
-background job had no way to supply). The qualitative result (design 2
-beats design 1, by a real and disassembly-corroborated margin, not just
-noise) is credible on its own evidence, but the exact percentages have not
-been cross-machine-confirmed the way FP32/FP8's were. Re-run
-``test_disldo_block4_fp4_wide_simd.cpp`` on ``arch-sandbox`` before citing
-these exact numbers elsewhere.
+That did not hold up on ``arch-sandbox`` (AMD Ryzen 7 3800XT, the
+authoritative AVX2 machine used for every other before/after comparison in
+this document). An initial n=15 interleaved round was ambiguous (design 1
+median 154520 vs design 2's 156430), so a larger n=35 interleaved round
+was run: design 1 median 154600 ns/call (mean 143139) vs design 2 median
+151200 (mean 144067) -- **statistically indistinguishable**. Individual
+runs for BOTH designs swung between ~124000 and ~178000 ns/call (a
+bimodal, likely frequency-scaling-driven pattern affecting both binaries
+equally), a spread far larger than the ~2% gap between their medians. The
+local laptop's clear-looking win simply did not replicate on the machine
+that matters.
+
+Given a genuine tie on ``arch-sandbox``, design 1 (twice-4-wide) was kept:
+it reuses the already-proven 4-wide ``block4_vec_decode_fp4`` rather than
+maintaining a second, wider decode function purely for a difference that
+turned out to be noise. ``block8_vec_decode_fp4``/``Block8VecU``/
+``block8_vecu_broadcast`` were removed from ``block4.hpp`` rather than left
+as unused dead code (same convention as FP8's rejected
+``block8_vec_decode_fp8``).
+
+**Lesson** (the actually load-bearing one here, worth remembering for
+future AVX2-widening work on this codebase): a clear-looking local result,
+even one that disassembly seems to corroborate, is not a substitute for
+measuring on the authoritative machine -- the laptop and arch-sandbox
+disagreed not just in magnitude but in DIRECTION. Every prior AVX2-widening
+decision in this document (FP32 forward/backward, FP8 forward/backward)
+was measured on ``arch-sandbox`` from the start; this is the one case that
+wasn't, and it produced a wrong initial conclusion as a direct result. Do
+not adopt a kernel change based on local-only timing again, regardless of
+how large or well-explained the local margin looks.
 
 .. _disldo_forward.aqrs_additive_branch:
 

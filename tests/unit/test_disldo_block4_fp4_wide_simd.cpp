@@ -27,24 +27,31 @@
 // 8-wide decode) for comparison. See docs/research/linear_disldo.rst:
 // disldo_forward.fp4_block4_avx2_column_pairing.
 //
-// RESULT: unlike FP8, the genuinely-8-wide gather-then-decode variant WON
-// and was adopted. Local (laptop, AMD Ryzen 7 3750H, -march=native, real
-// AVX2, num_cpus default) 8-run median-of-medians: pre-widening baseline
-// ~319941-340878ns/call; twice-4-wide-decode-call design (same shape as
-// FP8's adopted design) ~291513ns/call; genuinely-8-wide gather+single
-// block8_vec_decode_fp4 call ~267362ns/call (~8% faster than twice-4-wide,
-// ~21% faster than the pre-widening baseline). objdump of the compiled
-// block4 OpenMP-outlined function confirmed FP4 avoids most of FP8's
-// register-pressure penalty: only 207->231 stack-spill instructions
-// (+11.6%) and 1710->1754 total instructions (+2.6%) going from
-// twice-4-wide to genuinely-8-wide, vs FP8's 181->280 spills (+55%) for
-// the same comparison -- consistent with FP4's decode having no scalar
-// correction-loop/scratch-array overhead to double. NOTE: remote
-// arch-sandbox was unreachable from the session that ran this comparison
-// (SSH key access unavailable in that background job), so this result is
-// LOCAL-ONLY, not cross-machine-confirmed like the FP32/FP8 AVX2 widening
-// results were -- re-verify on arch-sandbox before treating this as final
-// if that matters for a future decision.
+// RESULT: twice-4-wide-decode-call was ADOPTED (same shape as FP32/FP8's
+// design) -- but getting here required correcting an initial wrong call.
+// A local laptop run (AMD Ryzen 7 3750H, -march=native) first suggested
+// the genuinely-8-wide gather+single block8_vec_decode_fp4 call was a
+// clear ~8% win over twice-4-wide (267362 vs 291513 ns/call, 8-run
+// median-of-medians), and disassembly showed FP4 avoids most of FP8's
+// register-pressure penalty (only 207->231 stack-spill instructions,
+// +11.6%, vs FP8's +55% for the same twice-4-wide-vs-8-wide comparison) --
+// so gather-then-decode was initially adopted on that basis. Re-measured
+// on arch-sandbox (the authoritative AVX2 machine, AMD Ryzen 7 3800XT,
+// n=35 interleaved runs each after an initial n=15 round didn't settle
+// it): twice-4-wide median 154600 ns/call (mean 143139) vs genuinely-8-wide
+// median 151200 (mean 144067) -- statistically indistinguishable, well
+// within this comparison's own run-to-run noise band (individual runs
+// swung between ~124000 and ~178000 ns/call for BOTH variants, a much
+// larger spread than the ~2% gap between their medians). The local
+// laptop's clear-looking win did not replicate on the machine that
+// matters. Given a genuine tie on arch-sandbox, twice-4-wide was kept for
+// simplicity (reuses the proven 4-wide block4_vec_decode_fp4 rather than
+// maintaining a second, wider decode function). Lesson, worth remembering
+// for future AVX2-widening work: local timing is a fine first signal but
+// not a substitute for the authoritative machine, even when disassembly
+// seems to back up the local result -- see
+// disldo_forward.fp4_block4_avx2_column_pairing in
+// docs/research/linear_disldo.rst for the full writeup.
 #include "../../sili/lib/headers/delta_csr_memory.hpp"
 #include "../../sili/lib/headers/linear_disldo.hpp"
 #include <algorithm>

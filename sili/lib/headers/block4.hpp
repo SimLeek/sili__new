@@ -49,13 +49,6 @@ static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float),
 using Block8Vec = float __attribute__((__vector_size__(2 * SILI_BLOCK4_TILE_SIZE * sizeof(float))));
 static_assert(sizeof(Block8Vec) == 2 * BLOCK4_TILE * sizeof(float),
               "Block8Vec width must be double BLOCK4_TILE");
-using Block8VecU =
-    uint32_t __attribute__((__vector_size__(2 * SILI_BLOCK4_TILE_SIZE * sizeof(uint32_t))));
-static_assert(sizeof(Block8VecU) == 2 * BLOCK4_TILE * sizeof(uint32_t),
-              "Block8VecU width must be double BLOCK4_TILE");
-inline Block8VecU block8_vecu_broadcast(uint32_t x) {
-    return Block8VecU{x, x, x, x, x, x, x, x};
-}
 
 inline Block8Vec block8_vec_load(const float* p) {
     Block8Vec v;
@@ -250,39 +243,21 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
     return result;
 }
 
-// 8-wide (256-bit) direct port of block4_vec_decode_fp4 above -- unlike
-// block8_vec_decode_fp8 (built, measured worse, and removed -- see
-// disldo_forward.fp8_block4_avx2_column_pairing in
-// docs/research/linear_disldo.rst), FP4's decode has NO scalar
-// correction-loop/scratch-array overhead to double: every step here is the
-// same branchless mask-and-select as the 4-wide version, just at 256-bit
-// width. Whether that avoids FP8's register-pressure/spill penalty is
-// measured empirically in disldo_forward's FP4 column-pairing path, not
-// assumed from this structural difference alone.
-inline Block8Vec block8_vec_decode_fp4(Block8VecU codes) {
-    const Block8VecU one_u = block8_vecu_broadcast(1u);
-    const Block8VecU zero_u = block8_vecu_broadcast(0u);
-    const Block8VecU s = (codes >> 3) & one_u;
-    const Block8VecU e = (codes >> 1) & block8_vecu_broadcast(3u);
-    const Block8VecU m = codes & one_u;
-
-    const Block8VecU bits_normal =
-        (s << 31) | ((e + block8_vecu_broadcast(126u)) << 23) | (m << 22);
-
-    const Block8VecU half_bits = block8_vecu_broadcast(0x3F000000u) | (s << 31);
-    const Block8VecU nan_bits = block8_vecu_broadcast(0x7FC00000u);
-    const Block8VecU s_mask = (s != zero_u);
-    const Block8VecU bits_m0 = (nan_bits & s_mask) | (zero_u & ~s_mask);
-    const Block8VecU m_mask = (m != zero_u);
-    const Block8VecU bits_special = (half_bits & m_mask) | (bits_m0 & ~m_mask);
-
-    const Block8VecU e_mask = (e != zero_u);
-    const Block8VecU bits = (bits_normal & e_mask) | (bits_special & ~e_mask);
-
-    Block8Vec result;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
-}
+// A genuinely 8-wide block8_vec_decode_fp4 (direct 8-lane port of the
+// 4-wide decode above, using a since-removed Block8VecU/
+// block8_vecu_broadcast) was built and measured for disldo_forward's FP4
+// block4 column pairing. Unlike FP8's equivalent attempt (measured worse
+// EVERYWHERE it was tried, from register pressure), FP4's result was
+// genuinely machine-dependent: a local laptop showed it ~8% FASTER than
+// calling the 4-wide decode twice, but on arch-sandbox (the authoritative
+// AVX2 machine, n=35 interleaved runs) the two designs were statistically
+// indistinguishable (median 154600 vs 151200 ns/call, mean 143139 vs
+// 144067 -- within this comparison's own run-to-run noise). Since it was
+// not a clear win on the machine that matters, and it adds a whole
+// duplicate decode function to maintain, the simpler twice-4-wide-call
+// design (same shape as FP32/FP8's) was kept instead. Reverted, not
+// adopted -- see disldo_forward.fp4_block4_avx2_column_pairing in
+// docs/research/linear_disldo.rst for the full local-vs-remote comparison.
 
 // 4-wide fp4_quantize_stochastic (fp4quant.hpp) -- stochastically quantizes
 // 4 values in one shot.
