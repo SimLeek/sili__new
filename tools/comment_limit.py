@@ -74,8 +74,14 @@ def analyze_file(filepath: str) -> tuple[int, int, int, list[int]]:  # noqa: C90
                 comment_indices.append(idx)
                 continue
 
-        # 4. Standard Inline Comments
-        if stripped.startswith(("#", "//")):
+        # 4. Standard Inline Comments. A leading hash only means a comment
+        # in Python -- in C/C++ that same character starts a preprocessor
+        # directive (include guards, conditional compilation, macros),
+        # which must NOT be counted here, or a file with legitimate
+        # platform-guard boilerplate gets misclassified as comment-heavy
+        # for reasons that have nothing to do with prose.
+        is_cpp = filepath.endswith((".cpp", ".h", ".hpp"))
+        if (is_cpp and stripped.startswith("//")) or (not is_cpp and stripped.startswith("#")):
             comment_lines_count += 1
             comment_indices.append(idx)
 

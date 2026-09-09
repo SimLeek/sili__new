@@ -7,6 +7,7 @@
 #ifndef SILI_BLOCK4_FORCE_SCALAR_BACKWARD
 #define SILI_BLOCK4_FORCE_SCALAR_BACKWARD 0
 #endif
+#include "cpu_topology.hpp"
 #include "csr.hpp"
 #include "sparse_struct.hpp"
 #include "parallel.hpp"
@@ -391,7 +392,6 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // in that case. See disldo_backward.setup_and_presizing_bugs in
     // docs/research/linear_disldo.rst.
     const std::size_t dst = static_cast<std::size_t>(batch) * in_cols;
-    std::vector<value_type> t_dx(static_cast<std::size_t>(num_cpus) * dst, value_type(0));
 
     // output_scale's own gradient (symmetric to value_scale's), shared
     // between the scattered loop and block4's own loop, per-thread-private
@@ -414,23 +414,81 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     std::vector<value_type> gamma_k_arr(rank);
     for (std::size_t k = 0; k < rank; ++k)
         gamma_k_arr[k] = weights.get_scale_gamma_k(k);
-    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * n_out * rank,
-                                       value_type(0));
-    // Parallel forward-contribution accumulator, same shape/layout as
-    // t_col_grad -- mirrors the per-synapse ci fix (contrib=x*w combined
-    // Additive-signal forward-contribution accumulator, same combination
-    // rationale as per-synapse ci (Joint.combined_signal_strictly_informative)
-    // applied one level up. See disldo_backward.scattered_lr_and_signal in
-    // docs/research/linear_disldo.rst.
-    std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * n_out * rank,
-                                               value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
 
-    // AQRS gamma's own gradient (task #273/#283): layer-wide scalar per k,
-    // not per-row/col, so sized num_cpus*rank.
-    std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
-    std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank,
-                                                 value_type(0));
+    // t_dx/t_col_grad/t_col_grad_contrib/t_gamma_grad/t_gamma_grad_contrib:
+    // persistent per-instance heap scratch (this session's fix, mirrors
+    // ScaleRankScratch's task #295 pattern above), replacing a fresh
+    // num_cpus*(...)-sized heap allocation + full zero-fill on EVERY
+    // disldo_backward() call. Measured as a real cost: at width=288
+    // (82944-element layer), backward at num_cpus=8 measured slower than
+    // num_cpus=1 -- these buffers scale with num_cpus, so more threads
+    // meant more to allocate+zero serially before the parallel region
+    // even opened. Addressing below ALWAYS uses the stored cap_* stride
+    // (t_dx_stride/t_out_rank_stride/t_rank_stride), never this call's
+    // own (possibly smaller) dst/n_out*rank/rank, so a later call with
+    // smaller dimensions than a historical max can never alias two
+    // threads' slices together.
+    weights.disldo_backward_scratch.ensure(static_cast<std::size_t>(num_cpus), dst, n_out * rank,
+                                           rank);
+    const std::size_t t_dx_stride = weights.disldo_backward_scratch.cap_dst;
+    const std::size_t t_out_rank_stride = weights.disldo_backward_scratch.cap_out_rank;
+    const std::size_t t_rank_stride = weights.disldo_backward_scratch.cap_rank;
+    std::vector<value_type>& t_dx = weights.disldo_backward_scratch.t_dx;
+    std::vector<value_type>& t_col_grad = weights.disldo_backward_scratch.t_col_grad;
+    std::vector<value_type>& t_col_grad_contrib =
+        weights.disldo_backward_scratch.t_col_grad_contrib;
+    std::vector<value_type>& t_gamma_grad = weights.disldo_backward_scratch.t_gamma_grad;
+    std::vector<value_type>& t_gamma_grad_contrib =
+        weights.disldo_backward_scratch.t_gamma_grad_contrib;
+
+    // Zero exactly the range THIS call will use, in its own dedicated
+    // parallel region (one thread per slice, so the zero-fill itself is
+    // parallelized instead of one thread serially zeroing everything
+    // before the real work starts). Deliberately its OWN region, separate
+    // from the scattered loop's and block4's parallel regions below: both
+    // of those ACCUMULATE (+=) into these same buffers and run
+    // sequentially one after the other, so zeroing inside either of them
+    // would wipe out whichever one ran first.
+    //
+    // group_of_tid[tid]: this call's cache-domain ("CCX") group per
+    // thread, feeding the group-aware t_dx/t_col_grad reduction far
+    // below. See disldo_backward.ccx_aware_reduction in
+    // docs/research/linear_disldo.rst.
+    std::vector<int> group_of_tid(static_cast<std::size_t>(num_cpus), 0);
+#pragma omp parallel num_threads(num_cpus)
+    {
+        const int tid = omp_get_thread_num();
+        group_of_tid[static_cast<std::size_t>(tid)] = sili_topology::current_thread_group();
+        std::fill_n(t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride, dst, value_type(0));
+        std::fill_n(t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
+                    n_out * rank, value_type(0));
+        std::fill_n(t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
+                    n_out * rank, value_type(0));
+        std::fill_n(t_gamma_grad.data() + static_cast<std::size_t>(tid) * t_rank_stride, rank,
+                    value_type(0));
+        std::fill_n(t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * t_rank_stride,
+                    rank, value_type(0));
+    }
+    // Distinct groups actually present among this call's num_cpus
+    // threads, and each group's leader (lowest tid) -- computed once,
+    // serially (num_cpus is small), reused by the group-aware reduction
+    // after both accumulate regions (scattered + block4) below.
+    std::vector<int> group_ids;
+    std::vector<int> group_leader_tid;
+    std::vector<int> tid_to_g(static_cast<std::size_t>(num_cpus), 0);
+    for (int t = 0; t < num_cpus; ++t) {
+        const int gid = group_of_tid[static_cast<std::size_t>(t)];
+        const auto it = std::find(group_ids.begin(), group_ids.end(), gid);
+        if (it == group_ids.end()) {
+            tid_to_g[static_cast<std::size_t>(t)] = static_cast<int>(group_ids.size());
+            group_ids.push_back(gid);
+            group_leader_tid.push_back(t);
+        } else {
+            tid_to_g[static_cast<std::size_t>(t)] = static_cast<int>(it - group_ids.begin());
+        }
+    }
+    const std::size_t num_groups = group_ids.size();
 
     // Pre-size value_scale/output_scale (n_in*rank / n_out*rank) before the
     // parallel region so direct indexed writes are safe.
@@ -469,32 +527,46 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     if (weights.value_scale_step.size() < n_in * rank)
         weights.value_scale_step.resize(n_in * rank, 0);
 
+    // Per-thread importance-stats staging (replaces a #pragma omp critical
+    // call to update_importance_stats_aggregate() inside the parallel
+    // region below): that function's own THREAD SAFETY comment already
+    // documents the intended pattern -- accumulate locally, call ONCE per
+    // thread AFTER the parallel region, not from inside one under a lock.
+    // Sized num_cpus regardless of dc.empty() so the post-region reduction
+    // loop below is unconditional and branch-free either way.
+    std::vector<double> t_stats_sum_abs_new(static_cast<std::size_t>(num_cpus), 0.0);
+    std::vector<double> t_stats_sum_abs_old(static_cast<std::size_t>(num_cpus), 0.0);
+    std::vector<double> t_stats_sum_sq_new(static_cast<std::size_t>(num_cpus), 0.0);
+    std::vector<double> t_stats_sum_sq_old(static_cast<std::size_t>(num_cpus), 0.0);
+    std::vector<value_type> t_stats_max_new(static_cast<std::size_t>(num_cpus), value_type(0));
+
     if (!dc.empty()) {
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
-            value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+            value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride;
             // mcol[col*rank+k]. False positive on all m*_base pointers
             // below: cppcheck can't trace mutation through the m*_at
             // lambdas' returned references.
             // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
-                t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
+                t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_base[col * rank + k];
             };
             // cppcheck-suppress constVariablePointer
             value_type* mcol_contrib_base =
-                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
+                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
             auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_contrib_base[col * rank + k];
             };
             // cppcheck-suppress constVariablePointer
-            value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+            value_type* mgamma_base =
+                t_gamma_grad.data() + static_cast<std::size_t>(tid) * t_rank_stride;
             auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
             // cppcheck-suppress constVariablePointer
             value_type* mgamma_contrib_base =
-                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * t_rank_stride;
             auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
                 return mgamma_contrib_base[k];
             };
@@ -738,12 +810,24 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             }
 
             if (learning_rate != value_type(0)) {
-#pragma omp critical
-                {
-                    weights.update_importance_stats_aggregate(
-                        local_sum_abs_new_i, local_sum_abs_old_i, local_sum_sq_new_i,
-                        local_sum_sq_old_i, local_max_new_i);
-                }
+                t_stats_sum_abs_new[tid] = local_sum_abs_new_i;
+                t_stats_sum_abs_old[tid] = local_sum_abs_old_i;
+                t_stats_sum_sq_new[tid] = local_sum_sq_new_i;
+                t_stats_sum_sq_old[tid] = local_sum_sq_old_i;
+                t_stats_max_new[tid] = local_max_new_i;
+            }
+        }
+        // Serial reduction, single-threaded (the parallel region above has
+        // already closed) -- no lock needed, matching
+        // update_importance_stats_aggregate()'s own documented contract.
+        if (learning_rate != value_type(0)) {
+            for (int t = 0; t < num_cpus; ++t) {
+                weights.update_importance_stats_aggregate(
+                    t_stats_sum_abs_new[static_cast<std::size_t>(t)],
+                    t_stats_sum_abs_old[static_cast<std::size_t>(t)],
+                    t_stats_sum_sq_new[static_cast<std::size_t>(t)],
+                    t_stats_sum_sq_old[static_cast<std::size_t>(t)],
+                    t_stats_max_new[static_cast<std::size_t>(t)]);
             }
         }
     } // !dc.empty()
@@ -798,12 +882,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
-            value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * dst;
+            value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride;
             // t_col_grad/t_row_grad laid out [thread][col or row][k]; both
             // FP4/FP8 block4 branches below are full rank-N.
             // cppcheck-suppress constVariablePointer
             value_type* mcol_base =
-                t_col_grad.data() + static_cast<std::size_t>(tid) * n_out * rank;
+                t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
             auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_base[col * rank + k];
             };
@@ -814,7 +898,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             };
             // cppcheck-suppress constVariablePointer
             value_type* mcol_contrib_base =
-                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * n_out * rank;
+                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
             auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& {
                 return mcol_contrib_base[col * rank + k];
             };
@@ -831,11 +915,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             // both regions accumulate into the same shared array, reduced
             // together once after both close.
             // cppcheck-suppress constVariablePointer
-            value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+            value_type* mgamma_base =
+                t_gamma_grad.data() + static_cast<std::size_t>(tid) * t_rank_stride;
             auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
             // cppcheck-suppress constVariablePointer
             value_type* mgamma_contrib_base =
-                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * t_rank_stride;
             auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
                 return mgamma_contrib_base[k];
             };
@@ -2705,8 +2790,68 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         }
     }
 
-    for (int t = 0; t < num_cpus; ++t) {
-        const value_type* s = t_dx.data() + static_cast<std::size_t>(t) * dst;
+    // Group-aware (CCX) reduction of t_dx/t_col_grad/t_col_grad_contrib,
+    // reusing group_of_tid captured above. See
+    // disldo_backward.ccx_aware_reduction in
+    // docs/research/linear_disldo.rst for the full design rationale and
+    // measured before/after numbers -- this REQUIRES OMP_PROC_BIND/
+    // OMP_PLACES pinning (set in sili/__init__.py) to be a net win rather
+    // than a regression. Gamma's own reduction further down is left flat
+    // (rank is small enough that the group-aware version isn't worth the
+    // added complexity), and t_row_grad's reduction above is deliberately
+    // out of scope (see its own comment).
+    std::vector<value_type> group_dx(num_groups * dst, value_type(0));
+    std::vector<value_type> group_col_grad(num_groups * n_out * rank, value_type(0));
+    std::vector<value_type> group_col_grad_contrib(num_groups * n_out * rank, value_type(0));
+    if (num_groups <= 1) {
+        value_type* gdx = group_dx.data();
+        value_type* gcol = group_col_grad.data();
+        value_type* gcol_c = group_col_grad_contrib.data();
+        for (int t = 0; t < num_cpus; ++t) {
+            const value_type* sdx = t_dx.data() + static_cast<std::size_t>(t) * t_dx_stride;
+            for (std::size_t i = 0; i < dst; ++i)
+                gdx[i] += sdx[i];
+            const value_type* scol =
+                t_col_grad.data() + static_cast<std::size_t>(t) * t_out_rank_stride;
+            const value_type* scol_c =
+                t_col_grad_contrib.data() + static_cast<std::size_t>(t) * t_out_rank_stride;
+            for (std::size_t i = 0; i < n_out * rank; ++i) {
+                gcol[i] += scol[i];
+                gcol_c[i] += scol_c[i];
+            }
+        }
+    } else {
+#pragma omp parallel num_threads(num_cpus)
+        {
+            const int tid = omp_get_thread_num();
+            const int g = tid_to_g[static_cast<std::size_t>(tid)];
+            if (tid == group_leader_tid[static_cast<std::size_t>(g)]) {
+                value_type* gdx = group_dx.data() + static_cast<std::size_t>(g) * dst;
+                value_type* gcol =
+                    group_col_grad.data() + static_cast<std::size_t>(g) * n_out * rank;
+                value_type* gcol_c =
+                    group_col_grad_contrib.data() + static_cast<std::size_t>(g) * n_out * rank;
+                for (int t = 0; t < num_cpus; ++t) {
+                    if (tid_to_g[static_cast<std::size_t>(t)] != g)
+                        continue;
+                    const value_type* sdx = t_dx.data() + static_cast<std::size_t>(t) * t_dx_stride;
+                    for (std::size_t i = 0; i < dst; ++i)
+                        gdx[i] += sdx[i];
+                    const value_type* scol =
+                        t_col_grad.data() + static_cast<std::size_t>(t) * t_out_rank_stride;
+                    const value_type* scol_c =
+                        t_col_grad_contrib.data() + static_cast<std::size_t>(t) * t_out_rank_stride;
+                    for (std::size_t i = 0; i < n_out * rank; ++i) {
+                        gcol[i] += scol[i];
+                        gcol_c[i] += scol_c[i];
+                    }
+                }
+            }
+        }
+    }
+
+    for (std::size_t g = 0; g < num_groups; ++g) {
+        const value_type* s = group_dx.data() + g * dst;
         for (std::size_t i = 0; i < dst; ++i) {
             input_grad[i] += s[i];
         }
@@ -2729,12 +2874,13 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             for (std::size_t k = 0; k < rank; ++k) {
                 double col_grad_sum = 0.0;
                 double col_grad_sum_contrib = 0.0;
-                for (int t = 0; t < num_cpus; ++t) {
-                    col_grad_sum +=
-                        t_col_grad[static_cast<std::size_t>(t) * n_out * rank + c * rank + k];
-                    col_grad_sum_contrib +=
-                        t_col_grad_contrib[static_cast<std::size_t>(t) * n_out * rank + c * rank +
-                                           k];
+                // Reads group_col_grad/group_col_grad_contrib (already
+                // fully reduced across every thread within its group,
+                // above) rather than t_col_grad directly -- num_groups is
+                // typically 1-2, not num_cpus.
+                for (std::size_t g = 0; g < num_groups; ++g) {
+                    col_grad_sum += group_col_grad[g * n_out * rank + c * rank + k];
+                    col_grad_sum_contrib += group_col_grad_contrib[g * n_out * rank + c * rank + k];
                 }
                 // Scale update via the swappable policy -- same as
                 // value_scale's own update above.
@@ -2778,9 +2924,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         for (std::size_t k = 0; k < rank; ++k) {
             double gamma_grad_sum = 0.0, gamma_grad_sum_contrib = 0.0;
             for (int t = 0; t < num_cpus; ++t) {
-                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * rank + k];
+                gamma_grad_sum += t_gamma_grad[static_cast<std::size_t>(t) * t_rank_stride + k];
                 gamma_grad_sum_contrib +=
-                    t_gamma_grad_contrib[static_cast<std::size_t>(t) * rank + k];
+                    t_gamma_grad_contrib[static_cast<std::size_t>(t) * t_rank_stride + k];
             }
             const value_type g_agg = static_cast<value_type>(gamma_grad_sum);
             const value_type contrib_agg = static_cast<value_type>(gamma_grad_sum_contrib);

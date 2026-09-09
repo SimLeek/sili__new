@@ -758,11 +758,28 @@ void sisldo_optim_synaptogenesis(WEIGHTS_T& weights, const VALUE_TYPE learning_r
     weights.out_degree.assign(n_out, 0u);
     if (new_nnz > 0) {
         const auto& new_ci = *weights.connections.indices[0];
-// todo: replace with a proper compute reduction
-#pragma omp parallel for num_threads(num_cpus) schedule(static)
-        for (SIZE_TYPE w = 0; w < new_nnz; ++w) {
-#pragma omp atomic
-            weights.out_degree[new_ci[w]]++;
+        // Per-thread private histogram, reduced serially after the
+        // parallel region -- replaces a #pragma omp atomic per element
+        // (every thread contending on the same out_degree[col] counters)
+        // with zero contention during the parallel pass. Only called on
+        // synaptogenesis growth/pruning events, not every training step,
+        // so the per-call num_cpus*n_out temporary allocation isn't on
+        // the hot path this session's timing work is targeting.
+        std::vector<std::vector<uint32_t>> t_out_degree(static_cast<std::size_t>(num_cpus),
+                                                        std::vector<uint32_t>(n_out, 0u));
+#pragma omp parallel num_threads(num_cpus)
+        {
+            const int tid = omp_get_thread_num();
+            auto& local_degree = t_out_degree[static_cast<std::size_t>(tid)];
+#pragma omp for schedule(static)
+            for (SIZE_TYPE w = 0; w < new_nnz; ++w) {
+                local_degree[new_ci[w]]++;
+            }
+        }
+        for (int t = 0; t < num_cpus; ++t) {
+            const auto& local_degree = t_out_degree[static_cast<std::size_t>(t)];
+            for (SIZE_TYPE c = 0; c < n_out; ++c)
+                weights.out_degree[c] += local_degree[c];
         }
     }
 }
