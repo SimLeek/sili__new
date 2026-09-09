@@ -170,6 +170,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_sparse_input_backward
     test_fp4_bitshift
     test_fp4_stochastic
+    test_disldo_block4_fp4_wide_simd
     test_fp8_bitshift
     test_fp8_block4_simd
     test_fp8_value_accessor

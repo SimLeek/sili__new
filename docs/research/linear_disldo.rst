@@ -362,6 +362,66 @@ footprint exceeds what the target actually has -- worth checking via
 disassembly, not just codegen presence, before trusting a "wider must be
 faster" intuition.
 
+.. _disldo_forward.fp4_block4_avx2_column_pairing:
+
+FP4 block4: AVX2 column pairing, genuinely 8-wide decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp4_block4_avx2_column_pairing``
+
+FP4's decode (``block4_vec_decode_fp4``) is structurally different from
+FP8's: it is FULLY BRANCHLESS -- pure bitwise mask-and-select via
+comparison-producing vector masks, no scalar correction loop, no
+``codes_arr``/``result_arr`` scratch buffers at all. This directly raised
+the question ``disldo_forward.fp8_block4_avx2_column_pairing`` above left
+open: does FP4 avoid the register-pressure penalty that made FP8's
+genuinely-8-wide decode attempt measure worse? Two designs were built and
+compared, not assumed from the structural difference alone:
+
+1. **Twice-4-wide-decode-call** (the same "safe default" shape adopted for
+   FP8/FP32): pair two adjacent columns, call the existing 4-wide
+   ``block4_vec_decode_fp4`` once per column, combine the two DECODED
+   ``Block4Vec`` results into one ``Block8Vec`` via ``block8_vec_from_lo_hi``.
+2. **Genuinely 8-wide gather-then-decode**: a new ``block8_vec_decode_fp4``
+   (direct 8-lane port of ``block4_vec_decode_fp4``'s branchless
+   mask-and-select logic, using new ``Block8VecU``/``block8_vecu_broadcast``
+   helpers in ``block4.hpp``) decodes both paired columns' 8 masked weight
+   codes in one call, gathered into one ``Block8VecU`` literal instead of
+   two separate 4-wide literals.
+
+**RESULT: design 2 (genuinely 8-wide) WON and was adopted** -- the opposite
+outcome from FP8. Measured on this session's local machine (laptop, AMD
+Ryzen 7 3750H, real AVX2 via ``-march=native``, NOT ``arch-sandbox`` -- see
+caveat below): 8-run median-of-medians against ``test_disldo_block4_fp4_wide_simd.cpp``
+(n_in=256/n_out=256/batch=8, 4096 tiles) gave pre-widening baseline
+~319941-340878 ns/call, design 1 (twice-4-wide) ~291513 ns/call, design 2
+(genuinely 8-wide) ~267362 ns/call -- design 2 is **~8% faster than design 1
+and ~21% faster than the pre-widening baseline**. Disassembly of the
+compiled block4 OpenMP-outlined function (objdump, comparing design 1 vs
+design 2 binaries) confirmed the structural hypothesis: going from
+twice-4-wide to genuinely-8-wide costs only 207->231 stack-spill
+instructions (+11.6%) and 1710->1754 total instructions (+2.6%) for FP4,
+vs FP8's 181->280 spills (+55%) and 1768->1962 instructions (+11%) for the
+same before/after comparison -- FP4's branchless decode has no scalar
+correction-loop/scratch-array temporaries to double to 256-bit, so pairing
+its decode 8-wide costs much less register pressure than FP8's hybrid
+decode did. This directly answers the open question from the FP8 section:
+the "genuinely 8-wide gather-then-decode doesn't help" finding does NOT
+generalize to FP4 -- it's specific to FP8's hybrid scalar-correction-loop
+decode design, not an inherent property of gather-then-decode itself.
+
+**Caveat**: unlike every other AVX2-widening result in this document
+(which were all measured on ``arch-sandbox``, a dedicated Zen2 AVX2
+machine used specifically for apples-to-apples before/after comparisons),
+this comparison is LOCAL-ONLY -- the session that ran it could not reach
+``arch-sandbox`` over SSH (the direct-link key required a passphrase this
+background job had no way to supply). The qualitative result (design 2
+beats design 1, by a real and disassembly-corroborated margin, not just
+noise) is credible on its own evidence, but the exact percentages have not
+been cross-machine-confirmed the way FP32/FP8's were. Re-run
+``test_disldo_block4_fp4_wide_simd.cpp`` on ``arch-sandbox`` before citing
+these exact numbers elsewhere.
+
 .. _disldo_forward.aqrs_additive_branch:
 
 AQRS additive branch
