@@ -1156,6 +1156,62 @@ struct SparseLinearWeightsDelta {
     };
     ScaleRankScratch scale_rank_scratch;
 
+    // Persistent per-instance heap scratch for disldo_backward's SCATTERED
+    // per-thread accumulators (t_dx, t_col_grad, t_col_grad_contrib,
+    // t_gamma_grad, t_gamma_grad_contrib) -- same task #295-style pattern
+    // as ScaleRankScratch above, avoiding a fresh heap allocation + full
+    // value-initialize-to-zero on EVERY disldo_backward() call. Measured
+    // as a real cost: at width=288 (82944-element layer), backward at
+    // num_cpus=8 was slower than num_cpus=1 -- the per-call buffers are
+    // sized num_cpus*(...), so more threads meant more to allocate+zero
+    // serially before the parallel region even opened, on every single
+    // call. Addressing ALWAYS uses the stored cap_* stride (not the
+    // current call's possibly-smaller dst/out_rank/rank), so a later call
+    // with smaller dimensions than a historical max can never alias two
+    // threads' slices together -- stricter than ScaleRankScratch's own
+    // addressing convention above, deliberately, since this is new code
+    // with no established precedent to match. Zeroing is the CALLER's
+    // responsibility (done inside the parallel region, one thread per
+    // slice, right before that slice is used) -- this struct only owns
+    // the memory, not its contents, since ensure()/resize_to() (like
+    // ScaleRankScratch) only zero NEWLY appended elements on growth, not
+    // the whole buffer every time.
+    struct DisldoBackwardScratch {
+        std::vector<value_type> t_dx;                 // [thread][batch][in_cols], stride cap_dst
+        std::vector<value_type> t_col_grad;           // [thread][col][k], stride cap_out_rank
+        std::vector<value_type> t_col_grad_contrib;   // [thread][col][k], stride cap_out_rank
+        std::vector<value_type> t_gamma_grad;         // [thread][k], stride cap_rank
+        std::vector<value_type> t_gamma_grad_contrib; // [thread][k], stride cap_rank
+
+        std::size_t cap_threads = 0, cap_dst = 0, cap_out_rank = 0, cap_rank = 0;
+
+        // Grow-only (never shrinks) -- called automatically at the top of
+        // every disldo_backward call, a cheap no-op once large enough.
+        void ensure(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank) {
+            if (threads <= cap_threads && dst <= cap_dst && out_rank <= cap_out_rank &&
+                rank <= cap_rank)
+                return;
+            resize_to(std::max(cap_threads, threads), std::max(cap_dst, dst),
+                      std::max(cap_out_rank, out_rank), std::max(cap_rank, rank));
+        }
+
+        // Explicit, caller-driven resize -- unlike ensure(), CAN shrink.
+        // Caller must not pass below what's currently in use.
+        void resize_to(std::size_t threads, std::size_t dst, std::size_t out_rank,
+                       std::size_t rank) {
+            cap_threads = threads;
+            cap_dst = dst;
+            cap_out_rank = out_rank;
+            cap_rank = rank;
+            t_dx.resize(cap_threads * cap_dst);
+            t_col_grad.resize(cap_threads * cap_out_rank);
+            t_col_grad_contrib.resize(cap_threads * cap_out_rank);
+            t_gamma_grad.resize(cap_threads * cap_rank);
+            t_gamma_grad_contrib.resize(cap_threads * cap_rank);
+        }
+    };
+    DisldoBackwardScratch disldo_backward_scratch;
+
     // Explicit, caller-driven scratch memory control (task #295) --
     // separate from scale_rank_max/additive_rank_max below (POLICY cap on
     // rank growth, not memory). Can shrink or preallocate ahead of need;

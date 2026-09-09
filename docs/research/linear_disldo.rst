@@ -926,3 +926,91 @@ legacy always-on channel to protect (``min_rank=0`` in
 ``apply_additive_dynamic_rank_control`` -- the branch can legitimately
 shrink itself back to fully off), so L1 applies to every ``k`` here,
 including ``k==0``.
+
+.. _disldo_backward.ccx_aware_reduction:
+
+group-aware (CCX) reduction of ``t_dx``/``t_col_grad``, and why it needs pinning
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.ccx_aware_reduction``
+
+**The problem this closes.** On a real dual-CCX desktop part (AMD Ryzen
+7 3800XT, confirmed via
+``/sys/devices/system/cpu/cpuN/cache/index3/shared_cpu_list``: cpu0-3
++8-11 share one L3 slice, cpu4-7+12-15 share a separate one),
+``disldo_backward``'s final serial reduction loops -- one thread reading
+every ``t_dx``/``t_col_grad`` slot in flat ``tid`` order after the
+parallel region closes -- pay full cross-CCX Infinity Fabric latency for
+any slot written by a thread on the OTHER cache domain. Measured on an
+isolated single-size backward benchmark (width=288, 82944 elements,
+fresh process per ``num_cpus``, no pinning): ``num_cpus`` 1-4 (fits one
+CCX) ran 1020-1289us; 5-9 (spans both CCXes) jumped to 1882-2366us; 10-16
+gradually diluted the fixed tax back down to 1162-1725us. This ISN'T a
+software bug being fixed elsewhere in this file (critical-section
+removal, persistent scratch) -- it survived process isolation and
+thread-affinity experiments unrelated to those fixes.
+
+**GPU-porting analogy** (this investigation doubled as a GPU-porting
+exercise -- see ``project_sili_optimal_hardware_vision`` /
+``sili_beyond_llm_benchmarks`` planning): a CCX here plays the same role
+an SM (streaming multiprocessor) plays on a GPU -- a group of cores that
+share one fast local cache/scratch resource, with a much slower path to
+any OTHER group's cache. The fix below (each cache-domain's own "leader"
+thread pre-sums its own group locally, then a small cross-group merge)
+is exactly the two-level reduction pattern used for GPU cross-block
+reductions: reduce WITHIN a block/SM using its fast shared memory first,
+then combine the small number of per-block partials across the slow
+global-memory path. The "persistent thread pool instead of forking a new
+OpenMP team every call" idea discussed alongside this (not implemented)
+is the CPU analog of a GPU persistent/mega-kernel: keep workers resident
+and dispatch via a lock-free queue instead of paying a fresh
+launch/rendezvous cost per kernel invocation.
+
+**The fix.** ``cpu_topology.hpp`` parses the sysfs cache-domain table
+once per process (cached), with a same-file API (``current_thread_group()``)
+that queries a thread's CURRENT physical CPU via ``sched_getcpu()`` (a
+cheap vDSO call) and maps it to a cache-group id. This is captured for
+every thread once, inside the existing zero-fill parallel region (before
+the scattered/block4 accumulate regions run), and used to build
+``group_leader_tid``/``tid_to_g``. After BOTH accumulate regions close,
+``t_dx``/``t_col_grad``/``t_col_grad_contrib`` are reduced in two levels:
+if every thread landed in one group (``num_groups<=1`` -- true on any
+single-CCX machine, and true whenever ``num_cpus`` fits inside one CCX
+even on a multi-CCX one), a plain flat serial accumulate runs, matching
+the old cost plus one negligible extra copy pass. Otherwise, a NEW small
+``#pragma omp parallel`` region lets each group's leader thread sum ONLY
+its own group's slots (cache-local reads, and every leader runs
+concurrently), leaving only ``num_groups`` (typically 1-2) values for a
+tiny final serial merge -- collapsing what used to be O(num_cpus)
+cross-domain reads down to O(num_groups). A stale/wrong group assignment
+can only cost performance, never correctness: the reduction still visits
+every ``tid`` in ``[0, num_cpus)`` exactly once regardless of grouping.
+Gamma's own reduction (tiny, ``rank`` is small) and block4's
+``t_row_grad`` reduction (a separate, pre-existing, deliberately
+out-of-scope buffer) are left flat.
+
+**Why this needs thread pinning to actually pay off.** The whole design
+assumes a thread's cache-group membership, captured once near the start
+of the call, stays valid for the REST of that call. Without
+``OMP_PROC_BIND``/``OMP_PLACES`` set, nothing guarantees that -- the OS
+is free to migrate a thread across CCXes mid-call. Measured directly:
+unpinned, this fix alone was a wash-to-regression (``num_cpus=4``, the
+previous best option, went from 1020us to 1478us -- worse, because at
+low thread counts the OS sometimes DOES scatter threads across both
+CCXes even for 3-4 threads, so the code correctly detects
+``num_groups=2`` and pays for an ENTIRE EXTRA parallel region's
+cross-CCX fork/join rendezvous just to reduce a handful of values,
+adding cost instead of avoiding it). Pinned
+(``OMP_PROC_BIND=true OMP_PLACES=cores``, set in ``sili/__init__.py``
+before the compiled extension is ever imported -- see that file's own
+comment for why Python-level ``os.environ`` is the only place early
+enough to influence libgomp's own env parsing), the same code hit a new
+session-best 812us at ``num_cpus=16`` (previous best-ever across every
+configuration measured all session: 890.8us at ``num_cpus=2``, from
+BEFORE any of this session's fixes) and meaningfully improved
+``num_cpus`` 2/8/9/10 too -- but ``num_cpus`` 3-6 got WORSE than the
+pre-fix baseline even pinned (``num_cpus=4``: 1605us). **Practical
+upshot**: this fix is only a net win when paired with pinning AND a
+``num_cpus`` choice of 2 or >=8 on this machine's topology -- staying at
+the old "safe default" of ``num_cpus=4`` under the new pinned regime is
+now the single worst non-plateau option measured.
