@@ -35,6 +35,16 @@ template <> struct Block4Codec<FP4BiPacked> {
     static float decode_importance(const uint8_t* tdata, uint32_t li, uint32_t lj) {
         return FP4_TABLE[(tdata[Block4Tile::slot_index(li, lj)] >> 4) & 0xFu];
     }
+    // SIMD-width (li=0..3) weight decode for a fixed column lj -- used by
+    // disldo_forward's cross-tile/column-pairing loops, which need all 4
+    // rows of a column at once, not one (li,lj) cell at a time.
+    static Block4Vec decode_weight_column4(const uint8_t* tdata, uint32_t lj) {
+        const Block4VecU codes = {uint32_t(tdata[Block4Tile::slot_index(0, lj)] & 0xFu),
+                                  uint32_t(tdata[Block4Tile::slot_index(1, lj)] & 0xFu),
+                                  uint32_t(tdata[Block4Tile::slot_index(2, lj)] & 0xFu),
+                                  uint32_t(tdata[Block4Tile::slot_index(3, lj)] & 0xFu)};
+        return block4_vec_decode_fp4(codes);
+    }
     // FP4-specific: the AQRS gradient-accumulation terms (mrow/mgamma/mcol)
     // substitute a small epsilon for an exactly-zero quantized weight, so a
     // permanently-dead synapse can still escape zero via its importance
@@ -87,6 +97,13 @@ template <> struct Block4Codec<FP8BiValues> {
     }
     static float decode_importance(const uint8_t* tdata, uint32_t li, uint32_t lj) {
         return fp8_decode_bits(tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]);
+    }
+    static Block4Vec decode_weight_column4(const uint8_t* tdata, uint32_t lj) {
+        const Block4VecU codes = {uint32_t(tdata[Block4Tile8::slot_index(0, lj)]),
+                                  uint32_t(tdata[Block4Tile8::slot_index(1, lj)]),
+                                  uint32_t(tdata[Block4Tile8::slot_index(2, lj)]),
+                                  uint32_t(tdata[Block4Tile8::slot_index(3, lj)])};
+        return block4_vec_decode_fp8(codes);
     }
     static float quant_floor(float quant, float /*zero_escape_eps*/) { return quant; }
     template <bool StochasticRounding>
@@ -142,6 +159,11 @@ template <> struct Block4Codec<DeltaCSRBiValues<float>> {
                     tdata + sizeof(float) * (BLOCK4_TILE_SLOTS + Block4Tile32::slot_index(li, lj)),
                     sizeof(v));
         return v;
+    }
+    static Block4Vec decode_weight_column4(const uint8_t* tdata, uint32_t lj) {
+        Block4Vec w;
+        std::memcpy(&w, tdata + sizeof(float) * Block4Tile32::slot_index(0, lj), sizeof(w));
+        return w;
     }
     static float quant_floor(float quant, float /*zero_escape_eps*/) { return quant; }
     template <bool StochasticRounding>

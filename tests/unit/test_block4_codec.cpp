@@ -56,6 +56,13 @@ static void test_fp4() {
     CHECK(Codec::quant_floor(0.0f, 0.1f) == 0.1f, "fp4 quant_floor(0) should substitute eps");
     CHECK(Codec::quant_floor(2.0f, 0.1f) == 2.0f, "fp4 quant_floor(nonzero) should pass through");
 
+    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+        const Block4Vec col = Codec::decode_weight_column4(tdata, lj);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            CHECK(float_eq(col[li], Codec::decode_weight(tdata, li, lj)),
+                  "fp4 decode_weight_column4 mismatch at li=%u lj=%u", li, lj);
+    }
+
     // Encode round-trip: for each was_live x StochasticRounding=false combo,
     // the trait's write-back byte must match calling fp4_quantize{,_live}
     // directly and packing the same way process_tile_pair_fp4 does.
@@ -104,6 +111,13 @@ static void test_fp8() {
     CHECK(Codec::quant_floor(0.0f, 0.1f) == 0.0f, "fp8 quant_floor must be identity");
     CHECK(Codec::quant_floor(3.0f, 0.1f) == 3.0f, "fp8 quant_floor must be identity");
 
+    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+        const Block4Vec col = Codec::decode_weight_column4(tdata, lj);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            CHECK(float_eq(col[li], Codec::decode_weight(tdata, li, lj)),
+                  "fp8 decode_weight_column4 mismatch at li=%u lj=%u", li, lj);
+    }
+
     for (int was_live = 0; was_live <= 1; ++was_live) {
         for (float w : {-100.0f, 0.0f, 12.5f}) {
             for (float imp : {0.0f, 0.25f, 8.0f}) {
@@ -149,6 +163,13 @@ static void test_fp32() {
     }
 
     CHECK(Codec::quant_floor(0.0f, 0.1f) == 0.0f, "fp32 quant_floor must be identity");
+
+    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+        const Block4Vec col = Codec::decode_weight_column4(tdata, lj);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            CHECK(col[li] == Codec::decode_weight(tdata, li, lj),
+                  "fp32 decode_weight_column4 mismatch at li=%u lj=%u", li, lj);
+    }
 
     uint8_t buf[BLOCK4_TILE_SLOTS32_BYTES] = {0};
     Codec::encode<false>(buf, 2, 1, 3.5f, -1.25f, true);
