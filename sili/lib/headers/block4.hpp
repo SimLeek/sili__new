@@ -1316,6 +1316,10 @@ struct Block4Store {
     std::vector<double> scratch_row_grad;         // backward only
     // backward only:
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward cross-tile pairing scratch -- currently only used by
+    // the FP32 block4 store; harmless unused field here (shared collection
+    // loop in disldo_forward populates it for every VALUES_TYPE).
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
@@ -1877,6 +1881,10 @@ struct Block4Store8 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward cross-tile pairing scratch -- currently only used by
+    // the FP32 block4 store; harmless unused field here (shared collection
+    // loop in disldo_forward populates it for every VALUES_TYPE).
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
@@ -2595,6 +2603,12 @@ struct Block4Store32 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward.fp32_block4_cross_tile_pairing: marks every SECOND
+    // tile of a same-br run in scratch_tile_br/bc (bc-ascending order) as
+    // already-consumed by its leader (the immediately preceding flat
+    // index) -- lets the forward parallel loop pair two DIFFERENT tiles
+    // sharing a block-row with zero extra indexing, just a skip-check.
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};

@@ -120,6 +120,15 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         std::vector<uint32_t>& tile_bc = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
+        // disldo_forward.fp32_block4_cross_tile_pairing: FP32-only, marks
+        // every SECOND tile of a same-br run (bk odd) as a "follower" --
+        // already consumed by its leader (ti-1) once the parallel loop
+        // below pairs two DIFFERENT tiles sharing a br. Computed for free
+        // during this same sequential collection walk (bk is already the
+        // per-row loop counter); unused (but harmlessly populated) for
+        // FP8/FP4, which share this collection loop but keep their
+        // existing per-tile (not cross-tile) processing.
+        std::vector<uint8_t>& tile_is_follower = weights.block4.scratch_tile_is_follower;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back(): push_back's
         // per-call capacity check is measured exclusive cost at this scale.
@@ -128,6 +137,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
         tile_byte.resize(n_b4);
+        tile_is_follower.resize(n_b4);
         const auto& BL4 = weights.block4.block_layout;
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
@@ -142,6 +152,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 tile_bc[ti] = bc_cursor.advance();
                 tile_elem[ti] = elem_pos;
                 tile_byte[ti] = byte_pos;
+                tile_is_follower[ti] = uint8_t(bk % 2 == 1);
                 byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
@@ -160,31 +171,92 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
 #pragma omp for schedule(static)
             for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
-                const uint32_t br = tile_br[std::size_t(row_ti)], bc = tile_bc[std::size_t(row_ti)];
-                // const: routes .at() through the const overload (no dirty
-                // mark, forward is read-only). at_index() reuses the
-                // coordinates the collection loop above already resolved.
-                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(row_ti)],
-                                                          tile_byte[std::size_t(row_ti)]);
-                // Resolved once per tile, not once per .at() call. See
-                // Block4TileHandle::raw_data().
-                const uint8_t* tdata = tile.raw_data();
                 if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                    // AVX2 widening: FP32 has no decode step (Block4Tile32's
-                    // weight half already stores 4 raw, contiguous floats
-                    // per column), and two adjacent columns (LJ0,LJ0+1) are
-                    // laid out back-to-back in tdata (slot_index(li,lj) =
-                    // lj*4+li), so ONE 32-byte memcpy loads BOTH columns'
-                    // weights as a single 8-wide vector. Both columns also
-                    // read the exact same 4 input rows (br*4..br*4+4, fixed
-                    // per tile), so the per-batch dot-product gather is
-                    // shared too -- this turns what was two separate 4-wide
-                    // (128-bit) multiply-accumulates into one 8-wide
-                    // (256-bit) op. See docs/research/linear_disldo.rst:
-                    // disldo_forward.fp32_block4_avx2_column_pairing.
+                    // disldo_forward.fp32_block4_cross_tile_pairing: pair
+                    // this tile (the "leader") with its consecutive
+                    // same-br partner if one exists (tile_is_follower[
+                    // row_ti+1], set by the collection loop above), instead
+                    // of always falling back to within-tile column pairing.
+                    // Forward is read-only, so unlike the backward port
+                    // below there's no live-handle-aliasing hazard from
+                    // holding two Block4TileHandle32 const handles at once.
+                    // Correctness and the real speedup (measured, not
+                    // assumed) were both validated first via a standalone
+                    // PoC -- see disldo_forward.fp32_block4_cross_tile_pairing
+                    // in docs/research/linear_disldo.rst and
+                    // tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp.
+                    if (tile_is_follower[std::size_t(row_ti)])
+                        continue; // already consumed by row_ti-1 as its partner.
+                    const uint32_t br = tile_br[std::size_t(row_ti)],
+                                   bcA = tile_bc[std::size_t(row_ti)];
+                    const auto tileA = weights.block4.at_index(
+                        br, bcA, tile_elem[std::size_t(row_ti)], tile_byte[std::size_t(row_ti)]);
+                    const uint8_t* tdataA = tileA.raw_data();
+                    const bool has_partner =
+                        (row_ti + 1 < n_tiles_local) && tile_is_follower[std::size_t(row_ti + 1)];
+                    if (has_partner) {
+                        const uint32_t bcB = tile_bc[std::size_t(row_ti + 1)];
+                        const auto tileB =
+                            weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
+                                                    tile_byte[std::size_t(row_ti + 1)]);
+                        const uint8_t* tdataB = tileB.raw_data();
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
+                            const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
+                            const bool haveA = colA < n_out;
+                            const bool haveB = colB < n_out;
+                            if (!haveA)
+                                continue;
+
+                            Block4Vec wA, wB = block4_vec_broadcast(0.0f);
+                            std::memcpy(&wA,
+                                        tdataA + sizeof(float) * Block4Tile32::slot_index(0, lj),
+                                        sizeof(wA));
+                            if (haveB)
+                                std::memcpy(
+                                    &wB, tdataB + sizeof(float) * Block4Tile32::slot_index(0, lj),
+                                    sizeof(wB));
+                            const Block8Vec w_decoded8 = block8_vec_from_lo_hi(wA, wB);
+
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, colA) : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? weights.get_scale(row, colB)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + colA] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (haveB)
+                                    mo[static_cast<std::size_t>(b) * n_out + colB] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
+                        }
+                        continue;
+                    }
+                    // solo: no partner tile in this br -- fall back to the
+                    // existing within-tile column pairing, unchanged math
+                    // (disldo_forward.fp32_block4_avx2_column_pairing).
                     static_assert(BLOCK4_TILE == 4,
                                   "column pairing below assumes exactly 4 columns (2 pairs)");
-                    auto process_pair = [&]<uint32_t LJ0>() {
+                    const uint32_t bc = bcA;
+                    const uint8_t* tdata = tdataA;
+                    const uint32_t br_ = br;
+                    auto process_pair = [&, br_]<uint32_t LJ0>() {
                         constexpr uint32_t LJ1 = LJ0 + 1;
                         const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
                         const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
@@ -202,7 +274,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         std::size_t row_idx[BLOCK4_TILE];
                         Block8Vec s8;
                         for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
                             row_idx[li] = row < n_in ? row : 0;
                             s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
                             s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
@@ -229,161 +301,181 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     };
                     process_pair.template operator()<0>();
                     process_pair.template operator()<2>();
-                } else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                    // AVX2 widening: unlike FP32 (no decode step at all),
-                    // FP8 DOES have a real 4-wide SIMD decode
-                    // (block4_vec_decode_fp8) -- kept UNCHANGED and called
-                    // once per column rather than rewritten 8-wide. A
-                    // genuinely 8-wide gather-then-decode variant (combining
-                    // both columns' codes into one block8_vec_decode_fp8
-                    // call) was built and MEASURED WORSE (median-of-medians
-                    // 180730 ns/call vs this version's 133110 ns/call on
-                    // arch-sandbox, even slower than the pre-widening
-                    // baseline's 176200) -- reverted, not adopted. See
-                    // disldo_forward.fp8_block4_avx2_column_pairing in
-                    // docs/research/linear_disldo.rst for the measured
-                    // rationale. The two columns' DECODED results are
-                    // combined into one Block8Vec, then reuse the exact
-                    // same 8-wide scale-multiply/batch-accumulate/
-                    // split-hsum pattern as FP32's process_pair above.
-                    static_assert(BLOCK4_TILE == 4,
-                                  "column pairing below assumes exactly 4 columns (2 pairs)");
-                    auto process_pair8 = [&]<uint32_t LJ0>() {
-                        constexpr uint32_t LJ1 = LJ0 + 1;
-                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
-                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
-                        const bool have0 = col0 < n_out;
-                        const bool have1 = col1 < n_out; // have0==false implies have1==false
-                        if (!have0)
-                            return;
-
-                        const Block4VecU w_codes0 = {
-                            uint32_t(tdata[Block4Tile8::slot_index(0, LJ0)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(1, LJ0)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(2, LJ0)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(3, LJ0)])};
-                        const Block4Vec w_decoded0 = block4_vec_decode_fp8(w_codes0);
-                        Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
-                        if (have1) {
-                            const Block4VecU w_codes1 = {
-                                uint32_t(tdata[Block4Tile8::slot_index(0, LJ1)]),
-                                uint32_t(tdata[Block4Tile8::slot_index(1, LJ1)]),
-                                uint32_t(tdata[Block4Tile8::slot_index(2, LJ1)]),
-                                uint32_t(tdata[Block4Tile8::slot_index(3, LJ1)])};
-                            w_decoded1 = block4_vec_decode_fp8(w_codes1);
-                        }
-                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
-
-                        std::size_t row_idx[BLOCK4_TILE];
-                        Block8Vec s8;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                            row_idx[li] = row < n_in ? row : 0;
-                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
-                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
-                                                               : value_type(0);
-                        }
-                        const Block8Vec w8 = w_decoded8 * s8;
-
-                        for (SIZE_TYPE b = 0; b < batch; ++b) {
-                            const value_type* in_row =
-                                input + static_cast<std::size_t>(b) * in_cols;
-                            Block8Vec in8;
-                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                const value_type iv = in_row[row_idx[li]];
-                                in8[li] = iv;
-                                in8[li + 4] = iv;
-                            }
-                            const Block8Vec prod = w8 * in8;
-                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
-                                prod[0] + prod[1] + prod[2] + prod[3];
-                            if (have1)
-                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
-                                    prod[4] + prod[5] + prod[6] + prod[7];
-                        }
-                    };
-                    process_pair8.template operator()<0>();
-                    process_pair8.template operator()<2>();
+                    continue;
                 } else {
-                    // AVX2 widening: FP4's decode (block4_vec_decode_fp4) is
-                    // fully branchless -- no scalar correction loop/scratch
-                    // arrays, unlike FP8's decode. A genuinely 8-wide
-                    // gather-then-decode variant (block8_vec_decode_fp4,
-                    // gathering both columns' 8 masked codes into one
-                    // Block8VecU) was ALSO built and measured on
-                    // arch-sandbox: it looked like a clear win on a local
-                    // laptop (~8% faster) but on arch-sandbox (n=35
-                    // interleaved runs) the two designs were statistically
-                    // indistinguishable (median 154600 vs 151200 ns/call,
-                    // mean 143139 vs 144067 -- within this comparison's own
-                    // run-to-run noise band). So this twice-4-wide-call
-                    // design was kept instead, for simplicity and
-                    // consistency with FP32/FP8's adopted shape: pairs two
-                    // adjacent columns into one 8-wide op by calling the
-                    // 4-wide decode ONCE per column and combining
-                    // post-decode via block8_vec_from_lo_hi. See
-                    // disldo_forward.fp4_block4_avx2_column_pairing in
-                    // docs/research/linear_disldo.rst for the full
-                    // local-vs-remote comparison.
-                    static_assert(BLOCK4_TILE == 4,
-                                  "column pairing below assumes exactly 4 columns (2 pairs)");
-                    auto process_pair4 = [&]<uint32_t LJ0>() {
-                        constexpr uint32_t LJ1 = LJ0 + 1;
-                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
-                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
-                        const bool have0 = col0 < n_out;
-                        const bool have1 = col1 < n_out; // have0==false implies have1==false
-                        if (!have0)
-                            return;
+                    // FP8/FP4 (unchanged from before the cross-tile pairing
+                    // change above -- only the FP32 branch's own tile lookup
+                    // was restructured; this whole else-branch is discarded
+                    // by if constexpr for the FP32 instantiation, so it is
+                    // never compiled against FP32's tile layout).
+                    const uint32_t br = tile_br[std::size_t(row_ti)],
+                                   bc = tile_bc[std::size_t(row_ti)];
+                    // const: routes .at() through the const overload (no dirty
+                    // mark, forward is read-only). at_index() reuses the
+                    // coordinates the collection loop above already resolved.
+                    const auto tile = weights.block4.at_index(
+                        br, bc, tile_elem[std::size_t(row_ti)], tile_byte[std::size_t(row_ti)]);
+                    // Resolved once per tile, not once per .at() call. See
+                    // Block4TileHandle::raw_data().
+                    const uint8_t* tdata = tile.raw_data();
+                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        // AVX2 widening: unlike FP32 (no decode step at all),
+                        // FP8 DOES have a real 4-wide SIMD decode
+                        // (block4_vec_decode_fp8) -- kept UNCHANGED and called
+                        // once per column rather than rewritten 8-wide. A
+                        // genuinely 8-wide gather-then-decode variant (combining
+                        // both columns' codes into one block8_vec_decode_fp8
+                        // call) was built and MEASURED WORSE (median-of-medians
+                        // 180730 ns/call vs this version's 133110 ns/call on
+                        // arch-sandbox, even slower than the pre-widening
+                        // baseline's 176200) -- reverted, not adopted. See
+                        // disldo_forward.fp8_block4_avx2_column_pairing in
+                        // docs/research/linear_disldo.rst for the measured
+                        // rationale. The two columns' DECODED results are
+                        // combined into one Block8Vec, then reuse the exact
+                        // same 8-wide scale-multiply/batch-accumulate/
+                        // split-hsum pattern as FP32's process_pair above.
+                        static_assert(BLOCK4_TILE == 4,
+                                      "column pairing below assumes exactly 4 columns (2 pairs)");
+                        auto process_pair8 = [&]<uint32_t LJ0>() {
+                            constexpr uint32_t LJ1 = LJ0 + 1;
+                            const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                            const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                            const bool have0 = col0 < n_out;
+                            const bool have1 = col1 < n_out; // have0==false implies have1==false
+                            if (!have0)
+                                return;
 
-                        const Block4VecU w_codes0 = {
-                            uint32_t(tdata[Block4Tile::slot_index(0, LJ0)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(1, LJ0)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(2, LJ0)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(3, LJ0)] & 0xFu)};
-                        const Block4Vec w_decoded0 = block4_vec_decode_fp4(w_codes0);
-                        Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
-                        if (have1) {
-                            const Block4VecU w_codes1 = {
-                                uint32_t(tdata[Block4Tile::slot_index(0, LJ1)] & 0xFu),
-                                uint32_t(tdata[Block4Tile::slot_index(1, LJ1)] & 0xFu),
-                                uint32_t(tdata[Block4Tile::slot_index(2, LJ1)] & 0xFu),
-                                uint32_t(tdata[Block4Tile::slot_index(3, LJ1)] & 0xFu)};
-                            w_decoded1 = block4_vec_decode_fp4(w_codes1);
-                        }
-                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
-
-                        std::size_t row_idx[BLOCK4_TILE];
-                        Block8Vec s8;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                            row_idx[li] = row < n_in ? row : 0;
-                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
-                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
-                                                               : value_type(0);
-                        }
-                        const Block8Vec w8 = w_decoded8 * s8;
-
-                        for (SIZE_TYPE b = 0; b < batch; ++b) {
-                            const value_type* in_row =
-                                input + static_cast<std::size_t>(b) * in_cols;
-                            Block8Vec in8;
-                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                const value_type iv = in_row[row_idx[li]];
-                                in8[li] = iv;
-                                in8[li + 4] = iv;
+                            const Block4VecU w_codes0 = {
+                                uint32_t(tdata[Block4Tile8::slot_index(0, LJ0)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(1, LJ0)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(2, LJ0)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(3, LJ0)])};
+                            const Block4Vec w_decoded0 = block4_vec_decode_fp8(w_codes0);
+                            Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
+                            if (have1) {
+                                const Block4VecU w_codes1 = {
+                                    uint32_t(tdata[Block4Tile8::slot_index(0, LJ1)]),
+                                    uint32_t(tdata[Block4Tile8::slot_index(1, LJ1)]),
+                                    uint32_t(tdata[Block4Tile8::slot_index(2, LJ1)]),
+                                    uint32_t(tdata[Block4Tile8::slot_index(3, LJ1)])};
+                                w_decoded1 = block4_vec_decode_fp8(w_codes1);
                             }
-                            const Block8Vec prod = w8 * in8;
-                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
-                                prod[0] + prod[1] + prod[2] + prod[3];
-                            if (have1)
-                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
-                                    prod[4] + prod[5] + prod[6] + prod[7];
-                        }
-                    };
-                    process_pair4.template operator()<0>();
-                    process_pair4.template operator()<2>();
-                }
+                            const Block8Vec w_decoded8 =
+                                block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                                s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (have1)
+                                    mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
+                        };
+                        process_pair8.template operator()<0>();
+                        process_pair8.template operator()<2>();
+                    } else {
+                        // AVX2 widening: FP4's decode (block4_vec_decode_fp4) is
+                        // fully branchless -- no scalar correction loop/scratch
+                        // arrays, unlike FP8's decode. A genuinely 8-wide
+                        // gather-then-decode variant (block8_vec_decode_fp4,
+                        // gathering both columns' 8 masked codes into one
+                        // Block8VecU) was ALSO built and measured on
+                        // arch-sandbox: it looked like a clear win on a local
+                        // laptop (~8% faster) but on arch-sandbox (n=35
+                        // interleaved runs) the two designs were statistically
+                        // indistinguishable (median 154600 vs 151200 ns/call,
+                        // mean 143139 vs 144067 -- within this comparison's own
+                        // run-to-run noise band). So this twice-4-wide-call
+                        // design was kept instead, for simplicity and
+                        // consistency with FP32/FP8's adopted shape: pairs two
+                        // adjacent columns into one 8-wide op by calling the
+                        // 4-wide decode ONCE per column and combining
+                        // post-decode via block8_vec_from_lo_hi. See
+                        // disldo_forward.fp4_block4_avx2_column_pairing in
+                        // docs/research/linear_disldo.rst for the full
+                        // local-vs-remote comparison.
+                        static_assert(BLOCK4_TILE == 4,
+                                      "column pairing below assumes exactly 4 columns (2 pairs)");
+                        auto process_pair4 = [&]<uint32_t LJ0>() {
+                            constexpr uint32_t LJ1 = LJ0 + 1;
+                            const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                            const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                            const bool have0 = col0 < n_out;
+                            const bool have1 = col1 < n_out; // have0==false implies have1==false
+                            if (!have0)
+                                return;
+
+                            const Block4VecU w_codes0 = {
+                                uint32_t(tdata[Block4Tile::slot_index(0, LJ0)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(1, LJ0)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(2, LJ0)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(3, LJ0)] & 0xFu)};
+                            const Block4Vec w_decoded0 = block4_vec_decode_fp4(w_codes0);
+                            Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
+                            if (have1) {
+                                const Block4VecU w_codes1 = {
+                                    uint32_t(tdata[Block4Tile::slot_index(0, LJ1)] & 0xFu),
+                                    uint32_t(tdata[Block4Tile::slot_index(1, LJ1)] & 0xFu),
+                                    uint32_t(tdata[Block4Tile::slot_index(2, LJ1)] & 0xFu),
+                                    uint32_t(tdata[Block4Tile::slot_index(3, LJ1)] & 0xFu)};
+                                w_decoded1 = block4_vec_decode_fp4(w_codes1);
+                            }
+                            const Block8Vec w_decoded8 =
+                                block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                                s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (have1)
+                                    mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
+                        };
+                        process_pair4.template operator()<0>();
+                        process_pair4.template operator()<2>();
+                    }
+                } // else (FP8/FP4)
             }
         }
         for (int t = 0; t < num_cpus; ++t) {

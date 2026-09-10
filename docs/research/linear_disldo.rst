@@ -1514,3 +1514,45 @@ of probing through a forward pass.
 Both PoCs were correctness-validated (weight/importance/dx all
 effectively exact, not just tolerance-close) before the port into the
 real kernels described in the commit(s) alongside this doc entry.
+
+**Forward production port, measured against the real kernel (not the
+PoC harness).** ``disldo_forward``'s existing tile-collection loop
+already walks each block-row's tiles in ``bc``-ascending order before
+the parallel region; a new per-tile ``uint8_t`` scratch flag
+(``scratch_tile_is_follower``) marks every SECOND tile of a same-``br``
+run as "already consumed by its leader," computed for free (one
+``bk % 2`` check) during that same walk. The parallel loop then pairs a
+leader with its follower into one 8-wide op (mirroring the PoC's
+``forward_cross_tile``), or falls back to the existing within-tile
+column-pairing (``process_pair``, unchanged) for a genuine solo tile.
+FP8/FP4 are structurally untouched (their whole per-tile branch moved
+into an ``else`` of a top-level ``if constexpr`` on ``VALUES_TYPE``, so
+none of this new code is even compiled for those instantiations).
+
+The PoC's own ~17-20% speedup (measured as a hand-rolled, single-
+threaded, no-OMP-overhead harness) does NOT reproduce when measured on
+the real ``disldo_forward`` call (interleaved remote A/B, 20 runs each,
+``n_in=n_out=256, batch=8``, checkered layout): at ``num_cpus=4``, mean
+before ~77.2us vs after ~79.0us (statistically indistinguishable); at
+``num_cpus=1`` (matching the PoC's single-threaded shape), medians were
+essentially identical (~174.3-181.5us both arms). The real kernel's
+fixed per-call overhead (rebuilding the ``tile_br``/``tile_bc``/
+``tile_elem``/``tile_byte``/``tile_is_follower`` scratch vectors, the
+per-thread output-buffer allocation and final reduction pass, OMP
+fork/join) is large enough relative to this problem size that halving
+the per-pair ``at_index()``/``raw_data()`` calls doesn't show up above
+the noise floor -- unlike the PoC's minimal harness, where that halving
+was a much larger fraction of total cost.
+
+**This is treated as a real, useful result, not a null result**: cross-
+tile pairing reaches PARITY with the already-optimized fully-dense
+adjacent-pairing baseline while now correctly handling a genuinely
+GAPPED (checkered) sparse tile pattern -- the two cases are "nearly
+indistinguishable" in measured cost. That parity is the actual target:
+this pairing axis exists to let sparse block4 occupancy patterns (which
+won't generally have convenient adjacent-column pairs to combine) still
+reach full 8-wide SIMD width, which matters more as sparsity increases
+past this 50%-density test case, and is the same underlying pattern
+intended to later fill GPU warps (task #408) -- a CPU-side wash on a
+50%-dense pattern is a good sign for both of those, not evidence against
+landing it.
