@@ -1665,3 +1665,48 @@ setup, ``was_live8`` bookkeeping, the scalar ``fp8_quantize_live``/
 bare float write, so halving the number of PER-TILE setup/lookup
 operations (not just per-cell math) has a larger relative payoff here
 than it did for the lighter-weight FP32 kernel.
+
+**FP4 backward production port.** Same structural approach as fp32/fp8's
+ports (``process_tile_pair_fp4`` mirroring ``process_tile_pair_fp8``'s
+shared/per-half role swap; scoped to ``scale_rank == 1``; falls back to
+the existing ``process_tile`` for solos and rank>1), with FP4's packed
+single-byte nibble decode/encode (``Block4Tile::slot_index``, weight in
+the low nibble / importance in the high, ``tdata[slot] = uint8_t((new_imp
+<< 4) | new_w)``) instead of FP8's two separate byte arrays. One
+FP4-specific detail carried over exactly from ``process_row_pair_fp4``:
+the gradient-accumulation terms feeding ``mrow``/``mgamma``/``mcol``
+(``prod_g``/``prod_contrib``) use ``quant_floor`` -- the raw quantized
+weight with a ``zero_escape_eps`` substitution at exactly zero, so a
+permanently-dead synapse still receives an importance gradient -- while
+``contrib``/``g_agg``/``mdx`` use the raw (unfloored) quantized value,
+matching FP32/FP8's equivalent terms. FP32/FP8 have no such split (no
+zero-escape substitution in either).
+
+Correctness gate: ``test_disldo_block4_fp4_crosstile_backward_
+divergence.cpp``, same striped-scattered-vs-block4 pattern as fp32/fp8's
+(both arms' importance round-tripped through the fp4 grid identically,
+learning the fp8 test's lesson about symmetric starting state) --
+forward/dx/post-backward weights all match to within fp4 quantization-
+noise tolerance (~2e-6). Full local C++ suite (160/160) and the existing
+dense fp4 backward regression test (``test_disldo_block4_fp4_backward_
+wide_simd.cpp``) both pass unmodified.
+
+Measured against the real kernel (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 15 runs, before=commit
+``f2f68f8``): a real, large, and extremely consistent speedup --
+median-of-medians 1837.2us before vs 643.9us after (~2.85x faster),
+``after`` faster than ``before`` in all 15 of 15 interleaved samples
+(not overlapping noise bands like fp32/fp8 forward or fp32 backward).
+Root cause, unlike fp8 backward's more modest ~29%: FP4's EXISTING
+within-tile adjacent-row pairing path (``process_row_pair_fp4``, still
+used for every solo tile) is the rank-N-generic implementation --
+allocating several ``std::vector``\\ s (``value_scale_k_row0/1``,
+``mrow_local0/1_k`` and their ``_contrib`` counterparts) on the HEAP
+per call, twice per tile (once per adjacent-row pair) -- while the new
+``process_tile_pair_fp4`` is the same scalar, rank==1-specialized,
+entirely-stack-array design already used for FP32/FP8's cross-tile
+lambdas. So for FP4 specifically, cross-tile pairing doesn't just halve
+the number of per-tile setup/lookup operations (the fp8 backward
+finding) -- on the striped occupancy pattern tested here, it replaces
+the ONLY previously-available multi-row-fused path (the heap-allocating
+rank-N one) with a heap-free one, which is a substantially larger win.
