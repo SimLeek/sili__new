@@ -1805,3 +1805,100 @@ literally the same floating-point operations in the same order across
 all three precisions, with quantization as the only actual difference.
 Registered in ``CMakeLists.txt``'s ``SILI_STANDALONE_TESTS`` (162/162
 total now) so they gate the upcoming refactor going forward.
+
+.. _block4_codec_refactor:
+
+**block4_codec_refactor.** Ran the refactor the dequant-equality tests
+above were built to gate: ``disldo_forward``/``disldo_backward``'s
+``if constexpr (std::is_same_v<VALUES_TYPE, ...>)`` triplication
+across fp32/fp8/fp4 -- three near-identical copies of the same kernel
+math, differing only in which decode/encode/quant_floor call gets
+made -- collapsed onto a new shared trait, ``Block4Codec<VALUES_TYPE>``
+(``sili/lib/headers/block4_codec.hpp``): a thin wrapper around the
+ALREADY-separate ``fp4quant.hpp``/``fp8quant.hpp`` bit-quantization
+functions (not a reimplementation), exposing ``decode_weight``/
+``decode_importance``/``decode_weight_column4``/``quant_floor``/
+``encode<StochasticRounding>``/``stored_tile_len`` plus the
+``has_zero_escape``/``has_was_live_gate``/``scratch_bytes`` compile-time
+constants. Every real kernel branch that used to be written three times
+per precision is now written once, generic over ``Block4Codec``.
+
+Genuinely-non-trivial per-precision differences (not just decode/encode
+swaps) were preserved exactly via the trait rather than papered over:
+FP4 alone substitutes ``zero_escape_eps`` for an exactly-zero quantized
+weight in the AQRS gradient-accumulation terms (``mrow``/``mgamma``/
+``mcol``), never in ``contrib``/``g_agg``/``mdx`` -- ``Block4Codec::
+quant_floor`` is identity for fp8/fp32, epsilon-substituting for fp4,
+called at exactly the same sites the original per-precision code did.
+FP8 and FP4 both gate their write-back through a ``was_live`` check
+(a cell that was never a real synapse must stay allowed to round to
+zero); FP32 has none (no quantization floor to escape) --
+``Block4Codec<DeltaCSRBiValues<float>>::encode`` accepts and ignores
+the parameter, matching FP32's existing unconditional-memcpy write-back
+exactly. ``process_tile_pair`` (cross-tile pairing) additionally
+generalized FP32's historically rank==1-hardcoded implementation onto
+the same rank-N-generic loop FP8/FP4 already used -- verified safe
+because ``scale_rank`` is 1 for every fp32 block4 backward configuration
+actually exercised anywhere in this codebase, so the collapse is
+behavior-identical for every real caller (the rank==1 gate at the
+pairing call site was nonetheless kept exactly as before, so this
+refactor does not silently widen fp32's reachable code path to an
+untested rank>1 configuration).
+
+``sisldo_ops.hpp``'s ``disldo_backward_sparse_grad`` had already
+centralized its own per-precision dispatch into four local lambdas
+(``decode_weight``/``decode_importance``/``encode_and_store``/
+``tile_len_of``) doing the identical three-way ``if constexpr``
+this file used to have inline -- their bodies now call into the same
+shared ``Block4Codec``, eliminating that second, independent copy of
+the bit-quantization logic.
+
+``linear_disldo.hpp`` was then split by concern, mirroring the existing
+``delta_csr_types.hpp``/``delta_csr_memory.hpp`` precedent (the only
+prior multi-file split in ``sili/lib/headers/``): ``linear_disldo.hpp``
+is now a thin entry point including ``linear_disldo_forward.hpp`` and
+``linear_disldo_backward.hpp``, with no external ``#include
+"linear_disldo.hpp"`` site needing any change.
+
+Measured via ``lizard`` (NLOC / CCN, before -> after):
+
+.. list-table::
+   :header-rows: 1
+
+   * - function
+     - before
+     - after
+   * - ``disldo_forward``
+     - 479 / 97
+     - 216 / 48
+   * - ``disldo_backward``
+     - 3640 / 524
+     - 1561 / 257
+   * - ``disldo_backward_sparse_grad``
+     - 729 / 140
+     - 663 / 120
+   * - ``sisldo_forward``
+     - 290 / 59
+     - 290 / 59 (unchanged -- its own inline decode-with-early-zero-
+       skip and merge-eviction callback were left as-is, each only 3
+       lines per branch, not worth a new trait member)
+
+Even after the collapse, ``disldo_backward`` at CCN 257 is still far
+above ``lizard``'s own default warning threshold (CCN>15) -- getting
+under that would need genuinely separate functions per code path
+(training vs not, full-tile vs boundary, stochastic vs deterministic,
+``DeferredScaleWrite``), not just per precision, which is out of scope
+here: this pass's goal was removing duplication and shrinking file
+size (motivated in large part by Claude Code itself hitting context
+compression reading the pre-refactor ~4600-line monolith), not hitting
+a specific CCN target. ``tools/lint_all.sh``'s ``lizard`` check is
+advisory-only and remains so.
+
+Every phase of this refactor was gated on the two dequant-equality
+tests above staying BIT-EXACT (``0.00000000``) throughout, the full
+local ``ctest`` suite, and re-verification on the arch-sandbox remote
+(including direct recompilation+rerun of the cross-tile backward
+divergence/timing tests specifically, since those are this session's
+own earlier ~2.85x-fp4/~29%-fp8 speedup work and needed confirmation
+the refactor didn't quietly regress it, not just that correctness
+held).
