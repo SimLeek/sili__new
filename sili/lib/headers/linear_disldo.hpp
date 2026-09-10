@@ -3903,7 +3903,13 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // but with a real fp8 decode/encode step per cell (mirrors
                 // process_row_pair_fp8's own decode/encode, including its
                 // was_live8 zero-escape gate) instead of FP32's raw float
-                // memcpy. rank==1 only, matching the validated scope.
+                // memcpy. Rank-N generic (unlike FP32, which stays rank==1
+                // only -- FP32 has no AQRS low-rank use case): the k-loop
+                // mirrors process_row_pair_fp8's rank-N math exactly, just
+                // re-mapped from a row0/row1 role split to this lambda's
+                // tileA/tileB role split. combined_scale (S) itself needs no
+                // k-loop -- weights.get_scale() already sums over all rank
+                // components internally, same as the single-tile path.
                 auto process_tile_pair_fp8 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
                                                  uint8_t* tdataB) -> std::pair<bool, bool> {
                     bool dirtyA = false, dirtyB = false;
@@ -3921,11 +3927,22 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         const value_type effective_lr =
                             lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
                                            : learning_rate;
-                        const value_type value_scale_k_row = weights.get_value_scale_k(row, 0);
+                        // Shared across both halves (same row) -- the
+                        // cross-tile analog of process_row_pair_fp8's
+                        // value_scale_k_row0/row1 (there it differs per
+                        // row; here it's identical for A and B).
+                        std::vector<value_type> value_scale_k_row(rank);
+                        for (std::size_t k = 0; k < rank; ++k)
+                            value_scale_k_row[k] = weights.get_value_scale_k(row, k);
 
                         std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
                         value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
-                        value_type out_scale_kA[BLOCK4_TILE], out_scale_kB[BLOCK4_TILE];
+                        // Per-half, per-k -- the cross-tile analog of
+                        // process_row_pair_fp8's out_scale_k4 (there it's
+                        // shared between rows since they share columns;
+                        // here A and B are DIFFERENT columns).
+                        std::vector<value_type> out_scale_kA(rank * BLOCK4_TILE),
+                            out_scale_kB(rank * BLOCK4_TILE);
                         value_type combined_scale8[2 * BLOCK4_TILE];
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                             colA[lj] = col_baseA + lj;
@@ -3938,10 +3955,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             out_imp_scaleB[lj] = haveB
                                                      ? weights.get_output_importance_scale(colB[lj])
                                                      : value_type(0);
-                            out_scale_kA[lj] =
-                                haveA ? weights.get_output_scale_k(colA[lj], 0) : value_type(0);
-                            out_scale_kB[lj] =
-                                haveB ? weights.get_output_scale_k(colB[lj], 0) : value_type(0);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                out_scale_kA[k * BLOCK4_TILE + lj] =
+                                    haveA ? weights.get_output_scale_k(colA[lj], k) : value_type(0);
+                                out_scale_kB[k * BLOCK4_TILE + lj] =
+                                    haveB ? weights.get_output_scale_k(colB[lj], k) : value_type(0);
+                            }
                             combined_scale8[lj] =
                                 haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
                             combined_scale8[lj + BLOCK4_TILE] =
@@ -3978,10 +3997,17 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         }
 
                         double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
-                        double mrow_local = 0.0, mrow_local_contrib = 0.0, mgamma_local = 0.0,
-                               mgamma_local_contrib = 0.0;
-                        value_type mcol_local8[2 * BLOCK4_TILE] = {0},
-                                                   mcol_local_contrib8[2 * BLOCK4_TILE] = {0};
+                        // Single accumulator per k (not split A/B) -- both
+                        // halves feed the SAME row's mrow/mgamma gradient,
+                        // the cross-tile analog of process_row_pair_fp8's
+                        // mrow_local0_k/mrow_local1_k (there split because
+                        // row0/row1 are DIFFERENT rows).
+                        std::vector<double> mrow_local_k(rank, 0.0),
+                            mrow_local_k_contrib(rank, 0.0);
+                        std::vector<double> mgamma_local_k(rank, 0.0),
+                            mgamma_local_k_contrib(rank, 0.0);
+                        std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
+                            mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
                         for (SIZE_TYPE b = 0; b < batch; ++b) {
                             const value_type iv =
                                 input[static_cast<std::size_t>(b) * in_cols + row];
@@ -4006,41 +4032,54 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 const value_type contrib = cw_orig8[i] * combined_scale8[i] * iv;
                                 g_agg8[i] += g;
                                 contrib_agg8[i] += contrib;
-                                const value_type out_scale_k_i =
-                                    i < BLOCK4_TILE ? out_scale_kA[i]
-                                                    : out_scale_kB[i - BLOCK4_TILE];
-                                const value_type prod_g = cw_orig8[i] * out_scale_k_i * g;
-                                const value_type prod_contrib =
-                                    cw_orig8[i] * out_scale_k_i * contrib;
-                                mrow_local += static_cast<double>(prod_g) * gamma_k_arr[0];
-                                mrow_local_contrib +=
-                                    static_cast<double>(prod_contrib) * gamma_k_arr[0];
-                                mgamma_local +=
-                                    static_cast<double>(out_scale_k_i * value_scale_k_row * prod_g);
-                                mgamma_local_contrib += static_cast<double>(
-                                    out_scale_k_i * value_scale_k_row * prod_contrib);
-                                mcol_local8[i] +=
-                                    cw_orig8[i] * value_scale_k_row * g * gamma_k_arr[0];
-                                mcol_local_contrib8[i] +=
-                                    cw_orig8[i] * value_scale_k_row * contrib * gamma_k_arr[0];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const value_type out_scale_k_i =
+                                        i < BLOCK4_TILE
+                                            ? out_scale_kA[k * BLOCK4_TILE + i]
+                                            : out_scale_kB[k * BLOCK4_TILE + (i - BLOCK4_TILE)];
+                                    const value_type prod_g = cw_orig8[i] * out_scale_k_i * g;
+                                    const value_type prod_contrib =
+                                        cw_orig8[i] * out_scale_k_i * contrib;
+                                    mrow_local_k[k] += static_cast<double>(prod_g) * gamma_k_arr[k];
+                                    mrow_local_k_contrib[k] +=
+                                        static_cast<double>(prod_contrib) * gamma_k_arr[k];
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_g);
+                                    mgamma_local_k_contrib[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_contrib);
+                                    mcol_local8[k * 2 * BLOCK4_TILE + i] +=
+                                        cw_orig8[i] * value_scale_k_row[k] * g * gamma_k_arr[k];
+                                    mcol_local_contrib8[k * 2 * BLOCK4_TILE + i] +=
+                                        cw_orig8[i] * value_scale_k_row[k] * contrib *
+                                        gamma_k_arr[k];
+                                }
                             }
                             mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
                         }
 
                         if (training) {
-                            mrow_at(row, 0) += mrow_local;
-                            mrow_at_contrib(row, 0) += mrow_local_contrib;
-                            mgamma_at(0) += static_cast<value_type>(mgamma_local);
-                            mgamma_at_contrib(0) += static_cast<value_type>(mgamma_local_contrib);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row, k) += mrow_local_k[k];
+                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                if (colA[lj] < n_out) {
-                                    mcol_at(colA[lj], 0) += mcol_local8[lj];
-                                    mcol_at_contrib(colA[lj], 0) += mcol_local_contrib8[lj];
-                                }
-                                if (colB[lj] < n_out) {
-                                    mcol_at(colB[lj], 0) += mcol_local8[lj + BLOCK4_TILE];
-                                    mcol_at_contrib(colB[lj], 0) +=
-                                        mcol_local_contrib8[lj + BLOCK4_TILE];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    if (colA[lj] < n_out) {
+                                        mcol_at(colA[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj];
+                                        mcol_at_contrib(colA[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj];
+                                    }
+                                    if (colB[lj] < n_out) {
+                                        mcol_at(colB[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj + BLOCK4_TILE];
+                                        mcol_at_contrib(colB[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj +
+                                                                BLOCK4_TILE];
+                                    }
                                 }
                             }
                             Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
@@ -4155,8 +4194,11 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // mrow/mgamma/mcol) use the FLOORED quant value, while
                 // contrib/g_agg/mdx use the raw (unfloored) quant_start
                 // value -- see quant_floor8's declaration comment in
-                // process_row_pair_fp4 for the rationale. rank==1 only,
-                // matching the validated scope.
+                // process_row_pair_fp4 for the rationale. Rank-N generic
+                // (unlike FP32, which stays rank==1 only -- FP32 has no
+                // AQRS low-rank use case) -- see process_tile_pair_fp8's
+                // header comment for the row-pair-to-tile-pair role-split
+                // mapping this k-loop follows.
                 auto process_tile_pair_fp4 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
                                                  uint8_t* tdataB) -> std::pair<bool, bool> {
                     bool dirtyA = false, dirtyB = false;
@@ -4174,11 +4216,14 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         const value_type effective_lr =
                             lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
                                            : learning_rate;
-                        const value_type value_scale_k_row = weights.get_value_scale_k(row, 0);
+                        std::vector<value_type> value_scale_k_row(rank);
+                        for (std::size_t k = 0; k < rank; ++k)
+                            value_scale_k_row[k] = weights.get_value_scale_k(row, k);
 
                         std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
                         value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
-                        value_type out_scale_kA[BLOCK4_TILE], out_scale_kB[BLOCK4_TILE];
+                        std::vector<value_type> out_scale_kA(rank * BLOCK4_TILE),
+                            out_scale_kB(rank * BLOCK4_TILE);
                         value_type combined_scale8[2 * BLOCK4_TILE];
                         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                             colA[lj] = col_baseA + lj;
@@ -4191,10 +4236,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             out_imp_scaleB[lj] = haveB
                                                      ? weights.get_output_importance_scale(colB[lj])
                                                      : value_type(0);
-                            out_scale_kA[lj] =
-                                haveA ? weights.get_output_scale_k(colA[lj], 0) : value_type(0);
-                            out_scale_kB[lj] =
-                                haveB ? weights.get_output_scale_k(colB[lj], 0) : value_type(0);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                out_scale_kA[k * BLOCK4_TILE + lj] =
+                                    haveA ? weights.get_output_scale_k(colA[lj], k) : value_type(0);
+                                out_scale_kB[k * BLOCK4_TILE + lj] =
+                                    haveB ? weights.get_output_scale_k(colB[lj], k) : value_type(0);
+                            }
                             combined_scale8[lj] =
                                 haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
                             combined_scale8[lj + BLOCK4_TILE] =
@@ -4230,10 +4277,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         }
 
                         double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
-                        double mrow_local = 0.0, mrow_local_contrib = 0.0, mgamma_local = 0.0,
-                               mgamma_local_contrib = 0.0;
-                        value_type mcol_local8[2 * BLOCK4_TILE] = {0},
-                                                   mcol_local_contrib8[2 * BLOCK4_TILE] = {0};
+                        std::vector<double> mrow_local_k(rank, 0.0),
+                            mrow_local_k_contrib(rank, 0.0);
+                        std::vector<double> mgamma_local_k(rank, 0.0),
+                            mgamma_local_k_contrib(rank, 0.0);
+                        std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
+                            mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
                         for (SIZE_TYPE b = 0; b < batch; ++b) {
                             const value_type iv =
                                 input[static_cast<std::size_t>(b) * in_cols + row];
@@ -4258,41 +4307,54 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 const value_type contrib = quant8[i] * combined_scale8[i] * iv;
                                 g_agg8[i] += g;
                                 contrib_agg8[i] += contrib;
-                                const value_type out_scale_k_i =
-                                    i < BLOCK4_TILE ? out_scale_kA[i]
-                                                    : out_scale_kB[i - BLOCK4_TILE];
-                                const value_type prod_g = quant_floor8[i] * out_scale_k_i * g;
-                                const value_type prod_contrib =
-                                    quant_floor8[i] * out_scale_k_i * contrib;
-                                mrow_local += static_cast<double>(prod_g) * gamma_k_arr[0];
-                                mrow_local_contrib +=
-                                    static_cast<double>(prod_contrib) * gamma_k_arr[0];
-                                mgamma_local +=
-                                    static_cast<double>(out_scale_k_i * value_scale_k_row * prod_g);
-                                mgamma_local_contrib += static_cast<double>(
-                                    out_scale_k_i * value_scale_k_row * prod_contrib);
-                                mcol_local8[i] +=
-                                    quant_floor8[i] * value_scale_k_row * g * gamma_k_arr[0];
-                                mcol_local_contrib8[i] +=
-                                    quant_floor8[i] * value_scale_k_row * contrib * gamma_k_arr[0];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const value_type out_scale_k_i =
+                                        i < BLOCK4_TILE
+                                            ? out_scale_kA[k * BLOCK4_TILE + i]
+                                            : out_scale_kB[k * BLOCK4_TILE + (i - BLOCK4_TILE)];
+                                    const value_type prod_g = quant_floor8[i] * out_scale_k_i * g;
+                                    const value_type prod_contrib =
+                                        quant_floor8[i] * out_scale_k_i * contrib;
+                                    mrow_local_k[k] += static_cast<double>(prod_g) * gamma_k_arr[k];
+                                    mrow_local_k_contrib[k] +=
+                                        static_cast<double>(prod_contrib) * gamma_k_arr[k];
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_g);
+                                    mgamma_local_k_contrib[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_contrib);
+                                    mcol_local8[k * 2 * BLOCK4_TILE + i] +=
+                                        quant_floor8[i] * value_scale_k_row[k] * g * gamma_k_arr[k];
+                                    mcol_local_contrib8[k * 2 * BLOCK4_TILE + i] +=
+                                        quant_floor8[i] * value_scale_k_row[k] * contrib *
+                                        gamma_k_arr[k];
+                                }
                             }
                             mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
                         }
 
                         if (training) {
-                            mrow_at(row, 0) += mrow_local;
-                            mrow_at_contrib(row, 0) += mrow_local_contrib;
-                            mgamma_at(0) += static_cast<value_type>(mgamma_local);
-                            mgamma_at_contrib(0) += static_cast<value_type>(mgamma_local_contrib);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row, k) += mrow_local_k[k];
+                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                if (colA[lj] < n_out) {
-                                    mcol_at(colA[lj], 0) += mcol_local8[lj];
-                                    mcol_at_contrib(colA[lj], 0) += mcol_local_contrib8[lj];
-                                }
-                                if (colB[lj] < n_out) {
-                                    mcol_at(colB[lj], 0) += mcol_local8[lj + BLOCK4_TILE];
-                                    mcol_at_contrib(colB[lj], 0) +=
-                                        mcol_local_contrib8[lj + BLOCK4_TILE];
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    if (colA[lj] < n_out) {
+                                        mcol_at(colA[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj];
+                                        mcol_at_contrib(colA[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj];
+                                    }
+                                    if (colB[lj] < n_out) {
+                                        mcol_at(colB[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj + BLOCK4_TILE];
+                                        mcol_at_contrib(colB[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj +
+                                                                BLOCK4_TILE];
+                                    }
                                 }
                             }
                             Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
@@ -4499,7 +4561,11 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             } // closes while (row_ti...)
                         }
                     } else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                        if (rank == 1) {
+                        // Unlike FP32 above, no rank==1 gate here --
+                        // process_tile_pair_fp8 is rank-N generic (see its
+                        // own header comment), so AQRS layers get the
+                        // cross-tile speedup too, at any scale_rank.
+                        {
                             row_handled_as_pairs = true;
                             std::size_t row_ti = row_ti_start[br];
                             while (row_ti < row_ti_start[br + 1]) {
@@ -4549,7 +4615,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             } // closes while (row_ti...)
                         }
                     } else if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
-                        if (rank == 1) {
+                        // Unlike FP32 above, no rank==1 gate here -- same
+                        // reasoning as the FP8 branch above.
+                        {
                             row_handled_as_pairs = true;
                             std::size_t row_ti = row_ti_start[br];
                             while (row_ti < row_ti_start[br + 1]) {

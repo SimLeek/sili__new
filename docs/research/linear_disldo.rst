@@ -1666,6 +1666,66 @@ bare float write, so halving the number of PER-TILE setup/lookup
 operations (not just per-cell math) has a larger relative payoff here
 than it did for the lighter-weight FP32 kernel.
 
+**FP8/FP4 backward: rank-N generalization.** The FP8/FP4 backward ports
+below were initially scoped to ``scale_rank == 1``, matching FP32's own
+scope. Direct feedback caught a real gap this left open: ``scale_rank``
+is not fixed at construction for FP8/FP4 layers -- AQRS dynamic rank
+control (task #273/#285) can grow a layer's rank live during training --
+so a rank==1 gate meant any layer AQRS grew past rank 1 would silently
+stop getting the cross-tile speedup for as long as it stayed there, with
+no error, just quietly slower. FP32 was deliberately left unchanged
+(unlike FP8/FP4, it has no AQRS low-rank use case, so the gap doesn't
+apply there). Root-caused first that FORWARD's cross-tile pairing (all
+three precisions) already needed NO change at all: it reads the
+multiplicative scale via ``weights.get_scale(row, col)``, which already
+sums over every ``scale_rank`` component internally -- there was never a
+rank gate in forward to begin with. Only BACKWARD's
+``process_tile_pair_fp8``/``process_tile_pair_fp4`` needed the
+generalization, since updating each rank-``k`` component's own
+value_scale/output_scale via gradient descent requires the full
+per-``k`` accumulator machinery that the scalar rank==1 version didn't
+have. Both lambdas were rewritten to loop over ``k`` explicitly (plain
+scalar loops, not the SIMD/``scale_rank_scratch`` machinery
+``process_row_pair_fp8``/``process_row_pair_fp4`` use for their own
+rank-N support -- lower-risk given this is a correctness generalization,
+not a further speed push), re-mapping the row0/row1 role split those
+lambdas use to this lambda's tileA/tileB role split (``value_scale_k``
+becomes SHARED across both halves since they're the same row;
+``out_scale_k`` becomes PER-HALF since A and B are different columns;
+``mrow``/``mgamma`` fold across all 8 lanes into ONE accumulator per
+``k`` instead of two, since one row feeds both halves). FP4 additionally
+keeps its ``quant_floor`` zero-escape substitution in the ``prod_g``/
+``prod_contrib`` terms exactly as before, now inside the ``k`` loop. The
+``rank == 1`` gate was removed from both write-loop branches (FP32's
+stays -- it's still the deliberately-scoped case).
+
+Correctness gates: two NEW standalone tests,
+``test_disldo_block4_fp{8,4}_crosstile_backward_rank2_divergence.cpp``,
+mirroring the existing rank==1 striped tests but with ``scale_rank=2``
+and a real, nonzero, IDENTICAL-across-both-arms second rank channel
+(``set_value_scale_raw_k(row,1,...)``/``set_output_scale_raw_k(col,1,
+...)``) -- not just a default-zero rank-2 that would pass trivially.
+Assert forward, ``dx``, post-backward weights, AND the per-component
+``k=1`` ``value_scale``/``output_scale`` themselves (not just the summed
+``S``) all match to float precision. Both pass (err ~3e-6 float, exact
+0.0 on the per-component check). Full local suite (160/160) and both
+existing rank==1 gates still pass unmodified, on both this machine and
+arch-sandbox.
+
+Measured cost of the generalization (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 10 runs, rank==1 case only --
+this measures whether generality itself has a price, not a new
+precision): the rank-N version still beats the pre-cross-tile baseline
+by a real, fully consistent ~2.25x (median-of-medians 1882.0us before
+vs 837.6us after, 10/10 samples faster), but costs ~30% versus the
+earlier rank==1-SPECIALIZED version's 643.9us (the ``std::vector``
+scratch allocated per row for the ``k``-loop -- ``value_scale_k_row``,
+``out_scale_kA``/``out_scale_kB``, the ``mrow``/``mgamma``/``mcol``
+accumulators -- isn't free, even when ``rank==1`` makes each vector
+length 1). Judged worth it: the alternative is a real, un-flagged
+performance cliff the instant AQRS grows a layer's rank, which is a
+documented, active mechanism in this codebase, not a hypothetical.
+
 **FP4 backward production port.** Same structural approach as fp32/fp8's
 ports (``process_tile_pair_fp4`` mirroring ``process_tile_pair_fp8``'s
 shared/per-half role swap; scoped to ``scale_rank == 1``; falls back to
