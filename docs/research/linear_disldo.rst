@@ -1612,3 +1612,15 @@ that paid almost nothing else). Landed as a real result for the same
 reason as forward: parity on a 50%-dense checkered pattern while now
 correctly handling genuinely gapped occupancy is the actual target here,
 not a further win on the already-dense case.
+
+**FP8/FP4 forward production timing.** Same interleaved-A/B methodology
+as fp32 (15 remote runs, striped, ``n_in=n_out=256, batch=8,
+num_cpus=4``, before=commit ``c13d1b7`` vs after=commit ``6b89ce8``):
+both precisions' before/after medians overlap heavily inside the same
+bimodal noise band already characterized elsewhere in this doc (values
+cluster in two clusters, ~57-65us and ~78-93us, in BOTH arms, tracking
+each other run-to-run) -- fp8 before/after median-of-medians ~85.2us/
+~83.8us, fp4 ~73.6us/~79.8us. Same parity conclusion as fp32 and the
+same root cause (real kernel overhead dilutes the isolated pairing
+win); not treated as a regression signal given the shared noise
+structure across both arms.
