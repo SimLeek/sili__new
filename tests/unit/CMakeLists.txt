@@ -201,6 +201,8 @@ set(SILI_STANDALONE_TESTS
     test_amortized_decay_stats
     test_top_k_csr_nucleus
     test_cpu_topology
+    test_dequant_equality_fp4_vs_fp8
+    test_dequant_equality_fp8_vs_fp32
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)

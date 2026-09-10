@@ -1770,3 +1770,38 @@ the number of per-tile setup/lookup operations (the fp8 backward
 finding) -- on the striped occupancy pattern tested here, it replaces
 the ONLY previously-available multi-row-fused path (the heap-allocating
 rank-N one) with a heap-free one, which is a substantially larger win.
+
+**Cross-precision dequantization equality tests.** Before the planned
+cyclomatic-complexity reduction pass (splitting the ``if constexpr``
+precision branches in ``disldo_forward``/``disldo_backward`` into
+separate per-precision template instantiations/files), a regression
+gate was needed to prove the three precisions' underlying MATH is
+identical when their storage happens to agree, so the refactor has
+something concrete to preserve. FP4's representable grid (``{0,
++-0.5, +-1, +-1.5, +-2, +-3, +-4, +-6}``) is a strict subset of FP8
+E4M3's, which is itself a strict subset of float32's -- so a weight/
+importance value drawn from the coarser grid decodes to the EXACT SAME
+float in either storage format. Two new standalone tests,
+``test_dequant_equality_fp4_vs_fp8.cpp`` and
+``test_dequant_equality_fp8_vs_fp32.cpp`` (scattered CSR only, not
+block4 -- this tests the precisions themselves, independent of storage
+format, which block4-vs-scattered parity tests already cover
+elsewhere), build two arms with IDENTICAL dequantized weights/
+importance (fp4 arm drawn from ``FP4_TABLE`` directly; fp8-vs-fp32 arm
+drawn from arbitrary floats round-tripped once through fp8's own codec
+so both land on an fp8 fixed point) and assert forward output and
+backward's ``dx``/``neuron_input_accum``/``neuron_grad_accum`` all
+match -- using a REAL nonzero ``learning_rate`` (not just ``lr=0``),
+since ``dx`` is computed from the pre-update stored weight and is
+provably independent of how each precision's own grid will round the
+post-update value. Post-update WEIGHTS are deliberately never compared
+between arms: once a real update happens, fp4's coarser grid and fp8's
+finer one round the same float delta to different codes, and that
+divergence is expected ("outside of learning... predictable"), not a
+correctness bug. Both tests passed BIT-EXACT (all four measured
+quantities: ``0.00000000``) on the first run, not just within
+tolerance -- confirming the scattered forward/backward math performs
+literally the same floating-point operations in the same order across
+all three precisions, with quantization as the only actual difference.
+Registered in ``CMakeLists.txt``'s ``SILI_STANDALONE_TESTS`` (162/162
+total now) so they gate the upcoming refactor going forward.
