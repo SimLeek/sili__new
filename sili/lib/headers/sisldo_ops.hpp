@@ -5,6 +5,7 @@
 
 #include "delta_csr_types.hpp"
 #include "delta_csr_memory.hpp"
+#include "block4_codec.hpp"
 
 // ── compact ────────────────────────────────────────────────────────────────────
 
@@ -781,93 +782,34 @@ void disldo_backward_sparse_grad(
     // gate needed at this level, mirroring disldo_backward's own
     // (never-gated) block4 branch in linear_disldo.hpp.
     {
-        // Per-tile scratch buffer size differs by storage type (FP4: 1 byte/
-        // slot, dual-nibble weight+importance packed together; FP8: 1 byte/
-        // slot, separate weight/importance halves; float32: 4 bytes/slot,
-        // separate weight/importance halves, no codec).
-        constexpr std::size_t SCRATCH_BYTES = std::is_same_v<VALUES_TYPE, FP8BiValues>
-                                                  ? std::size_t(BLOCK4_TILE_SLOTS8_BYTES)
-                                              : std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>
-                                                  ? std::size_t(BLOCK4_TILE_SLOTS32_BYTES)
-                                                  : std::size_t(BLOCK4_TILE_SLOTS);
+        // sisldo_ops.block4_codec_refactor: per-tile scratch size and
+        // decode/encode/tile-length dispatch, now routed through
+        // Block4Codec<VALUES_TYPE> (mirrors linear_disldo.hpp's identical
+        // refactor -- see block4_codec.hpp). See
+        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_backward_design.
+        using Codec = Block4Codec<VALUES_TYPE>;
+        constexpr std::size_t SCRATCH_BYTES = Codec::scratch_bytes;
         // Scalar per-(li,lj) decode -- this file's own established
         // (non-SIMD) convention, unlike linear_disldo.hpp's SIMD Block4Vec
         // approach; matches sisldo_forward's identical generalization above.
         auto decode_weight = [](const uint8_t* buf, uint32_t li, uint32_t lj) -> value_type {
-            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                return value_type(fp8_decode_bits(buf[Block4Tile8::slot_index(li, lj)]));
-            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                float w;
-                std::memcpy(&w, buf + sizeof(float) * Block4Tile32::slot_index(li, lj), sizeof(w));
-                return value_type(w);
-            } else {
-                return FP4_TABLE[buf[Block4Tile::slot_index(li, lj)] & 0xFu];
-            }
+            return value_type(Codec::decode_weight(buf, li, lj));
         };
         auto decode_importance = [](const uint8_t* buf, uint32_t li, uint32_t lj) -> value_type {
-            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                return value_type(
-                    fp8_decode_bits(buf[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]));
-            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                float v;
-                std::memcpy(&v,
-                            buf + sizeof(float) *
-                                      (BLOCK4_TILE_SLOTS + Block4Tile32::slot_index(li, lj)),
-                            sizeof(v));
-                return value_type(v);
-            } else {
-                return FP4_TABLE[(buf[Block4Tile::slot_index(li, lj)] >> 4) & 0xFu];
-            }
+            return value_type(Codec::decode_importance(buf, li, lj));
         };
         // Encodes+stores the post-update (weight, importance) pair into
         // scratch, returning the ACTUAL stored importance (post-rounding)
-        // for the importance-stat accumulators below. was_live gates the
-        // never-zero live quantizer for FP4/FP8 (a real synapse must never
-        // get silently zero-locked by its own quantization floor); float32
-        // has no quantization floor to escape, so no gating needed there
-        // (mirrors disldo_backward's own float32 branch, which drops both
-        // the live-quantize distinction and was_live entirely).
+        // for the importance-stat accumulators below -- read back via
+        // decode_importance since Codec::encode itself returns void.
+        // was_live gates the never-zero live quantizer for FP4/FP8 (a real
+        // synapse must never get silently zero-locked by its own
+        // quantization floor); Codec::encode ignores it for float32 (no
+        // quantization floor to escape there).
         auto encode_and_store = [](uint8_t* buf, uint32_t li, uint32_t lj, value_type quant,
                                    value_type imp_ratio, bool was_live) -> value_type {
-            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                uint8_t new_w_code, new_imp_code;
-                if constexpr (StochasticRounding) {
-                    new_w_code = was_live ? fp8_quantize_stochastic_live(quant)
-                                          : fp8_quantize_stochastic(quant);
-                    new_imp_code = was_live ? fp8_quantize_stochastic_live_nonneg(imp_ratio)
-                                            : fp8_quantize_stochastic(imp_ratio);
-                } else {
-                    new_w_code = was_live ? fp8_quantize_live(quant) : fp8_quantize(quant);
-                    new_imp_code =
-                        was_live ? fp8_quantize_live(imp_ratio) : fp8_quantize(imp_ratio);
-                }
-                buf[Block4Tile8::slot_index(li, lj)] = new_w_code;
-                buf[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)] = new_imp_code;
-                return value_type(fp8_decode_bits(new_imp_code));
-            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                const float new_w = float(quant);
-                const float new_imp = float(imp_ratio);
-                std::memcpy(buf + sizeof(float) * Block4Tile32::slot_index(li, lj), &new_w,
-                            sizeof(new_w));
-                std::memcpy(buf + sizeof(float) *
-                                      (BLOCK4_TILE_SLOTS + Block4Tile32::slot_index(li, lj)),
-                            &new_imp, sizeof(new_imp));
-                return value_type(new_imp);
-            } else {
-                uint8_t new_w_code, new_imp_code;
-                if constexpr (StochasticRounding) {
-                    new_w_code = was_live ? fp4_quantize_stochastic_live(quant)
-                                          : fp4_quantize_stochastic(quant);
-                    new_imp_code = was_live ? fp4_quantize_stochastic_live_nonneg(imp_ratio)
-                                            : fp4_quantize_stochastic(imp_ratio);
-                } else {
-                    new_w_code = was_live ? fp4_quantize_live(quant) : fp4_quantize(quant);
-                    new_imp_code =
-                        was_live ? fp4_quantize_live(imp_ratio) : fp4_quantize(imp_ratio);
-                }
-                buf[Block4Tile::slot_index(li, lj)] = uint8_t((new_imp_code << 4) | new_w_code);
-                return FP4_TABLE[new_imp_code];
-            }
+            Codec::template encode<StochasticRounding>(buf, li, lj, quant, imp_ratio, was_live);
+            return value_type(Codec::decode_importance(buf, li, lj));
         };
         // Type-dispatched stored-tile-length lookup for the row-local
         // workspace byte cursor below. Storage layout (and therefore
@@ -878,13 +820,7 @@ void disldo_backward_sparse_grad(
         // previously misaligned `local_pos` for every FP8/float32 tile
         // after the first in a row, corrupting decode of subsequent tiles.
         auto tile_len_of = [](bool is_sp, const uint8_t* b) -> std::size_t {
-            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                return block4_stored_tile_len8(is_sp, b);
-            } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                return block4_stored_tile_len32(is_sp, b);
-            } else {
-                return block4_stored_tile_len(is_sp, b);
-            }
+            return Codec::stored_tile_len(is_sp, b);
         };
 
         if (weights.block4.n_tiles() > 0) {
