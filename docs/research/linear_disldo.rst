@@ -1044,6 +1044,69 @@ RMSprop update plus rank-N AQRS bookkeeping (mrow/mcol/mgamma, gamma
 weighting, contrib terms) is exactly the kind of "lot more stuff going on
 in the SIMD part" that a wider op actually pays off on.
 
+.. _disldo_backward.fp4_block4_avx2_row_pairing:
+
+FP4 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp4_block4_avx2_row_pairing``
+
+FP4's existing block4 backward decodes via scalar ``FP4_TABLE`` lookups
+(``disldo_backward.fp4_table_decode`` above), not SIMD bit-shift, same
+deliberate choice FP8's backward makes for its own decode -- so this ports
+the same row-pairing design (``process_row_pair_fp4``) as
+``disldo_backward.fp8_block4_avx2_row_pairing`` above, with two real
+differences specific to FP4BiPacked: (1) weight+importance are packed as
+TWO NIBBLES in ONE byte per slot (not FP8's two separate byte arrays), so
+decode is one byte read + two ``FP4_TABLE`` lookups per (li,lj), and
+write-back is a single bit-OR pack
+(``uint8_t((new_imp<<4)|new_w)``) instead of two separate ``tdata``
+writes; (2) FP4's gradient-accumulation terms (mrow/mcol/mgamma) use a
+"quant_floor" -- the stored quantized weight with a ``zero_escape_eps``
+substitution at exactly ``quant==0``, giving a currently-zero-weight cell
+a real synaptogenesis growth signal (see
+``disldo_backward.deferred_vs_direct_quant`` above) -- where FP8 has no
+such floor and uses ``cw_orig`` directly. Both differences are read
+straight off FP4's existing single-row code, not new design; only the
+4-wide-vs-8-wide packing itself is new.
+
+TDD methodology matches FP8's exactly (see
+``tests/unit/test_disldo_block4_fp4_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked with tolerance
+against an all-scattered layer holding the identical already-quantized
+weights plus a post-backward forward probe, baseline timing recorded, then
+the kernel modified and re-measured with the same test. Correctness
+additionally verified against the broader existing regression suite
+(``test_block4_scattered_divergence``, ``test_aqrs_gamma``,
+``test_aqrs_additive_branch``, ``test_aqrs_rank_growth_shrink``,
+``test_block4_memory_cap_and_compression``, ``test_ci_ceiling``'s
+30000-step long run, ``sweep_synapse_policy_stochastic`` for
+``StochasticRounding=true`` coverage) -- all passed unmodified, since
+``process_row_pair_fp4`` reuses the exact same ``SynapsePolicyVec``/AQRS
+rank-N/gamma machinery as the single-row path, just at 8-wide.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): timing -- 15 before + 15 after
+binary invocations, randomly interleaved, each invocation's own
+median-of-200-calls as one sample -- gave before median-of-medians
+9311840 ns/call (mean-of-medians 11626223) vs after 3545899 ns/call
+(mean-of-medians 5461988): a real **~2.63x speedup**, matching FP8
+backward's ~2.65-2.9x almost exactly (same underlying reason: real
+per-cell RMSprop update plus rank-N AQRS bookkeeping to widen, unlike
+forward's much smaller and ultimately noise-confounded gain -- see
+``disldo_forward.fp4_block4_avx2_column_pairing`` above for that
+contrasting result). Both arms showed real bimodal run-to-run variance (a
+roughly 2x high/low split within each arm, most likely thermal/
+frequency-scaling, affecting before and after similarly) -- the
+median-of-15 is what actually separates the real signal from that noise;
+a single non-interleaved before/after pair measured only ~14% at one
+point during this work, purely from landing in each arm's opposite mode,
+before the full interleaved run resolved it. Directly following
+``disldo_forward.fp4_block4_avx2_column_pairing``'s own lesson, this
+result WAS verified on ``arch-sandbox`` before being adopted (a local
+laptop sanity check also showed a consistent, same-direction ~3.36x, but
+was not treated as the real number).
+
 .. _disldo_backward.was_live_gating:
 
 ``was_live`` gating: a real bug from block4's dense-tile semantics
