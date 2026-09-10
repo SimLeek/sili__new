@@ -1624,3 +1624,44 @@ each other run-to-run) -- fp8 before/after median-of-medians ~85.2us/
 same root cause (real kernel overhead dilutes the isolated pairing
 win); not treated as a regression signal given the shared noise
 structure across both arms.
+
+**FP8 backward production port.** Same structural approach as fp32's
+port (``process_tile_pair_fp8`` mirroring ``process_tile_pair_fp32``
+with the shared/per-half role swap; RowWorkspace already provides
+independent per-tile scratch buffers, so no aliasing hazard; scoped to
+``scale_rank == 1``; falls back to the existing ``process_tile`` for
+solos and rank>1), but with a genuine fp8 encode/decode step per cell
+(``fp8_decode_bits``/``fp8_quantize_live``/``fp8_quantize_stochastic_
+live``, including the ``was_live8`` zero-escape gate) mirroring
+``process_row_pair_fp8``'s own decode/encode exactly, instead of FP32's
+raw float memcpy.
+
+Correctness gate: ``test_disldo_block4_fp8_crosstile_backward_
+divergence.cpp``, same striped-scattered-vs-block4 pattern as fp32's
+(both a real pair and a real solo per row) -- forward/dx/post-backward
+weights all match to within fp8 quantization-noise tolerance. (One real
+test bug found and fixed during this: the scattered arm's importance
+was initialized to 0 while the block4 arm's was nonzero, an asymmetry
+between the two arms' STARTING state, not a kernel bug -- caught
+because it produced a large post-backward divergence despite matching
+forward/dx, which was the same shape of false alarm as fp32's earlier
+value_scale confound, but this time the actual cause was a test setup
+mismatch rather than an incomplete PoC scope.) Full local C++ suite
+(160/160) and existing dense fp8 backward regression test both pass
+unmodified (the dense test now exercises cross-tile pairing on every
+tile, since a fully-dense row always has a same-br partner).
+
+Measured against the real kernel (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 15 runs, before=commit
+``2344b84``): unlike every other cross-tile port measured so far
+(fp32 forward/backward, fp8/fp4 forward -- all landed at parity), FP8
+backward shows a real, consistently separated speedup: median-of-
+medians 876.4us before vs 621.5us after (~29% faster), with ``after``
+faster than ``before`` in 13 of 15 interleaved samples -- not just
+overlapping noise bands like the other precisions. Plausible reason
+this one differs: FP8's per-tile fixed overhead (scale-rank scratch
+setup, ``was_live8`` bookkeeping, the scalar ``fp8_quantize_live``/
+``fp8_quantize_stochastic_live`` encode calls) is heavier than FP32's
+bare float write, so halving the number of PER-TILE setup/lookup
+operations (not just per-cell math) has a larger relative payoff here
+than it did for the lighter-weight FP32 kernel.

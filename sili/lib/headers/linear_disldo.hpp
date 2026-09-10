@@ -3896,6 +3896,253 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     return {dirtyA, dirtyB};
                 }; // closes process_tile_pair_fp32
 
+                // disldo_backward.fp8_block4_cross_tile_pairing: same
+                // cross-tile axis as process_tile_pair_fp32 above (shared
+                // row-level quantities, per-half column-level quantities,
+                // mdx/mrow/mgamma fold across both halves, mcol per-half),
+                // but with a real fp8 decode/encode step per cell (mirrors
+                // process_row_pair_fp8's own decode/encode, including its
+                // was_live8 zero-escape gate) instead of FP32's raw float
+                // memcpy. rank==1 only, matching the validated scope.
+                auto process_tile_pair_fp8 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
+                                                 uint8_t* tdataB) -> std::pair<bool, bool> {
+                    bool dirtyA = false, dirtyB = false;
+                    const std::size_t col_baseA = std::size_t(bcA) * BLOCK4_TILE;
+                    const std::size_t col_baseB = std::size_t(bcB) * BLOCK4_TILE;
+                    const bool training = (learning_rate != value_type(0));
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        if (row >= n_in)
+                            continue;
+                        const uint32_t nnz_row = row_live_count[row];
+                        if (nnz_row == 0)
+                            continue;
+                        const value_type imp_scale = weights.get_importance_scale(row);
+                        const value_type effective_lr =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
+                                           : learning_rate;
+                        const value_type value_scale_k_row = weights.get_value_scale_k(row, 0);
+
+                        std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
+                        value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
+                        value_type out_scale_kA[BLOCK4_TILE], out_scale_kB[BLOCK4_TILE];
+                        value_type combined_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            colA[lj] = col_baseA + lj;
+                            colB[lj] = col_baseB + lj;
+                            const bool haveA = colA[lj] < n_out;
+                            const bool haveB = colB[lj] < n_out;
+                            out_imp_scaleA[lj] = haveA
+                                                     ? weights.get_output_importance_scale(colA[lj])
+                                                     : value_type(0);
+                            out_imp_scaleB[lj] = haveB
+                                                     ? weights.get_output_importance_scale(colB[lj])
+                                                     : value_type(0);
+                            out_scale_kA[lj] =
+                                haveA ? weights.get_output_scale_k(colA[lj], 0) : value_type(0);
+                            out_scale_kB[lj] =
+                                haveB ? weights.get_output_scale_k(colB[lj], 0) : value_type(0);
+                            combined_scale8[lj] =
+                                haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
+                            combined_scale8[lj + BLOCK4_TILE] =
+                                haveB ? weights.get_scale(row, colB[lj]) : value_type(0);
+                        }
+
+                        value_type w_decoded8[2 * BLOCK4_TILE], imp_decoded8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            w_decoded8[lj] =
+                                fp8_decode_bits(tdataA[Block4Tile8::slot_index(li, lj)]);
+                            w_decoded8[lj + BLOCK4_TILE] =
+                                fp8_decode_bits(tdataB[Block4Tile8::slot_index(li, lj)]);
+                            imp_decoded8[lj] = fp8_decode_bits(
+                                tdataA[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]);
+                            imp_decoded8[lj + BLOCK4_TILE] = fp8_decode_bits(
+                                tdataB[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]);
+                        }
+                        bool was_live8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i)
+                            was_live8[i] = (w_decoded8[i] != value_type(0)) ||
+                                           (imp_decoded8[i] != value_type(0));
+
+                        value_type combined_imp_scale8[2 * BLOCK4_TILE];
+                        value_type cw_orig8[2 * BLOCK4_TILE], cw8[2 * BLOCK4_TILE],
+                            ci8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            combined_imp_scale8[lj] = imp_scale * out_imp_scaleA[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale * out_imp_scaleB[lj];
+                        }
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            cw_orig8[i] = w_decoded8[i];
+                            cw8[i] = cw_orig8[i];
+                            ci8[i] = imp_decoded8[i] * combined_imp_scale8[i];
+                        }
+
+                        double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
+                        double mrow_local = 0.0, mrow_local_contrib = 0.0, mgamma_local = 0.0,
+                               mgamma_local_contrib = 0.0;
+                        value_type mcol_local8[2 * BLOCK4_TILE] = {0},
+                                                   mcol_local_contrib8[2 * BLOCK4_TILE] = {0};
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv =
+                                input[static_cast<std::size_t>(b) * in_cols + row];
+                            value_type dyv8[2 * BLOCK4_TILE];
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                dyv8[lj] = colA[lj] < n_out
+                                               ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                             colA[lj]]
+                                               : value_type(0);
+                                dyv8[lj + BLOCK4_TILE] =
+                                    colB[lj] < n_out
+                                        ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                      colB[lj]]
+                                        : value_type(0);
+                            }
+                            value_type mdx_term = value_type(0);
+                            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                                const value_type g = dyv8[i] * iv;
+                                mdx_term += cw_orig8[i] * combined_scale8[i] * dyv8[i];
+                                if (!training)
+                                    continue;
+                                const value_type contrib = cw_orig8[i] * combined_scale8[i] * iv;
+                                g_agg8[i] += g;
+                                contrib_agg8[i] += contrib;
+                                const value_type out_scale_k_i =
+                                    i < BLOCK4_TILE ? out_scale_kA[i]
+                                                    : out_scale_kB[i - BLOCK4_TILE];
+                                const value_type prod_g = cw_orig8[i] * out_scale_k_i * g;
+                                const value_type prod_contrib =
+                                    cw_orig8[i] * out_scale_k_i * contrib;
+                                mrow_local += static_cast<double>(prod_g) * gamma_k_arr[0];
+                                mrow_local_contrib +=
+                                    static_cast<double>(prod_contrib) * gamma_k_arr[0];
+                                mgamma_local +=
+                                    static_cast<double>(out_scale_k_i * value_scale_k_row * prod_g);
+                                mgamma_local_contrib += static_cast<double>(
+                                    out_scale_k_i * value_scale_k_row * prod_contrib);
+                                mcol_local8[i] +=
+                                    cw_orig8[i] * value_scale_k_row * g * gamma_k_arr[0];
+                                mcol_local_contrib8[i] +=
+                                    cw_orig8[i] * value_scale_k_row * contrib * gamma_k_arr[0];
+                            }
+                            mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+                        }
+
+                        if (training) {
+                            mrow_at(row, 0) += mrow_local;
+                            mrow_at_contrib(row, 0) += mrow_local_contrib;
+                            mgamma_at(0) += static_cast<value_type>(mgamma_local);
+                            mgamma_at_contrib(0) += static_cast<value_type>(mgamma_local_contrib);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    mcol_at(colA[lj], 0) += mcol_local8[lj];
+                                    mcol_at_contrib(colA[lj], 0) += mcol_local_contrib8[lj];
+                                }
+                                if (colB[lj] < n_out) {
+                                    mcol_at(colB[lj], 0) += mcol_local8[lj + BLOCK4_TILE];
+                                    mcol_at_contrib(colB[lj], 0) +=
+                                        mcol_local_contrib8[lj + BLOCK4_TILE];
+                                }
+                            }
+                            Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
+                                ci_v1, S_v0, S_v1;
+                            for (uint32_t i = 0; i < BLOCK4_TILE; ++i) {
+                                g_agg_v0[i] = static_cast<value_type>(g_agg8[i]);
+                                g_agg_v1[i] = static_cast<value_type>(g_agg8[i + BLOCK4_TILE]);
+                                contrib_agg_v0[i] = static_cast<value_type>(contrib_agg8[i]);
+                                contrib_agg_v1[i] =
+                                    static_cast<value_type>(contrib_agg8[i + BLOCK4_TILE]);
+                                ci_v0[i] = ci8[i];
+                                ci_v1[i] = ci8[i + BLOCK4_TILE];
+                                S_v0[i] = combined_scale8[i];
+                                S_v1[i] = combined_scale8[i + BLOCK4_TILE];
+                            }
+                            const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                cw8[lj] += delta_v0[lj];
+                                cw8[lj + BLOCK4_TILE] += delta_v1[lj];
+                                ci8[lj] = ci_v0[lj];
+                                ci8[lj + BLOCK4_TILE] = ci_v1[lj];
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    const uint32_t slotA = Block4Tile8::slot_index(li, lj);
+                                    const value_type cw_val = cw8[lj];
+                                    const value_type ci_val = ci8[lj] / combined_imp_scale8[lj];
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[lj]) {
+                                            tdataA[slotA] = fp8_quantize_stochastic_live(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_stochastic_live_nonneg(ci_val);
+                                        } else {
+                                            tdataA[slotA] = fp8_quantize_stochastic(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_stochastic(ci_val);
+                                        }
+                                    } else {
+                                        if (was_live8[lj]) {
+                                            tdataA[slotA] = fp8_quantize_live(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_live(ci_val);
+                                        } else {
+                                            tdataA[slotA] = fp8_quantize(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize(ci_val);
+                                        }
+                                    }
+                                    dirtyA = true;
+                                }
+                                if (colB[lj] < n_out) {
+                                    const uint32_t idx = lj + BLOCK4_TILE;
+                                    const uint32_t slotB = Block4Tile8::slot_index(li, lj);
+                                    const value_type cw_val = cw8[idx];
+                                    const value_type ci_val = ci8[idx] / combined_imp_scale8[idx];
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[idx]) {
+                                            tdataB[slotB] = fp8_quantize_stochastic_live(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_stochastic_live_nonneg(ci_val);
+                                        } else {
+                                            tdataB[slotB] = fp8_quantize_stochastic(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_stochastic(ci_val);
+                                        }
+                                    } else {
+                                        if (was_live8[idx]) {
+                                            tdataB[slotB] = fp8_quantize_live(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_live(ci_val);
+                                        } else {
+                                            tdataB[slotB] = fp8_quantize(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize(ci_val);
+                                        }
+                                    }
+                                    dirtyB = true;
+                                }
+                            }
+                        }
+                    } // closes for (li...)
+                    return {dirtyA, dirtyB};
+                }; // closes process_tile_pair_fp8
+
                 if (learning_rate == value_type(0)) {
                     // Read-only: process_tile structurally never writes here
                     // (every write inside it is gated by learning_rate != 0),
@@ -3996,6 +4243,56 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                             ws, eA, byte_posA, scratch_buf);
                                     live_byte_pos += block4_stored_tile_len32(ws.is_sparse[eA],
                                                                               &ws.bytes[byte_posA]);
+                                    ++row_ti;
+                                }
+                            } // closes while (row_ti...)
+                        }
+                    } else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        if (rank == 1) {
+                            row_handled_as_pairs = true;
+                            std::size_t row_ti = row_ti_start[br];
+                            while (row_ti < row_ti_start[br + 1]) {
+                                const std::size_t eA = row_ti - row_ti_start[br];
+                                const uint32_t bcA = ws.bc[eA];
+                                const std::size_t byte_posA = live_byte_pos;
+                                const bool has_partner = (row_ti + 1 < row_ti_start[br + 1]);
+                                if (has_partner) {
+                                    const std::size_t eB = eA + 1;
+                                    const uint32_t bcB = ws.bc[eB];
+                                    uint8_t scratch_bufA[BLOCK4_TILE_SLOTS8_BYTES];
+                                    uint8_t scratch_bufB[BLOCK4_TILE_SLOTS8_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_bufA);
+                                    const std::size_t lenA_before = block4_stored_tile_len8(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_before = byte_posA + lenA_before;
+                                    weights.block4.unpack_workspace_tile(ws, eB, byte_posB_before,
+                                                                         scratch_bufB);
+                                    const auto [dirtyA, dirtyB] =
+                                        process_tile_pair_fp8(bcA, bcB, scratch_bufA, scratch_bufB);
+                                    if (dirtyA)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_bufA);
+                                    const std::size_t lenA_after = block4_stored_tile_len8(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_after = byte_posA + lenA_after;
+                                    if (dirtyB)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eB, byte_posB_after, scratch_bufB);
+                                    const std::size_t lenB_after = block4_stored_tile_len8(
+                                        ws.is_sparse[eB], &ws.bytes[byte_posB_after]);
+                                    live_byte_pos = byte_posB_after + lenB_after;
+                                    row_ti += 2;
+                                } else {
+                                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS8_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_buf);
+                                    const bool tile_dirty = process_tile(bcA, scratch_buf);
+                                    if (tile_dirty)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_buf);
+                                    live_byte_pos += block4_stored_tile_len8(ws.is_sparse[eA],
+                                                                             &ws.bytes[byte_posA]);
                                     ++row_ti;
                                 }
                             } // closes while (row_ti...)
