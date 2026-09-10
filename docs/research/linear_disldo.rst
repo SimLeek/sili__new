@@ -1556,3 +1556,59 @@ past this 50%-density test case, and is the same underlying pattern
 intended to later fill GPU warps (task #408) -- a CPU-side wash on a
 50%-dense pattern is a good sign for both of those, not evidence against
 landing it.
+
+**Backward production port.** Unlike forward (read-only, no aliasing
+risk), backward's real block4 write loop already snapshots each block-
+row into a ``RowWorkspace`` and unpacks ONE tile at a time into a local
+``scratch_buf`` before calling ``process_tile``/committing it back --
+this means the cross-tile port needed no PoC-style read-all-then-write-
+all workaround at all: two DIFFERENT tiles' scratch buffers can safely
+be unpacked, processed together, and committed independently, since
+neither is ever a live handle into the shared store. A new
+``process_tile_pair_fp32`` lambda (mirroring ``process_row_pair_fp32``
+with the shared/per-half roles swapped, exactly as documented in the
+PoC's own header comment) handles the paired case; the existing
+``process_tile`` is unchanged and still used for solos, FP8, FP4, and
+(deliberately) any ``scale_rank > 1`` FP32 layer -- gated on
+``rank == 1`` so AQRS/rank-N layers get zero behavior change, matching
+the validated PoC's own scope. **Sequencing within a pair is the one
+place this differs from a naive port**: tile B's byte position depends
+on tile A's stored length, and committing A can change that length by
+resizing A's sparse/dense encoding in the row's shared byte buffer,
+shifting where B's bytes actually live -- so A is unpacked, then B is
+unpacked (both using A's PRE-write length to locate B), the row's math
+is computed from both, A is committed, A's length is RE-READ (post-
+commit), and only THEN is B committed at its now-correct position. This
+mirrors, applied twice per pair, exactly how the pre-existing single-
+tile loop already re-reads its own tile's post-commit length before
+advancing to the next tile -- not a new pattern, just applied to a pair
+instead of a singleton.
+
+Correctness gate: a NEW standalone test,
+``test_disldo_block4_fp32_crosstile_scattered_divergence.cpp`` (not
+just re-running the PoC's own oracle checks), builds two arms with
+IDENTICAL weights -- one entirely scattered-CSR (completely untouched by
+this change), one entirely block4 with checkered occupancy (``n_out=24``
+gives 3 block-columns, so both a genuine PAIR and a genuine SOLO occur
+in the same row, exercising both new code paths at once) -- and confirms
+forward output, ``dx``, and post-backward weight updates all match to
+float precision (errors ~1e-6, pure summation-order noise). Passes
+locally and on arch-sandbox. Full local C++ suite (160/160) still
+passes unmodified.
+
+Measured against the real kernel (interleaved remote A/B, checkered,
+``n_in=n_out=256, batch=8``): at ``num_cpus=4`` (20 runs), before/after
+medians overlap heavily (~406us vs ~407us median-of-medians, though the
+FIRST ~11 of 20 runs showed a real ~20-23% win before an apparent
+machine-wide regime shift mid-run affected both arms roughly equally);
+at ``num_cpus=1`` (15 runs, matching the PoC's own single-threaded
+shape), before/after track each other closely through the same kind of
+shift (~1247us vs ~1197us median-of-medians, within the shift's own
+noise band). Net result: the SAME parity finding as forward, for the
+SAME underlying reason (the real kernel's fixed per-call overhead --
+``RowWorkspace`` snapshot/merge, per-thread reductions, OMP fork/join --
+dilutes the PoC-measured 2.7x win, which came from a minimal harness
+that paid almost nothing else). Landed as a real result for the same
+reason as forward: parity on a 50%-dense checkered pattern while now
+correctly handling genuinely gapped occupancy is the actual target here,
+not a further win on the already-dense case.
