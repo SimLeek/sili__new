@@ -170,16 +170,22 @@ set(SILI_STANDALONE_TESTS
     test_block4_sparse_input_backward
     test_fp4_bitshift
     test_fp4_stochastic
+    test_disldo_block4_fp4_wide_simd
+    test_disldo_block4_fp4_backward_wide_simd
     test_fp8_bitshift
     test_fp8_block4_simd
     test_fp8_value_accessor
     test_fp8_block4_sparse_tile
     test_fp8_block4_store
     test_disldo_block4_fp8
+    test_disldo_block4_fp8_wide_simd
+    test_disldo_block4_fp8_backward_wide_simd
     test_disldo_block4_promotion_fp8
     test_fp32_block4_sparse_tile
     test_fp32_block4_store
     test_disldo_block4_fp32
+    test_disldo_block4_fp32_wide_simd
+    test_disldo_block4_fp32_backward_wide_simd
     test_disldo_block4_promotion_fp32
     test_never_zero_live_quantize
     test_aqrs_additive_branch

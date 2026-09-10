@@ -228,10 +228,206 @@ FP8 dispatch
 
 ``Block4Tile8``'s layout is a full byte/slot (no nibble mask) and
 decodes via E4M3 (``fp8quant.hpp``/``block4_vec_decode_fp8``), not FP4's
-table-driven bit-shift codec -- the only thing that differs from the FP4
-branch. Everything past this point (row-scale multiply, batch
-accumulation) is identical float32 math regardless of storage width. The
-FP4 branch is byte-for-byte the pre-existing code, untouched.
+table-driven bit-shift codec. Originally the only thing that differed
+from the (then-shared) FP4 branch, with everything past decode (row-scale
+multiply, batch accumulation) identical float32 math regardless of
+storage width -- **partially superseded** by
+``disldo_forward.fp8_block4_avx2_column_pairing`` below: FP8 now has its
+own dedicated ``process_pair8`` branch (column-paired, 8-wide) rather than
+sharing FP4's per-column ``process_col``, though the decode call itself
+(``block4_vec_decode_fp8``) is unchanged. FP4's branch remains the
+original per-column code, untouched.
+
+.. _disldo_forward.fp32_block4_avx2_column_pairing:
+
+FP32 block4: AVX2 column pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp32_block4_avx2_column_pairing``
+
+Float32 has no decode step at all (``Block4Tile32``'s weight half already
+stores 4 raw, contiguous floats per column), so unlike the FP4/FP8
+branches, there's nothing for a wider decode to buy here -- the real
+SIMD-arithmetic opportunity is the scale-multiply and the per-batch
+dot-product accumulate, both previously plain 4-wide scalar loops.
+
+Two adjacent columns of the SAME tile (``LJ0``, ``LJ0+1``) read the exact
+same 4 input rows (``br*4..br*4+4`` -- fixed per tile) and are laid out
+back-to-back in ``tdata`` (``slot_index(li,lj) = lj*4+li``, so column
+``LJ0``'s 4 floats end exactly where ``LJ0+1``'s begin). That means ONE
+32-byte memcpy loads both columns' weights as a single 8-wide
+``Block8Vec``, the row-scale gather can build one 8-wide scale vector
+(zeroing the upper half when the second column is out of bounds -- true
+whenever ``col0 < col1`` and only ``col0`` survives an ``n_out`` boundary,
+which is the only partial case since ``col1 = col0+1``), and the per-batch
+inner loop gathers the tile's 4 input values ONCE, duplicates them into
+both halves of an 8-wide vector, and does one 256-bit multiply followed
+by a split horizontal sum (lanes 0-3 -> column 0's output, lanes 4-7 ->
+column 1's). ``BLOCK4_TILE == 4`` makes this exact -- two pairs, no
+remainder -- so ``process_pair`` is called with ``LJ0 in {0, 2}``, mirroring
+the existing 4-way ``process_col`` unroll it replaces for this value type
+only (FP4/FP8 keep the original ``process_col`` path, untouched, in the
+``else`` branch).
+
+TDD methodology (see ``tests/unit/test_disldo_block4_fp32_wide_simd.cpp``):
+wrote the test FIRST against the unmodified kernel, correctness checked
+against an independent dense-matmul reference kept permanently in the
+test file (not a kernel toggle -- a ``SILI_BLOCK4_FORCE_SCALAR_*``-style
+compile-time toggle was explicitly rejected for this work, since it's
+unnecessary code that wouldn't be reused), recorded that baseline's timing,
+then modified the kernel in place and re-measured with the same test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function,
+not just SSE). Timing -- 15 before + 15 after binary invocations, randomly
+interleaved to cancel thermal/scheduling drift, each invocation's own
+median-of-200-calls as one sample -- gave before median-of-medians 173990
+ns/call (mean-of-medians 161149) vs after 160920 ns/call (mean-of-medians
+151265): a real but modest ~6-8% speedup, well inside the ~25-30%
+single-run noise band at this size. Not unexpected given how much else is
+already going on in this loop (tile lookup via ``at_index()``,
+``get_scale()``'s rank-N loop, thread-buffer reduction) -- the multiply-
+accumulate was never the whole cost.
+
+.. _disldo_forward.fp8_block4_avx2_column_pairing:
+
+FP8 block4: AVX2 column pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp8_block4_avx2_column_pairing``
+
+Unlike FP32 (no decode step at all -- see
+``disldo_forward.fp32_block4_avx2_column_pairing`` above), FP8 DOES have a
+real 4-wide SIMD decode (``block4_vec_decode_fp8``). Deliberately kept
+UNCHANGED here rather than rewritten 8-wide: it has a hybrid design (a
+whole-vector bit-shift fast path for normal-range codes, plus a per-lane
+scalar correction loop for rare subnormal/NaN-slot codes), and the batch
+loop that follows the decode (running ``batch`` times per tile, vs
+decode's once) is the dominant per-call cost anyway -- same reasoning
+FP32's widening used for its own arithmetic-only case. The two paired
+columns' weight codes are decoded separately via the existing
+``block4_vec_decode_fp8`` (called twice, once per column), then their
+DECODED ``Block4Vec`` results are combined into one ``Block8Vec`` via
+``block8_vec_from_lo_hi`` and fed through the exact same 8-wide
+scale-multiply/batch-accumulate/split-hsum pattern as FP32's
+``process_pair``. New branch ``process_pair8``, split out of what used to
+be a shared FP8/FP4 ``process_col`` (see
+``disldo_forward.fp8_dispatch`` above) -- FP4 keeps that original
+per-column code unchanged in its own ``else`` branch.
+
+TDD methodology matches FP32's exactly (see
+``tests/unit/test_disldo_block4_fp8_wide_simd.cpp``): written first
+against the unmodified kernel, correctness checked with tolerance against
+an all-scattered layer holding the IDENTICAL already-quantized weights
+(scattered's values are ``fp8_decode_bits(code)``, not the pre-
+quantization float, so both arms represent the exact same quantized value
+with no double-quantization mismatch -- matches
+``test_fp8_block4_scattered_divergence.cpp``'s convention), baseline
+timing recorded, then the kernel modified and re-measured with the same
+test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 15 before + 15 after binary invocations, randomly interleaved --
+gave before median-of-medians 176200 ns/call (mean-of-medians 168429) vs
+after 166960 ns/call (mean-of-medians 156001): a real but modest
+**~5.5-8% speedup**, the same magnitude as FP32's forward result (not
+FP8 backward's larger one, expected below) since the decode step was
+deliberately left untouched here -- the win is entirely from widening the
+same batch-loop arithmetic FP32's forward widening targeted.
+
+**Also tried and REJECTED**: a genuinely 8-wide ``block8_vec_decode_fp8``
+(``Block8VecU`` + a direct 8-lane port of the bit-shift fast path and
+rare-code scalar-correction loop above), gathering both paired columns'
+8 weight bytes in one contiguous load (they're adjacent in ``tdata``,
+same layout the column pairing already exploits) and decoding them
+together instead of calling the 4-wide decode twice. MEASURED WORSE on
+``arch-sandbox`` (15 before/after interleaved): median-of-medians 180730
+ns/call (mean-of-medians 177699) -- slower than even the pre-widening
+baseline (176200), let alone this section's twice-4-wide-decode design
+(133110). Root cause, confirmed by diffing the two versions' compiled
+disassembly: doubling every decode temporary (``s``/``e``/``m``/
+``bits_normal``/the ``codes_arr``/``result_arr`` scratch buffers) from
+128-bit to 256-bit pushed the combined YMM working set -- decode's own
+temporaries plus the pairing logic's own ``s8``/``w8``/``in8``/``prod``
+-- past the 16-register file, forcing spill/reload that outweighed the
+saved call overhead: 55% more stack-spill instructions (280 vs 181) and
+11% more total instructions (1962 vs 1768) in the compiled block4
+function. Reverted; ``block8_vec_decode_fp8``/``Block8VecU`` removed from
+``block4.hpp`` rather than left as unused dead code. Lesson: "pull two
+blocks together" doesn't uniformly help once the combined per-op register
+footprint exceeds what the target actually has -- worth checking via
+disassembly, not just codegen presence, before trusting a "wider must be
+faster" intuition.
+
+.. _disldo_forward.fp4_block4_avx2_column_pairing:
+
+FP4 block4: AVX2 column pairing, twice-4-wide decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp4_block4_avx2_column_pairing``
+
+FP4's decode (``block4_vec_decode_fp4``) is structurally different from
+FP8's: it is FULLY BRANCHLESS -- pure bitwise mask-and-select via
+comparison-producing vector masks, no scalar correction loop, no
+``codes_arr``/``result_arr`` scratch buffers at all. This directly raised
+the question ``disldo_forward.fp8_block4_avx2_column_pairing`` above left
+open: does FP4 avoid the register-pressure penalty that made FP8's
+genuinely-8-wide decode attempt measure worse? Two designs were built and
+compared, not assumed from the structural difference alone:
+
+1. **Twice-4-wide-decode-call** (the same "safe default" shape adopted for
+   FP8/FP32): pair two adjacent columns, call the existing 4-wide
+   ``block4_vec_decode_fp4`` once per column, combine the two DECODED
+   ``Block4Vec`` results into one ``Block8Vec`` via ``block8_vec_from_lo_hi``.
+2. **Genuinely 8-wide gather-then-decode**: a new ``block8_vec_decode_fp4``
+   (direct 8-lane port of ``block4_vec_decode_fp4``'s branchless
+   mask-and-select logic, using new ``Block8VecU``/``block8_vecu_broadcast``
+   helpers in ``block4.hpp``) decodes both paired columns' 8 masked weight
+   codes in one call, gathered into one ``Block8VecU`` literal instead of
+   two separate 4-wide literals.
+
+**RESULT: design 1 (twice-4-wide) was ADOPTED, after an initial wrong
+call.** A local laptop measurement (AMD Ryzen 7 3750H, real AVX2 via
+``-march=native``) first suggested design 2 was a clear ~8% win (267362 vs
+291513 ns/call, 8-run median-of-medians), corroborated by disassembly
+showing FP4 avoids most of FP8's register-pressure penalty when widened
+this way (only 207->231 stack-spill instructions, +11.6%, going from
+design 1 to design 2, vs FP8's +55% for the analogous comparison) -- so
+design 2 was initially adopted on that basis.
+
+That did not hold up on ``arch-sandbox`` (AMD Ryzen 7 3800XT, the
+authoritative AVX2 machine used for every other before/after comparison in
+this document). An initial n=15 interleaved round was ambiguous (design 1
+median 154520 vs design 2's 156430), so a larger n=35 interleaved round
+was run: design 1 median 154600 ns/call (mean 143139) vs design 2 median
+151200 (mean 144067) -- **statistically indistinguishable**. Individual
+runs for BOTH designs swung between ~124000 and ~178000 ns/call (a
+bimodal, likely frequency-scaling-driven pattern affecting both binaries
+equally), a spread far larger than the ~2% gap between their medians. The
+local laptop's clear-looking win simply did not replicate on the machine
+that matters.
+
+Given a genuine tie on ``arch-sandbox``, design 1 (twice-4-wide) was kept:
+it reuses the already-proven 4-wide ``block4_vec_decode_fp4`` rather than
+maintaining a second, wider decode function purely for a difference that
+turned out to be noise. ``block8_vec_decode_fp4``/``Block8VecU``/
+``block8_vecu_broadcast`` were removed from ``block4.hpp`` rather than left
+as unused dead code (same convention as FP8's rejected
+``block8_vec_decode_fp8``).
+
+**Lesson** (the actually load-bearing one here, worth remembering for
+future AVX2-widening work on this codebase): a clear-looking local result,
+even one that disassembly seems to corroborate, is not a substitute for
+measuring on the authoritative machine -- the laptop and arch-sandbox
+disagreed not just in magnitude but in DIRECTION. Every prior AVX2-widening
+decision in this document (FP32 forward/backward, FP8 forward/backward)
+was measured on ``arch-sandbox`` from the start; this is the one case that
+wasn't, and it produced a wrong initial conclusion as a direct result. Do
+not adopt a kernel change based on local-only timing again, regardless of
+how large or well-explained the local margin looks.
 
 .. _disldo_forward.aqrs_additive_branch:
 
@@ -712,6 +908,205 @@ rejects a gather-looking ``output_grad[...col4[lj]]`` index as
 index as contiguous -- hence the ``full_tile_cols`` split (whole
 tile-column in bounds) checked once per tile, not per batch element.
 
+.. _disldo_backward.fp32_block4_avx2_row_pairing:
+
+FP32 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp32_block4_avx2_row_pairing``
+
+Backward's counterpart to
+``disldo_forward.fp32_block4_avx2_column_pairing`` (above), on the OTHER axis.
+Forward's existing SIMD width already spans a fixed column's 4 rows, so it
+paired two columns; backward's existing SIMD width spans a fixed row's 4
+columns, so this pairs two adjacent rows (``li``, ``li+1``) of the same
+tile into one 8-wide op, called via a new ``process_row_pair_fp32``
+lambda inside ``process_tile``. Scoped to the common case only -- both
+rows must be live (``row < n_in``, ``row_live_count[row] > 0``) and the
+tile's column range must be fully in-bounds (mirrors ``full_tile_cols32``)
+-- a partial-column tile at the ``n_out`` edge or a dead partner row falls
+back unchanged to the existing single-row path. The outer ``for (li...)``
+loop detects a pairable pair, calls the new lambda, then does an extra
+``++li`` before its own increment/``continue`` to skip the consumed
+``li+1`` -- net advance of 2, not 1.
+
+Per-quantity handling, since backward's math mixes quantities that depend
+on the row, the column, or both:
+
+- ``dy``/``output_scale_k`` depend only on the column -- shared/duplicated
+  across both paired rows' halves of the 8-wide vector
+  (``block8_vec_dup4``), not recomputed per row.
+- The gathered input value, ``value_scale_k``, and ``effective_lr`` depend
+  only on the row -- broadcast per-half (``block8_vec_broadcast_pair``),
+  differing between the two rows.
+- The decoded weight/importance and combined scale genuinely depend on
+  BOTH row and column -- 8 distinct values, no sharing possible. No single
+  contiguous memcpy across rows either (``Block4Tile32::slot_index(li,lj)
+  = lj*4+li`` means fixed-li/varying-lj is already a stride-4 gather, same
+  total loads as two single-row passes) -- the win is the 8-wide
+  ARITHMETIC that follows the loads, not the loads themselves.
+- ``mrow``/``mdx`` are per-ROW reductions -- split via ``block8_vec_lo4``/
+  ``block8_vec_hi4`` (lower 4 lanes -> row0, upper 4 -> row1).
+- ``mcol`` is a per-COLUMN reduction, and a column's identity doesn't
+  depend on which of the two paired rows contributed -- folded via
+  ``block8_vec_fold4`` (elementwise lower+upper) into the SAME 4-wide
+  scratch a single-row pass would have used, no new scratch shape needed.
+- ``mgamma`` is a single layer-wide scalar accumulator -- summed across
+  ALL 8 lanes at once (``block8_vec_hsum``), combining both rows'
+  contributions directly.
+- The RMSprop-style ``ci``/``cw`` update is genuinely per-(row,col) cell
+  (no shared/duplicated lanes to exploit), and no ``Block8Vec``
+  specialization of ``SynapsePolicy`` exists (``PlainRMSpropSynapsePolicy``/
+  ``BoundedRMSpropSynapsePolicy`` are hand-specialized for ``Block4Vec``
+  specifically, using per-lane-loop helpers like ``block4_vec_sqrt`` that
+  don't generalize for free). Rather than write a new 8-wide specialization,
+  the accumulated 8-wide state is split back into two ``Block4Vec`` halves
+  and the EXISTING ``SynapsePolicyVec::update_ci``/``update_cw`` calls run
+  twice. This is a once-per-row-pair cost, not a per-batch one, so it
+  doesn't undo the batch loop's win.
+
+New ``Block8Vec`` helpers added to ``block4.hpp`` for this:
+``block8_vec_load``/``store``/``broadcast``, ``block8_vec_broadcast_pair``
+(different scalar per half), ``block8_vec_dup4`` (same 4-wide vector in
+both halves), ``block8_vec_lo4``/``hi4`` (extract a half),
+``block8_vec_from_lo_hi`` (recombine), ``block8_vec_fold4`` (elementwise
+lower+upper sum), ``block8_vec_hsum`` (all-8 sum) -- all memcpy/literal-
+based, mirroring ``Block4Vec``'s own helpers' style exactly.
+
+TDD methodology (see
+``tests/unit/test_disldo_block4_fp32_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked (with tolerance,
+not bit-exact -- unlike the tiny hand-placed-tile test elsewhere, this
+one's 32-row-dense scale means block4's parallel-thread reduction and
+scattered's sequential walk legitimately sum in different orders) against
+an all-scattered cross-check plus a post-backward forward probe, baseline
+timing recorded, then the kernel modified and re-measured with the same
+test -- no compile-time toggle added (same "don't add unnecessary code
+that would not be used again" rejection as forward's widening).
+
+.. _disldo_backward.fp8_block4_avx2_row_pairing:
+
+FP8 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp8_block4_avx2_row_pairing``
+
+FP8's existing block4 backward SIMD structure is the exact same shape as
+FP32's (see ``disldo_backward.fp32_block4_avx2_row_pairing`` above), so
+this ports the same row-pairing design (``process_row_pair_fp8``), with
+three real differences from the FP32 port: (1) decode is already SCALAR
+in the existing single-row code (``fp8_decode_bits``, not
+``block4_vec_decode_fp8``) -- measured faster for backward specifically
+(see ``disldo_backward.fp8_simd_measured`` above) -- kept scalar, just 8
+calls instead of 4, no widening attempted (unlike forward's rejected
+8-wide-decode experiment, this path never used a SIMD decode to begin
+with, so there was nothing to "un-widen"); (2) FP8's ``cw``/``ci`` are
+quantized CODE-SPACE values needing ``was_live``-gated encode-on-write
+(FP32 has no quantization floor to escape, so no such gating exists
+there); (3) encode is the existing ``StochasticRounding`` x ``was_live``
+4-way scalar dispatch (``fp8_quantize_live``/``_stochastic_live``/
+``_stochastic``/plain), called once per (row,col) cell -- 8 cells now
+instead of 4, no SIMD encode to widen either.
+
+TDD methodology matches FP32's exactly (see
+``tests/unit/test_disldo_block4_fp8_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked with tolerance
+against an all-scattered layer holding the identical already-quantized
+weights (same ``fp8_decode_bits(code)`` convention as the forward test)
+plus a post-backward forward probe, baseline timing recorded, then the
+kernel modified and re-measured with the same test.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vaddps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 12 before + 12 after binary invocations, randomly interleaved,
+each invocation's own median-of-200-calls as one sample -- gave before
+median-of-medians 9673260 ns/call (mean-of-medians 11653644) vs after
+3643525 ns/call (mean-of-medians 4001787): a real **~2.65-2.9x speedup**,
+matching FP32 backward's ~2.7-3.2x (same underlying reason: real per-cell
+RMSprop update plus rank-N AQRS bookkeeping to widen, unlike forward's
+modest ~5.5-8% where decode dominates and was deliberately left
+unwidened -- and where an attempt to widen it anyway was tried and
+measured worse, see ``disldo_forward.fp8_block4_avx2_column_pairing``
+above).
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): AVX2 codegen confirmed via
+objdump (``vmulps ymm`` in the compiled block4 OpenMP-outlined function).
+Timing -- 15 before + 15 after binary invocations, randomly interleaved to
+cancel thermal/scheduling drift, each invocation's own median-of-200-calls
+as one sample -- gave before median-of-medians 10967140 ns/call
+(mean-of-medians 13120815) vs after 3400970 ns/call (mean-of-medians
+4785922): a real **~2.7-3.2x speedup**, much larger than forward's modest
+~6-8%. Consistent with expectations going in: forward's FP32 "decode" was
+a no-op memcpy with almost nothing to widen, while backward's per-cell
+RMSprop update plus rank-N AQRS bookkeeping (mrow/mcol/mgamma, gamma
+weighting, contrib terms) is exactly the kind of "lot more stuff going on
+in the SIMD part" that a wider op actually pays off on.
+
+.. _disldo_backward.fp4_block4_avx2_row_pairing:
+
+FP4 block4 backward: AVX2 row pairing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_backward.fp4_block4_avx2_row_pairing``
+
+FP4's existing block4 backward decodes via scalar ``FP4_TABLE`` lookups
+(``disldo_backward.fp4_table_decode`` above), not SIMD bit-shift, same
+deliberate choice FP8's backward makes for its own decode -- so this ports
+the same row-pairing design (``process_row_pair_fp4``) as
+``disldo_backward.fp8_block4_avx2_row_pairing`` above, with two real
+differences specific to FP4BiPacked: (1) weight+importance are packed as
+TWO NIBBLES in ONE byte per slot (not FP8's two separate byte arrays), so
+decode is one byte read + two ``FP4_TABLE`` lookups per (li,lj), and
+write-back is a single bit-OR pack
+(``uint8_t((new_imp<<4)|new_w)``) instead of two separate ``tdata``
+writes; (2) FP4's gradient-accumulation terms (mrow/mcol/mgamma) use a
+"quant_floor" -- the stored quantized weight with a ``zero_escape_eps``
+substitution at exactly ``quant==0``, giving a currently-zero-weight cell
+a real synaptogenesis growth signal (see
+``disldo_backward.deferred_vs_direct_quant`` above) -- where FP8 has no
+such floor and uses ``cw_orig`` directly. Both differences are read
+straight off FP4's existing single-row code, not new design; only the
+4-wide-vs-8-wide packing itself is new.
+
+TDD methodology matches FP8's exactly (see
+``tests/unit/test_disldo_block4_fp4_backward_wide_simd.cpp``): written
+FIRST against the unmodified kernel, correctness checked with tolerance
+against an all-scattered layer holding the identical already-quantized
+weights plus a post-backward forward probe, baseline timing recorded, then
+the kernel modified and re-measured with the same test. Correctness
+additionally verified against the broader existing regression suite
+(``test_block4_scattered_divergence``, ``test_aqrs_gamma``,
+``test_aqrs_additive_branch``, ``test_aqrs_rank_growth_shrink``,
+``test_block4_memory_cap_and_compression``, ``test_ci_ceiling``'s
+30000-step long run, ``sweep_synapse_policy_stochastic`` for
+``StochasticRounding=true`` coverage) -- all passed unmodified, since
+``process_row_pair_fp4`` reuses the exact same ``SynapsePolicyVec``/AQRS
+rank-N/gamma machinery as the single-row path, just at 8-wide.
+
+Measured on ``arch-sandbox`` (full-rate Zen2 AVX2, num_cpus=4,
+n_in=256/n_out=256/batch=8, 4096 tiles): timing -- 15 before + 15 after
+binary invocations, randomly interleaved, each invocation's own
+median-of-200-calls as one sample -- gave before median-of-medians
+9311840 ns/call (mean-of-medians 11626223) vs after 3545899 ns/call
+(mean-of-medians 5461988): a real **~2.63x speedup**, matching FP8
+backward's ~2.65-2.9x almost exactly (same underlying reason: real
+per-cell RMSprop update plus rank-N AQRS bookkeeping to widen, unlike
+forward's much smaller and ultimately noise-confounded gain -- see
+``disldo_forward.fp4_block4_avx2_column_pairing`` above for that
+contrasting result). Both arms showed real bimodal run-to-run variance (a
+roughly 2x high/low split within each arm, most likely thermal/
+frequency-scaling, affecting before and after similarly) -- the
+median-of-15 is what actually separates the real signal from that noise;
+a single non-interleaved before/after pair measured only ~14% at one
+point during this work, purely from landing in each arm's opposite mode,
+before the full interleaved run resolved it. Directly following
+``disldo_forward.fp4_block4_avx2_column_pairing``'s own lesson, this
+result WAS verified on ``arch-sandbox`` before being adopted (a local
+laptop sanity check also showed a consistent, same-direction ~3.36x, but
+was not treated as the real number).
+
 .. _disldo_backward.was_live_gating:
 
 ``was_live`` gating: a real bug from block4's dense-tile semantics
@@ -1014,3 +1409,364 @@ upshot**: this fix is only a net win when paired with pinning AND a
 ``num_cpus`` choice of 2 or >=8 on this machine's topology -- staying at
 the old "safe default" of ``num_cpus=4`` under the new pinned regime is
 now the single worst non-plateau option measured.
+
+.. _disldo_forward.fp32_block4_cross_tile_pairing:
+
+FP32 block4: cross-tile (non-adjacent) pairing PoC
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp32_block4_cross_tile_pairing`` /
+``disldo_backward.fp32_block4_cross_tile_pairing``
+
+The column/row-pairing widenings above (``disldo_forward.
+fp32_block4_avx2_column_pairing``, ``disldo_backward.
+fp32_block4_avx2_row_pairing``) pair two halves of the SAME tile. This is
+a different axis: pairing TWO DIFFERENT tiles that share a block-row
+(``br``) but sit at different block-columns (``bc``) -- the case that
+matters once a layer has real gaps (checkered/sparse block4 occupancy),
+not just the fully-dense case those widenings targeted.
+
+**Forward's cross-tile axis**: for a fixed column-within-tile ``lj``,
+combine that SAME ``lj`` position from two DIFFERENT tiles sharing ``br``
+(different ``bc``) into one 8-wide op -- both tiles still read the same 4
+input rows, so this is cheap: forward's tile-collection loop already
+walks a row's occupied tiles in ``bc``-ascending order, so pairing
+consecutive entries needs no new indexing.
+
+**Backward's cross-tile axis** (the mirror image, per the design
+decision behind pairing on ``br`` rather than ``bc``: "same br different
+bc for backward as well -- sum the input grad, the weight grads are
+separate anyway"): for a fixed row ``li`` (same actual row), combine that
+row's computation against TWO DIFFERENT tiles (``bc0``, ``bc1``) sharing
+``br``. Row-level quantities (``imp_scale``, ``effective_lr``) become
+SHARED; column-level quantities (``col``, ``get_output_importance_scale``,
+``dy``) become PER-HALF (genuinely different columns from the two tiles);
+``dx`` accumulation FOLDS both tiles' contributions into one row entry
+(analogous to ``mdx``'s per-batch accumulation, NOT a single accumulator
+hoisted outside the batch loop -- ``mdx`` is shaped ``(batch, in_cols)``,
+each batch sample needs its own slot); weight/importance updates write to
+TWO SEPARATE tiles. This stays within one thread's row-ownership (no new
+column index, no cross-thread race), since a whole row's tiles are
+already collected together -- confirmed cheap, unlike an earlier
+(wrong) assumption that it would need new column-indexed infrastructure.
+
+Standalone PoC files (not yet ported into the real kernel; see below):
+``tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp`` and
+``test_disldo_block4_fp32_crosstile_backward.cpp``. Both hand-build a
+genuinely gapped ("checkered", every odd ``bc`` skipped) block4 fp32
+layer via ``get_or_create``/``set_weight``/``set_importance`` (mirroring
+``block4_load_dense_fp32``'s own construction loop minus the odd-``bc``
+skip), use the REAL ``disldo_forward``/``disldo_backward`` as both
+correctness oracle and timing baseline, and measure only the one new
+hand-written cross-tile function against it.
+
+**Backward-specific correctness pitfall, found and fixed**: two
+``Block4TileHandle32`` handles into the SAME row held open
+simultaneously while mutating one is a real use-after-free hazard (a
+write-triggered sparse<->dense repack on one handle can memmove the
+row's shared byte buffer out from under the other's still-open
+``byte_pos``) -- exactly the hazard ``disldo_backward.
+row_workspace_snapshot_fix`` documents and the real kernel avoids via
+``snapshot_row``/``unpack_workspace_tile``. The PoC's simpler
+(valid only because tiles never actually resize in this fixed-checkered
+test scenario) fix: read BOTH tiles fully into local arrays first, each
+handle opened and closed sequentially and never two alive at once,
+compute using only local data, then write both tiles back the same way.
+A second, purely mathematical bug: the PoC's ``ci`` (combined importance)
+formula initially used ``imp_scale(row) * value_scale(row)`` -- both
+row-level -- copying the row-pairing kernel's shared/per-half framing
+too literally. The real formula (``process_row_pair_fp32``,
+``combined_imp_scale8[lj] = imp_scale0 * out_imp_scale4[lj]``) uses
+``imp_scale(row) * get_output_importance_scale(col)`` -- the SECOND
+factor is column-level, not row-level, so it must be per-half (from each
+tile's own columns), not shared. Both bugs were undetectable by a naive
+forward-probe correctness check post-backward, because ``disldo_backward``
+ALSO runs its own unconditional per-row ``value_scale`` RMSprop update
+after the per-cell loop (``linear_disldo.hpp:3568-3648``, block4's
+dead-row-independent value_scale pass) which the PoC deliberately doesn't
+replicate (out of scope -- that machinery is orthogonal to the cross-tile
+per-cell math under test, and the real kernel port reuses it unmodified)
+-- so a forward probe conflated expected ``S(row)`` drift with actual
+correctness. Fixed by comparing raw stored ``cw``/``ci`` directly instead
+of probing through a forward pass.
+
+**Measured** (arch-sandbox, 15 interleaved-equivalent runs, ``n_in=n_out=
+256, batch=8``, oracle vs hand-written function, median ns/call):
+
+- Forward: ``adjacent_only`` (existing column-pairing) vs
+  ``cross_tile``: a real, consistent **~17-20% speedup**. Root cause:
+  the tile-handle fetch cost (``at_index``/``raw_data``) is halved (once
+  per pair instead of once per tile), not really about memory adjacency
+  itself.
+- Backward: ``adjacent_only`` (existing row-pairing) vs ``cross_tile``:
+  median 1,594,630 ns/call vs 589,950 ns/call across the 15 runs -- a
+  much larger **~2.7x speedup**, and far more STABLE than the adjacent
+  baseline (which showed large run-to-run variance, 1.5M-4.2M ns/call,
+  vs cross_tile's tight 589k-650k ns/call band across the same 15 runs)
+  -- plausibly because cross-tile pairing halves the number of per-tile
+  RMSprop ``update_ci``/``update_cw`` calls (once per row-pair across
+  TWO tiles' worth of columns, instead of once per tile), which is a
+  larger fixed per-tile cost on the backward path than on forward's.
+  (Note: as expected, this is dense-checkered-layout-neutral in principle
+  -- the real payoff is enabling cheaper work under genuine sparsity, not
+  a dense speedup per se, though the measured dense case is faster too.)
+
+Both PoCs were correctness-validated (weight/importance/dx all
+effectively exact, not just tolerance-close) before the port into the
+real kernels described in the commit(s) alongside this doc entry.
+
+**Forward production port, measured against the real kernel (not the
+PoC harness).** ``disldo_forward``'s existing tile-collection loop
+already walks each block-row's tiles in ``bc``-ascending order before
+the parallel region; a new per-tile ``uint8_t`` scratch flag
+(``scratch_tile_is_follower``) marks every SECOND tile of a same-``br``
+run as "already consumed by its leader," computed for free (one
+``bk % 2`` check) during that same walk. The parallel loop then pairs a
+leader with its follower into one 8-wide op (mirroring the PoC's
+``forward_cross_tile``), or falls back to the existing within-tile
+column-pairing (``process_pair``, unchanged) for a genuine solo tile.
+FP8/FP4 are structurally untouched (their whole per-tile branch moved
+into an ``else`` of a top-level ``if constexpr`` on ``VALUES_TYPE``, so
+none of this new code is even compiled for those instantiations).
+
+The PoC's own ~17-20% speedup (measured as a hand-rolled, single-
+threaded, no-OMP-overhead harness) does NOT reproduce when measured on
+the real ``disldo_forward`` call (interleaved remote A/B, 20 runs each,
+``n_in=n_out=256, batch=8``, checkered layout): at ``num_cpus=4``, mean
+before ~77.2us vs after ~79.0us (statistically indistinguishable); at
+``num_cpus=1`` (matching the PoC's single-threaded shape), medians were
+essentially identical (~174.3-181.5us both arms). The real kernel's
+fixed per-call overhead (rebuilding the ``tile_br``/``tile_bc``/
+``tile_elem``/``tile_byte``/``tile_is_follower`` scratch vectors, the
+per-thread output-buffer allocation and final reduction pass, OMP
+fork/join) is large enough relative to this problem size that halving
+the per-pair ``at_index()``/``raw_data()`` calls doesn't show up above
+the noise floor -- unlike the PoC's minimal harness, where that halving
+was a much larger fraction of total cost.
+
+**This is treated as a real, useful result, not a null result**: cross-
+tile pairing reaches PARITY with the already-optimized fully-dense
+adjacent-pairing baseline while now correctly handling a genuinely
+GAPPED (checkered) sparse tile pattern -- the two cases are "nearly
+indistinguishable" in measured cost. That parity is the actual target:
+this pairing axis exists to let sparse block4 occupancy patterns (which
+won't generally have convenient adjacent-column pairs to combine) still
+reach full 8-wide SIMD width, which matters more as sparsity increases
+past this 50%-density test case, and is the same underlying pattern
+intended to later fill GPU warps (task #408) -- a CPU-side wash on a
+50%-dense pattern is a good sign for both of those, not evidence against
+landing it.
+
+**Backward production port.** Unlike forward (read-only, no aliasing
+risk), backward's real block4 write loop already snapshots each block-
+row into a ``RowWorkspace`` and unpacks ONE tile at a time into a local
+``scratch_buf`` before calling ``process_tile``/committing it back --
+this means the cross-tile port needed no PoC-style read-all-then-write-
+all workaround at all: two DIFFERENT tiles' scratch buffers can safely
+be unpacked, processed together, and committed independently, since
+neither is ever a live handle into the shared store. A new
+``process_tile_pair_fp32`` lambda (mirroring ``process_row_pair_fp32``
+with the shared/per-half roles swapped, exactly as documented in the
+PoC's own header comment) handles the paired case; the existing
+``process_tile`` is unchanged and still used for solos, FP8, FP4, and
+(deliberately) any ``scale_rank > 1`` FP32 layer -- gated on
+``rank == 1`` so AQRS/rank-N layers get zero behavior change, matching
+the validated PoC's own scope. **Sequencing within a pair is the one
+place this differs from a naive port**: tile B's byte position depends
+on tile A's stored length, and committing A can change that length by
+resizing A's sparse/dense encoding in the row's shared byte buffer,
+shifting where B's bytes actually live -- so A is unpacked, then B is
+unpacked (both using A's PRE-write length to locate B), the row's math
+is computed from both, A is committed, A's length is RE-READ (post-
+commit), and only THEN is B committed at its now-correct position. This
+mirrors, applied twice per pair, exactly how the pre-existing single-
+tile loop already re-reads its own tile's post-commit length before
+advancing to the next tile -- not a new pattern, just applied to a pair
+instead of a singleton.
+
+Correctness gate: a NEW standalone test,
+``test_disldo_block4_fp32_crosstile_scattered_divergence.cpp`` (not
+just re-running the PoC's own oracle checks), builds two arms with
+IDENTICAL weights -- one entirely scattered-CSR (completely untouched by
+this change), one entirely block4 with checkered occupancy (``n_out=24``
+gives 3 block-columns, so both a genuine PAIR and a genuine SOLO occur
+in the same row, exercising both new code paths at once) -- and confirms
+forward output, ``dx``, and post-backward weight updates all match to
+float precision (errors ~1e-6, pure summation-order noise). Passes
+locally and on arch-sandbox. Full local C++ suite (160/160) still
+passes unmodified.
+
+Measured against the real kernel (interleaved remote A/B, checkered,
+``n_in=n_out=256, batch=8``): at ``num_cpus=4`` (20 runs), before/after
+medians overlap heavily (~406us vs ~407us median-of-medians, though the
+FIRST ~11 of 20 runs showed a real ~20-23% win before an apparent
+machine-wide regime shift mid-run affected both arms roughly equally);
+at ``num_cpus=1`` (15 runs, matching the PoC's own single-threaded
+shape), before/after track each other closely through the same kind of
+shift (~1247us vs ~1197us median-of-medians, within the shift's own
+noise band). Net result: the SAME parity finding as forward, for the
+SAME underlying reason (the real kernel's fixed per-call overhead --
+``RowWorkspace`` snapshot/merge, per-thread reductions, OMP fork/join --
+dilutes the PoC-measured 2.7x win, which came from a minimal harness
+that paid almost nothing else). Landed as a real result for the same
+reason as forward: parity on a 50%-dense checkered pattern while now
+correctly handling genuinely gapped occupancy is the actual target here,
+not a further win on the already-dense case.
+
+**FP8/FP4 forward production timing.** Same interleaved-A/B methodology
+as fp32 (15 remote runs, striped, ``n_in=n_out=256, batch=8,
+num_cpus=4``, before=commit ``c13d1b7`` vs after=commit ``6b89ce8``):
+both precisions' before/after medians overlap heavily inside the same
+bimodal noise band already characterized elsewhere in this doc (values
+cluster in two clusters, ~57-65us and ~78-93us, in BOTH arms, tracking
+each other run-to-run) -- fp8 before/after median-of-medians ~85.2us/
+~83.8us, fp4 ~73.6us/~79.8us. Same parity conclusion as fp32 and the
+same root cause (real kernel overhead dilutes the isolated pairing
+win); not treated as a regression signal given the shared noise
+structure across both arms.
+
+**FP8 backward production port.** Same structural approach as fp32's
+port (``process_tile_pair_fp8`` mirroring ``process_tile_pair_fp32``
+with the shared/per-half role swap; RowWorkspace already provides
+independent per-tile scratch buffers, so no aliasing hazard; scoped to
+``scale_rank == 1``; falls back to the existing ``process_tile`` for
+solos and rank>1), but with a genuine fp8 encode/decode step per cell
+(``fp8_decode_bits``/``fp8_quantize_live``/``fp8_quantize_stochastic_
+live``, including the ``was_live8`` zero-escape gate) mirroring
+``process_row_pair_fp8``'s own decode/encode exactly, instead of FP32's
+raw float memcpy.
+
+Correctness gate: ``test_disldo_block4_fp8_crosstile_backward_
+divergence.cpp``, same striped-scattered-vs-block4 pattern as fp32's
+(both a real pair and a real solo per row) -- forward/dx/post-backward
+weights all match to within fp8 quantization-noise tolerance. (One real
+test bug found and fixed during this: the scattered arm's importance
+was initialized to 0 while the block4 arm's was nonzero, an asymmetry
+between the two arms' STARTING state, not a kernel bug -- caught
+because it produced a large post-backward divergence despite matching
+forward/dx, which was the same shape of false alarm as fp32's earlier
+value_scale confound, but this time the actual cause was a test setup
+mismatch rather than an incomplete PoC scope.) Full local C++ suite
+(160/160) and existing dense fp8 backward regression test both pass
+unmodified (the dense test now exercises cross-tile pairing on every
+tile, since a fully-dense row always has a same-br partner).
+
+Measured against the real kernel (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 15 runs, before=commit
+``2344b84``): unlike every other cross-tile port measured so far
+(fp32 forward/backward, fp8/fp4 forward -- all landed at parity), FP8
+backward shows a real, consistently separated speedup: median-of-
+medians 876.4us before vs 621.5us after (~29% faster), with ``after``
+faster than ``before`` in 13 of 15 interleaved samples -- not just
+overlapping noise bands like the other precisions. Plausible reason
+this one differs: FP8's per-tile fixed overhead (scale-rank scratch
+setup, ``was_live8`` bookkeeping, the scalar ``fp8_quantize_live``/
+``fp8_quantize_stochastic_live`` encode calls) is heavier than FP32's
+bare float write, so halving the number of PER-TILE setup/lookup
+operations (not just per-cell math) has a larger relative payoff here
+than it did for the lighter-weight FP32 kernel.
+
+**FP8/FP4 backward: rank-N generalization.** The FP8/FP4 backward ports
+below were initially scoped to ``scale_rank == 1``, matching FP32's own
+scope. Direct feedback caught a real gap this left open: ``scale_rank``
+is not fixed at construction for FP8/FP4 layers -- AQRS dynamic rank
+control (task #273/#285) can grow a layer's rank live during training --
+so a rank==1 gate meant any layer AQRS grew past rank 1 would silently
+stop getting the cross-tile speedup for as long as it stayed there, with
+no error, just quietly slower. FP32 was deliberately left unchanged
+(unlike FP8/FP4, it has no AQRS low-rank use case, so the gap doesn't
+apply there). Root-caused first that FORWARD's cross-tile pairing (all
+three precisions) already needed NO change at all: it reads the
+multiplicative scale via ``weights.get_scale(row, col)``, which already
+sums over every ``scale_rank`` component internally -- there was never a
+rank gate in forward to begin with. Only BACKWARD's
+``process_tile_pair_fp8``/``process_tile_pair_fp4`` needed the
+generalization, since updating each rank-``k`` component's own
+value_scale/output_scale via gradient descent requires the full
+per-``k`` accumulator machinery that the scalar rank==1 version didn't
+have. Both lambdas were rewritten to loop over ``k`` explicitly (plain
+scalar loops, not the SIMD/``scale_rank_scratch`` machinery
+``process_row_pair_fp8``/``process_row_pair_fp4`` use for their own
+rank-N support -- lower-risk given this is a correctness generalization,
+not a further speed push), re-mapping the row0/row1 role split those
+lambdas use to this lambda's tileA/tileB role split (``value_scale_k``
+becomes SHARED across both halves since they're the same row;
+``out_scale_k`` becomes PER-HALF since A and B are different columns;
+``mrow``/``mgamma`` fold across all 8 lanes into ONE accumulator per
+``k`` instead of two, since one row feeds both halves). FP4 additionally
+keeps its ``quant_floor`` zero-escape substitution in the ``prod_g``/
+``prod_contrib`` terms exactly as before, now inside the ``k`` loop. The
+``rank == 1`` gate was removed from both write-loop branches (FP32's
+stays -- it's still the deliberately-scoped case).
+
+Correctness gates: two NEW standalone tests,
+``test_disldo_block4_fp{8,4}_crosstile_backward_rank2_divergence.cpp``,
+mirroring the existing rank==1 striped tests but with ``scale_rank=2``
+and a real, nonzero, IDENTICAL-across-both-arms second rank channel
+(``set_value_scale_raw_k(row,1,...)``/``set_output_scale_raw_k(col,1,
+...)``) -- not just a default-zero rank-2 that would pass trivially.
+Assert forward, ``dx``, post-backward weights, AND the per-component
+``k=1`` ``value_scale``/``output_scale`` themselves (not just the summed
+``S``) all match to float precision. Both pass (err ~3e-6 float, exact
+0.0 on the per-component check). Full local suite (160/160) and both
+existing rank==1 gates still pass unmodified, on both this machine and
+arch-sandbox.
+
+Measured cost of the generalization (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 10 runs, rank==1 case only --
+this measures whether generality itself has a price, not a new
+precision): the rank-N version still beats the pre-cross-tile baseline
+by a real, fully consistent ~2.25x (median-of-medians 1882.0us before
+vs 837.6us after, 10/10 samples faster), but costs ~30% versus the
+earlier rank==1-SPECIALIZED version's 643.9us (the ``std::vector``
+scratch allocated per row for the ``k``-loop -- ``value_scale_k_row``,
+``out_scale_kA``/``out_scale_kB``, the ``mrow``/``mgamma``/``mcol``
+accumulators -- isn't free, even when ``rank==1`` makes each vector
+length 1). Judged worth it: the alternative is a real, un-flagged
+performance cliff the instant AQRS grows a layer's rank, which is a
+documented, active mechanism in this codebase, not a hypothetical.
+
+**FP4 backward production port.** Same structural approach as fp32/fp8's
+ports (``process_tile_pair_fp4`` mirroring ``process_tile_pair_fp8``'s
+shared/per-half role swap; scoped to ``scale_rank == 1``; falls back to
+the existing ``process_tile`` for solos and rank>1), with FP4's packed
+single-byte nibble decode/encode (``Block4Tile::slot_index``, weight in
+the low nibble / importance in the high, ``tdata[slot] = uint8_t((new_imp
+<< 4) | new_w)``) instead of FP8's two separate byte arrays. One
+FP4-specific detail carried over exactly from ``process_row_pair_fp4``:
+the gradient-accumulation terms feeding ``mrow``/``mgamma``/``mcol``
+(``prod_g``/``prod_contrib``) use ``quant_floor`` -- the raw quantized
+weight with a ``zero_escape_eps`` substitution at exactly zero, so a
+permanently-dead synapse still receives an importance gradient -- while
+``contrib``/``g_agg``/``mdx`` use the raw (unfloored) quantized value,
+matching FP32/FP8's equivalent terms. FP32/FP8 have no such split (no
+zero-escape substitution in either).
+
+Correctness gate: ``test_disldo_block4_fp4_crosstile_backward_
+divergence.cpp``, same striped-scattered-vs-block4 pattern as fp32/fp8's
+(both arms' importance round-tripped through the fp4 grid identically,
+learning the fp8 test's lesson about symmetric starting state) --
+forward/dx/post-backward weights all match to within fp4 quantization-
+noise tolerance (~2e-6). Full local C++ suite (160/160) and the existing
+dense fp4 backward regression test (``test_disldo_block4_fp4_backward_
+wide_simd.cpp``) both pass unmodified.
+
+Measured against the real kernel (interleaved remote A/B, striped,
+``n_in=n_out=256, batch=8, num_cpus=4``, 15 runs, before=commit
+``f2f68f8``): a real, large, and extremely consistent speedup --
+median-of-medians 1837.2us before vs 643.9us after (~2.85x faster),
+``after`` faster than ``before`` in all 15 of 15 interleaved samples
+(not overlapping noise bands like fp32/fp8 forward or fp32 backward).
+Root cause, unlike fp8 backward's more modest ~29%: FP4's EXISTING
+within-tile adjacent-row pairing path (``process_row_pair_fp4``, still
+used for every solo tile) is the rank-N-generic implementation --
+allocating several ``std::vector``\\ s (``value_scale_k_row0/1``,
+``mrow_local0/1_k`` and their ``_contrib`` counterparts) on the HEAP
+per call, twice per tile (once per adjacent-row pair) -- while the new
+``process_tile_pair_fp4`` is the same scalar, rank==1-specialized,
+entirely-stack-array design already used for FP32/FP8's cross-tile
+lambdas. So for FP4 specifically, cross-tile pairing doesn't just halve
+the number of per-tile setup/lookup operations (the fp8 backward
+finding) -- on the striped occupancy pattern tested here, it replaces
+the ONLY previously-available multi-row-fused path (the heap-allocating
+rank-N one) with a heap-free one, which is a substantially larger win.

@@ -120,6 +120,15 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         std::vector<uint32_t>& tile_bc = weights.block4.scratch_tile_bc;
         std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
         std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
+        // disldo_forward.fp32_block4_cross_tile_pairing: FP32-only, marks
+        // every SECOND tile of a same-br run (bk odd) as a "follower" --
+        // already consumed by its leader (ti-1) once the parallel loop
+        // below pairs two DIFFERENT tiles sharing a br. Computed for free
+        // during this same sequential collection walk (bk is already the
+        // per-row loop counter); unused (but harmlessly populated) for
+        // FP8/FP4, which share this collection loop but keep their
+        // existing per-tile (not cross-tile) processing.
+        std::vector<uint8_t>& tile_is_follower = weights.block4.scratch_tile_is_follower;
         const std::size_t n_b4 = weights.block4.n_tiles();
         // resize()+direct indexing, not reserve()+push_back(): push_back's
         // per-call capacity check is measured exclusive cost at this scale.
@@ -128,6 +137,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         tile_bc.resize(n_b4);
         tile_elem.resize(n_b4);
         tile_byte.resize(n_b4);
+        tile_is_follower.resize(n_b4);
         const auto& BL4 = weights.block4.block_layout;
         std::size_t ti = 0;
         for (std::size_t br = 0; br < BL4.rows; ++br) {
@@ -142,6 +152,7 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 tile_bc[ti] = bc_cursor.advance();
                 tile_elem[ti] = elem_pos;
                 tile_byte[ti] = byte_pos;
+                tile_is_follower[ti] = uint8_t(bk % 2 == 1);
                 byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
         }
@@ -160,92 +171,419 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
 #pragma omp for schedule(static)
             for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
-                const uint32_t br = tile_br[std::size_t(row_ti)], bc = tile_bc[std::size_t(row_ti)];
-                // const: routes .at() through the const overload (no dirty
-                // mark, forward is read-only). at_index() reuses the
-                // coordinates the collection loop above already resolved.
-                const auto tile = weights.block4.at_index(br, bc, tile_elem[std::size_t(row_ti)],
-                                                          tile_byte[std::size_t(row_ti)]);
-                // Resolved once per tile, not once per .at() call. See
-                // Block4TileHandle::raw_data().
-                const uint8_t* tdata = tile.raw_data();
-                // Decode via block4_vec_decode_fp4 (bit-shift), not
-                // FP4_TABLE[code] gathers -- and LJ is templated
-                // (compile-time constant), not a runtime loop, since GCC
-                // could not vectorize the runtime version at all. See
-                // disldo_forward.decode_bitshift_vs_table in
-                // docs/research/linear_disldo.rst for the measured
-                // rationale, including why the scalar-table result that
-                // helped backward's decode did NOT transfer here.
-                auto process_col = [&]<uint32_t LJ>() {
-                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + LJ;
-                    if (col >= n_out)
-                        return;
+                if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                    // disldo_forward.fp32_block4_cross_tile_pairing: pair
+                    // this tile (the "leader") with its consecutive
+                    // same-br partner if one exists (tile_is_follower[
+                    // row_ti+1], set by the collection loop above), instead
+                    // of always falling back to within-tile column pairing.
+                    // Forward is read-only, so unlike the backward port
+                    // below there's no live-handle-aliasing hazard from
+                    // holding two Block4TileHandle32 const handles at once.
+                    // Correctness and the real speedup (measured, not
+                    // assumed) were both validated first via a standalone
+                    // PoC -- see disldo_forward.fp32_block4_cross_tile_pairing
+                    // in docs/research/linear_disldo.rst and
+                    // tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp.
+                    if (tile_is_follower[std::size_t(row_ti)])
+                        continue; // already consumed by row_ti-1 as its partner.
+                    const uint32_t br = tile_br[std::size_t(row_ti)],
+                                   bcA = tile_bc[std::size_t(row_ti)];
+                    const auto tileA = weights.block4.at_index(
+                        br, bcA, tile_elem[std::size_t(row_ti)], tile_byte[std::size_t(row_ti)]);
+                    const uint8_t* tdataA = tileA.raw_data();
+                    const bool has_partner =
+                        (row_ti + 1 < n_tiles_local) && tile_is_follower[std::size_t(row_ti + 1)];
+                    if (has_partner) {
+                        const uint32_t bcB = tile_bc[std::size_t(row_ti + 1)];
+                        const auto tileB =
+                            weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
+                                                    tile_byte[std::size_t(row_ti + 1)]);
+                        const uint8_t* tdataB = tileB.raw_data();
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
+                            const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
+                            const bool haveA = colA < n_out;
+                            const bool haveB = colB < n_out;
+                            if (!haveA)
+                                continue;
 
-                    // FP8 dispatch: Block4Tile8 is a full byte/slot (no
-                    // nibble mask), decoded via E4M3. FP32 dispatch: no
-                    // decode at all -- Block4Tile32's weight half already
-                    // stores 4 raw, contiguous floats for slots
-                    // (0,LJ)..(3,LJ) (slot_index(li,LJ)=LJ*4+li), so a
-                    // single memcpy IS the load, matching block4_vec_load's
-                    // own "unaligned-safe load" idiom directly instead of
-                    // going through it via a reinterpret_cast<float*> of a
-                    // uint8_t* (that would form a typed pointer to
-                    // dereference indirectly -- this avoids it entirely by
-                    // memcpy'ing straight into the Block4Vec, exactly what
-                    // block4_vec_load's own body does).
-                    Block4Vec w_decoded;
-                    if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                        const Block4VecU w_codes = {
-                            uint32_t(tdata[Block4Tile8::slot_index(0, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(1, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(2, LJ)]),
-                            uint32_t(tdata[Block4Tile8::slot_index(3, LJ)])};
-                        w_decoded = block4_vec_decode_fp8(w_codes);
-                    } else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
-                        std::memcpy(&w_decoded,
-                                    tdata + sizeof(float) * Block4Tile32::slot_index(0, LJ),
-                                    sizeof(w_decoded));
-                    } else {
-                        const Block4VecU w_codes = {
-                            uint32_t(tdata[Block4Tile::slot_index(0, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(1, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(2, LJ)] & 0xFu),
-                            uint32_t(tdata[Block4Tile::slot_index(3, LJ)] & 0xFu)};
-                        w_decoded = block4_vec_decode_fp4(w_codes);
-                    }
-                    const value_type w_decoded_arr[BLOCK4_TILE] = {
-                        value_type(w_decoded[0]), value_type(w_decoded[1]),
-                        value_type(w_decoded[2]), value_type(w_decoded[3])};
+                            Block4Vec wA, wB = block4_vec_broadcast(0.0f);
+                            std::memcpy(&wA,
+                                        tdataA + sizeof(float) * Block4Tile32::slot_index(0, lj),
+                                        sizeof(wA));
+                            if (haveB)
+                                std::memcpy(
+                                    &wB, tdataB + sizeof(float) * Block4Tile32::slot_index(0, lj),
+                                    sizeof(wB));
+                            const Block8Vec w_decoded8 = block8_vec_from_lo_hi(wA, wB);
 
-                    value_type w4[BLOCK4_TILE];
-                    std::size_t row_idx[BLOCK4_TILE];
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                        if (row < n_in) {
-                            w4[li] =
-                                w_decoded_arr[li] * weights.get_scale(row, col); // rank-N scale
-                            row_idx[li] = row;
-                        } else {
-                            w4[li] = value_type(0);
-                            row_idx[li] = 0;
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, colA) : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? weights.get_scale(row, colB)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + colA] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (haveB)
+                                    mo[static_cast<std::size_t>(b) * n_out + colB] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
                         }
+                        continue;
                     }
+                    // solo: no partner tile in this br -- fall back to the
+                    // existing within-tile column pairing, unchanged math
+                    // (disldo_forward.fp32_block4_avx2_column_pairing).
+                    static_assert(BLOCK4_TILE == 4,
+                                  "column pairing below assumes exactly 4 columns (2 pairs)");
+                    const uint32_t bc = bcA;
+                    const uint8_t* tdata = tdataA;
+                    const uint32_t br_ = br;
+                    auto process_pair = [&, br_]<uint32_t LJ0>() {
+                        constexpr uint32_t LJ1 = LJ0 + 1;
+                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                        const bool have0 = col0 < n_out;
+                        const bool have1 =
+                            col1 < n_out; // have0==false implies have1==false (col1>col0)
+                        if (!have0)
+                            return;
 
-                    for (SIZE_TYPE b = 0; b < batch; ++b) {
-                        value_type acc = value_type(0);
-                        const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
-                            acc += w4[li] * in_row[row_idx[li]];
-                        mo[static_cast<std::size_t>(b) * n_out + col] += acc;
+                        Block8Vec w_decoded8;
+                        std::memcpy(&w_decoded8,
+                                    tdata + sizeof(float) * Block4Tile32::slot_index(0, LJ0),
+                                    sizeof(w_decoded8));
+
+                        std::size_t row_idx[BLOCK4_TILE];
+                        Block8Vec s8;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            row_idx[li] = row < n_in ? row : 0;
+                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                               : value_type(0);
+                        }
+                        const Block8Vec w8 = w_decoded8 * s8;
+
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type* in_row =
+                                input + static_cast<std::size_t>(b) * in_cols;
+                            Block8Vec in8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const value_type iv = in_row[row_idx[li]];
+                                in8[li] = iv;
+                                in8[li + 4] = iv;
+                            }
+                            const Block8Vec prod = w8 * in8;
+                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                prod[0] + prod[1] + prod[2] + prod[3];
+                            if (have1)
+                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                    prod[4] + prod[5] + prod[6] + prod[7];
+                        }
+                    };
+                    process_pair.template operator()<0>();
+                    process_pair.template operator()<2>();
+                    continue;
+                } else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                    // disldo_forward.fp8_block4_cross_tile_pairing: mirrors
+                    // FP32's cross-tile pairing above exactly (leader/
+                    // follower via tile_is_follower, pair-or-solo), except
+                    // the weight load is a real fp8 decode per half instead
+                    // of a raw float memcpy. See disldo_forward.
+                    // fp8_block4_avx2_column_pairing above for why the
+                    // per-column (not gather-then-decode) shape was kept.
+                    if (tile_is_follower[std::size_t(row_ti)])
+                        continue;
+                    const uint32_t br = tile_br[std::size_t(row_ti)],
+                                   bcA = tile_bc[std::size_t(row_ti)];
+                    const auto tileA = weights.block4.at_index(
+                        br, bcA, tile_elem[std::size_t(row_ti)], tile_byte[std::size_t(row_ti)]);
+                    const uint8_t* tdataA = tileA.raw_data();
+                    const bool has_partner =
+                        (row_ti + 1 < n_tiles_local) && tile_is_follower[std::size_t(row_ti + 1)];
+                    if (has_partner) {
+                        const uint32_t bcB = tile_bc[std::size_t(row_ti + 1)];
+                        const auto tileB =
+                            weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
+                                                    tile_byte[std::size_t(row_ti + 1)]);
+                        const uint8_t* tdataB = tileB.raw_data();
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
+                            const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
+                            const bool haveA = colA < n_out;
+                            const bool haveB = colB < n_out;
+                            if (!haveA)
+                                continue;
+                            const Block4VecU w_codesA = {
+                                uint32_t(tdataA[Block4Tile8::slot_index(0, lj)]),
+                                uint32_t(tdataA[Block4Tile8::slot_index(1, lj)]),
+                                uint32_t(tdataA[Block4Tile8::slot_index(2, lj)]),
+                                uint32_t(tdataA[Block4Tile8::slot_index(3, lj)])};
+                            const Block4Vec w_decodedA = block4_vec_decode_fp8(w_codesA);
+                            Block4Vec w_decodedB = block4_vec_broadcast(0.0f);
+                            if (haveB) {
+                                const Block4VecU w_codesB = {
+                                    uint32_t(tdataB[Block4Tile8::slot_index(0, lj)]),
+                                    uint32_t(tdataB[Block4Tile8::slot_index(1, lj)]),
+                                    uint32_t(tdataB[Block4Tile8::slot_index(2, lj)]),
+                                    uint32_t(tdataB[Block4Tile8::slot_index(3, lj)])};
+                                w_decodedB = block4_vec_decode_fp8(w_codesB);
+                            }
+                            const Block8Vec w_decoded8 =
+                                block8_vec_from_lo_hi(w_decodedA, w_decodedB);
+
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, colA) : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? weights.get_scale(row, colB)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + colA] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (haveB)
+                                    mo[static_cast<std::size_t>(b) * n_out + colB] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
+                        }
+                        continue;
                     }
-                };
-                process_col.template operator()<0>();
-                process_col.template operator()<1>();
-                process_col.template operator()<2>();
-                process_col.template operator()<3>();
-                static_assert(BLOCK4_TILE == 4,
-                              "process_col above is hand-unrolled for exactly 4 columns");
+                    // solo: fall back to the existing within-tile column
+                    // pairing, unchanged (disldo_forward.
+                    // fp8_block4_avx2_column_pairing).
+                    static_assert(BLOCK4_TILE == 4,
+                                  "column pairing below assumes exactly 4 columns (2 pairs)");
+                    const uint32_t bc = bcA;
+                    const uint8_t* tdata = tdataA;
+                    const uint32_t br_ = br;
+                    auto process_pair8 = [&, br_]<uint32_t LJ0>() {
+                        constexpr uint32_t LJ1 = LJ0 + 1;
+                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                        const bool have0 = col0 < n_out;
+                        const bool have1 = col1 < n_out; // have0==false implies have1==false
+                        if (!have0)
+                            return;
+
+                        const Block4VecU w_codes0 = {
+                            uint32_t(tdata[Block4Tile8::slot_index(0, LJ0)]),
+                            uint32_t(tdata[Block4Tile8::slot_index(1, LJ0)]),
+                            uint32_t(tdata[Block4Tile8::slot_index(2, LJ0)]),
+                            uint32_t(tdata[Block4Tile8::slot_index(3, LJ0)])};
+                        const Block4Vec w_decoded0 = block4_vec_decode_fp8(w_codes0);
+                        Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
+                        if (have1) {
+                            const Block4VecU w_codes1 = {
+                                uint32_t(tdata[Block4Tile8::slot_index(0, LJ1)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(1, LJ1)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(2, LJ1)]),
+                                uint32_t(tdata[Block4Tile8::slot_index(3, LJ1)])};
+                            w_decoded1 = block4_vec_decode_fp8(w_codes1);
+                        }
+                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+
+                        std::size_t row_idx[BLOCK4_TILE];
+                        Block8Vec s8;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            row_idx[li] = row < n_in ? row : 0;
+                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                               : value_type(0);
+                        }
+                        const Block8Vec w8 = w_decoded8 * s8;
+
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type* in_row =
+                                input + static_cast<std::size_t>(b) * in_cols;
+                            Block8Vec in8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const value_type iv = in_row[row_idx[li]];
+                                in8[li] = iv;
+                                in8[li + 4] = iv;
+                            }
+                            const Block8Vec prod = w8 * in8;
+                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                prod[0] + prod[1] + prod[2] + prod[3];
+                            if (have1)
+                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                    prod[4] + prod[5] + prod[6] + prod[7];
+                        }
+                    };
+                    process_pair8.template operator()<0>();
+                    process_pair8.template operator()<2>();
+                    continue;
+                } else {
+                    // disldo_forward.fp4_block4_cross_tile_pairing: same
+                    // shape as FP8's cross-tile branch above, FP4 decode
+                    // (block4_vec_decode_fp4, masked & 0xFu) instead.
+                    if (tile_is_follower[std::size_t(row_ti)])
+                        continue;
+                    const uint32_t br = tile_br[std::size_t(row_ti)],
+                                   bcA = tile_bc[std::size_t(row_ti)];
+                    const auto tileA = weights.block4.at_index(
+                        br, bcA, tile_elem[std::size_t(row_ti)], tile_byte[std::size_t(row_ti)]);
+                    const uint8_t* tdataA = tileA.raw_data();
+                    const bool has_partner =
+                        (row_ti + 1 < n_tiles_local) && tile_is_follower[std::size_t(row_ti + 1)];
+                    if (has_partner) {
+                        const uint32_t bcB = tile_bc[std::size_t(row_ti + 1)];
+                        const auto tileB =
+                            weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
+                                                    tile_byte[std::size_t(row_ti + 1)]);
+                        const uint8_t* tdataB = tileB.raw_data();
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
+                            const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
+                            const bool haveA = colA < n_out;
+                            const bool haveB = colB < n_out;
+                            if (!haveA)
+                                continue;
+                            const Block4VecU w_codesA = {
+                                uint32_t(tdataA[Block4Tile::slot_index(0, lj)] & 0xFu),
+                                uint32_t(tdataA[Block4Tile::slot_index(1, lj)] & 0xFu),
+                                uint32_t(tdataA[Block4Tile::slot_index(2, lj)] & 0xFu),
+                                uint32_t(tdataA[Block4Tile::slot_index(3, lj)] & 0xFu)};
+                            const Block4Vec w_decodedA = block4_vec_decode_fp4(w_codesA);
+                            Block4Vec w_decodedB = block4_vec_broadcast(0.0f);
+                            if (haveB) {
+                                const Block4VecU w_codesB = {
+                                    uint32_t(tdataB[Block4Tile::slot_index(0, lj)] & 0xFu),
+                                    uint32_t(tdataB[Block4Tile::slot_index(1, lj)] & 0xFu),
+                                    uint32_t(tdataB[Block4Tile::slot_index(2, lj)] & 0xFu),
+                                    uint32_t(tdataB[Block4Tile::slot_index(3, lj)] & 0xFu)};
+                                w_decodedB = block4_vec_decode_fp4(w_codesB);
+                            }
+                            const Block8Vec w_decoded8 =
+                                block8_vec_from_lo_hi(w_decodedA, w_decodedB);
+
+                            std::size_t row_idx[BLOCK4_TILE];
+                            Block8Vec s8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                row_idx[li] = row < n_in ? row : 0;
+                                s8[li] = row < n_in ? weights.get_scale(row, colA) : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? weights.get_scale(row, colB)
+                                                                   : value_type(0);
+                            }
+                            const Block8Vec w8 = w_decoded8 * s8;
+
+                            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                                const value_type* in_row =
+                                    input + static_cast<std::size_t>(b) * in_cols;
+                                Block8Vec in8;
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
+                                const Block8Vec prod = w8 * in8;
+                                mo[static_cast<std::size_t>(b) * n_out + colA] +=
+                                    prod[0] + prod[1] + prod[2] + prod[3];
+                                if (haveB)
+                                    mo[static_cast<std::size_t>(b) * n_out + colB] +=
+                                        prod[4] + prod[5] + prod[6] + prod[7];
+                            }
+                        }
+                        continue;
+                    }
+                    // solo: fall back to the existing within-tile column
+                    // pairing, unchanged (disldo_forward.
+                    // fp4_block4_avx2_column_pairing).
+                    static_assert(BLOCK4_TILE == 4,
+                                  "column pairing below assumes exactly 4 columns (2 pairs)");
+                    const uint32_t bc = bcA;
+                    const uint8_t* tdata = tdataA;
+                    const uint32_t br_ = br;
+                    auto process_pair4 = [&, br_]<uint32_t LJ0>() {
+                        constexpr uint32_t LJ1 = LJ0 + 1;
+                        const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                        const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                        const bool have0 = col0 < n_out;
+                        const bool have1 = col1 < n_out; // have0==false implies have1==false
+                        if (!have0)
+                            return;
+
+                        const Block4VecU w_codes0 = {
+                            uint32_t(tdata[Block4Tile::slot_index(0, LJ0)] & 0xFu),
+                            uint32_t(tdata[Block4Tile::slot_index(1, LJ0)] & 0xFu),
+                            uint32_t(tdata[Block4Tile::slot_index(2, LJ0)] & 0xFu),
+                            uint32_t(tdata[Block4Tile::slot_index(3, LJ0)] & 0xFu)};
+                        const Block4Vec w_decoded0 = block4_vec_decode_fp4(w_codes0);
+                        Block4Vec w_decoded1 = block4_vec_broadcast(0.0f);
+                        if (have1) {
+                            const Block4VecU w_codes1 = {
+                                uint32_t(tdata[Block4Tile::slot_index(0, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(1, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(2, LJ1)] & 0xFu),
+                                uint32_t(tdata[Block4Tile::slot_index(3, LJ1)] & 0xFu)};
+                            w_decoded1 = block4_vec_decode_fp4(w_codes1);
+                        }
+                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+
+                        std::size_t row_idx[BLOCK4_TILE];
+                        Block8Vec s8;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            row_idx[li] = row < n_in ? row : 0;
+                            s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? weights.get_scale(row, col1)
+                                                               : value_type(0);
+                        }
+                        const Block8Vec w8 = w_decoded8 * s8;
+
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type* in_row =
+                                input + static_cast<std::size_t>(b) * in_cols;
+                            Block8Vec in8;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const value_type iv = in_row[row_idx[li]];
+                                in8[li] = iv;
+                                in8[li + 4] = iv;
+                            }
+                            const Block8Vec prod = w8 * in8;
+                            mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                                prod[0] + prod[1] + prod[2] + prod[3];
+                            if (have1)
+                                mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                                    prod[4] + prod[5] + prod[6] + prod[7];
+                        }
+                    };
+                    process_pair4.template operator()<0>();
+                    process_pair4.template operator()<2>();
+                }
             }
         }
         for (int t = 0; t < num_cpus; ++t) {
@@ -946,6 +1284,806 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // learning_rate != 0.
                 auto process_tile = [&](uint32_t bc, uint8_t* tdata) -> bool {
                     bool tile_dirty = false;
+
+                    // AVX2 row-pairing (FP32 only): combines rows li0/li0+1
+                    // of the SAME tile into one 8-wide op instead of two
+                    // 4-wide ones -- the backward counterpart to
+                    // disldo_forward's column-pairing. Forward's existing
+                    // SIMD width already spans a COLUMN's 4 rows, so it
+                    // paired two columns; backward's existing SIMD width
+                    // spans a ROW's 4 columns instead, so this pairs two
+                    // rows. Scoped to the full-column-tile case only
+                    // (mirrors full_tile_cols32 below) -- a partial column
+                    // tile at the n_out edge falls back to the existing
+                    // per-row path unchanged, as does a dead partner row.
+                    // See disldo_backward.fp32_block4_avx2_row_pairing in
+                    // docs/research/linear_disldo.rst.
+                    auto process_row_pair_fp32 = [&](uint32_t li0, std::size_t row0,
+                                                     uint32_t nnz_row0, std::size_t row1,
+                                                     uint32_t nnz_row1) {
+                        const uint32_t li1 = li0 + 1;
+                        const value_type imp_scale0 = weights.get_importance_scale(row0);
+                        const value_type effective_lr0 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row0)
+                                           : learning_rate;
+                        const value_type imp_scale1 = weights.get_importance_scale(row1);
+                        const value_type effective_lr1 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row1)
+                                           : learning_rate;
+
+                        // Decode both rows' 4-wide column vectors. No single
+                        // contiguous load across rows -- Block4Tile32's
+                        // slot_index(li,lj)=lj*4+li means fixed-li,
+                        // varying-lj is a stride-4 gather -- same total
+                        // loads as two separate single-row passes; the win
+                        // is the 8-wide ARITHMETIC that follows.
+                        value_type w_decoded_arr8[2 * BLOCK4_TILE],
+                            imp_decoded_arr8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            std::memcpy(&w_decoded_arr8[lj],
+                                        tdata + sizeof(float) * Block4Tile32::slot_index(li0, lj),
+                                        sizeof(float));
+                            std::memcpy(&w_decoded_arr8[lj + BLOCK4_TILE],
+                                        tdata + sizeof(float) * Block4Tile32::slot_index(li1, lj),
+                                        sizeof(float));
+                            std::memcpy(&imp_decoded_arr8[lj],
+                                        tdata + sizeof(float) * (BLOCK4_TILE_SLOTS +
+                                                                 Block4Tile32::slot_index(li0, lj)),
+                                        sizeof(float));
+                            std::memcpy(&imp_decoded_arr8[lj + BLOCK4_TILE],
+                                        tdata + sizeof(float) * (BLOCK4_TILE_SLOTS +
+                                                                 Block4Tile32::slot_index(li1, lj)),
+                                        sizeof(float));
+                        }
+
+                        // Columns are shared between both rows (col only
+                        // depends on bc/lj, not li) -- computed once,
+                        // 4-wide, reused for both halves below.
+                        std::size_t col4[BLOCK4_TILE];
+                        value_type out_imp_scale4[BLOCK4_TILE];
+                        const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+                        const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+                        auto& srs = weights.scale_rank_scratch;
+                        const Flat2DView out_scale_k4{srs.out_scale_k.data() + tid_rank_tile,
+                                                      BLOCK4_TILE};
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            col4[lj] = std::size_t(bc) * BLOCK4_TILE + lj;
+                            out_imp_scale4[lj] = weights.get_output_importance_scale(col4[lj]);
+                            for (std::size_t k = 0; k < rank; ++k)
+                                out_scale_k4[k][lj] = weights.get_output_scale_k(col4[lj], k);
+                        }
+
+                        std::vector<value_type> value_scale_k_row0(rank), value_scale_k_row1(rank);
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            value_scale_k_row0[k] = weights.get_value_scale_k(row0, k);
+                            value_scale_k_row1[k] = weights.get_value_scale_k(row1, k);
+                        }
+
+                        value_type combined_scale8[2 * BLOCK4_TILE],
+                            combined_imp_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            combined_scale8[lj] = weights.get_scale(row0, col4[lj]);
+                            combined_scale8[lj + BLOCK4_TILE] = weights.get_scale(row1, col4[lj]);
+                            combined_imp_scale8[lj] = imp_scale0 * out_imp_scale4[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale1 * out_imp_scale4[lj];
+                        }
+                        value_type cw_orig8[2 * BLOCK4_TILE], cw8[2 * BLOCK4_TILE],
+                            ci8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            cw_orig8[i] = w_decoded_arr8[i];
+                            cw8[i] = cw_orig8[i];
+                            ci8[i] = imp_decoded_arr8[i] * combined_imp_scale8[i];
+                        }
+
+                        const Block8Vec cw_start_v = block8_vec_load(cw8);
+                        Block8Vec ci_v = block8_vec_load(ci8);
+                        const Block8Vec cw_orig_v = block8_vec_load(cw_orig8);
+                        const Block8Vec S_v = block8_vec_load(combined_scale8);
+
+                        value_type* mcol_acc = srs.mcol_acc_raw.data() + tid_rank_tile;
+                        value_type* mcol_acc_contrib =
+                            srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            block4_vec_store(mcol_acc + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                            block4_vec_store(mcol_acc_contrib + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                        }
+                        std::vector<double> mrow_local0_k(rank, 0.0), mrow_local1_k(rank, 0.0),
+                            mrow_local0_k_contrib(rank, 0.0), mrow_local1_k_contrib(rank, 0.0);
+                        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
+                        double* mgamma_local_k_contrib =
+                            srs.mgamma_local_k_contrib.data() + tid_rank;
+                        std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
+                        std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
+
+                        Block8Vec g_agg_v = block8_vec_broadcast(0.0f);
+                        Block8Vec contrib_agg_v = block8_vec_broadcast(0.0f);
+                        const bool training = (learning_rate != value_type(0));
+                        const std::size_t col_base = std::size_t(bc) * BLOCK4_TILE;
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv0 =
+                                input[static_cast<std::size_t>(b) * in_cols + row0];
+                            const value_type iv1 =
+                                input[static_cast<std::size_t>(b) * in_cols + row1];
+                            value_type* mdx_row0 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row0;
+                            value_type* mdx_row1 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row1;
+                            const Block4Vec dyv4 = block4_vec_load(
+                                output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+                            const Block8Vec dyv_v = block8_vec_dup4(dyv4);
+                            const Block8Vec iv_v = block8_vec_broadcast_pair(iv0, iv1);
+                            const Block8Vec g_v = dyv_v * iv_v;
+                            if (training) {
+                                const Block8Vec contrib_v = cw_start_v * S_v * iv_v;
+                                g_agg_v += g_v;
+                                contrib_agg_v += contrib_v;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const Block8Vec value_scale_k_v = block8_vec_broadcast_pair(
+                                        value_scale_k_row0[k], value_scale_k_row1[k]);
+                                    const Block8Vec out_scale_k_v =
+                                        block8_vec_dup4(block4_vec_load(out_scale_k4[k]));
+                                    const Block8Vec prod_g = cw_orig_v * out_scale_k_v * g_v;
+                                    mrow_local0_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_lo4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_hi4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_g));
+                                    const Block8Vec prod_contrib =
+                                        cw_orig_v * out_scale_k_v * contrib_v;
+                                    mrow_local0_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_lo4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_hi4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k_contrib[k] +=
+                                        static_cast<double>(block8_vec_hsum(
+                                            out_scale_k_v * value_scale_k_v * prod_contrib));
+                                    value_type* acc = mcol_acc + k * BLOCK4_TILE;
+                                    const Block8Vec term = cw_orig_v * value_scale_k_v * g_v *
+                                                           block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc,
+                                                     block4_vec_load(acc) + block8_vec_fold4(term));
+                                    value_type* acc_c = mcol_acc_contrib + k * BLOCK4_TILE;
+                                    const Block8Vec term_c = cw_orig_v * value_scale_k_v *
+                                                             contrib_v *
+                                                             block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc_c, block4_vec_load(acc_c) +
+                                                                block8_vec_fold4(term_c));
+                                }
+                            }
+                            const Block8Vec mdx_term = cw_start_v * S_v * dyv_v;
+                            *mdx_row0 += block4_vec_hsum(block8_vec_lo4(mdx_term));
+                            *mdx_row1 += block4_vec_hsum(block8_vec_hi4(mdx_term));
+                        }
+
+                        Block8Vec cw_v = cw_start_v;
+                        if (training) {
+                            // ci/cw update is genuinely per-(row,col) cell
+                            // (no shared/duplicated lanes to exploit here),
+                            // and no Block8Vec specialization of
+                            // SynapsePolicy exists -- split into the two
+                            // EXISTING Block4Vec-specialized calls. This is
+                            // a once-per-row-pair cost, not a per-batch
+                            // one, so it doesn't undo the batch loop's win.
+                            const Block4Vec g_agg_v0 = block8_vec_lo4(g_agg_v);
+                            const Block4Vec g_agg_v1 = block8_vec_hi4(g_agg_v);
+                            const Block4Vec contrib_agg_v0 = block8_vec_lo4(contrib_agg_v);
+                            const Block4Vec contrib_agg_v1 = block8_vec_hi4(contrib_agg_v);
+                            Block4Vec ci_v0 = block8_vec_lo4(ci_v);
+                            Block4Vec ci_v1 = block8_vec_hi4(ci_v);
+                            const Block4Vec S_v0 = block8_vec_lo4(S_v);
+                            const Block4Vec S_v1 = block8_vec_hi4(S_v);
+                            const Block4Vec effective_lr_v0 = block4_vec_broadcast(effective_lr0);
+                            const Block4Vec effective_lr_v1 = block4_vec_broadcast(effective_lr1);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v0, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v1, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            cw_v = block8_vec_from_lo_hi(block8_vec_lo4(cw_start_v) + delta_v0,
+                                                         block8_vec_hi4(cw_start_v) + delta_v1);
+                            ci_v = block8_vec_from_lo_hi(ci_v0, ci_v1);
+                        }
+                        block8_vec_store(cw8, cw_v);
+                        block8_vec_store(ci8, ci_v);
+
+                        if (training) {
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row0, k) += mrow_local0_k[k];
+                                mrow_at(row1, k) += mrow_local1_k[k];
+                                mrow_at_contrib(row0, k) += mrow_local0_k_contrib[k];
+                                mrow_at_contrib(row1, k) += mrow_local1_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += (mcol_acc + k * BLOCK4_TILE)[lj];
+                                    mcol_at_contrib(col4[lj], k) +=
+                                        (mcol_acc_contrib + k * BLOCK4_TILE)[lj];
+                                }
+                                const uint32_t slot0 = Block4Tile32::slot_index(li0, lj);
+                                const uint32_t slot1 = Block4Tile32::slot_index(li1, lj);
+                                const float new_w0 = cw8[lj];
+                                const float new_imp0 = ci8[lj] / combined_imp_scale8[lj];
+                                const float new_w1 = cw8[lj + BLOCK4_TILE];
+                                const float new_imp1 =
+                                    ci8[lj + BLOCK4_TILE] / combined_imp_scale8[lj + BLOCK4_TILE];
+                                std::memcpy(tdata + sizeof(float) * slot0, &new_w0, sizeof(new_w0));
+                                std::memcpy(tdata + sizeof(float) * (BLOCK4_TILE_SLOTS + slot0),
+                                            &new_imp0, sizeof(new_imp0));
+                                std::memcpy(tdata + sizeof(float) * slot1, &new_w1, sizeof(new_w1));
+                                std::memcpy(tdata + sizeof(float) * (BLOCK4_TILE_SLOTS + slot1),
+                                            &new_imp1, sizeof(new_imp1));
+                            }
+                            tile_dirty = true;
+                        }
+                    };
+
+                    // FP8 row-pairing: same shape as process_row_pair_fp32
+                    // above (see its own comment), ported with the three
+                    // real differences FP8's per-row branch has relative to
+                    // FP32's: (1) decode is already SCALAR in the existing
+                    // single-row code (fp8_decode_bits, not
+                    // block4_vec_decode_fp8) -- measured faster for
+                    // backward specifically (see
+                    // disldo_backward.fp8_simd_measured in
+                    // docs/research/linear_disldo.rst), so the pair version
+                    // keeps that same scalar decode, just 8 calls instead
+                    // of 4; (2) FP8 has real quantization, so cw/ci are
+                    // CODE-SPACE values needing was_live-gated
+                    // encode-on-write (FP32 has neither concern -- its cw
+                    // IS the true value, raw memcpy write, no quantization
+                    // floor to escape); (3) the encode step is the existing
+                    // StochasticRounding x was_live 4-way scalar dispatch,
+                    // called once per (row,col) cell -- 8 cells now instead
+                    // of 4, no SIMD encode to widen (matches the existing
+                    // single-row code's own scalar encode). See
+                    // disldo_backward.fp8_block4_avx2_row_pairing in
+                    // docs/research/linear_disldo.rst.
+                    auto process_row_pair_fp8 = [&](uint32_t li0, std::size_t row0,
+                                                    uint32_t nnz_row0, std::size_t row1,
+                                                    uint32_t nnz_row1) {
+                        const uint32_t li1 = li0 + 1;
+                        const value_type imp_scale0 = weights.get_importance_scale(row0);
+                        const value_type effective_lr0 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row0)
+                                           : learning_rate;
+                        const value_type imp_scale1 = weights.get_importance_scale(row1);
+                        const value_type effective_lr1 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row1)
+                                           : learning_rate;
+
+                        value_type w_decoded_arr8[2 * BLOCK4_TILE],
+                            imp_decoded_arr8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            w_decoded_arr8[lj] =
+                                fp8_decode_bits(tdata[Block4Tile8::slot_index(li0, lj)]);
+                            w_decoded_arr8[lj + BLOCK4_TILE] =
+                                fp8_decode_bits(tdata[Block4Tile8::slot_index(li1, lj)]);
+                            imp_decoded_arr8[lj] = fp8_decode_bits(
+                                tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li0, lj)]);
+                            imp_decoded_arr8[lj + BLOCK4_TILE] = fp8_decode_bits(
+                                tdata[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li1, lj)]);
+                        }
+
+                        std::size_t col4[BLOCK4_TILE];
+                        value_type out_imp_scale4[BLOCK4_TILE];
+                        const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+                        const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+                        auto& srs = weights.scale_rank_scratch;
+                        const Flat2DView out_scale_k4{srs.out_scale_k.data() + tid_rank_tile,
+                                                      BLOCK4_TILE};
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            col4[lj] = std::size_t(bc) * BLOCK4_TILE + lj;
+                            out_imp_scale4[lj] = weights.get_output_importance_scale(col4[lj]);
+                            for (std::size_t k = 0; k < rank; ++k)
+                                out_scale_k4[k][lj] = weights.get_output_scale_k(col4[lj], k);
+                        }
+
+                        std::vector<value_type> value_scale_k_row0(rank), value_scale_k_row1(rank);
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            value_scale_k_row0[k] = weights.get_value_scale_k(row0, k);
+                            value_scale_k_row1[k] = weights.get_value_scale_k(row1, k);
+                        }
+
+                        // was_live gate -- see was_live4_8's declaration
+                        // comment (single-row branch above) for the full
+                        // rationale: a cell that was never a real synapse
+                        // must stay allowed to round to 0.
+                        bool was_live8[2 * BLOCK4_TILE];
+                        value_type combined_scale8[2 * BLOCK4_TILE],
+                            combined_imp_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            was_live8[lj] = (w_decoded_arr8[lj] != value_type(0)) ||
+                                            (imp_decoded_arr8[lj] != value_type(0));
+                            was_live8[lj + BLOCK4_TILE] =
+                                (w_decoded_arr8[lj + BLOCK4_TILE] != value_type(0)) ||
+                                (imp_decoded_arr8[lj + BLOCK4_TILE] != value_type(0));
+                            combined_scale8[lj] = weights.get_scale(row0, col4[lj]);
+                            combined_scale8[lj + BLOCK4_TILE] = weights.get_scale(row1, col4[lj]);
+                            combined_imp_scale8[lj] = imp_scale0 * out_imp_scale4[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale1 * out_imp_scale4[lj];
+                        }
+                        value_type cw_orig8[2 * BLOCK4_TILE], cw8[2 * BLOCK4_TILE],
+                            ci8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            cw_orig8[i] = w_decoded_arr8[i];
+                            cw8[i] = cw_orig8[i];
+                            ci8[i] = imp_decoded_arr8[i] * combined_imp_scale8[i];
+                        }
+
+                        const Block8Vec cw_start_v = block8_vec_load(cw8);
+                        Block8Vec ci_v = block8_vec_load(ci8);
+                        const Block8Vec cw_orig_v = block8_vec_load(cw_orig8);
+                        const Block8Vec S_v = block8_vec_load(combined_scale8);
+
+                        value_type* mcol_acc = srs.mcol_acc_raw.data() + tid_rank_tile;
+                        value_type* mcol_acc_contrib =
+                            srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            block4_vec_store(mcol_acc + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                            block4_vec_store(mcol_acc_contrib + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                        }
+                        std::vector<double> mrow_local0_k(rank, 0.0), mrow_local1_k(rank, 0.0),
+                            mrow_local0_k_contrib(rank, 0.0), mrow_local1_k_contrib(rank, 0.0);
+                        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
+                        double* mgamma_local_k_contrib =
+                            srs.mgamma_local_k_contrib.data() + tid_rank;
+                        std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
+                        std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
+
+                        Block8Vec g_agg_v = block8_vec_broadcast(0.0f);
+                        Block8Vec contrib_agg_v = block8_vec_broadcast(0.0f);
+                        const bool training = (learning_rate != value_type(0));
+                        const std::size_t col_base = std::size_t(bc) * BLOCK4_TILE;
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv0 =
+                                input[static_cast<std::size_t>(b) * in_cols + row0];
+                            const value_type iv1 =
+                                input[static_cast<std::size_t>(b) * in_cols + row1];
+                            value_type* mdx_row0 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row0;
+                            value_type* mdx_row1 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row1;
+                            const Block4Vec dyv4 = block4_vec_load(
+                                output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+                            const Block8Vec dyv_v = block8_vec_dup4(dyv4);
+                            const Block8Vec iv_v = block8_vec_broadcast_pair(iv0, iv1);
+                            const Block8Vec g_v = dyv_v * iv_v;
+                            if (training) {
+                                const Block8Vec contrib_v = cw_start_v * S_v * iv_v;
+                                g_agg_v += g_v;
+                                contrib_agg_v += contrib_v;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const Block8Vec value_scale_k_v = block8_vec_broadcast_pair(
+                                        value_scale_k_row0[k], value_scale_k_row1[k]);
+                                    const Block8Vec out_scale_k_v =
+                                        block8_vec_dup4(block4_vec_load(out_scale_k4[k]));
+                                    const Block8Vec prod_g = cw_orig_v * out_scale_k_v * g_v;
+                                    mrow_local0_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_lo4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_hi4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_g));
+                                    const Block8Vec prod_contrib =
+                                        cw_orig_v * out_scale_k_v * contrib_v;
+                                    mrow_local0_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_lo4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_hi4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k_contrib[k] +=
+                                        static_cast<double>(block8_vec_hsum(
+                                            out_scale_k_v * value_scale_k_v * prod_contrib));
+                                    value_type* acc = mcol_acc + k * BLOCK4_TILE;
+                                    const Block8Vec term = cw_orig_v * value_scale_k_v * g_v *
+                                                           block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc,
+                                                     block4_vec_load(acc) + block8_vec_fold4(term));
+                                    value_type* acc_c = mcol_acc_contrib + k * BLOCK4_TILE;
+                                    const Block8Vec term_c = cw_orig_v * value_scale_k_v *
+                                                             contrib_v *
+                                                             block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc_c, block4_vec_load(acc_c) +
+                                                                block8_vec_fold4(term_c));
+                                }
+                            }
+                            const Block8Vec mdx_term = cw_start_v * S_v * dyv_v;
+                            *mdx_row0 += block4_vec_hsum(block8_vec_lo4(mdx_term));
+                            *mdx_row1 += block4_vec_hsum(block8_vec_hi4(mdx_term));
+                        }
+
+                        Block8Vec cw_v = cw_start_v;
+                        if (training) {
+                            const Block4Vec g_agg_v0 = block8_vec_lo4(g_agg_v);
+                            const Block4Vec g_agg_v1 = block8_vec_hi4(g_agg_v);
+                            const Block4Vec contrib_agg_v0 = block8_vec_lo4(contrib_agg_v);
+                            const Block4Vec contrib_agg_v1 = block8_vec_hi4(contrib_agg_v);
+                            Block4Vec ci_v0 = block8_vec_lo4(ci_v);
+                            Block4Vec ci_v1 = block8_vec_hi4(ci_v);
+                            const Block4Vec S_v0 = block8_vec_lo4(S_v);
+                            const Block4Vec S_v1 = block8_vec_hi4(S_v);
+                            const Block4Vec effective_lr_v0 = block4_vec_broadcast(effective_lr0);
+                            const Block4Vec effective_lr_v1 = block4_vec_broadcast(effective_lr1);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v0, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v1, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            cw_v = block8_vec_from_lo_hi(block8_vec_lo4(cw_start_v) + delta_v0,
+                                                         block8_vec_hi4(cw_start_v) + delta_v1);
+                            ci_v = block8_vec_from_lo_hi(ci_v0, ci_v1);
+                            block8_vec_store(cw8, cw_v);
+                            block8_vec_store(ci8, ci_v);
+
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row0, k) += mrow_local0_k[k];
+                                mrow_at(row1, k) += mrow_local1_k[k];
+                                mrow_at_contrib(row0, k) += mrow_local0_k_contrib[k];
+                                mrow_at_contrib(row1, k) += mrow_local1_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += (mcol_acc + k * BLOCK4_TILE)[lj];
+                                    mcol_at_contrib(col4[lj], k) +=
+                                        (mcol_acc_contrib + k * BLOCK4_TILE)[lj];
+                                }
+                                // Scalar encode, same StochasticRounding x
+                                // was_live 4-way dispatch as the single-row
+                                // branch above -- no SIMD encode to widen,
+                                // just twice as many scalar calls (one per
+                                // paired row).
+                                for (int half = 0; half < 2; ++half) {
+                                    const uint32_t li_h = half == 0 ? li0 : li1;
+                                    const uint32_t idx = half == 0 ? lj : lj + BLOCK4_TILE;
+                                    const uint32_t slot = Block4Tile8::slot_index(li_h, lj);
+                                    const value_type cw_val = cw8[idx];
+                                    const value_type ci_val = ci8[idx] / combined_imp_scale8[idx];
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[idx]) {
+                                            tdata[slot] = fp8_quantize_stochastic_live(cw_val);
+                                            tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                fp8_quantize_stochastic_live_nonneg(ci_val);
+                                        } else {
+                                            tdata[slot] = fp8_quantize_stochastic(cw_val);
+                                            tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                fp8_quantize_stochastic(ci_val);
+                                        }
+                                    } else {
+                                        if (was_live8[idx]) {
+                                            tdata[slot] = fp8_quantize_live(cw_val);
+                                            tdata[BLOCK4_TILE_SLOTS + slot] =
+                                                fp8_quantize_live(ci_val);
+                                        } else {
+                                            tdata[slot] = fp8_quantize(cw_val);
+                                            tdata[BLOCK4_TILE_SLOTS + slot] = fp8_quantize(ci_val);
+                                        }
+                                    }
+                                }
+                            }
+                            tile_dirty = true;
+                        }
+                    };
+
+                    // FP4 row-pairing: same shape as process_row_pair_fp8
+                    // above, with two real differences from FP4's existing
+                    // scalar single-row code (below, unchanged for the
+                    // non-paired case): (1) FP4BiPacked stores weight+
+                    // importance as TWO NIBBLES in ONE byte per slot, so
+                    // decode is one byte read + two FP4_TABLE lookups per
+                    // (li,lj), not two separate byte-array reads like FP8;
+                    // write-back is a single bit-OR pack
+                    // (uint8_t((new_imp<<4)|new_w)), not two tdata writes.
+                    // (2) FP4's gradient-accumulation terms (mrow/mcol/
+                    // mgamma) use quant_floor -- the stored quantized
+                    // weight with a zero_escape_eps substitution at exactly
+                    // quant==0, letting a currently-zero-weight cell still
+                    // get a real synaptogenesis growth signal -- where
+                    // FP8's has no such floor and uses cw_orig directly.
+                    // Both differences are read off the existing FP4
+                    // single-row code, not new design; only the 4-wide-vs-
+                    // 8-wide packing is new here. See
+                    // disldo_backward.fp4_block4_avx2_row_pairing in
+                    // docs/research/linear_disldo.rst.
+                    auto process_row_pair_fp4 = [&](uint32_t li0, std::size_t row0,
+                                                    uint32_t nnz_row0, std::size_t row1,
+                                                    uint32_t nnz_row1) {
+                        const uint32_t li1 = li0 + 1;
+                        const value_type imp_scale0 = weights.get_importance_scale(row0);
+                        const value_type effective_lr0 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row0)
+                                           : learning_rate;
+                        const value_type imp_scale1 = weights.get_importance_scale(row1);
+                        const value_type effective_lr1 =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row1)
+                                           : learning_rate;
+
+                        value_type w_decoded_arr8[2 * BLOCK4_TILE],
+                            imp_decoded_arr8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const uint8_t byte_a = tdata[Block4Tile::slot_index(li0, lj)];
+                            const uint8_t byte_b = tdata[Block4Tile::slot_index(li1, lj)];
+                            w_decoded_arr8[lj] = FP4_TABLE[byte_a & 0xFu];
+                            w_decoded_arr8[lj + BLOCK4_TILE] = FP4_TABLE[byte_b & 0xFu];
+                            imp_decoded_arr8[lj] = FP4_TABLE[(byte_a >> 4) & 0xFu];
+                            imp_decoded_arr8[lj + BLOCK4_TILE] = FP4_TABLE[(byte_b >> 4) & 0xFu];
+                        }
+
+                        std::size_t col4[BLOCK4_TILE];
+                        value_type out_imp_scale4[BLOCK4_TILE];
+                        const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+                        const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+                        auto& srs = weights.scale_rank_scratch;
+                        const Flat2DView out_scale_k4{srs.out_scale_k.data() + tid_rank_tile,
+                                                      BLOCK4_TILE};
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            col4[lj] = std::size_t(bc) * BLOCK4_TILE + lj;
+                            out_imp_scale4[lj] = weights.get_output_importance_scale(col4[lj]);
+                            for (std::size_t k = 0; k < rank; ++k)
+                                out_scale_k4[k][lj] = weights.get_output_scale_k(col4[lj], k);
+                        }
+
+                        std::vector<value_type> value_scale_k_row0(rank), value_scale_k_row1(rank);
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            value_scale_k_row0[k] = weights.get_value_scale_k(row0, k);
+                            value_scale_k_row1[k] = weights.get_value_scale_k(row1, k);
+                        }
+
+                        // was_live gate -- see was_live4's declaration
+                        // comment (single-row branch below) for the full
+                        // rationale.
+                        bool was_live8[2 * BLOCK4_TILE];
+                        value_type combined_scale8[2 * BLOCK4_TILE],
+                            combined_imp_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            was_live8[lj] = (w_decoded_arr8[lj] != value_type(0)) ||
+                                            (imp_decoded_arr8[lj] != value_type(0));
+                            was_live8[lj + BLOCK4_TILE] =
+                                (w_decoded_arr8[lj + BLOCK4_TILE] != value_type(0)) ||
+                                (imp_decoded_arr8[lj + BLOCK4_TILE] != value_type(0));
+                            combined_scale8[lj] = weights.get_scale(row0, col4[lj]);
+                            combined_scale8[lj + BLOCK4_TILE] = weights.get_scale(row1, col4[lj]);
+                            combined_imp_scale8[lj] = imp_scale0 * out_imp_scale4[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale1 * out_imp_scale4[lj];
+                        }
+                        value_type quant8[2 * BLOCK4_TILE], ci8[2 * BLOCK4_TILE],
+                            quant_floor8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            quant8[i] = w_decoded_arr8[i];
+                            ci8[i] = imp_decoded_arr8[i] * combined_imp_scale8[i];
+                            // quant_floor: signed quant, except at quant==0
+                            // where zero_escape_eps substitutes -- see
+                            // disldo_backward.deferred_vs_direct_quant in
+                            // docs/research/linear_disldo.rst (same
+                            // mechanism as the single-row branch's
+                            // quant_floor_v below).
+                            quant_floor8[i] =
+                                (quant8[i] == value_type(0)) ? zero_escape_eps : quant8[i];
+                        }
+
+                        const Block8Vec quant_start_v = block8_vec_load(quant8);
+                        Block8Vec ci_v = block8_vec_load(ci8);
+                        const Block8Vec quant_floor_v = block8_vec_load(quant_floor8);
+                        const Block8Vec S_v = block8_vec_load(combined_scale8);
+
+                        value_type* mcol_acc = srs.mcol_acc_raw.data() + tid_rank_tile;
+                        value_type* mcol_acc_contrib =
+                            srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
+                        for (std::size_t k = 0; k < rank; ++k) {
+                            block4_vec_store(mcol_acc + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                            block4_vec_store(mcol_acc_contrib + k * BLOCK4_TILE,
+                                             block4_vec_broadcast(0.0f));
+                        }
+                        std::vector<double> mrow_local0_k(rank, 0.0), mrow_local1_k(rank, 0.0),
+                            mrow_local0_k_contrib(rank, 0.0), mrow_local1_k_contrib(rank, 0.0);
+                        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
+                        double* mgamma_local_k_contrib =
+                            srs.mgamma_local_k_contrib.data() + tid_rank;
+                        std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
+                        std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
+
+                        Block8Vec g_agg_v = block8_vec_broadcast(0.0f);
+                        Block8Vec contrib_agg_v = block8_vec_broadcast(0.0f);
+                        const bool training = (learning_rate != value_type(0));
+                        const std::size_t col_base = std::size_t(bc) * BLOCK4_TILE;
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv0 =
+                                input[static_cast<std::size_t>(b) * in_cols + row0];
+                            const value_type iv1 =
+                                input[static_cast<std::size_t>(b) * in_cols + row1];
+                            value_type* mdx_row0 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row0;
+                            value_type* mdx_row1 =
+                                mdx + static_cast<std::size_t>(b) * in_cols + row1;
+                            const Block4Vec dyv4 = block4_vec_load(
+                                output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+                            const Block8Vec dyv_v = block8_vec_dup4(dyv4);
+                            const Block8Vec iv_v = block8_vec_broadcast_pair(iv0, iv1);
+                            const Block8Vec g_v = dyv_v * iv_v;
+                            if (training) {
+                                const Block8Vec contrib_v = quant_start_v * S_v * iv_v;
+                                g_agg_v += g_v;
+                                contrib_agg_v += contrib_v;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const Block8Vec value_scale_k_v = block8_vec_broadcast_pair(
+                                        value_scale_k_row0[k], value_scale_k_row1[k]);
+                                    const Block8Vec out_scale_k_v =
+                                        block8_vec_dup4(block4_vec_load(out_scale_k4[k]));
+                                    const Block8Vec prod_g = quant_floor_v * out_scale_k_v * g_v;
+                                    mrow_local0_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_lo4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k[k] += static_cast<double>(block4_vec_hsum(
+                                                            block8_vec_hi4(prod_g))) *
+                                                        static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_g));
+                                    const Block8Vec prod_contrib =
+                                        quant_floor_v * out_scale_k_v * contrib_v;
+                                    mrow_local0_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_lo4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mrow_local1_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                                    block8_vec_hi4(prod_contrib))) *
+                                                                static_cast<double>(gamma_k_arr[k]);
+                                    mgamma_local_k_contrib[k] +=
+                                        static_cast<double>(block8_vec_hsum(
+                                            out_scale_k_v * value_scale_k_v * prod_contrib));
+                                    value_type* acc = mcol_acc + k * BLOCK4_TILE;
+                                    const Block8Vec term = quant_floor_v * value_scale_k_v * g_v *
+                                                           block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc,
+                                                     block4_vec_load(acc) + block8_vec_fold4(term));
+                                    value_type* acc_c = mcol_acc_contrib + k * BLOCK4_TILE;
+                                    const Block8Vec term_c = quant_floor_v * value_scale_k_v *
+                                                             contrib_v *
+                                                             block8_vec_broadcast(gamma_k_arr[k]);
+                                    block4_vec_store(acc_c, block4_vec_load(acc_c) +
+                                                                block8_vec_fold4(term_c));
+                                }
+                            }
+                            const Block8Vec mdx_term = quant_start_v * S_v * dyv_v;
+                            *mdx_row0 += block4_vec_hsum(block8_vec_lo4(mdx_term));
+                            *mdx_row1 += block4_vec_hsum(block8_vec_hi4(mdx_term));
+                        }
+
+                        Block8Vec quant_v = quant_start_v;
+                        if (training) {
+                            const Block4Vec g_agg_v0 = block8_vec_lo4(g_agg_v);
+                            const Block4Vec g_agg_v1 = block8_vec_hi4(g_agg_v);
+                            const Block4Vec contrib_agg_v0 = block8_vec_lo4(contrib_agg_v);
+                            const Block4Vec contrib_agg_v1 = block8_vec_hi4(contrib_agg_v);
+                            Block4Vec ci_v0 = block8_vec_lo4(ci_v);
+                            Block4Vec ci_v1 = block8_vec_hi4(ci_v);
+                            const Block4Vec S_v0 = block8_vec_lo4(S_v);
+                            const Block4Vec S_v1 = block8_vec_hi4(S_v);
+                            const Block4Vec effective_lr_v0 = block4_vec_broadcast(effective_lr0);
+                            const Block4Vec effective_lr_v1 = block4_vec_broadcast(effective_lr1);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v0, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v1, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            quant_v =
+                                block8_vec_from_lo_hi(block8_vec_lo4(quant_start_v) + delta_v0,
+                                                      block8_vec_hi4(quant_start_v) + delta_v1);
+                            ci_v = block8_vec_from_lo_hi(ci_v0, ci_v1);
+                            block8_vec_store(quant8, quant_v);
+                            block8_vec_store(ci8, ci_v);
+
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row0, k) += mrow_local0_k[k];
+                                mrow_at(row1, k) += mrow_local1_k[k];
+                                mrow_at_contrib(row0, k) += mrow_local0_k_contrib[k];
+                                mrow_at_contrib(row1, k) += mrow_local1_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    mcol_at(col4[lj], k) += (mcol_acc + k * BLOCK4_TILE)[lj];
+                                    mcol_at_contrib(col4[lj], k) +=
+                                        (mcol_acc_contrib + k * BLOCK4_TILE)[lj];
+                                }
+                                // Bit-OR pack write-back -- BiPacked stores
+                                // both nibbles in ONE byte, unlike FP8's two
+                                // separate byte arrays. StochasticRounding x
+                                // was_live dispatch matches the single-row
+                                // branch's deterministic path exactly (no
+                                // SIMD encode to widen, twice as many
+                                // scalar quantize calls -- one per paired
+                                // row, same reasoning as FP8's pair lambda).
+                                for (int half = 0; half < 2; ++half) {
+                                    const uint32_t li_h = half == 0 ? li0 : li1;
+                                    const uint32_t idx = half == 0 ? lj : lj + BLOCK4_TILE;
+                                    const uint32_t slot = Block4Tile::slot_index(li_h, lj);
+                                    const value_type quant_val = quant8[idx];
+                                    const value_type imp_ratio =
+                                        ci8[idx] / combined_imp_scale8[idx];
+                                    uint8_t new_w, new_imp;
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[idx]) {
+                                            new_w = fp4_quantize_stochastic_live(quant_val);
+                                            new_imp =
+                                                fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize_stochastic(quant_val);
+                                            new_imp = fp4_quantize_stochastic(imp_ratio);
+                                        }
+                                    } else {
+                                        if (was_live8[idx]) {
+                                            new_w = fp4_quantize_live(quant_val);
+                                            new_imp = fp4_quantize_live(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize(quant_val);
+                                            new_imp = fp4_quantize(imp_ratio);
+                                        }
+                                    }
+                                    tdata[slot] = uint8_t((new_imp << 4) | new_w);
+                                }
+                            }
+                            tile_dirty = true;
+                        }
+                    };
+
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                         if (row >= n_in)
@@ -953,6 +2091,31 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         const uint32_t nnz_row = row_live_count[row];
                         if (nnz_row == 0)
                             continue;
+
+                        if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>> ||
+                                      std::is_same_v<VALUES_TYPE, FP8BiValues> ||
+                                      std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+                            if ((li % 2) == 0) {
+                                const std::size_t row1 = row + 1;
+                                const std::size_t col_base_pair = std::size_t(bc) * BLOCK4_TILE;
+                                if (row1 < n_in && (col_base_pair + BLOCK4_TILE <= n_out)) {
+                                    const uint32_t nnz_row1 = row_live_count[row1];
+                                    if (nnz_row1 > 0) {
+                                        if constexpr (std::is_same_v<VALUES_TYPE,
+                                                                     DeltaCSRBiValues<float>>)
+                                            process_row_pair_fp32(li, row, nnz_row, row1, nnz_row1);
+                                        else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>)
+                                            process_row_pair_fp8(li, row, nnz_row, row1, nnz_row1);
+                                        else
+                                            process_row_pair_fp4(li, row, nnz_row, row1, nnz_row1);
+                                        ++li; // consumes li+1 too -- for's own ++li then makes
+                                              // the net advance +2, safely skipping li+1
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         const value_type val_scale = weights.get_value_scale(row);
                         const value_type imp_scale = weights.get_importance_scale(row);
                         const value_type effective_lr =
@@ -2497,6 +3660,802 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     return tile_dirty;
                 }; // closes process_tile
 
+                // disldo_backward.fp32_block4_cross_tile_pairing: pairs TWO
+                // DIFFERENT tiles (bcA, bcB) sharing this br into one 8-wide
+                // op per row li, the mirror image of process_row_pair_fp32
+                // above (which pairs two ROWS of the SAME tile). Row-level
+                // quantities (imp_scale, effective_lr, value_scale_k) are
+                // SHARED; column-level quantities (col, out_imp_scale,
+                // out_scale_k, dy) are PER-HALF; mdx folds both tiles'
+                // contributions into ONE row entry (like a normal single-
+                // tile row, not split like row-pairing's mdx_row0/row1);
+                // mgamma folds across both halves too; mcol stays per-half
+                // (2 separate sets of 4, written directly by lane -- no fold
+                // needed, since each of the 8 lanes already IS a distinct
+                // column). FP32-only, and only rank==1 (this mirrors the
+                // validated PoC's own scope -- see
+                // disldo_forward.fp32_block4_cross_tile_pairing in
+                // docs/research/linear_disldo.rst and
+                // tests/unit/test_disldo_block4_fp32_crosstile_backward.cpp
+                // -- rank>1/AQRS layers fall back to the existing per-tile
+                // process_tile path, unchanged, below). Takes BOTH tiles'
+                // scratch buffers as already-unpacked local arrays (RowWork-
+                // space's own design), so unlike the standalone PoC (which
+                // had to work around holding two LIVE at_index() handles at
+                // once) there is no live-handle-aliasing hazard here at all.
+                auto process_tile_pair_fp32 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
+                                                  uint8_t* tdataB) -> std::pair<bool, bool> {
+                    bool dirtyA = false, dirtyB = false;
+                    const std::size_t col_baseA = std::size_t(bcA) * BLOCK4_TILE;
+                    const std::size_t col_baseB = std::size_t(bcB) * BLOCK4_TILE;
+                    const bool training = (learning_rate != value_type(0));
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        if (row >= n_in)
+                            continue;
+                        const uint32_t nnz_row = row_live_count[row];
+                        if (nnz_row == 0)
+                            continue;
+                        const value_type imp_scale = weights.get_importance_scale(row);
+                        const value_type effective_lr =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
+                                           : learning_rate;
+                        const value_type value_scale_k_row = weights.get_value_scale_k(row, 0);
+
+                        std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
+                        value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
+                        value_type out_scale_kA[BLOCK4_TILE], out_scale_kB[BLOCK4_TILE];
+                        value_type combined_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            colA[lj] = col_baseA + lj;
+                            colB[lj] = col_baseB + lj;
+                            const bool haveA = colA[lj] < n_out;
+                            const bool haveB = colB[lj] < n_out;
+                            out_imp_scaleA[lj] = haveA
+                                                     ? weights.get_output_importance_scale(colA[lj])
+                                                     : value_type(0);
+                            out_imp_scaleB[lj] = haveB
+                                                     ? weights.get_output_importance_scale(colB[lj])
+                                                     : value_type(0);
+                            out_scale_kA[lj] =
+                                haveA ? weights.get_output_scale_k(colA[lj], 0) : value_type(0);
+                            out_scale_kB[lj] =
+                                haveB ? weights.get_output_scale_k(colB[lj], 0) : value_type(0);
+                            combined_scale8[lj] =
+                                haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
+                            combined_scale8[lj + BLOCK4_TILE] =
+                                haveB ? weights.get_scale(row, colB[lj]) : value_type(0);
+                        }
+
+                        value_type w_decoded8[2 * BLOCK4_TILE], imp_decoded8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            std::memcpy(&w_decoded8[lj],
+                                        tdataA + sizeof(float) * Block4Tile32::slot_index(li, lj),
+                                        sizeof(float));
+                            std::memcpy(&w_decoded8[lj + BLOCK4_TILE],
+                                        tdataB + sizeof(float) * Block4Tile32::slot_index(li, lj),
+                                        sizeof(float));
+                            std::memcpy(&imp_decoded8[lj],
+                                        tdataA + sizeof(float) * (BLOCK4_TILE_SLOTS +
+                                                                  Block4Tile32::slot_index(li, lj)),
+                                        sizeof(float));
+                            std::memcpy(&imp_decoded8[lj + BLOCK4_TILE],
+                                        tdataB + sizeof(float) * (BLOCK4_TILE_SLOTS +
+                                                                  Block4Tile32::slot_index(li, lj)),
+                                        sizeof(float));
+                        }
+
+                        value_type combined_imp_scale8[2 * BLOCK4_TILE];
+                        value_type cw_orig8[2 * BLOCK4_TILE], cw8[2 * BLOCK4_TILE],
+                            ci8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            combined_imp_scale8[lj] = imp_scale * out_imp_scaleA[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale * out_imp_scaleB[lj];
+                        }
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            cw_orig8[i] = w_decoded8[i];
+                            cw8[i] = cw_orig8[i];
+                            ci8[i] = imp_decoded8[i] * combined_imp_scale8[i];
+                        }
+
+                        double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
+                        double mrow_local = 0.0, mrow_local_contrib = 0.0, mgamma_local = 0.0,
+                               mgamma_local_contrib = 0.0;
+                        value_type mcol_local8[2 * BLOCK4_TILE] = {0},
+                                                   mcol_local_contrib8[2 * BLOCK4_TILE] = {0};
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv =
+                                input[static_cast<std::size_t>(b) * in_cols + row];
+                            value_type dyv8[2 * BLOCK4_TILE];
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                dyv8[lj] = colA[lj] < n_out
+                                               ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                             colA[lj]]
+                                               : value_type(0);
+                                dyv8[lj + BLOCK4_TILE] =
+                                    colB[lj] < n_out
+                                        ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                      colB[lj]]
+                                        : value_type(0);
+                            }
+                            value_type mdx_term = value_type(0);
+                            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                                const value_type g = dyv8[i] * iv;
+                                mdx_term += cw_orig8[i] * combined_scale8[i] * dyv8[i];
+                                if (!training)
+                                    continue;
+                                const value_type contrib = cw_orig8[i] * combined_scale8[i] * iv;
+                                g_agg8[i] += g;
+                                contrib_agg8[i] += contrib;
+                                const value_type out_scale_k_i =
+                                    i < BLOCK4_TILE ? out_scale_kA[i]
+                                                    : out_scale_kB[i - BLOCK4_TILE];
+                                const value_type prod_g = cw_orig8[i] * out_scale_k_i * g;
+                                const value_type prod_contrib =
+                                    cw_orig8[i] * out_scale_k_i * contrib;
+                                mrow_local += static_cast<double>(prod_g) * gamma_k_arr[0];
+                                mrow_local_contrib +=
+                                    static_cast<double>(prod_contrib) * gamma_k_arr[0];
+                                mgamma_local +=
+                                    static_cast<double>(out_scale_k_i * value_scale_k_row * prod_g);
+                                mgamma_local_contrib += static_cast<double>(
+                                    out_scale_k_i * value_scale_k_row * prod_contrib);
+                                mcol_local8[i] +=
+                                    cw_orig8[i] * value_scale_k_row * g * gamma_k_arr[0];
+                                mcol_local_contrib8[i] +=
+                                    cw_orig8[i] * value_scale_k_row * contrib * gamma_k_arr[0];
+                            }
+                            mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+                        }
+
+                        if (training) {
+                            mrow_at(row, 0) += mrow_local;
+                            mrow_at_contrib(row, 0) += mrow_local_contrib;
+                            mgamma_at(0) += static_cast<value_type>(mgamma_local);
+                            mgamma_at_contrib(0) += static_cast<value_type>(mgamma_local_contrib);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    mcol_at(colA[lj], 0) += mcol_local8[lj];
+                                    mcol_at_contrib(colA[lj], 0) += mcol_local_contrib8[lj];
+                                }
+                                if (colB[lj] < n_out) {
+                                    mcol_at(colB[lj], 0) += mcol_local8[lj + BLOCK4_TILE];
+                                    mcol_at_contrib(colB[lj], 0) +=
+                                        mcol_local_contrib8[lj + BLOCK4_TILE];
+                                }
+                            }
+                            // No Block8Vec specialization of SynapsePolicy
+                            // exists (mirrors process_row_pair_fp32's own
+                            // rationale) -- split into two 4-wide
+                            // Block4Vec-specialized calls.
+                            Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
+                                ci_v1, S_v0, S_v1;
+                            for (uint32_t i = 0; i < BLOCK4_TILE; ++i) {
+                                g_agg_v0[i] = static_cast<value_type>(g_agg8[i]);
+                                g_agg_v1[i] = static_cast<value_type>(g_agg8[i + BLOCK4_TILE]);
+                                contrib_agg_v0[i] = static_cast<value_type>(contrib_agg8[i]);
+                                contrib_agg_v1[i] =
+                                    static_cast<value_type>(contrib_agg8[i + BLOCK4_TILE]);
+                                ci_v0[i] = ci8[i];
+                                ci_v1[i] = ci8[i + BLOCK4_TILE];
+                                S_v0[i] = combined_scale8[i];
+                                S_v1[i] = combined_scale8[i + BLOCK4_TILE];
+                            }
+                            const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                cw8[lj] += delta_v0[lj];
+                                cw8[lj + BLOCK4_TILE] += delta_v1[lj];
+                                ci8[lj] = ci_v0[lj];
+                                ci8[lj + BLOCK4_TILE] = ci_v1[lj];
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    const float new_w = cw8[lj];
+                                    const float new_imp = ci8[lj] / combined_imp_scale8[lj];
+                                    const uint32_t slotA = Block4Tile32::slot_index(li, lj);
+                                    std::memcpy(tdataA + sizeof(float) * slotA, &new_w,
+                                                sizeof(new_w));
+                                    std::memcpy(tdataA +
+                                                    sizeof(float) * (BLOCK4_TILE_SLOTS + slotA),
+                                                &new_imp, sizeof(new_imp));
+                                    dirtyA = true;
+                                }
+                                if (colB[lj] < n_out) {
+                                    const float new_w = cw8[lj + BLOCK4_TILE];
+                                    const float new_imp = ci8[lj + BLOCK4_TILE] /
+                                                          combined_imp_scale8[lj + BLOCK4_TILE];
+                                    const uint32_t slotB = Block4Tile32::slot_index(li, lj);
+                                    std::memcpy(tdataB + sizeof(float) * slotB, &new_w,
+                                                sizeof(new_w));
+                                    std::memcpy(tdataB +
+                                                    sizeof(float) * (BLOCK4_TILE_SLOTS + slotB),
+                                                &new_imp, sizeof(new_imp));
+                                    dirtyB = true;
+                                }
+                            }
+                        }
+                    } // closes for (li...)
+                    return {dirtyA, dirtyB};
+                }; // closes process_tile_pair_fp32
+
+                // disldo_backward.fp8_block4_cross_tile_pairing: same
+                // cross-tile axis as process_tile_pair_fp32 above (shared
+                // row-level quantities, per-half column-level quantities,
+                // mdx/mrow/mgamma fold across both halves, mcol per-half),
+                // but with a real fp8 decode/encode step per cell (mirrors
+                // process_row_pair_fp8's own decode/encode, including its
+                // was_live8 zero-escape gate) instead of FP32's raw float
+                // memcpy. Rank-N generic (unlike FP32, which stays rank==1
+                // only -- FP32 has no AQRS low-rank use case): the k-loop
+                // mirrors process_row_pair_fp8's rank-N math exactly, just
+                // re-mapped from a row0/row1 role split to this lambda's
+                // tileA/tileB role split. combined_scale (S) itself needs no
+                // k-loop -- weights.get_scale() already sums over all rank
+                // components internally, same as the single-tile path.
+                auto process_tile_pair_fp8 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
+                                                 uint8_t* tdataB) -> std::pair<bool, bool> {
+                    bool dirtyA = false, dirtyB = false;
+                    const std::size_t col_baseA = std::size_t(bcA) * BLOCK4_TILE;
+                    const std::size_t col_baseB = std::size_t(bcB) * BLOCK4_TILE;
+                    const bool training = (learning_rate != value_type(0));
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        if (row >= n_in)
+                            continue;
+                        const uint32_t nnz_row = row_live_count[row];
+                        if (nnz_row == 0)
+                            continue;
+                        const value_type imp_scale = weights.get_importance_scale(row);
+                        const value_type effective_lr =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
+                                           : learning_rate;
+                        // Shared across both halves (same row) -- the
+                        // cross-tile analog of process_row_pair_fp8's
+                        // value_scale_k_row0/row1 (there it differs per
+                        // row; here it's identical for A and B).
+                        std::vector<value_type> value_scale_k_row(rank);
+                        for (std::size_t k = 0; k < rank; ++k)
+                            value_scale_k_row[k] = weights.get_value_scale_k(row, k);
+
+                        std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
+                        value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
+                        // Per-half, per-k -- the cross-tile analog of
+                        // process_row_pair_fp8's out_scale_k4 (there it's
+                        // shared between rows since they share columns;
+                        // here A and B are DIFFERENT columns).
+                        std::vector<value_type> out_scale_kA(rank * BLOCK4_TILE),
+                            out_scale_kB(rank * BLOCK4_TILE);
+                        value_type combined_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            colA[lj] = col_baseA + lj;
+                            colB[lj] = col_baseB + lj;
+                            const bool haveA = colA[lj] < n_out;
+                            const bool haveB = colB[lj] < n_out;
+                            out_imp_scaleA[lj] = haveA
+                                                     ? weights.get_output_importance_scale(colA[lj])
+                                                     : value_type(0);
+                            out_imp_scaleB[lj] = haveB
+                                                     ? weights.get_output_importance_scale(colB[lj])
+                                                     : value_type(0);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                out_scale_kA[k * BLOCK4_TILE + lj] =
+                                    haveA ? weights.get_output_scale_k(colA[lj], k) : value_type(0);
+                                out_scale_kB[k * BLOCK4_TILE + lj] =
+                                    haveB ? weights.get_output_scale_k(colB[lj], k) : value_type(0);
+                            }
+                            combined_scale8[lj] =
+                                haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
+                            combined_scale8[lj + BLOCK4_TILE] =
+                                haveB ? weights.get_scale(row, colB[lj]) : value_type(0);
+                        }
+
+                        value_type w_decoded8[2 * BLOCK4_TILE], imp_decoded8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            w_decoded8[lj] =
+                                fp8_decode_bits(tdataA[Block4Tile8::slot_index(li, lj)]);
+                            w_decoded8[lj + BLOCK4_TILE] =
+                                fp8_decode_bits(tdataB[Block4Tile8::slot_index(li, lj)]);
+                            imp_decoded8[lj] = fp8_decode_bits(
+                                tdataA[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]);
+                            imp_decoded8[lj + BLOCK4_TILE] = fp8_decode_bits(
+                                tdataB[BLOCK4_TILE_SLOTS + Block4Tile8::slot_index(li, lj)]);
+                        }
+                        bool was_live8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i)
+                            was_live8[i] = (w_decoded8[i] != value_type(0)) ||
+                                           (imp_decoded8[i] != value_type(0));
+
+                        value_type combined_imp_scale8[2 * BLOCK4_TILE];
+                        value_type cw_orig8[2 * BLOCK4_TILE], cw8[2 * BLOCK4_TILE],
+                            ci8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            combined_imp_scale8[lj] = imp_scale * out_imp_scaleA[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale * out_imp_scaleB[lj];
+                        }
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            cw_orig8[i] = w_decoded8[i];
+                            cw8[i] = cw_orig8[i];
+                            ci8[i] = imp_decoded8[i] * combined_imp_scale8[i];
+                        }
+
+                        double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
+                        // Single accumulator per k (not split A/B) -- both
+                        // halves feed the SAME row's mrow/mgamma gradient,
+                        // the cross-tile analog of process_row_pair_fp8's
+                        // mrow_local0_k/mrow_local1_k (there split because
+                        // row0/row1 are DIFFERENT rows).
+                        std::vector<double> mrow_local_k(rank, 0.0),
+                            mrow_local_k_contrib(rank, 0.0);
+                        std::vector<double> mgamma_local_k(rank, 0.0),
+                            mgamma_local_k_contrib(rank, 0.0);
+                        std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
+                            mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv =
+                                input[static_cast<std::size_t>(b) * in_cols + row];
+                            value_type dyv8[2 * BLOCK4_TILE];
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                dyv8[lj] = colA[lj] < n_out
+                                               ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                             colA[lj]]
+                                               : value_type(0);
+                                dyv8[lj + BLOCK4_TILE] =
+                                    colB[lj] < n_out
+                                        ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                      colB[lj]]
+                                        : value_type(0);
+                            }
+                            value_type mdx_term = value_type(0);
+                            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                                const value_type g = dyv8[i] * iv;
+                                mdx_term += cw_orig8[i] * combined_scale8[i] * dyv8[i];
+                                if (!training)
+                                    continue;
+                                const value_type contrib = cw_orig8[i] * combined_scale8[i] * iv;
+                                g_agg8[i] += g;
+                                contrib_agg8[i] += contrib;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const value_type out_scale_k_i =
+                                        i < BLOCK4_TILE
+                                            ? out_scale_kA[k * BLOCK4_TILE + i]
+                                            : out_scale_kB[k * BLOCK4_TILE + (i - BLOCK4_TILE)];
+                                    const value_type prod_g = cw_orig8[i] * out_scale_k_i * g;
+                                    const value_type prod_contrib =
+                                        cw_orig8[i] * out_scale_k_i * contrib;
+                                    mrow_local_k[k] += static_cast<double>(prod_g) * gamma_k_arr[k];
+                                    mrow_local_k_contrib[k] +=
+                                        static_cast<double>(prod_contrib) * gamma_k_arr[k];
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_g);
+                                    mgamma_local_k_contrib[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_contrib);
+                                    mcol_local8[k * 2 * BLOCK4_TILE + i] +=
+                                        cw_orig8[i] * value_scale_k_row[k] * g * gamma_k_arr[k];
+                                    mcol_local_contrib8[k * 2 * BLOCK4_TILE + i] +=
+                                        cw_orig8[i] * value_scale_k_row[k] * contrib *
+                                        gamma_k_arr[k];
+                                }
+                            }
+                            mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+                        }
+
+                        if (training) {
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row, k) += mrow_local_k[k];
+                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    if (colA[lj] < n_out) {
+                                        mcol_at(colA[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj];
+                                        mcol_at_contrib(colA[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj];
+                                    }
+                                    if (colB[lj] < n_out) {
+                                        mcol_at(colB[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj + BLOCK4_TILE];
+                                        mcol_at_contrib(colB[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj +
+                                                                BLOCK4_TILE];
+                                    }
+                                }
+                            }
+                            Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
+                                ci_v1, S_v0, S_v1;
+                            for (uint32_t i = 0; i < BLOCK4_TILE; ++i) {
+                                g_agg_v0[i] = static_cast<value_type>(g_agg8[i]);
+                                g_agg_v1[i] = static_cast<value_type>(g_agg8[i + BLOCK4_TILE]);
+                                contrib_agg_v0[i] = static_cast<value_type>(contrib_agg8[i]);
+                                contrib_agg_v1[i] =
+                                    static_cast<value_type>(contrib_agg8[i + BLOCK4_TILE]);
+                                ci_v0[i] = ci8[i];
+                                ci_v1[i] = ci8[i + BLOCK4_TILE];
+                                S_v0[i] = combined_scale8[i];
+                                S_v1[i] = combined_scale8[i + BLOCK4_TILE];
+                            }
+                            const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                cw8[lj] += delta_v0[lj];
+                                cw8[lj + BLOCK4_TILE] += delta_v1[lj];
+                                ci8[lj] = ci_v0[lj];
+                                ci8[lj + BLOCK4_TILE] = ci_v1[lj];
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    const uint32_t slotA = Block4Tile8::slot_index(li, lj);
+                                    const value_type cw_val = cw8[lj];
+                                    const value_type ci_val = ci8[lj] / combined_imp_scale8[lj];
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[lj]) {
+                                            tdataA[slotA] = fp8_quantize_stochastic_live(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_stochastic_live_nonneg(ci_val);
+                                        } else {
+                                            tdataA[slotA] = fp8_quantize_stochastic(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_stochastic(ci_val);
+                                        }
+                                    } else {
+                                        if (was_live8[lj]) {
+                                            tdataA[slotA] = fp8_quantize_live(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize_live(ci_val);
+                                        } else {
+                                            tdataA[slotA] = fp8_quantize(cw_val);
+                                            tdataA[BLOCK4_TILE_SLOTS + slotA] =
+                                                fp8_quantize(ci_val);
+                                        }
+                                    }
+                                    dirtyA = true;
+                                }
+                                if (colB[lj] < n_out) {
+                                    const uint32_t idx = lj + BLOCK4_TILE;
+                                    const uint32_t slotB = Block4Tile8::slot_index(li, lj);
+                                    const value_type cw_val = cw8[idx];
+                                    const value_type ci_val = ci8[idx] / combined_imp_scale8[idx];
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[idx]) {
+                                            tdataB[slotB] = fp8_quantize_stochastic_live(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_stochastic_live_nonneg(ci_val);
+                                        } else {
+                                            tdataB[slotB] = fp8_quantize_stochastic(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_stochastic(ci_val);
+                                        }
+                                    } else {
+                                        if (was_live8[idx]) {
+                                            tdataB[slotB] = fp8_quantize_live(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize_live(ci_val);
+                                        } else {
+                                            tdataB[slotB] = fp8_quantize(cw_val);
+                                            tdataB[BLOCK4_TILE_SLOTS + slotB] =
+                                                fp8_quantize(ci_val);
+                                        }
+                                    }
+                                    dirtyB = true;
+                                }
+                            }
+                        }
+                    } // closes for (li...)
+                    return {dirtyA, dirtyB};
+                }; // closes process_tile_pair_fp8
+
+                // disldo_backward.fp4_block4_cross_tile_pairing: same
+                // cross-tile axis and role split as process_tile_pair_fp8
+                // above, but with FP4's single-byte packed nibble
+                // decode/encode (Block4Tile::slot_index, weight in the low
+                // nibble, importance in the high) instead of FP8's two
+                // separate byte arrays -- mirrors process_row_pair_fp4's own
+                // decode/write-back exactly. Critically also mirrors
+                // process_row_pair_fp4's quant_floor8 zero-escape
+                // substitution: prod_g/prod_contrib (feeding
+                // mrow/mgamma/mcol) use the FLOORED quant value, while
+                // contrib/g_agg/mdx use the raw (unfloored) quant_start
+                // value -- see quant_floor8's declaration comment in
+                // process_row_pair_fp4 for the rationale. Rank-N generic
+                // (unlike FP32, which stays rank==1 only -- FP32 has no
+                // AQRS low-rank use case) -- see process_tile_pair_fp8's
+                // header comment for the row-pair-to-tile-pair role-split
+                // mapping this k-loop follows.
+                auto process_tile_pair_fp4 = [&](uint32_t bcA, uint32_t bcB, uint8_t* tdataA,
+                                                 uint8_t* tdataB) -> std::pair<bool, bool> {
+                    bool dirtyA = false, dirtyB = false;
+                    const std::size_t col_baseA = std::size_t(bcA) * BLOCK4_TILE;
+                    const std::size_t col_baseB = std::size_t(bcB) * BLOCK4_TILE;
+                    const bool training = (learning_rate != value_type(0));
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        if (row >= n_in)
+                            continue;
+                        const uint32_t nnz_row = row_live_count[row];
+                        if (nnz_row == 0)
+                            continue;
+                        const value_type imp_scale = weights.get_importance_scale(row);
+                        const value_type effective_lr =
+                            lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
+                                           : learning_rate;
+                        std::vector<value_type> value_scale_k_row(rank);
+                        for (std::size_t k = 0; k < rank; ++k)
+                            value_scale_k_row[k] = weights.get_value_scale_k(row, k);
+
+                        std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
+                        value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
+                        std::vector<value_type> out_scale_kA(rank * BLOCK4_TILE),
+                            out_scale_kB(rank * BLOCK4_TILE);
+                        value_type combined_scale8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            colA[lj] = col_baseA + lj;
+                            colB[lj] = col_baseB + lj;
+                            const bool haveA = colA[lj] < n_out;
+                            const bool haveB = colB[lj] < n_out;
+                            out_imp_scaleA[lj] = haveA
+                                                     ? weights.get_output_importance_scale(colA[lj])
+                                                     : value_type(0);
+                            out_imp_scaleB[lj] = haveB
+                                                     ? weights.get_output_importance_scale(colB[lj])
+                                                     : value_type(0);
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                out_scale_kA[k * BLOCK4_TILE + lj] =
+                                    haveA ? weights.get_output_scale_k(colA[lj], k) : value_type(0);
+                                out_scale_kB[k * BLOCK4_TILE + lj] =
+                                    haveB ? weights.get_output_scale_k(colB[lj], k) : value_type(0);
+                            }
+                            combined_scale8[lj] =
+                                haveA ? weights.get_scale(row, colA[lj]) : value_type(0);
+                            combined_scale8[lj + BLOCK4_TILE] =
+                                haveB ? weights.get_scale(row, colB[lj]) : value_type(0);
+                        }
+
+                        value_type w_decoded8[2 * BLOCK4_TILE], imp_decoded8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const uint8_t byte_a = tdataA[Block4Tile::slot_index(li, lj)];
+                            const uint8_t byte_b = tdataB[Block4Tile::slot_index(li, lj)];
+                            w_decoded8[lj] = FP4_TABLE[byte_a & 0xFu];
+                            w_decoded8[lj + BLOCK4_TILE] = FP4_TABLE[byte_b & 0xFu];
+                            imp_decoded8[lj] = FP4_TABLE[(byte_a >> 4) & 0xFu];
+                            imp_decoded8[lj + BLOCK4_TILE] = FP4_TABLE[(byte_b >> 4) & 0xFu];
+                        }
+                        bool was_live8[2 * BLOCK4_TILE];
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i)
+                            was_live8[i] = (w_decoded8[i] != value_type(0)) ||
+                                           (imp_decoded8[i] != value_type(0));
+
+                        value_type combined_imp_scale8[2 * BLOCK4_TILE];
+                        value_type quant8[2 * BLOCK4_TILE], ci8[2 * BLOCK4_TILE],
+                            quant_floor8[2 * BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            combined_imp_scale8[lj] = imp_scale * out_imp_scaleA[lj];
+                            combined_imp_scale8[lj + BLOCK4_TILE] = imp_scale * out_imp_scaleB[lj];
+                        }
+                        for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                            quant8[i] = w_decoded8[i];
+                            ci8[i] = imp_decoded8[i] * combined_imp_scale8[i];
+                            quant_floor8[i] =
+                                (quant8[i] == value_type(0)) ? zero_escape_eps : quant8[i];
+                        }
+
+                        double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
+                        std::vector<double> mrow_local_k(rank, 0.0),
+                            mrow_local_k_contrib(rank, 0.0);
+                        std::vector<double> mgamma_local_k(rank, 0.0),
+                            mgamma_local_k_contrib(rank, 0.0);
+                        std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
+                            mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv =
+                                input[static_cast<std::size_t>(b) * in_cols + row];
+                            value_type dyv8[2 * BLOCK4_TILE];
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                dyv8[lj] = colA[lj] < n_out
+                                               ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                             colA[lj]]
+                                               : value_type(0);
+                                dyv8[lj + BLOCK4_TILE] =
+                                    colB[lj] < n_out
+                                        ? output_grad[static_cast<std::size_t>(b) * n_out +
+                                                      colB[lj]]
+                                        : value_type(0);
+                            }
+                            value_type mdx_term = value_type(0);
+                            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
+                                const value_type g = dyv8[i] * iv;
+                                mdx_term += quant8[i] * combined_scale8[i] * dyv8[i];
+                                if (!training)
+                                    continue;
+                                const value_type contrib = quant8[i] * combined_scale8[i] * iv;
+                                g_agg8[i] += g;
+                                contrib_agg8[i] += contrib;
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    const value_type out_scale_k_i =
+                                        i < BLOCK4_TILE
+                                            ? out_scale_kA[k * BLOCK4_TILE + i]
+                                            : out_scale_kB[k * BLOCK4_TILE + (i - BLOCK4_TILE)];
+                                    const value_type prod_g = quant_floor8[i] * out_scale_k_i * g;
+                                    const value_type prod_contrib =
+                                        quant_floor8[i] * out_scale_k_i * contrib;
+                                    mrow_local_k[k] += static_cast<double>(prod_g) * gamma_k_arr[k];
+                                    mrow_local_k_contrib[k] +=
+                                        static_cast<double>(prod_contrib) * gamma_k_arr[k];
+                                    mgamma_local_k[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_g);
+                                    mgamma_local_k_contrib[k] += static_cast<double>(
+                                        out_scale_k_i * value_scale_k_row[k] * prod_contrib);
+                                    mcol_local8[k * 2 * BLOCK4_TILE + i] +=
+                                        quant_floor8[i] * value_scale_k_row[k] * g * gamma_k_arr[k];
+                                    mcol_local_contrib8[k * 2 * BLOCK4_TILE + i] +=
+                                        quant_floor8[i] * value_scale_k_row[k] * contrib *
+                                        gamma_k_arr[k];
+                                }
+                            }
+                            mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+                        }
+
+                        if (training) {
+                            for (std::size_t k = 0; k < rank; ++k) {
+                                mrow_at(row, k) += mrow_local_k[k];
+                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
+                                mgamma_at_contrib(k) +=
+                                    static_cast<value_type>(mgamma_local_k_contrib[k]);
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                for (std::size_t k = 0; k < rank; ++k) {
+                                    if (colA[lj] < n_out) {
+                                        mcol_at(colA[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj];
+                                        mcol_at_contrib(colA[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj];
+                                    }
+                                    if (colB[lj] < n_out) {
+                                        mcol_at(colB[lj], k) +=
+                                            mcol_local8[k * 2 * BLOCK4_TILE + lj + BLOCK4_TILE];
+                                        mcol_at_contrib(colB[lj], k) +=
+                                            mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj +
+                                                                BLOCK4_TILE];
+                                    }
+                                }
+                            }
+                            Block4Vec g_agg_v0, g_agg_v1, contrib_agg_v0, contrib_agg_v1, ci_v0,
+                                ci_v1, S_v0, S_v1;
+                            for (uint32_t i = 0; i < BLOCK4_TILE; ++i) {
+                                g_agg_v0[i] = static_cast<value_type>(g_agg8[i]);
+                                g_agg_v1[i] = static_cast<value_type>(g_agg8[i + BLOCK4_TILE]);
+                                contrib_agg_v0[i] = static_cast<value_type>(contrib_agg8[i]);
+                                contrib_agg_v1[i] =
+                                    static_cast<value_type>(contrib_agg8[i + BLOCK4_TILE]);
+                                ci_v0[i] = ci8[i];
+                                ci_v1[i] = ci8[i + BLOCK4_TILE];
+                                S_v0[i] = combined_scale8[i];
+                                S_v1[i] = combined_scale8[i + BLOCK4_TILE];
+                            }
+                            const Block4Vec effective_lr_v = block4_vec_broadcast(effective_lr);
+                            const Block4Vec beta2_v4 = block4_vec_broadcast(beta2);
+                            const Block4Vec eps_v4 = block4_vec_broadcast(eps);
+                            const Block4Vec min_decay_frac_v4 =
+                                block4_vec_broadcast(min_decay_frac);
+                            const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
+                            const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+                            ci_v0 =
+                                SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            ci_v1 =
+                                SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1,
+                                                            beta2_v4, min_decay_frac_v4, max_ci_v4);
+                            const Block4Vec delta_v0 = SynapsePolicyVec::update_cw(
+                                g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            const Block4Vec delta_v1 = SynapsePolicyVec::update_cw(
+                                g_agg_v1, ci_v1, S_v1, effective_lr_v, eps_v4, damp_by_importance,
+                                max_abs_delta_v4, scale_invariant);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                quant8[lj] += delta_v0[lj];
+                                quant8[lj + BLOCK4_TILE] += delta_v1[lj];
+                                ci8[lj] = ci_v0[lj];
+                                ci8[lj + BLOCK4_TILE] = ci_v1[lj];
+                            }
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (colA[lj] < n_out) {
+                                    const uint32_t slotA = Block4Tile::slot_index(li, lj);
+                                    const value_type quant_val = quant8[lj];
+                                    const value_type imp_ratio = ci8[lj] / combined_imp_scale8[lj];
+                                    uint8_t new_w, new_imp;
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[lj]) {
+                                            new_w = fp4_quantize_stochastic_live(quant_val);
+                                            new_imp =
+                                                fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize_stochastic(quant_val);
+                                            new_imp = fp4_quantize_stochastic(imp_ratio);
+                                        }
+                                    } else {
+                                        if (was_live8[lj]) {
+                                            new_w = fp4_quantize_live(quant_val);
+                                            new_imp = fp4_quantize_live(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize(quant_val);
+                                            new_imp = fp4_quantize(imp_ratio);
+                                        }
+                                    }
+                                    tdataA[slotA] = uint8_t((new_imp << 4) | new_w);
+                                    dirtyA = true;
+                                }
+                                if (colB[lj] < n_out) {
+                                    const uint32_t idx = lj + BLOCK4_TILE;
+                                    const uint32_t slotB = Block4Tile::slot_index(li, lj);
+                                    const value_type quant_val = quant8[idx];
+                                    const value_type imp_ratio =
+                                        ci8[idx] / combined_imp_scale8[idx];
+                                    uint8_t new_w, new_imp;
+                                    if constexpr (StochasticRounding) {
+                                        if (was_live8[idx]) {
+                                            new_w = fp4_quantize_stochastic_live(quant_val);
+                                            new_imp =
+                                                fp4_quantize_stochastic_live_nonneg(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize_stochastic(quant_val);
+                                            new_imp = fp4_quantize_stochastic(imp_ratio);
+                                        }
+                                    } else {
+                                        if (was_live8[idx]) {
+                                            new_w = fp4_quantize_live(quant_val);
+                                            new_imp = fp4_quantize_live(imp_ratio);
+                                        } else {
+                                            new_w = fp4_quantize(quant_val);
+                                            new_imp = fp4_quantize(imp_ratio);
+                                        }
+                                    }
+                                    tdataB[slotB] = uint8_t((new_imp << 4) | new_w);
+                                    dirtyB = true;
+                                }
+                            }
+                        }
+                    } // closes for (li...)
+                    return {dirtyA, dirtyB};
+                }; // closes process_tile_pair_fp4
+
                 if (learning_rate == value_type(0)) {
                     // Read-only: process_tile structurally never writes here
                     // (every write inside it is gated by learning_rate != 0),
@@ -2533,39 +4492,216 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                     // necessary under concurrency, not just an optimization.
                     auto ws = weights.block4.snapshot_row(br);
                     std::size_t live_byte_pos = 0;
-                    for (std::size_t row_ti = row_ti_start[br]; row_ti < row_ti_start[br + 1];
-                         ++row_ti) {
-                        const std::size_t e = row_ti - row_ti_start[br];
-                        const uint32_t bc = ws.bc[e];
-                        const std::size_t this_byte_pos = live_byte_pos;
-                        // Sized per VALUES_TYPE: FP8's Block4Tile8 is 32
-                        // bytes/tile (2/slot), FP32's Block4Tile32 is 128
-                        // bytes/tile (8/slot), not FP4's 16 (1/slot) --
-                        // a real stack buffer overflow otherwise (caught via
-                        // -fsanitize=address / gcc's own stringop-overflow
-                        // warning when this was still hardcoded to
-                        // BLOCK4_TILE_SLOTS for both types).
-                        uint8_t
-                            scratch_buf[std::is_same_v<VALUES_TYPE, FP8BiValues>
-                                            ? BLOCK4_TILE_SLOTS8_BYTES
-                                            : (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>
-                                                   ? BLOCK4_TILE_SLOTS32_BYTES
-                                                   : BLOCK4_TILE_SLOTS)];
-                        weights.block4.unpack_workspace_tile(ws, e, this_byte_pos, scratch_buf);
-                        const bool tile_dirty = process_tile(bc, scratch_buf);
-                        if (tile_dirty)
-                            weights.block4.commit_dirty_tile_in_workspace(ws, e, this_byte_pos,
-                                                                          scratch_buf);
-                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>)
-                            live_byte_pos +=
-                                block4_stored_tile_len8(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
-                        else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>)
-                            live_byte_pos +=
-                                block4_stored_tile_len32(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
-                        else
-                            live_byte_pos +=
-                                block4_stored_tile_len(ws.is_sparse[e], &ws.bytes[this_byte_pos]);
-                    } // closes for (row_ti...)
+                    // disldo_backward.fp32_block4_cross_tile_pairing: rank==1
+                    // FP32 pairs two DIFFERENT tiles per iteration via
+                    // process_tile_pair_fp32 (defined above); everything
+                    // else (FP8, FP4, rank>1 FP32/AQRS) keeps the original
+                    // one-tile-per-iteration loop, unchanged. Sequencing
+                    // within a pair matters: B's ORIGINAL byte position
+                    // depends on A's ORIGINAL (pre-write) length (both tiles
+                    // must be unpacked before either is committed, since a
+                    // commit can resize a tile and shift every subsequent
+                    // tile's bytes in the row's shared buffer -- see
+                    // disldo_backward.row_workspace_snapshot_fix), so A is
+                    // committed FIRST and its length is RE-READ afterward to
+                    // find B's true CURRENT position before B is committed
+                    // -- exactly mirroring how the single-tile loop below
+                    // re-reads its own tile's post-commit length before
+                    // advancing to the next tile, just applied twice per
+                    // pair instead of once per tile.
+                    bool row_handled_as_pairs = false;
+                    if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>) {
+                        if (rank == 1) {
+                            row_handled_as_pairs = true;
+                            std::size_t row_ti = row_ti_start[br];
+                            while (row_ti < row_ti_start[br + 1]) {
+                                const std::size_t eA = row_ti - row_ti_start[br];
+                                const uint32_t bcA = ws.bc[eA];
+                                const std::size_t byte_posA = live_byte_pos;
+                                const bool has_partner = (row_ti + 1 < row_ti_start[br + 1]);
+                                if (has_partner) {
+                                    const std::size_t eB = eA + 1;
+                                    const uint32_t bcB = ws.bc[eB];
+                                    uint8_t scratch_bufA[BLOCK4_TILE_SLOTS32_BYTES];
+                                    uint8_t scratch_bufB[BLOCK4_TILE_SLOTS32_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_bufA);
+                                    const std::size_t lenA_before = block4_stored_tile_len32(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_before = byte_posA + lenA_before;
+                                    weights.block4.unpack_workspace_tile(ws, eB, byte_posB_before,
+                                                                         scratch_bufB);
+                                    const auto [dirtyA, dirtyB] = process_tile_pair_fp32(
+                                        bcA, bcB, scratch_bufA, scratch_bufB);
+                                    if (dirtyA)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_bufA);
+                                    const std::size_t lenA_after = block4_stored_tile_len32(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_after = byte_posA + lenA_after;
+                                    if (dirtyB)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eB, byte_posB_after, scratch_bufB);
+                                    const std::size_t lenB_after = block4_stored_tile_len32(
+                                        ws.is_sparse[eB], &ws.bytes[byte_posB_after]);
+                                    live_byte_pos = byte_posB_after + lenB_after;
+                                    row_ti += 2;
+                                } else {
+                                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS32_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_buf);
+                                    const bool tile_dirty = process_tile(bcA, scratch_buf);
+                                    if (tile_dirty)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_buf);
+                                    live_byte_pos += block4_stored_tile_len32(ws.is_sparse[eA],
+                                                                              &ws.bytes[byte_posA]);
+                                    ++row_ti;
+                                }
+                            } // closes while (row_ti...)
+                        }
+                    } else if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                        // Unlike FP32 above, no rank==1 gate here --
+                        // process_tile_pair_fp8 is rank-N generic (see its
+                        // own header comment), so AQRS layers get the
+                        // cross-tile speedup too, at any scale_rank.
+                        {
+                            row_handled_as_pairs = true;
+                            std::size_t row_ti = row_ti_start[br];
+                            while (row_ti < row_ti_start[br + 1]) {
+                                const std::size_t eA = row_ti - row_ti_start[br];
+                                const uint32_t bcA = ws.bc[eA];
+                                const std::size_t byte_posA = live_byte_pos;
+                                const bool has_partner = (row_ti + 1 < row_ti_start[br + 1]);
+                                if (has_partner) {
+                                    const std::size_t eB = eA + 1;
+                                    const uint32_t bcB = ws.bc[eB];
+                                    uint8_t scratch_bufA[BLOCK4_TILE_SLOTS8_BYTES];
+                                    uint8_t scratch_bufB[BLOCK4_TILE_SLOTS8_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_bufA);
+                                    const std::size_t lenA_before = block4_stored_tile_len8(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_before = byte_posA + lenA_before;
+                                    weights.block4.unpack_workspace_tile(ws, eB, byte_posB_before,
+                                                                         scratch_bufB);
+                                    const auto [dirtyA, dirtyB] =
+                                        process_tile_pair_fp8(bcA, bcB, scratch_bufA, scratch_bufB);
+                                    if (dirtyA)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_bufA);
+                                    const std::size_t lenA_after = block4_stored_tile_len8(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_after = byte_posA + lenA_after;
+                                    if (dirtyB)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eB, byte_posB_after, scratch_bufB);
+                                    const std::size_t lenB_after = block4_stored_tile_len8(
+                                        ws.is_sparse[eB], &ws.bytes[byte_posB_after]);
+                                    live_byte_pos = byte_posB_after + lenB_after;
+                                    row_ti += 2;
+                                } else {
+                                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS8_BYTES];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_buf);
+                                    const bool tile_dirty = process_tile(bcA, scratch_buf);
+                                    if (tile_dirty)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_buf);
+                                    live_byte_pos += block4_stored_tile_len8(ws.is_sparse[eA],
+                                                                             &ws.bytes[byte_posA]);
+                                    ++row_ti;
+                                }
+                            } // closes while (row_ti...)
+                        }
+                    } else if constexpr (std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+                        // Unlike FP32 above, no rank==1 gate here -- same
+                        // reasoning as the FP8 branch above.
+                        {
+                            row_handled_as_pairs = true;
+                            std::size_t row_ti = row_ti_start[br];
+                            while (row_ti < row_ti_start[br + 1]) {
+                                const std::size_t eA = row_ti - row_ti_start[br];
+                                const uint32_t bcA = ws.bc[eA];
+                                const std::size_t byte_posA = live_byte_pos;
+                                const bool has_partner = (row_ti + 1 < row_ti_start[br + 1]);
+                                if (has_partner) {
+                                    const std::size_t eB = eA + 1;
+                                    const uint32_t bcB = ws.bc[eB];
+                                    uint8_t scratch_bufA[BLOCK4_TILE_SLOTS];
+                                    uint8_t scratch_bufB[BLOCK4_TILE_SLOTS];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_bufA);
+                                    const std::size_t lenA_before = block4_stored_tile_len(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_before = byte_posA + lenA_before;
+                                    weights.block4.unpack_workspace_tile(ws, eB, byte_posB_before,
+                                                                         scratch_bufB);
+                                    const auto [dirtyA, dirtyB] =
+                                        process_tile_pair_fp4(bcA, bcB, scratch_bufA, scratch_bufB);
+                                    if (dirtyA)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_bufA);
+                                    const std::size_t lenA_after = block4_stored_tile_len(
+                                        ws.is_sparse[eA], &ws.bytes[byte_posA]);
+                                    const std::size_t byte_posB_after = byte_posA + lenA_after;
+                                    if (dirtyB)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eB, byte_posB_after, scratch_bufB);
+                                    const std::size_t lenB_after = block4_stored_tile_len(
+                                        ws.is_sparse[eB], &ws.bytes[byte_posB_after]);
+                                    live_byte_pos = byte_posB_after + lenB_after;
+                                    row_ti += 2;
+                                } else {
+                                    uint8_t scratch_buf[BLOCK4_TILE_SLOTS];
+                                    weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
+                                                                         scratch_buf);
+                                    const bool tile_dirty = process_tile(bcA, scratch_buf);
+                                    if (tile_dirty)
+                                        weights.block4.commit_dirty_tile_in_workspace(
+                                            ws, eA, byte_posA, scratch_buf);
+                                    live_byte_pos += block4_stored_tile_len(ws.is_sparse[eA],
+                                                                            &ws.bytes[byte_posA]);
+                                    ++row_ti;
+                                }
+                            } // closes while (row_ti...)
+                        }
+                    }
+                    if (!row_handled_as_pairs) {
+                        for (std::size_t row_ti = row_ti_start[br]; row_ti < row_ti_start[br + 1];
+                             ++row_ti) {
+                            const std::size_t e = row_ti - row_ti_start[br];
+                            const uint32_t bc = ws.bc[e];
+                            const std::size_t this_byte_pos = live_byte_pos;
+                            // Sized per VALUES_TYPE: FP8's Block4Tile8 is 32
+                            // bytes/tile (2/slot), FP32's Block4Tile32 is 128
+                            // bytes/tile (8/slot), not FP4's 16 (1/slot) --
+                            // a real stack buffer overflow otherwise (caught
+                            // via -fsanitize=address / gcc's own
+                            // stringop-overflow warning when this was still
+                            // hardcoded to BLOCK4_TILE_SLOTS for both types).
+                            uint8_t scratch_buf[std::is_same_v<VALUES_TYPE, FP8BiValues>
+                                                    ? BLOCK4_TILE_SLOTS8_BYTES
+                                                    : (std::is_same_v<VALUES_TYPE,
+                                                                      DeltaCSRBiValues<float>>
+                                                           ? BLOCK4_TILE_SLOTS32_BYTES
+                                                           : BLOCK4_TILE_SLOTS)];
+                            weights.block4.unpack_workspace_tile(ws, e, this_byte_pos, scratch_buf);
+                            const bool tile_dirty = process_tile(bc, scratch_buf);
+                            if (tile_dirty)
+                                weights.block4.commit_dirty_tile_in_workspace(ws, e, this_byte_pos,
+                                                                              scratch_buf);
+                            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>)
+                                live_byte_pos += block4_stored_tile_len8(ws.is_sparse[e],
+                                                                         &ws.bytes[this_byte_pos]);
+                            else if constexpr (std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>)
+                                live_byte_pos += block4_stored_tile_len32(ws.is_sparse[e],
+                                                                          &ws.bytes[this_byte_pos]);
+                            else
+                                live_byte_pos += block4_stored_tile_len(ws.is_sparse[e],
+                                                                        &ws.bytes[this_byte_pos]);
+                        } // closes for (row_ti...)
+                    }
                     // Merge back -- evicts lowest-|true-importance| synapses
                     // only if this row genuinely grew past its own current
                     // headroom (see Block4Store::merge_row_workspace's

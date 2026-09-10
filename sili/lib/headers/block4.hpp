@@ -41,6 +41,67 @@ using Block4VecU =
 static_assert(sizeof(Block4Vec) == BLOCK4_TILE * sizeof(float),
               "Block4Vec width must match BLOCK4_TILE");
 
+// 8-wide (256-bit, AVX2 width) analog of Block4Vec -- combines two
+// block4 tiles'/columns' worth of multiply-accumulate work into one op
+// where they share the same underlying input-row gather (same
+// block-row). Used by disldo_forward's FP32 block4 path; see
+// linear_disldo.hpp: disldo_forward.fp32_block4_avx2_column_pairing.
+using Block8Vec = float __attribute__((__vector_size__(2 * SILI_BLOCK4_TILE_SIZE * sizeof(float))));
+static_assert(sizeof(Block8Vec) == 2 * BLOCK4_TILE * sizeof(float),
+              "Block8Vec width must be double BLOCK4_TILE");
+
+inline Block8Vec block8_vec_load(const float* p) {
+    Block8Vec v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+inline void block8_vec_store(float* p, Block8Vec v) {
+    std::memcpy(p, &v, sizeof(v));
+}
+inline Block8Vec block8_vec_broadcast(float x) {
+    return Block8Vec{x, x, x, x, x, x, x, x};
+}
+// Broadcasts one value into the lower BLOCK4_TILE lanes, another into the
+// upper -- used by disldo_backward's row-pairing (linear_disldo.hpp:
+// disldo_backward.fp32_block4_avx2_row_pairing) where a per-row scalar
+// (e.g. an input value or value_scale) differs between the two paired
+// rows but is constant across that row's own 4 columns.
+inline Block8Vec block8_vec_broadcast_pair(float lo, float hi) {
+    return Block8Vec{lo, lo, lo, lo, hi, hi, hi, hi};
+}
+// Duplicates a 4-wide vector into both halves -- used where a quantity is
+// shared between two paired rows (e.g. dy/output_scale_k, which depend
+// only on the column, not the row).
+inline Block8Vec block8_vec_dup4(Block4Vec v) {
+    return Block8Vec{v[0], v[1], v[2], v[3], v[0], v[1], v[2], v[3]};
+}
+inline Block4Vec block8_vec_lo4(Block8Vec v) {
+    Block4Vec r;
+    std::memcpy(&r, &v, sizeof(r));
+    return r;
+}
+inline Block4Vec block8_vec_hi4(Block8Vec v) {
+    Block4Vec r;
+    std::memcpy(&r, reinterpret_cast<const uint8_t*>(&v) + sizeof(Block4Vec), sizeof(r));
+    return r;
+}
+inline Block8Vec block8_vec_from_lo_hi(Block4Vec lo, Block4Vec hi) {
+    Block8Vec r;
+    std::memcpy(&r, &lo, sizeof(lo));
+    std::memcpy(reinterpret_cast<uint8_t*>(&r) + sizeof(lo), &hi, sizeof(hi));
+    return r;
+}
+// Elementwise sum of the lower and upper halves -- used to fold two paired
+// rows' per-COLUMN contributions (mcol) into the same 4-wide accumulator a
+// single-row pass would have used, since a column's identity doesn't
+// depend on which of the two rows contributed to it.
+inline Block4Vec block8_vec_fold4(Block8Vec v) {
+    return Block4Vec{v[0] + v[4], v[1] + v[5], v[2] + v[6], v[3] + v[7]};
+}
+inline float block8_vec_hsum(Block8Vec x) {
+    return x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7];
+}
+
 inline Block4Vec block4_vec_load(const float* p) {
     Block4Vec v;
     std::memcpy(&v, p, sizeof(v)); // unaligned-safe load
@@ -181,6 +242,22 @@ inline Block4Vec block4_vec_decode_fp4(Block4VecU codes) {
     std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
+
+// A genuinely 8-wide block8_vec_decode_fp4 (direct 8-lane port of the
+// 4-wide decode above, using a since-removed Block8VecU/
+// block8_vecu_broadcast) was built and measured for disldo_forward's FP4
+// block4 column pairing. Unlike FP8's equivalent attempt (measured worse
+// EVERYWHERE it was tried, from register pressure), FP4's result was
+// genuinely machine-dependent: a local laptop showed it ~8% FASTER than
+// calling the 4-wide decode twice, but on arch-sandbox (the authoritative
+// AVX2 machine, n=35 interleaved runs) the two designs were statistically
+// indistinguishable (median 154600 vs 151200 ns/call, mean 143139 vs
+// 144067 -- within this comparison's own run-to-run noise). Since it was
+// not a clear win on the machine that matters, and it adds a whole
+// duplicate decode function to maintain, the simpler twice-4-wide-call
+// design (same shape as FP32/FP8's) was kept instead. Reverted, not
+// adopted -- see disldo_forward.fp4_block4_avx2_column_pairing in
+// docs/research/linear_disldo.rst for the full local-vs-remote comparison.
 
 // 4-wide fp4_quantize_stochastic (fp4quant.hpp) -- stochastically quantizes
 // 4 values in one shot.
@@ -331,6 +408,18 @@ inline Block4Vec block4_vec_decode_fp8(Block4VecU codes) {
     std::memcpy(&result, result_arr, sizeof(result));
     return result;
 }
+
+// A genuinely 8-wide block8_vec_decode_fp8 (direct 8-lane port of the
+// 4-wide decode above) was built and MEASURED WORSE for disldo_forward's
+// FP8 block4 column pairing than calling the 4-wide decode twice and
+// combining post-decode: 55% more stack-spill traffic (280 vs 181 spill
+// instructions in the compiled block4 loop) since doubling every decode
+// temporary (s/e/m/bits_normal/codes_arr/result_arr) to 256-bit pushed
+// the combined YMM working set (decode's own temporaries plus the
+// pairing logic's s8/w8/in8/prod) past the register file, forcing
+// spill/reload that outweighed the saved call overhead. Reverted, not
+// adopted -- see disldo_forward.fp8_block4_avx2_column_pairing in
+// docs/research/linear_disldo.rst for the full measured comparison.
 
 // 4-wide fp8_quantize_stochastic (fp8quant.hpp) -- same split as
 // block4_vec_decode_fp8 above: the common normal-range case uses the
@@ -1227,6 +1316,10 @@ struct Block4Store {
     std::vector<double> scratch_row_grad;         // backward only
     // backward only:
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward cross-tile pairing scratch -- currently only used by
+    // the FP32 block4 store; harmless unused field here (shared collection
+    // loop in disldo_forward populates it for every VALUES_TYPE).
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
@@ -1788,6 +1881,10 @@ struct Block4Store8 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward cross-tile pairing scratch -- currently only used by
+    // the FP32 block4 store; harmless unused field here (shared collection
+    // loop in disldo_forward populates it for every VALUES_TYPE).
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
@@ -2506,6 +2603,12 @@ struct Block4Store32 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_forward.fp32_block4_cross_tile_pairing: marks every SECOND
+    // tile of a same-br run in scratch_tile_br/bc (bc-ascending order) as
+    // already-consumed by its leader (the immediately preceding flat
+    // index) -- lets the forward parallel loop pair two DIFFERENT tiles
+    // sharing a block-row with zero extra indexing, just a skip-check.
+    std::vector<uint8_t> scratch_tile_is_follower;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
