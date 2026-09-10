@@ -203,6 +203,7 @@ set(SILI_STANDALONE_TESTS
     test_cpu_topology
     test_dequant_equality_fp4_vs_fp8
     test_dequant_equality_fp8_vs_fp32
+    test_block4_codec
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)
