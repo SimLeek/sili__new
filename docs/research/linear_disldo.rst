@@ -1409,3 +1409,108 @@ upshot**: this fix is only a net win when paired with pinning AND a
 ``num_cpus`` choice of 2 or >=8 on this machine's topology -- staying at
 the old "safe default" of ``num_cpus=4`` under the new pinned regime is
 now the single worst non-plateau option measured.
+
+.. _disldo_forward.fp32_block4_cross_tile_pairing:
+
+FP32 block4: cross-tile (non-adjacent) pairing PoC
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.fp32_block4_cross_tile_pairing`` /
+``disldo_backward.fp32_block4_cross_tile_pairing``
+
+The column/row-pairing widenings above (``disldo_forward.
+fp32_block4_avx2_column_pairing``, ``disldo_backward.
+fp32_block4_avx2_row_pairing``) pair two halves of the SAME tile. This is
+a different axis: pairing TWO DIFFERENT tiles that share a block-row
+(``br``) but sit at different block-columns (``bc``) -- the case that
+matters once a layer has real gaps (checkered/sparse block4 occupancy),
+not just the fully-dense case those widenings targeted.
+
+**Forward's cross-tile axis**: for a fixed column-within-tile ``lj``,
+combine that SAME ``lj`` position from two DIFFERENT tiles sharing ``br``
+(different ``bc``) into one 8-wide op -- both tiles still read the same 4
+input rows, so this is cheap: forward's tile-collection loop already
+walks a row's occupied tiles in ``bc``-ascending order, so pairing
+consecutive entries needs no new indexing.
+
+**Backward's cross-tile axis** (the mirror image, per the design
+decision behind pairing on ``br`` rather than ``bc``: "same br different
+bc for backward as well -- sum the input grad, the weight grads are
+separate anyway"): for a fixed row ``li`` (same actual row), combine that
+row's computation against TWO DIFFERENT tiles (``bc0``, ``bc1``) sharing
+``br``. Row-level quantities (``imp_scale``, ``effective_lr``) become
+SHARED; column-level quantities (``col``, ``get_output_importance_scale``,
+``dy``) become PER-HALF (genuinely different columns from the two tiles);
+``dx`` accumulation FOLDS both tiles' contributions into one row entry
+(analogous to ``mdx``'s per-batch accumulation, NOT a single accumulator
+hoisted outside the batch loop -- ``mdx`` is shaped ``(batch, in_cols)``,
+each batch sample needs its own slot); weight/importance updates write to
+TWO SEPARATE tiles. This stays within one thread's row-ownership (no new
+column index, no cross-thread race), since a whole row's tiles are
+already collected together -- confirmed cheap, unlike an earlier
+(wrong) assumption that it would need new column-indexed infrastructure.
+
+Standalone PoC files (not yet ported into the real kernel; see below):
+``tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp`` and
+``test_disldo_block4_fp32_crosstile_backward.cpp``. Both hand-build a
+genuinely gapped ("checkered", every odd ``bc`` skipped) block4 fp32
+layer via ``get_or_create``/``set_weight``/``set_importance`` (mirroring
+``block4_load_dense_fp32``'s own construction loop minus the odd-``bc``
+skip), use the REAL ``disldo_forward``/``disldo_backward`` as both
+correctness oracle and timing baseline, and measure only the one new
+hand-written cross-tile function against it.
+
+**Backward-specific correctness pitfall, found and fixed**: two
+``Block4TileHandle32`` handles into the SAME row held open
+simultaneously while mutating one is a real use-after-free hazard (a
+write-triggered sparse<->dense repack on one handle can memmove the
+row's shared byte buffer out from under the other's still-open
+``byte_pos``) -- exactly the hazard ``disldo_backward.
+row_workspace_snapshot_fix`` documents and the real kernel avoids via
+``snapshot_row``/``unpack_workspace_tile``. The PoC's simpler
+(valid only because tiles never actually resize in this fixed-checkered
+test scenario) fix: read BOTH tiles fully into local arrays first, each
+handle opened and closed sequentially and never two alive at once,
+compute using only local data, then write both tiles back the same way.
+A second, purely mathematical bug: the PoC's ``ci`` (combined importance)
+formula initially used ``imp_scale(row) * value_scale(row)`` -- both
+row-level -- copying the row-pairing kernel's shared/per-half framing
+too literally. The real formula (``process_row_pair_fp32``,
+``combined_imp_scale8[lj] = imp_scale0 * out_imp_scale4[lj]``) uses
+``imp_scale(row) * get_output_importance_scale(col)`` -- the SECOND
+factor is column-level, not row-level, so it must be per-half (from each
+tile's own columns), not shared. Both bugs were undetectable by a naive
+forward-probe correctness check post-backward, because ``disldo_backward``
+ALSO runs its own unconditional per-row ``value_scale`` RMSprop update
+after the per-cell loop (``linear_disldo.hpp:3568-3648``, block4's
+dead-row-independent value_scale pass) which the PoC deliberately doesn't
+replicate (out of scope -- that machinery is orthogonal to the cross-tile
+per-cell math under test, and the real kernel port reuses it unmodified)
+-- so a forward probe conflated expected ``S(row)`` drift with actual
+correctness. Fixed by comparing raw stored ``cw``/``ci`` directly instead
+of probing through a forward pass.
+
+**Measured** (arch-sandbox, 15 interleaved-equivalent runs, ``n_in=n_out=
+256, batch=8``, oracle vs hand-written function, median ns/call):
+
+- Forward: ``adjacent_only`` (existing column-pairing) vs
+  ``cross_tile``: a real, consistent **~17-20% speedup**. Root cause:
+  the tile-handle fetch cost (``at_index``/``raw_data``) is halved (once
+  per pair instead of once per tile), not really about memory adjacency
+  itself.
+- Backward: ``adjacent_only`` (existing row-pairing) vs ``cross_tile``:
+  median 1,594,630 ns/call vs 589,950 ns/call across the 15 runs -- a
+  much larger **~2.7x speedup**, and far more STABLE than the adjacent
+  baseline (which showed large run-to-run variance, 1.5M-4.2M ns/call,
+  vs cross_tile's tight 589k-650k ns/call band across the same 15 runs)
+  -- plausibly because cross-tile pairing halves the number of per-tile
+  RMSprop ``update_ci``/``update_cw`` calls (once per row-pair across
+  TWO tiles' worth of columns, instead of once per tile), which is a
+  larger fixed per-tile cost on the backward path than on forward's.
+  (Note: as expected, this is dense-checkered-layout-neutral in principle
+  -- the real payoff is enabling cheaper work under genuine sparsity, not
+  a dense speedup per se, though the measured dense case is faster too.)
+
+Both PoCs were correctness-validated (weight/importance/dx all
+effectively exact, not just tolerance-close) before the port into the
+real kernels described in the commit(s) alongside this doc entry.
