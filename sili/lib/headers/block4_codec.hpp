@@ -178,6 +178,16 @@ template <> struct Block4Codec<DeltaCSRBiValues<float>> {
     }
 };
 
+// Thin 2D view over a flat scratch buffer -- was a local struct defined inside
+// disldo_backward itself (task #295); hoisted here (templated on value_type
+// explicitly, since it no longer has a using-alias value_type in scope) so
+// the free functions extracted below can use it too.
+template <typename value_type> struct Flat2DView {
+    value_type* base;
+    std::size_t stride;
+    inline value_type* operator[](std::size_t k) const { return base + k * stride; }
+};
+
 // disldo_backward.block4_extract_function_refactor: parameter-object structs for
 // pulling disldo_backward's nested process_tile/process_row_pair/process_tile_pair
 // closures out into real, independently-measured (by lizard/CCN tools) free
