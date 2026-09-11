@@ -1902,3 +1902,169 @@ divergence/timing tests specifically, since those are this session's
 own earlier ~2.85x-fp4/~29%-fp8 speedup work and needed confirmation
 the refactor didn't quietly regress it, not just that correctness
 held).
+
+.. _block4_backward_extract_function_refactor:
+
+**block4_backward_extract_function_refactor.** Even after
+``block4_codec_refactor`` above, ``disldo_backward`` still measured
+CCN 257 -- flagged as still too high for normal engineering practice
+(most teams would reject this in review), not because the precision
+triplication was still there (it wasn't), but because the function
+body contained three deeply nested closures (``process_tile``, and
+inside it ``process_row_pair``; plus a sibling ``process_tile_pair``)
+plus a large inlined single-row update block, all defined as ``auto x
+= [&](...){...}`` lambdas capturing ~25 variables by reference.
+``lizard`` (like most CCN tools) folds every branch inside an
+inline-defined lambda body into the ENCLOSING function's own
+complexity count, so none of that internal branching (SIMD-vs-scalar,
+full-tile-vs-boundary, training-vs-not, stochastic-vs-deterministic)
+was visible to the tool as belonging to a separate unit -- it was all
+attributed to ``disldo_backward`` itself.
+
+The fix was textbook Extract Function (Fowler): pull each closure out
+into a real, independently-named, top-level template function taking
+explicit parameters (or a small parameter-object struct) instead of
+capturing the enclosing scope by reference. Each extracted function
+then gets measured separately by ``lizard``, and ``disldo_backward``
+itself shrinks down to its actual orchestration logic (the row-block
+loop, the pairing-vs-single-tile dispatch, byte-position bookkeeping,
+the final reduction).
+
+**GPU-portability constraint.** This kernel's eventual target is
+Kompute/Vulkan/GLSL (with NVIDIA extensions). GLSL has no lambdas, no
+closures, no C++ templates, no ``std::function``/virtual dispatch, no
+``std::pair``/STL containers as first-class types -- only plain
+functions with explicit ``in``, ``out``, and combined-direction
+parameter qualifiers, and plain structs.
+The planned path for "templates" on the GPU side is Boost.Preprocessor-
+style macro expansion or an external Python/C++ codegen step that
+mechanically expands compile-time-dispatched C++ (template parameters,
+``if constexpr`` -- exactly what ``Block4Codec`` already does) into
+concrete GLSL variants, not runtime polymorphism, which has no GLSL
+analogue at all. This shaped the extraction:
+
+- Converting the nested lambdas into free functions is a move *toward*
+  GLSL's function model, not away from it -- good alignment, not a
+  tradeoff.
+- Two new parameter-object structs (``sili/lib/headers/
+  block4_codec.hpp``) group state the way a future GPU binding layout
+  would: ``Block4BackwardParams<SIZE_TYPE, VALUES_TYPE, COL_TYPE>``
+  holds broadcast/read-only call-level state (constructed once before
+  the ``#pragma omp parallel`` region -- eventually a UBO/push-
+  constant), ``Block4BackwardAccumulators<value_type>`` holds
+  per-thread mutable output state with named accessor methods
+  (``mcol_at``/``mrow_at``/``mgamma_at`` and their ``_contrib``
+  counterparts, replacing the old per-thread lambda closures 1:1 at
+  the call-site syntax level) -- eventually an SSBO, reduced
+  differently via atomics/workgroup-reduce on GPU, but the same
+  CPU-side field grouping conceptually. Named ``...Params``/
+  ``...Accumulators``, not ``...ThreadState``, since "thread" is a
+  CPU-specific concept this struct shouldn't presuppose.
+- Per-call coordinates (``br``, ``bc``, ``li``, ``row``, ``nnz``,
+  ``tdata`` pointers) stayed explicit scalar/pointer function
+  arguments, not folded into either struct -- on GPU these derive
+  from ``gl_GlobalInvocationID``, genuinely per-invocation rather than
+  uniform/broadcast state, so keeping them as plain params is the
+  correct analogue.
+- No ``std::function``, virtual dispatch, or other runtime-polymorphic
+  indirection was introduced to shrink CCN -- that would make the
+  eventual GPU port harder, not easier, since none of it exists in
+  GLSL. All dispatch stayed at compile time (template parameters /
+  ``if constexpr``), matching ``Block4Codec``'s existing pattern: every
+  extracted function takes the same 7 template parameters
+  ``disldo_backward`` itself has (``SIZE_TYPE, VALUES_TYPE, COL_TYPE,
+  ScalePolicy, DeferredScaleWrite, StochasticRounding,
+  SynapsePolicyT``), specified explicitly at every call site since 4
+  of them don't appear in any function parameter type and thus aren't
+  deducible.
+- ``process_tile_pair``'s ``std::pair<bool, bool>`` return became a
+  plain named struct, ``Block4TileDirtyPair{bool a; bool b;}`` --
+  ``std::pair`` has no GLSL analogue, a plain struct does.
+
+**Explicitly out of scope for this pass** (flagged, not fixed, to
+avoid conflating two different efforts): ``process_row_pair``/
+``process_tile_pair``'s existing ``std::vector<value_type>``
+allocations for per-rank scratch (``value_scale_k_row``,
+``out_scale_kA``, etc.) are a real future GPU-portability concern --
+dynamic-rank heap allocation has no GPU equivalent, and would need a
+fixed max-rank array or an SSBO-backed scratch buffer instead -- but
+touching that now would conflate this CCN-reduction pass with a
+genuinely separate allocation-strategy redesign.
+
+Four functions were extracted from ``disldo_backward``, in this order,
+each verified independently (full local + remote ``ctest``, plus a
+direct bit-exact correctness check via the relevant standalone timing
+test) before moving to the next:
+
+.. list-table::
+   :header-rows: 1
+
+   * - function
+     - NLOC
+     - CCN
+     - replaces
+   * - ``block4_backward_process_single_row``
+     - 255
+     - 33
+     - the inlined generic single-row update block
+   * - ``block4_backward_process_row_pair``
+     - 201
+     - 22
+     - the ``process_row_pair`` lambda (AVX2 within-tile adjacent-row
+       pairing)
+   * - ``block4_backward_process_single_tile``
+     - 37
+     - 8
+     - the ``process_tile`` lambda (per-tile row-loop + pairing
+       dispatch)
+   * - ``block4_backward_process_tile_pair``
+     - 208
+     - 38
+     - the ``process_tile_pair`` lambda (FP32-only, rank==1 cross-tile
+       pairing)
+
+``disldo_backward`` itself, measured via ``lizard`` before/after each
+extraction:
+
+.. list-table::
+   :header-rows: 1
+
+   * - phase
+     - NLOC
+     - CCN
+   * - before (post-``block4_codec_refactor``)
+     - 1561
+     - 257
+   * - after struct wiring, lambdas untouched (7a)
+     - 1561
+     - 257
+   * - after extracting ``process_single_row`` (7b)
+     - --
+     - 225
+   * - after extracting ``process_row_pair`` (7c)
+     - --
+     - 204
+   * - after extracting ``process_single_tile`` (7d)
+     - 1072
+     - 197
+   * - after extracting ``process_tile_pair`` (7e, final)
+     - 861
+     - 160
+
+``disldo_backward`` went from CCN 257 to CCN 160 (a 38% further
+reduction on top of ``block4_codec_refactor``'s own 524 -> 257) without
+changing any runtime behavior -- every phase's local + remote
+regression pass matched exactly, and the two dequant-equality tests
+plus the fp32 crosstile backward test's own dx/weight/importance
+correctness check stayed bit-exact (``0.00000000``) throughout. CCN
+160 is still above ``lizard``'s CCN>15 warning threshold -- the
+remaining complexity is genuine per-call orchestration (byte-position
+bookkeeping across a variable-length compressed tile stream, the
+read-only-vs-writing branch, the pairing-vs-single dispatch) that does
+not decompose further without either the ``std::vector`` scratch
+redesign flagged above or changing the on-disk tile format itself,
+both explicitly out of scope here. ``disldo_backward_sparse_grad``
+(``sisldo_ops.hpp``, CCN 120) and ``disldo_forward`` (CCN 48) were
+deliberately not touched in this pass -- offered as options and
+declined in favor of shipping the one function actually flagged,
+faster; revisit as a follow-up if wanted.
