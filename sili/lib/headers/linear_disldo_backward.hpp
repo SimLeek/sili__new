@@ -641,6 +641,58 @@ void block4_backward_process_row_pair(
     }
 }
 
+// disldo_backward.block4_extract_function_refactor: per-tile orchestration --
+// was the process_tile lambda, now a real free function. Loops over this
+// tile's 4 rows, dispatching each either to block4_backward_process_row_pair
+// (two adjacent live rows, full tile-column) or
+// block4_backward_process_single_row. Shared between the read-only and
+// writing call sites in disldo_backward, so they can't drift apart; every
+// write inside the two functions above is gated by learning_rate != 0.
+template <typename SIZE_TYPE, typename VALUES_TYPE, typename COL_TYPE, typename ScalePolicy,
+          bool DeferredScaleWrite, bool StochasticRounding,
+          template <typename> class SynapsePolicyT>
+bool block4_backward_process_single_tile(
+    const Block4BackwardParams<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& block4_params,
+    Block4BackwardAccumulators<typename ValueAccessor<VALUES_TYPE>::value_type>& block4_accum,
+    std::size_t br, uint32_t bc, uint8_t* tdata) {
+    bool tile_dirty = false;
+    const std::size_t n_in = block4_params.n_in;
+    const std::size_t n_out = block4_params.n_out;
+    const uint32_t* row_live_count = block4_params.row_live_count;
+
+    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+        if (row >= n_in)
+            continue;
+        const uint32_t nnz_row = row_live_count[row];
+        if (nnz_row == 0)
+            continue;
+
+        if ((li % 2) == 0) {
+            const std::size_t row1 = row + 1;
+            const std::size_t col_base_pair = std::size_t(bc) * BLOCK4_TILE;
+            if (row1 < n_in && (col_base_pair + BLOCK4_TILE <= n_out)) {
+                const uint32_t nnz_row1 = row_live_count[row1];
+                if (nnz_row1 > 0) {
+                    block4_backward_process_row_pair<SIZE_TYPE, VALUES_TYPE, COL_TYPE, ScalePolicy,
+                                                     DeferredScaleWrite, StochasticRounding,
+                                                     SynapsePolicyT>(block4_params, block4_accum,
+                                                                     br, bc, li, row, nnz_row, row1,
+                                                                     nnz_row1, tdata, tile_dirty);
+                    ++li; // consumes li+1 too -- for's own ++li then makes
+                          // the net advance +2, safely skipping li+1
+                    continue;
+                }
+            }
+        }
+
+        block4_backward_process_single_row<SIZE_TYPE, VALUES_TYPE, COL_TYPE, ScalePolicy,
+                                           DeferredScaleWrite, StochasticRounding, SynapsePolicyT>(
+            block4_params, block4_accum, br, bc, li, row, nnz_row, tdata, tile_dirty);
+    } // closes for (li...)
+    return tile_dirty;
+}
+
 // ── backward ─────────────────────────────────────────────────────────────────
 
 /**
@@ -1285,47 +1337,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // hazard (a different row's growth could memmove this
                 // row's bytes mid-read) -- see
                 // disldo_backward.row_workspace_snapshot_fix in
-                // docs/research/linear_disldo.rst. process_tile: shared
-                // between the read-only and writing branches below so
-                // they can't drift apart; every write inside is gated by
-                // learning_rate != 0.
-                auto process_tile = [&](uint32_t bc, uint8_t* tdata) -> bool {
-                    bool tile_dirty = false;
-
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                        if (row >= n_in)
-                            continue;
-                        const uint32_t nnz_row = row_live_count[row];
-                        if (nnz_row == 0)
-                            continue;
-
-                        if ((li % 2) == 0) {
-                            const std::size_t row1 = row + 1;
-                            const std::size_t col_base_pair = std::size_t(bc) * BLOCK4_TILE;
-                            if (row1 < n_in && (col_base_pair + BLOCK4_TILE <= n_out)) {
-                                const uint32_t nnz_row1 = row_live_count[row1];
-                                if (nnz_row1 > 0) {
-                                    block4_backward_process_row_pair<
-                                        SIZE_TYPE, VALUES_TYPE, COL_TYPE, ScalePolicy,
-                                        DeferredScaleWrite, StochasticRounding, SynapsePolicyT>(
-                                        block4_params, block4_accum, br, bc, li, row, nnz_row, row1,
-                                        nnz_row1, tdata, tile_dirty);
-                                    ++li; // consumes li+1 too -- for's own ++li then makes
-                                          // the net advance +2, safely skipping li+1
-                                    continue;
-                                }
-                            }
-                        }
-
-                        block4_backward_process_single_row<SIZE_TYPE, VALUES_TYPE, COL_TYPE,
-                                                           ScalePolicy, DeferredScaleWrite,
-                                                           StochasticRounding, SynapsePolicyT>(
-                            block4_params, block4_accum, br, bc, li, row, nnz_row, tdata,
-                            tile_dirty);
-                    } // closes for (li...)
-                    return tile_dirty;
-                }; // closes process_tile
+                // docs/research/linear_disldo.rst.
+                // block4_backward_process_single_tile is shared between the
+                // read-only and writing branches below so they can't drift
+                // apart; every write inside is gated by learning_rate != 0.
 
                 // disldo_backward.fp32_block4_cross_tile_pairing: pairs TWO
                 // DIFFERENT tiles (bcA, bcB) sharing this br into one 8-wide
@@ -1618,12 +1633,17 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             weights.block4.at_index(uint32_t(br), bc, elem_pos, byte_pos);
                         // const_cast: safe specifically because this branch
                         // only runs when learning_rate == value_type(0),
-                        // under which process_tile provably never writes
-                        // through tdata (every write is gated by the same
-                        // condition inside it) -- not a general-purpose cast,
-                        // just avoiding a second (const-parametrized) copy of
-                        // process_tile for a write that can't happen here.
-                        process_tile(bc, const_cast<uint8_t*>(tile.raw_data()));
+                        // under which block4_backward_process_single_tile
+                        // provably never writes through tdata (every write is
+                        // gated by the same condition inside it) -- not a
+                        // general-purpose cast, just avoiding a second
+                        // (const-parametrized) copy of that function for a
+                        // write that can't happen here.
+                        block4_backward_process_single_tile<SIZE_TYPE, VALUES_TYPE, COL_TYPE,
+                                                            ScalePolicy, DeferredScaleWrite,
+                                                            StochasticRounding, SynapsePolicyT>(
+                            block4_params, block4_accum, br, bc,
+                            const_cast<uint8_t*>(tile.raw_data()));
                         byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
                     }
                 } else {
@@ -1703,7 +1723,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 uint8_t scratch_buf[Codec::scratch_bytes];
                                 weights.block4.unpack_workspace_tile(ws, eA, byte_posA,
                                                                      scratch_buf);
-                                const bool tile_dirty = process_tile(bcA, scratch_buf);
+                                const bool tile_dirty = block4_backward_process_single_tile<
+                                    SIZE_TYPE, VALUES_TYPE, COL_TYPE, ScalePolicy,
+                                    DeferredScaleWrite, StochasticRounding, SynapsePolicyT>(
+                                    block4_params, block4_accum, br, bcA, scratch_buf);
                                 if (tile_dirty)
                                     weights.block4.commit_dirty_tile_in_workspace(ws, eA, byte_posA,
                                                                                   scratch_buf);
@@ -1720,7 +1743,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             const std::size_t this_byte_pos = live_byte_pos;
                             uint8_t scratch_buf[Codec::scratch_bytes];
                             weights.block4.unpack_workspace_tile(ws, e, this_byte_pos, scratch_buf);
-                            const bool tile_dirty = process_tile(bc, scratch_buf);
+                            const bool tile_dirty = block4_backward_process_single_tile<
+                                SIZE_TYPE, VALUES_TYPE, COL_TYPE, ScalePolicy, DeferredScaleWrite,
+                                StochasticRounding, SynapsePolicyT>(block4_params, block4_accum, br,
+                                                                    bc, scratch_buf);
                             if (tile_dirty)
                                 weights.block4.commit_dirty_tile_in_workspace(ws, e, this_byte_pos,
                                                                               scratch_buf);
