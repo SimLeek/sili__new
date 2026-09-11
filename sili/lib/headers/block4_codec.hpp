@@ -178,4 +178,84 @@ template <> struct Block4Codec<DeltaCSRBiValues<float>> {
     }
 };
 
+// disldo_backward.block4_extract_function_refactor: parameter-object structs for
+// pulling disldo_backward's nested process_tile/process_row_pair/process_tile_pair
+// closures out into real, independently-measured (by lizard/CCN tools) free
+// functions instead of [&]-capturing lambdas defined inline inside disldo_backward.
+// See docs/research/linear_disldo.rst:block4_backward_extract_function.
+//
+// GPU-portability note (why this shape, not std::function/virtual dispatch): this
+// kernel is a future Kompute/Vulkan/GLSL port target, and GLSL has no lambdas, no
+// closures, no runtime polymorphism -- only plain functions taking explicit
+// parameters/structs. Converting these closures into real functions taking a small
+// parameter-object struct is a move TOWARD that model, not away from it. The two
+// structs below are split to mirror a future GPU binding layout: Block4BackwardParams
+// is broadcast/read-only state (constant for the whole disldo_backward call --
+// eventually a UBO/push-constant), Block4BackwardAccumulators is the per-thread
+// mutable output state (eventually per-workitem SSBO writes, reduced differently on
+// GPU via atomics/workgroup-reduce, but the same field grouping). Per-call
+// coordinates (br, bc, li, row, tdata pointers) are deliberately NOT folded into
+// either struct -- they stay explicit function parameters, since on GPU they'd be
+// derived from gl_GlobalInvocationID (genuinely per-invocation, not uniform state).
+template <typename SIZE_TYPE, typename VALUES_TYPE, typename COL_TYPE> struct Block4BackwardParams {
+    using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
+    SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights;
+    const value_type* input;
+    const value_type* output_grad;
+    SIZE_TYPE batch;
+    SIZE_TYPE in_cols;
+    std::size_t n_in;
+    std::size_t n_out;
+    std::size_t rank;
+    value_type learning_rate;
+    value_type beta2;
+    value_type eps;
+    value_type min_decay_frac;
+    value_type max_abs_delta;
+    value_type max_ci;
+    value_type zero_escape_eps;
+    bool damp_by_importance;
+    bool scale_invariant;
+    bool lr_per_row_nnz;
+    const value_type* gamma_k_arr;  // [rank]
+    const uint32_t* row_live_count; // [n_in]
+};
+
+// Per-thread mutable output accumulators -- replaces the mcol_at/mrow_at/
+// mcol_at_contrib/mrow_at_contrib/mgamma_at/mgamma_at_contrib lambdas (which
+// captured raw base pointers by reference) with real named methods on a real
+// struct; call-site syntax is unchanged (accum.mcol_at(col, k)). tid is this
+// thread's index, needed to address weights.scale_rank_scratch's own
+// per-thread-strided scratch buffers. Constructed once per thread, inside the
+// parallel region, before the per-row-block loop.
+template <typename value_type> struct Block4BackwardAccumulators {
+    int tid;
+    value_type* mdx; // this thread's dx accumulator slice
+    value_type* mcol_base;
+    value_type* mcol_contrib_base;
+    double* mrow_base;
+    double* mrow_contrib_base;
+    value_type* mgamma_base;
+    value_type* mgamma_contrib_base;
+    std::size_t rank;
+
+    value_type& mcol_at(std::size_t col, std::size_t k) { return mcol_base[col * rank + k]; }
+    value_type& mcol_at_contrib(std::size_t col, std::size_t k) {
+        return mcol_contrib_base[col * rank + k];
+    }
+    double& mrow_at(std::size_t row, std::size_t k) { return mrow_base[row * rank + k]; }
+    double& mrow_at_contrib(std::size_t row, std::size_t k) {
+        return mrow_contrib_base[row * rank + k];
+    }
+    value_type& mgamma_at(std::size_t k) { return mgamma_base[k]; }
+    value_type& mgamma_at_contrib(std::size_t k) { return mgamma_contrib_base[k]; }
+};
+
+// Replaces process_tile_pair's std::pair<bool,bool> return -- std::pair has no GLSL
+// analogue, a plain struct does.
+struct Block4TileDirtyPair {
+    bool a;
+    bool b;
+};
+
 #endif

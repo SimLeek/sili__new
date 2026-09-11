@@ -611,51 +611,51 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         std::vector<double> t_row_grad_contrib(static_cast<std::size_t>(num_cpus) * n_in * rank,
                                                0.0);
 
+        // disldo_backward.block4_extract_function_refactor: broadcast/read-only
+        // state for the whole block4 parallel region, constructed once here --
+        // see Block4BackwardParams's own comment (block4_codec.hpp) for why this
+        // is split from the per-thread accumulators below, and the GPU-
+        // portability rationale for the split shape.
+        Block4BackwardParams<SIZE_TYPE, VALUES_TYPE, COL_TYPE> block4_params{weights,
+                                                                             input,
+                                                                             output_grad,
+                                                                             batch,
+                                                                             in_cols,
+                                                                             n_in,
+                                                                             n_out,
+                                                                             rank,
+                                                                             learning_rate,
+                                                                             beta2,
+                                                                             eps,
+                                                                             min_decay_frac,
+                                                                             max_abs_delta,
+                                                                             max_ci,
+                                                                             zero_escape_eps,
+                                                                             damp_by_importance,
+                                                                             scale_invariant,
+                                                                             lr_per_row_nnz,
+                                                                             gamma_k_arr.data(),
+                                                                             row_live_count.data()};
+
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
-            value_type* mdx = t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride;
             // t_col_grad/t_row_grad laid out [thread][col or row][k]; both
             // FP4/FP8 block4 branches below are full rank-N.
-            // cppcheck-suppress constVariablePointer
-            value_type* mcol_base =
-                t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
-            auto mcol_at = [&](std::size_t col, std::size_t k) -> value_type& {
-                return mcol_base[col * rank + k];
-            };
-            // cppcheck-suppress constVariablePointer
-            double* mrow_base = t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank;
-            auto mrow_at = [&](std::size_t row, std::size_t k) -> double& {
-                return mrow_base[row * rank + k];
-            };
-            // cppcheck-suppress constVariablePointer
-            value_type* mcol_contrib_base =
-                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride;
-            auto mcol_at_contrib = [&](std::size_t col, std::size_t k) -> value_type& {
-                return mcol_contrib_base[col * rank + k];
-            };
-            // cppcheck-suppress constVariablePointer
-            double* mrow_contrib_base =
-                t_row_grad_contrib.data() + static_cast<std::size_t>(tid) * n_in * rank;
-            auto mrow_at_contrib = [&](std::size_t row, std::size_t k) -> double& {
-                return mrow_contrib_base[row * rank + k];
-            };
-            // AQRS gamma: block4 gets its OWN parallel region, so
-            // mgamma_at/mgamma_at_contrib need their own tid-scoped
-            // closures, reading from the SAME t_gamma_grad/
-            // t_gamma_grad_contrib buffers the scattered path uses --
-            // both regions accumulate into the same shared array, reduced
-            // together once after both close.
-            // cppcheck-suppress constVariablePointer
-            value_type* mgamma_base =
-                t_gamma_grad.data() + static_cast<std::size_t>(tid) * t_rank_stride;
-            auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
-            // cppcheck-suppress constVariablePointer
-            value_type* mgamma_contrib_base =
-                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * t_rank_stride;
-            auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
-                return mgamma_contrib_base[k];
-            };
+            Block4BackwardAccumulators<value_type> block4_accum{
+                tid, t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride,
+                t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
+                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
+                t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank,
+                t_row_grad_contrib.data() + static_cast<std::size_t>(tid) * n_in * rank,
+                // AQRS gamma: block4 gets its OWN parallel region, so this
+                // thread's mgamma_base/mgamma_contrib_base need their own
+                // tid-scoped offset into the SAME t_gamma_grad/
+                // t_gamma_grad_contrib buffers the scattered path uses --
+                // both regions accumulate into the same shared array,
+                // reduced together once after both close.
+                t_gamma_grad.data() + static_cast<std::size_t>(tid) * t_rank_stride,
+                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * t_rank_stride, rank};
 
 // Partitioned BY BLOCK-ROW, not flat tile index: each thread
 // exclusively owns every tile in its assigned rows, so a
@@ -819,9 +819,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             const value_type iv1 =
                                 input[static_cast<std::size_t>(b) * in_cols + row1];
                             value_type* mdx_row0 =
-                                mdx + static_cast<std::size_t>(b) * in_cols + row0;
+                                block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row0;
                             value_type* mdx_row1 =
-                                mdx + static_cast<std::size_t>(b) * in_cols + row1;
+                                block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row1;
                             const Block4Vec dyv4 = block4_vec_load(
                                 output_grad + static_cast<std::size_t>(b) * n_out + col_base);
                             const Block8Vec dyv_v = block8_vec_dup4(dyv4);
@@ -919,12 +919,13 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             block8_vec_store(ci8, ci_v);
 
                             for (std::size_t k = 0; k < rank; ++k) {
-                                mrow_at(row0, k) += mrow_local0_k[k];
-                                mrow_at(row1, k) += mrow_local1_k[k];
-                                mrow_at_contrib(row0, k) += mrow_local0_k_contrib[k];
-                                mrow_at_contrib(row1, k) += mrow_local1_k_contrib[k];
-                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
-                                mgamma_at_contrib(k) +=
+                                block4_accum.mrow_at(row0, k) += mrow_local0_k[k];
+                                block4_accum.mrow_at(row1, k) += mrow_local1_k[k];
+                                block4_accum.mrow_at_contrib(row0, k) += mrow_local0_k_contrib[k];
+                                block4_accum.mrow_at_contrib(row1, k) += mrow_local1_k_contrib[k];
+                                block4_accum.mgamma_at(k) +=
+                                    static_cast<value_type>(mgamma_local_k[k]);
+                                block4_accum.mgamma_at_contrib(k) +=
                                     static_cast<value_type>(mgamma_local_k_contrib[k]);
                             }
                             // Write-back: was_live8[idx] gate +
@@ -934,8 +935,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             // tripled per precision, into one call per half.
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 for (std::size_t k = 0; k < rank; ++k) {
-                                    mcol_at(col4[lj], k) += (mcol_acc + k * BLOCK4_TILE)[lj];
-                                    mcol_at_contrib(col4[lj], k) +=
+                                    block4_accum.mcol_at(col4[lj], k) +=
+                                        (mcol_acc + k * BLOCK4_TILE)[lj];
+                                    block4_accum.mcol_at_contrib(col4[lj], k) +=
                                         (mcol_acc_contrib + k * BLOCK4_TILE)[lj];
                                 }
                                 for (int half = 0; half < 2; ++half) {
@@ -1063,7 +1065,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 out_scale_k4[k][lj] = weights.get_output_scale_k(col, k);
                         }
 
-                        // mcol_at(col,k) is a real 4-way (times rank) SCATTER
+                        // block4_accum.mcol_at(col,k) is a real 4-way (times rank) SCATTER
                         // if written every (b, lj) -- accumulate into small
                         // local arrays across the whole batch loop instead
                         // (pure register/stack traffic), flush once after.
@@ -1115,7 +1117,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 const value_type iv =
                                     input[static_cast<std::size_t>(b) * in_cols + row];
                                 value_type* mdx_row =
-                                    mdx + static_cast<std::size_t>(b) * in_cols + row;
+                                    block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row;
                                 for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                     if (!col_valid4[lj])
                                         continue;
@@ -1221,8 +1223,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                                     const value_type iv =
                                         input[static_cast<std::size_t>(b) * in_cols + row];
-                                    value_type* mdx_row =
-                                        mdx + static_cast<std::size_t>(b) * in_cols + row;
+                                    value_type* mdx_row = block4_accum.mdx +
+                                                          static_cast<std::size_t>(b) * in_cols +
+                                                          row;
                                     const Block4Vec dyv_v = block4_vec_load(
                                         output_grad + static_cast<std::size_t>(b) * n_out +
                                         col_base);
@@ -1315,18 +1318,20 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         // precision, into one call.
                         if (learning_rate != value_type(0)) {
                             for (std::size_t k = 0; k < rank; ++k) {
-                                mrow_at(row, k) += mrow_local_k[k];
-                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
-                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
-                                mgamma_at_contrib(k) +=
+                                block4_accum.mrow_at(row, k) += mrow_local_k[k];
+                                block4_accum.mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                block4_accum.mgamma_at(k) +=
+                                    static_cast<value_type>(mgamma_local_k[k]);
+                                block4_accum.mgamma_at_contrib(k) +=
                                     static_cast<value_type>(mgamma_local_k_contrib[k]);
                             }
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 if (!col_valid4[lj])
                                     continue;
                                 for (std::size_t k = 0; k < rank; ++k) {
-                                    mcol_at(col4[lj], k) += mcol4_rank[k][lj];
-                                    mcol_at_contrib(col4[lj], k) += mcol4_rank_contrib[k][lj];
+                                    block4_accum.mcol_at(col4[lj], k) += mcol4_rank[k][lj];
+                                    block4_accum.mcol_at_contrib(col4[lj], k) +=
+                                        mcol4_rank_contrib[k][lj];
                                 }
                                 const value_type imp_ratio = ci4[lj] / combined_imp_scale4[lj];
                                 Codec::template encode<StochasticRounding>(
@@ -1513,29 +1518,31 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                         gamma_k_arr[k];
                                 }
                             }
-                            mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+                            block4_accum.mdx[static_cast<std::size_t>(b) * in_cols + row] +=
+                                mdx_term;
                         }
 
                         if (training) {
                             for (std::size_t k = 0; k < rank; ++k) {
-                                mrow_at(row, k) += mrow_local_k[k];
-                                mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
-                                mgamma_at(k) += static_cast<value_type>(mgamma_local_k[k]);
-                                mgamma_at_contrib(k) +=
+                                block4_accum.mrow_at(row, k) += mrow_local_k[k];
+                                block4_accum.mrow_at_contrib(row, k) += mrow_local_k_contrib[k];
+                                block4_accum.mgamma_at(k) +=
+                                    static_cast<value_type>(mgamma_local_k[k]);
+                                block4_accum.mgamma_at_contrib(k) +=
                                     static_cast<value_type>(mgamma_local_k_contrib[k]);
                             }
                             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                                 for (std::size_t k = 0; k < rank; ++k) {
                                     if (colA[lj] < n_out) {
-                                        mcol_at(colA[lj], k) +=
+                                        block4_accum.mcol_at(colA[lj], k) +=
                                             mcol_local8[k * 2 * BLOCK4_TILE + lj];
-                                        mcol_at_contrib(colA[lj], k) +=
+                                        block4_accum.mcol_at_contrib(colA[lj], k) +=
                                             mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj];
                                     }
                                     if (colB[lj] < n_out) {
-                                        mcol_at(colB[lj], k) +=
+                                        block4_accum.mcol_at(colB[lj], k) +=
                                             mcol_local8[k * 2 * BLOCK4_TILE + lj + BLOCK4_TILE];
-                                        mcol_at_contrib(colB[lj], k) +=
+                                        block4_accum.mcol_at_contrib(colB[lj], k) +=
                                             mcol_local_contrib8[k * 2 * BLOCK4_TILE + lj +
                                                                 BLOCK4_TILE];
                                     }
