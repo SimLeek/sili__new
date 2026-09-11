@@ -562,6 +562,38 @@ def _nucleus_top_k_csr(
     return ptrs, indices, values
 
 
+def _record_grad_selection_stats(layer, dy2d: np.ndarray, dp: np.ndarray, di: np.ndarray, dv: np.ndarray) -> None:
+    """Real per-call GRADIENT-axis R/k stats for a dy_r_target nucleus
+    selection, mirroring sili_peridot's own x-axis
+    _update_input_selection_stats -- overwritten each call, not
+    accumulated. Exposed as layer.last_grad_selection so callers can log
+    achieved dy-axis density the same way x_r_target's achieved density
+    is already logged; previously the gradient axis only ever had its
+    setpoint available (r_bar), never a measured R/k, so a caller had no
+    way to tell how much the nucleus selection actually sparsified the
+    gradient at a given setpoint. di/dv are unused directly (k_per_row is
+    derived from dp's row-pointer diffs instead) but kept as parameters
+    so call sites can pass the exact CSR triple they just computed
+    without re-deriving it."""
+    del di
+    rows, cols = dy2d.shape
+    row_sq_total = np.sum(dy2d.astype(np.float64) ** 2, axis=1)
+    kept_sq = np.zeros(rows, dtype=np.float64)
+    k_per_row = np.zeros(rows, dtype=np.int64)
+    for row in range(rows):
+        start, end = int(dp[row]), int(dp[row + 1])
+        kept_sq[row] = np.sum(dv[start:end].astype(np.float64) ** 2)
+        k_per_row[row] = end - start
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_per_row = np.where(row_sq_total > 0, kept_sq / row_sq_total, 1.0)
+    layer.last_grad_selection = {
+        "R_mean": float(np.mean(r_per_row)),
+        "k_mean": float(np.mean(k_per_row)),
+        "rows": int(rows),
+        "cols": int(cols),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -706,6 +738,7 @@ class DISLDOLayer(_SparseLayerBase):
                     # gradient energy, not a fixed fraction.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
                     dx = self._c.backward_sparse(
                         x_dense,
                         dp,
@@ -1004,6 +1037,7 @@ class DISLDOLayer32(_SparseLayerBase):
                     # See DISLDOLayer.forward's own dy_r_target comment.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
                     dx = self._c.backward_sparse(
                         x_dense,
                         dp,
@@ -1568,7 +1602,7 @@ class FoldedLayer(Module):
             )
 
             # Each suffix layer gets the same dy_raw; accumulate dx.
-            dx_parts = [layer.backward_dense(dy_raw, lr, lr_per_row_nnz=True) for layer in _layers]
+            dx_parts = [layer.backward_dense(x_np, dy_raw, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(_batch, -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)
@@ -1759,7 +1793,7 @@ class FoldedColumnLayer(FoldedLayer):
             dy_np = np.asarray(out.grad, dtype=np.float32)
             if dy_np.ndim == 1:
                 dy_np = dy_np[np.newaxis, :]
-            dx_parts = [layer.backward_dense(dy_np, lr, lr_per_row_nnz=True) for layer in _layers]
+            dx_parts = [layer.backward_dense(x_np, dy_np, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(dy_np.shape[0], -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)
