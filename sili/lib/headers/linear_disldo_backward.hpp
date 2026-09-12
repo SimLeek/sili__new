@@ -870,12 +870,24 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
                 const value_type contrib = quant8[i] * combined_scale8[i] * iv;
                 g_agg8[i] += g;
                 contrib_agg8[i] += contrib;
+            }
+            block4_accum.mdx[row * static_cast<std::size_t>(batch) + b] += mdx_term;
+        }
+
+        // disldo_backward.batch_hsum_deferral: out_scale_k_i/value_scale_k_row/
+        // gamma_k_arr are all batch-invariant here, so this k-loop (rank * 8
+        // work) is deferred to run ONCE per tile against g_agg8/contrib_agg8
+        // instead of once per batch sample -- same algebraic identity as
+        // single_row/row_pair's deferral, just without an hsum in the middle.
+        if (training) {
+            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
                 for (std::size_t k = 0; k < rank; ++k) {
                     const value_type out_scale_k_i =
                         i < BLOCK4_TILE ? out_scale_kA[k * BLOCK4_TILE + i]
                                         : out_scale_kB[k * BLOCK4_TILE + (i - BLOCK4_TILE)];
-                    const value_type prod_g = quant_floor8[i] * out_scale_k_i * g;
-                    const value_type prod_contrib = quant_floor8[i] * out_scale_k_i * contrib;
+                    const value_type prod_g = quant_floor8[i] * out_scale_k_i * g_agg8[i];
+                    const value_type prod_contrib =
+                        quant_floor8[i] * out_scale_k_i * contrib_agg8[i];
                     mrow_local_k[k] += static_cast<double>(prod_g) * gamma_k_arr[k];
                     mrow_local_k_contrib[k] += static_cast<double>(prod_contrib) * gamma_k_arr[k];
                     mgamma_local_k[k] +=
@@ -883,12 +895,11 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
                     mgamma_local_k_contrib[k] +=
                         static_cast<double>(out_scale_k_i * value_scale_k_row[k] * prod_contrib);
                     mcol_local8[k * 2 * BLOCK4_TILE + i] +=
-                        quant_floor8[i] * value_scale_k_row[k] * g * gamma_k_arr[k];
+                        quant_floor8[i] * value_scale_k_row[k] * g_agg8[i] * gamma_k_arr[k];
                     mcol_local_contrib8[k * 2 * BLOCK4_TILE + i] +=
-                        quant_floor8[i] * value_scale_k_row[k] * contrib * gamma_k_arr[k];
+                        quant_floor8[i] * value_scale_k_row[k] * contrib_agg8[i] * gamma_k_arr[k];
                 }
             }
-            block4_accum.mdx[row * static_cast<std::size_t>(batch) + b] += mdx_term;
         }
 
         if (training) {

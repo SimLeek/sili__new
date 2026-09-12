@@ -2109,3 +2109,78 @@ verified fix produced no measured speedup is that it's now the
 dominant remaining cost. Not yet confirmed; re-profiling or applying
 the same block-transpose treatment to the dx accumulator is the
 natural next step.
+
+.. _disldo_backward.batch_hsum_deferral:
+
+``disldo_backward``: per-sample rank-loop redundancy (the real bottleneck)
+-----------------------------------------------------------------------------
+
+*ID:* ``disldo_backward.batch_hsum_deferral``
+
+A third hypothesis was tried on top of ``batch_stride_transpose`` above:
+transposing the ``mdx`` write-back to feature-major too. Also numerically
+correct (163/163 + 215/215), also made things WORSE (54.9ms -> 63.2ms at
+batch=256) -- rejected, pure overhead with no offsetting benefit.
+
+**Real fix #1 (modest)**: inside ``block4_backward_process_single_row`` and
+``_row_pair``, the ``mrow_local_k``/``mgamma_local_k`` (+contrib variants)
+accumulators called ``block4_vec_hsum`` (horizontal SIMD reduction, slow on
+AVX2) up to ``4*rank`` times PER BATCH SAMPLE. Every factor besides
+``g_v``/``contrib_v`` (``quant_floor_v``, ``out_scale_k_v``, ``value_scale_k``,
+``gamma_k_arr``) is batch-invariant inside a tile visit, so
+``sum_b(hsum(C*x_b)) == hsum(C*sum_b(x_b))`` -- deferred these accumulators
+onto the already-existing ``g_agg_v``/``contrib_agg_v`` vectors (which the
+``ci``/``cw`` synapse update already accumulated the same way) and hsum once
+per tile instead of once per sample. ``block4_backward_process_tile_pair``
+was skipped in this round: its loop is pure scalar with no ``hsum`` call, so
+it looked unaffected by the same pattern. Result: batch=256 went from 53.4ms
+to ~50ms -- real but modest (~6-7%), and did **not** close the ~25-30x gap
+to torch.
+
+**Real fix #2 (the actual bottleneck)**: `callgrind` (perf isn't installed on
+this machine) on a single-threaded batch=256 probe, annotated with
+``callgrind_annotate``, showed the compiled extension is LTO-inlined into one
+giant ``disldo_backward<...>::_omp_fn.2`` clone (88.89% of all instructions),
+erasing per-function attribution -- but line-level annotation inside that
+blob showed roughly 58% of ALL backward-pass instructions concentrated in
+~15 lines, all inside ``block4_backward_process_tile_pair``'s per-batch-sample
+loop (``out_scale_k_i`` alone was 22.48%). The rank-loop computing
+``mrow_local_k``/``mgamma_local_k``/``mcol_local8`` was still nested inside
+the ``for (b...)`` batch loop -- the exact same batch-invariant-factor
+redundancy as fix #1, just without an ``hsum`` call in the middle, which is
+why it had been wrongly assumed safe. ``g_agg8``/``contrib_agg8`` were
+already being accumulated per-sample (feeding the ``ci``/``cw`` update) but
+unused for this purpose. Deferred the whole ``for (i) for (k)`` block to run
+once per tile after the batch loop closes, reading ``g_agg8[i]``/
+``contrib_agg8[i]`` instead of per-sample ``g``/``contrib`` -- same algebraic
+identity as fix #1, applied to the one place it had been missed.
+
+**Result**: batch=256 backward-at-lr0 (pure compute, no optimizer step) went
+from ~25-30x slower than torch down to **3.1-3.5x**, confirmed reproducible
+across two independent full-sweep runs (NUM_CPUS=4):
+
+.. code-block:: text
+
+    batch | sili bwd lr0  torch bwd   ratio  (run 1 / run 2)
+        1 |     0.90ms      0.19ms    4.88x  /  0.82ms  0.18ms  4.62x
+        4 |     0.68ms      0.19ms    3.50x  /  0.64ms  0.24ms  2.68x
+       16 |     0.90ms      0.24ms    3.78x  /  0.75ms  0.23ms  3.26x
+       64 |     1.43ms      0.37ms    3.89x  /  1.59ms  0.38ms  4.20x
+      256 |     3.90ms      1.11ms    3.52x  /  3.48ms  1.12ms  3.10x
+
+Per-sample cost at batch=256 also stopped scaling super-linearly: sili's
+backward-at-lr0 per-sample cost drops from ~1.25ms (batch=1) to ~0.028ms
+(batch=256), a ~44x improvement with batch size -- close to torch's own
+~83x (0.47ms -> 0.0056ms), rather than the previous near-flat/worse scaling.
+
+Verified via the full local ``ctest`` suite (163/163, incl. both bit-exact
+dequant-equality gates) and Python suite (215/215). Shared template code
+(``block4_backward_process_tile_pair`` is templated on ``VALUES_TYPE``, one
+call site inside ``disldo_backward`` itself), so both fixes apply to fp8/fp4
+automatically -- no separate per-precision work needed.
+
+**Still open**: fwd-only and batch=1 backward ratios (still ~4-24x for
+forward, ~4.6-4.9x for backward at batch=1) were not targeted by this round
+and remain a smaller, separate gap -- likely genuine per-call Python/pybind
+and per-synapse-update overhead rather than a batch-scaling artifact. Not
+yet investigated.
