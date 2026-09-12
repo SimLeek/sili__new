@@ -492,7 +492,11 @@ void block4_backward_process_row_pair(
             out_scale_k4[k][lj] = weights.get_output_scale_k(col4[lj], k);
     }
 
-    std::vector<value_type> value_scale_k_row0(rank), value_scale_k_row1(rank);
+    // disldo_backward.scale_rank_scratch_pair_task: was a fresh
+    // std::vector heap allocation per call -- see docs/research/
+    // delta_csr_types.rst for the callgrind evidence this fixes.
+    value_type* value_scale_k_row0 = srs.value_scale_k_pair.data() + tid_rank * 2;
+    value_type* value_scale_k_row1 = value_scale_k_row0 + rank;
     for (std::size_t k = 0; k < rank; ++k) {
         value_scale_k_row0[k] = weights.get_value_scale_k(row0, k);
         value_scale_k_row1[k] = weights.get_value_scale_k(row1, k);
@@ -538,8 +542,14 @@ void block4_backward_process_row_pair(
         block4_vec_store(mcol_acc + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
         block4_vec_store(mcol_acc_contrib + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
     }
-    std::vector<double> mrow_local0_k(rank, 0.0), mrow_local1_k(rank, 0.0),
-        mrow_local0_k_contrib(rank, 0.0), mrow_local1_k_contrib(rank, 0.0);
+    double* mrow_local0_k = srs.mrow_local_k_pair.data() + tid_rank * 2;
+    double* mrow_local1_k = mrow_local0_k + rank;
+    double* mrow_local0_k_contrib = srs.mrow_local_k_pair_contrib.data() + tid_rank * 2;
+    double* mrow_local1_k_contrib = mrow_local0_k_contrib + rank;
+    std::fill(mrow_local0_k, mrow_local0_k + rank, 0.0);
+    std::fill(mrow_local1_k, mrow_local1_k + rank, 0.0);
+    std::fill(mrow_local0_k_contrib, mrow_local0_k_contrib + rank, 0.0);
+    std::fill(mrow_local1_k_contrib, mrow_local1_k_contrib + rank, 0.0);
     double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
     double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
     std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
@@ -779,6 +789,13 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
     const std::size_t col_baseA = std::size_t(bcA) * BLOCK4_TILE;
     const std::size_t col_baseB = std::size_t(bcB) * BLOCK4_TILE;
     const bool training = (learning_rate != value_type(0));
+    // disldo_backward.scale_rank_scratch_pair_task: see block4_backward_
+    // process_row_pair's identical comment -- the per-li locals below used
+    // to be fresh std::vector heap allocations every call.
+    const int tid = block4_accum.tid;
+    const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
+    const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
+    auto& srs = weights.scale_rank_scratch;
     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
         if (row >= n_in)
@@ -789,15 +806,18 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
         const value_type imp_scale = weights.get_importance_scale(row);
         const value_type effective_lr =
             lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row) : learning_rate;
-        // Shared across both halves (same row).
-        std::vector<value_type> value_scale_k_row(rank);
+        // Shared across both halves (same row) -- reuses the same
+        // single-row-shaped scratch slot block4_backward_process_single_row
+        // uses (never concurrent on one thread with that function).
+        value_type* value_scale_k_row = srs.value_scale_k.data() + tid_rank;
         for (std::size_t k = 0; k < rank; ++k)
             value_scale_k_row[k] = weights.get_value_scale_k(row, k);
 
         std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
         value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
         // Per-half, per-k -- A and B are DIFFERENT columns.
-        std::vector<value_type> out_scale_kA(rank * BLOCK4_TILE), out_scale_kB(rank * BLOCK4_TILE);
+        value_type* out_scale_kA = srs.out_scale_k_pair.data() + tid_rank_tile * 2;
+        value_type* out_scale_kB = out_scale_kA + rank * BLOCK4_TILE;
         value_type combined_scale8[2 * BLOCK4_TILE];
         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
             colA[lj] = col_baseA + lj;
@@ -849,11 +869,21 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
 
         double g_agg8[2 * BLOCK4_TILE] = {0};
         // Single accumulator per k (not split A/B) -- both
-        // halves feed the SAME row's mrow/mgamma gradient.
-        std::vector<double> mrow_local_k(rank, 0.0), mrow_local_k_contrib(rank, 0.0);
-        std::vector<double> mgamma_local_k(rank, 0.0), mgamma_local_k_contrib(rank, 0.0);
-        std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
-            mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
+        // halves feed the SAME row's mrow/mgamma gradient -- reuses the
+        // same single-row-shaped scratch slots as block4_backward_process_
+        // single_row (never concurrent on one thread with that function).
+        double* mrow_local_k = srs.mrow_local_k.data() + tid_rank;
+        double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_rank;
+        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
+        double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+        std::fill(mrow_local_k, mrow_local_k + rank, 0.0);
+        std::fill(mrow_local_k_contrib, mrow_local_k_contrib + rank, 0.0);
+        std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
+        std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
+        value_type* mcol_local8 = srs.mcol_local_pair.data() + tid_rank_tile * 2;
+        value_type* mcol_local_contrib8 = srs.mcol_local_pair_contrib.data() + tid_rank_tile * 2;
+        std::fill(mcol_local8, mcol_local8 + rank * 2 * BLOCK4_TILE, value_type(0));
+        std::fill(mcol_local_contrib8, mcol_local_contrib8 + rank * 2 * BLOCK4_TILE, value_type(0));
         // disldo_backward.batch_stride_transpose: see block4_backward_process_
         // single_row's identical comment. bcA/bcB tile-blocks are already
         // zero-padded past n_out, so no extra bounds check is needed here.

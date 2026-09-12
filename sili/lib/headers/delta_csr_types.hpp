@@ -1123,6 +1123,23 @@ struct SparseLinearWeightsDelta {
             mcol_acc_raw; // [thread][k][tile_width] -- Block4Vec accumulator backing
         std::vector<value_type> mcol_acc_raw_contrib; // [thread][k][tile_width]
 
+        // block4_backward_process_row_pair/tile_pair-only fields -- these
+        // process TWO rows or TWO tile-halves (A/B) at once, so they need
+        // genuinely double-width scratch, unlike the single-row-shaped
+        // fields above (which row_pair/tile_pair also use directly, for
+        // their own single-row-shaped locals -- see docs/research/
+        // delta_csr_types.rst:sparse_linear_weights_delta.scale_rank_scratch_pair_task).
+        // Replaces what used to be a fresh heap std::vector allocation on
+        // EVERY row-pair/tile-pair call -- measured via callgrind as ~33%
+        // of disldo_backward's total instructions at batch=1 (malloc/free/
+        // operator new dominating over actual arithmetic).
+        std::vector<value_type> value_scale_k_pair;      // [thread][row0_or_1][k]
+        std::vector<double> mrow_local_k_pair;           // [thread][row0_or_1][k]
+        std::vector<double> mrow_local_k_pair_contrib;   // [thread][row0_or_1][k]
+        std::vector<value_type> out_scale_k_pair;        // [thread][A_or_B][k][tile_width]
+        std::vector<value_type> mcol_local_pair;         // [thread][k][2*tile_width]
+        std::vector<value_type> mcol_local_pair_contrib; // [thread][k][2*tile_width]
+
         std::size_t cap_threads = 0, cap_rank = 0, cap_tile_width = 0;
 
         // Grow-only (never shrinks) -- called automatically at the top of
@@ -1152,6 +1169,12 @@ struct SparseLinearWeightsDelta {
             mgamma_local_k_contrib.resize(flat);
             mcol_acc_raw.resize(flat_tiled);
             mcol_acc_raw_contrib.resize(flat_tiled);
+            value_scale_k_pair.resize(2 * flat);
+            mrow_local_k_pair.resize(2 * flat);
+            mrow_local_k_pair_contrib.resize(2 * flat);
+            out_scale_k_pair.resize(2 * flat_tiled);
+            mcol_local_pair.resize(2 * flat_tiled);
+            mcol_local_pair_contrib.resize(2 * flat_tiled);
         }
     };
     ScaleRankScratch scale_rank_scratch;

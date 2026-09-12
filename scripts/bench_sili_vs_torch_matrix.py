@@ -174,23 +174,26 @@ def print_raw_tables(results, batches, densities, n_in):
 
 
 def print_summary_table(results, batches, densities):
-    print("\n=== Summary: where does sili need the most attention? ===")
+    # Shows BOTH engines' numbers, not just whichever wins -- a disldo-only
+    # or sisldo-only reader would otherwise never see how the engine they
+    # didn't pick is actually doing at that cell.
+    print("\n=== Summary: disldo vs sisldo vs torch, every cell ===")
     print(
-        f"{'op':>5} {'batch':>6} {'density':>8} | {'best sili':>16} {'engine':>7} "
-        f"{'torch':>16} | {'ratio':>7} {'sili wins?':>10}"
+        f"{'op':>5} {'batch':>6} {'density':>8} | {'disldo':>16} {'ratio':>7} | "
+        f"{'sisldo':>16} {'ratio':>7} | {'torch':>16} | {'best':>7} {'wins?':>6}"
     )
     for op in ("fwd", "bwd0", "bwdX"):
         for batch in batches:
             for density in densities:
                 cell = results[(batch, density)][op]
-                d, s = cell["disldo"], cell["sisldo"]
-                best, engine = (d, "disldo") if d[0] <= s[0] else (s, "sisldo")
-                t = cell["torch"]
-                ratio = best[0] / t[0]
-                win = "YES" if ratio <= 1.0 else "no"
+                d, s, t = cell["disldo"], cell["sisldo"], cell["torch"]
+                best_ratio = min(d[0], s[0]) / t[0]
+                best_engine = "disldo" if d[0] <= s[0] else "sisldo"
+                win = "YES" if best_ratio <= 1.0 else "no"
                 print(
-                    f"{op:>5} {batch:>6} {density:>8.3f} | {fmt(best):>16} {engine:>7} "
-                    f"{fmt(t):>16} | {ratio:>6.2f}x {win:>10}"
+                    f"{op:>5} {batch:>6} {density:>8.3f} | {fmt(d):>16} {d[0] / t[0]:>6.2f}x | "
+                    f"{fmt(s):>16} {s[0] / t[0]:>6.2f}x | {fmt(t):>16} | "
+                    f"{best_engine:>7} {win:>6}"
                 )
 
 
