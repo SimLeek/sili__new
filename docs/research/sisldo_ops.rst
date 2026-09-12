@@ -616,6 +616,42 @@ bit-exact dequant-equality gates, 215/215 Python). Shared template code
 (one ``disldo_backward_sparse_grad`` instantiated per ``VALUES_TYPE``), so
 the fix applies to fp8/fp4/fp32 uniformly.
 
+.. _disldo_backward_sparse_grad.read_only_decode_cache:
+
+Fixed: read-only (``learning_rate == 0``) block4 path re-decoded per batch sample
+-------------------------------------------------------------------------------------
+
+*ID:* ``disldo_backward_sparse_grad.read_only_decode_cache``
+
+Follow-up to ``batch_aggregated_update`` above, found while benchmarking it: the
+read-only block4 branch (no weight update, just dx) already had its tile
+*coordinates* precomputed once per row, but still called
+``weights.block4.at_index()`` and ``decode_weight()`` fresh on EVERY batch
+sample that touched a given tile -- the coordinate fix removed the cursor
+re-walk but not the actual bit-unpack + scale lookup, which is the more
+expensive part. Fixed by decoding ``w_decoded * S`` once per (tile, li, lj)
+into a per-row buffer before the batch loop, alongside the coordinate
+precompute; the batch loop now does a single array read instead of a
+tile lookup + decode per sample.
+
+Measured on a fully-dense (``load_dense_codes``) 288x288 fp4 layer,
+batch=256: this read-only path went from 34.8ms to 10.3ms (~3.4x), on top
+of the earlier coordinate-precompute fix (38.8ms originally) -- ~3.8x
+total. The write path (``learning_rate != 0``) already had its own decode
+cache from ``batch_aggregated_update`` and is unaffected by this change.
+
+``sisldo_forward`` (the separate all-read forward function, sisldo_ops.hpp
+top half) has a similar-flavored redundancy in its own block4 branch --
+each work item independently calls ``at_index()`` + decode, with no cache
+across batch samples touching the same tile -- but its work is distributed
+by flattening `(batch, window)` pairs across ALL samples to load-balance
+genuinely variable per-sample input sparsity, rebuilt fresh every batch
+iteration. Fixing it the same way would mean inverting that work
+distribution (group by tile first, then find which batches touch it)
+rather than a small mechanical addition, and risks hurting load balance
+for genuinely uneven-sparsity batches -- deliberately NOT done in this
+pass; flagged as a separate, larger-scoped follow-up if needed.
+
 .. _disldo_backward_sparse_grad.merge_scan_design:
 
 Merge-scan cost and the additive contrib combination

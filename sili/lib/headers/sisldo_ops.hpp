@@ -924,18 +924,37 @@ void disldo_backward_sparse_grad(
 
                 if (learning_rate == value_type(0)) {
                     // Read-only path, no concurrency hazard. Tile coordinates
-                    // (bc/elem_pos/byte_pos) don't depend on b -- precomputed
-                    // once instead of re-walking the row cursor per sample.
+                    // (bc/elem_pos/byte_pos) AND the decoded true weight
+                    // (w_decoded * S) don't depend on b -- both precomputed
+                    // once per row instead of re-decoded (bit-unpack +
+                    // at_index lookup) per batch sample. See
+                    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.
+                    // read_only_decode_cache.
                     std::vector<uint32_t> tile_bc(row_nnz_b4);
-                    std::vector<std::size_t> tile_elem_pos(row_nnz_b4), tile_byte_pos(row_nnz_b4);
+                    std::vector<value_type> w_buf(row_nnz_b4 * BLOCK4_TILE * BLOCK4_TILE);
                     {
                         auto bc_cursor = weights.block4.row_cursor(br);
                         std::size_t elem_pos = BL4.elem_start[br];
                         std::size_t byte_pos = weights.block4.tile_byte_start[br];
                         for (std::size_t e = 0; e < row_nnz_b4; ++e) {
-                            tile_bc[e] = bc_cursor.advance();
-                            tile_elem_pos[e] = elem_pos;
-                            tile_byte_pos[e] = byte_pos;
+                            const uint32_t bc = bc_cursor.advance();
+                            tile_bc[e] = bc;
+                            const auto tile = weights.block4.at_index(static_cast<uint32_t>(br), bc,
+                                                                      elem_pos, byte_pos);
+                            const uint8_t* tdata = tile.raw_data();
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = br * BLOCK4_TILE + li;
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const std::size_t col =
+                                        static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
+                                    const std::size_t idx =
+                                        e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                    w_buf[idx] = (row < n_inputs && col < out_cols)
+                                                     ? decode_weight(tdata, li, lj) *
+                                                           weights.get_scale(row, col)
+                                                     : value_type(0);
+                                }
+                            }
                             byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
                             ++elem_pos;
                         }
@@ -971,10 +990,6 @@ void disldo_backward_sparse_grad(
                             }
 
                             if (any) {
-                                const auto tile =
-                                    weights.block4.at_index(static_cast<uint32_t>(br), bc,
-                                                            tile_elem_pos[e], tile_byte_pos[e]);
-                                const uint8_t* tdata = tile.raw_data();
                                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                                     const std::size_t row = br * BLOCK4_TILE + li;
                                     if (row >= n_inputs)
@@ -985,11 +1000,9 @@ void disldo_backward_sparse_grad(
                                         const std::size_t col = window_lo + lj;
                                         if (col >= out_cols)
                                             continue;
-                                        const value_type w_decoded = decode_weight(tdata, li, lj);
-                                        // Rank-N, matches the scattered read-only path.
-                                        const value_type S = weights.get_scale(row, col);
-                                        const value_type w = w_decoded * S;
-                                        dx_accum[li] += w * dy_local[lj];
+                                        const std::size_t idx =
+                                            e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                        dx_accum[li] += w_buf[idx] * dy_local[lj];
                                     }
                                 }
                             }
