@@ -283,7 +283,6 @@ void block4_backward_process_single_row(
             for (int lane = 0; lane < BLOCK4_TILE; ++lane)
                 quant_floor_v[lane] = Codec::quant_floor(quant_start_v[lane], zero_escape_eps);
             Block4Vec g_agg_v = block4_vec_broadcast(0.0f);
-            Block4Vec contrib_agg_v = block4_vec_broadcast(0.0f);
             // mcol_acc_raw/_contrib are the only TRUE
             // cross-batch accumulators here; backed by
             // scratch (task #295).
@@ -295,25 +294,29 @@ void block4_backward_process_single_row(
                                  block4_vec_broadcast(0.0f));
             }
             const bool training = (learning_rate != value_type(0));
+            // disldo_backward.contrib_batch_invariant: contrib = (quant_start*S)*iv
+            // is a CONSTANT (quant_start*S) times iv, so sum_b(contrib) ==
+            // (quant_start*S)*sum_b(iv) -- tracking a running scalar iv sum here
+            // and multiplying once after the loop replaces a per-sample Block4Vec
+            // multiply+add with a per-sample scalar add. See
+            // docs/research/linear_disldo.rst.
+            double input_sum = 0.0;
             for (SIZE_TYPE b = 0; b < batch; ++b) {
                 const value_type iv = input_row_T[b];
+                input_sum += static_cast<double>(iv);
                 value_type* mdx_row = block4_accum.mdx + row * static_cast<std::size_t>(batch) + b;
                 const Block4Vec dyv_v =
                     block4_vec_load(dy_tile_T + static_cast<std::size_t>(b) * BLOCK4_TILE);
-                const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
-                if (training) {
-                    // Additive g+contrib combination -- see
-                    // the scattered path's fix.
-                    const Block4Vec contrib_v =
-                        (quant_start_v * combined_scale_v) * block4_vec_broadcast(iv);
-                    g_agg_v += g_v;
-                    contrib_agg_v += contrib_v;
-                }
+                if (training)
+                    g_agg_v += dyv_v * block4_vec_broadcast(iv);
                 // w = quant*S, FIXED for the whole batch --
                 // see quant_start_v's own comment above.
                 const Block4Vec w_v = quant_start_v * combined_scale_v;
                 *mdx_row += block4_vec_hsum(w_v * dyv_v);
             }
+            const Block4Vec contrib_agg_v =
+                (quant_start_v * combined_scale_v) *
+                block4_vec_broadcast(static_cast<value_type>(input_sum));
             // disldo_backward.batch_hsum_deferral: mrow_local_k/mgamma_local_k
             // (and contrib variants) are LINEAR in g_v/contrib_v, and every
             // other factor (quant_floor_v, out_scale_k_v, value_scale_k[k],
@@ -543,27 +546,32 @@ void block4_backward_process_row_pair(
     std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
 
     Block8Vec g_agg_v = block8_vec_broadcast(0.0f);
-    Block8Vec contrib_agg_v = block8_vec_broadcast(0.0f);
     const bool training = (learning_rate != value_type(0));
+    // disldo_backward.contrib_batch_invariant: see block4_backward_process_
+    // single_row's identical comment -- contrib = (quant_start*S)*iv is a
+    // CONSTANT times iv per row-half, so summing it over the batch collapses
+    // to a constant times sum_b(iv). Track running row0/row1 input sums
+    // instead of a per-sample Block8Vec multiply+add.
+    double iv0_sum = 0.0, iv1_sum = 0.0;
     for (SIZE_TYPE b = 0; b < batch; ++b) {
         const value_type iv0 = input_row0_T[b];
         const value_type iv1 = input_row1_T[b];
+        iv0_sum += static_cast<double>(iv0);
+        iv1_sum += static_cast<double>(iv1);
         value_type* mdx_row0 = block4_accum.mdx + row0 * static_cast<std::size_t>(batch) + b;
         value_type* mdx_row1 = block4_accum.mdx + row1 * static_cast<std::size_t>(batch) + b;
         const Block4Vec dyv4 =
             block4_vec_load(dy_tile_T + static_cast<std::size_t>(b) * BLOCK4_TILE);
         const Block8Vec dyv_v = block8_vec_dup4(dyv4);
-        const Block8Vec iv_v = block8_vec_broadcast_pair(iv0, iv1);
-        const Block8Vec g_v = dyv_v * iv_v;
-        if (training) {
-            const Block8Vec contrib_v = quant_start_v * S_v * iv_v;
-            g_agg_v += g_v;
-            contrib_agg_v += contrib_v;
-        }
+        if (training)
+            g_agg_v += dyv_v * block8_vec_broadcast_pair(iv0, iv1);
         const Block8Vec mdx_term = quant_start_v * S_v * dyv_v;
         *mdx_row0 += block4_vec_hsum(block8_vec_lo4(mdx_term));
         *mdx_row1 += block4_vec_hsum(block8_vec_hi4(mdx_term));
     }
+    const Block8Vec contrib_agg_v = quant_start_v * S_v *
+                                    block8_vec_broadcast_pair(static_cast<value_type>(iv0_sum),
+                                                              static_cast<value_type>(iv1_sum));
 
     // disldo_backward.batch_hsum_deferral: see block4_backward_process_
     // single_row's identical comment -- every factor here besides g_agg_v/
@@ -839,7 +847,7 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
             quant_floor8[i] = Codec::quant_floor(quant8[i], zero_escape_eps);
         }
 
-        double g_agg8[2 * BLOCK4_TILE] = {0}, contrib_agg8[2 * BLOCK4_TILE] = {0};
+        double g_agg8[2 * BLOCK4_TILE] = {0};
         // Single accumulator per k (not split A/B) -- both
         // halves feed the SAME row's mrow/mgamma gradient.
         std::vector<double> mrow_local_k(rank, 0.0), mrow_local_k_contrib(rank, 0.0);
@@ -854,8 +862,15 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
             output_grad_T + static_cast<std::size_t>(bcA) * batch * BLOCK4_TILE;
         const value_type* dy_tileB_T =
             output_grad_T + static_cast<std::size_t>(bcB) * batch * BLOCK4_TILE;
+        // disldo_backward.contrib_batch_invariant: see block4_backward_process_
+        // single_row's identical comment -- contrib[i] = quant8[i]*
+        // combined_scale8[i]*iv is a CONSTANT (per lane i) times iv, so
+        // sum_b(contrib[i]) == quant8[i]*combined_scale8[i]*sum_b(iv). Track a
+        // single running input_sum instead of 8 separate per-lane accumulators.
+        double input_sum = 0.0;
         for (SIZE_TYPE b = 0; b < batch; ++b) {
             const value_type iv = input_row_T[b];
+            input_sum += static_cast<double>(iv);
             value_type dyv8[2 * BLOCK4_TILE];
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                 dyv8[lj] = dy_tileA_T[static_cast<std::size_t>(b) * BLOCK4_TILE + lj];
@@ -863,16 +878,18 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
             }
             value_type mdx_term = value_type(0);
             for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
-                const value_type g = dyv8[i] * iv;
                 mdx_term += quant8[i] * combined_scale8[i] * dyv8[i];
                 if (!training)
                     continue;
-                const value_type contrib = quant8[i] * combined_scale8[i] * iv;
-                g_agg8[i] += g;
-                contrib_agg8[i] += contrib;
+                g_agg8[i] += dyv8[i] * iv;
             }
             block4_accum.mdx[row * static_cast<std::size_t>(batch) + b] += mdx_term;
         }
+        double contrib_agg8[2 * BLOCK4_TILE] = {0};
+        if (training)
+            for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i)
+                contrib_agg8[i] = static_cast<double>(quant8[i]) *
+                                  static_cast<double>(combined_scale8[i]) * input_sum;
 
         // disldo_backward.batch_hsum_deferral: out_scale_k_i/value_scale_k_row/
         // gamma_k_arr are all batch-invariant here, so this k-loop (rank * 8
