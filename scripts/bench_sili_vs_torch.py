@@ -108,14 +108,24 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n-in", type=int, default=288)
     ap.add_argument("--n-out", type=int, default=288)
-    ap.add_argument("--num-cpus", type=int, default=4)
+    ap.add_argument(
+        "--num-cpus",
+        type=int,
+        default=None,
+        help="defaults to torch.get_num_threads() -- torch's own thread count is fixed by "
+        "its runtime regardless of this flag, so giving sili fewer threads than torch "
+        "actually uses silently biases the comparison in torch's favor",
+    )
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 16, 64, 256])
     ap.add_argument("--calls-base", type=int, default=2000, help="n_calls = max(50, calls_base // batch)")
     args = ap.parse_args()
+    if args.num_cpus is None:
+        args.num_cpus = torch.get_num_threads()
 
     print(
         f"{args.n_in}x{args.n_out} dense fp32, NUM_CPUS={args.num_cpus} "
-        f"(torch backward includes dx: x.requires_grad_(True))\n"
+        f"(matches torch.get_num_threads(); torch backward includes dx: "
+        f"x.requires_grad_(True))\n"
     )
     print(
         f"{'batch':>6} | {'sili fwd':>10} {'torch fwd':>10} {'ratio':>7} || "

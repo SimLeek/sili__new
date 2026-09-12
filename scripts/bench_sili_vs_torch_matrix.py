@@ -217,6 +217,12 @@ def print_baseline_comparison(flat, baseline_path, meta):
             f"absolute times are not comparable across machines. Verdicts below are "
             f"unreliable; re-run with --save-baseline on THIS machine instead."
         )
+    if old_meta and old_meta.get("num_cpus") != meta.get("num_cpus"):
+        print(
+            f"WARNING: baseline was recorded with num_cpus={old_meta.get('num_cpus')}, this "
+            f"run used num_cpus={meta.get('num_cpus')} -- a thread-count change will show up "
+            f"as fake REGRESSED/IMPROVED verdicts below, not a real code change."
+        )
     print(f"\n=== Compared against baseline: {baseline_path} ===")
     print(f"{'key':>32} | {'baseline':>10} {'now':>10} | {'change':>8} {'verdict':>10}")
     any_regressed = False
@@ -237,7 +243,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n-in", type=int, default=288)
     ap.add_argument("--n-out", type=int, default=288)
-    ap.add_argument("--num-cpus", type=int, default=4)
+    ap.add_argument(
+        "--num-cpus",
+        type=int,
+        default=None,
+        help="defaults to torch.get_num_threads() -- torch's own thread count is fixed by "
+        "its runtime regardless of this flag, so giving sili fewer threads than torch "
+        "actually uses silently biases the comparison in torch's favor",
+    )
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 256], help="low, high, ...")
     ap.add_argument("--densities", type=float, nargs="+", default=[1.0, 0.05], help="1.0=dense, low=sparse")
     ap.add_argument("--calls-base", type=int, default=1000)
@@ -246,6 +259,9 @@ def main():
     ap.add_argument("--save-baseline", action="store_true", help="write this run as the new baseline")
     ap.add_argument("--no-compare", action="store_true", help="skip comparing against an existing baseline")
     args = ap.parse_args()
+    if args.num_cpus is None:
+        args.num_cpus = torch.get_num_threads()
+    print(f"sili num_cpus={args.num_cpus}, torch.get_num_threads()={torch.get_num_threads()}")
 
     rng_master = np.random.default_rng(0)
     wvals = rng_master.standard_normal(args.n_in * args.n_out).astype(np.float32) * 0.1
@@ -273,6 +289,7 @@ def main():
 
     flat = flatten_results(results, args.repeats)
     meta = machine_info()
+    meta["num_cpus"] = args.num_cpus
     print(f"\nMachine: {meta['cpu_model']} [{','.join(meta['simd_flags'])}] uid={meta['machine_uid']}")
 
     if not args.no_compare:
