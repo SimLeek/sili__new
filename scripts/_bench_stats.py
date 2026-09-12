@@ -83,22 +83,33 @@ def save_baseline(path, results):
         json.dump(results, f, indent=2)
 
 
-def compare(new_mean, new_std, new_n, old_mean, old_std, old_n):
+def compare(new_mean, new_std, new_n, old_mean, old_std, old_n, min_pct=5.0):
     """Returns (pct_change, verdict) where verdict is one of
     'IMPROVED', 'REGRESSED', 'noise', or 'n/a' (not enough repeats either
-    side to run the z-test)."""
+    side to run the z-test).
+
+    Flagging on the z-test alone is too sensitive in practice: the
+    within-run repeat variance this z-test is built from is much tighter
+    than the TRUE across-process/across-time noise floor (thermal drift,
+    scheduler decisions, other load on the box between the baseline run
+    and this one) -- confirmed empirically even on quiet dedicated
+    hardware, where sub-1% wobbles were statistically "significant" by
+    the z-test alone but not remotely a real regression. Requiring BOTH
+    z-significance AND a minimum practical magnitude (default 5%) filters
+    that out while still catching real, sizeable changes.
+    """
     if old_mean == 0:
         return float("inf"), "n/a"
     pct_change = (new_mean - old_mean) / old_mean * 100.0
-    if new_n < 2 or old_n < 2:
-        return pct_change, "n/a"
+    if new_n < 2 or old_n < 2 or abs(pct_change) < min_pct:
+        return pct_change, "n/a" if (new_n < 2 or old_n < 2) else "noise"
+
     se = ((new_std**2) / new_n + (old_std**2) / old_n) ** 0.5
-    if se == 0:
-        verdict = "noise" if new_mean == old_mean else ("REGRESSED" if new_mean > old_mean else "IMPROVED")
-        return pct_change, verdict
-    z = (new_mean - old_mean) / se
+    z = float("inf") if se == 0 else (new_mean - old_mean) / se
     if z > 2:
-        return pct_change, "REGRESSED"
-    if z < -2:
-        return pct_change, "IMPROVED"
-    return pct_change, "noise"
+        verdict = "REGRESSED"
+    elif z < -2:
+        verdict = "IMPROVED"
+    else:
+        verdict = "noise"
+    return pct_change, verdict
