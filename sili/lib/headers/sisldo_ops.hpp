@@ -600,69 +600,94 @@ void disldo_backward_sparse_grad(
         // Parallel forward-contribution accumulator, mirroring disldo_backward's own.
         std::vector<double> scale_grad_sums_rank_contrib(n_inputs * rank, 0.0);
 
-        for (SIZE_TYPE b = 0; b < batch; ++b) {
-            const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
-            const SIZE_TYPE og_end = (*out_grad_sparse.ptrs[0])[b + 1];
-
-            double batch_sum_abs_new_i = 0.0, batch_sum_abs_old_i = 0.0;
-            double batch_sum_sq_new_i = 0.0, batch_sum_sq_old_i = 0.0;
-            value_type batch_max_new_i = value_type(0);
-
+        // disldo_backward_sparse_grad.batch_aggregated_update: row is now the
+        // OUTER (parallel) loop and batch the inner one -- the opposite of
+        // the original (batch outer, row inner) layout. This mirrors
+        // disldo_backward's own structure, which reads each synapse's weight
+        // ONCE before its batch loop and applies exactly ONE ci/cw update
+        // per synapse per call, using grad/contrib aggregated across the
+        // WHOLE batch. The old layout instead re-read (and re-updated) each
+        // synapse on every batch sample, i.e. sequential per-sample SGD
+        // rather than a real batch-gradient step -- silently diverging from
+        // disldo whenever the same synapse is touched by more than one
+        // sample in a call (proven by test_sisldo_disldo_multibatch_parity,
+        // which fails hard under the old layout). See
+        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.
+        // batch_aggregated_update.
 #pragma omp parallel for num_threads(num_cpus) schedule(static)                                    \
-    reduction(+ : batch_sum_abs_new_i, batch_sum_abs_old_i, batch_sum_sq_new_i,                    \
-                  batch_sum_sq_old_i) reduction(max : batch_max_new_i)
-            for (std::size_t r = 0; r < n_inputs; ++r) {
-                const std::size_t nnz_this_row = L.row_nnz(r);
-                if (nnz_this_row == 0)
-                    continue;
-                const value_type in_val = input[b * n_inputs + r];
-                // lr/nnz_this_row keeps updates comparable across rows of different
-                // connection counts.
-                const value_type effective_lr =
-                    lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_this_row)
-                                   : learning_rate;
-                // value_scale's own scale_eff_lr is applied once after all batches (see below).
+    reduction(+ : total_sum_abs_new_i, total_sum_abs_old_i, total_sum_sq_new_i,                    \
+                  total_sum_sq_old_i) reduction(max : total_max_new_i)
+        for (std::size_t r = 0; r < n_inputs; ++r) {
+            const std::size_t nnz_this_row = L.row_nnz(r);
+            if (nnz_this_row == 0)
+                continue;
+            // lr/nnz_this_row keeps updates comparable across rows of different
+            // connection counts.
+            const value_type effective_lr =
+                lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_this_row)
+                               : learning_rate;
+            // value_scale's own scale_eff_lr is applied once after all batches (see below).
+            const value_type imp_scale = weights.get_importance_scale(r);
 
+            // Snapshot every synapse in this row ONCE, before any batch
+            // sample is processed -- matches disldo_backward's own
+            // read-weight-before-the-batch-loop pattern.
+            std::vector<COL_TYPE> col_buf(nnz_this_row);
+            std::vector<value_type> cw_orig_buf(nnz_this_row), S_buf(nnz_this_row),
+                w_buf(nnz_this_row), ci_orig_buf(nnz_this_row), quant_floor_buf(nnz_this_row);
+            std::vector<double> grad_sum(nnz_this_row, 0.0), contrib_sum(nnz_this_row, 0.0);
+            {
                 auto cursor = dc.row_cursor(r);
-                SIZE_TYPE og_ptr = og_start; // fresh per row -- each row does its own merge
-                value_type dx_accum = value_type(0);
-                const value_type imp_scale = weights.get_importance_scale(r);
-
-                // Per-thread rank-N accumulator lambdas.
-                const int tid = omp_get_thread_num();
-                // cppcheck-suppress constVariablePointer -- false positive, mutated indirectly via
-                // the m*_at lambdas below (see linear_disldo.hpp's mcol_base for the full
-                // rationale)
-                value_type* mcol_base =
-                    t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
-                auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
-                    return mcol_base[col_ * rank + k];
-                };
-                // cppcheck-suppress constVariablePointer
-                value_type* mcol_contrib_base =
-                    t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
-                auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
-                    return mcol_contrib_base[col_ * rank + k];
-                };
-                // cppcheck-suppress constVariablePointer
-                value_type* mgamma_base =
-                    t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
-                auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
-                // cppcheck-suppress constVariablePointer
-                value_type* mgamma_contrib_base =
-                    t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
-                auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
-                    return mgamma_contrib_base[k];
-                };
-
                 for (std::size_t e = 0; e < nnz_this_row; ++e) {
                     const COL_TYPE col = cursor.advance();
                     const std::size_t vb = L.elem_start[r] + e;
+                    col_buf[e] = col;
                     const value_type cw_orig = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                    cw_orig_buf[e] = cw_orig;
                     // S: real per-synapse scale, rank-N. See
                     // template_parity_and_scale_space_bug above.
-                    const value_type S = weights.get_scale(r, col);
-                    const value_type w = cw_orig * S; // -> true units, for dx only
+                    S_buf[e] = weights.get_scale(r, col);
+                    w_buf[e] = cw_orig * S_buf[e]; // -> true units, for dx only
+                    ci_orig_buf[e] = ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    quant_floor_buf[e] = (cw_orig == value_type(0)) ? value_type(0.1f) : cw_orig;
+                }
+            }
+
+            // Per-thread rank-N accumulator lambdas.
+            const int tid = omp_get_thread_num();
+            // cppcheck-suppress constVariablePointer -- false positive, mutated indirectly via
+            // the m*_at lambdas below (see linear_disldo.hpp's mcol_base for the full
+            // rationale)
+            value_type* mcol_base =
+                t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+            auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
+                return mcol_base[col_ * rank + k];
+            };
+            // cppcheck-suppress constVariablePointer
+            value_type* mcol_contrib_base =
+                t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+            auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
+                return mcol_contrib_base[col_ * rank + k];
+            };
+            // cppcheck-suppress constVariablePointer
+            value_type* mgamma_base = t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+            // cppcheck-suppress constVariablePointer
+            value_type* mgamma_contrib_base =
+                t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+            auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
+                return mgamma_contrib_base[k];
+            };
+
+            for (SIZE_TYPE b = 0; b < batch; ++b) {
+                const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+                const SIZE_TYPE og_end = (*out_grad_sparse.ptrs[0])[b + 1];
+                const value_type in_val = input[b * n_inputs + r];
+                SIZE_TYPE og_ptr = og_start; // fresh per (row,b) -- each does its own merge
+                value_type dx_accum = value_type(0);
+
+                for (std::size_t e = 0; e < nnz_this_row; ++e) {
+                    const COL_TYPE col = col_buf[e];
 
                     // Merge-advance, O(nnz_this_row + grad_nnz) per row.
                     while (og_ptr < og_end &&
@@ -673,49 +698,29 @@ void disldo_backward_sparse_grad(
                         continue; // this output has no significant gradient this pass -- skip
 
                     const value_type dy_val = (*out_grad_sparse.values[0])[og_ptr];
-                    dx_accum += w * dy_val; // weight-only -- reaches this row regardless of in_val
+                    dx_accum +=
+                        w_buf[e] * dy_val; // weight-only -- reaches this row regardless of in_val
 
                     if (learning_rate != value_type(0)) {
-                        const value_type out_scale = weights.get_output_scale(col);
                         const value_type out_imp_scale = weights.get_output_importance_scale(col);
                         const value_type combined_imp_scale = imp_scale * out_imp_scale;
                         const value_type grad = dy_val * in_val; // scales with true input value
-                        const value_type ci_orig =
-                            ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        value_type ci = ci_orig * combined_imp_scale; // -> true units
                         // Additive contrib combination -- see
                         // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.merge_scan_design.
-                        const value_type contrib = in_val * w;
-                        ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac,
-                                                      max_ci);
-                        value_type quant =
-                            cw_orig; // code-space accumulator, matches disldo_backward
-                        quant += SynapsePolicy::update_cw(grad, ci, S, effective_lr, eps,
-                                                          damp_by_importance, max_abs_delta,
-                                                          scale_invariant);
-                        if constexpr (StochasticRounding) {
-                            ValueAccessor<VALUES_TYPE>::set_stochastic_live(
-                                dc.values, vb, quant, ci / combined_imp_scale);
-                        } else {
-                            ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant,
-                                                                 ci / combined_imp_scale);
-                        }
-                        const value_type actual_imp =
-                            ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
-                        batch_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
-                        batch_sum_abs_old_i += std::abs(static_cast<double>(ci_orig));
-                        batch_sum_sq_new_i += static_cast<double>(actual_imp) * actual_imp;
-                        batch_sum_sq_old_i += static_cast<double>(ci_orig) * ci_orig;
-                        batch_max_new_i = std::max(batch_max_new_i, std::abs(actual_imp));
+                        const value_type contrib = in_val * w_buf[e];
+                        grad_sum[e] += static_cast<double>(grad);
+                        contrib_sum[e] += static_cast<double>(contrib);
 
                         // dL/d(value_scale_k) -- see merge_scan_design in
-                        // docs/research/sisldo_ops.rst.
-                        const value_type quant_floor =
-                            (cw_orig == value_type(0)) ? value_type(0.1f) : cw_orig;
+                        // docs/research/sisldo_ops.rst. Already correctly
+                        // aggregated across the whole batch (scale_grad_sums_rank
+                        // et al persist across the b loop) -- unaffected by the
+                        // ci/cw sequential-update bug this pass fixes.
                         for (std::size_t k = 0; k < rank; ++k) {
                             const value_type out_scale_k = weights.get_output_scale_k(col, k);
                             const value_type val_scale_k = weights.get_value_scale_k(r, k);
                             const value_type gamma_k = weights.get_scale_gamma_k(k);
+                            const value_type quant_floor = quant_floor_buf[e];
                             scale_grad_sums_rank[r * rank + k] += static_cast<double>(quant_floor) *
                                                                   static_cast<double>(out_scale_k) *
                                                                   static_cast<double>(gamma_k) *
@@ -736,11 +741,40 @@ void disldo_backward_sparse_grad(
                 input_gradients[b * n_inputs + r] += dx_accum;
             }
 
-            total_sum_abs_new_i += batch_sum_abs_new_i;
-            total_sum_abs_old_i += batch_sum_abs_old_i;
-            total_sum_sq_new_i += batch_sum_sq_new_i;
-            total_sum_sq_old_i += batch_sum_sq_old_i;
-            total_max_new_i = std::max(total_max_new_i, batch_max_new_i);
+            // Apply exactly ONE ci/cw update per synapse, using grad/contrib
+            // aggregated across the whole batch -- matches disldo_backward.
+            if (learning_rate != value_type(0)) {
+                for (std::size_t e = 0; e < nnz_this_row; ++e) {
+                    if (grad_sum[e] == 0.0 && contrib_sum[e] == 0.0)
+                        continue;
+                    const COL_TYPE col = col_buf[e];
+                    const std::size_t vb = L.elem_start[r] + e;
+                    const value_type out_imp_scale = weights.get_output_importance_scale(col);
+                    const value_type combined_imp_scale = imp_scale * out_imp_scale;
+                    const value_type grad = static_cast<value_type>(grad_sum[e]);
+                    const value_type contrib = static_cast<value_type>(contrib_sum[e]);
+                    value_type ci = ci_orig_buf[e] * combined_imp_scale; // -> true units
+                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                    value_type quant = cw_orig_buf[e]; // code-space accumulator
+                    quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], effective_lr, eps,
+                                                      damp_by_importance, max_abs_delta,
+                                                      scale_invariant);
+                    if constexpr (StochasticRounding) {
+                        ValueAccessor<VALUES_TYPE>::set_stochastic_live(dc.values, vb, quant,
+                                                                        ci / combined_imp_scale);
+                    } else {
+                        ValueAccessor<VALUES_TYPE>::set_live(dc.values, vb, quant,
+                                                             ci / combined_imp_scale);
+                    }
+                    const value_type actual_imp =
+                        ValueAccessor<VALUES_TYPE>::get_imp(dc.values, vb);
+                    total_sum_abs_new_i += std::abs(static_cast<double>(actual_imp));
+                    total_sum_abs_old_i += std::abs(static_cast<double>(ci_orig_buf[e]));
+                    total_sum_sq_new_i += static_cast<double>(actual_imp) * actual_imp;
+                    total_sum_sq_old_i += static_cast<double>(ci_orig_buf[e]) * ci_orig_buf[e];
+                    total_max_new_i = std::max(total_max_new_i, std::abs(actual_imp));
+                }
+            }
         }
 
         if (learning_rate != value_type(0)) {
@@ -838,61 +872,83 @@ void disldo_backward_sparse_grad(
             double b4_total_sum_sq_new = 0.0, b4_total_sum_sq_old = 0.0;
             value_type b4_total_max_new = value_type(0);
 
-            for (SIZE_TYPE b = 0; b < batch; ++b) {
-                const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
-                const SIZE_TYPE og_end = (*out_grad_sparse.ptrs[0])[b + 1];
-
-                double batch_sum_abs_new = 0.0, batch_sum_abs_old = 0.0;
-                double batch_sum_sq_new = 0.0, batch_sum_sq_old = 0.0;
-                value_type batch_max_new = value_type(0);
-
+            // disldo_backward_sparse_grad.batch_aggregated_update (block4):
+            // row is now the OUTER (parallel) loop and batch the inner one,
+            // matching the scattered path's identical restructuring above
+            // and disldo_backward's own design -- read every tile's weight/
+            // importance ONCE before any batch sample, accumulate grad/
+            // contrib across the WHOLE batch, apply exactly ONE ci/cw
+            // update + one encode/commit pass per tile. The old layout
+            // (batch outer, row inner) re-read-and-re-encoded every live
+            // synapse on every batch sample -- sequential per-sample SGD,
+            // not a real batch-gradient step. See
+            // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.
+            // batch_aggregated_update.
 #pragma omp parallel for num_threads(num_cpus) schedule(static)                                    \
-    reduction(+ : batch_sum_abs_new, batch_sum_abs_old, batch_sum_sq_new, batch_sum_sq_old)        \
-    reduction(max : batch_max_new)
-                for (std::size_t br = 0; br < tiles_r; ++br) {
-                    const std::size_t row_nnz_b4 = BL4.row_nnz(br);
-                    if (row_nnz_b4 == 0)
-                        continue;
-                    // Total live slots across ALL of this row's tiles this call.
-                    const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
+    reduction(+ : b4_total_sum_abs_new, b4_total_sum_abs_old, b4_total_sum_sq_new,                 \
+                  b4_total_sum_sq_old) reduction(max : b4_total_max_new)
+            for (std::size_t br = 0; br < tiles_r; ++br) {
+                const std::size_t row_nnz_b4 = BL4.row_nnz(br);
+                if (row_nnz_b4 == 0)
+                    continue;
+                // Total live slots across ALL of this row's tiles this call.
+                const std::size_t nnz_row = row_nnz_b4 * BLOCK4_TILE;
+                const value_type effective_lr =
+                    lr_per_row_nnz ? learning_rate / static_cast<value_type>(nnz_row)
+                                   : learning_rate;
 
-                    value_type dx_accum[BLOCK4_TILE] = {0, 0, 0, 0};
+                // Per-thread rank-N accumulator lambdas (tid stable across this br's work).
+                const int tid = omp_get_thread_num();
+                // cppcheck-suppress constVariablePointer
+                value_type* mcol_base =
+                    t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+                auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
+                    return mcol_base[col_ * rank + k];
+                };
+                // cppcheck-suppress constVariablePointer
+                value_type* mcol_contrib_base =
+                    t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
+                auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
+                    return mcol_contrib_base[col_ * rank + k];
+                };
+                // cppcheck-suppress constVariablePointer
+                value_type* mgamma_base =
+                    t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
+                auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
+                // cppcheck-suppress constVariablePointer
+                value_type* mgamma_contrib_base =
+                    t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
+                auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
+                    return mgamma_contrib_base[k];
+                };
 
-                    // Per-thread rank-N accumulator lambdas (tid stable across this br's work).
-                    const int tid = omp_get_thread_num();
-                    // cppcheck-suppress constVariablePointer
-                    value_type* mcol_base =
-                        t_col_grad.data() + static_cast<std::size_t>(tid) * out_cols * rank;
-                    auto mcol_at = [&](std::size_t col_, std::size_t k) -> value_type& {
-                        return mcol_base[col_ * rank + k];
-                    };
-                    // cppcheck-suppress constVariablePointer
-                    value_type* mcol_contrib_base =
-                        t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * out_cols * rank;
-                    auto mcol_at_contrib = [&](std::size_t col_, std::size_t k) -> value_type& {
-                        return mcol_contrib_base[col_ * rank + k];
-                    };
-                    // cppcheck-suppress constVariablePointer
-                    value_type* mgamma_base =
-                        t_gamma_grad.data() + static_cast<std::size_t>(tid) * rank;
-                    auto mgamma_at = [&](std::size_t k) -> value_type& { return mgamma_base[k]; };
-                    // cppcheck-suppress constVariablePointer
-                    value_type* mgamma_contrib_base =
-                        t_gamma_grad_contrib.data() + static_cast<std::size_t>(tid) * rank;
-                    auto mgamma_at_contrib = [&](std::size_t k) -> value_type& {
-                        return mgamma_contrib_base[k];
-                    };
-
-                    if (learning_rate == value_type(0)) {
-                        // Read-only path, no concurrency hazard. See
-                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
+                if (learning_rate == value_type(0)) {
+                    // Read-only path, no concurrency hazard. Tile coordinates
+                    // (bc/elem_pos/byte_pos) don't depend on b -- precomputed
+                    // once instead of re-walking the row cursor per sample.
+                    std::vector<uint32_t> tile_bc(row_nnz_b4);
+                    std::vector<std::size_t> tile_elem_pos(row_nnz_b4), tile_byte_pos(row_nnz_b4);
+                    {
                         auto bc_cursor = weights.block4.row_cursor(br);
                         std::size_t elem_pos = BL4.elem_start[br];
                         std::size_t byte_pos = weights.block4.tile_byte_start[br];
+                        for (std::size_t e = 0; e < row_nnz_b4; ++e) {
+                            tile_bc[e] = bc_cursor.advance();
+                            tile_elem_pos[e] = elem_pos;
+                            tile_byte_pos[e] = byte_pos;
+                            byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                            ++elem_pos;
+                        }
+                    }
+
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+                        const SIZE_TYPE og_end = (*out_grad_sparse.ptrs[0])[b + 1];
                         SIZE_TYPE og_ptr = og_start;
+                        value_type dx_accum[BLOCK4_TILE] = {0, 0, 0, 0};
 
                         for (std::size_t e = 0; e < row_nnz_b4; ++e) {
-                            const uint32_t bc = bc_cursor.advance();
+                            const uint32_t bc = tile_bc[e];
                             const std::size_t window_lo =
                                 static_cast<std::size_t>(bc) * BLOCK4_TILE;
                             const std::size_t window_hi = window_lo + BLOCK4_TILE;
@@ -915,8 +971,9 @@ void disldo_backward_sparse_grad(
                             }
 
                             if (any) {
-                                const auto tile = weights.block4.at_index(static_cast<uint32_t>(br),
-                                                                          bc, elem_pos, byte_pos);
+                                const auto tile =
+                                    weights.block4.at_index(static_cast<uint32_t>(br), bc,
+                                                            tile_elem_pos[e], tile_byte_pos[e]);
                                 const uint8_t* tdata = tile.raw_data();
                                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                                     const std::size_t row = br * BLOCK4_TILE + li;
@@ -936,15 +993,60 @@ void disldo_backward_sparse_grad(
                                     }
                                 }
                             }
-                            byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
-                            ++elem_pos;
                         }
-                    } else {
-                        // Writing path -- row-local workspace, ASan-confirmed hazard. See
-                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
-                        auto ws = weights.block4.snapshot_row(br);
-                        SIZE_TYPE og_ptr = og_start;
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = br * BLOCK4_TILE + li;
+                            if (row >= n_inputs)
+                                continue;
+                            input_gradients[static_cast<std::size_t>(b) * n_inputs + row] +=
+                                dx_accum[li];
+                        }
+                    } // batch
+                } else {
+                    // Writing path -- row-local workspace, ASan-confirmed hazard. See
+                    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
+                    auto ws = weights.block4.snapshot_row(br);
+
+                    // Pass 1 (read-only): decode every live tile's weight/
+                    // scale/importance ONCE, before any batch sample is
+                    // processed. Byte-cursor positions are stable until
+                    // pass 3 re-encodes (decode-only unpacking never
+                    // changes a tile's stored length).
+                    const std::size_t n_slots = row_nnz_b4 * BLOCK4_TILE * BLOCK4_TILE;
+                    std::vector<value_type> w_decoded_buf(n_slots), S_buf(n_slots),
+                        imp_decoded_buf(n_slots);
+                    std::vector<double> grad_sum(n_slots, 0.0), contrib_sum(n_slots, 0.0);
+                    {
                         std::size_t local_pos = 0;
+                        for (std::size_t e = 0; e < row_nnz_b4; ++e) {
+                            uint8_t scratch[SCRATCH_BYTES];
+                            weights.block4.unpack_workspace_tile(ws, e, local_pos, scratch);
+                            const uint32_t bc = ws.bc[e];
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = br * BLOCK4_TILE + li;
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                                    const std::size_t idx =
+                                        e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                    w_decoded_buf[idx] = decode_weight(scratch, li, lj);
+                                    imp_decoded_buf[idx] = decode_importance(scratch, li, lj);
+                                    S_buf[idx] = (row < n_inputs && col < out_cols)
+                                                     ? weights.get_scale(row, col)
+                                                     : value_type(0);
+                                }
+                            }
+                            local_pos += tile_len_of(ws.is_sparse[e], &ws.bytes[local_pos]);
+                        }
+                    }
+
+                    // Pass 2 (accumulate-only, per batch sample): dx uses
+                    // the pre-update weight for EVERY sample, matching
+                    // disldo_backward.
+                    for (SIZE_TYPE b = 0; b < batch; ++b) {
+                        const SIZE_TYPE og_start = (*out_grad_sparse.ptrs[0])[b];
+                        const SIZE_TYPE og_end = (*out_grad_sparse.ptrs[0])[b + 1];
+                        SIZE_TYPE og_ptr = og_start;
+                        value_type dx_accum[BLOCK4_TILE] = {0, 0, 0, 0};
 
                         for (std::size_t e = 0; e < row_nnz_b4; ++e) {
                             const uint32_t bc = ws.bc[e];
@@ -968,173 +1070,185 @@ void disldo_backward_sparse_grad(
                                 dy_local[col - window_lo] = (*out_grad_sparse.values[0])[p];
                                 any = true;
                             }
+                            if (!any)
+                                continue;
 
-                            const std::size_t this_local_pos = local_pos;
-                            if (any) {
-                                uint8_t scratch[SCRATCH_BYTES];
-                                weights.block4.unpack_workspace_tile(ws, e, this_local_pos,
-                                                                     scratch);
-                                bool dirty = false;
-
-                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                    const std::size_t row = br * BLOCK4_TILE + li;
-                                    if (row >= n_inputs)
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = br * BLOCK4_TILE + li;
+                                if (row >= n_inputs)
+                                    continue;
+                                const value_type in_val =
+                                    input[static_cast<std::size_t>(b) * n_inputs + row];
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    if (dy_local[lj] == value_type(0))
                                         continue;
-                                    const value_type in_val =
-                                        input[static_cast<std::size_t>(b) * n_inputs + row];
-                                    const value_type imp_scale = weights.get_importance_scale(row);
-                                    const value_type effective_lr =
-                                        lr_per_row_nnz
-                                            ? learning_rate / static_cast<value_type>(nnz_row)
-                                            : learning_rate;
-                                    // value_scale's own scale_eff_lr is applied
-                                    // once after all batches now, not folded in
-                                    // per-synapse -- see the final application
-                                    // loop below (recomputed there from nnz_row).
+                                    const std::size_t col = window_lo + lj;
+                                    if (col >= out_cols)
+                                        continue;
+                                    const std::size_t idx =
+                                        e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                    const value_type w = w_decoded_buf[idx] * S_buf[idx];
+                                    const value_type dy_val = dy_local[lj];
+                                    dx_accum[li] += w * dy_val;
+                                    grad_sum[idx] += static_cast<double>(dy_val * in_val);
+                                    contrib_sum[idx] += static_cast<double>(in_val * w);
+                                }
+                            }
+                        }
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = br * BLOCK4_TILE + li;
+                            if (row >= n_inputs)
+                                continue;
+                            input_gradients[static_cast<std::size_t>(b) * n_inputs + row] +=
+                                dx_accum[li];
+                        }
+                    } // batch
 
-                                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                        if (dy_local[lj] == value_type(0))
-                                            continue;
-                                        const std::size_t col = window_lo + lj;
-                                        if (col >= out_cols)
-                                            continue;
+                    // Pass 3 (apply-once): exactly ONE ci/cw update + one
+                    // encode/commit per tile, using grad/contrib aggregated
+                    // across the whole batch -- matches disldo_backward.
+                    {
+                        std::size_t local_pos = 0;
+                        for (std::size_t e = 0; e < row_nnz_b4; ++e) {
+                            const uint32_t bc = ws.bc[e];
+                            const std::size_t this_local_pos = local_pos;
+                            local_pos += tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
 
-                                        const value_type w_decoded = decode_weight(scratch, li, lj);
-                                        // Rank-N (task #331): S = weights.get_scale(row, col),
-                                        // matching the scattered write path's identical swap --
-                                        // threading S through SynapsePolicy::update_cw (code-space)
-                                        // instead of the old true-weight-space `new_w /
-                                        // combined_scale` store fixes the ~1/S^2 bug here too.
-                                        const value_type S = weights.get_scale(row, col);
-                                        const value_type w = w_decoded * S;
-                                        const value_type dy_val = dy_local[lj];
-                                        dx_accum[li] += w * dy_val;
+                            bool any_touched = false;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const std::size_t idx =
+                                        e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                    if (grad_sum[idx] != 0.0 || contrib_sum[idx] != 0.0)
+                                        any_touched = true;
+                                }
+                            if (!any_touched)
+                                continue;
 
-                                        const value_type out_imp_scale =
-                                            weights.get_output_importance_scale(col);
-                                        const value_type combined_imp_scale =
-                                            imp_scale * out_imp_scale;
-                                        const value_type imp_decoded =
-                                            decode_importance(scratch, li, lj);
-                                        const value_type grad = dy_val * in_val;
-                                        value_type ci = imp_decoded * combined_imp_scale;
-                                        // Additive contrib combination, matching the scattered path
-                                        // above.
-                                        const value_type contrib = in_val * w;
-                                        ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
-                                                                      min_decay_frac, max_ci);
-                                        value_type quant = w_decoded; // code-space accumulator,
-                                                                      // matches disldo_backward
-                                        quant += SynapsePolicy::update_cw(
-                                            grad, ci, S, effective_lr, eps, damp_by_importance,
-                                            max_abs_delta, scale_invariant);
-                                        // was_live gate -- see
-                                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
-                                        // Equivalent to FP4's old `byte != 0` check: a packed
-                                        // FP4 byte is 0 iff BOTH nibbles decode to 0.0.
-                                        const bool was_live = (w_decoded != value_type(0)) ||
-                                                              (imp_decoded != value_type(0));
-                                        const value_type imp_ratio = ci / combined_imp_scale;
-                                        const value_type actual_imp =
-                                            encode_and_store(scratch, li, lj, quant, imp_ratio,
-                                                             was_live) *
-                                            combined_imp_scale;
-                                        dirty = true;
+                            uint8_t scratch[SCRATCH_BYTES];
+                            weights.block4.unpack_workspace_tile(ws, e, this_local_pos, scratch);
+                            bool dirty = false;
 
-                                        const value_type stored_imp =
-                                            imp_decoded * combined_imp_scale;
-                                        batch_sum_abs_new +=
-                                            std::abs(static_cast<double>(actual_imp));
-                                        batch_sum_abs_old +=
-                                            std::abs(static_cast<double>(stored_imp));
-                                        batch_sum_sq_new +=
-                                            static_cast<double>(actual_imp) * actual_imp;
-                                        batch_sum_sq_old +=
-                                            static_cast<double>(stored_imp) * stored_imp;
-                                        batch_max_new =
-                                            std::max(batch_max_new, std::abs(actual_imp));
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = br * BLOCK4_TILE + li;
+                                if (row >= n_inputs)
+                                    continue;
+                                const value_type imp_scale = weights.get_importance_scale(row);
 
-                                        // Rank-N (task #331): per-k gradient accumulation, direct
-                                        // port of the scattered write path above. Race-free: this
-                                        // br exclusively owns `row` for the whole function.
-                                        const value_type quant_floor = (w_decoded == value_type(0))
-                                                                           ? value_type(0.1f)
-                                                                           : w_decoded;
-                                        for (std::size_t k = 0; k < rank; ++k) {
-                                            const value_type out_scale_k =
-                                                weights.get_output_scale_k(col, k);
-                                            const value_type val_scale_k =
-                                                weights.get_value_scale_k(row, k);
-                                            const value_type gamma_k = weights.get_scale_gamma_k(k);
-                                            row_scale_grad_sums_rank[row * rank + k] +=
-                                                static_cast<double>(quant_floor) *
-                                                static_cast<double>(out_scale_k) *
-                                                static_cast<double>(gamma_k) * grad;
-                                            mcol_at(col, k) +=
-                                                quant_floor * val_scale_k * gamma_k * grad;
-                                            mgamma_at(k) +=
-                                                quant_floor * val_scale_k * out_scale_k * grad;
-                                            row_scale_grad_sums_rank_contrib[row * rank + k] +=
-                                                static_cast<double>(quant_floor) *
-                                                static_cast<double>(out_scale_k) *
-                                                static_cast<double>(gamma_k) *
-                                                static_cast<double>(contrib);
-                                            mcol_at_contrib(col, k) +=
-                                                quant_floor * val_scale_k * gamma_k * contrib;
-                                            mgamma_at_contrib(k) +=
-                                                quant_floor * val_scale_k * out_scale_k * contrib;
-                                        }
+                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                    const std::size_t col = std::size_t(bc) * BLOCK4_TILE + lj;
+                                    if (col >= out_cols)
+                                        continue;
+                                    const std::size_t idx =
+                                        e * BLOCK4_TILE * BLOCK4_TILE + li * BLOCK4_TILE + lj;
+                                    if (grad_sum[idx] == 0.0 && contrib_sum[idx] == 0.0)
+                                        continue;
+
+                                    const value_type w_decoded = w_decoded_buf[idx];
+                                    const value_type S = S_buf[idx];
+                                    const value_type imp_decoded = imp_decoded_buf[idx];
+                                    const value_type out_imp_scale =
+                                        weights.get_output_importance_scale(col);
+                                    const value_type combined_imp_scale = imp_scale * out_imp_scale;
+                                    const value_type grad = static_cast<value_type>(grad_sum[idx]);
+                                    const value_type contrib =
+                                        static_cast<value_type>(contrib_sum[idx]);
+                                    value_type ci = imp_decoded * combined_imp_scale;
+                                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
+                                                                  min_decay_frac, max_ci);
+                                    value_type quant = w_decoded; // code-space accumulator,
+                                                                  // matches disldo_backward
+                                    quant += SynapsePolicy::update_cw(
+                                        grad, ci, S, effective_lr, eps, damp_by_importance,
+                                        max_abs_delta, scale_invariant);
+                                    // was_live gate -- computed from the PRE-update (snapshotted)
+                                    // weight/importance, matching disldo_backward's own
+                                    // was_live8. Equivalent to FP4's old `byte != 0` check.
+                                    const bool was_live = (w_decoded != value_type(0)) ||
+                                                          (imp_decoded != value_type(0));
+                                    const value_type imp_ratio = ci / combined_imp_scale;
+                                    const value_type actual_imp =
+                                        encode_and_store(scratch, li, lj, quant, imp_ratio,
+                                                         was_live) *
+                                        combined_imp_scale;
+                                    dirty = true;
+
+                                    const value_type stored_imp = imp_decoded * combined_imp_scale;
+                                    b4_total_sum_abs_new +=
+                                        std::abs(static_cast<double>(actual_imp));
+                                    b4_total_sum_abs_old +=
+                                        std::abs(static_cast<double>(stored_imp));
+                                    b4_total_sum_sq_new +=
+                                        static_cast<double>(actual_imp) * actual_imp;
+                                    b4_total_sum_sq_old +=
+                                        static_cast<double>(stored_imp) * stored_imp;
+                                    b4_total_max_new =
+                                        std::max(b4_total_max_new, std::abs(actual_imp));
+
+                                    // Rank-N (task #331): per-k gradient accumulation, direct
+                                    // port of the scattered write path above. Race-free: this
+                                    // br exclusively owns `row` for the whole function.
+                                    const value_type quant_floor =
+                                        (w_decoded == value_type(0)) ? value_type(0.1f) : w_decoded;
+                                    for (std::size_t k = 0; k < rank; ++k) {
+                                        const value_type out_scale_k =
+                                            weights.get_output_scale_k(col, k);
+                                        const value_type val_scale_k =
+                                            weights.get_value_scale_k(row, k);
+                                        const value_type gamma_k = weights.get_scale_gamma_k(k);
+                                        row_scale_grad_sums_rank[row * rank + k] +=
+                                            static_cast<double>(quant_floor) *
+                                            static_cast<double>(out_scale_k) *
+                                            static_cast<double>(gamma_k) * grad;
+                                        mcol_at(col, k) +=
+                                            quant_floor * val_scale_k * gamma_k * grad;
+                                        mgamma_at(k) +=
+                                            quant_floor * val_scale_k * out_scale_k * grad;
+                                        row_scale_grad_sums_rank_contrib[row * rank + k] +=
+                                            static_cast<double>(quant_floor) *
+                                            static_cast<double>(out_scale_k) *
+                                            static_cast<double>(gamma_k) *
+                                            static_cast<double>(contrib);
+                                        mcol_at_contrib(col, k) +=
+                                            quant_floor * val_scale_k * gamma_k * contrib;
+                                        mgamma_at_contrib(k) +=
+                                            quant_floor * val_scale_k * out_scale_k * contrib;
                                     }
                                 }
-                                if (dirty)
-                                    weights.block4.commit_dirty_tile_in_workspace(
-                                        ws, e, this_local_pos, scratch);
                             }
-                            local_pos += tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
+                            if (dirty)
+                                weights.block4.commit_dirty_tile_in_workspace(ws, e, this_local_pos,
+                                                                              scratch);
                         } // tiles in this row
-
-                        // Merge back -- see
-                        // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
-                        weights.block4.merge_row_workspace(
-                            br, ws,
-                            // Generic lambda: each store's own merge_row_workspace passes a
-                            // different eviction-code type (uint8_t for FP4/FP8, float for
-                            // float32 -- see Block4Store32::merge_row_workspace, which has no
-                            // code concept at all to pass).
-                            [&](std::size_t ev_row, std::size_t ev_col, auto ev_imp_raw) -> double {
-                                const value_type imp_scale = weights.get_importance_scale(ev_row);
-                                const value_type out_imp_scale =
-                                    weights.get_output_importance_scale(ev_col);
-                                value_type decoded_imp;
-                                if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                                    decoded_imp = value_type(fp8_decode_bits(ev_imp_raw));
-                                } else if constexpr (std::is_same_v<VALUES_TYPE,
-                                                                    DeltaCSRBiValues<float>>) {
-                                    decoded_imp = value_type(ev_imp_raw);
-                                } else {
-                                    decoded_imp = FP4_TABLE[ev_imp_raw & 0xFu];
-                                }
-                                return static_cast<double>(decoded_imp) *
-                                       static_cast<double>(imp_scale) *
-                                       static_cast<double>(out_imp_scale);
-                            });
                     }
 
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = br * BLOCK4_TILE + li;
-                        if (row >= n_inputs)
-                            continue;
-                        input_gradients[static_cast<std::size_t>(b) * n_inputs + row] +=
-                            dx_accum[li];
-                    }
-                } // br
-
-                b4_total_sum_abs_new += batch_sum_abs_new;
-                b4_total_sum_abs_old += batch_sum_abs_old;
-                b4_total_sum_sq_new += batch_sum_sq_new;
-                b4_total_sum_sq_old += batch_sum_sq_old;
-                b4_total_max_new = std::max(b4_total_max_new, batch_max_new);
-            } // batch
+                    // Merge back -- see
+                    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.block4_workspace_concurrency.
+                    weights.block4.merge_row_workspace(
+                        br, ws,
+                        // Generic lambda: each store's own merge_row_workspace passes a
+                        // different eviction-code type (uint8_t for FP4/FP8, float for
+                        // float32 -- see Block4Store32::merge_row_workspace, which has no
+                        // code concept at all to pass).
+                        [&](std::size_t ev_row, std::size_t ev_col, auto ev_imp_raw) -> double {
+                            const value_type imp_scale = weights.get_importance_scale(ev_row);
+                            const value_type out_imp_scale =
+                                weights.get_output_importance_scale(ev_col);
+                            value_type decoded_imp;
+                            if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                                decoded_imp = value_type(fp8_decode_bits(ev_imp_raw));
+                            } else if constexpr (std::is_same_v<VALUES_TYPE,
+                                                                DeltaCSRBiValues<float>>) {
+                                decoded_imp = value_type(ev_imp_raw);
+                            } else {
+                                decoded_imp = FP4_TABLE[ev_imp_raw & 0xFu];
+                            }
+                            return static_cast<double>(decoded_imp) *
+                                   static_cast<double>(imp_scale) *
+                                   static_cast<double>(out_imp_scale);
+                        });
+                }
+            } // br
 
             if (learning_rate != value_type(0)) {
                 weights.update_importance_stats_aggregate(b4_total_sum_abs_new,

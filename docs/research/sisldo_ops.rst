@@ -536,26 +536,85 @@ Why the value-scale-gradient accumulator differs from ``disldo_backward``'s
 *ID:* ``disldo_backward_sparse_grad.batch_outer_row_inner_layout``
 
 Importance stats accumulators (``total_sum_abs_new_i`` etc.) accumulate
-across batches -- each batch's ``#pragma omp parallel for`` is a SEPARATE
-parallel region (re-created every batch iteration), so ``reduction()``
-handles within-one-batch thread-safety and these variables accumulate
-each batch's reduced total for one final call after the whole loop. Value
-stats (``update_value_stats_`` aggregate) are intentionally NOT tracked
-here -- see ``disldo_backward``'s comment for the same reasoning.
-
-The ``value_scale`` gradient accumulator (``scale_grad_sums_rank``) is a
-serial per-``(row,k)`` vector accumulated across batches: within each
-batch's parallel-for, each ``r`` is unique per thread, so ``+=`` into
-``scale_grad_sums_rank[r*rank+k]`` is race-free; across batch iterations
-the outer loop is serial, so also race-free. Applied once after all
+across batches. The ``value_scale`` gradient accumulator
+(``scale_grad_sums_rank``) is a serial per-``(row,k)`` vector: within the
+parallel-for, each ``r`` is unique per thread, so ``+=`` into
+``scale_grad_sums_rank[r*rank+k]`` is race-free. Applied once after all
 batches ("sum first, then apply lr" per conversation).
 
-**Unlike** ``disldo_backward`` (row-outer/batch-inner, so its own
-``scale_grad_sum_rank`` is a small per-row-local vector reset every row),
-this function nests batch OUTER / row INNER -- a given row is visited once
-per SEPARATE batch iteration, not all at once -- so this accumulator must
-persist across the whole ``for (batch)`` loop, indexed by the full
-``(row,k)`` pair, not just ``k``.
+**Historical note**: this function used to nest batch OUTER / row INNER
+(the opposite of ``disldo_backward``'s row-outer/batch-inner layout),
+which is why this accumulator was sized ``n_inputs*rank`` (persisting
+across the whole ``for (batch)`` loop) rather than a small per-row-local
+vector. That layout turned out to hide a real bug -- see
+``disldo_backward_sparse_grad.batch_aggregated_update`` below, which
+fixed the loop nesting itself. This accumulator's shape (indexed by
+``(row,k)``, sized for the whole call) was kept as-is since it's correct
+either way and reshaping it wasn't needed to fix the bug -- it's just no
+longer required BY the (now row-outer) loop structure, only by mirroring
+``disldo_backward``'s naming convention here.
+
+.. _disldo_backward_sparse_grad.batch_aggregated_update:
+
+Fixed: sequential per-sample ci/cw updates instead of one batch-aggregated update
+-------------------------------------------------------------------------------------
+
+*ID:* ``disldo_backward_sparse_grad.batch_aggregated_update``
+
+``disldo_backward`` (the dense path, ``linear_disldo.hpp``) reads each
+synapse's weight/importance ONCE before its batch loop, accumulates
+grad/contrib across the WHOLE batch, and applies exactly ONE ci/cw
+(RMSprop state + weight) update per synapse per call -- a real batch-
+gradient-descent step. ``disldo_backward_sparse_grad`` did NOT: both its
+scattered path (``for (b) { parallel for (r) {...} }``) and its block4
+path (same nesting) re-read AND re-encoded every live synapse on EVERY
+batch sample, sequentially -- each sample's update was applied against
+the state left behind by the previous sample in the same call. That's a
+different optimizer (sequential SGD across the batch dimension) whenever
+the same synapse is touched by more than one sample in a call, not a
+batch-gradient step. ``test_sisldo_disldo_parity.cpp`` never caught this
+because it only ever exercises batch=1, where "aggregate then apply once"
+and "apply once per (single) sample" are the identical operation.
+
+Found by explicitly asking "does this function actually apply a real
+batch-gradient step like disldo_backward, or something else, under
+batch>1?", then proving it with a new test
+(``test_sisldo_disldo_multibatch_parity.cpp``, batch=2 with input/dy rows
+deliberately overlapping on the same synapses) which failed hard before
+the fix (e.g. one true-weight divergence of ``dense=1.50`` vs
+``sparse=1.00`` -- not numerical noise).
+
+**Fix**: swapped the loop nesting in both the scattered and block4 write
+paths from batch-outer/row-inner to row-outer(parallel)/batch-inner,
+matching ``disldo_backward``:
+
+- **Scattered path**: snapshot every synapse's ``cw``/``S``/``ci`` ONCE
+  per row (before any batch sample), accumulate ``grad_sum``/
+  ``contrib_sum`` per synapse across the whole batch, then apply exactly
+  one ``update_ci``/``update_cw`` + ``set_live`` per synapse afterward.
+- **Block4 path**: same idea, structured as three passes per row --
+  (1) read-only: decode every live tile's weight/importance ONCE
+  (byte-cursor positions are stable until pass 3 re-encodes, since
+  decode-only unpacking never changes a tile's stored length);
+  (2) accumulate-only per batch sample (dx uses the pre-update weight
+  for every sample, matching ``disldo_backward``); (3) apply-once: one
+  ci/cw update + one encode/commit per tile, using grad/contrib
+  aggregated across the whole batch.
+- The read-only (``learning_rate == 0``) block4 branch got a smaller,
+  free bonus fix along the way: tile coordinates (``bc``/``elem_pos``/
+  ``byte_pos``) don't depend on the batch sample, so they're now
+  precomputed once per row instead of re-walking the row cursor on every
+  batch sample.
+- The rank-N ``value_scale``/``output_scale``/``scale_gamma`` axis was
+  ALREADY correctly aggregated across the whole batch in both paths
+  (feeding ``scale_grad_sums_rank`` et al.) -- unaffected by this bug,
+  no changes needed there.
+
+Verified via the new multi-batch parity test (both scattered and block4
+configs now pass) plus the full regression suite (164/164 C++ incl. both
+bit-exact dequant-equality gates, 215/215 Python). Shared template code
+(one ``disldo_backward_sparse_grad`` instantiated per ``VALUES_TYPE``), so
+the fix applies to fp8/fp4/fp32 uniformly.
 
 .. _disldo_backward_sparse_grad.merge_scan_design:
 

@@ -154,6 +154,7 @@ set(SILI_STANDALONE_TESTS
     test_sisldo_disldo_parity
     test_sisldo_disldo_parity_fp32
     test_sisldo_disldo_parity_fp8
+    test_sisldo_disldo_multibatch_parity
     test_fp8_block4_scattered_divergence
     test_synapse_policy_dispatch
     test_synapse_policy_long_horizon
