@@ -14,6 +14,7 @@
 #include "parallel.hpp"
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -48,10 +49,10 @@ void block4_backward_process_single_row(
     const value_type learning_rate = params.learning_rate;
     const bool lr_per_row_nnz = params.lr_per_row_nnz;
     const std::size_t n_out = params.n_out;
-    const value_type* input = params.input;
-    const value_type* output_grad = params.output_grad;
+    const value_type* input_T = params.input_T;
+    const value_type* output_grad_T = params.output_grad_T;
     const auto batch = params.batch;
-    const auto in_cols = params.in_cols;
+    const auto in_cols = params.in_cols; // still needed for mdx (dx accum), unchanged layout
     const value_type beta2 = params.beta2;
     const value_type eps = params.eps;
     const value_type min_decay_frac = params.min_decay_frac;
@@ -62,6 +63,14 @@ void block4_backward_process_single_row(
     const value_type zero_escape_eps = params.zero_escape_eps;
     const value_type* gamma_k_arr = params.gamma_k_arr;
     const int tid = block4_accum.tid;
+    // disldo_backward.batch_stride_transpose: input_T is [n_in, batch]
+    // (contiguous per row across batch); output_grad_T is [n_col_tiles,
+    // batch, BLOCK4_TILE] (contiguous per output-tile across batch, still
+    // 4-wide-SIMD-loadable per sample) -- see Block4BackwardParams's
+    // comment (block4_codec.hpp) and disldo_backward's construction site.
+    const value_type* input_row_T = input_T + row * static_cast<std::size_t>(batch);
+    const value_type* dy_tile_T =
+        output_grad_T + static_cast<std::size_t>(bc) * batch * BLOCK4_TILE;
 
     const value_type val_scale = weights.get_value_scale(row);
     const value_type imp_scale = weights.get_importance_scale(row);
@@ -196,12 +205,12 @@ void block4_backward_process_single_row(
             quant_floor4[lj] = Codec::quant_floor(quant4[lj], zero_escape_eps);
         }
         for (SIZE_TYPE b = 0; b < batch; ++b) {
-            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
-            value_type* mdx_row = block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row;
+            const value_type iv = input_row_T[b];
+            value_type* mdx_row = block4_accum.mdx + row * static_cast<std::size_t>(batch) + b;
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                 if (!col_valid4[lj])
                     continue;
-                const value_type dyv = output_grad[static_cast<std::size_t>(b) * n_out + col4[lj]];
+                const value_type dyv = dy_tile_T[static_cast<std::size_t>(b) * BLOCK4_TILE + lj];
                 const value_type g = dyv * iv;
                 const value_type S = combined_scale4[lj];
                 if (learning_rate != value_type(0)) {
@@ -287,11 +296,10 @@ void block4_backward_process_single_row(
             }
             const bool training = (learning_rate != value_type(0));
             for (SIZE_TYPE b = 0; b < batch; ++b) {
-                const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
-                value_type* mdx_row =
-                    block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row;
+                const value_type iv = input_row_T[b];
+                value_type* mdx_row = block4_accum.mdx + row * static_cast<std::size_t>(batch) + b;
                 const Block4Vec dyv_v =
-                    block4_vec_load(output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+                    block4_vec_load(dy_tile_T + static_cast<std::size_t>(b) * BLOCK4_TILE);
                 const Block4Vec g_v = dyv_v * block4_vec_broadcast(iv);
                 if (training) {
                     // Additive g+contrib combination -- see
@@ -300,36 +308,47 @@ void block4_backward_process_single_row(
                         (quant_start_v * combined_scale_v) * block4_vec_broadcast(iv);
                     g_agg_v += g_v;
                     contrib_agg_v += contrib_v;
-                    for (std::size_t k = 0; k < rank; ++k) {
-                        // AQRS gamma: direction caches
-                        // never gamma-baked, explicit
-                        // gamma_k factor per site.
-                        const Block4Vec value_scale_k_v = block4_vec_broadcast(value_scale_k[k]);
-                        const Block4Vec out_scale_k_v = block4_vec_load(out_scale_k4[k]);
-                        mrow_local_k[k] += static_cast<double>(block4_vec_hsum(
-                                               quant_floor_v * out_scale_k_v * g_v)) *
-                                           static_cast<double>(gamma_k_arr[k]);
-                        mgamma_local_k[k] += static_cast<double>(
-                            block4_vec_hsum(quant_floor_v * out_scale_k_v * value_scale_k_v * g_v));
-                        mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(
-                                                       quant_floor_v * out_scale_k_v * contrib_v)) *
-                                                   static_cast<double>(gamma_k_arr[k]);
-                        mgamma_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(
-                            quant_floor_v * out_scale_k_v * value_scale_k_v * contrib_v));
-                        value_type* acc = mcol_acc_raw + k * BLOCK4_TILE;
-                        block4_vec_store(acc, block4_vec_load(acc) +
-                                                  quant_floor_v * value_scale_k_v * g_v *
-                                                      block4_vec_broadcast(gamma_k_arr[k]));
-                        value_type* acc_c = mcol_acc_raw_contrib + k * BLOCK4_TILE;
-                        block4_vec_store(acc_c, block4_vec_load(acc_c) +
-                                                    quant_floor_v * value_scale_k_v * contrib_v *
-                                                        block4_vec_broadcast(gamma_k_arr[k]));
-                    }
                 }
                 // w = quant*S, FIXED for the whole batch --
                 // see quant_start_v's own comment above.
                 const Block4Vec w_v = quant_start_v * combined_scale_v;
                 *mdx_row += block4_vec_hsum(w_v * dyv_v);
+            }
+            // disldo_backward.batch_hsum_deferral: mrow_local_k/mgamma_local_k
+            // (and contrib variants) are LINEAR in g_v/contrib_v, and every
+            // other factor (quant_floor_v, out_scale_k_v, value_scale_k[k],
+            // gamma_k_arr[k]) is batch-invariant -- so
+            // sum_b(hsum(C*g_v_b)) == hsum(C*sum_b(g_v_b)) == hsum(C*g_agg_v).
+            // Computing this ONCE here (using the g_agg_v/contrib_agg_v this
+            // loop already accumulates) instead of once per batch sample
+            // eliminates up to 4*rank horizontal-SIMD-reduction calls per
+            // sample -- see disldo_backward.batch_stride_transpose in
+            // docs/research/linear_disldo.rst for the profiling that found
+            // this (transpose/merge fixes measured negligible; this per-
+            // sample hsum work was ~99% of the real cost at batch=256).
+            if (training) {
+                for (std::size_t k = 0; k < rank; ++k) {
+                    const Block4Vec value_scale_k_v = block4_vec_broadcast(value_scale_k[k]);
+                    const Block4Vec out_scale_k_v = block4_vec_load(out_scale_k4[k]);
+                    mrow_local_k[k] += static_cast<double>(block4_vec_hsum(
+                                           quant_floor_v * out_scale_k_v * g_agg_v)) *
+                                       static_cast<double>(gamma_k_arr[k]);
+                    mgamma_local_k[k] += static_cast<double>(
+                        block4_vec_hsum(quant_floor_v * out_scale_k_v * value_scale_k_v * g_agg_v));
+                    mrow_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                                                   quant_floor_v * out_scale_k_v * contrib_agg_v)) *
+                                               static_cast<double>(gamma_k_arr[k]);
+                    mgamma_local_k_contrib[k] += static_cast<double>(block4_vec_hsum(
+                        quant_floor_v * out_scale_k_v * value_scale_k_v * contrib_agg_v));
+                    value_type* acc = mcol_acc_raw + k * BLOCK4_TILE;
+                    block4_vec_store(acc, block4_vec_load(acc) +
+                                              quant_floor_v * value_scale_k_v * g_agg_v *
+                                                  block4_vec_broadcast(gamma_k_arr[k]));
+                    value_type* acc_c = mcol_acc_raw_contrib + k * BLOCK4_TILE;
+                    block4_vec_store(acc_c, block4_vec_load(acc_c) +
+                                                quant_floor_v * value_scale_k_v * contrib_agg_v *
+                                                    block4_vec_broadcast(gamma_k_arr[k]));
+                }
             }
             // ONE update, using the batch-aggregated g/contrib.
             Block4Vec quant_v = quant_start_v;
@@ -410,10 +429,10 @@ void block4_backward_process_row_pair(
     const value_type learning_rate = params.learning_rate;
     const bool lr_per_row_nnz = params.lr_per_row_nnz;
     const std::size_t n_out = params.n_out;
-    const value_type* input = params.input;
-    const value_type* output_grad = params.output_grad;
+    const value_type* input_T = params.input_T;
+    const value_type* output_grad_T = params.output_grad_T;
     const auto batch = params.batch;
-    const auto in_cols = params.in_cols;
+    const auto in_cols = params.in_cols; // still needed for mdx (dx accum), unchanged layout
     const value_type beta2 = params.beta2;
     const value_type eps = params.eps;
     const value_type min_decay_frac = params.min_decay_frac;
@@ -424,6 +443,12 @@ void block4_backward_process_row_pair(
     const value_type zero_escape_eps = params.zero_escape_eps;
     const value_type* gamma_k_arr = params.gamma_k_arr;
     const int tid = block4_accum.tid;
+    // disldo_backward.batch_stride_transpose: see block4_backward_process_
+    // single_row's identical comment.
+    const value_type* input_row0_T = input_T + row0 * static_cast<std::size_t>(batch);
+    const value_type* input_row1_T = input_T + row1 * static_cast<std::size_t>(batch);
+    const value_type* dy_tile_T =
+        output_grad_T + static_cast<std::size_t>(bc) * batch * BLOCK4_TILE;
 
     using Codec = Block4Codec<VALUES_TYPE>;
     const uint32_t li1 = li0 + 1;
@@ -520,14 +545,13 @@ void block4_backward_process_row_pair(
     Block8Vec g_agg_v = block8_vec_broadcast(0.0f);
     Block8Vec contrib_agg_v = block8_vec_broadcast(0.0f);
     const bool training = (learning_rate != value_type(0));
-    const std::size_t col_base = std::size_t(bc) * BLOCK4_TILE;
     for (SIZE_TYPE b = 0; b < batch; ++b) {
-        const value_type iv0 = input[static_cast<std::size_t>(b) * in_cols + row0];
-        const value_type iv1 = input[static_cast<std::size_t>(b) * in_cols + row1];
-        value_type* mdx_row0 = block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row0;
-        value_type* mdx_row1 = block4_accum.mdx + static_cast<std::size_t>(b) * in_cols + row1;
+        const value_type iv0 = input_row0_T[b];
+        const value_type iv1 = input_row1_T[b];
+        value_type* mdx_row0 = block4_accum.mdx + row0 * static_cast<std::size_t>(batch) + b;
+        value_type* mdx_row1 = block4_accum.mdx + row1 * static_cast<std::size_t>(batch) + b;
         const Block4Vec dyv4 =
-            block4_vec_load(output_grad + static_cast<std::size_t>(b) * n_out + col_base);
+            block4_vec_load(dy_tile_T + static_cast<std::size_t>(b) * BLOCK4_TILE);
         const Block8Vec dyv_v = block8_vec_dup4(dyv4);
         const Block8Vec iv_v = block8_vec_broadcast_pair(iv0, iv1);
         const Block8Vec g_v = dyv_v * iv_v;
@@ -535,39 +559,46 @@ void block4_backward_process_row_pair(
             const Block8Vec contrib_v = quant_start_v * S_v * iv_v;
             g_agg_v += g_v;
             contrib_agg_v += contrib_v;
-            for (std::size_t k = 0; k < rank; ++k) {
-                const Block8Vec value_scale_k_v =
-                    block8_vec_broadcast_pair(value_scale_k_row0[k], value_scale_k_row1[k]);
-                const Block8Vec out_scale_k_v = block8_vec_dup4(block4_vec_load(out_scale_k4[k]));
-                const Block8Vec prod_g = quant_floor_v * out_scale_k_v * g_v;
-                mrow_local0_k[k] += static_cast<double>(block4_vec_hsum(block8_vec_lo4(prod_g))) *
-                                    static_cast<double>(gamma_k_arr[k]);
-                mrow_local1_k[k] += static_cast<double>(block4_vec_hsum(block8_vec_hi4(prod_g))) *
-                                    static_cast<double>(gamma_k_arr[k]);
-                mgamma_local_k[k] +=
-                    static_cast<double>(block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_g));
-                const Block8Vec prod_contrib = quant_floor_v * out_scale_k_v * contrib_v;
-                mrow_local0_k_contrib[k] +=
-                    static_cast<double>(block4_vec_hsum(block8_vec_lo4(prod_contrib))) *
-                    static_cast<double>(gamma_k_arr[k]);
-                mrow_local1_k_contrib[k] +=
-                    static_cast<double>(block4_vec_hsum(block8_vec_hi4(prod_contrib))) *
-                    static_cast<double>(gamma_k_arr[k]);
-                mgamma_local_k_contrib[k] += static_cast<double>(
-                    block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_contrib));
-                value_type* acc = mcol_acc + k * BLOCK4_TILE;
-                const Block8Vec term =
-                    quant_floor_v * value_scale_k_v * g_v * block8_vec_broadcast(gamma_k_arr[k]);
-                block4_vec_store(acc, block4_vec_load(acc) + block8_vec_fold4(term));
-                value_type* acc_c = mcol_acc_contrib + k * BLOCK4_TILE;
-                const Block8Vec term_c = quant_floor_v * value_scale_k_v * contrib_v *
-                                         block8_vec_broadcast(gamma_k_arr[k]);
-                block4_vec_store(acc_c, block4_vec_load(acc_c) + block8_vec_fold4(term_c));
-            }
         }
         const Block8Vec mdx_term = quant_start_v * S_v * dyv_v;
         *mdx_row0 += block4_vec_hsum(block8_vec_lo4(mdx_term));
         *mdx_row1 += block4_vec_hsum(block8_vec_hi4(mdx_term));
+    }
+
+    // disldo_backward.batch_hsum_deferral: see block4_backward_process_
+    // single_row's identical comment -- every factor here besides g_agg_v/
+    // contrib_agg_v is batch-invariant, so this collapses what was up to
+    // 6*rank horizontal-SIMD-reductions per batch sample into 6*rank total.
+    if (training) {
+        for (std::size_t k = 0; k < rank; ++k) {
+            const Block8Vec value_scale_k_v =
+                block8_vec_broadcast_pair(value_scale_k_row0[k], value_scale_k_row1[k]);
+            const Block8Vec out_scale_k_v = block8_vec_dup4(block4_vec_load(out_scale_k4[k]));
+            const Block8Vec prod_g = quant_floor_v * out_scale_k_v * g_agg_v;
+            mrow_local0_k[k] += static_cast<double>(block4_vec_hsum(block8_vec_lo4(prod_g))) *
+                                static_cast<double>(gamma_k_arr[k]);
+            mrow_local1_k[k] += static_cast<double>(block4_vec_hsum(block8_vec_hi4(prod_g))) *
+                                static_cast<double>(gamma_k_arr[k]);
+            mgamma_local_k[k] +=
+                static_cast<double>(block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_g));
+            const Block8Vec prod_contrib = quant_floor_v * out_scale_k_v * contrib_agg_v;
+            mrow_local0_k_contrib[k] +=
+                static_cast<double>(block4_vec_hsum(block8_vec_lo4(prod_contrib))) *
+                static_cast<double>(gamma_k_arr[k]);
+            mrow_local1_k_contrib[k] +=
+                static_cast<double>(block4_vec_hsum(block8_vec_hi4(prod_contrib))) *
+                static_cast<double>(gamma_k_arr[k]);
+            mgamma_local_k_contrib[k] += static_cast<double>(
+                block8_vec_hsum(out_scale_k_v * value_scale_k_v * prod_contrib));
+            value_type* acc = mcol_acc + k * BLOCK4_TILE;
+            const Block8Vec term =
+                quant_floor_v * value_scale_k_v * g_agg_v * block8_vec_broadcast(gamma_k_arr[k]);
+            block4_vec_store(acc, block4_vec_load(acc) + block8_vec_fold4(term));
+            value_type* acc_c = mcol_acc_contrib + k * BLOCK4_TILE;
+            const Block8Vec term_c = quant_floor_v * value_scale_k_v * contrib_agg_v *
+                                     block8_vec_broadcast(gamma_k_arr[k]);
+            block4_vec_store(acc_c, block4_vec_load(acc_c) + block8_vec_fold4(term_c));
+        }
     }
 
     Block8Vec quant_v = quant_start_v;
@@ -720,10 +751,10 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
     const std::size_t rank = params.rank;
     const value_type learning_rate = params.learning_rate;
     const bool lr_per_row_nnz = params.lr_per_row_nnz;
-    const value_type* input = params.input;
-    const value_type* output_grad = params.output_grad;
+    const value_type* input_T = params.input_T;
+    const value_type* output_grad_T = params.output_grad_T;
     const auto batch = params.batch;
-    const auto in_cols = params.in_cols;
+    const auto in_cols = params.in_cols; // still needed for mdx (dx accum), unchanged layout
     const value_type beta2 = params.beta2;
     const value_type eps = params.eps;
     const value_type min_decay_frac = params.min_decay_frac;
@@ -815,16 +846,20 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
         std::vector<double> mgamma_local_k(rank, 0.0), mgamma_local_k_contrib(rank, 0.0);
         std::vector<value_type> mcol_local8(rank * 2 * BLOCK4_TILE, value_type(0)),
             mcol_local_contrib8(rank * 2 * BLOCK4_TILE, value_type(0));
+        // disldo_backward.batch_stride_transpose: see block4_backward_process_
+        // single_row's identical comment. bcA/bcB tile-blocks are already
+        // zero-padded past n_out, so no extra bounds check is needed here.
+        const value_type* input_row_T = input_T + row * static_cast<std::size_t>(batch);
+        const value_type* dy_tileA_T =
+            output_grad_T + static_cast<std::size_t>(bcA) * batch * BLOCK4_TILE;
+        const value_type* dy_tileB_T =
+            output_grad_T + static_cast<std::size_t>(bcB) * batch * BLOCK4_TILE;
         for (SIZE_TYPE b = 0; b < batch; ++b) {
-            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + row];
+            const value_type iv = input_row_T[b];
             value_type dyv8[2 * BLOCK4_TILE];
             for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                dyv8[lj] = colA[lj] < n_out
-                               ? output_grad[static_cast<std::size_t>(b) * n_out + colA[lj]]
-                               : value_type(0);
-                dyv8[lj + BLOCK4_TILE] =
-                    colB[lj] < n_out ? output_grad[static_cast<std::size_t>(b) * n_out + colB[lj]]
-                                     : value_type(0);
+                dyv8[lj] = dy_tileA_T[static_cast<std::size_t>(b) * BLOCK4_TILE + lj];
+                dyv8[lj + BLOCK4_TILE] = dy_tileB_T[static_cast<std::size_t>(b) * BLOCK4_TILE + lj];
             }
             value_type mdx_term = value_type(0);
             for (uint32_t i = 0; i < 2 * BLOCK4_TILE; ++i) {
@@ -853,7 +888,7 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
                         quant_floor8[i] * value_scale_k_row[k] * contrib * gamma_k_arr[k];
                 }
             }
-            block4_accum.mdx[static_cast<std::size_t>(b) * in_cols + row] += mdx_term;
+            block4_accum.mdx[row * static_cast<std::size_t>(batch) + b] += mdx_term;
         }
 
         if (training) {
@@ -1077,6 +1112,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     const std::size_t t_out_rank_stride = weights.disldo_backward_scratch.cap_out_rank;
     const std::size_t t_rank_stride = weights.disldo_backward_scratch.cap_rank;
     std::vector<value_type>& t_dx = weights.disldo_backward_scratch.t_dx;
+    std::vector<value_type>& t_dx_T = weights.disldo_backward_scratch.t_dx_T;
     std::vector<value_type>& t_col_grad = weights.disldo_backward_scratch.t_col_grad;
     std::vector<value_type>& t_col_grad_contrib =
         weights.disldo_backward_scratch.t_col_grad_contrib;
@@ -1103,6 +1139,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         const int tid = omp_get_thread_num();
         group_of_tid[static_cast<std::size_t>(tid)] = sili_topology::current_thread_group();
         std::fill_n(t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride, dst, value_type(0));
+        std::fill_n(t_dx_T.data() + static_cast<std::size_t>(tid) * t_dx_stride, dst,
+                    value_type(0));
         std::fill_n(t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
                     n_out * rank, value_type(0));
         std::fill_n(t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
@@ -1521,6 +1559,47 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         std::vector<double> t_row_grad_contrib(static_cast<std::size_t>(num_cpus) * n_in * rank,
                                                0.0);
 
+        // disldo_backward.batch_stride_transpose: input/output_grad are
+        // [batch, features] (batch-major), but every row/tile visited below
+        // needs its own scan across the batch dimension -- for a dense
+        // layer that's O(rows*cols) separate batch-major scans, each
+        // striding through memory at in_cols/n_out floats per step (one
+        // cache line fetched, 4 bytes used). Pre-transposing ONCE here
+        // (O(n_in*batch + n_out*batch), negligible next to the O(nnz*batch)
+        // main loop) turns every one of those repeated scans contiguous.
+        // output_grad_T is a BLOCK transpose (grouped by output tile, not a
+        // flat transpose) so the existing 4-wide SIMD load stays contiguous
+        // too -- see Block4BackwardParams's own comment (block4_codec.hpp).
+        // TEMPORARY diagnostic timing (not for commit) -- gated behind an
+        // env var so it's a no-op unless explicitly requested.
+        const bool sili_timing_on = std::getenv("SILI_DISLDO_TIMING") != nullptr;
+        const auto sili_t_transpose_start = std::chrono::steady_clock::now();
+        std::vector<value_type>& input_T = weights.block4.scratch_input_T;
+        input_T.assign(n_in * static_cast<std::size_t>(batch), value_type(0));
+        for (std::size_t row = 0; row < n_in; ++row)
+            for (SIZE_TYPE b = 0; b < batch; ++b)
+                input_T[row * static_cast<std::size_t>(batch) + b] =
+                    input[static_cast<std::size_t>(b) * in_cols + row];
+
+        const std::size_t n_col_tiles = (n_out + BLOCK4_TILE - 1) / BLOCK4_TILE;
+        std::vector<value_type>& output_grad_T = weights.block4.scratch_output_grad_T;
+        output_grad_T.assign(n_col_tiles * static_cast<std::size_t>(batch) * BLOCK4_TILE,
+                             value_type(0));
+        for (std::size_t col = 0; col < n_out; ++col) {
+            const std::size_t tile_idx = col / BLOCK4_TILE;
+            const std::size_t lj = col % BLOCK4_TILE;
+            for (SIZE_TYPE b = 0; b < batch; ++b)
+                output_grad_T[(tile_idx * static_cast<std::size_t>(batch) + b) * BLOCK4_TILE + lj] =
+                    output_grad[static_cast<std::size_t>(b) * n_out + col];
+        }
+
+        const auto sili_t_transpose_end = std::chrono::steady_clock::now();
+        if (sili_timing_on)
+            std::fprintf(stderr, "[disldo_backward] transpose_build: %.4f ms\n",
+                         std::chrono::duration<double, std::milli>(sili_t_transpose_end -
+                                                                   sili_t_transpose_start)
+                             .count());
+
         // disldo_backward.block4_extract_function_refactor: broadcast/read-only
         // state for the whole block4 parallel region, constructed once here --
         // see Block4BackwardParams's own comment (block4_codec.hpp) for why this
@@ -1545,15 +1624,18 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                                              scale_invariant,
                                                                              lr_per_row_nnz,
                                                                              gamma_k_arr.data(),
-                                                                             row_live_count.data()};
+                                                                             row_live_count.data(),
+                                                                             input_T.data(),
+                                                                             output_grad_T.data()};
 
+        const auto sili_t_tileloop_start = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
             // t_col_grad/t_row_grad laid out [thread][col or row][k]; both
             // FP4/FP8 block4 branches below are full rank-N.
             Block4BackwardAccumulators<value_type> block4_accum{
-                tid, t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride,
+                tid, t_dx_T.data() + static_cast<std::size_t>(tid) * t_dx_stride,
                 t_col_grad.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
                 t_col_grad_contrib.data() + static_cast<std::size_t>(tid) * t_out_rank_stride,
                 t_row_grad.data() + static_cast<std::size_t>(tid) * n_in * rank,
@@ -1778,6 +1860,37 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 }
             } // closes for (br...)
         } // closes #pragma omp parallel
+        const auto sili_t_tileloop_end = std::chrono::steady_clock::now();
+        if (sili_timing_on)
+            std::fprintf(stderr, "[disldo_backward] tile_loop: %.4f ms\n",
+                         std::chrono::duration<double, std::milli>(sili_t_tileloop_end -
+                                                                   sili_t_tileloop_start)
+                             .count());
+
+        // disldo_backward.batch_stride_transpose: merge block4's transposed
+        // dx accumulator (t_dx_T) into the shared batch-major t_dx once,
+        // before the group-aware t_dx reduction further below -- see
+        // Block4BackwardParams's own comment (block4_codec.hpp).
+        const auto sili_t_merge_start = std::chrono::steady_clock::now();
+#pragma omp parallel num_threads(num_cpus)
+        {
+            const int tid = omp_get_thread_num();
+            value_type* dst_dx = t_dx.data() + static_cast<std::size_t>(tid) * t_dx_stride;
+            const value_type* src_dx_t =
+                t_dx_T.data() + static_cast<std::size_t>(tid) * t_dx_stride;
+            for (std::size_t row = 0; row < n_in; ++row) {
+                const value_type* row_t = src_dx_t + row * static_cast<std::size_t>(batch);
+                for (SIZE_TYPE b = 0; b < batch; ++b)
+                    dst_dx[static_cast<std::size_t>(b) * in_cols + row] += row_t[b];
+            }
+        }
+        if (sili_timing_on) {
+            const auto sili_t_merge_end = std::chrono::steady_clock::now();
+            std::fprintf(
+                stderr, "[disldo_backward] mdx_merge: %.4f ms\n",
+                std::chrono::duration<double, std::milli>(sili_t_merge_end - sili_t_merge_start)
+                    .count());
+        }
 
         if (learning_rate != value_type(0)) {
             for (std::size_t row = 0; row < n_in; ++row) {

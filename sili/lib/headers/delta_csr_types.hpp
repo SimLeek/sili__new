@@ -1177,7 +1177,14 @@ struct SparseLinearWeightsDelta {
     // ScaleRankScratch) only zero NEWLY appended elements on growth, not
     // the whole buffer every time.
     struct DisldoBackwardScratch {
-        std::vector<value_type> t_dx;                 // [thread][batch][in_cols], stride cap_dst
+        std::vector<value_type> t_dx; // [thread][batch][in_cols], stride cap_dst
+        // block4's own dx accumulator, transposed ([thread][n_in][batch],
+        // same stride cap_dst since in_cols==n_in) to avoid the batch-major
+        // stride block4's row/tile loop would otherwise hit -- merged into
+        // t_dx once per disldo_backward call. See
+        // disldo_backward.batch_stride_transpose in
+        // docs/research/linear_disldo.rst.
+        std::vector<value_type> t_dx_T;
         std::vector<value_type> t_col_grad;           // [thread][col][k], stride cap_out_rank
         std::vector<value_type> t_col_grad_contrib;   // [thread][col][k], stride cap_out_rank
         std::vector<value_type> t_gamma_grad;         // [thread][k], stride cap_rank
@@ -1204,6 +1211,7 @@ struct SparseLinearWeightsDelta {
             cap_out_rank = out_rank;
             cap_rank = rank;
             t_dx.resize(cap_threads * cap_dst);
+            t_dx_T.resize(cap_threads * cap_dst);
             t_col_grad.resize(cap_threads * cap_out_rank);
             t_col_grad_contrib.resize(cap_threads * cap_out_rank);
             t_gamma_grad.resize(cap_threads * cap_rank);

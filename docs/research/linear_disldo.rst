@@ -2068,3 +2068,44 @@ both explicitly out of scope here. ``disldo_backward_sparse_grad``
 deliberately not touched in this pass -- offered as options and
 declined in favor of shipping the one function actually flagged,
 faster; revisit as a follow-up if wanted.
+
+.. _disldo_backward.batch_stride_transpose:
+
+``disldo_backward``: batch-major stride in the block4 backward inner loop
+---------------------------------------------------------------------------
+
+*ID:* ``disldo_backward.batch_stride_transpose``
+
+sili-vs-torch benchmarking (fp32 dense 288x288, batch swept 1/4/16/64/256)
+found sili's backward+update cost growing super-linearly with batch
+(16x batch -> 35x slower) while torch's stayed nearly flat. Root cause:
+``block4_backward_process_{single_row,row_pair,tile_pair}`` read
+``input``/``output_grad`` (stored ``[batch, features]``, batch-major)
+with a stride of ``in_cols``/``n_out`` floats inside the per-row/tile
+batch-aggregation loop -- one 64-byte cache line fetched per sample, 4
+bytes used, repeated once per (row, tile) visited (~72x redundancy at
+288-wide). Fix: ``Block4BackwardParams::input_T``/``output_grad_T``
+(see block4_codec.hpp), built once per ``disldo_backward`` call.
+``output_grad_T`` is a BLOCK transpose to
+``[ceil(n_out/BLOCK4_TILE), batch, BLOCK4_TILE]`` rather than a flat
+transpose, so the existing 4-wide SIMD load per sample stays contiguous
+*and* the batch loop becomes contiguous (stride 4 floats instead of
+n_out) -- no tradeoff between the two access patterns. Zero-padded past
+``n_out`` so boundary tiles read 0 without an extra bounds check.
+Shared template code across ``VALUES_TYPE``, so the fix (and the two
+new scratch fields added to all three ``Block4Store``/``Store8``/
+``Store32`` structs) applies to fp8/fp4 too, not just fp32.
+
+Verified via the full local ``ctest`` suite (163/163, including both
+dequant-equality bit-exact gates) and the Python suite (215/215) --
+numerically correct.
+
+**Did not close the measured gap**: batch=256 backward+update cost was
+unchanged (53.4ms before -> 54.9ms after). ``Block4BackwardAccumulators::
+mdx`` (the dx accumulator write-back) has the identical batch-major
+strided pattern at the same call frequency and was deliberately left
+untouched in this pass -- leading hypothesis for why a numerically
+verified fix produced no measured speedup is that it's now the
+dominant remaining cost. Not yet confirmed; re-profiling or applying
+the same block-transpose treatment to the dx accumulator is the
+natural next step.

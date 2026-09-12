@@ -521,6 +521,33 @@ selection already computed, so a clamped row degrades to plain top-k rather
 than picking arbitrarily; an all-zero row can't manufacture ``k_min``
 entries out of nothing and stays at ``k=0`` regardless.
 
+.. _record_grad_selection_stats.design:
+
+``_record_grad_selection_stats``: achieved R/k for the GRAD axis, mirroring the X axis
+------------------------------------------------------------------------------------------
+
+*ID:* ``record_grad_selection_stats.design``
+
+Before this (2026-09), only the input axis (``x_r_target``, via
+sili_peridot's own ``_update_input_selection_stats``) had a measured
+achieved-density stat -- the gradient axis's own trajectory logging only
+ever echoed the ``dy_r_target`` setpoint, never what the nucleus selection
+actually kept. Called right after ``_nucleus_top_k_csr`` in both
+``DISLDOLayer.forward`` (FP4) and ``DISLDOLayer32.forward`` (fp32)'s
+``dy_r_target`` branches, writing ``layer.last_grad_selection`` (overwritten
+each call, not accumulated) -- ``DISLDOLayer8`` has no ``dy_r_target``
+support at all, so it has no counterpart call site. Real measurement at
+wide288 scale (embed_width=36, state_width=288) showed the grad axis is
+FAR less sparse than the x axis at the same nominal setpoint -- e.g. at
+``r_target=0.9``, x's q/k/v achieved ``k~=58/288`` (~20%) while dy's
+achieved ``k~=128-133/288`` (~45%), consistent with gradients being much
+more diffusely distributed across dims than forward activations (which
+concentrate into a small nucleus). This means the two axes do NOT compound
+multiplicatively the way a naive "density_x * density_dy" estimate would
+assume -- the achieved dy density needs to be measured continuously (not
+assumed) to reason about the real effective sparsification a training run
+is getting.
+
 .. _disldo_layer_forward.design_notes:
 
 ``DISLDOLayer.forward``: five small design decisions bundled into one call site

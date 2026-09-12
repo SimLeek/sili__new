@@ -1316,6 +1316,11 @@ struct Block4Store {
     std::vector<double> scratch_row_grad;         // backward only
     // backward only:
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_backward.batch_stride_transpose: pre-transposed input/
+    // output_grad, built once per disldo_backward call -- see
+    // Block4BackwardParams's own comment (block4_codec.hpp).
+    std::vector<float> scratch_input_T;       // backward only
+    std::vector<float> scratch_output_grad_T; // backward only
     // disldo_forward cross-tile pairing scratch -- currently only used by
     // the FP32 block4 store; harmless unused field here (shared collection
     // loop in disldo_forward populates it for every VALUES_TYPE).
@@ -1881,6 +1886,10 @@ struct Block4Store8 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_backward.batch_stride_transpose: see the FP4 store's
+    // identical fields above.
+    std::vector<float> scratch_input_T;
+    std::vector<float> scratch_output_grad_T;
     // disldo_forward cross-tile pairing scratch -- currently only used by
     // the FP32 block4 store; harmless unused field here (shared collection
     // loop in disldo_forward populates it for every VALUES_TYPE).
@@ -2603,6 +2612,10 @@ struct Block4Store32 {
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
+    // disldo_backward.batch_stride_transpose: see the FP4 store's
+    // identical fields above.
+    std::vector<float> scratch_input_T;
+    std::vector<float> scratch_output_grad_T;
     // disldo_forward.fp32_block4_cross_tile_pairing: marks every SECOND
     // tile of a same-br run in scratch_tile_br/bc (bc-ascending order) as
     // already-consumed by its leader (the immediately preceding flat
