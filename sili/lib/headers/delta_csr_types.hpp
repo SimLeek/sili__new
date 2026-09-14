@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <numeric>
 #include <omp.h>
 #include <stdexcept>
@@ -349,6 +350,27 @@ template <typename T> struct DeltaCSRBiValues {
     std::vector<T> weights;
     std::vector<T> importance;
 };
+
+// Rank-N scale (value_scale_k/output_scale_k/scale_gamma_k, see
+// SparseLinearWeightsDelta::get_scale below) exists to compensate for LOW-
+// BIT quantization error (FP8/FP4's coarse grid) -- it has nothing to
+// contribute for a full-precision store, where there's no quantization
+// error to compensate. Defaulting it ON for every precision (the prior
+// behavior) was a real BDD divergence: fp32/fp64 layers paid its full
+// per-cell compute cost (a redundant sum-of-products, dominant cost
+// measured via callgrind -- see disldo_forward.get_scale_row_col_cache in
+// docs/research/linear_disldo.rst) for a mechanism that's a mathematical
+// no-op there by construction (S=1 whenever value_scale/output_scale/gamma
+// are all untrained, which they always are unless a caller explicitly
+// opts in). is_full_precision_values<VALUES_TYPE> lets
+// SparseLinearWeightsDelta pick scale_enabled's default per-VALUES_TYPE:
+// off for DeltaCSRBiValues<T> (any T -- fp32 today, fp64 if ever used),
+// on for FP8BiValues/FP4BiPacked. Always explicitly overridable via
+// set_scale_enabled() regardless of default -- see
+// docs/research/delta_csr_types.rst:
+// sparse_linear_weights_delta.scale_enabled_precision_default.
+template <typename VALUES_TYPE> struct is_full_precision_values : std::false_type {};
+template <typename T> struct is_full_precision_values<DeltaCSRBiValues<T>> : std::true_type {};
 
 template <typename T> struct ValueAccessor<DeltaCSRBiValues<T>> {
     using value_type = T;
@@ -1314,7 +1336,27 @@ struct SparseLinearWeightsDelta {
     // for why rank>1 is needed at all (conflicting per-column gradient
     // demand within one row), the scattered/block4 scope note, and the
     // known DeferredScaleWrite rank-1-only limitation.
-    std::size_t scale_rank = 1;
+    // Default per-precision, not a single global default -- see
+    // is_full_precision_values above for the rationale: rank-N scale
+    // exists to compensate LOW-BIT quantization error, so a full-precision
+    // store (fp32/fp64) starts with NO scale channels at all (rank 0 --
+    // matching additive_rank's own existing "0 = branch doesn't exist"
+    // convention below, not a separate on/off flag layered on top of a
+    // still-populated rank). get_scale() treats rank==0 as identity (S=1);
+    // every rank-bounded loop elsewhere (forward's row/col scale cache,
+    // backward's mrow_local/mcol_local/mgamma_local scale-TRAINING
+    // gradient accumulation) naturally becomes a 0-iteration no-op at
+    // rank==0 too, so a disabled-by-default fp32 layer's backward pass
+    // never touches value_scale_k/output_scale_k/gamma_k at all -- not
+    // frozen-but-present, genuinely absent, so there's nothing to drift
+    // out of sync with the core weight matrix while scale sits unused.
+    // Explicitly settable to something >0 via set_scale_rank() (also
+    // raises scale_rank_max below if needed) for an fp32 layer that
+    // genuinely wants trained rank-N scale from the start -- NOT meant to
+    // be toggled on/off mid-training (equivalent to restructuring a
+    // pretrained network -- unsupported, same as changing additive_rank
+    // mid-training already is).
+    std::size_t scale_rank = is_full_precision_values<VALUES_TYPE>::value ? 0 : 1;
 
     // AQRS dynamic rank control (task #292 fix): calls since the LAST
     // rank mutation of EITHER kind on this branch -- a real 60k-step MQAR
@@ -1551,6 +1593,8 @@ struct SparseLinearWeightsDelta {
     // Hadamard-multiplied against quant in disldo_forward/backward. See
     // docs/research/delta_csr_types.rst:sparse_linear_weights_delta.get_scale_formula.
     inline value_type get_scale(std::size_t row, std::size_t col) const {
+        if (scale_rank == 0)
+            return value_type(1);
         value_type s = value_type(0);
         for (std::size_t k = 0; k < scale_rank; ++k)
             s += get_scale_gamma_k(k) * get_value_scale_k(row, k) * get_output_scale_k(col, k);
@@ -1748,8 +1792,14 @@ struct SparseLinearWeightsDelta {
     // Runtime-settable POLICY cap (task #295 -- was a compile-time
     // SCALE_RANK_MAX=4 forced by block4's now-gone fixed-size stack
     // arrays). Independent of scale_rank_scratch's memory sizing; default
-    // 4 matches the old compile-time constant.
-    std::size_t scale_rank_max = 4;
+    // 4 matches the old compile-time constant for FP8/FP4. Full-precision
+    // types default this to 0 too (alongside scale_rank itself, see
+    // above) so AQRS dynamic rank control can never silently grow scale
+    // into existence on an fp32/fp64 layer -- set_scale_rank's own
+    // exceeds-scale_rank_max check (below) already throws a clear error in
+    // that case, same explicit-opt-in path as raising it for any other
+    // reason.
+    std::size_t scale_rank_max = is_full_precision_values<VALUES_TYPE>::value ? 0 : 4;
     std::size_t additive_rank_max = 4;
     inline std::size_t get_scale_rank_max() const { return scale_rank_max; }
     // Lowering below the CURRENT scale_rank is allowed -- just blocks

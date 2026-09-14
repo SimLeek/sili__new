@@ -1562,6 +1562,21 @@ class DISLDOLayerV {
                                             static_cast<std::size_t>(n_outputs()));
         weights.recompute_stats();
     }
+
+    // Rank-N scale (value_scale_k/output_scale_k/gamma_k) defaults to 0
+    // channels for this fp32 class -- see is_full_precision_values in
+    // delta_csr_types.hpp for why: it exists to compensate LOW-BIT
+    // quantization error, which a full-precision store doesn't have. Not
+    // something to toggle mid-training (equivalent to restructuring a
+    // pretrained network) -- but genuinely explicit opt-in for a fresh
+    // fp32 layer that wants it (e.g. an extreme-precision problem) is a
+    // legitimate, supported use. set_scale_rank_max must be raised first
+    // if going above the current cap (default 0 here) -- mirrors
+    // SparseLinearLayer(8)Impl's identical accessors.
+    std::size_t get_scale_rank() const { return weights.scale_rank; }
+    void set_scale_rank(std::size_t rank) { weights.set_scale_rank(rank); }
+    std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
+    void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
 };
 
 // ── SparseLinearLayer8 ──────────────────────────────────────────────────────
@@ -3793,6 +3808,18 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("weights"), py::arg("importance"))
         .def("load_dense_values", &DISLDOLayerV::load_dense_values, py::arg("weight_values"),
              py::arg("importance_values"))
+        .def("get_scale_rank", &DISLDOLayerV::get_scale_rank,
+             "Rank-N scale (value_scale_k/output_scale_k/gamma_k) defaults to 0 channels for\n"
+             "this fp32 class -- it exists to compensate LOW-BIT quantization error, which a\n"
+             "full-precision store doesn't have. See set_scale_rank for opting in explicitly.")
+        .def("set_scale_rank", &DISLDOLayerV::set_scale_rank, py::arg("rank"),
+             "Explicit opt-in for a fresh fp32 layer that genuinely wants trained rank-N\n"
+             "scale (e.g. an extreme-precision problem). Raise scale_rank_max first if going\n"
+             "above its default (also 0 here). NOT meant to be toggled on/off mid-training --\n"
+             "equivalent to restructuring a pretrained network, unsupported, same as changing\n"
+             "additive_rank mid-training already is.")
+        .def("get_scale_rank_max", &DISLDOLayerV::get_scale_rank_max)
+        .def("set_scale_rank_max", &DISLDOLayerV::set_scale_rank_max, py::arg("new_max"))
         .def_property_readonly("out_degree",
                                [](const DISLDOLayerV& self) {
                                    return py::array_t<DISLDOLayerV::S>(

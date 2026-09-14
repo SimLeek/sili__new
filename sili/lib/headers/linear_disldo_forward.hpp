@@ -158,10 +158,45 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         // wall-clock effect). See disldo_forward.hoisted_tile_count in
         // docs/research/linear_disldo.rst.
         const int64_t n_tiles_local = int64_t(n_b4);
+        // gamma_k is layer-wide (not row/col-dependent) -- hoisted OUTSIDE
+        // the parallel region entirely, computed once per call and shared
+        // read-only across every thread, instead of get_scale() re-deriving
+        // it from get_scale_gamma_k()'s own lazy-default check on every
+        // single (row,col) cell. See disldo_forward.get_scale_row_col_cache
+        // in docs/research/linear_disldo.rst.
+        //
+        // weights.scale_rank is 0 by default for full-precision layers
+        // (fp32/fp64 -- see is_full_precision_values in
+        // delta_csr_types.hpp): every row_scale_cache/col_scale_cache fill
+        // loop below becomes a 0-iteration no-op, and the dot-product
+        // loops start their accumulator at scale_identity (1) instead of
+        // 0 and never execute either -- so the accumulator is left at
+        // exactly 1, matching get_scale()'s own rank==0 short-circuit,
+        // with NO extra branching inside the hot per-cell loops
+        // themselves.
+        const std::size_t scale_rank = weights.scale_rank;
+        const value_type scale_identity = scale_rank == 0 ? value_type(1) : value_type(0);
+        std::vector<value_type> gamma_k_arr(scale_rank);
+        for (std::size_t k = 0; k < scale_rank; ++k)
+            gamma_k_arr[k] = weights.get_scale_gamma_k(k);
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
             value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
+            // Per-thread, allocated once per call (not per tile): caches
+            // value_scale_k(row,:) for this tile-pair/tile's BLOCK4_TILE
+            // rows and output_scale_k(col,:) for the 1-2 columns currently
+            // in play, so get_scale(row,col)'s O(rank) sum-of-products is
+            // computed from these local arrays instead of calling
+            // weights.get_scale() -- which redundantly re-fetches the SAME
+            // row's value_scale_k once per column visited, and the SAME
+            // column's output_scale_k once per row visited (no caching at
+            // all previously). Measured via callgrind: get_scale() was
+            // 68% of disldo_forward's total instructions at batch=1,
+            // density=1.0 -- see disldo_forward.get_scale_row_col_cache in
+            // docs/research/linear_disldo.rst.
+            std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+            std::vector<value_type> col_scale_cache(2 * scale_rank);
 #pragma omp for schedule(static)
             for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
                 // disldo_forward.block4_cross_tile_pairing (Phase 2 of the
@@ -199,6 +234,19 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
                                                 tile_byte[std::size_t(row_ti + 1)]);
                     const uint8_t* tdataB = tileB.raw_data();
+                    // Row-level value_scale_k -- doesn't depend on lj at
+                    // all (br is fixed for this whole tile-pair), so cache
+                    // it ONCE here instead of once per lj (was 4x
+                    // redundant). See the row_scale_cache/col_scale_cache
+                    // comment above.
+                    std::size_t row_idx[BLOCK4_TILE];
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                        row_idx[li] = row < n_in ? row : 0;
+                        for (std::size_t k = 0; k < scale_rank; ++k)
+                            row_scale_cache[li * scale_rank + k] =
+                                row < n_in ? weights.get_value_scale_k(row, k) : value_type(0);
+                    }
                     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
                         const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
                         const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
@@ -212,14 +260,24 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                                                    : block4_vec_broadcast(0.0f);
                         const Block8Vec w_decoded8 = block8_vec_from_lo_hi(wA, wB);
 
-                        std::size_t row_idx[BLOCK4_TILE];
+                        // Column-level output_scale_k -- once per lj, not
+                        // once per li (was 4x redundant).
+                        for (std::size_t k = 0; k < scale_rank; ++k) {
+                            col_scale_cache[k] = weights.get_output_scale_k(colA, k);
+                            col_scale_cache[scale_rank + k] =
+                                haveB ? weights.get_output_scale_k(colB, k) : value_type(0);
+                        }
                         Block8Vec s8;
                         for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                             const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                            row_idx[li] = row < n_in ? row : 0;
-                            s8[li] = row < n_in ? weights.get_scale(row, colA) : value_type(0);
-                            s8[li + 4] = (row < n_in && haveB) ? weights.get_scale(row, colB)
-                                                               : value_type(0);
+                            value_type sA = scale_identity, sB = scale_identity;
+                            for (std::size_t k = 0; k < scale_rank; ++k) {
+                                const value_type vsk = row_scale_cache[li * scale_rank + k];
+                                sA += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                                sB += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                            }
+                            s8[li] = row < n_in ? sA : value_type(0);
+                            s8[li + 4] = (row < n_in && haveB) ? sB : value_type(0);
                         }
                         const Block8Vec w8 = w_decoded8 * s8;
 
@@ -250,6 +308,19 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 const uint32_t bc = bcA;
                 const uint8_t* tdata = tdataA;
                 const uint32_t br_ = br;
+                // Row-level value_scale_k -- shared by BOTH process_pair
+                // calls below (LJ0=0 and LJ0=2, same br_), so hoisted
+                // outside the lambda entirely instead of being recomputed
+                // once per call (was 2x redundant on top of get_scale's
+                // own per-cell cost).
+                std::size_t row_idx[BLOCK4_TILE];
+                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                    const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                    row_idx[li] = row < n_in ? row : 0;
+                    for (std::size_t k = 0; k < scale_rank; ++k)
+                        row_scale_cache[li * scale_rank + k] =
+                            row < n_in ? weights.get_value_scale_k(row, k) : value_type(0);
+                }
                 auto process_pair = [&, br_]<uint32_t LJ0>() {
                     constexpr uint32_t LJ1 = LJ0 + 1;
                     const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
@@ -265,14 +336,22 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                                                        : block4_vec_broadcast(0.0f);
                     const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
 
-                    std::size_t row_idx[BLOCK4_TILE];
+                    for (std::size_t k = 0; k < scale_rank; ++k) {
+                        col_scale_cache[k] = weights.get_output_scale_k(col0, k);
+                        col_scale_cache[scale_rank + k] =
+                            have1 ? weights.get_output_scale_k(col1, k) : value_type(0);
+                    }
                     Block8Vec s8;
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
-                        row_idx[li] = row < n_in ? row : 0;
-                        s8[li] = row < n_in ? weights.get_scale(row, col0) : value_type(0);
-                        s8[li + 4] =
-                            (row < n_in && have1) ? weights.get_scale(row, col1) : value_type(0);
+                        value_type s0 = scale_identity, s1 = scale_identity;
+                        for (std::size_t k = 0; k < scale_rank; ++k) {
+                            const value_type vsk = row_scale_cache[li * scale_rank + k];
+                            s0 += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                            s1 += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                        }
+                        s8[li] = row < n_in ? s0 : value_type(0);
+                        s8[li + 4] = (row < n_in && have1) ? s1 : value_type(0);
                     }
                     const Block8Vec w8 = w_decoded8 * s8;
 
