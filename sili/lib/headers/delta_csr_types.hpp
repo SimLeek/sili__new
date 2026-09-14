@@ -1142,6 +1142,44 @@ struct SparseLinearWeightsDelta {
 
         std::size_t cap_threads = 0, cap_rank = 0, cap_tile_width = 0;
 
+        // Per-thread STRIDES (in elements, one per distinct element-type/
+        // shape combination below), each padded so a thread's slice never
+        // shares a cache line with an adjacent thread's slice in the SAME
+        // vector. Without this, every real (lr!=0) write through
+        // block4_backward_process_row_pair/tile_pair -- which route the
+        // MAJORITY of disldo_backward's work once density is high enough
+        // that rows pair up -- causes cross-core cache-line ping-pong
+        // between threads whose per-thread blocks are smaller than 64
+        // bytes (e.g. rank=8 floats = 32B, well under a cache line).
+        // Measured: at width=288/rank=8/num_cpus=8 on the dual-CCX
+        // Ryzen 3800XT remote box, this alone made disldo_backward's
+        // TRAINING path (bwdX, lr!=0) 5-30x SLOWER after task #295-style
+        // scratch reuse was extended to row_pair/tile_pair, despite a
+        // clean single-threaded instruction-count IMPROVEMENT (callgrind:
+        // 7.8B vs 11.5B Ir for the same 300 calls) -- a classic false-
+        // sharing signature: fewer instructions, much higher wall time
+        // under concurrent writers. See docs/research/delta_csr_types.rst:
+        // sparse_linear_weights_delta.scale_rank_scratch_false_sharing.
+        std::size_t thread_stride_v = 0;           // value_type, rank elements
+        std::size_t thread_stride_v_tile = 0;      // value_type, rank*tile_width elements
+        std::size_t thread_stride_d = 0;           // double, rank elements
+        std::size_t thread_stride_v_pair = 0;      // value_type, 2*rank elements
+        std::size_t thread_stride_v_tile_pair = 0; // value_type, 2*rank*tile_width elements
+        std::size_t thread_stride_d_pair = 0;      // double, 2*rank elements
+
+        static constexpr std::size_t CACHE_LINE_BYTES = 64;
+
+        // Rounds elems up so elems*sizeof(T) is a whole multiple of a
+        // cache line -- the actual per-thread DATA stays at `elems`
+        // (only indices [0, elems) are ever read/written), the extra
+        // slots are pure padding that separates adjacent threads' blocks.
+        template <typename T> static std::size_t pad_elems(std::size_t elems) {
+            const std::size_t bytes = elems * sizeof(T);
+            const std::size_t padded_bytes =
+                ((bytes + CACHE_LINE_BYTES - 1) / CACHE_LINE_BYTES) * CACHE_LINE_BYTES;
+            return padded_bytes / sizeof(T);
+        }
+
         // Grow-only (never shrinks) -- called automatically at the top of
         // every disldo_backward call, a cheap no-op once large enough.
         void ensure(std::size_t threads, std::size_t rank, std::size_t tile_width) {
@@ -1157,24 +1195,28 @@ struct SparseLinearWeightsDelta {
             cap_threads = threads;
             cap_rank = rank;
             cap_tile_width = tile_width;
-            const std::size_t flat = threads * rank;
-            const std::size_t flat_tiled = flat * tile_width;
-            value_scale_k.resize(flat);
-            out_scale_k.resize(flat_tiled);
-            mcol_rank.resize(flat_tiled);
-            mrow_local_k.resize(flat);
-            mcol_rank_contrib.resize(flat_tiled);
-            mrow_local_k_contrib.resize(flat);
-            mgamma_local_k.resize(flat);
-            mgamma_local_k_contrib.resize(flat);
-            mcol_acc_raw.resize(flat_tiled);
-            mcol_acc_raw_contrib.resize(flat_tiled);
-            value_scale_k_pair.resize(2 * flat);
-            mrow_local_k_pair.resize(2 * flat);
-            mrow_local_k_pair_contrib.resize(2 * flat);
-            out_scale_k_pair.resize(2 * flat_tiled);
-            mcol_local_pair.resize(2 * flat_tiled);
-            mcol_local_pair_contrib.resize(2 * flat_tiled);
+            thread_stride_v = pad_elems<value_type>(rank);
+            thread_stride_v_tile = pad_elems<value_type>(rank * tile_width);
+            thread_stride_d = pad_elems<double>(rank);
+            thread_stride_v_pair = pad_elems<value_type>(2 * rank);
+            thread_stride_v_tile_pair = pad_elems<value_type>(2 * rank * tile_width);
+            thread_stride_d_pair = pad_elems<double>(2 * rank);
+            value_scale_k.resize(threads * thread_stride_v);
+            out_scale_k.resize(threads * thread_stride_v_tile);
+            mcol_rank.resize(threads * thread_stride_v_tile);
+            mrow_local_k.resize(threads * thread_stride_d);
+            mcol_rank_contrib.resize(threads * thread_stride_v_tile);
+            mrow_local_k_contrib.resize(threads * thread_stride_d);
+            mgamma_local_k.resize(threads * thread_stride_d);
+            mgamma_local_k_contrib.resize(threads * thread_stride_d);
+            mcol_acc_raw.resize(threads * thread_stride_v_tile);
+            mcol_acc_raw_contrib.resize(threads * thread_stride_v_tile);
+            value_scale_k_pair.resize(threads * thread_stride_v_pair);
+            mrow_local_k_pair.resize(threads * thread_stride_d_pair);
+            mrow_local_k_pair_contrib.resize(threads * thread_stride_d_pair);
+            out_scale_k_pair.resize(threads * thread_stride_v_tile_pair);
+            mcol_local_pair.resize(threads * thread_stride_v_tile_pair);
+            mcol_local_pair_contrib.resize(threads * thread_stride_v_tile_pair);
         }
     };
     ScaleRankScratch scale_rank_scratch;

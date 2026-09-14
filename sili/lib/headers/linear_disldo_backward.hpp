@@ -63,6 +63,7 @@ void block4_backward_process_single_row(
     const value_type zero_escape_eps = params.zero_escape_eps;
     const value_type* gamma_k_arr = params.gamma_k_arr;
     const int tid = block4_accum.tid;
+    auto& srs = weights.scale_rank_scratch;
     // disldo_backward.batch_stride_transpose: input_T is [n_in, batch]
     // (contiguous per row across batch); output_grad_T is [n_col_tiles,
     // batch, BLOCK4_TILE] (contiguous per output-tile across batch, still
@@ -106,7 +107,7 @@ void block4_backward_process_single_row(
     // the scattered path's own once-per-row granularity
     // (see disldo_backward's non-DeferredScaleWrite branch).
     value_type* value_scale_k =
-        weights.scale_rank_scratch.value_scale_k.data() + static_cast<std::size_t>(tid) * rank;
+        srs.value_scale_k.data() + static_cast<std::size_t>(tid) * srs.thread_stride_v;
     for (std::size_t k = 0; k < rank; ++k)
         value_scale_k[k] = weights.get_value_scale_k(row, k);
 
@@ -119,10 +120,9 @@ void block4_backward_process_single_row(
     // quant_orig4: immutable snapshot of its call-entry
     // value, for contrib.
     value_type quant4[BLOCK4_TILE], ci4[BLOCK4_TILE], quant_orig4[BLOCK4_TILE];
-    const Flat2DView<value_type> out_scale_k4{weights.scale_rank_scratch.out_scale_k.data() +
-                                                  static_cast<std::size_t>(tid) * rank *
-                                                      BLOCK4_TILE,
-                                              BLOCK4_TILE};
+    const Flat2DView<value_type> out_scale_k4{
+        srs.out_scale_k.data() + static_cast<std::size_t>(tid) * srs.thread_stride_v_tile,
+        BLOCK4_TILE};
     // was_live4[lj]: TRUE only if this cell held a genuine
     // synapse BEFORE this call -- gates the never-zero
     // live quantizer so it never permanently "births" a
@@ -165,16 +165,15 @@ void block4_backward_process_single_row(
     // (pure register/stack traffic), flush once after.
     // Reused scratch memory -- explicit zero each tile
     // visit (task #295).
-    const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
-    const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
-    auto& srs = weights.scale_rank_scratch;
-    const Flat2DView<value_type> mcol4_rank{srs.mcol_rank.data() + tid_rank_tile, BLOCK4_TILE};
-    double* mrow_local_k = srs.mrow_local_k.data() + tid_rank;
-    const Flat2DView<value_type> mcol4_rank_contrib{srs.mcol_rank_contrib.data() + tid_rank_tile,
+    const std::size_t tid_off_v_tile = static_cast<std::size_t>(tid) * srs.thread_stride_v_tile;
+    const std::size_t tid_off_d = static_cast<std::size_t>(tid) * srs.thread_stride_d;
+    const Flat2DView<value_type> mcol4_rank{srs.mcol_rank.data() + tid_off_v_tile, BLOCK4_TILE};
+    double* mrow_local_k = srs.mrow_local_k.data() + tid_off_d;
+    const Flat2DView<value_type> mcol4_rank_contrib{srs.mcol_rank_contrib.data() + tid_off_v_tile,
                                                     BLOCK4_TILE};
-    double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_rank;
-    double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
-    double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+    double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_off_d;
+    double* mgamma_local_k = srs.mgamma_local_k.data() + tid_off_d;
+    double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_off_d;
     std::fill(mcol4_rank[0], mcol4_rank[0] + rank * BLOCK4_TILE, value_type(0));
     std::fill(mrow_local_k, mrow_local_k + rank, 0.0);
     std::fill(mcol4_rank_contrib[0], mcol4_rank_contrib[0] + rank * BLOCK4_TILE, value_type(0));
@@ -286,8 +285,8 @@ void block4_backward_process_single_row(
             // mcol_acc_raw/_contrib are the only TRUE
             // cross-batch accumulators here; backed by
             // scratch (task #295).
-            value_type* mcol_acc_raw = srs.mcol_acc_raw.data() + tid_rank_tile;
-            value_type* mcol_acc_raw_contrib = srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
+            value_type* mcol_acc_raw = srs.mcol_acc_raw.data() + tid_off_v_tile;
+            value_type* mcol_acc_raw_contrib = srs.mcol_acc_raw_contrib.data() + tid_off_v_tile;
             for (std::size_t k = 0; k < rank; ++k) {
                 block4_vec_store(mcol_acc_raw + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
                 block4_vec_store(mcol_acc_raw_contrib + k * BLOCK4_TILE,
@@ -481,10 +480,12 @@ void block4_backward_process_row_pair(
     // 4-wide, reused for both halves below.
     std::size_t col4[BLOCK4_TILE];
     value_type out_imp_scale4[BLOCK4_TILE];
-    const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
-    const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
     auto& srs = weights.scale_rank_scratch;
-    const Flat2DView<value_type> out_scale_k4{srs.out_scale_k.data() + tid_rank_tile, BLOCK4_TILE};
+    const std::size_t tid_off_v_tile = static_cast<std::size_t>(tid) * srs.thread_stride_v_tile;
+    const std::size_t tid_off_v_pair = static_cast<std::size_t>(tid) * srs.thread_stride_v_pair;
+    const std::size_t tid_off_d = static_cast<std::size_t>(tid) * srs.thread_stride_d;
+    const std::size_t tid_off_d_pair = static_cast<std::size_t>(tid) * srs.thread_stride_d_pair;
+    const Flat2DView<value_type> out_scale_k4{srs.out_scale_k.data() + tid_off_v_tile, BLOCK4_TILE};
     for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
         col4[lj] = std::size_t(bc) * BLOCK4_TILE + lj;
         out_imp_scale4[lj] = weights.get_output_importance_scale(col4[lj]);
@@ -495,7 +496,7 @@ void block4_backward_process_row_pair(
     // disldo_backward.scale_rank_scratch_pair_task: was a fresh
     // std::vector heap allocation per call -- see docs/research/
     // delta_csr_types.rst for the callgrind evidence this fixes.
-    value_type* value_scale_k_row0 = srs.value_scale_k_pair.data() + tid_rank * 2;
+    value_type* value_scale_k_row0 = srs.value_scale_k_pair.data() + tid_off_v_pair;
     value_type* value_scale_k_row1 = value_scale_k_row0 + rank;
     for (std::size_t k = 0; k < rank; ++k) {
         value_scale_k_row0[k] = weights.get_value_scale_k(row0, k);
@@ -536,22 +537,22 @@ void block4_backward_process_row_pair(
     const Block8Vec quant_floor_v = block8_vec_load(quant_floor8);
     const Block8Vec S_v = block8_vec_load(combined_scale8);
 
-    value_type* mcol_acc = srs.mcol_acc_raw.data() + tid_rank_tile;
-    value_type* mcol_acc_contrib = srs.mcol_acc_raw_contrib.data() + tid_rank_tile;
+    value_type* mcol_acc = srs.mcol_acc_raw.data() + tid_off_v_tile;
+    value_type* mcol_acc_contrib = srs.mcol_acc_raw_contrib.data() + tid_off_v_tile;
     for (std::size_t k = 0; k < rank; ++k) {
         block4_vec_store(mcol_acc + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
         block4_vec_store(mcol_acc_contrib + k * BLOCK4_TILE, block4_vec_broadcast(0.0f));
     }
-    double* mrow_local0_k = srs.mrow_local_k_pair.data() + tid_rank * 2;
+    double* mrow_local0_k = srs.mrow_local_k_pair.data() + tid_off_d_pair;
     double* mrow_local1_k = mrow_local0_k + rank;
-    double* mrow_local0_k_contrib = srs.mrow_local_k_pair_contrib.data() + tid_rank * 2;
+    double* mrow_local0_k_contrib = srs.mrow_local_k_pair_contrib.data() + tid_off_d_pair;
     double* mrow_local1_k_contrib = mrow_local0_k_contrib + rank;
     std::fill(mrow_local0_k, mrow_local0_k + rank, 0.0);
     std::fill(mrow_local1_k, mrow_local1_k + rank, 0.0);
     std::fill(mrow_local0_k_contrib, mrow_local0_k_contrib + rank, 0.0);
     std::fill(mrow_local1_k_contrib, mrow_local1_k_contrib + rank, 0.0);
-    double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
-    double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+    double* mgamma_local_k = srs.mgamma_local_k.data() + tid_off_d;
+    double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_off_d;
     std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
     std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
 
@@ -793,9 +794,11 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
     // process_row_pair's identical comment -- the per-li locals below used
     // to be fresh std::vector heap allocations every call.
     const int tid = block4_accum.tid;
-    const std::size_t tid_rank = static_cast<std::size_t>(tid) * rank;
-    const std::size_t tid_rank_tile = tid_rank * BLOCK4_TILE;
     auto& srs = weights.scale_rank_scratch;
+    const std::size_t tid_off_v = static_cast<std::size_t>(tid) * srs.thread_stride_v;
+    const std::size_t tid_off_v_tile_pair =
+        static_cast<std::size_t>(tid) * srs.thread_stride_v_tile_pair;
+    const std::size_t tid_off_d = static_cast<std::size_t>(tid) * srs.thread_stride_d;
     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
         if (row >= n_in)
@@ -809,14 +812,14 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
         // Shared across both halves (same row) -- reuses the same
         // single-row-shaped scratch slot block4_backward_process_single_row
         // uses (never concurrent on one thread with that function).
-        value_type* value_scale_k_row = srs.value_scale_k.data() + tid_rank;
+        value_type* value_scale_k_row = srs.value_scale_k.data() + tid_off_v;
         for (std::size_t k = 0; k < rank; ++k)
             value_scale_k_row[k] = weights.get_value_scale_k(row, k);
 
         std::size_t colA[BLOCK4_TILE], colB[BLOCK4_TILE];
         value_type out_imp_scaleA[BLOCK4_TILE], out_imp_scaleB[BLOCK4_TILE];
         // Per-half, per-k -- A and B are DIFFERENT columns.
-        value_type* out_scale_kA = srs.out_scale_k_pair.data() + tid_rank_tile * 2;
+        value_type* out_scale_kA = srs.out_scale_k_pair.data() + tid_off_v_tile_pair;
         value_type* out_scale_kB = out_scale_kA + rank * BLOCK4_TILE;
         value_type combined_scale8[2 * BLOCK4_TILE];
         for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
@@ -872,16 +875,16 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
         // halves feed the SAME row's mrow/mgamma gradient -- reuses the
         // same single-row-shaped scratch slots as block4_backward_process_
         // single_row (never concurrent on one thread with that function).
-        double* mrow_local_k = srs.mrow_local_k.data() + tid_rank;
-        double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_rank;
-        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_rank;
-        double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_rank;
+        double* mrow_local_k = srs.mrow_local_k.data() + tid_off_d;
+        double* mrow_local_k_contrib = srs.mrow_local_k_contrib.data() + tid_off_d;
+        double* mgamma_local_k = srs.mgamma_local_k.data() + tid_off_d;
+        double* mgamma_local_k_contrib = srs.mgamma_local_k_contrib.data() + tid_off_d;
         std::fill(mrow_local_k, mrow_local_k + rank, 0.0);
         std::fill(mrow_local_k_contrib, mrow_local_k_contrib + rank, 0.0);
         std::fill(mgamma_local_k, mgamma_local_k + rank, 0.0);
         std::fill(mgamma_local_k_contrib, mgamma_local_k_contrib + rank, 0.0);
-        value_type* mcol_local8 = srs.mcol_local_pair.data() + tid_rank_tile * 2;
-        value_type* mcol_local_contrib8 = srs.mcol_local_pair_contrib.data() + tid_rank_tile * 2;
+        value_type* mcol_local8 = srs.mcol_local_pair.data() + tid_off_v_tile_pair;
+        value_type* mcol_local_contrib8 = srs.mcol_local_pair_contrib.data() + tid_off_v_tile_pair;
         std::fill(mcol_local8, mcol_local8 + rank * 2 * BLOCK4_TILE, value_type(0));
         std::fill(mcol_local_contrib8, mcol_local_contrib8 + rank * 2 * BLOCK4_TILE, value_type(0));
         // disldo_backward.batch_stride_transpose: see block4_backward_process_
