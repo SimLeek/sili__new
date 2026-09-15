@@ -162,6 +162,67 @@ inline float block4_vec_hsum(Block4Vec x) {
     return x[0] + x[1] + x[2] + x[3];
 }
 
+// disldo_forward.batch_blocked_accumulate (Phase 1, batch-blocked
+// accumulation rollout -- see TODO_BATCH_BLOCKING.md): register-blocked
+// multiply-accumulate of BLOCK4_TILE input rows into ONE output column,
+// against BLOCK4_BATCH_BLOCK_B batch samples at a time. Requires BOTH
+// sides pre-transposed to batch-contiguous layout: `row_ptrs[li]` each
+// point to `batch` CONTIGUOUS values (disldo_forward's shared, read-only
+// `input_T[row*batch+b]`, built once per call), and `out_col` points to
+// `batch` contiguous values in a per-thread PRIVATE column-major
+// accumulator (never the real shared `output`, which stays row-major and
+// gets one transpose-back pass per thread at the very end -- see the wide
+// path in disldo_forward). Both the load of `row_ptrs[li]` and the
+// load/store of `out_col` are then genuine wide SIMD instead of, on the
+// input side, a per-sample 4-lane gather, and on the output side, a
+// per-sample horizontal reduce-and-scalar-store
+// (out[b]+=prod[0]+prod[1]+prod[2]+prod[3], measured via callgrind as
+// ~74% of disldo_forward's real per-sample work at batch=1024). Confirmed
+// via a standalone multi-threaded PoC (num_cpus=8, real OpenMP
+// contention, not just single-thread isolation) that writing into a
+// PRIVATE per-thread buffer like this beats writing the transposed
+// accumulate straight into a SHARED buffer by an additional, consistent
+// 10-20% on top of the transpose's own 2.2-3.8x -- see
+// TODO_BATCH_BLOCKING.md for the actual measured table. LOSES below
+// roughly batch=8 (transpose overhead not amortized) -- gated by
+// BLOCK4_BATCH_BLOCK_THRESHOLD at the disldo_forward call site, not
+// inside this function.
+constexpr int BLOCK4_BATCH_BLOCK_B = 8;
+using Block4BatchVec = float __attribute__((__vector_size__(BLOCK4_BATCH_BLOCK_B * sizeof(float))));
+
+inline void block4_batch_accumulate(const float w4[BLOCK4_TILE],
+                                    const float* const row_ptrs[BLOCK4_TILE], std::size_t batch,
+                                    float* out_col) {
+    // Hoist the per-row weight broadcast OUT of the batch-chunk loop: it's
+    // loop-invariant (constant across b), but a per-lane fill loop like
+    // `for(k) wv[k]=w4[li]` INSIDE the loop defeats GCC's ability to keep
+    // it in a register -- same lesson block4_vec_broadcast's own
+    // docstring above already documents from disldo_backward (7.6% of a
+    // whole profiled run was that exact anti-pattern). Aggregate-init
+    // instead, once, before the loop.
+    Block4BatchVec wv[BLOCK4_TILE];
+    for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+        wv[li] = Block4BatchVec{w4[li], w4[li], w4[li], w4[li], w4[li], w4[li], w4[li], w4[li]};
+
+    std::size_t b = 0;
+    for (; b + BLOCK4_BATCH_BLOCK_B <= batch; b += BLOCK4_BATCH_BLOCK_B) {
+        Block4BatchVec acc;
+        std::memcpy(&acc, out_col + b, sizeof(acc));
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            Block4BatchVec iv;
+            std::memcpy(&iv, row_ptrs[li] + b, sizeof(iv));
+            acc += wv[li] * iv;
+        }
+        std::memcpy(out_col + b, &acc, sizeof(acc));
+    }
+    for (; b < batch; ++b) {
+        float s = 0;
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            s += w4[li] * row_ptrs[li][b];
+        out_col[b] += s;
+    }
+}
+
 // Elementwise sqrt -- GCC vector-extension types have no built-in sqrt.
 // Used by the RMSprop-style importance damping (decayed mean-of-g^2,
 // see linear_disldo.hpp's disldo_backward) instead of block4_vec_abs.
@@ -1369,7 +1430,12 @@ struct Block4Store {
     // disldo_backward.batch_stride_transpose: pre-transposed input/
     // output_grad, built once per disldo_backward call -- see
     // Block4BackwardParams's own comment (block4_codec.hpp).
-    std::vector<float> scratch_input_T;       // backward only
+    // Shared, read-only [row, batch] transpose of the input, reused
+    // call to call so no fresh allocation happens on the hot path.
+    // Originally backward-only; disldo_forward's wide (column-partitioned)
+    // path now reuses it too at batch >= BLOCK4_BATCH_BLOCK_THRESHOLD --
+    // see disldo_forward.batch_blocked_wide_path in linear_disldo_forward.hpp.
+    std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T; // backward only
     // disldo_forward.column_partitioned_threading: per-thread work-item
     // lists (see Block4WorkItem above) plus the column-block partition

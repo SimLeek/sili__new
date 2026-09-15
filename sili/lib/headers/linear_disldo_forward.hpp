@@ -314,8 +314,18 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         // assumed) speedup first. ONE generic implementation for all
         // three precisions -- the only per-precision difference is the
         // weight decode, Block4Codec<VALUES_TYPE>::decode_weight_column4.
+        // disldo_forward.batch_blocked_wide_path (Phase 1, see
+        // TODO_BATCH_BLOCKING.md): when `input_T` is non-null, `mo` is
+        // reinterpreted as a per-thread PRIVATE column-major accumulator
+        // (thread's own columns only, offset by `col_lo`) instead of the
+        // real row-major `output` -- see block4_batch_accumulate's own
+        // docstring in block4.hpp for the full rationale. `input_T` and
+        // `col_lo` default to "off" (nullptr / 0) so every other call site
+        // (narrow path, Phase 2+) is untouched.
         auto process_block4_item = [&](const Block4WorkItem& item, value_type* mo,
-                                       value_type* row_scale_cache, value_type* col_scale_cache) {
+                                       value_type* row_scale_cache, value_type* col_scale_cache,
+                                       const value_type* input_T = nullptr,
+                                       std::size_t col_lo = 0) {
             using Codec = Block4Codec<VALUES_TYPE>;
             const uint32_t br = item.br, bcA = item.bcA;
             const auto tileA = weights.block4.at_index(br, bcA, item.elemA, item.byteA);
@@ -389,6 +399,28 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         }
                     }
                     const Block8Vec w8 = w_decoded8 * s8;
+
+                    if (input_T != nullptr) {
+                        // disldo_forward.batch_blocked_wide_path: mo is
+                        // this thread's private column-major accumulator
+                        // here, not `output` -- see block4_batch_accumulate.
+                        const value_type* row_ptrs[BLOCK4_TILE];
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                            row_ptrs[li] = input_T + row_idx[li] * static_cast<std::size_t>(batch);
+                        float wA[BLOCK4_TILE], wB[BLOCK4_TILE];
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            wA[li] = w8[li];
+                            wB[li] = w8[li + 4];
+                        }
+                        block4_batch_accumulate(wA, row_ptrs, batch,
+                                                mo + (colA - col_lo) *
+                                                         static_cast<std::size_t>(batch));
+                        if (haveB)
+                            block4_batch_accumulate(wB, row_ptrs, batch,
+                                                    mo + (colB - col_lo) *
+                                                             static_cast<std::size_t>(batch));
+                        continue;
+                    }
 
                     // full_rows: row_idx[0..3] are 4 consecutive rows,
                     // one contiguous wide load instead of 4 scalar reads.
@@ -475,6 +507,24 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 }
                 const Block8Vec w8 = w_decoded8 * s8;
 
+                if (input_T != nullptr) {
+                    const value_type* row_ptrs[BLOCK4_TILE];
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                        row_ptrs[li] = input_T + row_idx[li] * static_cast<std::size_t>(batch);
+                    float w0[BLOCK4_TILE], w1[BLOCK4_TILE];
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        w0[li] = w8[li];
+                        w1[li] = w8[li + 4];
+                    }
+                    block4_batch_accumulate(w0, row_ptrs, batch,
+                                            mo + (col0 - col_lo) * static_cast<std::size_t>(batch));
+                    if (have1)
+                        block4_batch_accumulate(w1, row_ptrs, batch,
+                                                mo + (col1 - col_lo) *
+                                                         static_cast<std::size_t>(batch));
+                    return;
+                }
+
                 for (SIZE_TYPE b = 0; b < batch; ++b) {
                     const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
                     Block8Vec in8;
@@ -505,14 +555,70 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             // ownership -- that's what makes writing directly into
             // `output` safe with zero cross-thread writes, zero
             // reduction.
+            //
+            // disldo_forward.batch_blocked_wide_path (Phase 1, see
+            // TODO_BATCH_BLOCKING.md): below BLOCK4_BATCH_BLOCK_THRESHOLD,
+            // the transpose isn't amortized and this path measured
+            // SLOWER than the plain per-item scalar path (0.1-0.6x at
+            // batch=1) -- so it stays off below threshold, matching the
+            // existing per-item call exactly. At/above threshold, build
+            // input_T once (shared, read-only, transposed to
+            // [row, batch]), give each thread a PRIVATE column-major
+            // accumulator sized to just its own column range, and flush
+            // (transpose back, +=) into `output` once at the end --
+            // still zero cross-thread writes, same safety property as
+            // today's direct-to-`output` writes.
+            constexpr SIZE_TYPE BLOCK4_BATCH_BLOCK_THRESHOLD = 8;
+            if (batch >= BLOCK4_BATCH_BLOCK_THRESHOLD) {
+                std::vector<value_type>& input_T = weights.block4.scratch_input_T;
+                input_T.resize(n_in * static_cast<std::size_t>(batch));
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
+                for (std::size_t r = 0; r < n_in; ++r) {
+                    value_type* dst = input_T.data() + r * static_cast<std::size_t>(batch);
+                    for (SIZE_TYPE b = 0; b < batch; ++b)
+                        dst[b] = input[static_cast<std::size_t>(b) * in_cols + r];
+                }
+
 #pragma omp parallel num_threads(num_cpus)
-            {
-                const int tid = omp_get_thread_num();
-                std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
-                std::vector<value_type> col_scale_cache(2 * scale_rank);
-                for (const Block4WorkItem& item : thread_items[static_cast<std::size_t>(tid)])
-                    process_block4_item(item, output, row_scale_cache.data(),
-                                        col_scale_cache.data());
+                {
+                    const int tid = omp_get_thread_num();
+                    std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                    std::vector<value_type> col_scale_cache(2 * scale_rank);
+                    const std::vector<std::size_t>& thread_bc_start_ =
+                        weights.block4.scratch_thread_bc_start;
+                    const std::size_t col_lo = std::min(
+                        thread_bc_start_[static_cast<std::size_t>(tid)] * BLOCK4_TILE, n_out);
+                    const std::size_t col_hi = std::min(
+                        thread_bc_start_[static_cast<std::size_t>(tid) + 1] * BLOCK4_TILE, n_out);
+                    if (col_hi > col_lo) {
+                        const std::size_t thread_ncols = col_hi - col_lo;
+                        std::vector<value_type> thread_buf(
+                            thread_ncols * static_cast<std::size_t>(batch), value_type(0));
+                        for (const Block4WorkItem& item :
+                             thread_items[static_cast<std::size_t>(tid)])
+                            process_block4_item(item, thread_buf.data(), row_scale_cache.data(),
+                                                col_scale_cache.data(), input_T.data(), col_lo);
+                        // Transpose-back flush: this thread's columns
+                        // only, so no cross-thread writes here either.
+                        for (std::size_t col = col_lo; col < col_hi; ++col) {
+                            const value_type* src =
+                                thread_buf.data() +
+                                (col - col_lo) * static_cast<std::size_t>(batch);
+                            for (SIZE_TYPE b = 0; b < batch; ++b)
+                                output[static_cast<std::size_t>(b) * n_out + col] += src[b];
+                        }
+                    }
+                }
+            } else {
+#pragma omp parallel num_threads(num_cpus)
+                {
+                    const int tid = omp_get_thread_num();
+                    std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                    std::vector<value_type> col_scale_cache(2 * scale_rank);
+                    for (const Block4WorkItem& item : thread_items[static_cast<std::size_t>(tid)])
+                        process_block4_item(item, output, row_scale_cache.data(),
+                                            col_scale_cache.data());
+                }
             }
         } else {
             // Narrow path: process the flat, row-major item list via a
