@@ -60,6 +60,30 @@ def dense_masked(batch, n, density, rng):
     return out
 
 
+def banded_weights(n_in, n_out, synapse_density, rng):
+    """[n_in, n_out] weight matrix where row i's nonzero synapses form a
+    CONTIGUOUS band of round(synapse_density*n_out) columns centered on
+    row i's diagonal-corresponding position, instead of dense_masked's
+    scattered-random nonzeros. This is a structural (SYNAPSE) sparsity
+    pattern, not an input/grad (ACTIVATION) one -- it changes which block4
+    tiles exist at all, not which input/dy entries are zero within an
+    otherwise-fully-populated layer. synapse_density=1.0 reproduces the
+    fully dense case (every column nonzero, same as the flat
+    rng.standard_normal(...) weight init used elsewhere in this script).
+    A contiguous band packs into fewer, denser block4 tiles than the same
+    nonzero COUNT scattered randomly would -- locally-connected/conv-like
+    layers are the real-world shape this approximates.
+    """
+    out = np.zeros((n_in, n_out), dtype=np.float32)
+    k = max(1, round(synapse_density * n_out))
+    for i in range(n_in):
+        center = round(i * n_out / max(1, n_in - 1)) if n_in > 1 else 0
+        lo = max(0, min(n_out - k, center - k // 2))
+        hi = lo + k
+        out[i, lo:hi] = rng.standard_normal(hi - lo).astype(np.float32) * 0.1
+    return out
+
+
 def to_csr(dense):
     batch, n = dense.shape
     ptrs = [0]
@@ -76,22 +100,31 @@ def to_csr(dense):
     )
 
 
-def make_layer(n_in, n_out, num_cpus, wvals, ivals):
+def make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses=False):
     layer = _cpu.DISLDOLayerV(n_in, n_out, n_in * n_out, num_cpus)
-    layer.load_dense_values(wvals, ivals)
+    # load_dense_values allocates every block4 tile unconditionally --
+    # measured directly as giving essentially NO speedup for a sparse
+    # weight pattern (a 10%-density banded matrix ran only ~11% faster
+    # than fully dense). load_sparse_values instead skips any (br,bc)
+    # block with no live content, so --synapse-density < 1.0 actually
+    # produces a genuinely smaller block4 structure to benchmark.
+    if sparse_synapses:
+        layer.load_sparse_values(wvals, ivals)
+    else:
+        layer.load_dense_values(wvals, ivals)
     return layer
 
 
-def run_cell(n_in, n_out, num_cpus, batch, density, calls_base, repeats, wvals, ivals, rng):
+def run_cell(n_in, n_out, num_cpus, batch, density, calls_base, repeats, wvals, ivals, rng, sparse_synapses=False):
     n_calls = n_calls_for(batch, calls_base)
     x = dense_masked(batch, n_in, density, rng)
     dy = dense_masked(batch, n_out, density, rng)
     x_ptrs, x_idx, x_val = to_csr(x)
     dy_ptrs, dy_idx, dy_val = to_csr(dy)
 
-    disldo_fwd = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    disldo_fwd = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     fwd_disldo = bench_repeated(lambda: disldo_fwd.forward(x), n_calls, repeats)
-    sisldo_fwd = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    sisldo_fwd = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     fwd_sisldo = bench_repeated(lambda: sisldo_fwd.forward_sparse(x_ptrs, x_idx, x_val, batch), n_calls, repeats)
 
     torch.manual_seed(0)
@@ -102,9 +135,9 @@ def run_cell(n_in, n_out, num_cpus, batch, density, calls_base, repeats, wvals, 
     with torch.no_grad():
         fwd_torch = bench_repeated(lambda: tl(xt), n_calls, repeats)
 
-    disldo_bwd0 = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    disldo_bwd0 = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     bwd0_disldo = bench_repeated(lambda: disldo_bwd0.backward(x, dy, 0.0, lr_per_row_nnz=True), n_calls, repeats)
-    sisldo_bwd0 = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    sisldo_bwd0 = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     bwd0_sisldo = bench_repeated(
         lambda: sisldo_bwd0.backward_sparse(x, dy_ptrs, dy_idx, dy_val, batch, 0.0, lr_per_row_nnz=True),
         n_calls,
@@ -119,9 +152,9 @@ def run_cell(n_in, n_out, num_cpus, batch, density, calls_base, repeats, wvals, 
 
     bwd0_torch = bench_repeated(torch_bwd0, n_calls, repeats)
 
-    disldo_bwdX = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    disldo_bwdX = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     bwdX_disldo = bench_repeated(lambda: disldo_bwdX.backward(x, dy, 1e-3, lr_per_row_nnz=True), n_calls, repeats)
-    sisldo_bwdX = make_layer(n_in, n_out, num_cpus, wvals, ivals)
+    sisldo_bwdX = make_layer(n_in, n_out, num_cpus, wvals, ivals, sparse_synapses)
     bwdX_sisldo = bench_repeated(
         lambda: sisldo_bwdX.backward_sparse(x, dy_ptrs, dy_idx, dy_val, batch, 1e-3, lr_per_row_nnz=True),
         n_calls,
@@ -256,6 +289,16 @@ def main():
     )
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 256], help="low, high, ...")
     ap.add_argument("--densities", type=float, nargs="+", default=[1.0, 0.05], help="1.0=dense, low=sparse")
+    ap.add_argument(
+        "--synapse-density",
+        type=float,
+        default=1.0,
+        help="1.0=fully dense weights (default, unchanged behavior); <1.0 loads a "
+        "diagonal-banded weight matrix instead (banded_weights()) -- tests SYNAPSE "
+        "sparsity (which block4 tiles exist at all), a different axis from "
+        "--densities (which is input/grad ACTIVATION sparsity within an otherwise-"
+        "fully-populated layer).",
+    )
     ap.add_argument("--calls-base", type=int, default=1000)
     ap.add_argument("--repeats", type=int, default=5, help="independent timed loops per cell")
     ap.add_argument("--baseline-path", default=DEFAULT_BASELINE_PATH)
@@ -267,7 +310,19 @@ def main():
     print(f"sili num_cpus={args.num_cpus}, torch.get_num_threads()={torch.get_num_threads()}")
 
     rng_master = np.random.default_rng(0)
-    wvals = rng_master.standard_normal(args.n_in * args.n_out).astype(np.float32) * 0.1
+    if args.synapse_density >= 1.0:
+        wvals = rng_master.standard_normal(args.n_in * args.n_out).astype(np.float32) * 0.1
+    else:
+        wvals = banded_weights(args.n_in, args.n_out, args.synapse_density, rng_master).reshape(-1)
+        nnz = int(np.count_nonzero(wvals))
+        probe = _cpu.DISLDOLayerV(args.n_in, args.n_out, args.n_in * args.n_out, 1)
+        probe.load_sparse_values(wvals, np.zeros(args.n_in * args.n_out, dtype=np.float32))
+        full_tiles = ((args.n_in + 3) // 4) * ((args.n_out + 3) // 4)
+        print(
+            f"synapse_density={args.synapse_density:.3f}: {nnz}/{args.n_in * args.n_out} "
+            f"weights nonzero ({nnz / (args.n_in * args.n_out):.3%} actual); block4 tiles: "
+            f"{probe.get_block4_tile_count()}/{full_tiles}"
+        )
     ivals = np.zeros(args.n_in * args.n_out, dtype=np.float32)
 
     results = {}  # (batch, density) -> {op: {engine: (mean, std)}}
@@ -285,6 +340,7 @@ def main():
                 wvals,
                 ivals,
                 rng,
+                sparse_synapses=(args.synapse_density < 1.0),
             )
 
     print_raw_tables(results, args.batches, args.densities, args.n_in)

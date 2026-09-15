@@ -1563,6 +1563,27 @@ class DISLDOLayerV {
         weights.recompute_stats();
     }
 
+    // Same [n_in*n_out] flat dense VALUES layout as load_dense_values, but
+    // routes through block4_load_sparse_fp32 instead of
+    // block4_load_dense_fp32 -- skips get_or_create() entirely for any
+    // (br,bc) block with no live (nonzero weight OR importance) content,
+    // so a caller-supplied sparse pattern (e.g. a diagonal-banded weight
+    // matrix) genuinely produces fewer block4 tiles, not the same tile
+    // count with mostly-zero content. See block4_load_sparse_fp32's own
+    // docstring (delta_csr_memory.hpp) for the measured motivation.
+    void load_sparse_values(py::array_t<V> weight_values, py::array_t<V> importance_values) {
+        auto wb = weight_values.request(), ib = importance_values.request();
+        block4_load_sparse_fp32<S, COL_TYPE>(weights, (const V*)wb.ptr, (const V*)ib.ptr,
+                                             static_cast<std::size_t>(n_inputs()),
+                                             static_cast<std::size_t>(n_outputs()));
+        weights.recompute_stats();
+    }
+
+    // Real block4 tile count -- lets a caller verify load_sparse_values
+    // actually produced fewer tiles than a dense-equivalent load, not
+    // just trust it silently.
+    std::size_t get_block4_tile_count() const { return weights.block4.n_tiles(); }
+
     // Rank-N scale (value_scale_k/output_scale_k/gamma_k) defaults to 0
     // channels for this fp32 class -- see is_full_precision_values in
     // delta_csr_types.hpp for why: it exists to compensate LOW-BIT
@@ -3808,6 +3829,15 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("weights"), py::arg("importance"))
         .def("load_dense_values", &DISLDOLayerV::load_dense_values, py::arg("weight_values"),
              py::arg("importance_values"))
+        .def("load_sparse_values", &DISLDOLayerV::load_sparse_values, py::arg("weight_values"),
+             py::arg("importance_values"),
+             "Same [n_in*n_out] flat dense VALUES layout as load_dense_values, but skips\n"
+             "block4 tiles with no live (nonzero weight OR importance) content instead of\n"
+             "allocating every (br,bc) block unconditionally -- use for a genuinely sparse\n"
+             "SYNAPSE structure (e.g. diagonal-banded weights), where load_dense_values\n"
+             "would allocate the same tile count as a fully dense layer regardless of how\n"
+             "much content is actually zero.")
+        .def("get_block4_tile_count", &DISLDOLayerV::get_block4_tile_count)
         .def("get_scale_rank", &DISLDOLayerV::get_scale_rank,
              "Rank-N scale (value_scale_k/output_scale_k/gamma_k) defaults to 0 channels for\n"
              "this fp32 class -- it exists to compensate LOW-BIT quantization error, which a\n"

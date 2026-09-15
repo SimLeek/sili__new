@@ -150,6 +150,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_backward
     test_disldo_block4_promotion
     test_block4_load_dense
+    test_block4_load_sparse_fp32
     test_block4_scattered_divergence
     test_sisldo_disldo_parity
     test_sisldo_disldo_parity_fp32

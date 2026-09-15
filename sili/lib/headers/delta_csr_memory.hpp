@@ -1053,6 +1053,75 @@ void block4_load_dense_fp32(
     }
 }
 
+// FP32 counterpart to block4_load_dense_fp32 that actually produces a
+// SPARSE block4 structure: block4_load_dense_fp32 calls get_or_create()
+// for EVERY (br,bc) unconditionally, so a weight matrix with mostly-zero
+// content still allocates every tile (confirmed directly: a 10%-density
+// banded weight matrix loaded via block4_load_dense_fp32 ran forward()
+// only ~11% faster than a fully dense matrix of the same shape -- noise-
+// level, not the real ~10x a genuinely sparse structure should show).
+// This function instead checks each (br,bc) block for ANY live content
+// (nonzero weight OR importance, matching block4_count_live's own "live
+// iff weight OR importance nonzero" convention used elsewhere in this
+// file) BEFORE calling get_or_create(), so weights.block4.n_tiles() and
+// every row's BL4.row_nnz() genuinely reflect the sparse pattern instead
+// of always covering the whole layer.
+//
+// Same "FP32-only for now, no growth headroom reserved" scoping as
+// block4_load_dense_fp32 -- see its docstring. A layer loaded this way
+// that later needs new tiles via synaptogenesis would need
+// block4_expand_headroom() extended to support FP32 first (currently a
+// no-op for anything but FP4BiPacked); out of scope here, which is about
+// making a genuinely sparse STATIC structure loadable/benchmarkable, not
+// about growing one afterward.
+template <typename SIZE_TYPE, typename COL_TYPE = uint32_t>
+void block4_load_sparse_fp32(
+    SparseLinearWeightsDelta<SIZE_TYPE, DeltaCSRBiValues<float>, COL_TYPE>& weights,
+    const float* weight_values, const float* importance_values, std::size_t n_in,
+    std::size_t n_out) {
+    const uint32_t block_rows = uint32_t((n_in + BLOCK4_TILE - 1) / BLOCK4_TILE);
+    const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
+
+    weights.block4.init(n_in, n_out);
+    const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
+    const std::size_t tile_budget =
+        std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS32_BYTES;
+    weights.block4.set_limits(idx_budget, tile_budget);
+
+    for (uint32_t br = 0; br < block_rows; ++br) {
+        const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+        const std::size_t row_hi = std::min(row_lo + BLOCK4_TILE, n_in);
+        for (uint32_t bc = 0; bc < block_cols; ++bc) {
+            const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+            const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, n_out);
+
+            bool any_live = false;
+            for (std::size_t row = row_lo; row < row_hi && !any_live; ++row) {
+                for (std::size_t col = col_lo; col < col_hi; ++col) {
+                    const std::size_t idx = row * n_out + col;
+                    if (weight_values[idx] != 0.0f || importance_values[idx] != 0.0f) {
+                        any_live = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_live)
+                continue;
+
+            auto tile = weights.block4.get_or_create(br, bc);
+            for (std::size_t row = row_lo; row < row_hi; ++row) {
+                const uint32_t li = uint32_t(row - row_lo);
+                for (std::size_t col = col_lo; col < col_hi; ++col) {
+                    const uint32_t lj = uint32_t(col - col_lo);
+                    const std::size_t idx = row * n_out + col;
+                    tile.set_weight(li, lj, weight_values[idx]);
+                    tile.set_importance(li, lj, importance_values[idx]);
+                }
+            }
+        }
+    }
+}
+
 // Pruning-only hook.
 // Throws if a target row has run out of blank space
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
