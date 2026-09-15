@@ -139,14 +139,85 @@ void sisldo_forward(
         original_contributions_output ? static_cast<std::size_t>(num_cpus) * num_inputs : 0,
         value_type(0));
 
-    std::vector<SIZE_TYPE> work_offsets;
-
     if (!dc.empty()) {
+        // Row-major sweep with one cursor per batch sample (GPU-style
+        // gather-then-process), replacing the old per-batch-sample walk
+        // that re-decoded/re-fetched every synapse from scratch once per
+        // batch sample it appeared in, with zero reuse across samples --
+        // measured as flat per-sample cost with NO improvement from
+        // batching at all (disldo's per-sample cost drops ~10x from
+        // batch=1 to batch=32+; sisldo's stayed within noise of ~90-130us
+        // regardless of batch size). Requires input indices sorted
+        // ascending within each batch sample's range -- already an
+        // existing assumption of this file's block4 branch below ("sorted
+        // input means a single forward scan, not a search"), not a new
+        // one. See docs/research/sisldo_ops.rst:
+        // sisldo_forward.row_major_batch_gather.
+        //
+        // Phase 1 (sequential, O(n_in * n_batches) -- accepted cost, see
+        // the design note above): walk rows 0..n_in-1; at each row with
+        // live synapses, gather every batch sample whose cursor currently
+        // points there into one flat work-item, advancing that sample's
+        // cursor past it. A row visited by multiple batch samples then
+        // gets its synapses decoded ONCE in phase 2 and reused across all
+        // of them, instead of once per sample.
+        const SIZE_TYPE n_batches_in = input_tensor.rows;
+        std::vector<SIZE_TYPE> cursor_pos(n_batches_in), cursor_row(n_batches_in);
+        for (SIZE_TYPE b = 0; b < n_batches_in; ++b) {
+            const SIZE_TYPE start = (*input_tensor.ptrs[0])[b];
+            const SIZE_TYPE end = (*input_tensor.ptrs[0])[b + 1];
+            cursor_pos[b] = start;
+            cursor_row[b] = start < end ? (*input_tensor.indices[0])[start]
+                                        : static_cast<SIZE_TYPE>(num_inputs);
+        }
+
+        std::vector<SIZE_TYPE> item_row;
+        std::vector<SIZE_TYPE> item_batch_offset;
+        item_batch_offset.push_back(0);
+        std::vector<SIZE_TYPE> item_batches;
+        std::vector<value_type> item_vals;
+
+        for (SIZE_TYPE r = 0; r < static_cast<SIZE_TYPE>(num_inputs); ++r) {
+            if (L.row_nnz(r) == 0) {
+                // No synapses on this row regardless of input -- still
+                // advance any cursor sitting here so it isn't stuck.
+                for (SIZE_TYPE b = 0; b < n_batches_in; ++b) {
+                    if (cursor_row[b] == r) {
+                        const SIZE_TYPE end = (*input_tensor.ptrs[0])[b + 1];
+                        ++cursor_pos[b];
+                        cursor_row[b] = cursor_pos[b] < end
+                                            ? (*input_tensor.indices[0])[cursor_pos[b]]
+                                            : static_cast<SIZE_TYPE>(num_inputs);
+                    }
+                }
+                continue;
+            }
+            const SIZE_TYPE before = static_cast<SIZE_TYPE>(item_batches.size());
+            for (SIZE_TYPE b = 0; b < n_batches_in; ++b) {
+                if (cursor_row[b] == r) {
+                    item_batches.push_back(b);
+                    item_vals.push_back((*input_tensor.values[0])[cursor_pos[b]]);
+                    const SIZE_TYPE end = (*input_tensor.ptrs[0])[b + 1];
+                    ++cursor_pos[b];
+                    cursor_row[b] = cursor_pos[b] < end ? (*input_tensor.indices[0])[cursor_pos[b]]
+                                                        : static_cast<SIZE_TYPE>(num_inputs);
+                }
+            }
+            if (item_batches.size() > before) {
+                item_row.push_back(r);
+                item_batch_offset.push_back(static_cast<SIZE_TYPE>(item_batches.size()));
+            }
+        }
+
+        // Phase 2 (parallel, embarrassingly so -- one work item per row
+        // that has at least one active batch sample): decode the row's
+        // synapses once, apply to every active sample. Same per-thread-
+        // private-buffer-then-tree-reduce pattern as before.
+        const int64_t n_items = static_cast<int64_t>(item_row.size());
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
             const int nthreads = omp_get_num_threads();
-
             value_type* thread_output =
                 all_outputs.data() + static_cast<std::size_t>(tid) * num_outputs;
             value_type* thread_contrib =
@@ -154,72 +225,34 @@ void sisldo_forward(
                     ? all_contributions.data() + static_cast<std::size_t>(tid) * num_inputs
                     : nullptr;
 
-            for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
-                const SIZE_TYPE batch_start = (*input_tensor.ptrs[0])[batch];
-                const SIZE_TYPE batch_end = (*input_tensor.ptrs[0])[batch + 1];
-                const SIZE_TYPE batch_nnz = batch_end - batch_start;
-                const SIZE_TYPE batch_offset = batch * static_cast<SIZE_TYPE>(out_cols);
-
-#pragma omp single
-                {
-                    work_offsets.resize(batch_nnz + 1);
-                    work_offsets[0] = 0;
-                    for (SIZE_TYPE i = 0; i < batch_nnz; ++i) {
-                        const SIZE_TYPE in_idx = (*input_tensor.indices[0])[batch_start + i];
-                        work_offsets[i + 1] =
-                            work_offsets[i] + static_cast<SIZE_TYPE>(L.row_nnz(in_idx));
-                    }
-                }
-
-                const SIZE_TYPE total_work = work_offsets[batch_nnz];
-                const SIZE_TYPE chunk = (total_work + nthreads - 1) / nthreads;
-                const SIZE_TYPE w_start = std::min(static_cast<SIZE_TYPE>(tid) * chunk, total_work);
-                const SIZE_TYPE w_end = std::min(w_start + chunk, total_work);
-
-                if (w_start < w_end) {
-                    SIZE_TYPE ip =
-                        static_cast<SIZE_TYPE>(
-                            std::upper_bound(work_offsets.begin(), work_offsets.end(), w_start) -
-                            work_offsets.begin()) -
-                        1;
-
-                    SIZE_TYPE last_ip = std::numeric_limits<SIZE_TYPE>::max();
-                    DeltaCSRRowCursor<COL_TYPE> cursor;
-
-                    for (SIZE_TYPE w = w_start; w < w_end; ++w) {
-                        while (ip + 1 < batch_nnz && work_offsets[ip + 1] <= w)
-                            ++ip;
-
-                        const SIZE_TYPE in_idx = (*input_tensor.indices[0])[batch_start + ip];
-                        const value_type in_val = (*input_tensor.values[0])[batch_start + ip];
-                        const SIZE_TYPE elem_offset = w - work_offsets[ip];
-
-                        if (ip != last_ip) {
-                            cursor = DeltaCSRRowCursor<COL_TYPE>(dc.indices_buf.data(), L, in_idx);
-                            cursor.advance_to(elem_offset);
-                            last_ip = ip;
-                        } else {
-                            cursor.advance();
-                        }
-
-                        const SIZE_TYPE out_idx = static_cast<SIZE_TYPE>(cursor.col());
-                        const std::size_t wptr = L.elem_start[in_idx] + elem_offset;
-                        const value_type wval_stored =
-                            ValueAccessor<VALUES_TYPE>::get_w(dc.values, wptr);
-                        // Per-synapse scale lookup (not hoisted -- in_idx varies within
-                        // this loop). Rank-N scale; fixes a real bug where output_scale
-                        // was silently dropped. See
-                        // docs/research/sisldo_ops.rst:sisldo_forward.output_scale_read_bug.
-                        const value_type wval =
-                            wval_stored * weights.get_scale(in_idx, out_idx); // -> true units
+#pragma omp for schedule(static)
+            for (int64_t wi = 0; wi < n_items; ++wi) {
+                const SIZE_TYPE r = item_row[std::size_t(wi)];
+                const SIZE_TYPE bstart = item_batch_offset[std::size_t(wi)];
+                const SIZE_TYPE bend = item_batch_offset[std::size_t(wi) + 1];
+                const SIZE_TYPE n_row = static_cast<SIZE_TYPE>(L.row_nnz(r));
+                auto cursor = dc.row_cursor(r);
+                for (SIZE_TYPE e = 0; e < n_row; ++e) {
+                    const SIZE_TYPE out_idx = static_cast<SIZE_TYPE>(cursor.advance());
+                    const std::size_t wptr = L.elem_start[r] + e;
+                    const value_type wval_stored =
+                        ValueAccessor<VALUES_TYPE>::get_w(dc.values, wptr);
+                    // Per-synapse scale lookup, decoded once per row here
+                    // (not once per batch sample) -- rank-N scale; fixes a
+                    // real bug where output_scale was silently dropped.
+                    // See docs/research/sisldo_ops.rst:
+                    // sisldo_forward.output_scale_read_bug.
+                    const value_type wval =
+                        wval_stored * weights.get_scale(r, out_idx); // -> true units
+                    for (SIZE_TYPE bi = bstart; bi < bend; ++bi) {
+                        const SIZE_TYPE b = item_batches[bi];
+                        const value_type in_val = item_vals[bi];
                         const value_type contrib = wval * in_val;
-
-                        thread_output[batch_offset + out_idx] += contrib;
+                        thread_output[static_cast<std::size_t>(b) * out_cols + out_idx] += contrib;
                         if (thread_contrib)
-                            thread_contrib[in_idx] += in_val * wval;
+                            thread_contrib[r] += in_val * wval;
                     }
                 }
-#pragma omp barrier
             }
 
             for (int stride = 1; stride < nthreads; stride <<= 1) {
@@ -264,188 +297,169 @@ void sisldo_forward(
             std::vector<value_type> all_b4_outputs(static_cast<std::size_t>(num_cpus) * num_outputs,
                                                    value_type(0));
 
-            // Per-batch scratch, reused across batches (not reallocated per batch).
-            std::vector<SIZE_TYPE> win_br;           // active window's block-row index
-            std::vector<value_type> win_vals;        // flat, 4 per window: win_vals[4*w + li]
-            std::vector<SIZE_TYPE> win_work_offsets; // cumulative block4 tile count per window
+            // Same row-major, cursor-per-batch restructuring as the
+            // scattered branch above, adapted to block4's 4-wide
+            // block-row granularity: sequential collection walks
+            // br=0..BL4.rows-1 with one cursor per batch sample, gathering
+            // each batch's 4-wide input window at any block-row it
+            // touches; the parallel phase then decodes each block4 tile
+            // ONCE per (br,bc) and reuses it across every batch sample
+            // that shares it, instead of once per (batch, window) as
+            // before. See the scattered branch's identical comment above
+            // and docs/research/sisldo_ops.rst:
+            // sisldo_forward.row_major_batch_gather.
+            const SIZE_TYPE n_batches_in = input_tensor.rows;
+            std::vector<SIZE_TYPE> cursor_pos(n_batches_in), cursor_idx(n_batches_in);
+            for (SIZE_TYPE b = 0; b < n_batches_in; ++b) {
+                const SIZE_TYPE start = (*input_tensor.ptrs[0])[b];
+                const SIZE_TYPE end = (*input_tensor.ptrs[0])[b + 1];
+                cursor_pos[b] = start;
+                cursor_idx[b] = start < end ? (*input_tensor.indices[0])[start]
+                                            : static_cast<SIZE_TYPE>(num_inputs);
+            }
 
+            std::vector<SIZE_TYPE> item_br;
+            std::vector<SIZE_TYPE> item_batch_offset;
+            item_batch_offset.push_back(0);
+            std::vector<SIZE_TYPE> item_batches;
+            std::vector<value_type> item_local; // flat, 4 values per (item,batch) entry
+
+            for (SIZE_TYPE br = 0; br < static_cast<SIZE_TYPE>(BL4.rows); ++br) {
+                const SIZE_TYPE window_lo = br * static_cast<SIZE_TYPE>(BLOCK4_TILE);
+                const SIZE_TYPE window_hi = window_lo + static_cast<SIZE_TYPE>(BLOCK4_TILE);
+                const std::size_t row_nnz_b4 = BL4.row_nnz(br);
+                const SIZE_TYPE before = static_cast<SIZE_TYPE>(item_batches.size());
+                for (SIZE_TYPE b = 0; b < n_batches_in; ++b) {
+                    if (cursor_idx[b] < window_lo || cursor_idx[b] >= window_hi)
+                        continue; // this batch's cursor isn't in this window
+                    const SIZE_TYPE end = (*input_tensor.ptrs[0])[b + 1];
+                    value_type local[4] = {value_type(0), value_type(0), value_type(0),
+                                           value_type(0)};
+                    bool any = false;
+                    while (cursor_pos[b] < end && cursor_idx[b] < window_hi) {
+                        local[cursor_idx[b] - window_lo] = (*input_tensor.values[0])[cursor_pos[b]];
+                        any = true;
+                        ++cursor_pos[b];
+                        cursor_idx[b] = cursor_pos[b] < end
+                                            ? (*input_tensor.indices[0])[cursor_pos[b]]
+                                            : static_cast<SIZE_TYPE>(num_inputs);
+                    }
+                    if (any && row_nnz_b4 > 0) {
+                        item_batches.push_back(b);
+                        item_local.push_back(local[0]);
+                        item_local.push_back(local[1]);
+                        item_local.push_back(local[2]);
+                        item_local.push_back(local[3]);
+                    }
+                    // row_nnz_b4==0: cursor advanced past this window
+                    // regardless (weight has nothing here) -- matches the
+                    // scattered branch's identical zero-row handling.
+                }
+                if (item_batches.size() > before) {
+                    item_br.push_back(br);
+                    item_batch_offset.push_back(static_cast<SIZE_TYPE>(item_batches.size()));
+                }
+            }
+
+            const int64_t n_items = static_cast<int64_t>(item_br.size());
 #pragma omp parallel num_threads(num_cpus)
             {
                 const int tid = omp_get_thread_num();
-                const int nthreads = omp_get_num_threads();
                 value_type* thread_output =
                     all_b4_outputs.data() + static_cast<std::size_t>(tid) * num_outputs;
 
-                for (SIZE_TYPE batch = 0; batch < input_tensor.rows; ++batch) {
-                    const SIZE_TYPE batch_start = (*input_tensor.ptrs[0])[batch];
-                    const SIZE_TYPE batch_end = (*input_tensor.ptrs[0])[batch + 1];
-                    const SIZE_TYPE batch_nnz = batch_end - batch_start;
-                    const SIZE_TYPE batch_offset = batch * static_cast<SIZE_TYPE>(out_cols);
+#pragma omp for schedule(static)
+                for (int64_t wi = 0; wi < n_items; ++wi) {
+                    const SIZE_TYPE br = item_br[std::size_t(wi)];
+                    const SIZE_TYPE bstart = item_batch_offset[std::size_t(wi)];
+                    const SIZE_TYPE bend = item_batch_offset[std::size_t(wi) + 1];
+                    const std::size_t row_nnz_b4 = BL4.row_nnz(br);
 
-#pragma omp single
-                    {
-                        win_br.clear();
-                        win_vals.clear();
-                        win_work_offsets.clear();
-                        win_work_offsets.push_back(0);
+                    auto bc_cursor = weights.block4.row_cursor(static_cast<std::size_t>(br));
+                    std::size_t elem_pos = BL4.elem_start[br];
+                    std::size_t byte_pos = weights.block4.tile_byte_start[br];
+                    for (std::size_t t = 0; t < row_nnz_b4; ++t) {
+                        const uint32_t bc = bc_cursor.advance();
+                        // Read-only lookup, does not mark the handle dirty.
+                        const auto tile = weights.block4.at_index(static_cast<uint32_t>(br), bc,
+                                                                  elem_pos, byte_pos);
+                        const uint8_t* tdata = tile.raw_data();
+                        byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
+                        ++elem_pos;
 
-                        SIZE_TYPE i = 0;
-                        while (i < batch_nnz) {
-                            const SIZE_TYPE idx0 = (*input_tensor.indices[0])[batch_start + i];
-                            const SIZE_TYPE br = idx0 / static_cast<SIZE_TYPE>(BLOCK4_TILE);
-                            const SIZE_TYPE window_lo = br * static_cast<SIZE_TYPE>(BLOCK4_TILE);
-                            const SIZE_TYPE window_hi =
-                                window_lo + static_cast<SIZE_TYPE>(BLOCK4_TILE);
-
-                            // Gather this window's entries -- sorted input means a
-                            // single forward scan, not a search.
-                            value_type local[4] = {value_type(0), value_type(0), value_type(0),
-                                                   value_type(0)};
-                            SIZE_TYPE j = i;
-                            while (j < batch_nnz) {
-                                const SIZE_TYPE idxj = (*input_tensor.indices[0])[batch_start + j];
-                                if (idxj >= window_hi)
-                                    break;
-                                local[idxj - window_lo] =
-                                    (*input_tensor.values[0])[batch_start + j];
-                                ++j;
-                            }
-
-                            const std::size_t row_nnz_b4 =
-                                static_cast<std::size_t>(br) < BL4.rows ? BL4.row_nnz(br) : 0;
-                            if (row_nnz_b4 > 0) {
-                                win_br.push_back(br);
-                                win_vals.push_back(local[0]);
-                                win_vals.push_back(local[1]);
-                                win_vals.push_back(local[2]);
-                                win_vals.push_back(local[3]);
-                                win_work_offsets.push_back(win_work_offsets.back() +
-                                                           static_cast<SIZE_TYPE>(row_nnz_b4));
-                            }
-                            i = j;
-                        }
-                    }
-
-                    const SIZE_TYPE n_windows = static_cast<SIZE_TYPE>(win_br.size());
-                    const SIZE_TYPE total_work = win_work_offsets.back();
-
-                    if (total_work > 0) {
-                        const SIZE_TYPE chunk = (total_work + nthreads - 1) / nthreads;
-                        const SIZE_TYPE w_start =
-                            std::min(static_cast<SIZE_TYPE>(tid) * chunk, total_work);
-                        const SIZE_TYPE w_end = std::min(w_start + chunk, total_work);
-
-                        if (w_start < w_end) {
-                            SIZE_TYPE wi = static_cast<SIZE_TYPE>(
-                                               std::upper_bound(win_work_offsets.begin(),
-                                                                win_work_offsets.end(), w_start) -
-                                               win_work_offsets.begin()) -
-                                           1;
-
-                            SIZE_TYPE last_wi = std::numeric_limits<SIZE_TYPE>::max();
-                            DeltaCSRRowCursor<uint32_t> bc_cursor;
-                            std::size_t elem_pos = 0, byte_pos = 0;
-
-                            for (SIZE_TYPE w = w_start; w < w_end; ++w) {
-                                while (wi + 1 < n_windows && win_work_offsets[wi + 1] <= w)
-                                    ++wi;
-
-                                const SIZE_TYPE br = win_br[wi];
-                                const SIZE_TYPE tile_offset = w - win_work_offsets[wi];
-                                const value_type* local =
-                                    &win_vals[static_cast<std::size_t>(wi) * 4];
-
-                                if (wi != last_wi) {
-                                    // Incremental walk avoids find()'s redundant rescan. See
-                                    // docs/research/sisldo_ops.rst:sisldo_forward.block4_incremental_walk_perf.
-                                    bc_cursor =
-                                        weights.block4.row_cursor(static_cast<std::size_t>(br));
-                                    elem_pos = BL4.elem_start[br];
-                                    byte_pos = weights.block4.tile_byte_start[br];
-                                    for (SIZE_TYPE s = 0; s < tile_offset; ++s) {
-                                        bc_cursor.advance();
-                                        byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
-                                        ++elem_pos;
-                                    }
-                                    last_wi = wi;
-                                } else {
-                                    byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
-                                    ++elem_pos;
-                                }
-                                const uint32_t bc = bc_cursor.advance();
-
-                                // Read-only lookup, does not mark the handle dirty.
-                                const auto tile = weights.block4.at_index(static_cast<uint32_t>(br),
-                                                                          bc, elem_pos, byte_pos);
-                                const uint8_t* tdata = tile.raw_data();
-
-                                // Window-level zero-skip -- see
-                                // docs/research/sisldo_ops.rst:sisldo_forward.block4_zero_skip.
-                                if (local[0] == value_type(0) && local[1] == value_type(0) &&
-                                    local[2] == value_type(0) && local[3] == value_type(0)) {
+                        // Decode this tile's 4x4 synapses ONCE -- shared
+                        // across every batch sample active at this
+                        // (br,bc), instead of once per (batch, window) as
+                        // before. Type-generic decode -- see
+                        // docs/research/sisldo_ops.rst:
+                        // sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8.
+                        // Read-only (forward never updates block4
+                        // weight/importance inline), so this is
+                        // decode-only, unlike disldo_backward's fuller
+                        // per-type update branches.
+                        value_type w_true[BLOCK4_TILE][BLOCK4_TILE] = {};
+                        bool col_valid[BLOCK4_TILE];
+                        for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                            const std::size_t col = static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
+                            col_valid[lj] = col < out_cols;
+                            if (!col_valid[lj])
+                                continue;
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row =
+                                    static_cast<std::size_t>(br) * BLOCK4_TILE + li;
+                                if (row >= num_inputs)
                                     continue;
-                                }
-
-                                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                                    const std::size_t col =
-                                        static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
-                                    if (col >= out_cols)
+                                value_type w_decoded;
+                                if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
+                                    const uint8_t byte = tdata[Block4Tile8::slot_index(li, lj)];
+                                    if (byte == 0)
                                         continue;
-
-                                    value_type acc = value_type(0);
-                                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                        const std::size_t row =
-                                            static_cast<std::size_t>(br) * BLOCK4_TILE + li;
-                                        if (row >= num_inputs)
-                                            continue;
-                                        // Per-li skip: zeroed input needs no decode.
-                                        if (local[li] == value_type(0))
-                                            continue;
-                                        // Type-generic decode -- see
-                                        // docs/research/sisldo_ops.rst:
-                                        // sisldo_forward.block4_fp4_only_silent_zero_for_dense_fp32_fp8.
-                                        // Read-only (forward never updates
-                                        // block4 weight/importance inline),
-                                        // so this is decode-only, unlike
-                                        // disldo_backward's fuller per-type
-                                        // update branches.
-                                        value_type w_decoded;
-                                        if constexpr (std::is_same_v<VALUES_TYPE, FP8BiValues>) {
-                                            const uint8_t byte =
-                                                tdata[Block4Tile8::slot_index(li, lj)];
-                                            if (byte == 0)
-                                                continue;
-                                            w_decoded = value_type(fp8_decode_bits(byte));
-                                        } else if constexpr (std::is_same_v<
-                                                                 VALUES_TYPE,
-                                                                 DeltaCSRBiValues<float>>) {
-                                            float w;
-                                            std::memcpy(&w,
-                                                        tdata +
-                                                            sizeof(float) *
-                                                                Block4Tile32::slot_index(li, lj),
-                                                        sizeof(w));
-                                            if (w == 0.0f)
-                                                continue;
-                                            w_decoded = value_type(w);
-                                        } else {
-                                            const uint8_t byte =
-                                                tdata[Block4Tile::slot_index(li, lj)];
-                                            if (byte == 0)
-                                                continue;
-                                            w_decoded = FP4_TABLE[byte & 0xFu];
-                                        }
-                                        // Rank-N scale.
-                                        const value_type w_true =
-                                            w_decoded * weights.get_scale(row, col);
-                                        acc += w_true * local[li];
-                                    }
-                                    thread_output[batch_offset + col] += acc;
+                                    w_decoded = value_type(fp8_decode_bits(byte));
+                                } else if constexpr (std::is_same_v<VALUES_TYPE,
+                                                                    DeltaCSRBiValues<float>>) {
+                                    float w;
+                                    std::memcpy(&w,
+                                                tdata + sizeof(float) *
+                                                            Block4Tile32::slot_index(li, lj),
+                                                sizeof(w));
+                                    if (w == 0.0f)
+                                        continue;
+                                    w_decoded = value_type(w);
+                                } else {
+                                    const uint8_t byte = tdata[Block4Tile::slot_index(li, lj)];
+                                    if (byte == 0)
+                                        continue;
+                                    w_decoded = FP4_TABLE[byte & 0xFu];
                                 }
+                                // Rank-N scale.
+                                w_true[li][lj] = w_decoded * weights.get_scale(row, col);
+                            }
+                        }
+
+                        for (SIZE_TYPE bi = bstart; bi < bend; ++bi) {
+                            const SIZE_TYPE b = item_batches[bi];
+                            const value_type* local = &item_local[static_cast<std::size_t>(bi) * 4];
+                            // Window-level zero-skip -- see
+                            // docs/research/sisldo_ops.rst:sisldo_forward.block4_zero_skip.
+                            if (local[0] == value_type(0) && local[1] == value_type(0) &&
+                                local[2] == value_type(0) && local[3] == value_type(0))
+                                continue;
+                            const SIZE_TYPE batch_offset = b * static_cast<SIZE_TYPE>(out_cols);
+                            for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                                if (!col_valid[lj])
+                                    continue;
+                                value_type acc = value_type(0);
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    if (local[li] == value_type(0))
+                                        continue;
+                                    acc += w_true[li][lj] * local[li];
+                                }
+                                const std::size_t col =
+                                    static_cast<std::size_t>(bc) * BLOCK4_TILE + lj;
+                                thread_output[batch_offset + col] += acc;
                             }
                         }
                     }
-#pragma omp barrier
                 }
             }
 
