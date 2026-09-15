@@ -80,12 +80,21 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     const value_type w =
                         w_stored * weights.get_scale(r, col); // rank-N scale -> true units
 
+                    // No per-sample zero-skip here -- DISLDO is Dense Input
+                    // by design (see file header), so input is almost
+                    // never exactly zero in the intended use case, making
+                    // this branch nearly-always-false overhead on every
+                    // (synapse, batch-sample) pair rather than a real skip
+                    // (measured via callgrind as 18% of this function's
+                    // total instructions at batch=256). w*0=0 either way,
+                    // so dropping the check is a pure perf change, not a
+                    // behavior change. SISLDO (sparse input, CSRInput) is
+                    // the actual sparse-input path and has no analogous
+                    // check to remove -- its input format only ever
+                    // contains nonzero entries in the first place.
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
-                        if (iv == value_type(0))
-                            continue;
-                        const value_type contrib = w * iv;
-                        mo[static_cast<std::size_t>(b) * n_out + col] += contrib;
+                        mo[static_cast<std::size_t>(b) * n_out + col] += w * iv;
                     }
                 }
             }
@@ -179,6 +188,16 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         std::vector<value_type> gamma_k_arr(scale_rank);
         for (std::size_t k = 0; k < scale_rank; ++k)
             gamma_k_arr[k] = weights.get_scale_gamma_k(k);
+        // rank==0 fast-path constants (see below): S is then always
+        // exactly 1, so the whole per-lane sA/sB dot-product collapses to
+        // pure boundary masking -- for a full (non-boundary) tile-pair
+        // that's just a constant vector, no per-lane loop at all.
+        // Measured via callgrind as ~23% of disldo_forward's total
+        // instructions at batch=1 (over-lane construction dominating the
+        // actual SIMD math by more than 10x) -- see
+        // disldo_forward.rank0_s8_fast_path in docs/research/linear_disldo.rst.
+        const Block4Vec ones4 = block4_vec_broadcast(1.0f);
+        const Block4Vec zeros4 = block4_vec_broadcast(0.0f);
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
@@ -240,6 +259,10 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     // redundant). See the row_scale_cache/col_scale_cache
                     // comment above.
                     std::size_t row_idx[BLOCK4_TILE];
+                    // True iff all 4 rows of this br block are in bounds --
+                    // false only for the last (possibly partial) row block.
+                    // See the rank==0 s8 fast path below.
+                    const bool full_rows = std::size_t(br) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
                     for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                         const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                         row_idx[li] = row < n_in ? row : 0;
@@ -268,16 +291,32 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                                 haveB ? weights.get_output_scale_k(colB, k) : value_type(0);
                         }
                         Block8Vec s8;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                            value_type sA = scale_identity, sB = scale_identity;
-                            for (std::size_t k = 0; k < scale_rank; ++k) {
-                                const value_type vsk = row_scale_cache[li * scale_rank + k];
-                                sA += gamma_k_arr[k] * vsk * col_scale_cache[k];
-                                sB += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                        if (scale_rank == 0 && full_rows) {
+                            // S is always exactly 1 here (see scale_identity
+                            // above) and every row is in bounds -- s8 is a
+                            // pure constant, no per-lane loop needed.
+                            s8 = haveB ? block8_vec_from_lo_hi(ones4, ones4)
+                                       : block8_vec_from_lo_hi(ones4, zeros4);
+                        } else if (scale_rank == 0) {
+                            // Last (partial) row block -- still no scale
+                            // lookup needed, just per-lane row masking.
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                s8[li] = row < n_in ? value_type(1) : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? value_type(1) : value_type(0);
                             }
-                            s8[li] = row < n_in ? sA : value_type(0);
-                            s8[li + 4] = (row < n_in && haveB) ? sB : value_type(0);
+                        } else {
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                                value_type sA = scale_identity, sB = scale_identity;
+                                for (std::size_t k = 0; k < scale_rank; ++k) {
+                                    const value_type vsk = row_scale_cache[li * scale_rank + k];
+                                    sA += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                                    sB += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                                }
+                                s8[li] = row < n_in ? sA : value_type(0);
+                                s8[li + 4] = (row < n_in && haveB) ? sB : value_type(0);
+                            }
                         }
                         const Block8Vec w8 = w_decoded8 * s8;
 
@@ -314,6 +353,9 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                 // once per call (was 2x redundant on top of get_scale's
                 // own per-cell cost).
                 std::size_t row_idx[BLOCK4_TILE];
+                // See the identical rank==0 s8 fast path comment in the
+                // cross-tile-pairing branch above.
+                const bool full_rows = std::size_t(br_) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
                     const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
                     row_idx[li] = row < n_in ? row : 0;
@@ -342,16 +384,27 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                             have1 ? weights.get_output_scale_k(col1, k) : value_type(0);
                     }
                     Block8Vec s8;
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
-                        value_type s0 = scale_identity, s1 = scale_identity;
-                        for (std::size_t k = 0; k < scale_rank; ++k) {
-                            const value_type vsk = row_scale_cache[li * scale_rank + k];
-                            s0 += gamma_k_arr[k] * vsk * col_scale_cache[k];
-                            s1 += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                    if (scale_rank == 0 && full_rows) {
+                        s8 = have1 ? block8_vec_from_lo_hi(ones4, ones4)
+                                   : block8_vec_from_lo_hi(ones4, zeros4);
+                    } else if (scale_rank == 0) {
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            s8[li] = row < n_in ? value_type(1) : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? value_type(1) : value_type(0);
                         }
-                        s8[li] = row < n_in ? s0 : value_type(0);
-                        s8[li + 4] = (row < n_in && have1) ? s1 : value_type(0);
+                    } else {
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            value_type s0 = scale_identity, s1 = scale_identity;
+                            for (std::size_t k = 0; k < scale_rank; ++k) {
+                                const value_type vsk = row_scale_cache[li * scale_rank + k];
+                                s0 += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                                s1 += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                            }
+                            s8[li] = row < n_in ? s0 : value_type(0);
+                            s8[li + 4] = (row < n_in && have1) ? s1 : value_type(0);
+                        }
                     }
                     const Block8Vec w8 = w_decoded8 * s8;
 
