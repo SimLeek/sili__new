@@ -1571,11 +1571,24 @@ class DISLDOLayerV {
     // matrix) genuinely produces fewer block4 tiles, not the same tile
     // count with mostly-zero content. See block4_load_sparse_fp32's own
     // docstring (delta_csr_memory.hpp) for the measured motivation.
+    //
+    // Real growth headroom: block4_expand_headroom (now FP32-capable, see
+    // its own docstring) reserves blank_fraction slack per row afterward,
+    // same as the scattered-CSR side already does -- a row that starts
+    // tightly packed (block4_load_sparse_fp32 itself reserves zero slack,
+    // matching block4_load_dense_fp32's own "no growth needed for a
+    // static load" scoping) can otherwise never grow a tile from sparse-
+    // packed to dense during training without hitting merge_row_
+    // workspace's eviction path on the very first update that needs more
+    // room. min_slack_bytes is FP32's own full-dense-tile size
+    // (BLOCK4_TILE_SLOTS32_BYTES, 128 bytes) -- the function's own default
+    // is FP4-sized (16 bytes) and would under-reserve here.
     void load_sparse_values(py::array_t<V> weight_values, py::array_t<V> importance_values) {
         auto wb = weight_values.request(), ib = importance_values.request();
         block4_load_sparse_fp32<S, COL_TYPE>(weights, (const V*)wb.ptr, (const V*)ib.ptr,
                                              static_cast<std::size_t>(n_inputs()),
                                              static_cast<std::size_t>(n_outputs()));
+        block4_expand_headroom<S, VT, COL_TYPE>(weights, 0.2f, BLOCK4_TILE_SLOTS32_BYTES);
         weights.recompute_stats();
     }
 

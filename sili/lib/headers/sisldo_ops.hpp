@@ -1139,7 +1139,26 @@ void disldo_backward_sparse_grad(
                         for (std::size_t e = 0; e < row_nnz_b4; ++e) {
                             const uint32_t bc = ws.bc[e];
                             const std::size_t this_local_pos = local_pos;
-                            local_pos += tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
+                            // disldo_backward_sparse_grad.stale_local_pos_after_commit: do NOT
+                            // advance local_pos using this tile's PRE-commit length here --
+                            // commit_dirty_tile_in_workspace() below may change this tile's
+                            // stored length (a sparse<->dense encoding transition, e.g. its
+                            // live-slot count crossing switch_point), which shifts every
+                            // subsequent tile's real position in ws.bytes. Advancing eagerly
+                            // with the old length left every later `this_local_pos` in this row
+                            // stale whenever a dirty tile's encoding actually changed size --
+                            // ASan-confirmed heap corruption (negative-size memmove inside
+                            // block4_resize_tile_in_row, called via commit_dirty_tile_in_
+                            // workspace with a now-wrong local_byte_pos for a LATER tile).
+                            // Never triggered before load_sparse_values existed: a fully-dense-
+                            // loaded layer's tiles are almost always deep in "dense" territory
+                            // (count_live near BLOCK4_TILE_SLOTS), rarely crossing switch_point
+                            // during ordinary training; a genuinely sparse/partially-filled
+                            // layer (e.g. tiles at a diagonal band's edge) crosses it often.
+                            // local_pos is now only advanced once, below (after any commit),
+                            // using this tile's ACTUAL current length.
+                            const std::size_t old_tile_len =
+                                tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
 
                             bool any_touched = false;
                             for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
@@ -1149,8 +1168,10 @@ void disldo_backward_sparse_grad(
                                     if (grad_sum[idx] != 0.0 || contrib_sum[idx] != 0.0)
                                         any_touched = true;
                                 }
-                            if (!any_touched)
+                            if (!any_touched) {
+                                local_pos = this_local_pos + old_tile_len;
                                 continue;
+                            }
 
                             uint8_t scratch[SCRATCH_BYTES];
                             weights.block4.unpack_workspace_tile(ws, e, this_local_pos, scratch);
@@ -1243,9 +1264,18 @@ void disldo_backward_sparse_grad(
                                     }
                                 }
                             }
-                            if (dirty)
+                            if (dirty) {
                                 weights.block4.commit_dirty_tile_in_workspace(ws, e, this_local_pos,
                                                                               scratch);
+                                // Re-read this tile's length AFTER commit -- it may have
+                                // changed (sparse<->dense transition). See
+                                // disldo_backward_sparse_grad.stale_local_pos_after_commit
+                                // above.
+                                local_pos = this_local_pos +
+                                            tile_len_of(ws.is_sparse[e], &ws.bytes[this_local_pos]);
+                            } else {
+                                local_pos = this_local_pos + old_tile_len;
+                            }
                         } // tiles in this row
                     }
 

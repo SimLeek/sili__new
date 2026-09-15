@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1166,6 +1167,35 @@ block4_resize_tile_in_row(const DeltaCSRLayout& L, std::vector<std::size_t>& tby
         }
     }
     const std::size_t shift_from = tbyte_pos + old_len;
+    // Defense in depth: shift_from should never exceed tbyte_end[row] --
+    // that would mean `old_len` (the caller's belief about this tile's
+    // CURRENT stored length) disagrees with the row's own recorded content
+    // size, which should be mathematically impossible after the
+    // disldo_backward_sparse_grad.stale_local_pos_after_commit fix
+    // (sisldo_ops.hpp) that this guard was added alongside -- that bug let
+    // a caller pass a stale `old_len` for a tile whose real position had
+    // shifted after an EARLIER tile in the same row changed its stored
+    // encoding (sparse<->dense), and the resulting negative-size memmove
+    // was reproduced directly (ASan: negative-size-param) before the fix.
+    // If this ever fires again (a different bug, a future caller), warn
+    // and skip the shift rather than computing a wrapped-around size and
+    // corrupting/crashing -- same "detect, clamp, count, never crash"
+    // shape as row_merge_overflow_events elsewhere in this file.
+    if (shift_from > tbyte_end[row]) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "WARNING: block4_resize_tile_in_row: tile position/length invariant "
+                         "violated (row=%zu tbyte_pos=%zu old_len=%zu shift_from=%zu > "
+                         "tbyte_end[row]=%zu) -- skipping this tile's shift to avoid memory "
+                         "corruption. This should not happen; please report.\n",
+                         row, tbyte_pos, old_len, shift_from, tbyte_end[row]);
+            std::fflush(stderr);
+        }
+        std::memcpy(tile_data.data() + tbyte_pos, new_bytes, new_len);
+        tbyte_end[row] = std::size_t(std::ptrdiff_t(tbyte_end[row]) + delta);
+        return;
+    }
     const std::size_t shift_len = tbyte_end[row] - shift_from;
     if (shift_len > 0)
         std::memmove(tile_data.data() + tbyte_pos + new_len, tile_data.data() + shift_from,
