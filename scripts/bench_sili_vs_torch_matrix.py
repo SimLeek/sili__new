@@ -188,9 +188,14 @@ def fmt(mean_std):
     return f"{mean:>7.4f}±{std:<6.4f}"
 
 
-def print_raw_tables(results, batches, densities, n_in):
+def print_raw_tables(results, batches, densities, n_in, synapse_density=1.0):
+    synapse_note = (
+        f", synapse_density={synapse_density:.3f} (SPARSE SYNAPSES -- banded weights)"
+        if synapse_density < 1.0
+        else ", synapse_density=1.000 (fully dense weights)"
+    )
     for density in densities:
-        print(f"\n=== density={density:.3f} ({round(density * n_in)}/{n_in} nonzero per row) ===")
+        print(f"\n=== density={density:.3f} ({round(density * n_in)}/{n_in} nonzero per row){synapse_note} ===")
         print(
             f"{'batch':>6} | {'fwd disldo':>16} {'fwd sisldo':>16} {'fwd torch':>16} || "
             f"{'bwd0 disldo':>16} {'bwd0 sisldo':>16} {'bwd0 torch':>16} || "
@@ -206,11 +211,16 @@ def print_raw_tables(results, batches, densities, n_in):
             )
 
 
-def print_summary_table(results, batches, densities):
+def print_summary_table(results, batches, densities, synapse_density=1.0):
     # Shows BOTH engines' numbers, not just whichever wins -- a disldo-only
     # or sisldo-only reader would otherwise never see how the engine they
     # didn't pick is actually doing at that cell.
-    print("\n=== Summary: disldo vs sisldo vs torch, every cell ===")
+    synapse_note = (
+        f" (synapse_density={synapse_density:.3f}, SPARSE SYNAPSES)"
+        if synapse_density < 1.0
+        else " (synapse_density=1.000, fully dense weights)"
+    )
+    print(f"\n=== Summary: disldo vs sisldo vs torch, every cell{synapse_note} ===")
     print(
         f"{'op':>5} {'batch':>6} {'density':>8} | {'disldo':>16} {'ratio':>7} | "
         f"{'sisldo':>16} {'ratio':>7} | {'torch':>16} | {'best':>7} {'wins?':>6}"
@@ -343,8 +353,8 @@ def main():
                 sparse_synapses=(args.synapse_density < 1.0),
             )
 
-    print_raw_tables(results, args.batches, args.densities, args.n_in)
-    print_summary_table(results, args.batches, args.densities)
+    print_raw_tables(results, args.batches, args.densities, args.n_in, args.synapse_density)
+    print_summary_table(results, args.batches, args.densities, args.synapse_density)
 
     flat = flatten_results(results, args.repeats)
     meta = machine_info()
