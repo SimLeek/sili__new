@@ -320,14 +320,20 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         }
                         const Block8Vec w8 = w_decoded8 * s8;
 
+                        // full_rows: row_idx[0..3] are 4 consecutive rows,
+                        // one contiguous wide load instead of 4 scalar reads.
                         for (SIZE_TYPE b = 0; b < batch; ++b) {
                             const value_type* in_row =
                                 input + static_cast<std::size_t>(b) * in_cols;
                             Block8Vec in8;
-                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                const value_type iv = in_row[row_idx[li]];
-                                in8[li] = iv;
-                                in8[li + 4] = iv;
+                            if (full_rows) {
+                                in8 = block8_vec_dup4(block4_vec_load(in_row + row_idx[0]));
+                            } else {
+                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                    const value_type iv = in_row[row_idx[li]];
+                                    in8[li] = iv;
+                                    in8[li + 4] = iv;
+                                }
                             }
                             const Block8Vec prod = w8 * in8;
                             mo[static_cast<std::size_t>(b) * n_out + colA] +=
@@ -411,10 +417,14 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
                         Block8Vec in8;
-                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const value_type iv = in_row[row_idx[li]];
-                            in8[li] = iv;
-                            in8[li + 4] = iv;
+                        if (full_rows) {
+                            in8 = block8_vec_dup4(block4_vec_load(in_row + row_idx[0]));
+                        } else {
+                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                                const value_type iv = in_row[row_idx[li]];
+                                in8[li] = iv;
+                                in8[li + 4] = iv;
+                            }
                         }
                         const Block8Vec prod = w8 * in8;
                         mo[static_cast<std::size_t>(b) * n_out + col0] +=
