@@ -113,60 +113,157 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // lets this SIMD where the scattered loop above can't. See
     // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
-        // Collect (br,bc,elem_pos,byte_pos) tuples once per call before the
-        // parallel region -- row-major cursor walk isn't parallel-for
-        // friendly, and a Block4Tile handle is move-only/RAII so it can't
-        // be pre-collected across threads. See
-        // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
-        std::vector<uint32_t>& tile_br = weights.block4.scratch_tile_br;
-        std::vector<uint32_t>& tile_bc = weights.block4.scratch_tile_bc;
-        std::vector<std::size_t>& tile_elem = weights.block4.scratch_tile_elem;
-        std::vector<std::size_t>& tile_byte = weights.block4.scratch_tile_byte;
-        // disldo_forward.fp32_block4_cross_tile_pairing: FP32-only, marks
-        // every SECOND tile of a same-br run (bk odd) as a "follower" --
-        // already consumed by its leader (ti-1) once the parallel loop
-        // below pairs two DIFFERENT tiles sharing a br. Computed for free
-        // during this same sequential collection walk (bk is already the
-        // per-row loop counter); unused (but harmlessly populated) for
-        // FP8/FP4, which share this collection loop but keep their
-        // existing per-tile (not cross-tile) processing.
-        std::vector<uint8_t>& tile_is_follower = weights.block4.scratch_tile_is_follower;
-        const std::size_t n_b4 = weights.block4.n_tiles();
-        // resize()+direct indexing, not reserve()+push_back(): push_back's
-        // per-call capacity check is measured exclusive cost at this scale.
-        // See disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
-        tile_br.resize(n_b4);
-        tile_bc.resize(n_b4);
-        tile_elem.resize(n_b4);
-        tile_byte.resize(n_b4);
-        tile_is_follower.resize(n_b4);
+        // disldo_forward.column_partitioned_threading: two strategies,
+        // chosen per call by layer width relative to num_cpus. Both start
+        // from the SAME flat, row-major item list (leader tile, or
+        // leader+consecutive-follower pair within a row -- unchanged
+        // pairing rule, no ownership concept yet):
+        //
+        //  - WIDE (>= COLUMN_PARTITION_MIN_COLS_PER_THREAD output
+        //    column-blocks per thread): re-bucket the flat list by which
+        //    thread owns each item's output column-block range, then
+        //    every thread writes straight into `output` -- zero
+        //    cross-thread writes, zero reduction. This is what the
+        //    O(num_cpus * batch * n_out) alloc+reduce tax measured at
+        //    large batch/wide layers (see disldo_forward.
+        //    per_thread_output_buffers in docs/research/linear_disldo.
+        //    rst) gets replaced with.
+        //  - NARROW: process the flat list directly via `#pragma omp for
+        //    schedule(static)` (each thread gets a CONTIGUOUS chunk of
+        //    row-major tiles, same locality as the pre-this-session
+        //    scheme) into a private per-thread buffer, then combine the
+        //    num_cpus private buffers with a PARALLEL tree reduction
+        //    inside this same parallel region -- O(log2(num_cpus)) more
+        //    barriers, but the combine work itself is split across every
+        //    thread each round instead of one thread doing it serially.
+        //
+        // The wide path alone regresses badly for narrow layers: measured
+        // directly (standalone A/B, arch-sandbox, CCX-pinned) at n_out=64/
+        // num_cpus=4 (4 output column-blocks per thread), efficiency
+        // crashed to ~0.21-0.26 at batch>=256 (worse than doing NOTHING
+        // in parallel) vs ~0.86-0.88 for the old row-partitioned+serial-
+        // reduce scheme -- root cause: with few column-blocks per thread,
+        // a thread's work items jump to a DIFFERENT row-block's input
+        // slice every 1-2 items instead of reusing one row-block's slice
+        // across many consecutive items, so input reads stay cold instead
+        // of warm in cache. Row-major chunking never has this problem
+        // (that's what the narrow path restores), which is why the two
+        // strategies are split on layer width, not just accepted as a
+        // blanket tradeoff. "Few outputs, many inputs" (embedding/readout-
+        // shaped layers) is a real, not hypothetical, network shape.
         const auto& BL4 = weights.block4.block_layout;
-        std::size_t ti = 0;
+        const std::size_t n_bc_total = BL4.cols;
+
+        // Per-row lookahead (this row's tiles, gathered before deciding
+        // pairing) -- reused/cleared every row instead of reallocated.
+        std::vector<uint32_t>& row_bc = weights.block4.scratch_row_bc_lookahead;
+        std::vector<std::size_t>& row_elem = weights.block4.scratch_row_elem_lookahead;
+        std::vector<std::size_t>& row_byte = weights.block4.scratch_row_byte_lookahead;
+        std::vector<Block4WorkItem>& flat_items = weights.block4.scratch_flat_items;
+        flat_items.clear();
+
         for (std::size_t br = 0; br < BL4.rows; ++br) {
             const std::size_t n_bc = BL4.row_nnz(br);
             if (n_bc == 0)
                 continue;
+            row_bc.clear();
+            row_elem.clear();
+            row_byte.clear();
             auto bc_cursor = weights.block4.row_cursor(br);
             std::size_t elem_pos = BL4.elem_start[br];
             std::size_t byte_pos = weights.block4.tile_byte_start[br];
-            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos, ++ti) {
-                tile_br[ti] = uint32_t(br);
-                tile_bc[ti] = bc_cursor.advance();
-                tile_elem[ti] = elem_pos;
-                tile_byte[ti] = byte_pos;
-                tile_is_follower[ti] = uint8_t(bk % 2 == 1);
+            for (std::size_t bk = 0; bk < n_bc; ++bk, ++elem_pos) {
+                row_bc.push_back(bc_cursor.advance());
+                row_elem.push_back(elem_pos);
+                row_byte.push_back(byte_pos);
                 byte_pos += weights.block4.tile_len_at(elem_pos, byte_pos);
             }
+            // disldo_forward.fp32_block4_cross_tile_pairing: pair this
+            // tile with the next one IN THIS ROW (bk parity, unconditional
+            // -- ownership isn't decided until/unless the wide path
+            // re-buckets this list below).
+            for (std::size_t bk = 0; bk < n_bc; bk += 2) {
+                Block4WorkItem item;
+                item.br = uint32_t(br);
+                item.bcA = row_bc[bk];
+                item.elemA = row_elem[bk];
+                item.byteA = row_byte[bk];
+                if (bk + 1 < n_bc) {
+                    item.has_partner = true;
+                    item.bcB = row_bc[bk + 1];
+                    item.elemB = row_elem[bk + 1];
+                    item.byteB = row_byte[bk + 1];
+                } else {
+                    item.has_partner = false;
+                }
+                flat_items.push_back(item);
+            }
         }
-        // Per-thread private output buffers -- necessary, not optional:
-        // two tiles sharing a block-column write to the same output
-        // positions. See disldo_forward.per_thread_output_buffers in
-        // docs/research/linear_disldo.rst.
-        std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
-        // Hoisted loop bound -- measured instruction-count win (no
-        // wall-clock effect). See disldo_forward.hoisted_tile_count in
-        // docs/research/linear_disldo.rst.
-        const int64_t n_tiles_local = int64_t(n_b4);
+
+        // See the big comment above: measured threshold (arch-sandbox,
+        // CCX-pinned) -- 4 cols/thread was a severe regression, 9 was
+        // decent-but-not-great, 18 was a clean win. See docs/research/
+        // linear_disldo.rst for the actual sweep this was tuned from.
+        constexpr std::size_t COLUMN_PARTITION_MIN_COLS_PER_THREAD = 12;
+        const std::size_t cols_per_thread = n_bc_total / static_cast<std::size_t>(num_cpus);
+        const bool use_column_partition = cols_per_thread >= COLUMN_PARTITION_MIN_COLS_PER_THREAD;
+
+        std::vector<std::vector<Block4WorkItem>>& thread_items =
+            weights.block4.scratch_thread_items;
+        if (use_column_partition) {
+            if (thread_items.size() != static_cast<std::size_t>(num_cpus))
+                thread_items.resize(static_cast<std::size_t>(num_cpus));
+            for (auto& items : thread_items)
+                items.clear();
+
+            // Contiguous, disjoint column-block ranges, split as evenly as
+            // possible: thread t owns [thread_bc_start[t], thread_bc_start[t+1]).
+            std::vector<std::size_t>& thread_bc_start = weights.block4.scratch_thread_bc_start;
+            thread_bc_start.resize(static_cast<std::size_t>(num_cpus) + 1);
+            for (int t = 0; t <= num_cpus; ++t)
+                thread_bc_start[static_cast<std::size_t>(t)] =
+                    (static_cast<std::size_t>(t) * n_bc_total) / static_cast<std::size_t>(num_cpus);
+            // Flat O(1)-lookup owner table instead of a per-tile binary
+            // search -- measured directly: a std::upper_bound() per tile
+            // was a real, mostly-fixed per-call tax (~50-90us at
+            // n_out=288 regardless of batch), the dominant cost of this
+            // whole restructure at low batch before this table existed.
+            std::vector<int32_t>& bc_owner_table = weights.block4.scratch_bc_owner_table;
+            bc_owner_table.resize(n_bc_total);
+            for (int t = 0; t < num_cpus; ++t) {
+                const std::size_t lo = thread_bc_start[static_cast<std::size_t>(t)];
+                const std::size_t hi = thread_bc_start[static_cast<std::size_t>(t) + 1];
+                std::fill(bc_owner_table.begin() + static_cast<std::ptrdiff_t>(lo),
+                          bc_owner_table.begin() + static_cast<std::ptrdiff_t>(hi), t);
+            }
+
+            // Re-bucket the flat list: a pair straddling a thread
+            // boundary would need cross-thread writes, exactly what this
+            // path exists to avoid, so it's demoted to two solo items
+            // instead (each still cheap: solo processing never leaves its
+            // own tile's 4 columns, always inside one thread's range by
+            // construction).
+            for (const Block4WorkItem& src : flat_items) {
+                const int ownerA = bc_owner_table[src.bcA];
+                if (src.has_partner && bc_owner_table[src.bcB] == ownerA) {
+                    thread_items[static_cast<std::size_t>(ownerA)].push_back(src);
+                } else {
+                    Block4WorkItem solo = src;
+                    solo.has_partner = false;
+                    thread_items[static_cast<std::size_t>(ownerA)].push_back(solo);
+                    if (src.has_partner) {
+                        Block4WorkItem partner;
+                        partner.br = src.br;
+                        partner.bcA = src.bcB;
+                        partner.elemA = src.elemB;
+                        partner.byteA = src.byteB;
+                        partner.has_partner = false;
+                        thread_items[static_cast<std::size_t>(bc_owner_table[src.bcB])].push_back(
+                            partner);
+                    }
+                }
+            }
+        }
         // gamma_k is layer-wide (not row/col-dependent) -- hoisted OUTSIDE
         // the parallel region entirely, computed once per call and shared
         // read-only across every thread, instead of get_scale() re-deriving
@@ -198,222 +295,103 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         // disldo_forward.rank0_s8_fast_path in docs/research/linear_disldo.rst.
         const Block4Vec ones4 = block4_vec_broadcast(1.0f);
         const Block4Vec zeros4 = block4_vec_broadcast(0.0f);
-#pragma omp parallel num_threads(num_cpus)
-        {
-            const int tid = omp_get_thread_num();
-            value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
-            // Per-thread, allocated once per call (not per tile): caches
-            // value_scale_k(row,:) for this tile-pair/tile's BLOCK4_TILE
-            // rows and output_scale_k(col,:) for the 1-2 columns currently
-            // in play, so get_scale(row,col)'s O(rank) sum-of-products is
-            // computed from these local arrays instead of calling
-            // weights.get_scale() -- which redundantly re-fetches the SAME
-            // row's value_scale_k once per column visited, and the SAME
-            // column's output_scale_k once per row visited (no caching at
-            // all previously). Measured via callgrind: get_scale() was
-            // 68% of disldo_forward's total instructions at batch=1,
-            // density=1.0 -- see disldo_forward.get_scale_row_col_cache in
-            // docs/research/linear_disldo.rst.
-            std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
-            std::vector<value_type> col_scale_cache(2 * scale_rank);
-#pragma omp for schedule(static)
-            for (int64_t row_ti = 0; row_ti < n_tiles_local; ++row_ti) {
-                // disldo_forward.block4_cross_tile_pairing (Phase 2 of the
-                // block4_codec refactor, see docs/research/linear_disldo.
-                // rst): pair this tile (the "leader") with its consecutive
-                // same-br partner if one exists (tile_is_follower[row_ti+1],
-                // set by the collection loop above), instead of always
-                // falling back to within-tile column pairing. Forward is
-                // read-only, so there's no live-handle-aliasing hazard from
-                // holding two tile handles at once (unlike backward's port
-                // of this same axis). ONE generic implementation for all
-                // three precisions now -- the only per-precision difference
-                // was ever the weight decode, which is now
-                // Block4Codec<VALUES_TYPE>::decode_weight_column4 instead of
-                // three copy-pasted ~140-line blocks (raw memcpy / fp8
-                // gather+decode / fp4 mask+decode). Correctness and the real
-                // speedup (measured, not assumed) were both validated first
-                // via a standalone PoC -- see disldo_forward.
-                // fp32_block4_cross_tile_pairing in docs/research/
-                // linear_disldo.rst and
-                // tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp.
-                using Codec = Block4Codec<VALUES_TYPE>;
-                if (tile_is_follower[std::size_t(row_ti)])
-                    continue; // already consumed by row_ti-1 as its partner.
-                const uint32_t br = tile_br[std::size_t(row_ti)],
-                               bcA = tile_bc[std::size_t(row_ti)];
-                const auto tileA = weights.block4.at_index(br, bcA, tile_elem[std::size_t(row_ti)],
-                                                           tile_byte[std::size_t(row_ti)]);
-                const uint8_t* tdataA = tileA.raw_data();
-                const bool has_partner =
-                    (row_ti + 1 < n_tiles_local) && tile_is_follower[std::size_t(row_ti + 1)];
-                if (has_partner) {
-                    const uint32_t bcB = tile_bc[std::size_t(row_ti + 1)];
-                    const auto tileB =
-                        weights.block4.at_index(br, bcB, tile_elem[std::size_t(row_ti + 1)],
-                                                tile_byte[std::size_t(row_ti + 1)]);
-                    const uint8_t* tdataB = tileB.raw_data();
-                    // Row-level value_scale_k -- doesn't depend on lj at
-                    // all (br is fixed for this whole tile-pair), so cache
-                    // it ONCE here instead of once per lj (was 4x
-                    // redundant). See the row_scale_cache/col_scale_cache
-                    // comment above.
-                    std::size_t row_idx[BLOCK4_TILE];
-                    // True iff all 4 rows of this br block are in bounds --
-                    // false only for the last (possibly partial) row block.
-                    // See the rank==0 s8 fast path below.
-                    const bool full_rows = std::size_t(br) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
-                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                        const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                        row_idx[li] = row < n_in ? row : 0;
-                        for (std::size_t k = 0; k < scale_rank; ++k)
-                            row_scale_cache[li * scale_rank + k] =
-                                row < n_in ? weights.get_value_scale_k(row, k) : value_type(0);
-                    }
-                    for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
-                        const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
-                        const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
-                        const bool haveA = colA < n_out;
-                        const bool haveB = colB < n_out;
-                        if (!haveA)
-                            continue;
-
-                        const Block4Vec wA = Codec::decode_weight_column4(tdataA, lj);
-                        const Block4Vec wB = haveB ? Codec::decode_weight_column4(tdataB, lj)
-                                                   : block4_vec_broadcast(0.0f);
-                        const Block8Vec w_decoded8 = block8_vec_from_lo_hi(wA, wB);
-
-                        // Column-level output_scale_k -- once per lj, not
-                        // once per li (was 4x redundant).
-                        for (std::size_t k = 0; k < scale_rank; ++k) {
-                            col_scale_cache[k] = weights.get_output_scale_k(colA, k);
-                            col_scale_cache[scale_rank + k] =
-                                haveB ? weights.get_output_scale_k(colB, k) : value_type(0);
-                        }
-                        Block8Vec s8;
-                        if (scale_rank == 0 && full_rows) {
-                            // S is always exactly 1 here (see scale_identity
-                            // above) and every row is in bounds -- s8 is a
-                            // pure constant, no per-lane loop needed.
-                            s8 = haveB ? block8_vec_from_lo_hi(ones4, ones4)
-                                       : block8_vec_from_lo_hi(ones4, zeros4);
-                        } else if (scale_rank == 0) {
-                            // Last (partial) row block -- still no scale
-                            // lookup needed, just per-lane row masking.
-                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                                s8[li] = row < n_in ? value_type(1) : value_type(0);
-                                s8[li + 4] = (row < n_in && haveB) ? value_type(1) : value_type(0);
-                            }
-                        } else {
-                            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
-                                value_type sA = scale_identity, sB = scale_identity;
-                                for (std::size_t k = 0; k < scale_rank; ++k) {
-                                    const value_type vsk = row_scale_cache[li * scale_rank + k];
-                                    sA += gamma_k_arr[k] * vsk * col_scale_cache[k];
-                                    sB += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
-                                }
-                                s8[li] = row < n_in ? sA : value_type(0);
-                                s8[li + 4] = (row < n_in && haveB) ? sB : value_type(0);
-                            }
-                        }
-                        const Block8Vec w8 = w_decoded8 * s8;
-
-                        // full_rows: row_idx[0..3] are 4 consecutive rows,
-                        // one contiguous wide load instead of 4 scalar reads.
-                        for (SIZE_TYPE b = 0; b < batch; ++b) {
-                            const value_type* in_row =
-                                input + static_cast<std::size_t>(b) * in_cols;
-                            Block8Vec in8;
-                            if (full_rows) {
-                                in8 = block8_vec_dup4(block4_vec_load(in_row + row_idx[0]));
-                            } else {
-                                for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                                    const value_type iv = in_row[row_idx[li]];
-                                    in8[li] = iv;
-                                    in8[li + 4] = iv;
-                                }
-                            }
-                            const Block8Vec prod = w8 * in8;
-                            mo[static_cast<std::size_t>(b) * n_out + colA] +=
-                                prod[0] + prod[1] + prod[2] + prod[3];
-                            if (haveB)
-                                mo[static_cast<std::size_t>(b) * n_out + colB] +=
-                                    prod[4] + prod[5] + prod[6] + prod[7];
-                        }
-                    }
-                    continue;
-                }
-                // solo: no partner tile in this br -- fall back to the
-                // existing within-tile column pairing, unchanged math
-                // (disldo_forward.block4_avx2_column_pairing).
-                static_assert(BLOCK4_TILE == 4,
-                              "column pairing below assumes exactly 4 columns (2 pairs)");
-                const uint32_t bc = bcA;
-                const uint8_t* tdata = tdataA;
-                const uint32_t br_ = br;
-                // Row-level value_scale_k -- shared by BOTH process_pair
-                // calls below (LJ0=0 and LJ0=2, same br_), so hoisted
-                // outside the lambda entirely instead of being recomputed
-                // once per call (was 2x redundant on top of get_scale's
-                // own per-cell cost).
+        // disldo_forward.block4_item_processor: the actual per-item SIMD
+        // math, factored out into one callable shared by BOTH strategies
+        // below -- only the OUTPUT POINTER (`mo`: `output` directly for
+        // the wide path, or a private per-thread slice for the narrow
+        // path's pre-reduction buffer) and per-thread scratch differ.
+        // Captures only read-only, thread-safe state by reference
+        // (weights, input dims, scale_rank/gamma_k_arr/ones4/zeros4); the
+        // genuinely per-thread state (row_scale_cache/col_scale_cache) is
+        // passed in explicitly since a captured reference would alias
+        // across threads. See disldo_forward.block4_cross_tile_pairing
+        // (Phase 2 of the block4_codec refactor, docs/research/
+        // linear_disldo.rst) for why leader+follower tile-pairs get
+        // processed together via 8-wide SIMD instead of always falling
+        // back to within-tile column pairing, and
+        // tests/unit/test_disldo_block4_fp32_crosstile_forward.cpp for
+        // the standalone PoC that validated the real (measured, not
+        // assumed) speedup first. ONE generic implementation for all
+        // three precisions -- the only per-precision difference is the
+        // weight decode, Block4Codec<VALUES_TYPE>::decode_weight_column4.
+        auto process_block4_item = [&](const Block4WorkItem& item, value_type* mo,
+                                       value_type* row_scale_cache, value_type* col_scale_cache) {
+            using Codec = Block4Codec<VALUES_TYPE>;
+            const uint32_t br = item.br, bcA = item.bcA;
+            const auto tileA = weights.block4.at_index(br, bcA, item.elemA, item.byteA);
+            const uint8_t* tdataA = tileA.raw_data();
+            if (item.has_partner) {
+                const uint32_t bcB = item.bcB;
+                const auto tileB = weights.block4.at_index(br, bcB, item.elemB, item.byteB);
+                const uint8_t* tdataB = tileB.raw_data();
+                // Row-level value_scale_k -- doesn't depend on lj at
+                // all (br is fixed for this whole tile-pair), so cache
+                // it ONCE here instead of once per lj (was 4x
+                // redundant).
                 std::size_t row_idx[BLOCK4_TILE];
-                // See the identical rank==0 s8 fast path comment in the
-                // cross-tile-pairing branch above.
-                const bool full_rows = std::size_t(br_) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
+                // True iff all 4 rows of this br block are in bounds --
+                // false only for the last (possibly partial) row block.
+                // See the rank==0 s8 fast path below.
+                const bool full_rows = std::size_t(br) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
                 for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                    const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                    const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                     row_idx[li] = row < n_in ? row : 0;
                     for (std::size_t k = 0; k < scale_rank; ++k)
                         row_scale_cache[li * scale_rank + k] =
                             row < n_in ? weights.get_value_scale_k(row, k) : value_type(0);
                 }
-                auto process_pair = [&, br_]<uint32_t LJ0>() {
-                    constexpr uint32_t LJ1 = LJ0 + 1;
-                    const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
-                    const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
-                    const bool have0 = col0 < n_out;
-                    const bool have1 =
-                        col1 < n_out; // have0==false implies have1==false (col1>col0)
-                    if (!have0)
-                        return;
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    const std::size_t colA = std::size_t(bcA) * BLOCK4_TILE + lj;
+                    const std::size_t colB = std::size_t(bcB) * BLOCK4_TILE + lj;
+                    const bool haveA = colA < n_out;
+                    const bool haveB = colB < n_out;
+                    if (!haveA)
+                        continue;
 
-                    const Block4Vec w_decoded0 = Codec::decode_weight_column4(tdata, LJ0);
-                    const Block4Vec w_decoded1 = have1 ? Codec::decode_weight_column4(tdata, LJ1)
-                                                       : block4_vec_broadcast(0.0f);
-                    const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+                    const Block4Vec wA = Codec::decode_weight_column4(tdataA, lj);
+                    const Block4Vec wB = haveB ? Codec::decode_weight_column4(tdataB, lj)
+                                               : block4_vec_broadcast(0.0f);
+                    const Block8Vec w_decoded8 = block8_vec_from_lo_hi(wA, wB);
 
+                    // Column-level output_scale_k -- once per lj, not
+                    // once per li (was 4x redundant).
                     for (std::size_t k = 0; k < scale_rank; ++k) {
-                        col_scale_cache[k] = weights.get_output_scale_k(col0, k);
+                        col_scale_cache[k] = weights.get_output_scale_k(colA, k);
                         col_scale_cache[scale_rank + k] =
-                            have1 ? weights.get_output_scale_k(col1, k) : value_type(0);
+                            haveB ? weights.get_output_scale_k(colB, k) : value_type(0);
                     }
                     Block8Vec s8;
                     if (scale_rank == 0 && full_rows) {
-                        s8 = have1 ? block8_vec_from_lo_hi(ones4, ones4)
+                        // S is always exactly 1 here (see scale_identity
+                        // above) and every row is in bounds -- s8 is a
+                        // pure constant, no per-lane loop needed.
+                        s8 = haveB ? block8_vec_from_lo_hi(ones4, ones4)
                                    : block8_vec_from_lo_hi(ones4, zeros4);
                     } else if (scale_rank == 0) {
+                        // Last (partial) row block -- still no scale
+                        // lookup needed, just per-lane row masking.
                         for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
                             s8[li] = row < n_in ? value_type(1) : value_type(0);
-                            s8[li + 4] = (row < n_in && have1) ? value_type(1) : value_type(0);
+                            s8[li + 4] = (row < n_in && haveB) ? value_type(1) : value_type(0);
                         }
                     } else {
                         for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
-                            const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
-                            value_type s0 = scale_identity, s1 = scale_identity;
+                            const std::size_t row = std::size_t(br) * BLOCK4_TILE + li;
+                            value_type sA = scale_identity, sB = scale_identity;
                             for (std::size_t k = 0; k < scale_rank; ++k) {
                                 const value_type vsk = row_scale_cache[li * scale_rank + k];
-                                s0 += gamma_k_arr[k] * vsk * col_scale_cache[k];
-                                s1 += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                                sA += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                                sB += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
                             }
-                            s8[li] = row < n_in ? s0 : value_type(0);
-                            s8[li + 4] = (row < n_in && have1) ? s1 : value_type(0);
+                            s8[li] = row < n_in ? sA : value_type(0);
+                            s8[li + 4] = (row < n_in && haveB) ? sB : value_type(0);
                         }
                     }
                     const Block8Vec w8 = w_decoded8 * s8;
 
+                    // full_rows: row_idx[0..3] are 4 consecutive rows,
+                    // one contiguous wide load instead of 4 scalar reads.
                     for (SIZE_TYPE b = 0; b < batch; ++b) {
                         const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
                         Block8Vec in8;
@@ -427,21 +405,157 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                             }
                         }
                         const Block8Vec prod = w8 * in8;
-                        mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                        mo[static_cast<std::size_t>(b) * n_out + colA] +=
                             prod[0] + prod[1] + prod[2] + prod[3];
-                        if (have1)
-                            mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                        if (haveB)
+                            mo[static_cast<std::size_t>(b) * n_out + colB] +=
                                 prod[4] + prod[5] + prod[6] + prod[7];
                     }
-                };
-                process_pair.template operator()<0>();
-                process_pair.template operator()<2>();
+                }
+                return;
             }
-        }
-        for (int t = 0; t < num_cpus; ++t) {
-            const value_type* s = b4_out.data() + static_cast<std::size_t>(t) * ost;
-            for (std::size_t i = 0; i < ost; ++i)
-                output[i] += s[i];
+            // solo: no partner tile -- fall back to the existing
+            // within-tile column pairing, unchanged math
+            // (disldo_forward.block4_avx2_column_pairing).
+            static_assert(BLOCK4_TILE == 4,
+                          "column pairing below assumes exactly 4 columns (2 pairs)");
+            const uint32_t bc = bcA;
+            const uint8_t* tdata = tdataA;
+            const uint32_t br_ = br;
+            std::size_t row_idx[BLOCK4_TILE];
+            const bool full_rows = std::size_t(br_) * BLOCK4_TILE + BLOCK4_TILE <= n_in;
+            for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                row_idx[li] = row < n_in ? row : 0;
+                for (std::size_t k = 0; k < scale_rank; ++k)
+                    row_scale_cache[li * scale_rank + k] =
+                        row < n_in ? weights.get_value_scale_k(row, k) : value_type(0);
+            }
+            auto process_pair = [&, br_]<uint32_t LJ0>() {
+                constexpr uint32_t LJ1 = LJ0 + 1;
+                const std::size_t col0 = std::size_t(bc) * BLOCK4_TILE + LJ0;
+                const std::size_t col1 = std::size_t(bc) * BLOCK4_TILE + LJ1;
+                const bool have0 = col0 < n_out;
+                const bool have1 = col1 < n_out; // have0==false implies have1==false
+                if (!have0)
+                    return;
+
+                const Block4Vec w_decoded0 = Codec::decode_weight_column4(tdata, LJ0);
+                const Block4Vec w_decoded1 =
+                    have1 ? Codec::decode_weight_column4(tdata, LJ1) : block4_vec_broadcast(0.0f);
+                const Block8Vec w_decoded8 = block8_vec_from_lo_hi(w_decoded0, w_decoded1);
+
+                for (std::size_t k = 0; k < scale_rank; ++k) {
+                    col_scale_cache[k] = weights.get_output_scale_k(col0, k);
+                    col_scale_cache[scale_rank + k] =
+                        have1 ? weights.get_output_scale_k(col1, k) : value_type(0);
+                }
+                Block8Vec s8;
+                if (scale_rank == 0 && full_rows) {
+                    s8 = have1 ? block8_vec_from_lo_hi(ones4, ones4)
+                               : block8_vec_from_lo_hi(ones4, zeros4);
+                } else if (scale_rank == 0) {
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                        s8[li] = row < n_in ? value_type(1) : value_type(0);
+                        s8[li + 4] = (row < n_in && have1) ? value_type(1) : value_type(0);
+                    }
+                } else {
+                    for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                        const std::size_t row = std::size_t(br_) * BLOCK4_TILE + li;
+                        value_type s0 = scale_identity, s1 = scale_identity;
+                        for (std::size_t k = 0; k < scale_rank; ++k) {
+                            const value_type vsk = row_scale_cache[li * scale_rank + k];
+                            s0 += gamma_k_arr[k] * vsk * col_scale_cache[k];
+                            s1 += gamma_k_arr[k] * vsk * col_scale_cache[scale_rank + k];
+                        }
+                        s8[li] = row < n_in ? s0 : value_type(0);
+                        s8[li + 4] = (row < n_in && have1) ? s1 : value_type(0);
+                    }
+                }
+                const Block8Vec w8 = w_decoded8 * s8;
+
+                for (SIZE_TYPE b = 0; b < batch; ++b) {
+                    const value_type* in_row = input + static_cast<std::size_t>(b) * in_cols;
+                    Block8Vec in8;
+                    if (full_rows) {
+                        in8 = block8_vec_dup4(block4_vec_load(in_row + row_idx[0]));
+                    } else {
+                        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+                            const value_type iv = in_row[row_idx[li]];
+                            in8[li] = iv;
+                            in8[li + 4] = iv;
+                        }
+                    }
+                    const Block8Vec prod = w8 * in8;
+                    mo[static_cast<std::size_t>(b) * n_out + col0] +=
+                        prod[0] + prod[1] + prod[2] + prod[3];
+                    if (have1)
+                        mo[static_cast<std::size_t>(b) * n_out + col1] +=
+                            prod[4] + prod[5] + prod[6] + prod[7];
+                }
+            };
+            process_pair.template operator()<0>();
+            process_pair.template operator()<2>();
+        };
+
+        if (use_column_partition) {
+            // Wide path: thread_items[tid] was already assigned to this
+            // exact thread during collection, by output column-block
+            // ownership -- that's what makes writing directly into
+            // `output` safe with zero cross-thread writes, zero
+            // reduction.
+#pragma omp parallel num_threads(num_cpus)
+            {
+                const int tid = omp_get_thread_num();
+                std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                std::vector<value_type> col_scale_cache(2 * scale_rank);
+                for (const Block4WorkItem& item : thread_items[static_cast<std::size_t>(tid)])
+                    process_block4_item(item, output, row_scale_cache.data(),
+                                        col_scale_cache.data());
+            }
+        } else {
+            // Narrow path: process the flat, row-major item list via a
+            // real `#pragma omp for` (contiguous chunk per thread -- same
+            // locality the old row-partitioned scheme had) into a private
+            // per-thread buffer, then combine with a PARALLEL tree
+            // reduction inside this same region instead of one thread
+            // summing num_cpus * ost elements serially afterward: each of
+            // the log2(num_cpus) rounds halves the number of "active"
+            // buffers, and every round's own combine work is itself split
+            // across all num_cpus threads via `#pragma omp for` (not just
+            // done by whichever thread owns that round's pair) -- total
+            // combine work is still O(ost * num_cpus), same as a serial
+            // reduction, but wall-clock drops to O(ost * log2(num_cpus))
+            // since it's parallelized every round instead of serialized
+            // once. See disldo_forward.per_thread_output_buffers in
+            // docs/research/linear_disldo.rst.
+            std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
+            const int64_t n_items_local = int64_t(flat_items.size());
+#pragma omp parallel num_threads(num_cpus)
+            {
+                const int tid = omp_get_thread_num();
+                value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
+                std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                std::vector<value_type> col_scale_cache(2 * scale_rank);
+#pragma omp for schedule(static)
+                for (int64_t idx = 0; idx < n_items_local; ++idx)
+                    process_block4_item(flat_items[static_cast<std::size_t>(idx)], mo,
+                                        row_scale_cache.data(), col_scale_cache.data());
+
+                for (int stride = 1; stride < num_cpus; stride *= 2) {
+                    const int step = stride * 2;
+#pragma omp for schedule(static)
+                    for (std::size_t i = 0; i < ost; ++i) {
+                        for (int base = 0; base + stride < num_cpus; base += step)
+                            b4_out[static_cast<std::size_t>(base) * ost + i] +=
+                                b4_out[static_cast<std::size_t>(base + stride) * ost + i];
+                    }
+                }
+#pragma omp for schedule(static)
+                for (std::size_t i = 0; i < ost; ++i)
+                    output[i] += b4_out[i];
+            }
         }
     }
 

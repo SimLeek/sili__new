@@ -126,17 +126,109 @@ stores.
 
 .. _disldo_forward.per_thread_output_buffers:
 
-block4 forward compute: per-thread output buffers
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+block4 forward compute: two threading strategies, chosen by layer width
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 *ID:* ``disldo_forward.per_thread_output_buffers``
 
-Same pattern as the scattered path's ``t_out`` above, and necessary, not
-optional: two tiles that share a block-COLUMN (different block-rows,
-i.e. different input rows feeding the same output columns) write to the
-same output positions, so parallelizing freely over tiles without this
-would race exactly the way the scattered path's own scatter-write would
-without ``t_out``.
+Two tiles that share a block-COLUMN (different block-rows, i.e.
+different input rows feeding the same output columns) write to the same
+output positions, so parallelizing freely over tiles needs either
+private per-thread output buffers + a reduction (same shape as the
+scattered path's ``t_out`` above), or a partitioning of work that makes
+cross-thread writes structurally impossible. Both are used here, chosen
+per call by layer width -- see
+:ref:`disldo_forward.column_partitioned_threading` below for why one
+scheme alone isn't enough.
+
+The ORIGINAL version of this scheme (every thread gets a full
+``num_cpus``-way private output-sized buffer, one thread sums them all
+serially after the parallel region closes) is what the two strategies
+below replaced. It has a real, measured flaw: the serial reduction is
+O(num_cpus * batch * n_out) work done by ONE thread, and that cost
+GROWS with batch and layer width -- exactly the sizes that should
+amortize a fixed per-call overhead, not make it worse. Measured directly
+via a standalone probe matching the exact reduction code: at
+n_out=288/batch=1024/num_cpus=4 this reduction alone cost ~491us (out of
+the ORIGINAL scheme's ~14.8ms per real forward() call there); the real
+matrix benchmark showed per-call efficiency (speedup/num_cpus) actually
+PEAKING mid-batch and then declining again at the largest batch tested
+for several layer widths, the opposite of the expected "more work
+amortizes fixed overhead" shape.
+
+.. _disldo_forward.column_partitioned_threading:
+
+Wide layers: column-block-partitioned threading, zero cross-thread writes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.column_partitioned_threading``
+
+Every tile (or leader+follower tile-pair) is bucketed, during the same
+sequential row-major collection walk, into whichever thread owns its
+output COLUMN-block range -- contiguous, disjoint ranges of block4
+column-blocks, split as evenly as possible across ``num_cpus`` threads.
+Since ownership is by output column and disjoint, every thread can write
+straight into the real ``output`` array with zero cross-thread
+aggregation of any kind -- no private buffer, no reduction, serial or
+parallel.
+
+This alone is NOT a strict improvement over the old per-thread-buffer
+scheme, though: it trades the old scheme's reduction-tax problem for a
+different one. With a NARROW layer relative to ``num_cpus`` (few
+column-blocks per thread), a single thread's work items span MANY
+different row-blocks (since with dense-ish data every row-block touches
+every thread's narrow column range), so it revisits a fresh, cold
+row-block's input slice every 1-2 work items instead of reusing one
+row-block's slice across many consecutive items the way row-major
+chunking naturally does. Measured directly (standalone A/B, arch-sandbox
+CCX-pinned, num_cpus=4): at n_out=64 (4 output column-blocks/thread),
+efficiency (speedup/num_cpus) CRASHED to ~0.21-0.26 at batch>=256 --
+worse than not parallelizing at all -- vs ~0.86-0.88 for the old
+row-partitioned+serial-reduce scheme at the same shape. "Few outputs,
+many inputs" (embedding/readout-shaped layers) is a real network shape,
+not a hypothetical edge case, so this couldn't be shipped as the only
+strategy.
+
+.. _disldo_forward.narrow_layer_tree_reduction:
+
+Narrow layers: row-major chunking + parallel tree reduction
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.narrow_layer_tree_reduction``
+
+For layers below the column-partitioning threshold, the SAME flat,
+row-major item list is instead processed via a real ``#pragma omp for
+schedule(static)`` -- each thread gets a CONTIGUOUS chunk of row-major
+tiles, restoring the old scheme's good input-row locality -- into a
+private per-thread buffer (``num_cpus`` copies of the ``[batch x
+n_out]`` output, same shape as the old scheme). The combine step is
+where this differs from the old scheme: instead of one thread summing
+all ``num_cpus`` buffers serially, ``log2(num_cpus)`` rounds of a
+PARALLEL tree reduction run inside the SAME parallel region (an explicit
+``#pragma omp for schedule(static)`` over the ``[batch x n_out]`` index
+range per round, not a bare ``#pragma omp for`` over tiles) -- each
+round halves the number of "active" buffers, and every round's own
+combine work is itself split across all ``num_cpus`` threads rather than
+done by whichever thread owns that round's pair. Total addition work is
+still O(ost * num_cpus), same as the old serial reduction, but
+wall-clock drops to O(ost * log2(num_cpus)) since every round is
+parallelized instead of one round being serialized ``num_cpus`` times.
+Final combine into the real ``output`` array is a last ``#pragma omp
+for`` too, not a single-thread pass.
+
+**Threshold**: ``COLUMN_PARTITION_MIN_COLS_PER_THREAD = 12`` (output
+column-blocks per thread; ``n_bc_total / num_cpus``). Chosen from a
+direct sweep (arch-sandbox, CCX-pinned, num_cpus=4) straddling the
+boundary (6/8/10/12/14 cols/thread, batch 1-1024): efficiency was smooth
+and good on BOTH sides of 12 (0.66-0.92 throughout, no cliff), so the
+exact cutoff isn't hypersensitive -- 12 was picked as a round number
+inside that flat zone, not fitted to a sharp transition. The full width
+sweep (32/64/144/288/576, num_cpus=4) confirmed no regression anywhere
+with this threshold: narrow layers (32/64/144, all routed to the tree-
+reduction path) climbed smoothly from ~0.35-0.73 at batch=1 to
+~0.57-0.90 at batch=1024 with no turnover; wide layers (288/576, routed
+to column-partitioning) reached 0.82-0.93 at batch=1024, also with no
+turnover -- the old scheme's large-batch decline is gone on both paths.
 
 .. _disldo_forward.hoisted_tile_count:
 

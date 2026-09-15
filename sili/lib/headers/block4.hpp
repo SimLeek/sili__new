@@ -26,6 +26,28 @@ constexpr uint32_t BLOCK4_TILE = SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_TILE_SLOTS = SILI_BLOCK4_TILE_SIZE * SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
 
+// disldo_forward.column_partitioned_threading: one tile (or one
+// leader+follower tile-pair, same br, consecutive in row order) pre-
+// assigned to whichever thread owns its output column-block range. See
+// disldo_forward.per_thread_output_buffers in docs/research/
+// linear_disldo.rst for why this replaced the earlier "every thread gets
+// a full private output-sized buffer, reduce serially at the end" scheme
+// -- that reduction was O(num_cpus * batch * n_out) and grew *worse* at
+// exactly the large-batch/large-layer sizes that should have amortized
+// it. Column-block ownership is disjoint per thread, so a thread holding
+// this item can write directly into the shared output array with zero
+// cross-thread aggregation.
+struct Block4WorkItem {
+    uint32_t br = 0;
+    uint32_t bcA = 0;
+    std::size_t elemA = 0;
+    std::size_t byteA = 0;
+    bool has_partner = false;
+    uint32_t bcB = 0;
+    std::size_t elemB = 0;
+    std::size_t byteB = 0;
+};
+
 // block4 4-wide SIMD helpers
 //
 // Currently the only supported activation and backprop value is float32.
@@ -1310,8 +1332,6 @@ struct Block4Store {
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
     // Persistent scratch buffers for disldo_forward/disldo_backward
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count; // backward only
     std::vector<double> scratch_row_grad;         // backward only
     // backward only:
@@ -1321,10 +1341,18 @@ struct Block4Store {
     // Block4BackwardParams's own comment (block4_codec.hpp).
     std::vector<float> scratch_input_T;       // backward only
     std::vector<float> scratch_output_grad_T; // backward only
-    // disldo_forward cross-tile pairing scratch -- currently only used by
-    // the FP32 block4 store; harmless unused field here (shared collection
-    // loop in disldo_forward populates it for every VALUES_TYPE).
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_forward.column_partitioned_threading: per-thread work-item
+    // lists (see Block4WorkItem above) plus the column-block partition
+    // boundaries used to build them, reused call to call so no fresh
+    // allocation happens on the hot path.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    // Per-row lookahead buffer used while deciding tile-pairing +
+    // thread ownership (cleared and refilled each row).
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
@@ -1881,8 +1909,6 @@ struct Block4Store8 {
     std::uint64_t row_merge_overflow_events = 0;
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
@@ -1890,10 +1916,14 @@ struct Block4Store8 {
     // identical fields above.
     std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T;
-    // disldo_forward cross-tile pairing scratch -- currently only used by
-    // the FP32 block4 store; harmless unused field here (shared collection
-    // loop in disldo_forward populates it for every VALUES_TYPE).
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_forward.column_partitioned_threading: see the FP4 store's
+    // identical fields above.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
@@ -2607,8 +2637,6 @@ struct Block4Store32 {
     std::uint64_t row_merge_overflow_events = 0;
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
@@ -2616,12 +2644,14 @@ struct Block4Store32 {
     // identical fields above.
     std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T;
-    // disldo_forward.fp32_block4_cross_tile_pairing: marks every SECOND
-    // tile of a same-br run in scratch_tile_br/bc (bc-ascending order) as
-    // already-consumed by its leader (the immediately preceding flat
-    // index) -- lets the forward parallel loop pair two DIFFERENT tiles
-    // sharing a block-row with zero extra indexing, just a skip-check.
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_forward.column_partitioned_threading: see the FP4 store's
+    // identical fields above.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
