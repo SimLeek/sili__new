@@ -1435,14 +1435,39 @@ range -- do not consider a phase done on PoC evidence alone.
   ZERO peridot-side code changes once the extension is rebuilt --
   already true today (confirmed `_cpu.DIDLDOLayerV` exists in that venv,
   built from this branch's HEAD). No peridot code change needed for this
-  target; next step is measuring real before/after on peridot's own
-  MQAR shapes (see below), not more wiring.
+  target.
+
+  **Real before/after measured (2026-09-16)**, `scripts/
+  train_mqar_curriculum.py fp32 30 1000 0.015 16 10 1 1 50 0 0 288`
+  (matched config both arms, embed_width=288, dynamic_rank_control on),
+  merge-base `74aca2b` (pre-branch) in an isolated git worktree vs this
+  branch's HEAD, same machine, same peridot checkout:
+
+  - Before: 303s wall / 32m3s total CPU for 30 steps (steps_per_sec=0.1)
+  - After: 79s wall / 3m57s total CPU for 30 steps (steps_per_sec=0.4)
+  - **~3.8x wall-clock, ~8.1x total-CPU-seconds** for the identical
+    script/config/seed -- matches the "huge speedup" expectation.
+
+  Hit one unrelated pre-existing peridot bug getting there: `ToyTile
+  RecurrenceRMT.report_ranks()` (model/toy_tile_recurrence_rmt.py)
+  unconditionally called `c.get_additive_rank()` once it saw
+  `get_scale_rank`, crashing on `DISLDOLayerV`/fp32 backends (which have
+  the former, not the latter -- AQRS's additive branch was only ever
+  added to the FP4/FP8 classes). This crashed EVERY fp32 MQAR run at
+  completion, unrelated to anything in this branch -- fixed with a
+  `hasattr` guard (additive_rank reads 0 when absent) so the real script
+  could even finish and be timed. Same fix applied identically to both
+  before/after arms (peridot code, not duplicated across the git
+  worktrees), so it doesn't bias the comparison. Left uncommitted in
+  `sili_peridot` -- that's the user's repo/call, not committed here.
 
   **Not done**: the design-time Group-A-vs-Group-B recommender (still
   needs the "rule of thumb" itself derived, not just documented as
   missing); the fuller multi-dimensional engine-selection surface both
   real-time dispatchers are coarse stand-ins for; the FP4/FP8 dense-
   weight kernel peridot's actual MiniCPM5 FP4 path would need (separate,
-  unscoped, bigger effort -- flagged, not started); a real peridot
-  MQAR before/after speed measurement (merge-base vs current HEAD,
-  in progress).
+  unscoped, bigger effort -- flagged, not started); DIDLDOLayer32/Group B
+  was not evaluated against the real MQAR shapes above (that model uses
+  AQRS dynamic rank control, which DIDLDOLayerV/DenseLinearWeights
+  doesn't support at all -- would need feature parity work first, not
+  just a class swap).
