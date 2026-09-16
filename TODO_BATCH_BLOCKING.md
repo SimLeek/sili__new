@@ -1461,13 +1461,57 @@ range -- do not consider a phase done on PoC evidence alone.
   worktrees), so it doesn't bias the comparison. Left uncommitted in
   `sili_peridot` -- that's the user's repo/call, not committed here.
 
+  **DIDLDOLayer32 (Group B) vs DISLDOLayer32 (Group A) on the real MQAR
+  model (2026-09-16)**, per the user's ask ("it does have dense synapses
+  pretty much everywhere"). DIDLDOLayer32 wasn't actually a drop-in
+  `disldo_cls` yet -- `ToyTileRecurrenceRMT` builds every real layer as
+  `disldo_cls(in, out, max_weights, num_cpus, rng=..., **layer_kwargs)`
+  (positional max_weights, `dense=True` in layer_kwargs) and always
+  forwards `max_abs_delta`/`max_ci` (NOCAPS_KWARGS_FP32) plus
+  `damp_by_importance=False` (L1_SPARSITY_COEF is hardcoded nonzero, so
+  this path is always live, not optional). Fixed:
+  - `DIDLDOLayer32.__init__` accepts+ignores `max_weights`/`dense`
+    (DenseLinearWeights has no CSR budget and is already fully dense).
+  - `DIDLDOLayer32.forward` accepts+ignores `max_ci`/`damp_by_importance`
+    (no importance/ci concept on dense storage) and actually HONORS
+    `max_abs_delta` -- ported disldo_backward's own clamp semantics into
+    `didldo_backward` (linear_didldo.hpp), gated so the smart backward()
+    dispatcher forces the dense branch whenever it's set (sidldo_backward
+    has no clamp yet, would otherwise silently no-op it half the time).
+
+  Matched-config comparison (`scripts/train_mqar_curriculum.py`'s
+  `train_curriculum()` called directly, disldo_cls swapped via a
+  throwaway driver script -- not committed anywhere, both arms
+  identical otherwise): embed_width=288, num_tiles=16, peak_lr=0.015,
+  seed=1000, 30 steps, AQRS OFF both arms (additive_rank=0,
+  dynamic_rank_control=False -- DIDLDOLayerV has no AQRS support at
+  all, so this isolates the storage/kernel difference cleanly rather
+  than comparing AQRS-on vs AQRS-off as a confound):
+
+  - DISLDOLayer32 (Group A): 47.3s wall / 218.3s total CPU
+    (steps_per_sec=0.634)
+  - DIDLDOLayer32 (Group B): 30.2s wall / 96.3s total CPU
+    (steps_per_sec=0.994)
+  - **~1.6x wall-clock, ~2.3x total-CPU-seconds** favoring DIDLDO --
+    confirms the "dense synapses everywhere" hypothesis: on this real
+    model's actual weight density, paying zero CSR/block4 bookkeeping
+    (Group B) beats even the Group A smart dispatcher's best per-call
+    choice. Peak RSS was comparable both arms (~670-690MB, same fp32
+    weight count either way, as expected).
+
+  Not yet done: an AQRS-feature-parity build of DIDLDOLayerV (so the
+  comparison could run WITH AQRS on both arms, matching real production
+  config exactly rather than the isolated no-AQRS variant above); a
+  longer/real training run (this was a 30-step timing probe only, same
+  caveat as the DISLDO before/after above); Group A's own dy_r_target/
+  x_r_target/dy_sparsity_p sparsity-axis kwargs still aren't accepted by
+  DIDLDOLayer32 at all (would TypeError if a config used them) -- only
+  the specific kwarg surface this real script's default config actually
+  exercises was made compatible, not the full DISLDOLayer32 surface.
+
   **Not done**: the design-time Group-A-vs-Group-B recommender (still
   needs the "rule of thumb" itself derived, not just documented as
   missing); the fuller multi-dimensional engine-selection surface both
   real-time dispatchers are coarse stand-ins for; the FP4/FP8 dense-
   weight kernel peridot's actual MiniCPM5 FP4 path would need (separate,
-  unscoped, bigger effort -- flagged, not started); DIDLDOLayer32/Group B
-  was not evaluated against the real MQAR shapes above (that model uses
-  AQRS dynamic rank control, which DIDLDOLayerV/DenseLinearWeights
-  doesn't support at all -- would need feature parity work first, not
-  just a class swap).
+  unscoped, bigger effort -- flagged, not started).
