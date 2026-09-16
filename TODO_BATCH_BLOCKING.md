@@ -198,34 +198,6 @@ range -- do not consider a phase done on PoC evidence alone.
          could be compounding, not competing, explanations. Re-test on
          an idle machine (and at num_cpus=10-16) before trusting the
          precise ratio here.
-- [ ] **Phase 1.5 -- check the PYTHON side, not just the C++ real-kernel
-      bench.** Flagged 2026-09-15: all of Phase 1's verification so far
-      (unit tests + `scripts/bench_disldo_forward_kernel.cpp`) is pure
-      C++, but the actual perf-comparison-vs-torch numbers this whole
-      investigation reports to the user live in
-      `scripts/bench_sili_vs_torch_matrix.py`, which goes through the
-      pybind11 bindings (`sili/cpu_backend.cpp` -> `DISLDOLayerV`), not
-      `disldo_forward` directly. Needs checking, not assumed:
-      1. Does `DISLDOLayerV`'s forward binding call `disldo_forward` with
-         the SAME `num_cpus` value the C++ bench used (4, the measured
-         sweet spot on arch-sandbox), or a different default that could
-         land in the num_cpus=5-9 dead zone or below the batch=8
-         threshold for some of the bench matrix's rows?
-      2. Re-run `scripts/bench_sili_vs_torch_matrix.py` on arch-sandbox
-         (before vs after Phase 1, same worktree-diff technique as the
-         C++ A/B) across its existing batch sweep (1/32/64/128/256/512/
-         1024) and confirm the ~1.5x @ batch=8-64 / ~1.0x @ batch>=256
-         shape from the C++ bench actually shows up end-to-end through
-         Python, not just in the isolated kernel call.
-      3. If it DOESN'T show up proportionally, that's a real finding
-         (Python/pybind overhead dominating, or GIL/dispatch overhead
-         swamping the C++-side win at these batch sizes) worth its own
-         investigation before claiming Phase 1 "done" end-to-end -- the
-         C++ kernel win is necessary but not sufficient for the thing the
-         user actually cares about (real torch-comparison numbers).
-      Do this AFTER at least Phase 2 lands (per explicit ordering from
-      the user: add the task, keep going on the current C++ queue, THEN
-      come back and check Python) -- not blocking Phase 2's start.
 - [x] **Phase 2 -- disldo_forward, narrow (tree-reduction) path, FP32
       (+fp8/fp4 for free, same reasoning as Phase 1/3).** Landed
       2026-09-16. Reused the SAME `process_block4_item`/
@@ -354,10 +326,41 @@ range -- do not consider a phase done on PoC evidence alone.
       quick fp8/fp4 real-kernel bench is a cheap thing to add whenever
       convenient, not urgent since the code path is provably identical
       past weight decode.
-- [ ] **Phase 4 -- disldo_forward's scattered (non-block4, `!dc.empty()`)
-      path.** Different shape already (scalar multiply-add, not
-      horizontal-reduce) -- needs its own check for whether the
-      cross-thread-contention angle still applies before assuming yes.
+- [x] **Phase 4 -- disldo_forward's scattered (non-block4, `!dc.empty()`)
+      path.** Landed 2026-09-16. Applied the two ALREADY-PROVEN fixes
+      (persistent scratch buffer instead of fresh-per-call
+      `std::vector(size,0)`; static-per-thread-range parallel tree
+      reduction instead of the fully SERIAL one-thread-sums-everything
+      loop this path still had -- exactly the pattern
+      disldo_forward.per_thread_output_buffers already diagnosed and
+      fixed for block4, just never ported here). New scratch member
+      `Block4Store::scratch_scattered_out`.
+
+      Real-kernel A/B (arch-sandbox, num_cpus=4, n_in=n_out=288,
+      10%-density pure-scattered layer via
+      `scripts/bench_disldo_forward_scattered.cpp`, 2 interleaved
+      pairs, full batch range): **before == after within noise at every
+      batch size, 1 through 1024.** A real, clean negative result, not a
+      bug -- correctness fully verified (same 5 pre-existing unrelated
+      ctest failures, nothing new), the fix is real and harmless, it
+      just doesn't matter here. Best explanation: this path's compute is
+      already the dominant cost and it's expensive for an unrelated
+      reason -- confirmed by comparing totals directly: at batch=1024
+      this scattered layer (nnz=8064, so 8.25M total multiply-adds) took
+      ~2.25ms, more than DOUBLE the fully-dense block4 case's ~0.93ms
+      (82944 synapses, 84.9M multiply-adds -- 10x more actual work,
+      less than half the time). Matches this project's own established
+      understanding (see
+      [[project_sili_optimal_hardware_vision]]: "scattered CSR is
+      gather/scatter-bound not SIMD-bound") -- the scalar, strided
+      per-(row,col,batch) access pattern here is the real bottleneck,
+      not allocation, and allocation-tax fixes (which worked great for
+      block4's cheap SIMD-efficient compute) are noise against it. A
+      genuine fix for this path would need something more like block4's
+      own transpose+blocked-accumulate treatment, adapted for arbitrary
+      (non-4-wide-tile) CSR column patterns -- a bigger, more speculative
+      redesign, not attempted here; flagged as a possible future
+      direction, not started.
 - [ ] **Phase 5 -- sisldo_forward.** Different structure (gather-based,
       work-offset table for variable-density CSR batches) -- needs its
       own investigation of whether/how this pattern applies at all before
@@ -370,6 +373,51 @@ range -- do not consider a phase done on PoC evidence alone.
       sisldo_ops.hpp).** Same audit as Phase 6, plus keep in mind the
       heap-corruption bug just fixed there (stale tile position tracking)
       -- any restructuring must not reintroduce that class of bug.
+- [ ] **Phase 7.5 -- scattered-path transpose+blocked-accumulate.**
+      Flagged by the user 2026-09-16, right after Phase 4's negative
+      result: Phase 4's persistent-buffer fix didn't move the scattered
+      (non-block4) path's needle because allocation was never the real
+      bottleneck there -- this path is scalar, strided,
+      gather/scatter-bound (see the scattered-path note at the end of
+      disldo_forward.persistent_scratch_buffers in
+      docs/research/linear_disldo.rst). A genuine fix would need
+      something like block4's own transpose+register-blocked-accumulate
+      treatment (disldo_forward.batch_blocked_threshold), adapted for
+      ARBITRARY (non-4-wide-tile) CSR column patterns -- e.g. transpose
+      input to `[row, batch]` same as block4 does, but the accumulate
+      side can't use a fixed BLOCK4_TILE=4 stride since a CSR row's
+      columns aren't grouped into tiles; would need per-row batch-
+      blocking into a column-indexed (not tile-indexed) accumulator, or
+      some other structure -- not designed yet, just flagged. Explicitly
+      placed HERE (after Phase 7, right before Phase 1.5's Python check)
+      per the user's own instruction: "write that down for a later check
+      to come back to right before the python side checking."
+- [ ] **Phase 1.5 -- check the PYTHON side, not just the C++ real-kernel
+      bench.** Flagged 2026-09-15: all of Phase 1's verification so far
+      (unit tests + `scripts/bench_disldo_forward_kernel.cpp`) is pure
+      C++, but the actual perf-comparison-vs-torch numbers this whole
+      investigation reports to the user live in
+      `scripts/bench_sili_vs_torch_matrix.py`, which goes through the
+      pybind11 bindings (`sili/cpu_backend.cpp` -> `DISLDOLayerV`), not
+      `disldo_forward` directly. Needs checking, not assumed:
+      1. Does `DISLDOLayerV`'s forward binding call `disldo_forward` with
+         the SAME `num_cpus` value the C++ bench used (4, the measured
+         sweet spot on arch-sandbox), or a different default that could
+         land in the num_cpus=5-9 dead zone or below the batch=8
+         threshold for some of the bench matrix's rows?
+      2. Re-run `scripts/bench_sili_vs_torch_matrix.py` on arch-sandbox
+         (before vs after this whole rollout, same worktree-diff
+         technique as the C++ A/Bs) across its existing batch sweep
+         (1/32/64/128/256/512/1024) and confirm the C++-bench wins
+         actually show up end-to-end through Python, not just in the
+         isolated kernel call.
+      3. If it DOESN'T show up proportionally, that's a real finding
+         (Python/pybind overhead dominating, or GIL/dispatch overhead
+         swamping the C++-side win at these batch sizes) worth its own
+         investigation before claiming this rollout "done" end-to-end --
+         the C++ kernel wins are necessary but not sufficient for the
+         thing the user actually cares about (real torch-comparison
+         numbers).
 
 ## Also queued (unrelated to this rollout, don't lose these either)
 

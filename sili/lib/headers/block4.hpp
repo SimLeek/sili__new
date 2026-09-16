@@ -1465,6 +1465,11 @@ struct Block4Store {
     // zeroed per-thread inside the parallel region same as
     // scratch_b4_out.
     std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
     // disldo_forward.column_partitioned_threading: per-thread work-item
     // lists (see Block4WorkItem above) plus the column-block partition
     // boundaries used to build them, reused call to call so no fresh
@@ -2068,6 +2073,11 @@ struct Block4Store8 {
     // zeroed per-thread inside the parallel region same as
     // scratch_b4_out.
     std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
@@ -2824,6 +2834,11 @@ struct Block4Store32 {
     // zeroed per-thread inside the parallel region same as
     // scratch_b4_out.
     std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;

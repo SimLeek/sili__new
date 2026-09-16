@@ -379,6 +379,24 @@ shape, with no live CPU hog found via ``ps aux`` but a nonzero
 idle machine, so the precise ratio there isn't trusted yet even though
 the fix never measured worse.
 
+**Scattered (non-block4) path**: the same persistent-buffer +
+static-per-thread-range-reduction treatment was also ported to the
+``!dc.empty()`` scattered CSR path (which had the SAME two issues in
+their original form -- a fresh ``std::vector`` every call, and a fully
+SERIAL final reduction). Real-kernel A/B (10%-density pure-scattered
+layer, num_cpus=4, n_in=n_out=288): before == after within noise at
+every batch size. A real negative result, not a bug -- this path's
+compute is already the dominant cost, and it's expensive for an
+unrelated, already-understood reason (scalar, strided per-synapse
+access -- confirmed directly: at batch=1024 this layer's 8.25M total
+multiply-adds took ~2.25ms, over double the fully-dense block4 case's
+~0.93ms for 84.9M multiply-adds, 10x more actual work in under half the
+time). Matches this project's established understanding that scattered
+CSR is gather/scatter-bound, not SIMD-bound. Kept anyway (correct,
+harmless); a genuine fix here would need something more like block4's
+own transpose+blocked-accumulate treatment adapted for arbitrary CSR
+column patterns -- a bigger redesign, not attempted.
+
 .. _disldo_forward.hoisted_tile_count:
 
 Hoisting ``tile_br.size()`` -- measured instruction-count win, no

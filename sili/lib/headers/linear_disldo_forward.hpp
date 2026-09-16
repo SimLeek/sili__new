@@ -59,12 +59,20 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // hold live synapses. See disldo_forward.dc_empty_check in
     // docs/research/linear_disldo.rst.
     if (!dc.empty()) {
-        std::vector<value_type> t_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
+        // Same persistent-scratch + static-per-thread-range reduction
+        // already proven for the block4 paths -- see
+        // disldo_forward.persistent_scratch_buffers in
+        // docs/research/linear_disldo.rst (measured NOT to matter here,
+        // see the scattered-path note at the end of that section --
+        // kept anyway since it's correct and harmless).
+        std::vector<value_type>& t_out = weights.block4.scratch_scattered_out;
+        t_out.resize(static_cast<std::size_t>(num_cpus) * ost);
 
 #pragma omp parallel num_threads(num_cpus)
         {
             const int tid = omp_get_thread_num();
             value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
+            std::fill(mo, mo + ost, value_type(0));
 
 #pragma omp for schedule(static)
             for (std::size_t r = 0; r < n_in; ++r) {
@@ -98,12 +106,25 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                     }
                 }
             }
-        }
-
-        for (int t = 0; t < num_cpus; ++t) {
-            const value_type* s = t_out.data() + static_cast<std::size_t>(t) * ost;
-            for (std::size_t i = 0; i < ost; ++i)
-                output[i] += s[i];
+            // Parallel tree reduction + flush, static per-thread index
+            // range, one barrier (implicit, end of the `#pragma omp for`
+            // above) -- see disldo_forward.narrow_path_barrier_reduction
+            // in docs/research/linear_disldo.rst for why this needs no
+            // further barriers.
+            const std::size_t i_lo =
+                (static_cast<std::size_t>(tid) * ost) / static_cast<std::size_t>(num_cpus);
+            const std::size_t i_hi =
+                (static_cast<std::size_t>(tid + 1) * ost) / static_cast<std::size_t>(num_cpus);
+            for (int stride = 1; stride < num_cpus; stride *= 2) {
+                const int step = stride * 2;
+                for (std::size_t i = i_lo; i < i_hi; ++i) {
+                    for (int base = 0; base + stride < num_cpus; base += step)
+                        t_out[static_cast<std::size_t>(base) * ost + i] +=
+                            t_out[static_cast<std::size_t>(base + stride) * ost + i];
+                }
+            }
+            for (std::size_t i = i_lo; i < i_hi; ++i)
+                output[i] += t_out[i];
         }
     } // !dc.empty()
 
@@ -113,13 +134,10 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // lets this SIMD where the scattered loop above can't. See
     // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
-        // Two threading strategies, chosen per call by layer width
-        // relative to num_cpus -- see
+        // Two threading strategies chosen by layer width -- see
         // disldo_forward.column_partitioned_threading and
         // disldo_forward.narrow_layer_tree_reduction in
-        // docs/research/linear_disldo.rst for why one scheme alone
-        // isn't enough (each regresses badly for the shape the other
-        // handles).
+        // docs/research/linear_disldo.rst.
         const auto& BL4 = weights.block4.block_layout;
         const std::size_t n_bc_total = BL4.cols;
 
