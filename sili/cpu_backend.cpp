@@ -10,6 +10,11 @@
 
 #include "linear_sisldo.hpp"
 #include "linear_disldo.hpp"
+#include "engine_select.hpp"
+#ifdef SILI_HAVE_MKL
+#include "linear_didldo.hpp"
+#include "linear_sidldo.hpp"
+#endif
 #include "csr.hpp"
 #include "loss.hpp"
 #include "hoyer_sparsify.hpp"
@@ -1257,12 +1262,63 @@ using SparseLinearLayerResyncDeterministic =
 using SparseLinearLayerNoScaleDeterministic =
     SparseLinearLayerImpl<NoScalePolicy<float>, false, false>;
 
+// ── dense<->CSR helpers for real-time engine dispatch ────────────────────────
+// See sili/lib/headers/engine_select.hpp for the actual decision rules
+// this supports. Internal C++ versions of the same logic the module-
+// level `dense_to_csr` python function already exposes (kept separate
+// since that one's a pybind lambda, not callable from inside another
+// C++ method) -- same |v|>threshold convention for what counts as
+// "nonzero", so density counted here matches what a caller would get
+// calling dense_to_csr themselves.
+inline float _measure_density(const float* x, std::size_t n, float threshold = 1e-4f) {
+    if (n == 0)
+        return 0.0f;
+    std::size_t nz = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        if (x[i] > threshold || x[i] < -threshold)
+            ++nz;
+    return float(nz) / float(n);
+}
+
+inline void _dense_to_csr(const float* x, int batch, int cols, std::vector<int>& ptrs,
+                          std::vector<int>& indices, std::vector<float>& values,
+                          float threshold = 1e-4f) {
+    ptrs.assign(std::size_t(batch) + 1, 0);
+    indices.clear();
+    values.clear();
+    for (int b = 0; b < batch; ++b) {
+        ptrs[std::size_t(b)] = int(indices.size());
+        for (int c = 0; c < cols; ++c) {
+            const float v = x[std::size_t(b) * cols + c];
+            if (v > threshold || v < -threshold) {
+                indices.push_back(c);
+                values.push_back(v);
+            }
+        }
+    }
+    ptrs[std::size_t(batch)] = int(indices.size());
+}
+
+inline void _csr_to_dense(const int* ptrs, const int* indices, const float* values, int batch,
+                          int cols, std::vector<float>& out) {
+    out.assign(std::size_t(batch) * cols, 0.0f);
+    for (int b = 0; b < batch; ++b)
+        for (int i = ptrs[b]; i < ptrs[b + 1]; ++i)
+            out[std::size_t(b) * cols + std::size_t(indices[i])] = values[i];
+}
+
 // ── DISLDOLayerV ──────────────────────────────────────────────────────────────
 // Same rewrite as SparseLinearLayer, VALUES_TYPE=DeltaCSRBiValues<float> instead of
 // FP4BiPacked — the exact same disldo_forward/backward/build_probes/
 // synap_row_step functions, generic via ValueAccessor, no separate
 // implementation needed. This is the concrete realization of "run_tests_4_bit
 // and run_tests_32_bit should use the same functions" (see conversation).
+//
+// forward()/backward() are real-time engine dispatchers (DISLDO<->SISLDO,
+// see engine_select.hpp); forward_dense/forward_sparse/backward_dense/
+// backward_sparse remain as explicit, no-decision-making calls. See
+// docs/research/sparse_rnn.rst:sparse_rnn.engine_select_two_groups for
+// the full two-group architecture this is one half of.
 
 class DISLDOLayerV {
   public:
@@ -1345,7 +1401,9 @@ class DISLDOLayerV {
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
     // explicit backward argument now instead of an engine-side cache.
-    py::array_t<V> forward(py::array_t<V> x) {
+    // Renamed from forward -- explicit, no-decision-making dense call.
+    // See forward() below for the real-time-dispatching entry point.
+    py::array_t<V> forward_dense(py::array_t<V> x) {
         auto xbuf = x.request();
         _last_batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         _last_cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
@@ -1365,13 +1423,15 @@ class DISLDOLayerV {
     // See SparseLinearLayerImpl::backward_dense's identical comment on
     // min_decay_frac/max_abs_delta/max_ci (kSynapsePolicy* constants above)
     // and on why `x` is now an explicit argument.
-    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
-                            V beta2 = 0.999f, V eps = 1e-8f,
-                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                            V max_ci = kSynapsePolicyMaxCi,
-                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+    // Renamed from backward -- explicit, no-decision-making dense-dy call.
+    // See backward() below for the real-time-dispatching entry point.
+    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                                  bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                                  V beta2 = 0.999f, V eps = 1e-8f,
+                                  V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                                  V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                                  V max_ci = kSynapsePolicyMaxCi,
+                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto dybuf = dy.request();
@@ -1445,6 +1505,107 @@ class DISLDOLayerV {
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // ── real-time engine dispatch
+    // ─────────────────────────────────────────────────────────────────────────
+    // forward()/backward(): the actual entry points -- pick disldo vs
+    // sisldo per call using group_a_forward_use_sisldo/
+    // group_a_backward_use_sisldo (engine_select.hpp), which give
+    // identical results either way, only speed differs. Two overloads
+    // each (dense array in, or already-CSR in) so callers can hand over
+    // whichever form their data is already in without a needless
+    // round-trip; pybind resolves which one runs from the Python-side
+    // argument types. forward_dense/forward_sparse/backward_dense/
+    // backward_sparse above remain the explicit, no-decision-making
+    // calls for anyone who wants to force one.
+    py::array_t<V> forward(py::array_t<V> x) {
+        auto xbuf = x.request();
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        const float density = _measure_density((const float*)xbuf.ptr, std::size_t(batch) * cols);
+        if (group_a_forward_use_sisldo(batch, density)) {
+            std::vector<int> ptrs, idx;
+            std::vector<float> vals;
+            _dense_to_csr((const float*)xbuf.ptr, batch, cols, ptrs, idx, vals);
+            py::array_t<S> p({(py::ssize_t)ptrs.size()});
+            py::array_t<S> i({(py::ssize_t)idx.size()});
+            py::array_t<V> v({(py::ssize_t)vals.size()});
+            std::copy(ptrs.begin(), ptrs.end(), (S*)p.request().ptr);
+            std::copy(idx.begin(), idx.end(), (S*)i.request().ptr);
+            std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
+            return forward_sparse(p, i, v, batch);
+        }
+        return forward_dense(x);
+    }
+
+    py::array_t<V> forward(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
+                           S batch) {
+        auto ib = indices.request();
+        const float density = float(ib.size) / float(std::size_t(batch) * n_inputs());
+        if (group_a_forward_use_sisldo(batch, density))
+            return forward_sparse(ptrs, indices, values, batch);
+        auto pb = ptrs.request(), vb = values.request();
+        std::vector<float> dense;
+        _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_inputs(),
+                      dense);
+        py::array_t<V> x({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dense.begin(), dense.end(), (V*)x.request().ptr);
+        return forward_dense(x);
+    }
+
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f,
+                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                            V max_ci = kSynapsePolicyMaxCi,
+                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+        auto xbuf = x.request();
+        auto dybuf = dy.request();
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const float density =
+            _measure_density((const float*)dybuf.ptr, std::size_t(batch) * n_outputs());
+        if (group_a_backward_use_sisldo(batch, density)) {
+            std::vector<int> ptrs, idx;
+            std::vector<float> vals;
+            _dense_to_csr((const float*)dybuf.ptr, batch, n_outputs(), ptrs, idx, vals);
+            py::array_t<S> p({(py::ssize_t)ptrs.size()});
+            py::array_t<S> i({(py::ssize_t)idx.size()});
+            py::array_t<V> v({(py::ssize_t)vals.size()});
+            std::copy(ptrs.begin(), ptrs.end(), (S*)p.request().ptr);
+            std::copy(idx.begin(), idx.end(), (S*)i.request().ptr);
+            std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
+            return backward_sparse(x, p, i, v, batch, learning_rate, lr_per_row_nnz,
+                                   damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta,
+                                   max_ci, scale_invariant);
+        }
+        return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+    }
+
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
+                            py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f,
+                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
+                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+                            V max_ci = kSynapsePolicyMaxCi,
+                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+        auto ib = dy_indices.request();
+        const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
+        if (group_a_backward_use_sisldo(batch, density))
+            return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
+                                   lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
+                                   max_abs_delta, max_ci, scale_invariant);
+        auto pb = dy_ptrs.request(), vb = dy_values.request();
+        std::vector<float> dense;
+        _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_outputs(),
+                      dense);
+        py::array_t<V> dy({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(dense.begin(), dense.end(), (V*)dy.request().ptr);
+        return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
     }
 
     // Amortized decoupled L2 decay + stats -- see member state's own
@@ -1612,6 +1773,172 @@ class DISLDOLayerV {
     std::size_t get_scale_rank_max() const { return weights.get_scale_rank_max(); }
     void set_scale_rank_max(std::size_t new_max) { weights.set_scale_rank_max(new_max); }
 };
+
+#ifdef SILI_HAVE_MKL
+// ── DIDLDOLayerV ─────────────────────────────────────────────────────────────
+// Group B sibling of DISLDOLayerV: DIDLDO<->SIDLDO over DenseLinearWeights
+// (dense storage, see linear_didldo.hpp) instead of sparse/block4 storage.
+// Only exists when the optional mkl/mkl-include pip extra was present at
+// build time (`pip install sili[mkl]`) -- see setup.py's _find_mkl().
+// Much simpler than DISLDOLayerV: no block4/CSR growth, importance,
+// probes, or rank-N-scale machinery, since DenseLinearWeights is just a
+// plain [n_in x n_out] float array + its RMSprop running-average buffer.
+// fp32 only, same reason DIDLDO/SIDLDO are fp32-only at the kernel level
+// (BLAS is inherently single-precision) -- no fp8/fp4 variant of this
+// class exists; see sparse_rnn.py's DIDLDOLayer8/DIDLDOLayer4 stubs for
+// the NotImplementedError callers get if they ask for one, same
+// per-precision-class convention DISLDOLayer32/8/etc. already use.
+class DIDLDOLayerV {
+  public:
+    using S = int;
+    using V = float;
+
+    DenseLinearWeights weights;
+    SidldoForwardScratch fwd_scratch;
+    SidldoBackwardScratch bwd_scratch;
+    int num_cpus;
+
+    DIDLDOLayerV(S n_inputs, S n_outputs, int cpus = 4) : num_cpus(cpus) {
+        weights.resize(std::size_t(n_inputs), std::size_t(n_outputs));
+    }
+
+    S n_inputs() const { return static_cast<S>(weights.n_in); }
+    S n_outputs() const { return static_cast<S>(weights.n_out); }
+
+    py::array_t<V> forward_dense(py::array_t<V> x) {
+        auto xbuf = x.request();
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        std::vector<V> out(std::size_t(batch) * n_outputs());
+        didldo_forward((const V*)xbuf.ptr, weights, out.data(), batch, num_cpus);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(out.begin(), out.end(), result.mutable_data());
+        return result;
+    }
+
+    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate) {
+        auto xbuf = x.request();
+        auto dybuf = dy.request();
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        std::vector<V> dx(std::size_t(batch) * n_inputs());
+        didldo_backward((const V*)xbuf.ptr, (const V*)dybuf.ptr, weights, dx.data(), batch,
+                        num_cpus, learning_rate);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    py::array_t<V> forward_sparse(py::array_t<S> ptrs, py::array_t<S> indices,
+                                  py::array_t<V> values, S batch) {
+        auto pb = ptrs.request(), ib = indices.request(), vb = values.request();
+        std::vector<V> out(std::size_t(batch) * n_outputs());
+        sidldo_forward((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, weights,
+                       fwd_scratch, out.data(), num_cpus);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(out.begin(), out.end(), result.mutable_data());
+        return result;
+    }
+
+    py::array_t<V> backward_sparse(py::array_t<V> x, py::array_t<S> dy_ptrs,
+                                   py::array_t<S> dy_indices, py::array_t<V> dy_values, S batch,
+                                   V learning_rate = 0.01f) {
+        auto xbuf = x.request();
+        auto pb = dy_ptrs.request(), ib = dy_indices.request(), vb = dy_values.request();
+        std::vector<V> dx(std::size_t(batch) * n_inputs());
+        sidldo_backward((const V*)xbuf.ptr, (const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr,
+                        batch, weights, bwd_scratch, dx.data(), learning_rate);
+        py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
+        return result;
+    }
+
+    // ── real-time engine dispatch ───────────────────────────────────────────
+    // See DISLDOLayerV's identical-shaped forward/backward for the full
+    // rationale -- same idea, group_b_forward_use_sidldo/
+    // group_b_backward_use_sidldo (engine_select.hpp) instead of the
+    // group_a_* rules. group_b_backward_use_sidldo is a placeholder
+    // (reuses forward's rule, not independently measured) -- see that
+    // function's own comment.
+    py::array_t<V> forward(py::array_t<V> x) {
+        auto xbuf = x.request();
+        const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
+        const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
+        const float density = _measure_density((const float*)xbuf.ptr, std::size_t(batch) * cols);
+        if (group_b_forward_use_sidldo(batch, density)) {
+            std::vector<int> ptrs, idx;
+            std::vector<float> vals;
+            _dense_to_csr((const float*)xbuf.ptr, batch, cols, ptrs, idx, vals);
+            py::array_t<S> p({(py::ssize_t)ptrs.size()});
+            py::array_t<S> i({(py::ssize_t)idx.size()});
+            py::array_t<V> v({(py::ssize_t)vals.size()});
+            std::copy(ptrs.begin(), ptrs.end(), (S*)p.request().ptr);
+            std::copy(idx.begin(), idx.end(), (S*)i.request().ptr);
+            std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
+            return forward_sparse(p, i, v, batch);
+        }
+        return forward_dense(x);
+    }
+
+    py::array_t<V> forward(py::array_t<S> ptrs, py::array_t<S> indices, py::array_t<V> values,
+                           S batch) {
+        auto ib = indices.request();
+        const float density = float(ib.size) / float(std::size_t(batch) * n_inputs());
+        if (group_b_forward_use_sidldo(batch, density))
+            return forward_sparse(ptrs, indices, values, batch);
+        auto pb = ptrs.request(), vb = values.request();
+        std::vector<float> dense;
+        _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_inputs(),
+                      dense);
+        py::array_t<V> x({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
+        std::copy(dense.begin(), dense.end(), (V*)x.request().ptr);
+        return forward_dense(x);
+    }
+
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate) {
+        auto dybuf = dy.request();
+        const S batch = (dybuf.ndim == 2) ? (S)dybuf.shape[0] : 1;
+        const float density =
+            _measure_density((const float*)dybuf.ptr, std::size_t(batch) * n_outputs());
+        if (group_b_backward_use_sidldo(batch, density)) {
+            std::vector<int> ptrs, idx;
+            std::vector<float> vals;
+            _dense_to_csr((const float*)dybuf.ptr, batch, n_outputs(), ptrs, idx, vals);
+            py::array_t<S> p({(py::ssize_t)ptrs.size()});
+            py::array_t<S> i({(py::ssize_t)idx.size()});
+            py::array_t<V> v({(py::ssize_t)vals.size()});
+            std::copy(ptrs.begin(), ptrs.end(), (S*)p.request().ptr);
+            std::copy(idx.begin(), idx.end(), (S*)i.request().ptr);
+            std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
+            return backward_sparse(x, p, i, v, batch, learning_rate);
+        }
+        return backward_dense(x, dy, learning_rate);
+    }
+
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
+                            py::array_t<V> dy_values, S batch, V learning_rate = 0.01f) {
+        auto ib = dy_indices.request();
+        const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
+        if (group_b_backward_use_sidldo(batch, density))
+            return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate);
+        auto pb = dy_ptrs.request(), vb = dy_values.request();
+        std::vector<float> dense;
+        _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_outputs(),
+                      dense);
+        py::array_t<V> dy({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
+        std::copy(dense.begin(), dense.end(), (V*)dy.request().ptr);
+        return backward_dense(x, dy, learning_rate);
+    }
+
+    py::array_t<V> get_weights_vals() const {
+        py::array_t<V> result({(py::ssize_t)weights.n_in, (py::ssize_t)weights.n_out});
+        std::copy(weights.w.begin(), weights.w.end(), result.mutable_data());
+        return result;
+    }
+    void load_dense_values(py::array_t<V> vals) {
+        auto vb = vals.request();
+        std::copy((const V*)vb.ptr, (const V*)vb.ptr + vb.size, weights.w.begin());
+    }
+};
+#endif // SILI_HAVE_MKL
 
 // ── SparseLinearLayer8 ──────────────────────────────────────────────────────
 // FP8 (OCP MX E4M3, fp8quant.hpp) real quantized storage -- the "alt, not
@@ -3808,8 +4135,8 @@ PYBIND11_MODULE(_cpu, m) {
     py::class_<DISLDOLayerV>(m, "DISLDOLayerV")
         .def(py::init<int, int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
              py::arg("max_weights"), py::arg("num_cpus") = 4)
-        .def("forward", &DISLDOLayerV::forward, py::arg("x"))
-        .def("backward", &DISLDOLayerV::backward, py::arg("x"), py::arg("dy"),
+        .def("forward_dense", &DISLDOLayerV::forward_dense, py::arg("x"))
+        .def("backward_dense", &DISLDOLayerV::backward_dense, py::arg("x"), py::arg("dy"),
              py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
@@ -3821,6 +4148,44 @@ PYBIND11_MODULE(_cpu, m) {
         .def("backward_sparse", &DISLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
              py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
              py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        // Real-time engine dispatch -- picks disldo vs sisldo per call
+        // (engine_select.hpp); identical results either way, only speed
+        // differs. Two overloads each, resolved by pybind from the
+        // Python-side argument types (dense array vs ptrs/indices/values).
+        .def("forward",
+             static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
+                 py::array_t<DISLDOLayerV::V>)>(&DISLDOLayerV::forward),
+             py::arg("x"))
+        .def("forward",
+             static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
+                 py::array_t<DISLDOLayerV::S>, py::array_t<DISLDOLayerV::S>,
+                 py::array_t<DISLDOLayerV::V>, DISLDOLayerV::S)>(&DISLDOLayerV::forward),
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward",
+             static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
+                 py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::V, bool,
+                 bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
+                 DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"),
+             py::arg("lr_per_row_nnz") = false, py::arg("damp_by_importance") = true,
+             py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("backward",
+             static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
+                 py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::S>,
+                 py::array_t<DISLDOLayerV::S>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::S,
+                 DISLDOLayerV::V, bool, bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
+                 DISLDOLayerV::V, DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
@@ -3876,6 +4241,47 @@ PYBIND11_MODULE(_cpu, m) {
         .def_property_readonly("nnz", &DISLDOLayerV::nnz)
         .def_property_readonly("block4",
                                py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
+
+#ifdef SILI_HAVE_MKL
+    // ── DIDLDOLayerV ─────────────────────────────────────────────────────────
+    py::class_<DIDLDOLayerV>(m, "DIDLDOLayerV")
+        .def(py::init<int, int, int>(), py::arg("n_inputs"), py::arg("n_outputs"),
+             py::arg("num_cpus") = 4)
+        .def("forward_dense", &DIDLDOLayerV::forward_dense, py::arg("x"))
+        .def("backward_dense", &DIDLDOLayerV::backward_dense, py::arg("x"), py::arg("dy"),
+             py::arg("learning_rate"))
+        .def("forward_sparse", &DIDLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
+             py::arg("values"), py::arg("batch"))
+        .def("backward_sparse", &DIDLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
+             py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
+             py::arg("learning_rate") = 0.01f)
+        .def("forward",
+             static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
+                 py::array_t<DIDLDOLayerV::V>)>(&DIDLDOLayerV::forward),
+             py::arg("x"))
+        .def("forward",
+             static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
+                 py::array_t<DIDLDOLayerV::S>, py::array_t<DIDLDOLayerV::S>,
+                 py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::S)>(&DIDLDOLayerV::forward),
+             py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
+        .def("backward",
+             static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
+                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::V)>(
+                 &DIDLDOLayerV::backward),
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"))
+        .def("backward",
+             static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
+                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::S>,
+                 py::array_t<DIDLDOLayerV::S>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::S,
+                 DIDLDOLayerV::V)>(&DIDLDOLayerV::backward),
+             py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
+             py::arg("batch"), py::arg("learning_rate") = 0.01f)
+        .def_property_readonly("weights_vals", &DIDLDOLayerV::get_weights_vals)
+        .def("load_dense_values", &DIDLDOLayerV::load_dense_values, py::arg("weight_values"))
+        .def_readonly("num_cpus", &DIDLDOLayerV::num_cpus)
+        .def_property_readonly("n_inputs", &DIDLDOLayerV::n_inputs)
+        .def_property_readonly("n_outputs", &DIDLDOLayerV::n_outputs);
+#endif // SILI_HAVE_MKL
 
     // ── SISLDOLayerV ─────────────────────────────────────────────────────────
     // The class itself predates this pybind registration (source existed,

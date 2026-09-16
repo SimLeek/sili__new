@@ -963,7 +963,14 @@ class DISLDOLayer32(_SparseLayerBase):
     into block4 (not the scattered CSR path `_preseed_dense_scattered`
     used before task #350) -- max_weights is still expanded automatically
     to cover every (input, output) pair. See
-    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history.
+
+    forward()/backward() (via self._c) auto-pick disldo vs sisldo per
+    call based on measured density -- see docs/research/sparse_rnn.rst:
+    sparse_rnn.engine_select_two_groups. If your weights genuinely never
+    need synaptogenesis/pruning (stay fully dense), DIDLDOLayer32 avoids
+    this class's CSR/block4 bookkeeping overhead entirely -- same file,
+    dense weight storage instead."""
 
     def __init__(
         self,
@@ -1008,7 +1015,13 @@ class DISLDOLayer32(_SparseLayerBase):
             csr = x.data
             was_1d = csr.rows == 1
             x_dense = csr.to_dense()
-            out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+            # forward() not forward_sparse(): the CSR overload of the
+            # real-time engine dispatcher (engine_select.hpp) -- even
+            # though the caller handed over CSR data, the underlying
+            # engine may still decide densifying-and-using-disldo is
+            # faster for this call's actual density/batch. Sending
+            # forward_sparse explicitly would force sisldo regardless.
+            out_np = self._c.forward(csr.ptrs, csr.indices, csr.values, csr.rows)
         else:
             x_np = np.asarray(x.data, dtype=np.float32)
             was_1d = x_np.ndim == 1
@@ -1079,6 +1092,123 @@ class DISLDOLayer32(_SparseLayerBase):
 
         out._backward = _bwd
         return out
+
+
+class DIDLDOLayer32(Module):
+    """Group B sibling of DISLDOLayer32: DIDLDO<->SIDLDO over dense
+    weight storage (_cpu.DIDLDOLayerV, linear_didldo.hpp/
+    linear_sidldo.hpp) instead of sparse/block4 storage -- for layers
+    whose weights are genuinely dense (no synaptogenesis/pruning
+    expected), where DISLDO/SISLDO pay real CSR/block4 bookkeeping
+    overhead for no benefit. `forward()`/`backward()` are real-time
+    engine dispatchers (`engine_select.hpp`'s group_b_forward_use_sidldo/
+    group_b_backward_use_sidldo) -- DIDLDO vs SIDLDO per call based on
+    measured density, identical results either way, only speed differs.
+    `forward_dense`/`forward_sparse`/`backward_dense`/`backward_sparse`
+    remain on `self._c` directly for an explicit, no-decision-making call.
+
+    No block4/CSR growth, importance, probes, or rank-N-scale machinery
+    here -- DenseLinearWeights is just a plain [n_in x n_out] float array
+    plus its own RMSprop running-average buffer, nothing to grow into.
+    fp32 only (BLAS is inherently single-precision); see DIDLDOLayer8/
+    DIDLDOLayer4 below for the not-yet-implemented fp8/fp4 siblings,
+    same per-precision-class convention DISLDOLayer32/8/etc. already use."""
+
+    def parameters(self) -> list:
+        return []
+
+    @property
+    def in_features(self) -> int:
+        return self._c.n_inputs
+
+    @property
+    def out_features(self) -> int:
+        return self._c.n_outputs
+
+    @property
+    def num_cpus(self) -> int:
+        return self._c.num_cpus
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self._c.weights_vals
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+    ):
+        self._c = _cpu.DIDLDOLayerV(in_features, out_features, num_cpus)
+        # Same fan-in-normalized Gaussian init as _preseed_dense_fp32
+        # (DISLDOLayerV's own dense-init helper) -- no output_scale
+        # correction needed here either, same reasoning: nothing to
+        # correct a quantization floor for at fp32.
+        if rng is None:
+            rng = np.random.default_rng()
+        scale = 1.0 / np.sqrt(max(1, in_features))
+        w = (rng.standard_normal((in_features, out_features)).astype(np.float32) * scale).flatten()
+        self._c.load_dense_values(w)
+
+    def forward(self, x, learning_rate: float = 0.0, requires_grad: bool = True) -> Tensor:
+        if not isinstance(x, Tensor):
+            x = Tensor(np.asarray(x, dtype=np.float32))
+        if x.is_csr:
+            csr = x.data
+            was_1d = csr.rows == 1
+            x_dense = csr.to_dense()
+            # forward(), not forward_sparse() -- see DISLDOLayer32's
+            # identical comment on its own CSR branch.
+            out_np = self._c.forward(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np = np.asarray(x.data, dtype=np.float32)
+            was_1d = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np = self._c.forward(x_np)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        if not requires_grad:
+            return Tensor(out_np, backend=x.backend)
+        out = Tensor(out_np, _children=(x,), _op="didldo32", backend=x.backend)
+
+        def _bwd():
+            if out.grad is not None:
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                dx = self._c.backward(x_dense, dy2d, learning_rate)
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
+
+        out._backward = _bwd
+        return out
+
+
+class DIDLDOLayer8(Module):
+    """Not implemented yet. DIDLDO/SIDLDO kernels are fp32-only at the
+    C++ level (BLAS is inherently single-precision) -- there is no fp8
+    variant of linear_didldo.hpp/linear_sidldo.hpp to wrap, unlike
+    DISLDOLayer8's real SparseLinearLayer8 backing. Raises immediately on
+    construction, matching this file's per-precision-class convention
+    (DISLDOLayer32/DISLDOLayer8/etc.) rather than silently behaving like
+    DIDLDOLayer32 or failing confusingly later inside a training loop."""
+
+    def __init__(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "DIDLDOLayer8 does not exist -- DIDLDO/SIDLDO kernels are fp32-only "
+            "(BLAS is inherently single-precision). Use DIDLDOLayer32."
+        )
+
+
+class DIDLDOLayer4(Module):
+    """Not implemented yet -- see DIDLDOLayer8's docstring, same reason."""
+
+    def __init__(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "DIDLDOLayer4 does not exist -- DIDLDO/SIDLDO kernels are fp32-only "
+            "(BLAS is inherently single-precision). Use DIDLDOLayer32."
+        )
 
 
 class DISLDOLayer8(_SparseLayerBase):

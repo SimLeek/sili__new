@@ -1268,3 +1268,138 @@ range -- do not consider a phase done on PoC evidence alone.
   errors rather than silently doing the wrong thing (both engines are
   fp32-only; this is a binding-layer concern, not resolved until
   bindings themselves are built).
+
+  **Next arc (2026-09-16), user's own framing -- 3 pieces, not 1:**
+
+  1. **Python layer type for Group B.** Mirrors `DISLDOLayerV`'s own
+     established shape exactly (confirmed by reading its real pybind
+     bindings in `cpu_backend.cpp`, not assumed): ONE class exposing
+     `.forward(x)`/`.backward(x, dy, lr, ...)` (dense IO -> DIDLDO) and
+     `.forward_sparse(ptrs, indices, values, batch)`/`.backward_sparse(
+     x, dy_ptrs, dy_indices, dy_values, batch, lr, ...)` (sparse IO ->
+     SIDLDO) on the SAME underlying weight storage -- `DISLDOLayerV`'s
+     `backward_sparse` is literally `disldo_backward_sparse_grad`
+     (dense x, sparse dy), the identical shape SIDLDO backward already
+     uses here. Proposed name: `DIDLDOLayerV` (same naming precedent --
+     named after the dense-IO member of its pair). Much simpler than
+     `DISLDOLayerV`: no block4/CSR growth, importance, probes, or
+     rank-N-scale machinery, since `DenseLinearWeights` has none of
+     that -- just a constructor, forward/backward x2, and basic
+     weight load/read accessors. fp8/fp4 raise NotImplementedError
+     here (both engines are fp32-only; see above).
+
+  2. **Two REAL-TIME engines** (per-call dispatch, no relayout --
+     each pair already shares one weight storage):
+     - Engine A: DISLDO <-> SISLDO. Real bench data already exists
+       (Block4 Bench, 336 cells across n/syn/density/batch/op).
+     - Engine B: DIDLDO <-> SIDLDO. Only scattered bench points exist
+       so far (this investigation's own probes) -- needs a systematic
+       density x batch sweep matching Group A's existing grid before a
+       real decision rule can be fit, not guessed.
+
+  3. **One DESIGN-TIME recommender**: which GROUP (A, sparse/block4
+     storage, vs B, dense storage) to build a layer as in the first
+     place -- a coarser, one-time choice, since crossing groups means an
+     actual weight relayout (expensive, not a per-call decision). This
+     needs a real "rule of thumb" derived from data (expected/typical
+     weight density and its trajectory under synaptogenesis/pruning is
+     the likely deciding factor, not confirmed yet), and -- user's
+     explicit requirement -- that rule of thumb must be documented
+     prominently at EVERY level: C++ header comments, `docs/research/
+     *.rst`, and Python docstrings/API docs, not buried in just one of
+     them.
+
+  Sequencing: user listed Python bindings first; it's also the only
+  piece with no data dependency on the others (engines/recommender both
+  need real bench data first, bindings don't -- `DISLDOLayerV` itself
+  exposes both engines raw with no automatic picker, callers choose
+  explicitly, matching how `bench_sili_vs_torch_matrix.py` already
+  calls `.forward()` vs `.forward_sparse()` itself). Starting there.
+
+  **All 3 pieces landed together (2026-09-16)** -- mid-build, user asked
+  for `forward_dense`/`forward_sparse`/`forward` (and the same for
+  backward) on BOTH `DISLDOLayerV` and `DIDLDOLayerV`, with `forward`/
+  `backward` being the actual real-time dispatchers -- a bigger, more
+  useful shape than the original plan, built as directed:
+
+  - `sili/lib/headers/engine_select.hpp`: the four real, data-backed
+    dispatch rules (`group_a_forward_use_sisldo`,
+    `group_a_backward_use_sisldo`, `group_b_forward_use_sidldo`,
+    `group_b_backward_use_sidldo`), derived from the actual Block4 Bench
+    dataset (Group A, 336 cells, near-100% agreement across 4 width/
+    synapse combos) and a dedicated DIDLDO-vs-SIDLDO A/B (Group B, one
+    width tested). Documented limitations inline, not smoothed over:
+    Group A backward's density>=0.05 branch only agreed 3/4 of the time
+    (one width/synapse combo consistently disagreed); Group B backward
+    has NOT been independently measured at all and reuses forward's rule
+    as an explicit placeholder.
+  - `sili/cpu_backend.cpp`: `DISLDOLayerV`'s old `forward`/`backward`
+    renamed to `forward_dense`/`backward_dense` (explicit, no-decision
+    calls); new `forward`/`backward` are real-time dispatchers, each with
+    TWO pybind-resolved overloads (dense array in, or already-CSR in) so
+    a caller never pays a needless format round-trip. Real bug found and
+    fixed along the way: `<mkl.h>`'s sparse-matrix-checker sub-header
+    declares its own global `sparse_struct`, colliding with this
+    codebase's own `sparse_struct` TEMPLATE (`delta_csr_types.hpp`, used
+    throughout -- CSRSynapses/COOSynapses/CSRInput are all built from
+    it) -- fixed by including only the narrower `mkl_cblas.h`+
+    `mkl_vml_functions.h` in `linear_didldo.hpp` instead of the `<mkl.h>`
+    umbrella, neither of which pulls in the sparse-checker API at all.
+    New `DIDLDOLayerV` class mirrors `DISLDOLayerV`'s exact shape
+    (forward_dense/forward_sparse/backward_dense/backward_sparse/
+    forward/backward), guarded by `#ifdef SILI_HAVE_MKL` throughout.
+  - `sili/sparse_rnn.py`: new `DIDLDOLayer32` (autograd-integrated
+    wrapper, same `Tensor`/`_children`/`_backward` shape as
+    `DISLDOLayer32`, no growth/importance/rank-scale machinery since
+    `DenseLinearWeights` has none of that) plus `DIDLDOLayer8`/
+    `DIDLDOLayer4` stub classes that raise `NotImplementedError`
+    immediately on construction (per the explicit fp8/fp4 direction).
+    `DISLDOLayer32.forward()`'s CSR-input branch changed from calling
+    `forward_sparse` explicitly to calling the smart `forward()`
+    overload instead -- per the user's "just send a csr or tensor...
+    have it use the optimal kernel automatically" framing, even a
+    caller who already has CSR data can still get routed to disldo
+    internally if that's actually faster for the call's real density/
+    batch. The other 2 explicit `backward_sparse` call sites
+    (`dy_r_target`/`dy_sparsity_p`-triggered deliberate gradient
+    sparsification) were deliberately LEFT AS explicit calls -- those
+    exist to enforce a specific sparsity pattern for reasons beyond
+    speed, and letting the auto-dispatcher silently convert back to
+    dense would defeat that.
+  - `docs/research/sparse_rnn.rst` (new section
+    `sparse_rnn.engine_select_two_groups`), `DISLDOLayerV`'s C++ class
+    comment, and `DISLDOLayer32`'s python docstring all updated with the
+    two-group architecture and pointers to the real rules -- the
+    "documented at every level" requirement.
+  - `tests/unit/python/test_group_b_engine_select.py` (new, 15 tests,
+    skipped gracefully via `hasattr(_cpu, "DIDLDOLayerV")` when the mkl
+    extra wasn't present at build time): `DIDLDOLayerV`'s four explicit
+    calls against independent numpy references, the real-time dispatcher
+    matching the explicit calls exactly on both forward and backward
+    (dense and CSR input), output-not-aliased (the SAME class of bug
+    `test_forward_output_not_aliased.py` found for `SparseLinearLayer`/
+    `DISLDOLayerV` previously), `DISLDOLayerV`'s retrofit giving
+    bit-identical results to its old behavior (regression guard), the
+    fp8/fp4 stubs raising, and a full `DIDLDOLayer32` forward+backward
+    pass through real `Tensor` autograd (`x.grad` populated, weights
+    updated).
+
+  Verified thoroughly before calling this done: full local pip-based
+  build (`setup.py build_ext --inplace`) with the mkl extra, C++
+  syntax-check AND a real link (not just syntax) on arch-sandbox too,
+  the new test file passing (15/15), and the FULL existing
+  `tests/unit/python` suite re-run after the `DISLDOLayerV` retrofit
+  specifically to make sure nothing else broke (186 passed, 4 skipped,
+  same as before this change -- `DISLDOLayerV` is widely used elsewhere
+  in this codebase, this was the highest-risk piece). Full local `ctest`
+  also re-run, same 5 pre-existing failures, nothing new.
+
+  **Not done**: the design-time Group-A-vs-Group-B recommender (still
+  needs the "rule of thumb" itself derived, not just documented as
+  missing); the fuller multi-dimensional engine-selection surface both
+  real-time dispatchers are coarse stand-ins for; Group B backward's own
+  A/B (flagged above); threading any of this into `sili_peridot` (raised
+  mid-build -- not automatic, peridot depends on this package separately
+  and would need its own code changes to actually adopt `DIDLDOLayerV`
+  for its dense layers, plus its own before/after benchmark on peridot's
+  real shapes rather than assuming these numbers transfer directly).

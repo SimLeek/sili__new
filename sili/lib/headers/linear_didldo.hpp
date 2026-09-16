@@ -1,6 +1,11 @@
 #pragma once
 #ifdef SILI_HAVE_MKL
-#include <mkl.h>
+// NOT <mkl.h> -- its sparse-matrix-checker sub-header declares its own
+// global `sparse_struct`, colliding with this codebase's own
+// sparse_struct TEMPLATE (delta_csr_types.hpp). Only cblas+VML used
+// here; neither narrower header pulls in the sparse-checker API.
+#include <mkl_cblas.h>
+#include <mkl_vml_functions.h>
 #endif
 #include <cmath>
 #include <cstddef>

@@ -963,3 +963,61 @@ connectivity almost immediately rather than growing gradually. ``k=4``
 (default) or smaller is far more sane for continuous per-step growth; only
 raise this if you've checked the resulting per-step ``nnz`` growth against
 your actual ``max_weights`` budget and step rate.
+
+.. _sparse_rnn.engine_select_two_groups:
+
+Two engine groups, real-time dispatch, and the design-time choice still to make
+------------------------------------------------------------------------------------------
+
+*ID:* ``sparse_rnn.engine_select_two_groups``
+
+Every ``*LayerV`` class belongs to one of two storage GROUPS, and this
+matters for which layer type to reach for:
+
+- **Group A** (``DISLDOLayerV``, ``SISLDOLayerV``): sparse/block4 weight
+  storage (``SparseLinearWeightsDelta``, ``sili/lib/headers/block4.hpp``).
+  Built for weights that genuinely change shape over training --
+  synaptogenesis and pruning both assume this storage.
+- **Group B** (``DIDLDOLayerV``): plain dense weight storage
+  (``DenseLinearWeights``, ``sili/lib/headers/linear_didldo.hpp``). Built
+  for weights that stay fully dense -- no synaptogenesis/pruning support
+  at all, by design; Group A pays real CSR/block4 bookkeeping overhead
+  for weights that never actually use it, which is exactly the case
+  ``sili_peridot``'s current dense layers are in.
+
+**Within a group, engine choice is a real-time, per-call, zero-cost
+decision** -- both members of a pair share the SAME weight storage, so
+switching costs nothing but a runtime branch (``sili/lib/headers/
+engine_select.hpp``, ``group_a_forward_use_sisldo`` /
+``group_a_backward_use_sisldo`` / ``group_b_forward_use_sidldo`` /
+``group_b_backward_use_sidldo``). This is what ``DISLDOLayerV.forward()``/
+``.backward()`` and ``DIDLDOLayerV.forward()``/``.backward()`` actually
+call -- ``forward_dense``/``forward_sparse``/``backward_dense``/
+``backward_sparse`` remain on both classes as the explicit, no-decision
+escape hatch. The rules themselves are coarse first cuts, not a full
+surface fit (that's separate, larger future work -- see below):
+
+- Group A forward: ``batch == 1`` always picks sisldo, regardless of
+  density; otherwise ``density < 0.05`` picks sisldo, else disldo. 100%
+  agreement across 4 width/synapse-density combinations in the Block4
+  Bench dataset (336 cells) at every tested point but one.
+- Group A backward: same shape, but the ``density >= 0.05`` branch only
+  agreed 3/4 of the time in that same dataset (one width/synapse combo
+  consistently preferred sisldo there too) -- a real, unresolved gap,
+  not smoothed over.
+- Group B forward: two-tier threshold (0.1 at ``batch <= 1``, 0.02
+  otherwise) from a dedicated DIDLDO-vs-SIDLDO A/B, ONE width tested
+  (n=288), 100% agreement at every point tested there.
+- Group B backward: **not independently measured** -- reuses forward's
+  rule as an unvalidated placeholder. Do not trust this branch without
+  running the actual A/B first.
+
+**Crossing groups is NOT a real-time decision** -- it means an actual
+weight-storage relayout (sparse/block4 <-> dense), real work, not
+something to do per-call. No automatic recommender for this exists yet;
+picking Group A vs Group B is a manual, design-time choice today
+(expected weight density and whether synaptogenesis/pruning will ever
+run against this layer are the likely deciding factors, not yet
+formalized). A real recommender, and the fuller multi-dimensional
+surface the coarse rules above are standing in for, are both scoped as
+separate future work in ``TODO_BATCH_BLOCKING.md`` ("Also queued").
