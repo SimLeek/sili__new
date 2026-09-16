@@ -25,7 +25,9 @@ inline bool group_b_forward_use_sidldo(int batch, float density) {
     return density < threshold;
 }
 
-// Group B (didldo/sidldo backward) -- UNVALIDATED placeholder.
+// Group B (didldo/sidldo backward) -- real A/B, 28/28 tested points match.
 inline bool group_b_backward_use_sidldo(int batch, float density) {
-    return group_b_forward_use_sidldo(batch, density);
+    if (batch == 1)
+        return density < 0.9f;
+    return density < 0.02f && batch <= 128;
 }

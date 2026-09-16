@@ -1008,9 +1008,18 @@ surface fit (that's separate, larger future work -- see below):
 - Group B forward: two-tier threshold (0.1 at ``batch <= 1``, 0.02
   otherwise) from a dedicated DIDLDO-vs-SIDLDO A/B, ONE width tested
   (n=288), 100% agreement at every point tested there.
-- Group B backward: **not independently measured** -- reuses forward's
-  rule as an unvalidated placeholder. Do not trust this branch without
-  running the actual A/B first.
+- Group B backward: **independently measured (2026-09-16)**, real A/B,
+  n=288, 4 densities x 7 batches, 28/28 tested points match the rule:
+  ``batch == 1`` picks sidldo unless density is near-full (``< 0.9``);
+  ``batch > 1`` only picks sidldo at low density AND modest batch
+  together (``density < 0.02 AND batch <= 128``) -- once the batch grows
+  past that even at low density, didldo wins, matching
+  ``sidldo_backward``'s own documented high-batch weakness at high
+  density/width (``TODO_BATCH_BLOCKING.md``, the row-major-gather fix
+  section) showing up here too, just gated by batch instead of width.
+  Replaced the earlier placeholder (reused forward's rule), which was
+  independently confirmed wrong on 2 of these 28 points once real data
+  existed.
 
 **Crossing groups is NOT a real-time decision** -- it means an actual
 weight-storage relayout (sparse/block4 <-> dense), real work, not

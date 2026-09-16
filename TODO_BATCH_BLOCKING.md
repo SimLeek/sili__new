@@ -1394,12 +1394,55 @@ range -- do not consider a phase done on PoC evidence alone.
   in this codebase, this was the highest-risk piece). Full local `ctest`
   also re-run, same 5 pre-existing failures, nothing new.
 
+  **Group B backward A/B (2026-09-16, done)**: real data, n=288, 4
+  densities x 7 batches (`/tmp/bench_groupb_backward_crossover.cpp` on
+  arch-sandbox, didldo_backward vs sidldo_backward, both bwdX lr=1e-3).
+  Replaced `group_b_backward_use_sidldo`'s placeholder (which just reused
+  forward's rule -- confirmed wrong on 2/28 real points) with the actual
+  derived rule: `batch==1` picks sidldo unless density is near-full
+  (`< 0.9`); `batch > 1` only picks sidldo at low density AND modest
+  batch together (`density < 0.02 && batch <= 128`) -- past that even at
+  low density didldo wins, matching sidldo_backward's own documented
+  high-batch/high-width weakness (the row-major-gather fix section
+  above) showing up here too, gated by batch instead of width. 28/28
+  tested points match. `engine_select.hpp` and
+  docs/research/sparse_rnn.rst updated; full local pytest (186/4) and
+  arch-sandbox ctest re-run clean, nothing new broken.
+
+  **sili_peridot integration -- narrower than first assumed.**
+  `sili_peridot` does NOT use `DISLDOLayerV`/`DIDLDOLayerV` for its FP4
+  production model (MiniCPM5 conversion, `model/sili_model.py` +
+  `sili_block.py`) -- that path uses a completely separate, hand-written,
+  hardcoded-FP4 class (`SparseLinearLayerImpl<ScalePolicy,...>`, typedef
+  `SparseLinearLayer`) that shares the underlying `disldo_forward`/
+  `sisldo_forward` free functions but has no engine-select dispatch and
+  no dense-weight-storage option at all -- Group B (DIDLDO, fp32-only)
+  can't drop in there without an 8x memory blowup, and the real lever
+  (an FP4/FP8 dense-weight kernel) doesn't exist yet. Separate future
+  work if that path ever needs it.
+
+  The ACTUAL current target, per the user (2026-09-16): peridot's fp32
+  tiled-transformer MQAR-curriculum models
+  (`scripts/train_mqar_curriculum.py fp32 ...` ->
+  `model/toy_tile_recurrence_rmt.py`'s `ToyTileRecurrenceRMT`, built
+  generically over `disldo_cls`). `PRECISION_CLS["fp32"] = DISLDOLayer32`
+  -- and `DISLDOLayer32.forward()`/`.backward()` (sili/sparse_rnn.py)
+  already call `self._c.forward(...)`/`self._c.backward(...)`, the smart
+  Group A dispatcher, for both the plain dense-array path and the CSR
+  path. Confirmed peridot's `.venv_peridot` is an editable install
+  pointing straight at this checkout (`sili.__file__` resolves into
+  `sili__new/sili/`), so this branch's Group A speedup lands there with
+  ZERO peridot-side code changes once the extension is rebuilt --
+  already true today (confirmed `_cpu.DIDLDOLayerV` exists in that venv,
+  built from this branch's HEAD). No peridot code change needed for this
+  target; next step is measuring real before/after on peridot's own
+  MQAR shapes (see below), not more wiring.
+
   **Not done**: the design-time Group-A-vs-Group-B recommender (still
   needs the "rule of thumb" itself derived, not just documented as
   missing); the fuller multi-dimensional engine-selection surface both
-  real-time dispatchers are coarse stand-ins for; Group B backward's own
-  A/B (flagged above); threading any of this into `sili_peridot` (raised
-  mid-build -- not automatic, peridot depends on this package separately
-  and would need its own code changes to actually adopt `DIDLDOLayerV`
-  for its dense layers, plus its own before/after benchmark on peridot's
-  real shapes rather than assuming these numbers transfer directly).
+  real-time dispatchers are coarse stand-ins for; the FP4/FP8 dense-
+  weight kernel peridot's actual MiniCPM5 FP4 path would need (separate,
+  unscoped, bigger effort -- flagged, not started); a real peridot
+  MQAR before/after speed measurement (merge-base vs current HEAD,
+  in progress).
