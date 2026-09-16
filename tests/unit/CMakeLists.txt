@@ -249,18 +249,21 @@ foreach(t ${SILI_STANDALONE_TESTS})
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
-# test_didldo_kernel needs MKL's headers/direct-linked GNU-threading-layer
-# libs (not just OpenMP::OpenMP_CXX like every other test above), so it's
-# kept out of the uniform SILI_STANDALONE_TESTS loop and only built when
-# SILI_MKL_FOUND -- same graceful compile-out setup.py's cpu_ext uses.
+# MKL-dependent tests need its headers/direct-linked GNU-threading-layer
+# libs (not just OpenMP::OpenMP_CXX like every other test above), so
+# they're kept out of the uniform SILI_STANDALONE_TESTS loop and only
+# built when SILI_MKL_FOUND -- same graceful compile-out setup.py uses.
+set(SILI_MKL_TESTS test_didldo_kernel test_sidldo_kernel)
 if(SILI_MKL_FOUND)
-    add_executable(test_didldo_kernel test_didldo_kernel.cpp)
-    target_include_directories(test_didldo_kernel PRIVATE "../../sili/" "../../sili/lib/headers" "../../sili/lib/src" "${SILI_MKL_INCLUDE_DIR}")
-    target_link_directories(test_didldo_kernel PRIVATE "${SILI_MKL_LIB_DIR}")
-    target_compile_definitions(test_didldo_kernel PRIVATE SILI_HAVE_MKL=1)
-    target_link_libraries(test_didldo_kernel OpenMP::OpenMP_CXX
-        "-l:libmkl_intel_lp64.so.3" "-l:libmkl_gnu_thread.so.3" "-l:libmkl_core.so.3"
-        "-Wl,-rpath,${SILI_MKL_LIB_DIR}")
-    set_target_properties(test_didldo_kernel PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-    add_test(NAME test_didldo_kernel COMMAND test_didldo_kernel)
+    foreach(t ${SILI_MKL_TESTS})
+        add_executable(${t} ${t}.cpp)
+        target_include_directories(${t} PRIVATE "../../sili/" "../../sili/lib/headers" "../../sili/lib/src" "${SILI_MKL_INCLUDE_DIR}")
+        target_link_directories(${t} PRIVATE "${SILI_MKL_LIB_DIR}")
+        target_compile_definitions(${t} PRIVATE SILI_HAVE_MKL=1)
+        target_link_libraries(${t} OpenMP::OpenMP_CXX
+            "-l:libmkl_intel_lp64.so.3" "-l:libmkl_gnu_thread.so.3" "-l:libmkl_core.so.3"
+            "-Wl,-rpath,${SILI_MKL_LIB_DIR}")
+        set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
 endif()

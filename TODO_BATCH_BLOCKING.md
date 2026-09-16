@@ -1052,5 +1052,46 @@ range -- do not consider a phase done on PoC evidence alone.
     ahead of time (same category of problem as `pip install torch` with
     CUDA support on an offline machine -- not unique to this).
 
-  **Next**: SIDLDO (the gather-strategy design above) is the remaining
-  piece of Group B. Not started.
+  **SIDLDO forward landed for real (2026-09-16), low-batch (union-gather)
+  path only.** `sili/lib/headers/linear_sidldo.hpp`: `SidldoForwardScratch`
+  (persistent, grow-only `active_row`/`inverse_map`/`w_compact`/
+  `x_compact`) + `sidldo_forward`, sharing `DenseLinearWeights` with
+  DIDLDO (same Group-B storage, per the two-group architecture). Union of
+  the batch's nonzero input positions computed SERIALLY, deliberately not
+  parallelized -- the DIDLDO threading investigation directly informed
+  this: SIDLDO targets low batch, where a custom `#pragma omp` region for
+  the gather step would pay the same handoff tax found for DIDLDO's
+  RMSprop step, for a step cheap enough at this scale to not need
+  parallelizing at all. Only the final `cblas_sgemv`/`cblas_sgemm` call
+  (MKL's own threading) does real parallel work -- one dispatch per call,
+  matching the ~1.0x/no-handoff result from that investigation.
+
+  `tests/unit/test_sidldo_kernel.cpp`: forward vs an independent
+  dense-matmul reference across batch=1/batch>1, near-dense and fully-
+  empty inputs, plus a scratch-reuse-across-different-active-set-sizes
+  case (catches stale-state bugs a fixed-shape test wouldn't). Passed
+  locally and on arch-sandbox. `tests/unit/CMakeLists.txt`'s MKL-gated
+  test block generalized from a single `if(SILI_MKL_FOUND)` for
+  `test_didldo_kernel` into a `SILI_MKL_TESTS` foreach covering both.
+
+  `scripts/bench_sidldo_forward.cpp`: timed at n=288 across the low-batch
+  range (1-64) and a density sweep (0.005-0.5), compared directly against
+  sisldo_ms/torch_ms already recorded in the Block4 Bench dataset at
+  matching (density, batch) points (same dense-weight, syn=1.0 rows).
+  SIDLDO beats SISLDO (the existing sparse-weight engine, paying CSR/
+  block4 overhead for weights that are actually fully dense here) at
+  EVERY density/batch combination tested, often by 5-10x (e.g. density=
+  0.5, batch=64: sisldo 0.6207ms vs sidldo 0.1040ms). At low batch
+  specifically, SIDLDO also beats torch's own dense GEMM outright (e.g.
+  density=0.5, batch=1: torch 0.0099ms vs sidldo 0.0064ms) -- torch has
+  no way to exploit input sparsity, SIDLDO does. Loses to torch at higher
+  batch + higher density (e.g. density=0.5, batch=64: torch 0.0316ms vs
+  sidldo 0.1040ms) -- the union has filled in by then, exactly the
+  degradation this design predicted and accepted going in.
+
+  **Not done**: SIDLDO backward (dx/dw via column-gather, the mirror of
+  forward's row-gather); the high-batch feature-major-CSR + nnz-balanced
+  design (still just a design in this file, not implemented -- and its
+  own threading-coexistence risk, flagged above, is still open); python
+  bindings for either DIDLDO or SIDLDO (both are C++-kernel-plus-tests
+  only so far, same phased approach the rest of this rollout used).
