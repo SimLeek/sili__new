@@ -100,6 +100,26 @@ class TestDIDLDOLayerVExplicitCalls:
         dx = layer.backward_sparse(x, dp, di, dv, 3, 0.0)
         np.testing.assert_allclose(dx, dy_masked @ w.T, atol=1e-3)
 
+    def test_backward_dense_max_abs_delta_clamps_update(self):
+        """max_abs_delta: sili_peridot's NOCAPS_KWARGS_FP32-style guard
+        against unbounded RMSprop blowup (linear_didldo.hpp's
+        didldo_backward). A huge lr with a tight clamp must move weights
+        by at most max_abs_delta per element; the same lr with the clamp
+        off (default 0.0) must move them further."""
+        layer, w, rng = _layer()
+        x = rng.uniform(-1, 1, (3, 8)).astype(np.float32)
+        dy = rng.uniform(-1, 1, (3, 5)).astype(np.float32)
+        w_before = layer.weights_vals.copy()
+        layer.backward_dense(x, dy, 10.0, 0.01)
+        clamped_delta = np.abs(layer.weights_vals - w_before)
+        assert clamped_delta.max() <= 0.01 + 1e-5
+
+        layer2, _, _ = _layer()
+        w2_before = layer2.weights_vals.copy()
+        layer2.backward_dense(x, dy, 10.0)
+        unclamped_delta = np.abs(layer2.weights_vals - w2_before)
+        assert unclamped_delta.max() > clamped_delta.max()
+
 
 class TestDIDLDOLayerVSmartDispatchMatchesExplicit:
     """forward()/backward() (engine_select.hpp dispatch) must give the
@@ -213,4 +233,24 @@ class TestDIDLDOLayer32Autograd:
 
         assert x.grad is not None
         assert x.grad.shape == (3, 8)
+        assert not np.allclose(layer.weights, w_before)
+
+    def test_disldo_cls_drop_in_call_convention(self):
+        """DIDLDOLayer32 must accept DISLDOLayer32's own disldo_cls call
+        shape (positional max_weights, dense=True kwarg) so it's a real
+        swap-in for sili_peridot's ToyTileRecurrenceRMT (which always
+        constructs every real layer as
+        `disldo_cls(in, out, max_weights, num_cpus, rng=..., **layer_kwargs)`,
+        layer_kwargs including `dense=True`). Ignoring both is correct --
+        DenseLinearWeights has no CSR budget and is already fully dense."""
+        from sili.sparse_rnn import DIDLDOLayer32
+        from sili.tensor import Tensor
+
+        rng = np.random.default_rng(3)
+        layer = DIDLDOLayer32(8, 5, 999, 4, rng=rng, dense=True)
+        x = Tensor(rng.uniform(-1, 1, (3, 8)).astype(np.float32))
+        out = layer.forward(x, learning_rate=1e-2, max_abs_delta=2.0, max_ci=100.0)
+        w_before = layer.weights.copy()
+        out.grad = np.ones_like(out.data)
+        out._backward()
         assert not np.allclose(layer.weights, w_before)

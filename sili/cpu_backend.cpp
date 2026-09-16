@@ -1815,13 +1815,14 @@ class DIDLDOLayerV {
         return result;
     }
 
-    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate) {
+    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                                  V max_abs_delta = 0.0f) {
         auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         std::vector<V> dx(std::size_t(batch) * n_inputs());
         didldo_backward((const V*)xbuf.ptr, (const V*)dybuf.ptr, weights, dx.data(), batch,
-                        num_cpus, learning_rate);
+                        num_cpus, learning_rate, max_abs_delta);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1893,7 +1894,16 @@ class DIDLDOLayerV {
         return forward_dense(x);
     }
 
-    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate) {
+    // max_abs_delta forces the dense (didldo_backward) branch regardless
+    // of the dispatch rule -- sidldo_backward has no clamp implementation
+    // yet (see linear_didldo.hpp's didldo_backward docstring); silently
+    // skipping the clamp on the sidldo branch would make max_abs_delta a
+    // no-op some of the time, which is worse than the small speed cost
+    // of forcing dense here.
+    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
+                            V max_abs_delta = 0.0f) {
+        if (max_abs_delta > 0.0f)
+            return backward_dense(x, dy, learning_rate, max_abs_delta);
         auto dybuf = dy.request();
         const S batch = (dybuf.ndim == 2) ? (S)dybuf.shape[0] : 1;
         const float density =
@@ -4249,7 +4259,7 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("num_cpus") = 4)
         .def("forward_dense", &DIDLDOLayerV::forward_dense, py::arg("x"))
         .def("backward_dense", &DIDLDOLayerV::backward_dense, py::arg("x"), py::arg("dy"),
-             py::arg("learning_rate"))
+             py::arg("learning_rate"), py::arg("max_abs_delta") = 0.0f)
         .def("forward_sparse", &DIDLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
              py::arg("values"), py::arg("batch"))
         .def("backward_sparse", &DIDLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
@@ -4266,9 +4276,9 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
         .def("backward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
-                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::V)>(
-                 &DIDLDOLayerV::backward),
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"))
+                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::V,
+                 DIDLDOLayerV::V)>(&DIDLDOLayerV::backward),
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("max_abs_delta") = 0.0f)
         .def("backward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
                  py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::S>,

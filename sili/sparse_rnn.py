@@ -1137,9 +1137,17 @@ class DIDLDOLayer32(Module):
         self,
         in_features: int,
         out_features: int,
+        max_weights: int | None = None,
         num_cpus: int = 4,
         rng: np.random.Generator | None = None,
+        dense: bool = False,
     ):
+        # max_weights/dense: accepted-and-ignored so this class is a
+        # drop-in disldo_cls for callers built against DISLDOLayer32's
+        # positional convention (e.g. sili_peridot's ToyTileRecurrenceRMT)
+        # -- DenseLinearWeights has no CSR budget to size and is already
+        # unconditionally fully dense, so neither concept applies here.
+        del max_weights, dense
         self._c = _cpu.DIDLDOLayerV(in_features, out_features, num_cpus)
         # Same fan-in-normalized Gaussian init as _preseed_dense_fp32
         # (DISLDOLayerV's own dense-init helper) -- no output_scale
@@ -1151,7 +1159,21 @@ class DIDLDOLayer32(Module):
         w = (rng.standard_normal((in_features, out_features)).astype(np.float32) * scale).flatten()
         self._c.load_dense_values(w)
 
-    def forward(self, x, learning_rate: float = 0.0, requires_grad: bool = True) -> Tensor:
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        requires_grad: bool = True,
+        max_abs_delta: float | None = None,
+        max_ci: float | None = None,
+    ) -> Tensor:
+        # max_ci accepted-and-ignored: no importance/ci concept exists on
+        # DenseLinearWeights to clamp (see class docstring). max_abs_delta
+        # IS honored (didldo_backward's own clamp, linear_didldo.hpp) --
+        # both exist purely so this class is a drop-in disldo_cls next to
+        # DISLDOLayer32 for callers that always pass both (e.g.
+        # sili_peridot's NOCAPS_KWARGS_FP32).
+        del max_ci
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
@@ -1176,7 +1198,8 @@ class DIDLDOLayer32(Module):
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
                 dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                dx = self._c.backward(x_dense, dy2d, learning_rate)
+                extra = {} if max_abs_delta is None else {"max_abs_delta": max_abs_delta}
+                dx = self._c.backward(x_dense, dy2d, learning_rate, **extra)
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)

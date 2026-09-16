@@ -63,9 +63,14 @@ inline void didldo_forward(const float* x, DenseLinearWeights& weights, float* y
 // Always computes dx+dw; gates an in-place RMSprop update on lr != 0
 // (lr=0.0 = grad-only, lr!=0 = grad+update, one function, no separate
 // optimizer call -- matches disldo_backward's own shape). dx is
-// [batch,n_in], caller-owned.
+// [batch,n_in], caller-owned. max_abs_delta (default 0 = disabled):
+// clamps the per-weight lr*update magnitude before applying, same
+// semantics as disldo_backward's own max_abs_delta (delta_csr_types.hpp)
+// -- ports the fp32-unbounded-weight-blowup guard sili_peridot's
+// DISLDOLayer32 path needed; no max_ci analogue exists here since
+// DenseLinearWeights has no importance/ci concept to clamp.
 inline void didldo_backward(const float* x, const float* dy, DenseLinearWeights& weights, float* dx,
-                            int batch, int num_cpus, float lr) {
+                            int batch, int num_cpus, float lr, float max_abs_delta = 0.0f) {
     (void)num_cpus;
     const int n_in = static_cast<int>(weights.n_in);
     const int n_out = static_cast<int>(weights.n_out);
@@ -105,7 +110,15 @@ inline void didldo_backward(const float* x, const float* dy, DenseLinearWeights&
     vsSqrt(ni, weights.square_avg.data(), denom.data());
     vsLinearFrac(ni, denom.data(), denom.data(), 1.0f, eps, 0.0f, 1.0f, denom.data());
     vsDiv(ni, dw, denom.data(), tmp.data());
-    cblas_saxpy(ni, -lr, tmp.data(), 1, w, 1);
+    if (max_abs_delta > 0.0f) {
+        cblas_sscal(ni, lr, tmp.data(), 1); // tmp = lr * raw_update
+        for (int i = 0; i < ni; ++i)
+            tmp[std::size_t(i)] =
+                std::min(std::max(tmp[std::size_t(i)], -max_abs_delta), max_abs_delta);
+        cblas_saxpy(ni, -1.0f, tmp.data(), 1, w, 1);
+    } else {
+        cblas_saxpy(ni, -lr, tmp.data(), 1, w, 1);
+    }
 }
 
 #endif // SILI_HAVE_MKL
