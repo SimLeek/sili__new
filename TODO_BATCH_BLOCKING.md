@@ -1482,32 +1482,77 @@ range -- do not consider a phase done on PoC evidence alone.
   Matched-config comparison (`scripts/train_mqar_curriculum.py`'s
   `train_curriculum()` called directly, disldo_cls swapped via a
   throwaway driver script -- not committed anywhere, both arms
-  identical otherwise): embed_width=288, num_tiles=16, peak_lr=0.015,
-  seed=1000, 30 steps, AQRS OFF both arms (additive_rank=0,
-  dynamic_rank_control=False -- DIDLDOLayerV has no AQRS support at
-  all, so this isolates the storage/kernel difference cleanly rather
-  than comparing AQRS-on vs AQRS-off as a confound):
+  identical otherwise): embed_width=288 (state_width=2304, column_
+  neurons=8), num_tiles=16, peak_lr=0.015, seed=1000, 30 steps, AQRS off
+  both arms. Per the user (2026-09-16): AQRS is for low-bit precision
+  only, fp32 should never use it -- so this ISN'T an isolation-only
+  convenience, it's the actually-correct fp32 config, superseding the
+  earlier before/after entry above (which left dynamic_rank_control on
+  for fp32 by following the CLI script's own default, since discovered
+  to be more than fp32 needs).
 
-  - DISLDOLayer32 (Group A): 47.3s wall / 218.3s total CPU
-    (steps_per_sec=0.634)
-  - DIDLDOLayer32 (Group B): 30.2s wall / 96.3s total CPU
-    (steps_per_sec=0.994)
-  - **~1.6x wall-clock, ~2.3x total-CPU-seconds** favoring DIDLDO --
-    confirms the "dense synapses everywhere" hypothesis: on this real
-    model's actual weight density, paying zero CSR/block4 bookkeeping
-    (Group B) beats even the Group A smart dispatcher's best per-call
-    choice. Peak RSS was comparable both arms (~670-690MB, same fp32
-    weight count either way, as expected).
+  **Real optimizer bug found and fixed first** (2026-09-16, see
+  docs/research/sparse_rnn.rst:sparse_rnn.didldo_same_optimizer_as_disldo):
+  the first version of this comparison used DIDLDO/SIDLDO's original
+  vanilla-RMSprop backward, a DIFFERENT optimizer than DISLDO actually
+  uses (BoundedRMSpropSynapsePolicy, where per-synapse importance IS the
+  optimizer -- feedback_importance_is_already_the_optimizer memory).
+  Fixed via a real port (not just a rename) plus a genuine bug catch in
+  SIDLDO's sparse-dy contrib gating, verified via a new bit-exact-
+  formula cross-group test suite. The numbers below are POST-fix; the
+  original ~1.6x/2.3x figures this entry used to report were measured
+  against the wrong optimizer and are superseded, not just refined.
 
-  Not yet done: an AQRS-feature-parity build of DIDLDOLayerV (so the
-  comparison could run WITH AQRS on both arms, matching real production
-  config exactly rather than the isolated no-AQRS variant above); a
-  longer/real training run (this was a 30-step timing probe only, same
-  caveat as the DISLDO before/after above); Group A's own dy_r_target/
-  x_r_target/dy_sparsity_p sparsity-axis kwargs still aren't accepted by
-  DIDLDOLayer32 at all (would TypeError if a config used them) -- only
-  the specific kwarg surface this real script's default config actually
-  exercises was made compatible, not the full DISLDOLayer32 surface.
+  Four-way result, same shapes/config throughout:
+
+  | arm | wall | total CPU | steps/sec |
+  |---|---|---|---|
+  | pre-branch (`74aca2b`) DISLDOLayer32 | 298s | 1981s | 0.10 |
+  | current DISLDOLayer32 (Group A) | 47.3s | 218.3s | 0.63 |
+  | current DIDLDOLayer32 (Group B, fixed optimizer) | 18.6s | 44.2s | 1.62 |
+  | numpy dense-matmul+Adam floor (not torch, see below) | 31.9s | ~29s | 0.94 |
+
+  - **This branch's batch-blocking work alone** (pre-branch -> current
+    DISLDO): 6.3x wall, 9.1x CPU -- consistent with the earlier peridot
+    before/after entry above, same shapes.
+  - **DIDLDO vs current DISLDO**: 2.54x wall, 4.94x CPU -- bigger than
+    the pre-fix (wrong-optimizer) measurement, not smaller; the correct
+    optimizer does MORE work per call (an extra sgemv + two elementwise
+    passes over ci/contrib) yet DIDLDO still won by more, mainly because
+    DISLDO's own CSR/block4 bookkeeping overhead is real and unavoidable
+    at 100% density, not because the old (wrong) DIDLDO path was
+    secretly doing less work than the fixed one.
+  - **DIDLDO vs pre-branch DISLDO**: 16.0x wall, 44.8x CPU.
+  - Peak RSS: DIDLDO ~947MB vs DISLDO's ~670-690MB (both current-branch)
+    -- `contrib_scratch`'s new dense [n_in x n_out] scratch buffer,
+    genuine memory-for-speed tradeoff, not a bug.
+
+  **"torch (approximated)"** -- explicitly NOT a real torch script (per
+  the user: "don't make a torch version"). A plain-numpy floor estimate
+  covering only the dominant linear-algebra cost (forward + backward-dx
+  + backward-dw matmul, plus a Adam-shaped elementwise optimizer step,
+  at the SAME real shapes/batches: input_proj/q/k/v/o_proj/lm_head, 30
+  steps) -- no autograd graph, no per-op Python/dispatch overhead, no
+  attention/RoPE, none of the rest of the real model. A real torch run
+  would very likely be SLOWER than this floor, not faster, since none of
+  that framework overhead is modeled. Notable on its own: DISLDO (47.3s)
+  is SLOWER than this bare floor (31.9s) at this shape -- real, expected
+  evidence that CSR/block4 bookkeeping is a genuine tax at 100% density,
+  exactly DIDLDO's reason to exist; DIDLDO (18.6s) beats the floor by
+  ~1.7x, plausible for a real BLAS-call-per-layer implementation with
+  less Python-loop/allocation overhead than the floor script's own
+  per-step object churn.
+
+  Not yet done: an AQRS-feature-parity build of DIDLDOLayerV is now
+  understood to be unnecessary for fp32 (AQRS doesn't belong there --
+  see above), so this is no longer a real gap for the fp32 comparison;
+  a longer/real training run (this was a 30-step timing probe only,
+  same caveat as the DISLDO before/after above); Group A's own dy_r_
+  target/x_r_target/dy_sparsity_p sparsity-axis kwargs still aren't
+  accepted by DIDLDOLayer32 at all (would TypeError if a config used
+  them) -- only the specific kwarg surface this real script's default
+  config actually exercises was made compatible, not the full
+  DISLDOLayer32 surface.
 
   **Not done**: the design-time Group-A-vs-Group-B recommender (still
   needs the "rule of thumb" itself derived, not just documented as
