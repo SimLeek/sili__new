@@ -223,6 +223,36 @@ inline void block4_batch_accumulate(const float w4[BLOCK4_TILE],
     }
 }
 
+// disldo_forward.scattered_batch_blocked (Phase 7.5, see
+// TODO_BATCH_BLOCKING.md): single-weight sibling of
+// block4_batch_accumulate above, for the SCATTERED (non-block4) path --
+// a CSR row's columns aren't grouped into fixed 4-wide tiles, so there's
+// only ever ONE weight per (row, column) synapse here, not four. Same
+// requirements and rationale as block4_batch_accumulate (transposed,
+// batch-contiguous `in_row`; batch-contiguous `out_col` in a per-thread
+// PRIVATE column-major accumulator) -- profiled via callgrind
+// (num_cpus=1, batch=1024, 10% density) that this exact per-sample
+// scalar accumulate was ~92% of the scattered path's real instructions
+// (57.8% loop overhead + 34.6% the strided `mo[...]+=w*iv` store itself)
+// with CSR traversal/decode a negligible ~0.02% -- so, unlike Phase 4's
+// buffer-allocation fix (which found this path NOT allocation-bound),
+// THIS is the real bottleneck the same transpose treatment already
+// fixed for block4 addresses.
+inline void scalar_batch_accumulate(float w, const float* in_row, std::size_t batch,
+                                    float* out_col) {
+    const Block4BatchVec wv{w, w, w, w, w, w, w, w};
+    std::size_t b = 0;
+    for (; b + BLOCK4_BATCH_BLOCK_B <= batch; b += BLOCK4_BATCH_BLOCK_B) {
+        Block4BatchVec acc, iv;
+        std::memcpy(&acc, out_col + b, sizeof(acc));
+        std::memcpy(&iv, in_row + b, sizeof(iv));
+        acc += wv * iv;
+        std::memcpy(out_col + b, &acc, sizeof(acc));
+    }
+    for (; b < batch; ++b)
+        out_col[b] += w * in_row[b];
+}
+
 // Elementwise sqrt -- GCC vector-extension types have no built-in sqrt.
 // Used by the RMSprop-style importance damping (decayed mean-of-g^2,
 // see linear_disldo.hpp's disldo_backward) instead of block4_vec_abs.

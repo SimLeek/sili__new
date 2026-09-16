@@ -189,6 +189,7 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_fp32
     test_disldo_block4_fp32_wide_simd
     test_disldo_block4_fp32_batch_blocked
+    test_disldo_scattered_batch_blocked
     test_disldo_block4_fp32_backward_wide_simd
     test_disldo_block4_promotion_fp32
     test_never_zero_live_quantize

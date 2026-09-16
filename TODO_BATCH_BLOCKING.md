@@ -515,25 +515,74 @@ range -- do not consider a phase done on PoC evidence alone.
       compute, so the small fixed buffer-allocation saving becomes
       negligible in comparison. Consistent with and slightly more
       pronounced than Phase 6's finding for the same class of buffer.
-- [ ] **Phase 7.5 -- scattered-path transpose+blocked-accumulate.**
-      Flagged by the user 2026-09-16, right after Phase 4's negative
-      result: Phase 4's persistent-buffer fix didn't move the scattered
-      (non-block4) path's needle because allocation was never the real
-      bottleneck there -- this path is scalar, strided,
-      gather/scatter-bound (see the scattered-path note at the end of
-      disldo_forward.persistent_scratch_buffers in
-      docs/research/linear_disldo.rst). A genuine fix would need
-      something like block4's own transpose+register-blocked-accumulate
-      treatment (disldo_forward.batch_blocked_threshold), adapted for
-      ARBITRARY (non-4-wide-tile) CSR column patterns -- e.g. transpose
-      input to `[row, batch]` same as block4 does, but the accumulate
-      side can't use a fixed BLOCK4_TILE=4 stride since a CSR row's
-      columns aren't grouped into tiles; would need per-row batch-
-      blocking into a column-indexed (not tile-indexed) accumulator, or
-      some other structure -- not designed yet, just flagged. Explicitly
-      placed HERE (after Phase 7, right before Phase 1.5's Python check)
-      per the user's own instruction: "write that down for a later check
-      to come back to right before the python side checking."
+- [x] **Phase 7.5 -- scattered-path transpose+blocked-accumulate.**
+      Landed 2026-09-16. Flagged by the user right after Phase 4's
+      negative result, with an explicit request to profile FIRST before
+      implementing (rather than trust the Phase 4 writeup's causal
+      story). Good call: that story turned out to be WRONG.
+
+      **Profiled first, and the earlier "gather/scatter-bound" claim
+      didn't hold up.** callgrind on the real scattered path (num_cpus=1,
+      batch=1024, 10% density, so no GOMP artifact) showed the
+      per-batch-sample accumulate loop itself -- `for(b) mo[...]+=w*iv`
+      -- was **~92% of the function's real instructions** (57.8% loop
+      overhead + 34.6% the strided store), with CSR
+      traversal/decode (`row_cursor`, `cursor.advance()`, weight/scale
+      lookup) a negligible ~0.02%. Phase 4's buffer-allocation fix
+      genuinely didn't help (that was never the bottleneck), but the
+      explanation attached to that finding was incomplete -- the real
+      story is this loop is STRIDED on both sides (`input[b*in_cols+r]`
+      and `mo[b*n_out+col]`), structurally identical to block4's
+      ORIGINAL pre-Phase-1 problem, just with one weight instead of
+      four. Lesson: a plausible-sounding explanation for a negative
+      result still needs its own verification before being trusted for
+      the next decision -- it wasn't.
+
+      **Implementation**: added `scalar_batch_accumulate` (block4.hpp,
+      single-weight sibling of `block4_batch_accumulate`) and gated the
+      scattered path on the SAME `BLOCK4_BATCH_BLOCK_THRESHOLD` (hoisted
+      to the top of `disldo_forward`, shared with the block4 dispatch
+      below it). At/above threshold: transpose input to `[row, batch]`
+      (reuses `scratch_input_T`, same buffer the block4 paths use --
+      accepted minor redundancy if BOTH scattered and block4 content
+      exist on the same layer/call, since this section runs first and
+      unconditionally rebuilds it; not a big deal at O(n_in*batch), not
+      restructured further to avoid touching the block4 section's
+      control flow), and accumulate into `scratch_scattered_out`
+      reinterpreted as column-major `[n_out, batch]` per thread (dual
+      row-major/column-major reuse of one field, same pattern as Phase
+      2's `scratch_b4_out`/`scratch_b4_out_T`). Reused the existing
+      static-per-thread-range reduction unchanged (layout-agnostic); the
+      final flush maps flat index -> (col, b) via plain div/mod rather
+      than forcing column-aligned thread ranges, since alignment isn't
+      needed for correctness and the added complexity wasn't worth it
+      for a flush that's a small fraction of total work.
+
+      **Correctness**: new `test_disldo_scattered_batch_blocked.cpp` (8
+      cases, below/at/above threshold, remainder-tail batches, very
+      sparse/near-dense rows, non-dividing num_cpus, verified
+      `block4_tiles==0` so it only ever exercises this phase's code)
+      against an independent dense-matmul reference. Full local+remote
+      ctest clean (same 5 pre-existing unrelated failures).
+
+      **Real-kernel A/B** (`scripts/bench_disldo_forward_scattered.cpp`,
+      num_cpus=4, 10% density, 2 interleaved pairs, arch-sandbox): clean
+      and highly consistent across both repeats --
+
+      | batch | speedup |
+      |---|---|
+      | 8    | ~1.08x |
+      | 16   | ~1.17-1.27x |
+      | 32   | ~1.70-1.71x |
+      | 64   | ~1.99x |
+      | 256  | ~2.71-2.72x |
+      | 1024 | **~3.22x** |
+
+      Same growing-with-batch shape as the wide path's own Phase 1
+      persistent-buffer fix, for the same reason (a fixed-shape cost
+      that used to dominate shrinks as a share of an otherwise-scaling
+      workload once removed). One of the largest wins in this whole
+      rollout, on a path that looked like a dead end two phases ago.
 - [ ] **Phase 1.5 -- check the PYTHON side, not just the C++ real-kernel
       bench.** Flagged 2026-09-15: all of Phase 1's verification so far
       (unit tests + `scripts/bench_disldo_forward_kernel.cpp`) is pure

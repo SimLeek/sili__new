@@ -55,6 +55,11 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     const std::size_t n_out = L.cols;
     const std::size_t ost = static_cast<std::size_t>(batch) * n_out;
 
+    // See disldo_forward.batch_blocked_threshold in
+    // docs/research/linear_disldo.rst -- shared by the scattered path
+    // right below and the block4 wide/narrow dispatch further down.
+    constexpr SIZE_TYPE BLOCK4_BATCH_BLOCK_THRESHOLD = 8;
+
     // dc.empty() no longer means "nothing to do" -- block4 below may still
     // hold live synapses. See disldo_forward.dc_empty_check in
     // docs/research/linear_disldo.rst.
@@ -62,69 +67,124 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
         // Same persistent-scratch + static-per-thread-range reduction
         // already proven for the block4 paths -- see
         // disldo_forward.persistent_scratch_buffers in
-        // docs/research/linear_disldo.rst (measured NOT to matter here,
-        // see the scattered-path note at the end of that section --
-        // kept anyway since it's correct and harmless).
+        // docs/research/linear_disldo.rst. At/above
+        // BLOCK4_BATCH_BLOCK_THRESHOLD, also applies
+        // disldo_forward.scattered_batch_blocked (Phase 7.5) -- see
+        // block4.hpp's scalar_batch_accumulate for the profiling that
+        // motivated it.
         std::vector<value_type>& t_out = weights.block4.scratch_scattered_out;
         t_out.resize(static_cast<std::size_t>(num_cpus) * ost);
 
+        if (batch >= BLOCK4_BATCH_BLOCK_THRESHOLD) {
+            std::vector<value_type>& input_T = weights.block4.scratch_input_T;
+            input_T.resize(n_in * static_cast<std::size_t>(batch));
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
+            for (std::size_t r = 0; r < n_in; ++r) {
+                value_type* dst = input_T.data() + r * static_cast<std::size_t>(batch);
+                for (SIZE_TYPE b = 0; b < batch; ++b)
+                    dst[b] = input[static_cast<std::size_t>(b) * in_cols + r];
+            }
+
 #pragma omp parallel num_threads(num_cpus)
-        {
-            const int tid = omp_get_thread_num();
-            value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
-            std::fill(mo, mo + ost, value_type(0));
+            {
+                const int tid = omp_get_thread_num();
+                // Column-major [n_out, batch] this time (was row-major
+                // [batch, n_out] below threshold) -- see
+                // scalar_batch_accumulate in block4.hpp.
+                value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
+                std::fill(mo, mo + ost, value_type(0));
 
 #pragma omp for schedule(static)
-            for (std::size_t r = 0; r < n_in; ++r) {
-                const std::size_t n_row = L.row_nnz(r);
-                if (n_row == 0)
-                    continue;
-
-                auto cursor = dc.row_cursor(r);
-                for (std::size_t e = 0; e < n_row; ++e) {
-                    const COL_TYPE col = cursor.advance();
-                    const std::size_t vb = L.elem_start[r] + e;
-                    const value_type w_stored = ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
-                    const value_type w =
-                        w_stored * weights.get_scale(r, col); // rank-N scale -> true units
-
-                    // No per-sample zero-skip here -- DISLDO is Dense Input
-                    // by design (see file header), so input is almost
-                    // never exactly zero in the intended use case, making
-                    // this branch nearly-always-false overhead on every
-                    // (synapse, batch-sample) pair rather than a real skip
-                    // (measured via callgrind as 18% of this function's
-                    // total instructions at batch=256). w*0=0 either way,
-                    // so dropping the check is a pure perf change, not a
-                    // behavior change. SISLDO (sparse input, CSRInput) is
-                    // the actual sparse-input path and has no analogous
-                    // check to remove -- its input format only ever
-                    // contains nonzero entries in the first place.
-                    for (SIZE_TYPE b = 0; b < batch; ++b) {
-                        const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
-                        mo[static_cast<std::size_t>(b) * n_out + col] += w * iv;
+                for (std::size_t r = 0; r < n_in; ++r) {
+                    const std::size_t n_row = L.row_nnz(r);
+                    if (n_row == 0)
+                        continue;
+                    const value_type* in_row_T =
+                        input_T.data() + r * static_cast<std::size_t>(batch);
+                    auto cursor = dc.row_cursor(r);
+                    for (std::size_t e = 0; e < n_row; ++e) {
+                        const COL_TYPE col = cursor.advance();
+                        const std::size_t vb = L.elem_start[r] + e;
+                        const value_type w_stored =
+                            ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                        const value_type w = w_stored * weights.get_scale(r, col);
+                        scalar_batch_accumulate(w, in_row_T, static_cast<std::size_t>(batch),
+                                                mo + static_cast<std::size_t>(col) *
+                                                         static_cast<std::size_t>(batch));
                     }
                 }
-            }
-            // Parallel tree reduction + flush, static per-thread index
-            // range, one barrier (implicit, end of the `#pragma omp for`
-            // above) -- see disldo_forward.narrow_path_barrier_reduction
-            // in docs/research/linear_disldo.rst for why this needs no
-            // further barriers.
-            const std::size_t i_lo =
-                (static_cast<std::size_t>(tid) * ost) / static_cast<std::size_t>(num_cpus);
-            const std::size_t i_hi =
-                (static_cast<std::size_t>(tid + 1) * ost) / static_cast<std::size_t>(num_cpus);
-            for (int stride = 1; stride < num_cpus; stride *= 2) {
-                const int step = stride * 2;
+                // Same static-per-thread-range reduction as below --
+                // layout-agnostic, doesn't care that t_out is
+                // column-major here. Only the flush differs: needs
+                // col/b from the flat index instead of a 1:1 copy.
+                const std::size_t i_lo =
+                    (static_cast<std::size_t>(tid) * ost) / static_cast<std::size_t>(num_cpus);
+                const std::size_t i_hi =
+                    (static_cast<std::size_t>(tid + 1) * ost) / static_cast<std::size_t>(num_cpus);
+                for (int stride = 1; stride < num_cpus; stride *= 2) {
+                    const int step = stride * 2;
+                    for (std::size_t i = i_lo; i < i_hi; ++i) {
+                        for (int base = 0; base + stride < num_cpus; base += step)
+                            t_out[static_cast<std::size_t>(base) * ost + i] +=
+                                t_out[static_cast<std::size_t>(base + stride) * ost + i];
+                    }
+                }
                 for (std::size_t i = i_lo; i < i_hi; ++i) {
-                    for (int base = 0; base + stride < num_cpus; base += step)
-                        t_out[static_cast<std::size_t>(base) * ost + i] +=
-                            t_out[static_cast<std::size_t>(base + stride) * ost + i];
+                    const std::size_t col = i / static_cast<std::size_t>(batch);
+                    const std::size_t b = i % static_cast<std::size_t>(batch);
+                    output[b * n_out + col] += t_out[i];
                 }
             }
-            for (std::size_t i = i_lo; i < i_hi; ++i)
-                output[i] += t_out[i];
+        } else {
+#pragma omp parallel num_threads(num_cpus)
+            {
+                const int tid = omp_get_thread_num();
+                value_type* mo = t_out.data() + static_cast<std::size_t>(tid) * ost;
+                std::fill(mo, mo + ost, value_type(0));
+
+#pragma omp for schedule(static)
+                for (std::size_t r = 0; r < n_in; ++r) {
+                    const std::size_t n_row = L.row_nnz(r);
+                    if (n_row == 0)
+                        continue;
+
+                    auto cursor = dc.row_cursor(r);
+                    for (std::size_t e = 0; e < n_row; ++e) {
+                        const COL_TYPE col = cursor.advance();
+                        const std::size_t vb = L.elem_start[r] + e;
+                        const value_type w_stored =
+                            ValueAccessor<VALUES_TYPE>::get_w(dc.values, vb);
+                        const value_type w =
+                            w_stored * weights.get_scale(r, col); // rank-N scale -> true units
+
+                        // No per-sample zero-skip here -- DISLDO is Dense
+                        // Input by design (see file header), so input is
+                        // almost never exactly zero in the intended use
+                        // case, making this branch nearly-always-false
+                        // overhead on every (synapse, batch-sample) pair
+                        // rather than a real skip. w*0=0 either way, so
+                        // dropping the check is a pure perf change.
+                        for (SIZE_TYPE b = 0; b < batch; ++b) {
+                            const value_type iv = input[static_cast<std::size_t>(b) * in_cols + r];
+                            mo[static_cast<std::size_t>(b) * n_out + col] += w * iv;
+                        }
+                    }
+                }
+                const std::size_t i_lo =
+                    (static_cast<std::size_t>(tid) * ost) / static_cast<std::size_t>(num_cpus);
+                const std::size_t i_hi =
+                    (static_cast<std::size_t>(tid + 1) * ost) / static_cast<std::size_t>(num_cpus);
+                for (int stride = 1; stride < num_cpus; stride *= 2) {
+                    const int step = stride * 2;
+                    for (std::size_t i = i_lo; i < i_hi; ++i) {
+                        for (int base = 0; base + stride < num_cpus; base += step)
+                            t_out[static_cast<std::size_t>(base) * ost + i] +=
+                                t_out[static_cast<std::size_t>(base + stride) * ost + i];
+                    }
+                }
+                for (std::size_t i = i_lo; i < i_hi; ++i)
+                    output[i] += t_out[i];
+            }
         }
     } // !dc.empty()
 
@@ -536,11 +596,8 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             process_pair.template operator()<2>();
         };
 
-        // See disldo_forward.batch_blocked_threshold in
-        // docs/research/linear_disldo.rst -- shared by the wide and
-        // narrow dispatch below.
-        constexpr SIZE_TYPE BLOCK4_BATCH_BLOCK_THRESHOLD = 8;
-
+        // BLOCK4_BATCH_BLOCK_THRESHOLD (shared with the scattered path
+        // above) is declared once, near the top of this function.
         if (use_column_partition) {
             // Wide path: thread_items[tid] was already assigned to this
             // exact thread during collection, by output column-block

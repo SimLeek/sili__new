@@ -386,16 +386,51 @@ their original form -- a fresh ``std::vector`` every call, and a fully
 SERIAL final reduction). Real-kernel A/B (10%-density pure-scattered
 layer, num_cpus=4, n_in=n_out=288): before == after within noise at
 every batch size. A real negative result, not a bug -- this path's
-compute is already the dominant cost, and it's expensive for an
-unrelated, already-understood reason (scalar, strided per-synapse
-access -- confirmed directly: at batch=1024 this layer's 8.25M total
-multiply-adds took ~2.25ms, over double the fully-dense block4 case's
-~0.93ms for 84.9M multiply-adds, 10x more actual work in under half the
-time). Matches this project's established understanding that scattered
-CSR is gather/scatter-bound, not SIMD-bound. Kept anyway (correct,
-harmless); a genuine fix here would need something more like block4's
-own transpose+blocked-accumulate treatment adapted for arbitrary CSR
-column patterns -- a bigger redesign, not attempted.
+compute was already the dominant cost. At the time this was first
+written, that was attributed to CSR traversal/decode overhead ("scalar,
+strided per-synapse access... gather/scatter-bound") -- **this
+explanation turned out to be wrong**, corrected below in
+:ref:`disldo_forward.scattered_batch_blocked` once it was actually
+profiled rather than assumed.
+
+.. _disldo_forward.scattered_batch_blocked:
+
+Scattered path, corrected: it WAS the batch loop, not CSR traversal
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.scattered_batch_blocked``
+
+Profiled directly (callgrind, num_cpus=1, batch=1024, 10% density, so no
+GOMP-region artifact) before implementing anything, prompted by a
+request to verify the claim above rather than build on it unchecked.
+Result: the per-batch-sample accumulate loop itself
+(``for(b) mo[...]+=w*iv``) was ~92% of the function's real instructions
+(57.8% loop overhead + 34.6% the strided store), with CSR
+traversal/decode (``row_cursor``, ``cursor.advance()``, weight/scale
+lookup) a negligible ~0.02%. The real bottleneck was never CSR
+traversal -- it was this loop being STRIDED on both sides
+(``input[b*in_cols+r]`` and ``mo[b*n_out+col]``), structurally identical
+to block4's own original pre-:ref:`disldo_forward.batch_blocked_threshold`
+problem, just with one weight per synapse instead of four.
+
+Fix: ``scalar_batch_accumulate`` (block4.hpp, single-weight sibling of
+``block4_batch_accumulate``), gated on the same
+``BLOCK4_BATCH_BLOCK_THRESHOLD`` (hoisted to the top of
+``disldo_forward``, shared with the block4 dispatch). Transposes input
+to ``[row, batch]`` (reuses ``scratch_input_T``) and accumulates into
+``scratch_scattered_out`` reinterpreted column-major ``[n_out, batch]``
+per thread -- same dual-layout reuse of one field
+:ref:`disldo_forward.persistent_scratch_buffers` already established for
+block4's own blocked/unblocked buffers.
+
+Real-kernel A/B (10% density, num_cpus=4, n_in=n_out=288, 2 interleaved
+pairs): clean and consistent, growing from **~1.08x at batch=8** up to
+**~3.22x at batch=1024** (~1.2-2.0x through the middle of the range).
+One of the largest wins in the whole batch-blocking rollout, on a path
+that looked like a dead end after the first (buffer-allocation-only)
+attempt. Lesson kept for next time: a plausible explanation attached to
+a negative result still needs its own verification before the next
+decision is built on it.
 
 .. _disldo_forward.hoisted_tile_count:
 
