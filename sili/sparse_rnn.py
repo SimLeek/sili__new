@@ -1166,14 +1166,16 @@ class DIDLDOLayer32(Module):
         requires_grad: bool = True,
         max_abs_delta: float | None = None,
         max_ci: float | None = None,
+        damp_by_importance: bool | None = None,
     ) -> Tensor:
-        # max_ci accepted-and-ignored: no importance/ci concept exists on
-        # DenseLinearWeights to clamp (see class docstring). max_abs_delta
-        # IS honored (didldo_backward's own clamp, linear_didldo.hpp) --
-        # both exist purely so this class is a drop-in disldo_cls next to
-        # DISLDOLayer32 for callers that always pass both (e.g.
-        # sili_peridot's NOCAPS_KWARGS_FP32).
-        del max_ci
+        # max_ci/damp_by_importance accepted-and-ignored: no importance/ci
+        # concept exists on DenseLinearWeights to clamp or damp (see class
+        # docstring). max_abs_delta IS honored (didldo_backward's own
+        # clamp, linear_didldo.hpp) -- all three exist purely so this
+        # class is a drop-in disldo_cls next to DISLDOLayer32 for callers
+        # that always pass them (e.g. sili_peridot's NOCAPS_KWARGS_FP32 +
+        # ToyTileRecurrenceRMT._l1_sparsity_split's damp_by_importance=False).
+        del max_ci, damp_by_importance
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:

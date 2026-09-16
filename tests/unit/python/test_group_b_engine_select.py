@@ -249,7 +249,7 @@ class TestDIDLDOLayer32Autograd:
         rng = np.random.default_rng(3)
         layer = DIDLDOLayer32(8, 5, 999, 4, rng=rng, dense=True)
         x = Tensor(rng.uniform(-1, 1, (3, 8)).astype(np.float32))
-        out = layer.forward(x, learning_rate=1e-2, max_abs_delta=2.0, max_ci=100.0)
+        out = layer.forward(x, learning_rate=1e-2, max_abs_delta=2.0, max_ci=100.0, damp_by_importance=False)
         w_before = layer.weights.copy()
         out.grad = np.ones_like(out.data)
         out._backward()
