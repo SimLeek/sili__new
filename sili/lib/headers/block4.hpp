@@ -1470,6 +1470,14 @@ struct Block4Store {
     // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
     // (non-block4, dc.empty()==false) path's per-thread accumulator.
     std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
     // disldo_forward.column_partitioned_threading: per-thread work-item
     // lists (see Block4WorkItem above) plus the column-block partition
     // boundaries used to build them, reused call to call so no fresh
@@ -2078,6 +2086,14 @@ struct Block4Store8 {
     // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
     // (non-block4, dc.empty()==false) path's per-thread accumulator.
     std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
@@ -2839,6 +2855,14 @@ struct Block4Store32 {
     // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
     // (non-block4, dc.empty()==false) path's per-thread accumulator.
     std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;

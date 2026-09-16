@@ -361,10 +361,47 @@ range -- do not consider a phase done on PoC evidence alone.
       (non-4-wide-tile) CSR column patterns -- a bigger, more speculative
       redesign, not attempted here; flagged as a possible future
       direction, not started.
-- [ ] **Phase 5 -- sisldo_forward.** Different structure (gather-based,
-      work-offset table for variable-density CSR batches) -- needs its
-      own investigation of whether/how this pattern applies at all before
-      implementing anything.
+- [x] **Phase 5 -- sisldo_forward.** Landed 2026-09-16. Investigated
+      first (per the note this replaces): sisldo's structure is entirely
+      different from disldo's (row-major gather with a per-batch cursor,
+      not a fixed block4 tile SIMD shape), so the transpose+blocked-
+      accumulate idea doesn't apply here at all. But `sisldo_ops.hpp`'s
+      `sisldo_forward` turned out to have the SAME two allocation/
+      reduction issues as disldo's scattered path did before Phase 4,
+      in BOTH of its two branches:
+      - Scattered branch: `all_outputs`/`all_contributions` were fresh
+        `std::vector`s every call, but the final reduction was ALREADY
+        a parallel tree (raw `#pragma omp barrier` + half-the-threads-
+        each-round, not `#pragma omp for`) -- only the buffer-allocation
+        half of the fix applied here.
+      - Block4 branch: `all_b4_outputs` was ALSO fresh every call, AND
+        the final reduction was a fully SERIAL one-thread-sums-
+        everything loop (same as disldo's old scattered path) -- both
+        halves of the fix applied. New scratch members
+        `Block4Store::scratch_sisldo_out/_contrib/_b4_out`.
+
+      Real-kernel A/B (arch-sandbox, num_cpus=4, n_in=n_out=288, 2
+      interleaved pairs each):
+      - **Block4 branch** (10% input density, fully-dense block4
+        weights, `scripts/bench_sisldo_forward_block4.cpp`): real,
+        consistent win -- **~1.1-1.2x at batch=1-8**, growing to
+        **~1.5-1.8x at batch=32-256**, **~1.35-1.5x at batch=1024**.
+        Same shape of win as disldo_forward's block4 paths, for the same
+        reason (this branch decodes real block4 tiles, dense compute,
+        allocation was a real visible cost once the reduction stopped
+        being the bottleneck).
+      - **Scattered branch** (10%/10% weight/input density,
+        `scripts/bench_sisldo_forward_scattered.cpp`, `block4_tiles=0`
+        confirmed): before == after within noise at every batch size,
+        1 through 1024 -- expected and confirmed, not just assumed: the
+        reduction here was already parallel, so only the (apparently
+        negligible on its own) buffer-allocation half of the fix
+        applied, and this branch is likely compute-bound the same way
+        disldo's scattered path is (gather-based, scalar).
+
+      Correctness: full local+remote ctest (including existing sisldo/
+      disldo parity and block4-sparse-input-forward tests), same 5
+      pre-existing unrelated failures as baseline, nothing new.
 - [ ] **Phase 6 -- disldo_backward.** Already has SOME transpose infra
       (`batch_stride_transpose`, input_T/output_grad_T -- see
       `docs/research/linear_disldo.rst`). Audit whether the missing piece

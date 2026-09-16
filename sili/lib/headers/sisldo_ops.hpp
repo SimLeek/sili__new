@@ -133,11 +133,16 @@ void sisldo_forward(
     const std::size_t num_outputs = static_cast<std::size_t>(input_tensor.rows) * out_cols;
     const std::size_t num_inputs = L.rows;
 
-    std::vector<value_type> all_outputs(static_cast<std::size_t>(num_cpus) * num_outputs,
-                                        value_type(0));
-    std::vector<value_type> all_contributions(
-        original_contributions_output ? static_cast<std::size_t>(num_cpus) * num_inputs : 0,
-        value_type(0));
+    // See disldo_forward.persistent_scratch_buffers in
+    // docs/research/linear_disldo.rst -- same fix, ported here: a
+    // persistent scratch member instead of a fresh std::vector every
+    // call, zeroed per-thread inside the parallel region below instead
+    // of serially up-front by the constructor.
+    std::vector<value_type>& all_outputs = weights.block4.scratch_sisldo_out;
+    all_outputs.resize(static_cast<std::size_t>(num_cpus) * num_outputs);
+    std::vector<value_type>& all_contributions = weights.block4.scratch_sisldo_contrib;
+    all_contributions.resize(
+        original_contributions_output ? static_cast<std::size_t>(num_cpus) * num_inputs : 0);
 
     if (!dc.empty()) {
         // Row-major sweep with one cursor per batch sample (GPU-style
@@ -224,6 +229,9 @@ void sisldo_forward(
                 original_contributions_output
                     ? all_contributions.data() + static_cast<std::size_t>(tid) * num_inputs
                     : nullptr;
+            std::fill(thread_output, thread_output + num_outputs, value_type(0));
+            if (thread_contrib)
+                std::fill(thread_contrib, thread_contrib + num_inputs, value_type(0));
 
 #pragma omp for schedule(static)
             for (int64_t wi = 0; wi < n_items; ++wi) {
@@ -294,8 +302,8 @@ void sisldo_forward(
         if (weights.block4.n_tiles() > 0) {
             const auto& BL4 = weights.block4.block_layout;
 
-            std::vector<value_type> all_b4_outputs(static_cast<std::size_t>(num_cpus) * num_outputs,
-                                                   value_type(0));
+            std::vector<value_type>& all_b4_outputs = weights.block4.scratch_sisldo_b4_out;
+            all_b4_outputs.resize(static_cast<std::size_t>(num_cpus) * num_outputs);
 
             // Same row-major, cursor-per-batch restructuring as the
             // scattered branch above, adapted to block4's 4-wide
@@ -367,6 +375,7 @@ void sisldo_forward(
                 const int tid = omp_get_thread_num();
                 value_type* thread_output =
                     all_b4_outputs.data() + static_cast<std::size_t>(tid) * num_outputs;
+                std::fill(thread_output, thread_output + num_outputs, value_type(0));
 
 #pragma omp for schedule(static)
                 for (int64_t wi = 0; wi < n_items; ++wi) {
@@ -461,14 +470,27 @@ void sisldo_forward(
                         }
                     }
                 }
-            }
-
-            // Sum EVERY thread's private slice, not just thread 0's.
-            for (int t = 0; t < num_cpus; ++t) {
-                const value_type* s =
-                    all_b4_outputs.data() + static_cast<std::size_t>(t) * num_outputs;
-                for (std::size_t i = 0; i < num_outputs; ++i)
-                    output[i] += s[i];
+                // Static per-thread range, zero further barriers -- see
+                // disldo_forward.narrow_path_barrier_reduction in
+                // docs/research/linear_disldo.rst (replaces a fully
+                // SERIAL one-thread-sums-everything loop that used to
+                // sit outside this parallel region).
+                const std::size_t i_lo = (static_cast<std::size_t>(tid) * num_outputs) /
+                                         static_cast<std::size_t>(num_cpus);
+                const std::size_t i_hi = (static_cast<std::size_t>(tid + 1) * num_outputs) /
+                                         static_cast<std::size_t>(num_cpus);
+                for (int stride = 1; stride < num_cpus; stride *= 2) {
+                    const int step = stride * 2;
+                    for (std::size_t i = i_lo; i < i_hi; ++i) {
+                        for (int base = 0; base + stride < num_cpus; base += step)
+                            all_b4_outputs[static_cast<std::size_t>(base) * num_outputs + i] +=
+                                all_b4_outputs[static_cast<std::size_t>(base + stride) *
+                                                   num_outputs +
+                                               i];
+                    }
+                }
+                for (std::size_t i = i_lo; i < i_hi; ++i)
+                    output[i] += all_b4_outputs[i];
             }
         }
     }
