@@ -270,19 +270,19 @@ inline void sidldo_forward(const int* x_ptrs, const int* x_idx, const float* x_v
 
 // Backward-only scratch, persistent and grow-only.
 struct SidldoBackwardScratch {
-    std::vector<int> active_col;
-    std::vector<int> inverse_map;     // [n_out], -1 sentinel
-    std::vector<float> w_col_compact; // [num_active x n_in]: row i = W[:,active_col[i]]
-    std::vector<float> dy_compact;    // [batch x num_active]
-    std::vector<float> dw_compact;    // [n_in x num_active]
+    std::vector<int> active_col;   // SORTED ascending -- see sidldo_backward
+    std::vector<int> inverse_map;  // [n_out], -1 sentinel
+    std::vector<float> w_masked;   // [n_in x num_active]: row r = W[r,active_col[:]]
+    std::vector<float> dy_compact; // [batch x num_active]
+    std::vector<float> dw_compact; // [n_in x num_active]
 
     void ensure(std::size_t n_in, std::size_t n_out, std::size_t batch) {
         if (inverse_map.size() < n_out)
             inverse_map.assign(n_out, -1);
         if (active_col.capacity() < n_out)
             active_col.reserve(n_out);
-        if (w_col_compact.size() < n_out * n_in)
-            w_col_compact.resize(n_out * n_in);
+        if (w_masked.size() < n_out * n_in)
+            w_masked.resize(n_out * n_in);
         if (dy_compact.size() < batch * n_out)
             dy_compact.resize(batch * n_out);
         if (dw_compact.size() < n_in * n_out)
@@ -317,16 +317,33 @@ inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_id
     }
     const int num_active = static_cast<int>(scratch.active_col.size());
 
-    // Gather W's active COLUMNS into a compact, contiguous [num_active x
-    // n_in] buffer -- a strided read from row-major W (unavoidable, W's
-    // layout is fixed by forward/DIDLDO's needs), but a contiguous write,
-    // and the buffer this produces is exactly the shape both GEMMs below
-    // need (no further transpose).
-    for (int i = 0; i < num_active; ++i) {
-        const int c = scratch.active_col[i];
-        float* dst = scratch.w_col_compact.data() + std::size_t(i) * n_in;
-        for (int r = 0; r < n_in; ++r)
-            dst[r] = weights.w[std::size_t(r) * n_out + c];
+    // Sort active_col ascending and rebuild inverse_map to match --
+    // first-seen order (from the scan above) can walk columns in any
+    // order; sorted order is what lets the row-major gather/update below
+    // touch each row's active positions in ascending, cache-clustered
+    // order rather than jumping around it.
+    std::sort(scratch.active_col.begin(), scratch.active_col.begin() + num_active);
+    for (int i = 0; i < num_active; ++i)
+        scratch.inverse_map[scratch.active_col[i]] = i;
+
+    // Gather ROW-major, not column-major: for each row r (W's own
+    // natural order), pull out just its active_col entries. The OLD
+    // version iterated active columns outer / rows inner, meaning every
+    // single element read jumped n_out floats to a completely different
+    // row -- O(num_active*n_in) cache MISSES, revisiting the same n_in
+    // row-jumps once per active column. This version visits each row
+    // ONCE; that row's active positions are all within its own ~n_out*4
+    // byte region, likely already resident after the row's first touch
+    // -- O(n_in) row-fetches total, not O(num_active*n_in). Confirmed
+    // this was the real bottleneck via direct bench (TODO_BATCH_
+    // BLOCKING.md): at n=1024, density=0.5, batch=1 -- the CHEAPEST
+    // possible case for union-gather -- the old version was 13.6x
+    // SLOWER than sisldo purely from this access pattern.
+    for (int r = 0; r < n_in; ++r) {
+        const float* w_row = weights.w.data() + std::size_t(r) * n_out;
+        float* out_row = scratch.w_masked.data() + std::size_t(r) * num_active;
+        for (int i = 0; i < num_active; ++i)
+            out_row[i] = w_row[scratch.active_col[i]];
     }
 
     std::fill(scratch.dy_compact.begin(),
@@ -344,41 +361,49 @@ inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_id
         return;
     }
 
-    // dx[batch,n_in] = dy_compact[batch,num_active] @ w_col_compact[num_active,n_in]
+    // dx[batch,n_in] = dy_compact[batch,num_active] @ w_masked[n_in,num_active]^T.
+    // w_masked is stored [n_in x num_active] (natural, un-transposed --
+    // see the gather above), so this is TransB=Trans, the opposite of
+    // the old w_col_compact orientation.
     if (batch == 1) {
-        cblas_sgemv(CblasRowMajor, CblasTrans, num_active, n_in, 1.0f, scratch.w_col_compact.data(),
-                    n_in, scratch.dy_compact.data(), 1, 0.0f, dx, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_in, num_active, 1.0f, scratch.w_masked.data(),
+                    num_active, scratch.dy_compact.data(), 1, 0.0f, dx, 1);
     } else {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, batch, n_in, num_active, 1.0f,
-                    scratch.dy_compact.data(), num_active, scratch.w_col_compact.data(), n_in, 0.0f,
-                    dx, n_in);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, batch, n_in, num_active, 1.0f,
+                    scratch.dy_compact.data(), num_active, scratch.w_masked.data(), num_active,
+                    0.0f, dx, n_in);
     }
 
     // dw_compact[n_in,num_active] = x[batch,n_in]^T @ dy_compact[batch,num_active].
     // K=batch=1 (sger shape) not special-cased, same precedent as DIDLDO.
+    // Already [n_in x num_active] row-major -- matches the row-outer
+    // access the RMSprop update below needs, no further change from the
+    // old version.
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, n_in, num_active, batch, 1.0f, x, n_in,
                 scratch.dy_compact.data(), num_active, 0.0f, scratch.dw_compact.data(), num_active);
 
     if (lr == 0.0f)
         return;
 
-    // In-place RMSprop, applied directly at the real (strided) weight
-    // positions -- hand-rolled, not VML, since VML's vector ops need
-    // contiguous input and gathering/scattering a compact square_avg
-    // buffer just to use VML would cost more than this plain loop saves
-    // (same lesson as the high-batch forward path: a hand-rolled loop
-    // often beats routing a small, memory-bound op through a library
-    // built for large contiguous ones). Reuses dw_compact, already
-    // contiguous from the GEMM above.
+    // In-place RMSprop, applied directly at the real weight positions --
+    // hand-rolled, not VML, same reasoning as the high-batch forward
+    // path (gathering/scattering a compact square_avg buffer just to use
+    // VML would cost more than this plain loop saves). Row-major outer
+    // loop, same cache-locality fix as the gather above -- the old
+    // version's outer-column/inner-row order had the identical strided-
+    // write problem the gather did.
     constexpr float alpha = 0.99f;
     constexpr float eps = 1e-8f;
-    for (int i = 0; i < num_active; ++i) {
-        const int c = scratch.active_col[i];
-        for (int r = 0; r < n_in; ++r) {
-            const float g = scratch.dw_compact[std::size_t(r) * num_active + i];
-            float& sq = weights.square_avg[std::size_t(r) * n_out + c];
+    for (int r = 0; r < n_in; ++r) {
+        float* w_row = weights.w.data() + std::size_t(r) * n_out;
+        float* sq_row = weights.square_avg.data() + std::size_t(r) * n_out;
+        const float* dw_row = scratch.dw_compact.data() + std::size_t(r) * num_active;
+        for (int i = 0; i < num_active; ++i) {
+            const int c = scratch.active_col[i];
+            const float g = dw_row[i];
+            float& sq = sq_row[c];
             sq = alpha * sq + (1.0f - alpha) * g * g;
-            weights.w[std::size_t(r) * n_out + c] -= lr * g / (std::sqrt(sq) + eps);
+            w_row[c] -= lr * g / (std::sqrt(sq) + eps);
         }
     }
 }

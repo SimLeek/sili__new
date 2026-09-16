@@ -1198,15 +1198,68 @@ range -- do not consider a phase done on PoC evidence alone.
   catches). Passes locally and on arch-sandbox. Full local regression
   clean (same 5 pre-existing failures, nothing new).
 
+  Benched right after landing (`scripts/bench_sidldo_backward.cpp`,
+  n=288) -- looked great there, beating sisldo virtually everywhere,
+  often by double digits, and staying within ~10-20% of torch even at
+  batch=1024. But n=288 turned out to be too small a layer to surface a
+  real bug: the gather (and the RMSprop update, same shape) iterated
+  active COLUMN outer / row inner, meaning every single read/write
+  jumped `n_out` floats to a totally different row of `weights.w` --
+  strided access on every element. At n=288 that stride is cheap enough
+  not to matter; at n=1024/2048 it doesn't scale, it becomes the whole
+  cost. Direct check at n=1024 (in the actual Block4 Bench dataset, so
+  directly comparable to sisldo/torch) found density=0.5 batch=1 -- the
+  CHEAPEST possible case for union-gather -- running 19.3ms, **13.6x
+  slower than sisldo's 1.41ms**, on what should have been an easy win.
+  At n=2048 it got much worse: 65.7ms for a single bwd0 call at
+  batch=1024/density=0.005, ~63x slower than the equivalent n=288 call
+  for a layer only 7x wider -- clearly super-linear, not just "needs a
+  high-batch variant" the way forward did.
+
+  **User's fix, applied exactly as described**: gather the union of
+  `dy`'s active columns first (unchanged), then walk `weights.w` in its
+  own natural ROW-major order, pulling out just the active-column
+  positions within each row (all clustered in that row's own ~`n_out*4`
+  byte region, likely resident after one fetch) instead of revisiting
+  all `n_in` rows once per active column. Also sorted `active_col`
+  ascending (needed so a row's active positions are visited in
+  monotonic order) and applied the SAME row-outer restructuring to the
+  RMSprop update loop, which had the identical strided pattern. `W`'s
+  storage in the compact buffer flipped from `[num_active x n_in]`
+  (pre-transposed) to `[n_in x num_active]` (natural, un-transposed) to
+  make the row-major walk produce contiguous writes too -- the GEMM/GEMV
+  Trans/NoTrans flags for `dx` flipped accordingly to match.
+
+  Re-benched the exact same cells after the fix:
+
+  | n | density | batch | bwd0 before | bwd0 after | sisldo | torch |
+  |---|---|---|---|---|---|---|
+  | 1024 | 0.5 | 1 | 3.003 (13.6x worse than sisldo on bwdX) | **0.270** | 0.378 | 0.658 |
+  | 1024 | 0.005 | 64 | 1.837 (lost to sisldo) | **0.819** | 1.417 | 1.106 |
+  | 1024 | 0.5 | 1024 | 15.85 | **11.74** | 254.6 | 11.30 |
+  | 2048 | 0.5 | 1 | 17.76 | **2.411** | -- | -- |
+  | 2048 | 0.005 | 1024 | 65.73 | **34.90** | -- | -- |
+
+  Every case that used to lose now wins or ties -- n=1024/density=0.5/
+  batch=1 flipped from 13.6x worse than sisldo to BEATING both sisldo
+  and torch; n=1024/batch=1024 now ties torch almost exactly (11.74ms vs
+  11.30ms) while beating sisldo by 21.7x (254.6ms -> effectively gone).
+  n=2048 (no sisldo/torch numbers exist at that width in the dataset,
+  not directly comparable) improved 2-11x across the board but the
+  largest cells (batch=1024) are still tens of ms -- since the gather/
+  update loops are still entirely SERIAL, just cache-friendly now rather
+  than cache-hostile; parallelizing them is a plausible further win, not
+  attempted here (would need the same care about custom-omp-region
+  handoff cost this whole investigation kept finding matters, so worth
+  measuring before assuming it's free).
+
   Not done: a high-batch (feature-major-CSR-style) SIDLDO backward
-  variant -- forward's high-batch path exists because forward's
-  union-gather measurably degrades at high batch; backward's
-  union-gather almost certainly has the same degradation shape (dy's
-  active-column union fills in the same way x's active-row union does),
-  but this hasn't been benched yet, so building a high-batch backward
-  now would be speculative rather than measured. Natural next step if/
-  when asked, same as forward's own high-batch path was a separate,
-  later request rather than built preemptively.
+  variant, still not benched as needed now that the union-gather path
+  itself is fast (may not be needed at all -- forward's high-batch path
+  existed to fix a real, measured degradation; backward's union-gather,
+  post-fix, hasn't shown that same degradation yet at the sizes tested).
+  Natural next step if a real degradation shows up, not built
+  preemptively.
 
   **Not done**: density-aware dispatch (see above); python bindings for
   either DIDLDO or SIDLDO (both are C++-kernel-plus-tests only so far,
