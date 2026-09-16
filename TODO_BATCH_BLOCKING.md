@@ -402,10 +402,75 @@ range -- do not consider a phase done on PoC evidence alone.
       Correctness: full local+remote ctest (including existing sisldo/
       disldo parity and block4-sparse-input-forward tests), same 5
       pre-existing unrelated failures as baseline, nothing new.
-- [ ] **Phase 6 -- disldo_backward.** Already has SOME transpose infra
-      (`batch_stride_transpose`, input_T/output_grad_T -- see
-      `docs/research/linear_disldo.rst`). Audit whether the missing piece
-      is just the private-per-thread-buffer/contention angle, or more.
+- [x] **Phase 6 -- disldo_backward.** Landed 2026-09-16. Audited first
+      (this function is CCN 257, huge, and already the subject of a
+      SEPARATE active CCN-reduction refactoring plan -- did not touch
+      its control flow, only buffer lifecycle):
+      - **Main per-thread buffers already fixed, long before this
+        session.** `t_dx`/`t_col_grad`/`t_col_grad_contrib`/
+        `t_gamma_grad`/`t_gamma_grad_contrib` already live in a
+        dedicated persistent `weights.disldo_backward_scratch`
+        (`DisldoBackwardScratch`, `delta_csr_types.hpp`) with a
+        grow-only `ensure()`/`resize_to()` and per-thread parallel
+        zero-fill via `std::fill_n` -- exactly this rollout's pattern,
+        already done.
+      - **The dx horizontal-reduce fix was explicitly TRIED and
+        REJECTED already, too.** `disldo_backward.batch_stride_transpose`
+        in `docs/research/linear_disldo.rst` documents that literally
+        Phase 1's core idea (transposing the `mdx` write-back to avoid a
+        per-sample `block4_vec_hsum`) was tried here first and made
+        things WORSE (54.9ms -> 63.2ms at batch=256) -- rejected as
+        "pure overhead with no offsetting benefit." The REAL fix that
+        actually worked (`disldo_backward.batch_hsum_deferral`) was a
+        different, more powerful technique: an ALGEBRAIC reassociation
+        (`sum_b(hsum(C*x_b)) == hsum(C*sum_b(x_b))`) that defers the
+        weight-gradient hsum to ONCE per tile instead of once per
+        sample -- something dx itself can't use (dx needs a genuinely
+        distinct value per sample, not an aggregate), but which beat a
+        literal transpose+block-accumulate attempt for everything that
+        COULD use it. Already landed this gap from ~25-30x slower than
+        torch down to 3.1-3.5x. Given this rollout's core idea was
+        already tried here and lost to a better technique, re-attempting
+        it now would just rediscover the same rejected result -- did
+        not re-attempt.
+      - **One real gap found**: `group_dx`/`group_col_grad`/
+        `group_col_grad_contrib` (the CCX-group-aware reduction's own
+        buffers, `disldo_backward.ccx_aware_reduction`) were STILL a
+        fresh `std::vector` every call, unlike the main t_dx/t_col_grad
+        buffers right next to them. Fixed the same way: added to
+        `DisldoBackwardScratch` (new `group_dx`/`group_col_grad`/
+        `group_col_grad_contrib` fields + `cap_groups`, `ensure()`/
+        `resize_to()` extended to take a `groups` param), addressed via
+        the same `cap_dst`/`cap_out_rank` strides the thread buffers
+        already use (not this call's own possibly-smaller `dst`/
+        `n_out*rank`, for the same historical-max-aliasing-safety
+        reason), zero-filled per-group inside the parallel region.
+
+        **Correctness verified with extra care** (this is a
+        stride-indexing change in gradient-accumulation code, and the
+        `num_groups>1` branch only triggers on real dual-CCX hardware
+        at high thread counts -- easy to ship an indexing bug that
+        never gets exercised by the local/default test suite): wrote a
+        dedicated probe confirming `num_groups` is ACTUALLY 2 at
+        num_cpus=8/16 on arch-sandbox (not just plausible-by-topology --
+        directly measured via `sili_topology::current_thread_group()`
+        inside a real parallel region), then a separate correctness
+        verifier (`scripts/verify_disldo_backward_group_reduction.cpp`)
+        comparing `sum(|input_grad|)` across num_cpus=1/4/8/16 with an
+        IDENTICAL weight seed -- bit-exact match at every thread count,
+        confirming the `num_groups=2` branch specifically produces the
+        same answer as the trivial `num_groups=1` path. Full local+
+        remote ctest also clean (same 5 pre-existing unrelated
+        failures).
+
+        **Real-kernel A/B** (`scripts/bench_disldo_backward_group_reduction.cpp`,
+        num_cpus=8 with `OMP_PROC_BIND=true OMP_PLACES=cores` so
+        `num_groups=2` actually triggers, 2 repeats): small, modest,
+        somewhat noisy win as expected for a small batch-INdependent
+        buffer -- roughly **~3-16%** depending on the run (batch=256:
+        1.03x-1.13x; batch=1024: 1.03x-1.16x), nowhere near the
+        batch-scaling buffers' 2-5x wins elsewhere in this rollout, but
+        real and never measured worse.
 - [ ] **Phase 7 -- sisldo backward (`disldo_backward_sparse_grad`,
       sisldo_ops.hpp).** Same audit as Phase 6, plus keep in mind the
       heap-corruption bug just fixed there (stale tile position tracking)

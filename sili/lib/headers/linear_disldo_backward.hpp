@@ -1168,7 +1168,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // smaller dimensions than a historical max can never alias two
     // threads' slices together.
     weights.disldo_backward_scratch.ensure(static_cast<std::size_t>(num_cpus), dst, n_out * rank,
-                                           rank);
+                                           rank, 0);
     const std::size_t t_dx_stride = weights.disldo_backward_scratch.cap_dst;
     const std::size_t t_out_rank_stride = weights.disldo_backward_scratch.cap_out_rank;
     const std::size_t t_rank_stride = weights.disldo_backward_scratch.cap_rank;
@@ -1230,6 +1230,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
         }
     }
     const std::size_t num_groups = group_ids.size();
+    weights.disldo_backward_scratch.ensure(static_cast<std::size_t>(num_cpus), dst, n_out * rank,
+                                           rank, num_groups);
 
     // Pre-size value_scale/output_scale (n_in*rank / n_out*rank) before the
     // parallel region so direct indexed writes are safe.
@@ -2150,14 +2152,21 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     // than a regression. Gamma's own reduction further down is left flat
     // (rank is small enough that the group-aware version isn't worth the
     // added complexity), and t_row_grad's reduction above is deliberately
-    // out of scope (see its own comment).
-    std::vector<value_type> group_dx(num_groups * dst, value_type(0));
-    std::vector<value_type> group_col_grad(num_groups * n_out * rank, value_type(0));
-    std::vector<value_type> group_col_grad_contrib(num_groups * n_out * rank, value_type(0));
+    // out of scope (see its own comment). group_dx/group_col_grad/
+    // group_col_grad_contrib: persistent scratch, addressed via the
+    // SAME cap_dst/cap_out_rank strides t_dx/t_col_grad use (see
+    // disldo_forward.persistent_scratch_buffers, linear_disldo.rst).
+    std::vector<value_type>& group_dx = weights.disldo_backward_scratch.group_dx;
+    std::vector<value_type>& group_col_grad = weights.disldo_backward_scratch.group_col_grad;
+    std::vector<value_type>& group_col_grad_contrib =
+        weights.disldo_backward_scratch.group_col_grad_contrib;
     if (num_groups <= 1) {
         value_type* gdx = group_dx.data();
         value_type* gcol = group_col_grad.data();
         value_type* gcol_c = group_col_grad_contrib.data();
+        std::fill(gdx, gdx + dst, value_type(0));
+        std::fill(gcol, gcol + n_out * rank, value_type(0));
+        std::fill(gcol_c, gcol_c + n_out * rank, value_type(0));
         for (int t = 0; t < num_cpus; ++t) {
             const value_type* sdx = t_dx.data() + static_cast<std::size_t>(t) * t_dx_stride;
             for (std::size_t i = 0; i < dst; ++i)
@@ -2177,11 +2186,14 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
             const int tid = omp_get_thread_num();
             const int g = tid_to_g[static_cast<std::size_t>(tid)];
             if (tid == group_leader_tid[static_cast<std::size_t>(g)]) {
-                value_type* gdx = group_dx.data() + static_cast<std::size_t>(g) * dst;
+                value_type* gdx = group_dx.data() + static_cast<std::size_t>(g) * t_dx_stride;
                 value_type* gcol =
-                    group_col_grad.data() + static_cast<std::size_t>(g) * n_out * rank;
+                    group_col_grad.data() + static_cast<std::size_t>(g) * t_out_rank_stride;
                 value_type* gcol_c =
-                    group_col_grad_contrib.data() + static_cast<std::size_t>(g) * n_out * rank;
+                    group_col_grad_contrib.data() + static_cast<std::size_t>(g) * t_out_rank_stride;
+                std::fill(gdx, gdx + dst, value_type(0));
+                std::fill(gcol, gcol + n_out * rank, value_type(0));
+                std::fill(gcol_c, gcol_c + n_out * rank, value_type(0));
                 for (int t = 0; t < num_cpus; ++t) {
                     if (tid_to_g[static_cast<std::size_t>(t)] != g)
                         continue;
@@ -2202,7 +2214,7 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
     }
 
     for (std::size_t g = 0; g < num_groups; ++g) {
-        const value_type* s = group_dx.data() + g * dst;
+        const value_type* s = group_dx.data() + g * t_dx_stride;
         for (std::size_t i = 0; i < dst; ++i) {
             input_grad[i] += s[i];
         }
@@ -2230,8 +2242,9 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                 // above) rather than t_col_grad directly -- num_groups is
                 // typically 1-2, not num_cpus.
                 for (std::size_t g = 0; g < num_groups; ++g) {
-                    col_grad_sum += group_col_grad[g * n_out * rank + c * rank + k];
-                    col_grad_sum_contrib += group_col_grad_contrib[g * n_out * rank + c * rank + k];
+                    col_grad_sum += group_col_grad[g * t_out_rank_stride + c * rank + k];
+                    col_grad_sum_contrib +=
+                        group_col_grad_contrib[g * t_out_rank_stride + c * rank + k];
                 }
                 // Scale update via the swappable policy -- same as
                 // value_scale's own update above.

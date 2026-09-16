@@ -1277,32 +1277,50 @@ struct SparseLinearWeightsDelta {
         std::vector<value_type> t_gamma_grad;         // [thread][k], stride cap_rank
         std::vector<value_type> t_gamma_grad_contrib; // [thread][k], stride cap_rank
 
-        std::size_t cap_threads = 0, cap_dst = 0, cap_out_rank = 0, cap_rank = 0;
+        // disldo_forward.persistent_scratch_buffers (see
+        // docs/research/linear_disldo.rst): group_dx/group_col_grad/
+        // group_col_grad_contrib were a fresh std::vector every call in
+        // disldo_backward's CCX-group-aware reduction
+        // (disldo_backward.ccx_aware_reduction) -- much smaller and
+        // batch-INdependent unlike this session's other buffer fixes
+        // (sized by num_groups, not batch), so expect a small effect,
+        // but it's the same proven-safe pattern.
+        std::vector<value_type> group_dx;       // [group][dst], stride cap_dst
+        std::vector<value_type> group_col_grad; // [group][col][k], stride cap_out_rank
+        std::vector<value_type> group_col_grad_contrib;
+
+        std::size_t cap_threads = 0, cap_dst = 0, cap_out_rank = 0, cap_rank = 0, cap_groups = 0;
 
         // Grow-only (never shrinks) -- called automatically at the top of
         // every disldo_backward call, a cheap no-op once large enough.
-        void ensure(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank) {
+        void ensure(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank,
+                    std::size_t groups) {
             if (threads <= cap_threads && dst <= cap_dst && out_rank <= cap_out_rank &&
-                rank <= cap_rank)
+                rank <= cap_rank && groups <= cap_groups)
                 return;
             resize_to(std::max(cap_threads, threads), std::max(cap_dst, dst),
-                      std::max(cap_out_rank, out_rank), std::max(cap_rank, rank));
+                      std::max(cap_out_rank, out_rank), std::max(cap_rank, rank),
+                      std::max(cap_groups, groups));
         }
 
         // Explicit, caller-driven resize -- unlike ensure(), CAN shrink.
         // Caller must not pass below what's currently in use.
-        void resize_to(std::size_t threads, std::size_t dst, std::size_t out_rank,
-                       std::size_t rank) {
+        void resize_to(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank,
+                       std::size_t groups) {
             cap_threads = threads;
             cap_dst = dst;
             cap_out_rank = out_rank;
             cap_rank = rank;
+            cap_groups = groups;
             t_dx.resize(cap_threads * cap_dst);
             t_dx_T.resize(cap_threads * cap_dst);
             t_col_grad.resize(cap_threads * cap_out_rank);
             t_col_grad_contrib.resize(cap_threads * cap_out_rank);
             t_gamma_grad.resize(cap_threads * cap_rank);
             t_gamma_grad_contrib.resize(cap_threads * cap_rank);
+            group_dx.resize(cap_groups * cap_dst);
+            group_col_grad.resize(cap_groups * cap_out_rank);
+            group_col_grad_contrib.resize(cap_groups * cap_out_rank);
         }
     };
     DisldoBackwardScratch disldo_backward_scratch;
