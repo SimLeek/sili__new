@@ -1816,13 +1816,17 @@ class DIDLDOLayerV {
     }
 
     py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                                  V max_abs_delta = 0.0f) {
+                                  bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                                  V beta2 = 0.999f, V eps = 1e-8f, V min_decay_frac = 0.0f,
+                                  V max_abs_delta = 2.0f, V max_ci = 100.0f,
+                                  bool scale_invariant = false) {
         auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         std::vector<V> dx(std::size_t(batch) * n_inputs());
         didldo_backward((const V*)xbuf.ptr, (const V*)dybuf.ptr, weights, dx.data(), batch,
-                        num_cpus, learning_rate, max_abs_delta);
+                        num_cpus, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
+                        min_decay_frac, max_abs_delta, max_ci, scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1841,12 +1845,17 @@ class DIDLDOLayerV {
 
     py::array_t<V> backward_sparse(py::array_t<V> x, py::array_t<S> dy_ptrs,
                                    py::array_t<S> dy_indices, py::array_t<V> dy_values, S batch,
-                                   V learning_rate = 0.01f) {
+                                   V learning_rate = 0.01f, bool lr_per_row_nnz = false,
+                                   bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+                                   V min_decay_frac = 0.0f, V max_abs_delta = 2.0f,
+                                   V max_ci = 100.0f, bool scale_invariant = false) {
         auto xbuf = x.request();
         auto pb = dy_ptrs.request(), ib = dy_indices.request(), vb = dy_values.request();
         std::vector<V> dx(std::size_t(batch) * n_inputs());
         sidldo_backward((const V*)xbuf.ptr, (const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr,
-                        batch, weights, bwd_scratch, dx.data(), learning_rate);
+                        batch, weights, bwd_scratch, dx.data(), learning_rate, lr_per_row_nnz,
+                        damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta, max_ci,
+                        scale_invariant);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1894,16 +1903,16 @@ class DIDLDOLayerV {
         return forward_dense(x);
     }
 
-    // max_abs_delta forces the dense (didldo_backward) branch regardless
-    // of the dispatch rule -- sidldo_backward has no clamp implementation
-    // yet (see linear_didldo.hpp's didldo_backward docstring); silently
-    // skipping the clamp on the sidldo branch would make max_abs_delta a
-    // no-op some of the time, which is worse than the small speed cost
-    // of forcing dense here.
+    // didldo_backward/sidldo_backward now implement the SAME
+    // BoundedRMSpropSynapsePolicy formula (see linear_didldo.hpp's
+    // didldo_backward docstring), so unlike before, no kwarg forces one
+    // branch over the other anymore -- whichever the dispatch rule picks
+    // gives the same result.
     py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                            V max_abs_delta = 0.0f) {
-        if (max_abs_delta > 0.0f)
-            return backward_dense(x, dy, learning_rate, max_abs_delta);
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f, V min_decay_frac = 0.0f,
+                            V max_abs_delta = 2.0f, V max_ci = 100.0f,
+                            bool scale_invariant = false) {
         auto dybuf = dy.request();
         const S batch = (dybuf.ndim == 2) ? (S)dybuf.shape[0] : 1;
         const float density =
@@ -1918,24 +1927,34 @@ class DIDLDOLayerV {
             std::copy(ptrs.begin(), ptrs.end(), (S*)p.request().ptr);
             std::copy(idx.begin(), idx.end(), (S*)i.request().ptr);
             std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
-            return backward_sparse(x, p, i, v, batch, learning_rate);
+            return backward_sparse(x, p, i, v, batch, learning_rate, lr_per_row_nnz,
+                                   damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta,
+                                   max_ci, scale_invariant);
         }
-        return backward_dense(x, dy, learning_rate);
+        return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
     }
 
     py::array_t<V> backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
-                            py::array_t<V> dy_values, S batch, V learning_rate = 0.01f) {
+                            py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            V beta2 = 0.999f, V eps = 1e-8f, V min_decay_frac = 0.0f,
+                            V max_abs_delta = 2.0f, V max_ci = 100.0f,
+                            bool scale_invariant = false) {
         auto ib = dy_indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
         if (group_b_backward_use_sidldo(batch, density))
-            return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate);
+            return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
+                                   lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
+                                   max_abs_delta, max_ci, scale_invariant);
         auto pb = dy_ptrs.request(), vb = dy_values.request();
         std::vector<float> dense;
         _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_outputs(),
                       dense);
         py::array_t<V> dy({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
         std::copy(dense.begin(), dense.end(), (V*)dy.request().ptr);
-        return backward_dense(x, dy, learning_rate);
+        return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
     }
 
     py::array_t<V> get_weights_vals() const {
@@ -4259,12 +4278,22 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("num_cpus") = 4)
         .def("forward_dense", &DIDLDOLayerV::forward_dense, py::arg("x"))
         .def("backward_dense", &DIDLDOLayerV::backward_dense, py::arg("x"), py::arg("dy"),
-             py::arg("learning_rate"), py::arg("max_abs_delta") = 0.0f)
+             py::arg("learning_rate"), py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("forward_sparse", &DIDLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
              py::arg("values"), py::arg("batch"))
         .def("backward_sparse", &DIDLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
              py::arg("dy_indices"), py::arg("dy_values"), py::arg("batch"),
-             py::arg("learning_rate") = 0.01f)
+             py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("forward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
                  py::array_t<DIDLDOLayerV::V>)>(&DIDLDOLayerV::forward),
@@ -4276,16 +4305,29 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("ptrs"), py::arg("indices"), py::arg("values"), py::arg("batch"))
         .def("backward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
-                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::V,
-                 DIDLDOLayerV::V)>(&DIDLDOLayerV::backward),
-             py::arg("x"), py::arg("dy"), py::arg("learning_rate"), py::arg("max_abs_delta") = 0.0f)
+                 py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::V, bool,
+                 bool, DIDLDOLayerV::V, DIDLDOLayerV::V, DIDLDOLayerV::V, DIDLDOLayerV::V,
+                 DIDLDOLayerV::V, bool)>(&DIDLDOLayerV::backward),
+             py::arg("x"), py::arg("dy"), py::arg("learning_rate"),
+             py::arg("lr_per_row_nnz") = false, py::arg("damp_by_importance") = true,
+             py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
+             py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("backward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
                  py::array_t<DIDLDOLayerV::V>, py::array_t<DIDLDOLayerV::S>,
                  py::array_t<DIDLDOLayerV::S>, py::array_t<DIDLDOLayerV::V>, DIDLDOLayerV::S,
-                 DIDLDOLayerV::V)>(&DIDLDOLayerV::backward),
+                 DIDLDOLayerV::V, bool, bool, DIDLDOLayerV::V, DIDLDOLayerV::V, DIDLDOLayerV::V,
+                 DIDLDOLayerV::V, DIDLDOLayerV::V, bool)>(&DIDLDOLayerV::backward),
              py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
-             py::arg("batch"), py::arg("learning_rate") = 0.01f)
+             py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
+             py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
+             py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
+             py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def_property_readonly("weights_vals", &DIDLDOLayerV::get_weights_vals)
         .def("load_dense_values", &DIDLDOLayerV::load_dense_values, py::arg("weight_values"))
         .def_readonly("num_cpus", &DIDLDOLayerV::num_cpus)

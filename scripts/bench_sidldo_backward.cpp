@@ -73,8 +73,8 @@ int main(int argc, char** argv) {
             }
             double t_bwd0 = t / reps;
 
-            // bwdX (lr!=0, grad+update) -- persistent square_avg across
-            // reps, same as every other backward bench in this arc.
+            // bwdX (lr!=0, grad+update) -- persistent ci across reps,
+            // same as every other backward bench in this arc.
             for (int i = 0; i < 10; ++i)
                 sidldo_backward(x.data(), dy_ptrs.data(), dy_idx.data(), dy_val.data(), batch,
                                 weights, scratch, dx.data(), 1e-3f);

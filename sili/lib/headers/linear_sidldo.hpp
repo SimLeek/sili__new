@@ -270,11 +270,13 @@ inline void sidldo_forward(const int* x_ptrs, const int* x_idx, const float* x_v
 
 // Backward-only scratch, persistent and grow-only.
 struct SidldoBackwardScratch {
-    std::vector<int> active_col;   // SORTED ascending -- see sidldo_backward
-    std::vector<int> inverse_map;  // [n_out], -1 sentinel
-    std::vector<float> w_masked;   // [n_in x num_active]: row r = W[r,active_col[:]]
-    std::vector<float> dy_compact; // [batch x num_active]
-    std::vector<float> dw_compact; // [n_in x num_active]
+    std::vector<int> active_col;        // SORTED ascending -- see sidldo_backward
+    std::vector<int> inverse_map;       // [n_out], -1 sentinel
+    std::vector<float> w_masked;        // [n_in x num_active]: row r = W[r,active_col[:]]
+    std::vector<float> dy_compact;      // [batch x num_active]
+    std::vector<float> dw_compact;      // [n_in x num_active]
+    std::vector<float> mask_compact;    // [batch x num_active]: 1.0 where dy explicitly present
+    std::vector<float> contrib_compact; // [n_in x num_active]: x^T @ mask_compact, then *= w_masked
 
     void ensure(std::size_t n_in, std::size_t n_out, std::size_t batch) {
         if (inverse_map.size() < n_out)
@@ -287,18 +289,31 @@ struct SidldoBackwardScratch {
             dy_compact.resize(batch * n_out);
         if (dw_compact.size() < n_in * n_out)
             dw_compact.resize(n_in * n_out);
+        if (mask_compact.size() < batch * n_out)
+            mask_compact.resize(batch * n_out);
+        if (contrib_compact.size() < n_in * n_out)
+            contrib_compact.resize(n_in * n_out);
     }
 };
 
 // x[batch,n_in] dense. dy_ptrs[batch+1]/dy_idx[nnz]/dy_val[nnz]: per-
 // sample CSR, row=sample, column=output feature index. dx[batch,n_in]
 // overwritten (caller-owned). Always computes dx+dw, gates the in-place
-// RMSprop update on lr != 0 (lr=0.0 = grad-only, lr!=0 = grad+update),
-// matching disldo_backward/didldo_backward's own shape -- no separate
-// optimizer call anywhere.
+// update on lr != 0 (lr=0.0 = grad-only, lr!=0 = grad+update), matching
+// disldo_backward/didldo_backward's own shape -- no separate optimizer
+// call anywhere. Same BoundedRMSpropSynapsePolicy port as didldo_backward
+// (see its own docstring, linear_didldo.hpp) -- NOT vanilla RMSprop, and
+// must match didldo_backward's formula exactly so DIDLDOLayerV's smart
+// backward() dispatcher gives the same result whichever of the two it
+// picks (group_b_backward_use_sidldo, engine_select.hpp).
 inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_idx,
                             const float* dy_val, int batch, DenseLinearWeights& weights,
-                            SidldoBackwardScratch& scratch, float* dx, float lr) {
+                            SidldoBackwardScratch& scratch, float* dx, float lr,
+                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
+                            float beta2 = 0.999f, float eps = 1e-8f, float min_decay_frac = 0.0f,
+                            float max_abs_delta = 2.0f, float max_ci = 100.0f,
+                            bool scale_invariant = false) {
+    (void)scale_invariant; // no S concept here -- see didldo_backward's own docstring
     const int n_in = static_cast<int>(weights.n_in);
     const int n_out = static_cast<int>(weights.n_out);
     scratch.ensure(weights.n_in, weights.n_out, std::size_t(batch));
@@ -348,10 +363,17 @@ inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_id
 
     std::fill(scratch.dy_compact.begin(),
               scratch.dy_compact.begin() + std::size_t(batch) * num_active, 0.0f);
+    std::fill(scratch.mask_compact.begin(),
+              scratch.mask_compact.begin() + std::size_t(batch) * num_active, 0.0f);
     for (int b = 0; b < batch; ++b) {
         float* row = scratch.dy_compact.data() + std::size_t(b) * num_active;
-        for (int i = dy_ptrs[b]; i < dy_ptrs[b + 1]; ++i)
-            row[scratch.inverse_map[dy_idx[i]]] = dy_val[i];
+        float* mrow = scratch.mask_compact.data() + std::size_t(b) * num_active;
+        for (int i = dy_ptrs[b]; i < dy_ptrs[b + 1]; ++i) {
+            const int local = scratch.inverse_map[dy_idx[i]];
+            row[local] = dy_val[i];
+            mrow[local] = 1.0f; // explicit presence, not "dy_val != 0" -- see disldo_backward_
+                                // sparse_grad's own contrib gating (sisldo_ops.hpp)
+        }
     }
     for (int i = 0; i < num_active; ++i)
         scratch.inverse_map[scratch.active_col[i]] = -1;
@@ -385,25 +407,48 @@ inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_id
     if (lr == 0.0f)
         return;
 
-    // In-place RMSprop, applied directly at the real weight positions --
-    // hand-rolled, not VML, same reasoning as the high-batch forward
-    // path (gathering/scattering a compact square_avg buffer just to use
-    // VML would cost more than this plain loop saves). Row-major outer
-    // loop, same cache-locality fix as the gather above -- the old
-    // version's outer-column/inner-row order had the identical strided-
-    // write problem the gather did.
-    constexpr float alpha = 0.99f;
-    constexpr float eps = 1e-8f;
+    // contrib_compact[r,i] = w_masked[r,i] * (sum over ONLY the batch
+    // samples where active_col[i] has an EXPLICIT dy entry of x[b,r]).
+    // NOT a plain column-sum of x -- disldo_backward_sparse_grad
+    // (sisldo_ops.hpp) only accumulates contrib for (row,col,sample)
+    // triples where the sparse dy actually has that entry (its
+    // `contrib_sum[e] += in_val * w_buf[e]` sits inside the merge-scan's
+    // "found a matching sparse dy index" branch) -- a sample that simply
+    // doesn't touch this column doesn't contribute to contrib either,
+    // unlike the dense-dy path (didldo_backward) where every batch
+    // sample always "touches" every column (dy is fully materialized,
+    // even where its value happens to be 0). Getting this wrong (summing
+    // x over the WHOLE batch regardless of per-column activity, this
+    // function's first attempt) measurably diverged from DISLDO's real
+    // update -- see test_group_b_engine_select.py's cross-group test.
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, n_in, num_active, batch, 1.0f, x, n_in,
+                scratch.mask_compact.data(), num_active, 0.0f, scratch.contrib_compact.data(),
+                num_active);
+
+    // effective_lr: same nnz_row==n_out-per-row reasoning as
+    // didldo_backward -- DenseLinearWeights is fully dense regardless of
+    // which columns THIS call's dy happened to touch.
+    const float effective_lr = lr_per_row_nnz ? (lr / float(n_out)) : lr;
+
+    // Gather+update+scatter ci at the real weight positions, hand-rolled
+    // (not VML), same reasoning as the high-batch forward path -- row-
+    // major outer loop, same cache-locality fix as the w/dy gather above.
     for (int r = 0; r < n_in; ++r) {
         float* w_row = weights.w.data() + std::size_t(r) * n_out;
-        float* sq_row = weights.square_avg.data() + std::size_t(r) * n_out;
+        float* ci_row = weights.ci.data() + std::size_t(r) * n_out;
         const float* dw_row = scratch.dw_compact.data() + std::size_t(r) * num_active;
+        const float* xmask_row = scratch.contrib_compact.data() + std::size_t(r) * num_active;
         for (int i = 0; i < num_active; ++i) {
             const int c = scratch.active_col[i];
             const float g = dw_row[i];
-            float& sq = sq_row[c];
-            sq = alpha * sq + (1.0f - alpha) * g * g;
-            w_row[c] -= lr * g / (std::sqrt(sq) + eps);
+            const float contrib = w_row[c] * xmask_row[i]; // w_row[c] still batch-start value
+            float& ci = ci_row[c];
+            const float ema = beta2 * ci + (1.0f - beta2) * (g * g + contrib * contrib);
+            const float floor_v = min_decay_frac * ci;
+            ci = std::min(std::max(ema, floor_v), max_ci);
+            float raw = damp_by_importance ? (-g) / (std::sqrt(ci) + eps) : (-g);
+            raw = std::min(std::max(raw, -max_abs_delta), max_abs_delta);
+            w_row[c] += effective_lr * raw;
         }
     }
 }

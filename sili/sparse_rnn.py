@@ -1107,9 +1107,16 @@ class DIDLDOLayer32(Module):
     `forward_dense`/`forward_sparse`/`backward_dense`/`backward_sparse`
     remain on `self._c` directly for an explicit, no-decision-making call.
 
-    No block4/CSR growth, importance, probes, or rank-N-scale machinery
-    here -- DenseLinearWeights is just a plain [n_in x n_out] float array
-    plus its own RMSprop running-average buffer, nothing to grow into.
+    No block4/CSR growth, probes, or rank-N-scale machinery here --
+    DenseLinearWeights is just a plain [n_in x n_out] float array, no
+    growth to grow into. It DOES carry per-weight importance (`ci`) and
+    use the same BoundedRMSpropSynapsePolicy update as DISLDOLayer32
+    (see DenseLinearWeights/didldo_backward's own docstring,
+    linear_didldo.hpp) -- importance IS the optimizer
+    (feedback_importance_is_already_the_optimizer memory), so dense
+    storage needs the same one DISLDO uses, not a different one, or
+    DIDLDO's results would silently diverge from DISLDO's on the same
+    weights and break the "same group, interchangeable" invariant.
     fp32 only (BLAS is inherently single-precision); see DIDLDOLayer8/
     DIDLDOLayer4 below for the not-yet-implemented fp8/fp4 siblings,
     same per-precision-class convention DISLDOLayer32/8/etc. already use."""
@@ -1163,19 +1170,21 @@ class DIDLDOLayer32(Module):
         self,
         x,
         learning_rate: float = 0.0,
-        requires_grad: bool = True,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        min_decay_frac: float | None = None,
         max_abs_delta: float | None = None,
         max_ci: float | None = None,
-        damp_by_importance: bool | None = None,
+        scale_invariant: bool = False,
+        requires_grad: bool = True,
     ) -> Tensor:
-        # max_ci/damp_by_importance accepted-and-ignored: no importance/ci
-        # concept exists on DenseLinearWeights to clamp or damp (see class
-        # docstring). max_abs_delta IS honored (didldo_backward's own
-        # clamp, linear_didldo.hpp) -- all three exist purely so this
-        # class is a drop-in disldo_cls next to DISLDOLayer32 for callers
-        # that always pass them (e.g. sili_peridot's NOCAPS_KWARGS_FP32 +
-        # ToyTileRecurrenceRMT._l1_sparsity_split's damp_by_importance=False).
-        del max_ci, damp_by_importance
+        # Same call convention as DISLDOLayer32.forward (lr_per_row_nnz
+        # default True included) -- ci IS honored here now (Bounded
+        # RMSprop importance, see DenseLinearWeights/didldo_backward's own
+        # docstring, linear_didldo.hpp) via self._c.backward, not a
+        # separate optimizer. scale_invariant accepted for signature
+        # parity only -- no value_scale/output_scale concept exists on
+        # dense storage for it to normalize against, so it has no effect.
         if not isinstance(x, Tensor):
             x = Tensor(np.asarray(x, dtype=np.float32))
         if x.is_csr:
@@ -1200,8 +1209,23 @@ class DIDLDOLayer32(Module):
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
                 dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
-                extra = {} if max_abs_delta is None else {"max_abs_delta": max_abs_delta}
-                dx = self._c.backward(x_dense, dy2d, learning_rate, **extra)
+                extra = {}
+                if min_decay_frac is not None:
+                    extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None:
+                    extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None:
+                    extra["max_ci"] = max_ci
+                if scale_invariant:
+                    extra["scale_invariant"] = True
+                dx = self._c.backward(
+                    x_dense,
+                    dy2d,
+                    learning_rate,
+                    lr_per_row_nnz=lr_per_row_nnz,
+                    damp_by_importance=damp_by_importance,
+                    **extra,
+                )
                 if was_1d:
                     dx = dx.squeeze(0)
                 _acc(x, dx)

@@ -100,25 +100,43 @@ static void run_case(const char* label, int n_in, int n_out, int batch, unsigned
     CHECK(w_drift_bwd0 < 1e-8, "%s: bwd0 (lr=0) must not mutate weights, drift %.8f", label,
           w_drift_bwd0);
 
-    // backward, lr!=0 (bwdX): dx still correct, w updates match a
-    // reference RMSprop step applied to the reference dw.
+    // backward, lr!=0 (bwdX): dx still correct, w updates match
+    // BoundedRMSpropSynapsePolicy applied to the reference dw/contrib --
+    // NOT vanilla RMSprop, see didldo_backward's own docstring
+    // (importance is the optimizer, feedback_importance_is_already_the_
+    // optimizer memory). Defaults: lr_per_row_nnz=false,
+    // damp_by_importance=true, beta2=0.999, eps=1e-8, min_decay_frac=0,
+    // max_abs_delta=2.0, max_ci=100.0 -- same as
+    // DISLDOLayerV::backward_dense's own C++ defaults (cpu_backend.cpp).
     weights.w = w0;
-    weights.square_avg.assign(weights.square_avg.size(), 0.0f);
+    weights.ci.assign(weights.ci.size(), 0.0f);
     const float lr = 1e-2f;
     didldo_backward(x.data(), dy.data(), weights, dx.data(), batch, 4, lr);
     dx_err = max_abs_diff(dx, dx_ref);
     CHECK(dx_err < 1e-2, "%s: bwdX dx max abs err %.6f too large", label, dx_err);
 
     auto dw_ref = ref_dw(x, dy, batch, n_in, n_out);
+    std::vector<float> colsum_x(std::size_t(n_in), 0.0f);
+    for (int b = 0; b < batch; ++b)
+        for (int r = 0; r < n_in; ++r)
+            colsum_x[std::size_t(r)] += x[std::size_t(b) * n_in + r];
+
     std::vector<float> w_expect = w0;
-    const float alpha = 0.99f, eps = 1e-8f;
-    std::vector<float> sq(w0.size(), 0.0f);
-    for (std::size_t i = 0; i < w0.size(); ++i) {
-        sq[i] = alpha * sq[i] + (1.0f - alpha) * dw_ref[i] * dw_ref[i];
-        w_expect[i] -= lr * dw_ref[i] / (std::sqrt(sq[i]) + eps);
-    }
+    const float beta2 = 0.999f, eps = 1e-8f, max_abs_delta = 2.0f, max_ci = 100.0f;
+    std::vector<float> ci(w0.size(), 0.0f);
+    for (int r = 0; r < n_in; ++r)
+        for (int c = 0; c < n_out; ++c) {
+            const std::size_t i = std::size_t(r) * n_out + c;
+            const float g = dw_ref[i];
+            const float contrib = w0[i] * colsum_x[std::size_t(r)];
+            const float ema = beta2 * ci[i] + (1.0f - beta2) * (g * g + contrib * contrib);
+            ci[i] = std::min(std::max(ema, 0.0f), max_ci); // min_decay_frac=0 -> floor=0
+            float raw = -g / (std::sqrt(ci[i]) + eps);
+            raw = std::min(std::max(raw, -max_abs_delta), max_abs_delta);
+            w_expect[i] += lr * raw;
+        }
     double w_err = max_abs_diff(weights.w, w_expect);
-    CHECK(w_err < 1e-2, "%s: bwdX RMSprop-updated weights max abs err %.6f too large", label,
+    CHECK(w_err < 1e-2, "%s: bwdX BoundedRMSprop-updated weights max abs err %.6f too large", label,
           w_err);
 }
 

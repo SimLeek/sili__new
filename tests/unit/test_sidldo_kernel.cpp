@@ -164,9 +164,16 @@ static void run_backward_case(const char* label, int n_in, int n_out, int batch,
     double w_drift = max_abs_diff(weights.w, w0);
     CHECK(w_drift < 1e-8, "%s: bwd0 (lr=0) must not mutate weights, drift %.8f", label, w_drift);
 
-    // bwdX: dx still correct, weights match a reference RMSprop step.
+    // bwdX: dx still correct, weights match BoundedRMSpropSynapsePolicy
+    // (NOT vanilla RMSprop -- see sidldo_backward's own docstring,
+    // linear_sidldo.hpp). Same defaults as DISLDOLayerV::backward_dense
+    // (cpu_backend.cpp): damp_by_importance=true, beta2=0.999, eps=1e-8,
+    // min_decay_frac=0, max_abs_delta=2.0, max_ci=100.0. At columns no
+    // sample's dy ever touches, g=0 for every row regardless of contrib,
+    // so raw=0 and the weight is unaffected either way -- safe to apply
+    // this update uniformly over every (r,c), not just active columns.
     weights.w = w0;
-    weights.square_avg.assign(weights.square_avg.size(), 0.0f);
+    weights.ci.assign(weights.ci.size(), 0.0f);
     const float lr = 1e-2f;
     sidldo_backward(x.data(), dy_ptrs.data(), dy_idx.data(), dy_val.data(), batch, weights, scratch,
                     dx.data(), lr);
@@ -174,15 +181,40 @@ static void run_backward_case(const char* label, int n_in, int n_out, int batch,
     CHECK(dx_err < 1e-2, "%s: bwdX dx max abs err %.6f too large", label, dx_err);
 
     auto dw_ref = ref_dw();
+    // masked_colsum[r,c] = sum over ONLY samples b whose dy explicitly
+    // has column c of x[b,r] -- NOT a plain column-sum of x. Matches
+    // disldo_backward_sparse_grad's own contrib gating (sisldo_ops.hpp,
+    // contrib_sum[e] accumulated only inside its merge-scan match
+    // branch) -- a sample that doesn't touch a column contributes
+    // nothing toward that column's contrib either, unlike the dense-dy
+    // path. dy_dense's nonzero pattern IS the explicit-entry pattern
+    // here (this test's random values are never exactly 0.0).
+    std::vector<float> masked_colsum(std::size_t(n_in) * std::size_t(n_out), 0.0f);
+    for (int b = 0; b < batch; ++b)
+        for (int c = 0; c < n_out; ++c) {
+            if (dy_dense[std::size_t(b) * n_out + std::size_t(c)] == 0.0f)
+                continue;
+            for (int r = 0; r < n_in; ++r)
+                masked_colsum[std::size_t(r) * n_out + std::size_t(c)] +=
+                    x[std::size_t(b) * n_in + std::size_t(r)];
+        }
+
     std::vector<float> w_expect = w0;
-    const float alpha = 0.99f, eps = 1e-8f;
-    std::vector<float> sq(w0.size(), 0.0f);
-    for (std::size_t i = 0; i < w0.size(); ++i) {
-        sq[i] = alpha * sq[i] + (1.0f - alpha) * dw_ref[i] * dw_ref[i];
-        w_expect[i] -= lr * dw_ref[i] / (std::sqrt(sq[i]) + eps);
-    }
+    const float beta2 = 0.999f, eps = 1e-8f, max_abs_delta = 2.0f, max_ci = 100.0f;
+    std::vector<float> ci(w0.size(), 0.0f);
+    for (int r = 0; r < n_in; ++r)
+        for (int c = 0; c < n_out; ++c) {
+            const std::size_t i = std::size_t(r) * std::size_t(n_out) + std::size_t(c);
+            const float g = dw_ref[i];
+            const float contrib = w0[i] * masked_colsum[i];
+            const float ema = beta2 * ci[i] + (1.0f - beta2) * (g * g + contrib * contrib);
+            ci[i] = std::min(std::max(ema, 0.0f), max_ci);
+            float raw = -g / (std::sqrt(ci[i]) + eps);
+            raw = std::min(std::max(raw, -max_abs_delta), max_abs_delta);
+            w_expect[i] += lr * raw;
+        }
     double w_err = max_abs_diff(weights.w, w_expect);
-    CHECK(w_err < 1e-2, "%s: bwdX RMSprop-updated weights max abs err %.6f too large", label,
+    CHECK(w_err < 1e-2, "%s: bwdX BoundedRMSprop-updated weights max abs err %.6f too large", label,
           w_err);
 }
 

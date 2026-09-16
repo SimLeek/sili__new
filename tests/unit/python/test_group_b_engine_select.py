@@ -102,21 +102,27 @@ class TestDIDLDOLayerVExplicitCalls:
 
     def test_backward_dense_max_abs_delta_clamps_update(self):
         """max_abs_delta: sili_peridot's NOCAPS_KWARGS_FP32-style guard
-        against unbounded RMSprop blowup (linear_didldo.hpp's
-        didldo_backward). A huge lr with a tight clamp must move weights
-        by at most max_abs_delta per element; the same lr with the clamp
-        off (default 0.0) must move them further."""
+        against unbounded weight blowup (linear_didldo.hpp's
+        didldo_backward). Clips the RAW (pre-lr-multiply) update, matching
+        BoundedRMSpropSynapsePolicy::update_cw's own clip-order (delta_
+        csr_types.hpp:synapse_policy.clip_order_and_lr_ceiling) -- so the
+        actual weight delta is bounded by lr*max_abs_delta, not
+        max_abs_delta alone. A huge lr with a tight clamp must move
+        weights by at most lr*max_abs_delta per element; the same lr with
+        an effectively-disabled clamp must move them further."""
         layer, w, rng = _layer()
         x = rng.uniform(-1, 1, (3, 8)).astype(np.float32)
         dy = rng.uniform(-1, 1, (3, 5)).astype(np.float32)
+        lr = 10.0
+        max_abs_delta = 0.01
         w_before = layer.weights_vals.copy()
-        layer.backward_dense(x, dy, 10.0, 0.01)
+        layer.backward_dense(x, dy, lr, max_abs_delta=max_abs_delta)
         clamped_delta = np.abs(layer.weights_vals - w_before)
-        assert clamped_delta.max() <= 0.01 + 1e-5
+        assert clamped_delta.max() <= lr * max_abs_delta + 1e-4
 
         layer2, _, _ = _layer()
         w2_before = layer2.weights_vals.copy()
-        layer2.backward_dense(x, dy, 10.0)
+        layer2.backward_dense(x, dy, lr, max_abs_delta=1e9)
         unclamped_delta = np.abs(layer2.weights_vals - w2_before)
         assert unclamped_delta.max() > clamped_delta.max()
 
@@ -174,6 +180,101 @@ class TestDIDLDOLayerVOutputNotAliased:
         y2 = layer.forward_dense(x2)
         assert not np.allclose(y1, y2)
         assert not np.shares_memory(y1, y2)
+
+
+class TestGroupACrossGroupBSameOptimizer:
+    """DIDLDOLayerV/SIDLDOLayerV must use the SAME optimizer as
+    DISLDOLayerV/SISLDOLayerV -- BoundedRMSpropSynapsePolicy
+    (delta_csr_types.hpp), where per-synapse importance (ci) already IS
+    the adaptive optimizer (feedback_importance_is_already_the_optimizer
+    memory) -- not a different one (e.g. plain RMSprop). Given the SAME
+    starting weights/ci and the SAME x/dy/hyperparameters, DISLDO's dense
+    path (Group A) and DIDLDO's dense path (Group B) must land on the
+    SAME updated weights; same for DISLDO's sparse-grad path
+    (disldo_backward_sparse_grad) and SIDLDO's (sidldo_backward). A
+    mismatch here means DIDLDO/SIDLDO silently diverge from DISLDO/
+    SISLDO on identical inputs -- breaking every group's own
+    'interchangeable, only speed differs' invariant, not just the
+    engine-select dispatch's.
+
+    Compares via a forward-probe (layer.forward_dense(np.eye(n_in))
+    reconstructs the true dense weight matrix regardless of each class's
+    internal storage layout -- CSR/block4 for DISLDOLayerV, plain array
+    for DIDLDOLayerV) rather than any raw internal accessor, so the test
+    doesn't need to know either class's storage format."""
+
+    def _matched_pair(self, n_in=6, n_out=5, seed=0):
+        rng = np.random.default_rng(seed)
+        w = rng.standard_normal((n_in, n_out)).astype(np.float32)
+        a = _cpu.DISLDOLayerV(n_in, n_out, n_in * n_out, 4)
+        a.load_dense_values(w.flatten(), np.zeros(n_in * n_out, dtype=np.float32))
+        b = _cpu.DIDLDOLayerV(n_in, n_out, 4)
+        b.load_dense_values(w.flatten())
+        return a, b, rng
+
+    def _true_dense_weights(self, layer, n_in):
+        return layer.forward_dense(np.eye(n_in, dtype=np.float32))
+
+    def test_backward_dense_matches_disldo_backward(self):
+        n_in, n_out = 6, 5
+        a, b, rng = self._matched_pair(n_in, n_out, seed=10)
+        x = rng.uniform(-1, 1, (4, n_in)).astype(np.float32)
+        dy = rng.uniform(-1, 1, (4, n_out)).astype(np.float32)
+        a.backward_dense(x, dy, 1e-2)
+        b.backward_dense(x, dy, 1e-2)
+        np.testing.assert_allclose(
+            self._true_dense_weights(a, n_in), self._true_dense_weights(b, n_in), atol=1e-3, rtol=1e-3
+        )
+
+    def test_backward_sparse_grad_matches_disldo_backward_sparse_grad(self):
+        n_in, n_out = 6, 5
+        a, b, rng = self._matched_pair(n_in, n_out, seed=11)
+        x = rng.uniform(-1, 1, (4, n_in)).astype(np.float32)
+        dy_dense = rng.uniform(-1, 1, (4, n_out)).astype(np.float32)
+        _, dp, di, dv = _dense_csr(dy_dense, rng, keep_prob=0.5)
+        a.backward_sparse(x, dp, di, dv, 4, 1e-2)
+        b.backward_sparse(x, dp, di, dv, 4, 1e-2)
+        np.testing.assert_allclose(
+            self._true_dense_weights(a, n_in), self._true_dense_weights(b, n_in), atol=1e-3, rtol=1e-3
+        )
+
+    def test_backward_dense_max_abs_delta_matches_disldo(self):
+        """Non-default hyperparameters (tight max_abs_delta, huge lr) must
+        still agree -- not just the C++ defaults."""
+        n_in, n_out = 6, 5
+        a, b, rng = self._matched_pair(n_in, n_out, seed=12)
+        x = rng.uniform(-1, 1, (4, n_in)).astype(np.float32)
+        dy = rng.uniform(-1, 1, (4, n_out)).astype(np.float32)
+        a.backward_dense(x, dy, 5.0, max_abs_delta=0.05)
+        b.backward_dense(x, dy, 5.0, max_abs_delta=0.05)
+        np.testing.assert_allclose(
+            self._true_dense_weights(a, n_in), self._true_dense_weights(b, n_in), atol=1e-3, rtol=1e-3
+        )
+
+    def test_didldolayer_smart_dispatch_dense_vs_sparse_engine_agree_at_lr_nonzero(self):
+        """Group B internal consistency at lr!=0 (the existing
+        TestDIDLDOLayerVSmartDispatchMatchesExplicit only covers lr=0,
+        i.e. the gradient-only path -- it never exercised the optimizer
+        formula, exactly where a didldo/sidldo formula mismatch would
+        show up). dy given as a FULLY dense CSR (keep_prob=1.0) so
+        backward_sparse exercises sidldo_backward's real code path while
+        still being numerically equivalent to the dense call."""
+        n_in, n_out = 6, 5
+        rng = np.random.default_rng(13)
+        w = rng.standard_normal((n_in, n_out)).astype(np.float32)
+        b1 = _cpu.DIDLDOLayerV(n_in, n_out, 4)
+        b1.load_dense_values(w.flatten())
+        b2 = _cpu.DIDLDOLayerV(n_in, n_out, 4)
+        b2.load_dense_values(w.flatten())
+
+        x = rng.uniform(-1, 1, (4, n_in)).astype(np.float32)
+        dy_dense = rng.uniform(-1, 1, (4, n_out)).astype(np.float32)
+        _, dp, di, dv = _dense_csr(dy_dense, rng, keep_prob=1.0)
+        b1.backward_dense(x, dy_dense, 1e-2)
+        b2.backward_sparse(x, dp, di, dv, 4, 1e-2)
+        np.testing.assert_allclose(
+            self._true_dense_weights(b1, n_in), self._true_dense_weights(b2, n_in), atol=1e-3, rtol=1e-3
+        )
 
 
 class TestDISLDOLayerVRetrofitRegression:

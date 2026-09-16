@@ -1030,3 +1030,89 @@ run against this layer are the likely deciding factors, not yet
 formalized). A real recommender, and the fuller multi-dimensional
 surface the coarse rules above are standing in for, are both scoped as
 separate future work in ``TODO_BATCH_BLOCKING.md`` ("Also queued").
+
+.. _sparse_rnn.didldo_same_optimizer_as_disldo:
+
+DIDLDO/SIDLDO must use DISLDO's real optimizer, not vanilla RMSprop
+------------------------------------------------------------------------------------------
+
+*ID:* ``sparse_rnn.didldo_same_optimizer_as_disldo``
+
+``didldo_backward``/``sidldo_backward`` (``linear_didldo.hpp``/
+``linear_sidldo.hpp``) originally used a hand-rolled plain RMSprop
+update. That is a DIFFERENT optimizer than ``disldo_backward``/
+``disldo_backward_sparse_grad`` (``sisldo_ops.hpp``) actually run --
+per the ``feedback_importance_is_already_the_optimizer`` memory,
+DISLDO's per-synapse "importance" (``ci``) already IS the adaptive
+optimizer state (``BoundedRMSpropSynapsePolicy``, ``delta_csr_types.
+hpp``), not a separate bookkeeping value alongside one. Dense storage
+still needs the identical optimizer, or DIDLDO/SIDLDO silently diverge
+from DISLDO/SISLDO on identical weights/inputs -- breaking the "same
+group, interchangeable, only speed differs" invariant every real-time
+dispatcher above depends on. Fixed 2026-09-16.
+
+**The real formula** (``BoundedRMSpropSynapsePolicy::update_ci``/
+``update_cw``): ``ci = clip(beta2*ci + (1-beta2)*(g^2+contrib^2),
+min_decay_frac*ci, max_ci)``, where ``contrib = x * w_start`` (the
+synapse's actual output contribution this call, not just its
+gradient) and ``w_start`` is the weight value snapshotted at the START
+of the batch (never the mid-update value). The weight delta clips the
+RAW (pre-lr) update to ``+/-max_abs_delta`` BEFORE multiplying by
+``effective_lr`` -- clipping after would make ``max_abs_delta`` an
+absolute cap independent of ``lr``, a real bug fixed once already on
+the scattered/block4 side (``synapse_policy.clip_order_and_lr_ceiling``).
+
+**Dense-dy contrib** (``didldo_backward``): every batch sample "touches"
+every column (dy is fully materialized even where its value is 0), so
+``contrib_agg[i,j] = w[i,j] * sum_b(x[b,i])`` -- one MKL sgemv
+(``ones^T @ x``) gives the column-sum, then a per-row broadcast
+multiply against ``w``.
+
+**Sparse-dy contrib** (``sidldo_backward``) is NOT the same reduction --
+this was a real bug caught by the cross-group test below, not just a
+formula port. ``disldo_backward_sparse_grad`` only accumulates
+``contrib`` for ``(row, col, sample)`` triples where the sparse dy
+actually HAS that explicit entry (its merge-scan gates
+``contrib_sum[e] += in_val * w_buf[e]`` inside the "found a matching
+index" branch) -- a sample that simply doesn't touch a column
+contributes nothing to that column's contrib either, unlike the
+dense-dy case where an absent contribution just means a stored 0.
+First attempt used a plain global column-sum of ``x`` (matching the
+dense-dy formula), which measurably diverged from DISLDO's real update
+(~1% on some elements, a handful of synapses per call, at
+n_in=6/n_out=5/batch=4/density=0.5). Fixed via a
+``mask_compact[batch,num_active]`` matrix (1.0 at explicit dy
+positions, built during the same gather pass as ``dy_compact``) and an
+sgemm (``x^T @ mask_compact``) giving the correctly-gated per-(row,
+active-column) sum, elementwise-multiplied by ``w_masked`` afterward.
+
+**Float-vs-double accumulation caveat**: this is algorithm-exact, not
+bit-exact down to the last ULP. ``disldo_backward`` sums ``g``/
+``contrib`` in DOUBLE per synapse across the batch loop before casting
+to float for the update; DIDLDO/SIDLDO's ``g``/``contrib`` come from
+MKL sgemm/sgemv, which accumulate internally in float. Same formula,
+different summation precision/order -- verified equal within
+``atol=1e-3, rtol=1e-3`` (``tests/unit/python/
+test_group_b_engine_select.py``'s ``TestGroupACrossGroupBSameOptimizer``),
+not exact equality. Getting true bit-exactness would mean abandoning
+BLAS for the ``dw``/``contrib`` reduction (a manual double-accumulating
+loop), which would give up most of DIDLDO's own reason to exist --
+not done, and not expected to be needed (the two-group architecture's
+"interchangeable" premise is about training dynamics being
+equivalent, not about literal bit-for-bit replay).
+
+**Verification**: cross-group tests build a DISLDOLayerV and a
+DIDLDOLayerV from the SAME initial weights (``load_dense_values``, ``ci``
+0 both sides), apply the SAME ``x``/``dy``/hyperparameters via each
+class's ``backward_dense``/``backward_sparse``, and compare the
+resulting TRUE dense weight matrix (via
+``layer.forward_dense(np.eye(n_in))``, sidestepping the need to know
+either class's internal storage layout) -- covers the dense-dy path,
+the sparse-dy path (what caught the contrib-gating bug above),
+non-default hyperparameters, and DIDLDOLayerV's own dense-vs-sparse
+dispatch agreement at ``lr != 0`` (the pre-existing dispatch-match
+tests only ever exercised ``lr=0``, the gradient-only path, so never
+exercised the optimizer formula at all). Plus C++-level
+``test_didldo_kernel.cpp``/``test_sidldo_kernel.cpp`` reference-formula
+fixes -- the old vanilla-RMSprop reference would have hidden this
+exact bug class since it never modeled ``contrib`` at all.

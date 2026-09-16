@@ -26,20 +26,25 @@
 
 #ifdef SILI_HAVE_MKL
 
-// Persistent dense weight + RMSprop state. square_avg/dw_scratch are
-// backward-only scratch, allocated once via resize(), never per-call.
+// Persistent dense weight + optimizer state. ci/dw_scratch/contrib_scratch
+// are backward-only scratch, allocated once via resize(), never per-call.
+// ci is NOT vanilla RMSprop's square_avg -- see didldo_backward's own
+// docstring for why (importance IS the optimizer,
+// feedback_importance_is_already_the_optimizer memory).
 struct DenseLinearWeights {
-    std::vector<float> w;          // [n_in x n_out] row-major
-    std::vector<float> square_avg; // [n_in x n_out] RMSprop running avg, same shape as w
-    std::vector<float> dw_scratch; // [n_in x n_out] backward-only scratch
+    std::vector<float> w;               // [n_in x n_out] row-major
+    std::vector<float> ci;              // [n_in x n_out] BoundedRMSpropSynapsePolicy state
+    std::vector<float> dw_scratch;      // [n_in x n_out] backward-only scratch
+    std::vector<float> contrib_scratch; // [n_in x n_out] backward-only scratch
     std::size_t n_in = 0, n_out = 0;
 
     void resize(std::size_t rows, std::size_t cols) {
         n_in = rows;
         n_out = cols;
         w.assign(rows * cols, 0.0f);
-        square_avg.assign(rows * cols, 0.0f);
+        ci.assign(rows * cols, 0.0f);
         dw_scratch.resize(rows * cols);
+        contrib_scratch.resize(rows * cols);
     }
 };
 
@@ -60,22 +65,26 @@ inline void didldo_forward(const float* x, DenseLinearWeights& weights, float* y
                 weights.w.data(), n_out, 0.0f, y, n_out);
 }
 
-// Always computes dx+dw; gates an in-place RMSprop update on lr != 0
-// (lr=0.0 = grad-only, lr!=0 = grad+update, one function, no separate
-// optimizer call -- matches disldo_backward's own shape). dx is
-// [batch,n_in], caller-owned. max_abs_delta (default 0 = disabled):
-// clamps the per-weight lr*update magnitude before applying, same
-// semantics as disldo_backward's own max_abs_delta (delta_csr_types.hpp)
-// -- ports the fp32-unbounded-weight-blowup guard sili_peridot's
-// DISLDOLayer32 path needed; no max_ci analogue exists here since
-// DenseLinearWeights has no importance/ci concept to clamp.
+// Always computes dx+dw; gates an in-place update on lr != 0 (lr=0.0 =
+// grad-only, lr!=0 = grad+update, one function, no separate optimizer
+// call -- matches disldo_backward's own shape). dx is [batch,n_in],
+// caller-owned. NOT vanilla RMSprop -- BoundedRMSpropSynapsePolicy
+// (delta_csr_types.hpp), same optimizer disldo_backward uses -- see
+// docs/research/sparse_rnn.rst:sparse_rnn.didldo_same_optimizer_as_disldo
+// for the full why (importance IS the optimizer) and the float-vs-double
+// accumulation caveat. scale_invariant is a no-op (S is always 1 here);
+// accepted for signature parity with DISLDOLayerV::backward_dense only.
 inline void didldo_backward(const float* x, const float* dy, DenseLinearWeights& weights, float* dx,
-                            int batch, int num_cpus, float lr, float max_abs_delta = 0.0f) {
+                            int batch, int num_cpus, float lr, bool lr_per_row_nnz = false,
+                            bool damp_by_importance = true, float beta2 = 0.999f, float eps = 1e-8f,
+                            float min_decay_frac = 0.0f, float max_abs_delta = 2.0f,
+                            float max_ci = 100.0f, bool scale_invariant = false) {
     (void)num_cpus;
+    (void)scale_invariant; // no S concept here -- see docstring above
     const int n_in = static_cast<int>(weights.n_in);
     const int n_out = static_cast<int>(weights.n_out);
     float* w = weights.w.data();
-    float* dw = weights.dw_scratch.data();
+    float* dw = weights.dw_scratch.data(); // this call's g_agg, per weight
 
     // dx[batch,n_in] = dy[batch,n_out] @ w[n_in,n_out]^T -- same M=1 GEMV
     // dispatch as didldo_forward, same reason.
@@ -93,31 +102,46 @@ inline void didldo_backward(const float* x, const float* dy, DenseLinearWeights&
     if (lr == 0.0f)
         return;
 
-    // In-place RMSprop routed entirely through MKL (VML + BLAS-1), zero
-    // hand-rolled #pragma omp -- see TODO_BATCH_BLOCKING.md for why.
-    static thread_local std::vector<float> tmp;
-    static thread_local std::vector<float> denom;
-    const std::size_t n = weights.n_in * weights.n_out;
-    tmp.resize(n);
-    denom.resize(n);
-    constexpr float alpha = 0.99f;
-    constexpr float eps = 1e-8f;
-    const int ni = static_cast<int>(n);
+    // contrib_agg[i,j] = w[i,j] * sum_b(x[b,i]) -- see the RST anchor above.
+    static thread_local std::vector<float> colsum_x;
+    static thread_local std::vector<float> ones_batch;
+    colsum_x.resize(std::size_t(n_in));
+    ones_batch.assign(std::size_t(batch), 1.0f);
+    cblas_sgemv(CblasRowMajor, CblasTrans, batch, n_in, 1.0f, x, n_in, ones_batch.data(), 1, 0.0f,
+                colsum_x.data(), 1);
+    float* contrib = weights.contrib_scratch.data();
+    for (int i = 0; i < n_in; ++i) {
+        const float s = colsum_x[std::size_t(i)];
+        const float* wr = w + std::size_t(i) * std::size_t(n_out);
+        float* cr = contrib + std::size_t(i) * std::size_t(n_out);
+        for (int j = 0; j < n_out; ++j)
+            cr[j] = wr[j] * s;
+    }
 
-    vsMul(ni, dw, dw, tmp.data());                        // tmp = dw^2
-    cblas_sscal(ni, alpha, weights.square_avg.data(), 1); // square_avg *= alpha
-    cblas_saxpy(ni, 1.0f - alpha, tmp.data(), 1, weights.square_avg.data(), 1);
-    vsSqrt(ni, weights.square_avg.data(), denom.data());
-    vsLinearFrac(ni, denom.data(), denom.data(), 1.0f, eps, 0.0f, 1.0f, denom.data());
-    vsDiv(ni, dw, denom.data(), tmp.data());
-    if (max_abs_delta > 0.0f) {
-        cblas_sscal(ni, lr, tmp.data(), 1); // tmp = lr * raw_update
-        for (int i = 0; i < ni; ++i)
-            tmp[std::size_t(i)] =
-                std::min(std::max(tmp[std::size_t(i)], -max_abs_delta), max_abs_delta);
-        cblas_saxpy(ni, -1.0f, tmp.data(), 1, w, 1);
-    } else {
-        cblas_saxpy(ni, -lr, tmp.data(), 1, w, 1);
+    // ci = clip(beta2*ci + (1-beta2)*(g^2+contrib^2), min_decay_frac*ci, max_ci)
+    // -- BoundedRMSpropSynapsePolicy::update_ci, verbatim.
+    const std::size_t n = weights.n_in * weights.n_out;
+    const int ni = static_cast<int>(n);
+    float* ci = weights.ci.data();
+    for (int i = 0; i < ni; ++i) {
+        const float g = dw[std::size_t(i)];
+        const float c = contrib[std::size_t(i)];
+        const float ema = beta2 * ci[std::size_t(i)] + (1.0f - beta2) * (g * g + c * c);
+        const float floor_v = min_decay_frac * ci[std::size_t(i)];
+        ci[std::size_t(i)] = std::min(std::max(ema, floor_v), max_ci);
+    }
+
+    // effective_lr: nnz_row==n_out for every row here (fully dense), so
+    // lr_per_row_nnz reduces to one constant divisor, not per-row.
+    const float effective_lr = lr_per_row_nnz ? (lr / float(n_out)) : lr;
+
+    // Clip BEFORE the lr multiply -- delta_csr_types.hpp:synapse_policy.
+    // clip_order_and_lr_ceiling.
+    for (int i = 0; i < ni; ++i) {
+        const float g = dw[std::size_t(i)];
+        float raw = damp_by_importance ? (-g) / (std::sqrt(ci[std::size_t(i)]) + eps) : (-g);
+        raw = std::min(std::max(raw, -max_abs_delta), max_abs_delta);
+        w[std::size_t(i)] += effective_lr * raw;
     }
 }
 
