@@ -257,4 +257,130 @@ inline void sidldo_forward(const int* x_ptrs, const int* x_idx, const float* x_v
         sidldo_forward_union_gather(x_ptrs, x_idx, x_val, batch, weights, scratch, y);
 }
 
+// ── backward ──────────────────────────────────────────────────────────────────
+//
+// Dense x, SPARSE dy (CSR) -- matches disldo_backward_sparse_grad's own
+// established convention (dense input, sparse output gradient), not
+// forward's sparse-input convention: dy's sparsity here comes from
+// whatever downstream sparsifying op produced it, independent of
+// whether THIS layer's own forward input was sparse. Restricts to the
+// COLUMNS of W where dy is nonzero (the transpose of forward's row
+// restriction) for both dx and the dW/RMSprop update. Union-gather only
+// for now, no high-batch variant yet -- see TODO_BATCH_BLOCKING.md.
+
+// Backward-only scratch, persistent and grow-only.
+struct SidldoBackwardScratch {
+    std::vector<int> active_col;
+    std::vector<int> inverse_map;     // [n_out], -1 sentinel
+    std::vector<float> w_col_compact; // [num_active x n_in]: row i = W[:,active_col[i]]
+    std::vector<float> dy_compact;    // [batch x num_active]
+    std::vector<float> dw_compact;    // [n_in x num_active]
+
+    void ensure(std::size_t n_in, std::size_t n_out, std::size_t batch) {
+        if (inverse_map.size() < n_out)
+            inverse_map.assign(n_out, -1);
+        if (active_col.capacity() < n_out)
+            active_col.reserve(n_out);
+        if (w_col_compact.size() < n_out * n_in)
+            w_col_compact.resize(n_out * n_in);
+        if (dy_compact.size() < batch * n_out)
+            dy_compact.resize(batch * n_out);
+        if (dw_compact.size() < n_in * n_out)
+            dw_compact.resize(n_in * n_out);
+    }
+};
+
+// x[batch,n_in] dense. dy_ptrs[batch+1]/dy_idx[nnz]/dy_val[nnz]: per-
+// sample CSR, row=sample, column=output feature index. dx[batch,n_in]
+// overwritten (caller-owned). Always computes dx+dw, gates the in-place
+// RMSprop update on lr != 0 (lr=0.0 = grad-only, lr!=0 = grad+update),
+// matching disldo_backward/didldo_backward's own shape -- no separate
+// optimizer call anywhere.
+inline void sidldo_backward(const float* x, const int* dy_ptrs, const int* dy_idx,
+                            const float* dy_val, int batch, DenseLinearWeights& weights,
+                            SidldoBackwardScratch& scratch, float* dx, float lr) {
+    const int n_in = static_cast<int>(weights.n_in);
+    const int n_out = static_cast<int>(weights.n_out);
+    scratch.ensure(weights.n_in, weights.n_out, std::size_t(batch));
+
+    // Serial union + gather, same reasoning as forward's union-gather:
+    // targets a batch range small enough that a custom #pragma omp
+    // region here would just pay handoff tax for no benefit.
+    scratch.active_col.clear();
+    const int nnz = dy_ptrs[batch];
+    for (int i = 0; i < nnz; ++i) {
+        const int c = dy_idx[i];
+        if (scratch.inverse_map[c] == -1) {
+            scratch.inverse_map[c] = static_cast<int>(scratch.active_col.size());
+            scratch.active_col.push_back(c);
+        }
+    }
+    const int num_active = static_cast<int>(scratch.active_col.size());
+
+    // Gather W's active COLUMNS into a compact, contiguous [num_active x
+    // n_in] buffer -- a strided read from row-major W (unavoidable, W's
+    // layout is fixed by forward/DIDLDO's needs), but a contiguous write,
+    // and the buffer this produces is exactly the shape both GEMMs below
+    // need (no further transpose).
+    for (int i = 0; i < num_active; ++i) {
+        const int c = scratch.active_col[i];
+        float* dst = scratch.w_col_compact.data() + std::size_t(i) * n_in;
+        for (int r = 0; r < n_in; ++r)
+            dst[r] = weights.w[std::size_t(r) * n_out + c];
+    }
+
+    std::fill(scratch.dy_compact.begin(),
+              scratch.dy_compact.begin() + std::size_t(batch) * num_active, 0.0f);
+    for (int b = 0; b < batch; ++b) {
+        float* row = scratch.dy_compact.data() + std::size_t(b) * num_active;
+        for (int i = dy_ptrs[b]; i < dy_ptrs[b + 1]; ++i)
+            row[scratch.inverse_map[dy_idx[i]]] = dy_val[i];
+    }
+    for (int i = 0; i < num_active; ++i)
+        scratch.inverse_map[scratch.active_col[i]] = -1;
+
+    if (num_active == 0) {
+        std::fill(dx, dx + std::size_t(batch) * n_in, 0.0f);
+        return;
+    }
+
+    // dx[batch,n_in] = dy_compact[batch,num_active] @ w_col_compact[num_active,n_in]
+    if (batch == 1) {
+        cblas_sgemv(CblasRowMajor, CblasTrans, num_active, n_in, 1.0f, scratch.w_col_compact.data(),
+                    n_in, scratch.dy_compact.data(), 1, 0.0f, dx, 1);
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, batch, n_in, num_active, 1.0f,
+                    scratch.dy_compact.data(), num_active, scratch.w_col_compact.data(), n_in, 0.0f,
+                    dx, n_in);
+    }
+
+    // dw_compact[n_in,num_active] = x[batch,n_in]^T @ dy_compact[batch,num_active].
+    // K=batch=1 (sger shape) not special-cased, same precedent as DIDLDO.
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, n_in, num_active, batch, 1.0f, x, n_in,
+                scratch.dy_compact.data(), num_active, 0.0f, scratch.dw_compact.data(), num_active);
+
+    if (lr == 0.0f)
+        return;
+
+    // In-place RMSprop, applied directly at the real (strided) weight
+    // positions -- hand-rolled, not VML, since VML's vector ops need
+    // contiguous input and gathering/scattering a compact square_avg
+    // buffer just to use VML would cost more than this plain loop saves
+    // (same lesson as the high-batch forward path: a hand-rolled loop
+    // often beats routing a small, memory-bound op through a library
+    // built for large contiguous ones). Reuses dw_compact, already
+    // contiguous from the GEMM above.
+    constexpr float alpha = 0.99f;
+    constexpr float eps = 1e-8f;
+    for (int i = 0; i < num_active; ++i) {
+        const int c = scratch.active_col[i];
+        for (int r = 0; r < n_in; ++r) {
+            const float g = scratch.dw_compact[std::size_t(r) * num_active + i];
+            float& sq = weights.square_avg[std::size_t(r) * n_out + c];
+            sq = alpha * sq + (1.0f - alpha) * g * g;
+            weights.w[std::size_t(r) * n_out + c] -= lr * g / (std::sqrt(sq) + eps);
+        }
+    }
+}
+
 #endif // SILI_HAVE_MKL

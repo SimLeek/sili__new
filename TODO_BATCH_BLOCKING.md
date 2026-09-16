@@ -1157,7 +1157,61 @@ range -- do not consider a phase done on PoC evidence alone.
   arch-sandbox, full local regression clean (same 5 pre-existing
   failures, nothing new).
 
-  **Not done**: SIDLDO backward (dx/dw via column-gather, the mirror of
-  forward's row-gather); density-aware dispatch (see above); python
-  bindings for either DIDLDO or SIDLDO (both are C++-kernel-plus-tests
-  only so far, same phased approach the rest of this rollout used).
+  **SIDLDO backward landed (2026-09-16), union-gather only (no high-batch
+  variant yet).** First had to resolve a real ambiguity before writing
+  any code: SIDLDO's own name only commits FORWARD's input to being
+  sparse -- what's sparse for backward wasn't obvious, and guessing
+  wrong would mean scrapping the implementation. Asked directly; user
+  confirmed it matches the codebase's EXISTING convention for the
+  sisldo family (`disldo_backward_sparse_grad`, sisldo_ops.hpp): DENSE
+  input `x`, SPARSE output gradient `dy` (CSR) -- not a reuse of
+  forward's sparse `x`. `dy`'s sparsity comes from whatever downstream
+  sparsifying op produced it, independent of whether this layer's own
+  forward input was sparse.
+
+  `sidldo_backward(x, dy_ptrs, dy_idx, dy_val, batch, weights, scratch,
+  dx, lr)`: mirrors forward's union-gather exactly, transposed -- union
+  of `dy`'s active output COLUMNS (not input rows), gather those
+  COLUMNS of `W` into a compact `[num_active x n_in]` buffer (a strided
+  read from row-major `W`, unavoidable given `W`'s layout is fixed by
+  forward/DIDLDO's needs, but a contiguous write, and the buffer this
+  produces is exactly what both GEMMs below need with no further
+  transpose), densify `dy` into a compact `[batch x num_active]` buffer.
+  `dx = dy_compact @ w_col_compact` (sgemv at batch=1, sgemm otherwise,
+  same M=1 dispatch as everywhere else in this arc) and
+  `dw_compact = x^T @ dy_compact` (one sgemm). RMSprop update (lr != 0
+  gate, same one-function shape as DIDLDO/disldo_backward, no separate
+  optimizer call) applied via a hand-rolled loop directly at the real
+  strided `(row, active_col)` positions in `weights.w`/`square_avg` --
+  not through VML, same reasoning as the high-batch forward path:
+  gathering/scattering a compact `square_avg` buffer just to use VML's
+  contiguous-array ops would cost more than this plain loop saves, and
+  `dw_compact` is already contiguous from the GEMM immediately above it.
+
+  `tests/unit/test_sidldo_kernel.cpp` extended with `run_backward_case`:
+  dx checked against an independent dense reference, bwd0 (lr=0) leaves
+  weights bit-identical, bwdX (lr!=0) matches an independently computed
+  reference RMSprop step applied to an independently computed reference
+  dw -- across batch=1/batch>1, near-dense, fully-empty dy, and a
+  scratch-reuse-across-different-active-column-count case (same
+  stale-state class of bug forward's own scratch-reuse test already
+  catches). Passes locally and on arch-sandbox. Full local regression
+  clean (same 5 pre-existing failures, nothing new).
+
+  Not done: a high-batch (feature-major-CSR-style) SIDLDO backward
+  variant -- forward's high-batch path exists because forward's
+  union-gather measurably degrades at high batch; backward's
+  union-gather almost certainly has the same degradation shape (dy's
+  active-column union fills in the same way x's active-row union does),
+  but this hasn't been benched yet, so building a high-batch backward
+  now would be speculative rather than measured. Natural next step if/
+  when asked, same as forward's own high-batch path was a separate,
+  later request rather than built preemptively.
+
+  **Not done**: density-aware dispatch (see above); python bindings for
+  either DIDLDO or SIDLDO (both are C++-kernel-plus-tests only so far,
+  same phased approach the rest of this rollout used) -- user's explicit
+  direction: when bindings land, fp8/fp4 should raise not-implemented
+  errors rather than silently doing the wrong thing (both engines are
+  fp32-only; this is a binding-layer concern, not resolved until
+  bindings themselves are built).
