@@ -588,15 +588,26 @@ void disldo_backward_sparse_grad(
     // ── AQRS rank-N scale scaffolding ─────────────────────────────────────────
     // See docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.rank_backfill_pattern.
     const std::size_t rank = weights.scale_rank;
-    std::vector<value_type> t_col_grad(static_cast<std::size_t>(num_cpus) * out_cols * rank,
-                                       value_type(0));
-    std::vector<value_type> t_col_grad_contrib(static_cast<std::size_t>(num_cpus) * out_cols * rank,
-                                               value_type(0));
+    // Persistent scratch instead of a fresh std::vector every call (see
+    // disldo_forward.persistent_scratch_buffers, linear_disldo.rst) --
+    // small and batch-independent like disldo_backward's own
+    // group_dx/group_col_grad (Phase 6), so zeroed ONCE here (serial,
+    // cheap at this size) rather than per-thread-in-parallel: BOTH the
+    // scattered and block4 regions below accumulate (+=) into these SAME
+    // buffers, so they must be zeroed exactly once before either runs,
+    // not per-region.
+    std::vector<value_type>& t_col_grad = weights.block4.scratch_sisldo_bwd_col_grad;
+    t_col_grad.assign(static_cast<std::size_t>(num_cpus) * out_cols * rank, value_type(0));
+    std::vector<value_type>& t_col_grad_contrib =
+        weights.block4.scratch_sisldo_bwd_col_grad_contrib;
+    t_col_grad_contrib.assign(static_cast<std::size_t>(num_cpus) * out_cols * rank, value_type(0));
     const bool output_scale_trainable = weights.output_scale_is_trainable;
     // AQRS gamma's own gradient (task #273/#283 parity) -- layer-wide, sized num_cpus*rank.
-    std::vector<value_type> t_gamma_grad(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
-    std::vector<value_type> t_gamma_grad_contrib(static_cast<std::size_t>(num_cpus) * rank,
-                                                 value_type(0));
+    std::vector<value_type>& t_gamma_grad = weights.block4.scratch_sisldo_bwd_gamma_grad;
+    t_gamma_grad.assign(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
+    std::vector<value_type>& t_gamma_grad_contrib =
+        weights.block4.scratch_sisldo_bwd_gamma_grad_contrib;
+    t_gamma_grad_contrib.assign(static_cast<std::size_t>(num_cpus) * rank, value_type(0));
 
     // Pre-size value_scale/output_scale -- backfill pattern, see
     // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.rank_backfill_pattern.

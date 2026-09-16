@@ -471,10 +471,50 @@ range -- do not consider a phase done on PoC evidence alone.
         1.03x-1.13x; batch=1024: 1.03x-1.16x), nowhere near the
         batch-scaling buffers' 2-5x wins elsewhere in this rollout, but
         real and never measured worse.
-- [ ] **Phase 7 -- sisldo backward (`disldo_backward_sparse_grad`,
-      sisldo_ops.hpp).** Same audit as Phase 6, plus keep in mind the
-      heap-corruption bug just fixed there (stale tile position tracking)
-      -- any restructuring must not reintroduce that class of bug.
+- [x] **Phase 7 -- sisldo backward (`disldo_backward_sparse_grad`,
+      sisldo_ops.hpp).** Landed 2026-09-16. Unlike disldo_backward
+      (Phase 6), this function's t_col_grad/t_col_grad_contrib/
+      t_gamma_grad/t_gamma_grad_contrib had NOT already received the
+      persistent-buffer treatment -- still a fresh `std::vector` every
+      call. Same shape as Phase 6's group buffers (small,
+      batch-INdependent, out_cols/rank-scaled) so the SAME expectation
+      applied: modest win, not the 2-5x batch-scaling wins elsewhere.
+
+      One real subtlety this function has that disldo_backward's
+      group buffers didn't: TWO separate `#pragma omp parallel for`
+      regions (scattered accumulate, then block4 accumulate) both
+      accumulate (`+=`, via `mcol_at`/`mgamma_at` lambdas) into the
+      SAME `t_col_grad`/`t_gamma_grad` buffers -- so the zero-fill has
+      to happen exactly ONCE, before EITHER region runs, not per-thread
+      inside one region (which would wipe the other region's
+      contribution). Used `.assign()` (serial, but the buffer is small
+      enough that this is cheap) rather than the per-thread-parallel
+      fill pattern used for the large batch-scaling buffers elsewhere.
+      New scratch members `Block4Store::scratch_sisldo_bwd_col_grad(
+      _contrib)/scratch_sisldo_bwd_gamma_grad(_contrib)` -- kept
+      separate from disldo_backward's own scratch struct deliberately,
+      to avoid coupling the two functions' scratch lifetimes given this
+      file's recent heap-corruption history.
+
+      **Correctness verified with the SAME extra care as Phase 6**,
+      given the heap-corruption bug fixed earlier this session was in
+      this exact function: full local+remote ctest (same 5 pre-existing
+      unrelated failures, nothing new), the dedicated
+      `test_sisldo_sparse_load_backward_stability` regression test
+      (500 repeated calls, the test that originally caught the
+      heap-corruption bug) passing on both, AND re-run under
+      AddressSanitizer (`LD_PRELOAD=libasan.so`) locally -- clean, no
+      memory errors.
+
+      **Real-kernel A/B** (`scripts/bench_sisldo_backward_sparse_grad.cpp`,
+      num_cpus=4, dense dy, 2 interleaved pairs): modest win at small/
+      medium batch (**batch=1: ~1.02-1.10x; batch=8: ~1.02-1.14x;
+      batch=64: ~1.06-1.08x**), essentially flat/negligible by
+      batch=256-1024 (~1.00x both times) -- at that point the call
+      takes 10-39ms and is dominated by real per-synapse/per-batch
+      compute, so the small fixed buffer-allocation saving becomes
+      negligible in comparison. Consistent with and slightly more
+      pronounced than Phase 6's finding for the same class of buffer.
 - [ ] **Phase 7.5 -- scattered-path transpose+blocked-accumulate.**
       Flagged by the user 2026-09-16, right after Phase 4's negative
       result: Phase 4's persistent-buffer fix didn't move the scattered

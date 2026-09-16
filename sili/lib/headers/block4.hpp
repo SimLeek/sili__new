@@ -1478,6 +1478,17 @@ struct Block4Store {
     std::vector<float> scratch_sisldo_out;
     std::vector<float> scratch_sisldo_contrib;
     std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
     // disldo_forward.column_partitioned_threading: per-thread work-item
     // lists (see Block4WorkItem above) plus the column-block partition
     // boundaries used to build them, reused call to call so no fresh
@@ -2094,6 +2105,17 @@ struct Block4Store8 {
     std::vector<float> scratch_sisldo_out;
     std::vector<float> scratch_sisldo_contrib;
     std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
@@ -2863,6 +2885,17 @@ struct Block4Store32 {
     std::vector<float> scratch_sisldo_out;
     std::vector<float> scratch_sisldo_contrib;
     std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
