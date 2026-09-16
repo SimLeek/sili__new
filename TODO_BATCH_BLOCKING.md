@@ -1089,9 +1089,75 @@ range -- do not consider a phase done on PoC evidence alone.
   sidldo 0.1040ms) -- the union has filled in by then, exactly the
   degradation this design predicted and accepted going in.
 
+  **High-batch feature-major-CSR path landed too (2026-09-16), same
+  day.** User asked directly whether the high-batch design had been
+  built -- it hadn't yet; built it. `sidldo_forward_high_batch`:
+  transposes the batch's per-sample CSR into a feature-major CSR
+  (counting-sort, serial, O(nnz+n_in)), partitions total nnz evenly
+  across threads, each thread accumulates into its own buffer, `y` gets
+  a final combine. `sidldo_forward` now dispatches on
+  `SIDLDO_HIGH_BATCH_THRESHOLD` (64) between this and the low-batch
+  union-gather path. First direct A/B against the flagged threading risk
+  above (`probe_nested_mkl.cpp`): calling MKL's `sger` from inside a
+  custom `#pragma omp` region, once per row per thread, measured ~3x
+  SLOWER than a plain hand-rolled scalar loop doing the same math -- so
+  this function calls MKL nowhere at all, confirming the risk was real
+  and resolving it by avoiding BLAS entirely in this path, not by
+  unifying threading further.
+
+  First version used a full `[num_threads x batch x n_out]` private
+  buffer per thread (same shape disldo_forward/backward's own reductions
+  use) -- correctness-verified, but benching against the union-gather
+  path directly (`probe_crossover2.cpp`/`probe_crossover3.cpp`, not just
+  against the dispatcher) found it losing badly in some cells, most
+  starkly at low density + high batch (n=288, density=0.005, batch=1024:
+  union 0.577ms vs high-batch 1.33ms -- LOST despite being "the sparse
+  path"). Root-caused, not guessed: the reduction step costs
+  `O(threads*batch*n_out)`, independent of density -- at low density
+  there's little real work to justify that fixed cost.
+
+  **Fixed the real cause, not the symptom (user's explicit direction)**:
+  replaced the full private buffer with a compact per-thread
+  touched-sample buffer -- the SAME union/inverse-map trick the
+  low-batch path already uses for weight ROWS, applied to output SAMPLES
+  instead. `sample_local_map` is grow-only and reset only at touched
+  entries (never a full clear), matching the low-batch path's own
+  `inverse_map` discipline. The combine step is now bounded by actual
+  touched work (nnz-bounded), not `threads*batch*n_out`. Re-ran the same
+  A/B after the fix:
+
+  | n_in | density | batch | union_ms | highbatch_ms (before fix) | highbatch_ms (after fix) |
+  |---|---|---|---|---|---|
+  | 288 | 0.005 | 1024 | 0.577 | 1.33 (LOST) | **0.133** (4.3x win) |
+  | 2048 | 0.005 | 1024 | 18.61 | 12.32 | **8.84** (bigger win) |
+  | 2048 | 0.02 | 1024 | 18.74 | 22.58 (LOST) | 20.32 (still lost, closer) |
+  | 2048 | 0.05 | 1024 | 17.17 | 44.74 (LOST) | 41.98 (still lost) |
+
+  The fix eliminated the worst class of loss (low density) outright and
+  meaningfully narrowed the rest, but did NOT fully close the
+  moderate-to-high-density + very-high-batch cells. Root cause there is
+  DIFFERENT and not a memory-overhead problem: once nnz is large enough
+  that each thread's chunk already touches most of the batch anyway, the
+  compact-buffer trick has nothing left to save, and the real bottleneck
+  becomes raw accumulate-loop throughput -- MKL's cache-blocked dense
+  GEMM genuinely computes faster than this hand-rolled loop at that
+  scale, the same "BLAS wins at genuinely dense work" fact this whole
+  investigation kept re-confirming. **This means `SIDLDO_HIGH_BATCH_
+  THRESHOLD`'s flat batch-only dispatch is STILL known-imperfect** at
+  high density + very high batch -- the correct fix is density-aware
+  dispatch (or just always trying both and keeping the winner, at some
+  extra cost), not implemented, folded into the multi-dimensional
+  engine-selection-surface work already scoped above rather than solved
+  ad hoc here.
+
+  Correctness: `tests/unit/test_sidldo_kernel.cpp` extended with the
+  threshold boundary (batch=63 vs 64) and high-batch cases at varying,
+  non-power-of-two `num_cpus` (1, 3, 7) to stress the nnz-balanced
+  partition and binary-search row lookup. Passes locally and on
+  arch-sandbox, full local regression clean (same 5 pre-existing
+  failures, nothing new).
+
   **Not done**: SIDLDO backward (dx/dw via column-gather, the mirror of
-  forward's row-gather); the high-batch feature-major-CSR + nnz-balanced
-  design (still just a design in this file, not implemented -- and its
-  own threading-coexistence risk, flagged above, is still open); python
+  forward's row-gather); density-aware dispatch (see above); python
   bindings for either DIDLDO or SIDLDO (both are C++-kernel-plus-tests
   only so far, same phased approach the rest of this rollout used).

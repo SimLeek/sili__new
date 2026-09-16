@@ -1,7 +1,8 @@
 // SIDLDO forward bench (TODO_BATCH_BLOCKING.md "Also queued") -- times
-// the union-gather forward at n=288 across the low-batch range this
-// engine targets, for direct comparison against sisldo_ms/torch_ms
-// already recorded in the Block4 Bench dataset at matching shapes.
+// sidldo_forward (dispatches union-gather vs the high-batch feature-
+// major-CSR path internally) across both the low- and high-batch range,
+// for direct comparison against sisldo_ms/torch_ms already recorded in
+// the Block4 Bench dataset at matching shapes.
 #include "../sili/lib/headers/linear_sidldo.hpp"
 #include <algorithm>
 #include <chrono>
@@ -28,10 +29,9 @@ int main(int argc, char** argv) {
     weights.resize(std::size_t(n_in), std::size_t(n_out));
     for (auto& v : weights.w)
         v = dist(rng);
-    (void)num_cpus; // MKL's own thread count fixed at link/env time
 
     std::vector<float> densities = {0.005f, 0.05f, 0.1f, 0.2f, 0.5f};
-    std::vector<int> batches = {1, 4, 8, 16, 32, 64};
+    std::vector<int> batches = {1, 4, 8, 16, 32, 63, 64, 128, 256, 512, 1024};
 
     std::printf("n_in=%d n_out=%d\n", n_in, n_out);
     std::printf("%10s %6s %14s\n", "density", "batch", "fwd_ms");
@@ -59,13 +59,13 @@ int main(int argc, char** argv) {
 
             for (int i = 0; i < 10; ++i)
                 sidldo_forward(x_ptrs.data(), x_idx.data(), x_val.data(), batch, weights, scratch,
-                               y.data());
-            const int reps = 100;
+                               y.data(), num_cpus);
+            const int reps = batch >= 256 ? 20 : 100;
             double t = 0;
             for (int r = 0; r < reps; ++r) {
                 double t0 = now_ms();
                 sidldo_forward(x_ptrs.data(), x_idx.data(), x_val.data(), batch, weights, scratch,
-                               y.data());
+                               y.data(), num_cpus);
                 t += now_ms() - t0;
             }
             std::printf("%10.3f %6d %14.4f\n", density, batch, t / reps);

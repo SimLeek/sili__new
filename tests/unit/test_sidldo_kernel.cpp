@@ -29,7 +29,7 @@ static double max_abs_diff(const std::vector<float>& a, const std::vector<float>
 }
 
 static void run_case(const char* label, int n_in, int n_out, int batch, float density,
-                     unsigned seed) {
+                     unsigned seed, int num_cpus = 4) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
@@ -64,7 +64,8 @@ static void run_case(const char* label, int n_in, int n_out, int batch, float de
 
     SidldoForwardScratch scratch;
     std::vector<float> y(std::size_t(batch) * n_out);
-    sidldo_forward(x_ptrs.data(), x_idx.data(), x_val.data(), batch, weights, scratch, y.data());
+    sidldo_forward(x_ptrs.data(), x_idx.data(), x_val.data(), batch, weights, scratch, y.data(),
+                   num_cpus);
 
     std::vector<float> y_ref(std::size_t(batch) * n_out, 0.0f);
     for (int b = 0; b < batch; ++b)
@@ -93,6 +94,22 @@ int main() {
              3);
     run_case("n_in=97 n_out=61 batch=64 density=0.9 (near-dense)", 97, 61, 64, 0.9f, 4);
     run_case("n_in=200 n_out=50 batch=5 density=0.0 (fully empty)", 200, 50, 5, 0.0f, 5);
+    // Threshold boundary (SIDLDO_HIGH_BATCH_THRESHOLD=64): one below and
+    // one at, to catch an off-by-one in the dispatch condition -- this
+    // rollout's established pattern for every other batch threshold.
+    run_case("n_in=89 n_out=101 batch=63 density=0.1 (below threshold)", 89, 101, 63, 0.1f, 6);
+    run_case("n_in=89 n_out=101 batch=64 density=0.1 (at threshold)", 89, 101, 64, 0.1f, 7);
+    // Well above threshold, num_cpus not dividing evenly into nnz --
+    // checks the nnz-balanced partition's boundary math (thread ranges,
+    // the binary-search row lookup, the private-buffer reduction) and
+    // multiple num_cpus so it isn't accidentally single-threaded-correct
+    // only.
+    run_case("n_in=150 n_out=90 batch=300 density=0.05, high batch, num_cpus=1", 150, 90, 300,
+             0.05f, 8, 1);
+    run_case("n_in=150 n_out=90 batch=300 density=0.6, high batch+density, num_cpus=3", 150, 90,
+             300, 0.6f, 9, 3);
+    run_case("n_in=150 n_out=90 batch=300 density=0.05, high batch, num_cpus=7", 150, 90, 300,
+             0.05f, 10, 7);
     // Reusing the same scratch/weights across calls of DIFFERENT shapes'
     // active-row counts, checking the grow-only scratch doesn't leave
     // stale state from a prior call's larger/smaller active set.
@@ -108,13 +125,13 @@ int main() {
         std::vector<int> idx1 = {0, 1, 2, 5, 6, 7};
         std::vector<float> val1 = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
         std::vector<float> y1(std::size_t(3) * 40);
-        sidldo_forward(ptrs1.data(), idx1.data(), val1.data(), 3, weights, scratch, y1.data());
+        sidldo_forward(ptrs1.data(), idx1.data(), val1.data(), 3, weights, scratch, y1.data(), 4);
 
         std::vector<int> ptrs2 = {0, 1};
         std::vector<int> idx2 = {79};
         std::vector<float> val2 = {2.0f};
         std::vector<float> y2(std::size_t(1) * 40);
-        sidldo_forward(ptrs2.data(), idx2.data(), val2.data(), 1, weights, scratch, y2.data());
+        sidldo_forward(ptrs2.data(), idx2.data(), val2.data(), 1, weights, scratch, y2.data(), 4);
         std::vector<float> y2_ref(40);
         for (int c = 0; c < 40; ++c)
             y2_ref[std::size_t(c)] = 2.0f * weights.w[std::size_t(79) * 40 + std::size_t(c)];
