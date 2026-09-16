@@ -583,32 +583,40 @@ range -- do not consider a phase done on PoC evidence alone.
       that used to dominate shrinks as a share of an otherwise-scaling
       workload once removed). One of the largest wins in this whole
       rollout, on a path that looked like a dead end two phases ago.
-- [ ] **Phase 1.5 -- check the PYTHON side, not just the C++ real-kernel
-      bench.** Flagged 2026-09-15: all of Phase 1's verification so far
-      (unit tests + `scripts/bench_disldo_forward_kernel.cpp`) is pure
-      C++, but the actual perf-comparison-vs-torch numbers this whole
-      investigation reports to the user live in
-      `scripts/bench_sili_vs_torch_matrix.py`, which goes through the
-      pybind11 bindings (`sili/cpu_backend.cpp` -> `DISLDOLayerV`), not
-      `disldo_forward` directly. Needs checking, not assumed:
-      1. Does `DISLDOLayerV`'s forward binding call `disldo_forward` with
-         the SAME `num_cpus` value the C++ bench used (4, the measured
-         sweet spot on arch-sandbox), or a different default that could
-         land in the num_cpus=5-9 dead zone or below the batch=8
-         threshold for some of the bench matrix's rows?
-      2. Re-run `scripts/bench_sili_vs_torch_matrix.py` on arch-sandbox
-         (before vs after this whole rollout, same worktree-diff
-         technique as the C++ A/Bs) across its existing batch sweep
-         (1/32/64/128/256/512/1024) and confirm the C++-bench wins
-         actually show up end-to-end through Python, not just in the
-         isolated kernel call.
-      3. If it DOESN'T show up proportionally, that's a real finding
-         (Python/pybind overhead dominating, or GIL/dispatch overhead
-         swamping the C++-side win at these batch sizes) worth its own
-         investigation before claiming this rollout "done" end-to-end --
-         the C++ kernel wins are necessary but not sufficient for the
-         thing the user actually cares about (real torch-comparison
-         numbers).
+- [x] **Phase 1.5 -- check the PYTHON side, not just the C++ real-kernel
+      bench.** Landed 2026-09-16. Re-ran the full matrix
+      (`scripts/bench_sili_vs_torch_matrix.py`, no CPU pinning, torch's
+      own default thread count -- 8 on arch-sandbox) across 336 cells
+      (2 layer widths x 2 synapse regimes x 4 input densities x 7
+      batches x 3 ops), published to the "Block4 Bench" artifact.
+
+      User then asked the right follow-up directly: is this Python-level
+      timing (pybind11-wrapped calls) actually trustworthy, or could
+      wrapping overhead be confounding the disldo/sisldo/torch
+      comparison, especially at small batch where fixed overhead matters
+      most? Checked directly rather than assumed: built a matching pure-
+      C++ real-kernel bench at the SAME num_cpus=8, same shape
+      (n=288, dense), and compared ns/call to the Python-measured ms/call
+      for both disldo and sisldo forward across the full batch range:
+
+      | batch | disldo python/C++ | sisldo python/C++ |
+      |---|---|---|
+      | 1    | 0.88x | 0.90x |
+      | 32   | 1.02x | 0.90x |
+      | 64   | 1.12x | 0.91x |
+      | 256  | 1.15x | 1.05x |
+      | 1024 | 1.14x | 1.09x |
+
+      Tight band around 1.0x across 3 orders of magnitude of batch, for
+      BOTH engines -- the signature of a large FIXED per-call overhead
+      would be a big ratio at batch=1 shrinking toward 1.0x as batch
+      grows; that's not what happens here. Conclusion: pybind11
+      wrapping overhead is small (<=15%) and roughly proportional, not a
+      meaningful confound on the disldo-vs-sisldo-vs-torch ratios
+      reported by the bench matrix. Checked one representative slice
+      (dense, 288-wide, full batch sweep) for both engines, not all 336
+      cells, but a ratio staying flat across that whole batch range is a
+      real pattern, not a coincidence specific to one point.
 
 ## Also queued (unrelated to this rollout, don't lose these either)
 
@@ -616,13 +624,433 @@ range -- do not consider a phase done on PoC evidence alone.
   already-tested 0.05 and 0.5) to find the actual sisldo/disldo crossover
   density for automatic engine switching, rather than just bracketing it
   between 0.05 (sisldo wins) and 0.5 (disldo wins).
-- User raised "DIDLDO" (dense input, dense linear/weights, dense output --
-  this is just standard dense matmul/BLAS, what torch already does) and
-  "SIDLDO" (sparse input, DENSE linear/weights, dense output -- doesn't
-  exist yet) as two more points on the same 2x2 grid as DISLDO/SISLDO.
-  Check whether SIDLDO would meaningfully beat SISLDO when weights happen
-  to be dense but input is sparse -- SISLDO currently pays block4/CSR
-  weight-lookup overhead designed for SPARSE weights even when the
-  weights are actually fully dense, which may be a real, avoidable chunk
-  of why sisldo underperforms at high input density in the current
-  benchmark matrix.
+
+- **DIDLDO / SIDLDO -- a second 2x2 grid, dense-weight-storage siblings
+  of DISLDO/SISLDO.** Raised 2026-09-15/16, refined into a concrete
+  implementation sketch after looking at the fresh Block4 Bench data
+  (336-cell matrix, see `disldo_forward.python_side_verified` above).
+  Naming follows the existing convention (`<input><linear><output>`,
+  D=dense/S=sparse):
+
+  - **DIDLDO** (dense input, dense linear/weights, dense output) --
+    doesn't need new sili code at all, it's just a standard BLAS/MKL
+    matmul + backprop + optimizer step. This is architecturally what
+    torch's `nn.Linear` already does, so DIDLDO's "implementation" is
+    really just "call BLAS directly instead of going through sili's
+    CSR/block4 machinery for a layer that's fully dense anyway."
+  - **SIDLDO** (sparse input, DENSE linear/weights, dense output) --
+    doesn't exist yet. Forward (and contribution) would load only the
+    ROWS of the dense weight matrix that correspond to nonzero positions
+    in the input CSR; backward (and importance updates, and in-place
+    optimizer step) would load only the COLUMNS corresponding to nonzero
+    output-gradient positions. Because sparsity is on the ACTIVATIONS
+    (input/grad) rather than the weights, most of the weight matrix's
+    RAM genuinely never gets touched on a given call, proportional to
+    input/grad density -- this is a different sparsity axis than
+    DISLDO/SISLDO exploit (weight sparsity via CSR/block4) and should
+    compose with it, not replace it.
+
+  **Two-group interchangeability architecture** (user's key structural
+  insight, worth preserving verbatim): DISLDO and SISLDO already share
+  the SAME underlying weight storage (`weights.connections` / CSR +
+  `weights.block4`), which is exactly why they're interchangeable
+  per-call today -- you can run DISLDO forward then SISLDO backward (or
+  vice versa) against the identical weight object with no conversion.
+  DIDLDO and SIDLDO would likewise share a single DENSE weight storage
+  representation, and would be interchangeable with EACH OTHER the same
+  way. But the two groups are NOT interchangeable with each other
+  without an actual weight-storage relayout (CSR/block4 <-> dense),
+  which is real work and its own separate, longer-term speedup question
+  (worth asking: could a layer hold BOTH representations simultaneously
+  during a transition/relayout window, the way some sparse formats keep
+  a COO staging buffer? Not decided, just flagging the question exists).
+  So near-term engine switching is two independent binary choices, not
+  one 4-way choice:
+  - Group A (sparse/block4 weight storage): DISLDO <-> SISLDO, switch
+    freely per forward/backward call based on input density that call.
+  - Group B (dense weight storage, not yet built): DIDLDO <-> SIDLDO,
+    same idea once SIDLDO exists.
+  - Crossing groups (A->B or B->A) means physically relaying out the
+    weights -- expensive, and only worth doing when a layer's weight
+    density has genuinely shifted enough (e.g. after synaptogenesis/
+    pruning) to justify it, not on a per-call basis.
+
+  **Why this looks promising**: the fresh 336-cell bench matrix shows
+  sili's best-case wins (up to ~5x vs torch) cluster at high batch AND
+  high synapse density -- exactly the regime where DISLDO/SISLDO are
+  paying CSR/block4 bookkeeping overhead for weights that are barely
+  sparse at all. A dense-weight-storage engine (DIDLDO/SIDLDO) sidesteps
+  that overhead entirely and should dominate in that corner of the
+  parameter space; SISLDO's row/column-selective loading (SIDLDO) should
+  still beat plain BLAS (DIDLDO) whenever the ACTIVATIONS are sparse
+  enough, independent of weight density.
+
+  **DIDLDO proof-of-concept: done, sanity check passed (2026-09-16).**
+  Built `scripts/bench_didldo_kernel.cpp` -- plain forward GEMM via
+  `cblas_sgemm`, calling numpy's own bundled OpenBLAS
+  (`scipy.libs/libscipy_openblas-*.so`, real production BLAS, no new
+  system dependency needed) directly from C++, and a single
+  `didldo_backward(x, dy, w, square_avg, dx, dw_scratch, ..., lr)` call
+  that always computes dx+dw via `cblas_sgemm` and gates an in-place,
+  OpenMP-parallel RMSprop update on `lr != 0` -- matching the RMSprop
+  torch itself uses in the comparison bench (alpha=0.99, eps=1e-8) and,
+  more importantly, matching disldo_backward's own API shape: lr=0.0 IS
+  the "grad-only" case, lr!=0 IS "grad+update", ONE function, no
+  separate optimizer/"update" call ever exposed (first draft used a
+  standalone `rmsprop_update_inplace` helper and plain SGD instead of
+  RMSprop -- both corrected after review before trusting any number from
+  this).
+
+  Ran on arch-sandbox (same machine as the Block4 Bench data) at
+  num_cpus=8, same n=288/1024 shapes and batch sweep, compared directly
+  against the torch_ms already recorded in that dataset (torch's own
+  `nn.Linear` is density-agnostic, so those numbers are valid to compare
+  against regardless of synapse/input density). didldo/torch ratio,
+  bwd0 = fwd+dx+dw (no update), bwdX = fwd+dx+dw+RMSprop step:
+
+  | width | op | batch=1 | batch=32 | batch=256 | batch=1024 |
+  |---|---|---|---|---|---|
+  | 288  | fwd  | 3.01x | 1.41x | 1.80x | 1.43x |
+  | 288  | bwd0 | 0.79x | 0.71x | 1.31x | 1.42x |
+  | 288  | bwdX | 0.92x | 0.59x | 0.97x | 1.44x |
+  | 1024 | fwd  | 4.34x | 2.48x | 1.58x | 1.36x |
+  | 1024 | bwd0 | 1.24x | 1.36x | 1.06x | 0.99x |
+  | 1024 | bwdX | 1.39x | 1.32x | 1.06x | 0.95x |
+
+  **Root-caused the batch=1 outliers instead of hand-waving them (user
+  pushed back: "why is didldo fwd slow, it should just be a BLAS call
+  right?").** Two SEPARATE, real mechanisms, not one:
+
+  1. **`sgemm` vs `sgemv` dispatch.** `didldo_forward`/`didldo_backward`'s
+     dx step called `cblas_sgemm` unconditionally, even at batch=1 where
+     M=1 -- a pure GEMV shape. Direct A/B
+     (`scripts/probe_didldo_sgemv.cpp`): `sgemm` pays real fixed blocked/
+     packed-GEMM setup cost a dedicated `sgemv` call skips -- 5.6x slower
+     at n=288 (0.0209ms vs 0.0037ms), 2.4x at n=1024 (0.0996ms vs
+     0.0417ms). Fixed by dispatching to `sgemv` at batch==1 for both
+     forward and dx (dw's batch=1 case is a K=1 outer product, an `sger`
+     shape -- noted, not applied, since it needs an explicit zero-fill
+     first and wasn't the reported problem). This alone explains most of
+     n=288's improvement and confirms numpy's own `x @ w` almost
+     certainly makes this same shape-dependent dispatch internally
+     (a follow-up probe showed numpy(openblas) BEATING torch(mkl) at
+     batch=1 despite using "the slower" BLAS library -- shape dispatch
+     mattered far more than which BLAS).
+  2. **Cross-thread-pool contention between the RMSprop OpenMP region and
+     OpenBLAS's own internal threading -- bigger, and still open.**
+     Even after the sgemv fix, n=1024 batch=1 forward stayed stuck around
+     0.23-0.27ms (vs an isolated sgemv's 0.035-0.04ms) no matter what else
+     was tried (removing a global `omp_set_num_threads` call, testing
+     `-fopenmp` linkage alone, testing one prior `sgemm`/`sger`-shaped
+     call alone -- none reproduced it standalone). Root-caused by direct
+     per-rep instrumentation: it's specifically the ALTERNATION -- this
+     bench's timed loop does forward, then backward+RMSprop-update, then
+     forward again, every iteration (which is also exactly what a real
+     training loop does). A minimal repro
+     (`fwd()` timed immediately after `#pragma omp parallel for` RMSprop
+     region, repeated) reproduced it cleanly and consistently: ~0.29ms
+     every single time, vs ~0.035ms with no RMSprop region in between.
+     `OMP_WAIT_POLICY=PASSIVE` cut it to ~0.17-0.22ms but did not close
+     it. Root cause, confirmed (not just theorized) via `nm -D`/`readelf`
+     on the actual `.so`: this specific OpenBLAS build (numpy's bundled
+     `scipy.libs/libscipy_openblas-*.so`) uses OpenBLAS's own PTHREADS
+     threading backend -- `pthread_create`, `blas_server_avail`,
+     `blas_thread_init`, zero `GOMP_*`/`omp_get_*` symbols, no libgomp
+     dependency in `readelf -d` at all. So this is two COMPLETELY
+     SEPARATE, uncoordinated thread-pool runtimes (my libgomp team, its
+     own persistent pthread worker pool) contending for the same cores
+     -- the textbook "don't mix threading runtimes" HPC anti-pattern,
+     not a subtler libgomp-internal effect.
+
+     User asked directly: is there no BLAS that uses OpenMP (or
+     something like it), so the two pools could coexist? Yes -- OpenBLAS
+     itself supports an OpenMP build (`USE_OPENMP=1`, just not the
+     specific wheel-bundled copy here), and MKL (what torch actually
+     uses) explicitly supports a selectable threading layer, including a
+     GNU/libgomp one (`libmkl_gnu_thread.so`, present locally via
+     oneAPI). Tested directly, not assumed: copied the needed MKL `.so`s
+     (~200MB: `libmkl_rt`, `libmkl_gnu_thread`, `libmkl_core`,
+     `libmkl_def`, `libmkl_avx2`, `libmkl_intel_lp64`) to arch-sandbox
+     and reran the SAME alternating-call probe with
+     `MKL_THREADING_LAYER=GNU` forcing MKL's GEMV calls through libgomp,
+     the same pool my own `#pragma omp` region uses:
+
+     | config | isolated sgemv | after-RMSprop-region sgemv | penalty |
+     |---|---|---|---|
+     | OpenBLAS (pthreads) | ~0.035-0.04ms | ~0.29ms | ~7.3-8.3x |
+     | MKL (GNU/libgomp layer) | ~0.08ms | ~0.17ms | ~2.1x |
+
+     Confirms the theory: sharing ONE thread-pool runtime cuts the
+     alternation penalty by ~3.5x (relative to each config's own
+     isolated baseline), even though MKL's GNU-layer isolated throughput
+     for this tiny GEMV happens to be worse than OpenBLAS's pthreads
+     path in absolute terms (GNU layer isn't MKL's fastest threading
+     choice -- Intel's own iomp5 layer or the sequential layer would
+     likely win outright, but neither shares libgomp with custom code).
+     STILL NOT fully closed at that point (2.1x real, not noise) -- user
+     directed the next step: route the RMSprop update through MKL too
+     (VML: `vsMul`/`vsSqrt`/`vsDiv`/`vsLinearFrac`, plus `cblas_sscal`/
+     `cblas_saxpy` for the scale/accumulate steps), eliminating the
+     hand-rolled `#pragma omp` region entirely -- ALL backward work
+     (dx/dw GEMM+GEMV and the RMSprop update) now goes through MKL,
+     zero custom OpenMP anywhere. Tested directly: **no change** --
+     still ~0.17ms, same 2.1x penalty as the custom-omp version. This
+     disproved the "custom omp region vs BLAS's own region" framing --
+     the penalty survives with literally zero custom omp code involved.
+
+     Real cause, found by varying call COUNT, not library: the 7-call
+     VML RMSprop sequence (`vsMul`, `sscal`, `saxpy`, `vsSqrt`,
+     `vsLinearFrac`, `vsDiv`, `saxpy`) makes 7 separate parallel
+     dispatches before the next `sgemv`. Replaced it with a single
+     `vsSqrt` call (same element count, doing nothing useful, just
+     testing dispatch count) between `fwd()` calls: **penalty
+     vanished** -- 0.083ms, matching the isolated 0.0803ms baseline
+     almost exactly. So the driver is DISPATCH COUNT (how many separate
+     parallel regions get entered/torn down before the next call), not
+     which library or runtime issues them. Confirmed progression:
+
+     | config | penalty vs isolated |
+     |---|---|
+     | OpenBLAS(pthreads) + custom omp (cross-runtime) | ~7.3-8.3x |
+     | MKL(GNU) + custom omp (same-runtime, ~2 dispatches) | ~2.1x |
+     | MKL(GNU), all-MKL RMSprop (same-runtime, 7 dispatches) | ~2.1x |
+     | MKL(GNU), single fused call (same-runtime, 1 dispatch) | ~1.0x |
+
+     **Actionable conclusion for DIDLDO/SIDLDO's real implementation**:
+     (1) use a BLAS built with the SAME OpenMP/libgomp backend sili's
+     own kernels already use (MKL with `MKL_THREADING_LAYER=GNU`, not
+     the numpy-wheel-bundled pthreads OpenBLAS) -- this alone kills the
+     worst-case cross-runtime tax (~7-8x down to ~2x); AND (2) fuse the
+     backward/update math into as FEW separate parallel-dispatching
+     calls as possible, ideally one, not just "any BLAS call however
+     many" -- a real RMSprop-via-VML implementation should look for the
+     most fused VML entry points available (or, if MKL doesn't have a
+     single call that does the whole RMSprop step, consider whether a
+     hand-fused single-pass kernel beats a multi-call VML pipeline,
+     re-measuring rather than assuming). Neither point alone was
+     sufficient; both together are. Not yet implemented as a real
+     kernel -- this was root-causing via probes, not landing production
+     code.
+
+     **Mixed-engine (Group A sparse-native + Group B dense-BLAS) hand-off,
+     per the user's specific question**: since the driver is dispatch
+     COUNT rather than which library, a Group-A-to-Group-B layer
+     transition in one model pays a MUCH smaller relative tax than
+     DIDLDO's own internal RMSprop fragmentation did -- a layer boundary
+     is one hand-off per layer call, not per-element multiplied many
+     times over. Sharing the same OpenMP/libgomp runtime across both
+     groups (sili's native kernels are already libgomp-based; picking a
+     libgomp-backed BLAS for Group B matches that) avoids the worse
+     cross-runtime case (~7-8x) at every such boundary; the residual
+     same-runtime handoff cost (~2x scale, from the isolated-single-call
+     row above) would apply once per layer transition, not per
+     internal op -- real but far smaller than staying naive on BOTH
+     axes (cross-runtime AND unfused) would be.
+
+     User called this "quite important," not secondary -- validated
+     directly with REAL production code
+     (`scripts/probe_mixed_engine_handoff.cpp`), not another synthetic
+     proxy: the actual `disldo_forward` kernel (`linear_disldo.hpp`,
+     Group A, sili's own `#pragma omp` regions) called immediately
+     before a real MKL `cblas_sgemv` (Group B), both on libgomp
+     (`MKL_THREADING_LAYER=GNU`; confirmed sili's own build already
+     targets libgomp too -- `setup.py` passes `-fopenmp`,
+     `tests/unit/CMakeLists.txt` does `find_package(OpenMP REQUIRED)` --
+     so this match isn't hypothetical, it's what the build already
+     does). Result: MKL fwd right after a real `disldo_forward` call,
+     0.0713-0.0774ms across 15 reps, vs 0.0709-0.0751ms fully isolated
+     -- no measurable penalty. Confirms the dispatch-count theory holds
+     at a real layer boundary (one kernel call = one dispatch, same as
+     the synthetic single-fused-call row), not just in the synthetic
+     probe. Mixing Group A and Group B layers in one model is safe from
+     this specific tax as long as both sides share the runtime -- which
+     they already would, with no extra work needed on sili's existing
+     kernels' side.
+
+  **This is NOT just a DIDLDO benchmark quirk -- it's a real preemptive
+  warning for SIDLDO's high-batch design below**, which explicitly
+  proposes mixing custom nnz-balanced `#pragma omp` work with per-row
+  BLAS calls (`sger`/small `sgemm`) in the same hot path. If alternating
+  a custom OpenMP region with an external-BLAS call pays this same
+  cross-team contention tax, SIDLDO's high-batch kernel could inherit it
+  directly unless the threading strategy is unified up front -- flagged
+  in that section below too, not just here.
+
+  Conclusion: dense-weight-storage parity with torch confirmed for
+  isolated calls (mechanism 1, fixed); a real, unresolved thread-pool-
+  coexistence cost exists for realistic forward/backward-update
+  alternation (mechanism 2, open) that any BLAS+custom-OpenMP engine in
+  this codebase (DIDLDO now, SIDLDO later) will need a real answer for.
+  Not blocking SIDLDO's scoping -- the gather-strategy design (rows/
+  columns to load) is orthogonal to the threading-coexistence question --
+  but the threading question needs its own resolution before either
+  engine is trusted in a real training loop, not just isolated benchmark
+  calls. SIDLDO's row/column-selective loader still sits on top of the
+  same `cblas_sgemm`/`sgemv` calls (SIDLDO forward = gather the nonzero-
+  input-position rows of W into a compact buffer, then one smaller
+  `sgemm`/`sgemv`; backward same idea over columns -- still "just BLAS",
+  per the user's framing, just on a pre-gathered slice of the weight
+  matrix rather than the
+  whole thing).
+
+  **Aside, worth folding into the eventual selection surface**: even at
+  full density and batch=1, SISLDO already beats DISLDO on forward
+  (n=288: sisldo_ratio=3.48 vs disldo_ratio=7.94x torch) -- so the
+  crossover isn't purely a density threshold even within the existing
+  DISLDO/SISLDO pair; batch=1 specifically favors sisldo regardless of
+  density. One more data point for why this needs a real multi-axis
+  surface, not a hand-tuned single-density cutoff.
+
+  **SIDLDO gather strategy -- two regimes, not one (2026-09-16).** A
+  batch's sparse-input positions vary per sample, so "load only the rows
+  where input is nonzero" needs a real answer to "nonzero for WHICH
+  sample." Settled on two strategies for two batch regimes, not a single
+  approach:
+
+  - **Low batch: union-of-batch gather.** Take the OR of every sample's
+    nonzero input positions in the batch, gather that shared row set
+    from W once, run ONE `sgemm` over the compacted rows for the whole
+    batch. The union-reduction itself is parallelizable to `log2(batch)`
+    passes (pairwise OR-merge of per-sample bitmasks/index sets, same
+    tree-reduction shape as this rollout's barrier-elimination work).
+    Degrades as batch grows -- at density=0.05, the union already covers
+    ~81% of rows by batch=32 (`1-(1-0.05)^32`) -- so this only pays off
+    while the union stays meaningfully smaller than the full row count.
+  - **High batch: feature-major CSR + nnz-balanced threading.**
+    Transpose the batch's sparsity into an input-row-major structure:
+    for each input feature (row of W), the "columns" are which batch
+    samples have that feature active -- i.e. a CSR with n_in rows and
+    batch columns, the transpose of the usual per-sample-row layout.
+    Partition work across threads by TOTAL NNZ in this structure (not by
+    row or by batch), so every thread gets an equal amount of real
+    compute regardless of how unevenly features are activated across
+    the batch -- each thread computes its own start/end row + col
+    position via the nnz-partitioned row-ptr (same load-balancing shape
+    `DeltaCSRLayout`/`row_nnz`-based partitioning already uses elsewhere
+    in this codebase). Then each thread walks its row range and, for
+    each input row it owns, loads that ONE dense weight row once (n_out
+    wide) and applies it to every batch sample active for that
+    feature while the row is still hot in cache/registers -- rank-1-
+    update shaped (one weight row broadcast against several samples'
+    scalar input values, accumulating into each of those samples'
+    output rows), so per the user's framing this can likely still route
+    through BLAS (`sger`/small `sgemm` on a thread's compacted slice)
+    rather than needing a fully custom scalar accumulate kernel -- to be
+    confirmed once this is actually built and profiled, not assumed.
+    This is the regime the union approach breaks down in, and not
+    coincidentally the regime (high batch) where the bench matrix shows
+    the biggest sili-vs-torch wins clustering. **Real risk, found while
+    root-causing DIDLDO's own batch=1 numbers (see above)**: mixing a
+    custom nnz-balanced `#pragma omp` partitioning with per-thread BLAS
+    calls (`sger`/small `sgemm`) is exactly the "alternate custom OpenMP
+    with external BLAS calls" pattern that measurably contends for
+    threads in DIDLDO's own bench (a lone forward call cost ~7-8x more
+    immediately after an unrelated `#pragma omp` region than in
+    isolation, and `OMP_WAIT_POLICY=PASSIVE` only partially closed it).
+    This high-batch design does that alternation once per thread's row
+    range rather than once per training step, which could be worse, not
+    better -- the threading strategy needs to be unified (one thread
+    team doing the nnz-partitioned work AND issuing the BLAS calls,
+    not two separate teams handing off) before trusting this design's
+    numbers, not just its gather-shape correctness.
+
+  Not started. This is a bigger design than DIDLDO's POC -- new
+  feature-major CSR construction, new nnz-based thread partitioning,
+  and an open question about how much of the high-batch path can stay
+  BLAS-shaped vs needs a custom accumulate kernel, NOW COMPOUNDED by the
+  open thread-pool-coexistence question above. Given the size,
+  treat as its own multi-phase effort (like this rollout was) rather
+  than a quick follow-on, once scoped in more detail.
+
+  **Multi-dimensional engine-selection surface, deferred until engines
+  exist**: the same bench matrix shows the DISLDO/SISLDO crossover isn't
+  a single density threshold -- batch count shifts it too (see the
+  backward-ratio-vs-batch pattern discussed in chat 2026-09-16: forward
+  ratios IMPROVE with batch after this rollout, but backward ratios
+  WORSEN with batch, e.g. disldo bwd0 at n=288 dense goes from beating
+  torch at batch=1 to ~6x worse at batch=1024 -- a real, monotonic,
+  batch-dependent effect, not noise). Once DIDLDO/SIDLDO exist, engine
+  auto-selection genuinely needs a function of (batch, input density,
+  weight/synapse density, layer width) rather than a hand-tuned
+  threshold on one axis -- either a fitted decision surface or a
+  clustering approach over benchmarked (params -> best engine) samples.
+  Not started; explicitly gated on SIDLDO existing so there's a second
+  real engine to switch to.
+
+  Not yet implemented. Original, thinner note (density-threshold-only
+  framing) superseded by the above.
+
+  **DIDLDO landed for real (2026-09-16).** User direction: "stick to the
+  same omp backend everywhere," route backward through another library
+  so there's no handoff, and package MKL's `.so` files the same way
+  torch packages its CUDA `.so` files (a separate, optional, pip-managed
+  dependency -- never vendored into this repo).
+
+  - `setup.py`: `_find_mkl()` detects an installed `mkl`/`mkl-include`
+    pip package via `sys.prefix` (confirmed by real install + inspection:
+    `mkl` -> `<prefix>/lib/libmkl_*.so.N`, `mkl-include` ->
+    `<prefix>/include/mkl*.h`). When found, direct-links
+    `libmkl_intel_lp64.so.3`+`libmkl_gnu_thread.so.3`+`libmkl_core.so.3`
+    (the GNU/libgomp threading layer, NOT the `libmkl_rt.so` runtime
+    dispatcher + `MKL_THREADING_LAYER=GNU` env var -- baking the
+    threading choice into the binary itself is more robust than relying
+    on correct env-var configuration at deploy time; confirmed via
+    `readelf -d`: `NEEDED libgomp.so.1`, no env var required) and defines
+    `-DSILI_HAVE_MKL=1`. Absent MKL, the extension builds identically to
+    before -- graceful compile-out, matching torch's CPU-only fallback
+    when CUDA isn't present. New extra: `pip install sili[mkl]`.
+  - `tests/unit/CMakeLists.txt`: mirrors the same detection (via
+    `find_package(Python3 COMPONENTS Interpreter)` + `sys.prefix` query
+    -- found and fixed a real bug here: the existing
+    `find_package(Python3 COMPONENTS Development REQUIRED)` does NOT
+    populate `Python3_EXECUTABLE`, only `Interpreter` does; the first
+    attempt silently queried an empty prefix). `test_didldo_kernel` is
+    kept out of the uniform `SILI_STANDALONE_TESTS` foreach (needs MKL
+    include/link flags none of the other tests do) and only built when
+    `SILI_MKL_FOUND`.
+  - `sili/lib/headers/linear_didldo.hpp`: `DenseLinearWeights` (plain
+    `w`/`square_avg`/`dw_scratch`, persistent, `.resize()`-once -- same
+    lesson as every other engine in this rollout, no fresh
+    per-call allocation) + `didldo_forward`/`didldo_backward`. forward
+    and backward's dx both dispatch to `cblas_sgemv` at batch==1,
+    `cblas_sgemm` otherwise (the root-caused fix from this investigation).
+    `didldo_backward(x, dy, weights, dx, batch, num_cpus, lr)` always
+    computes dx+dw, gates an RMSprop update on `lr != 0` -- same shape as
+    `disldo_backward`'s own API, no separate optimizer call anywhere. The
+    RMSprop step routes entirely through MKL (`vsMul`/`cblas_sscal`/
+    `cblas_saxpy`/`vsSqrt`/`vsLinearFrac`/`vsDiv`/`cblas_saxpy`) -- zero
+    hand-rolled `#pragma omp` regions in this file at all, per the user's
+    direction. fp32 only for now (BLAS is inherently single-precision;
+    fp8/fp4 would need a dense fp32 staging buffer, separate future work).
+  - `tests/unit/test_didldo_kernel.cpp`: forward, bwd0 (dx correct, lr=0
+    leaves weights bit-identical), and bwdX (dx correct AND weights match
+    an independent reference RMSprop step applied to an independently
+    computed reference dw) checked against hand-written dense-matmul/
+    RMSprop references, across batch=1 (sgemv path) and batch>1 (sgemm
+    path), including a non-square shape (where a transpose-direction bug
+    would hide on a square matrix). PASSED locally AND on arch-sandbox
+    (same real kernel file, same test file, both machines).
+  - Full local regression: 174 tests via `ctest`, 169 passed, the only 5
+    failures are pre-existing/already-documented
+    (`pre_existing_failure`-tagged, unrelated to this change) --
+    `test_didldo_kernel` itself passed clean, nothing else regressed from
+    the shared `CMakeLists.txt` edit.
+  - **Packaging reality check, worth knowing before anyone runs
+    `pip install sili[mkl]` fresh**: `mkl`'s pip dependency tree is
+    deep -- `mkl` alone pulls in `onemkl-license`, `intel-openmp`, `tbb`,
+    and `intel-openmp` itself further pulls `intel-cmplr-lib-ur` (and
+    likely more beyond that, not fully walked). On a machine WITH
+    internet this resolves transparently (confirmed on the local
+    machine: clean `pip install mkl mkl-include`, no manual
+    intervention). arch-sandbox has no internet at all, so validating
+    there used the already-scp'd subset of `.so`/`.h` files from this
+    investigation's earlier probes (`~/claude_code/mkl_probe_libs`)
+    rather than a full pip install -- sufficient to confirm the actual
+    kernel/build/test are correct, but NOT a demonstration that
+    `pip install sili[mkl]` itself works offline. Anyone deploying to an
+    offline/restricted environment needs the full wheel set staged
+    ahead of time (same category of problem as `pip install torch` with
+    CUDA support on an offline machine -- not unique to this).
+
+  **Next**: SIDLDO (the gather-strategy design above) is the remaining
+  piece of Group B. Not started.

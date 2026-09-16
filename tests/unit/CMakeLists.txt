@@ -98,6 +98,37 @@ add_executable(
 # installed, on any machine, without editing this file per-environment.
 find_package(Python3 COMPONENTS Development REQUIRED)
 
+# Optional MKL detection for DIDLDO/SIDLDO (TODO_BATCH_BLOCKING.md, "Also
+# queued"), mirroring setup.py's `_find_mkl()`: `pip install mkl
+# mkl-include` into whatever Python environment this build is configured
+# against installs the payload under that interpreter's `sys.prefix`
+# (`lib/libmkl_*.so.N`, `include/mkl*.h`) -- confirmed by direct install
+# and inspection, not assumed. The Development-only find_package(Python3)
+# above does NOT populate Python3_EXECUTABLE (only Interpreter does) --
+# found directly (it silently produced an empty sys.prefix the first time
+# this was written) -- so resolve the interpreter separately, NOT
+# REQUIRED since MKL support itself is optional; no interpreter found
+# just means no MKL detection attempted.
+find_package(Python3 COMPONENTS Interpreter)
+set(SILI_MKL_FOUND FALSE)
+if(Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import sys; print(sys.prefix)"
+        OUTPUT_VARIABLE SILI_PY_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    set(SILI_MKL_LIB_DIR "${SILI_PY_PREFIX}/lib")
+    set(SILI_MKL_INCLUDE_DIR "${SILI_PY_PREFIX}/include")
+    if(EXISTS "${SILI_MKL_LIB_DIR}/libmkl_gnu_thread.so.3" AND EXISTS "${SILI_MKL_INCLUDE_DIR}/mkl_cblas.h")
+        set(SILI_MKL_FOUND TRUE)
+        message("Found MKL (mkl/mkl-include pip packages) under ${SILI_PY_PREFIX} -- building test_didldo_kernel")
+    else()
+        message("MKL not found under ${SILI_PY_PREFIX} (pip install mkl mkl-include to enable) -- skipping test_didldo_kernel")
+    endif()
+else()
+    message("No Python3 interpreter found for MKL detection -- skipping test_didldo_kernel")
+endif()
+
 
 # currently, torch is broken in arch linux. Package is marked out of date. Should be fixed in a week or so.
 # pacman -S python-pytorch-opt-cuda
@@ -217,3 +248,19 @@ foreach(t ${SILI_STANDALONE_TESTS})
     set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# test_didldo_kernel needs MKL's headers/direct-linked GNU-threading-layer
+# libs (not just OpenMP::OpenMP_CXX like every other test above), so it's
+# kept out of the uniform SILI_STANDALONE_TESTS loop and only built when
+# SILI_MKL_FOUND -- same graceful compile-out setup.py's cpu_ext uses.
+if(SILI_MKL_FOUND)
+    add_executable(test_didldo_kernel test_didldo_kernel.cpp)
+    target_include_directories(test_didldo_kernel PRIVATE "../../sili/" "../../sili/lib/headers" "../../sili/lib/src" "${SILI_MKL_INCLUDE_DIR}")
+    target_link_directories(test_didldo_kernel PRIVATE "${SILI_MKL_LIB_DIR}")
+    target_compile_definitions(test_didldo_kernel PRIVATE SILI_HAVE_MKL=1)
+    target_link_libraries(test_didldo_kernel OpenMP::OpenMP_CXX
+        "-l:libmkl_intel_lp64.so.3" "-l:libmkl_gnu_thread.so.3" "-l:libmkl_core.so.3"
+        "-Wl,-rpath,${SILI_MKL_LIB_DIR}")
+    set_target_properties(test_didldo_kernel PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME test_didldo_kernel COMMAND test_didldo_kernel)
+endif()
