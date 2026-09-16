@@ -47,9 +47,9 @@ static void dense_reference(const float* x, SIZE_TYPE batch, std::size_t n_in, s
 // n_in/n_out deliberately NOT multiples of BLOCK4_TILE(4) -- exercises
 // the boundary (partial) row/col block, which the transposed path must
 // handle via the same row_idx[li]=0-fallback + zero-weight masking as
-// the existing scalar path. num_cpus/n_out chosen so cols_per_thread >=
-// COLUMN_PARTITION_MIN_COLS_PER_THREAD(12) -- i.e. this really exercises
-// the WIDE path, not the narrow (unaffected by Phase 1) one.
+// the existing scalar path. Callers below pick num_cpus/n_out to hit
+// BOTH the wide and narrow dispatch (see main()'s comment) -- this
+// helper itself doesn't care which, it just checks the math is right.
 static void run_case(const char* label, std::size_t n_in, std::size_t n_out, SIZE_TYPE batch,
                      int num_cpus, unsigned seed) {
     std::mt19937 rng(seed);
@@ -110,19 +110,44 @@ static void run_case(const char* label, std::size_t n_in, std::size_t n_out, SIZ
 }
 
 int main() {
-    // Exactly at threshold (8), and its immediate neighbors, since
-    // off-by-one gate bugs live at boundaries.
-    run_case("n_in=61 n_out=97 batch=7 (below threshold)", 61, 97, 7, 4, 1);
-    run_case("n_in=61 n_out=97 batch=8 (at threshold)", 61, 97, 8, 4, 2);
-    run_case("n_in=61 n_out=97 batch=9 (above threshold)", 61, 97, 9, 4, 3);
-    // Multiple BLOCK4_BATCH_BLOCK_B(8)-wide chunks plus a remainder tail.
-    run_case("n_in=64 n_out=128 batch=37 (partial tail chunk)", 64, 128, 37, 4, 4);
-    // Large batch, exact multiple of BLOCK4_BATCH_BLOCK_B, many threads.
-    run_case("n_in=128 n_out=128 batch=256 (no remainder)", 128, 128, 256, 4, 5);
-    // Boundary row/col block (n_in/n_out not multiples of BLOCK4_TILE)
-    // with a bigger batch, more threads (checks the per-thread column
-    // range math at the n_out%num_cpus!=0 boundary too).
-    run_case("n_in=61 n_out=101 batch=64, num_cpus=6", 61, 101, 64, 6, 6);
+    // IMPORTANT: disldo_forward picks WIDE (column-partitioned) vs
+    // NARROW (tree-reduction) per call based on
+    // cols_per_thread = ceil(n_out/BLOCK4_TILE) / num_cpus vs
+    // COLUMN_PARTITION_MIN_COLS_PER_THREAD(12) -- Phase 1 only touched
+    // the wide path's blocked branch, Phase 2 added the narrow path's.
+    // An earlier version of this file picked (n_in,n_out,num_cpus)
+    // combos that all worked out to cols_per_thread<12 without checking
+    // the arithmetic, so it accidentally tested ONLY the narrow path the
+    // whole time it claimed to test "the wide path" -- Phase 1's own
+    // blocked-wide branch was actually verified only by the
+    // pre-existing test_disldo_block4_fp32_wide_simd.cpp (n_out=256,
+    // num_cpus=4 -> cols_per_thread=16, genuinely wide). Fixed here:
+    // both groups below are picked with the real formula checked, and
+    // each covers the below/at/above-threshold boundary independently.
+
+    // ── WIDE path (cols_per_thread >= 12) ──
+    // n_out=200, num_cpus=4: ceil(200/4)=50 block-cols, 50/4=12 (exact
+    // boundary of the wide/narrow split itself -- also worth covering).
+    run_case("WIDE n_in=61 n_out=200 batch=7 (below threshold)", 61, 200, 7, 4, 11);
+    run_case("WIDE n_in=61 n_out=200 batch=8 (at threshold)", 61, 200, 8, 4, 12);
+    run_case("WIDE n_in=61 n_out=200 batch=9 (above threshold)", 61, 200, 9, 4, 13);
+    // n_out=256, num_cpus=4: 64 block-cols, cols_per_thread=16 -- well
+    // inside the wide regime, multiple BLOCK4_BATCH_BLOCK_B(8)-wide
+    // chunks plus a remainder tail, and a large exact-multiple batch.
+    run_case("WIDE n_in=64 n_out=256 batch=37 (partial tail chunk)", 64, 256, 37, 4, 14);
+    run_case("WIDE n_in=128 n_out=256 batch=256 (no remainder)", 128, 256, 256, 4, 15);
+
+    // ── NARROW path (cols_per_thread < 12) ──
+    // n_out=97, num_cpus=4: ceil(97/4)=25 block-cols, cols_per_thread=6.
+    run_case("NARROW n_in=61 n_out=97 batch=7 (below threshold)", 61, 97, 7, 4, 1);
+    run_case("NARROW n_in=61 n_out=97 batch=8 (at threshold)", 61, 97, 8, 4, 2);
+    run_case("NARROW n_in=61 n_out=97 batch=9 (above threshold)", 61, 97, 9, 4, 3);
+    // n_out=128, num_cpus=4: 32 block-cols, cols_per_thread=8.
+    run_case("NARROW n_in=64 n_out=128 batch=37 (partial tail chunk)", 64, 128, 37, 4, 4);
+    run_case("NARROW n_in=128 n_out=128 batch=256 (no remainder)", 128, 128, 256, 4, 5);
+    // Boundary row/col block (n_in/n_out not multiples of BLOCK4_TILE),
+    // num_cpus=6: ceil(101/4)=26 block-cols, cols_per_thread=4.
+    run_case("NARROW n_in=61 n_out=101 batch=64, num_cpus=6", 61, 101, 64, 6, 6);
 
     if (g_fail == 0)
         std::printf("PASS: all disldo_block4_fp32_batch_blocked checks\n");

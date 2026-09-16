@@ -1437,6 +1437,34 @@ struct Block4Store {
     // see disldo_forward.batch_blocked_wide_path in linear_disldo_forward.hpp.
     std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T; // backward only
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
     // disldo_forward.column_partitioned_threading: per-thread work-item
     // lists (see Block4WorkItem above) plus the column-block partition
     // boundaries used to build them, reused call to call so no fresh
@@ -2012,6 +2040,34 @@ struct Block4Store8 {
     // identical fields above.
     std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T;
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
@@ -2740,6 +2796,34 @@ struct Block4Store32 {
     // identical fields above.
     std::vector<float> scratch_input_T;
     std::vector<float> scratch_output_grad_T;
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
     // disldo_forward.column_partitioned_threading: see the FP4 store's
     // identical fields above.
     std::vector<std::vector<Block4WorkItem>> scratch_thread_items;

@@ -230,6 +230,155 @@ reduction path) climbed smoothly from ~0.35-0.73 at batch=1 to
 to column-partitioning) reached 0.82-0.93 at batch=1024, also with no
 turnover -- the old scheme's large-batch decline is gone on both paths.
 
+.. _disldo_forward.batch_blocked_threshold:
+
+Batch-blocked accumulation: transposed input + register-blocked accumulate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.batch_blocked_threshold``
+
+Profiled via callgrind (batch=1024, num_cpus=1): the per-sample
+horizontal-reduce-and-scalar-store inside ``process_block4_item``
+(``mo[...] += prod[0]+prod[1]+prod[2]+prod[3]``) was ~74% of real
+compute, vs ~4% for the actual useful SIMD multiply. Fix: transpose the
+input once per call to ``[row, batch]`` (``scratch_input_T``, shared,
+read-only across threads), then accumulate ``BLOCK4_BATCH_BLOCK_B=8``
+batch samples at a time via ``block4_batch_accumulate`` (``block4.hpp``)
+-- both the input gather and the accumulator write become genuine wide
+SIMD loads/stores instead of a per-sample horizontal reduce. Below
+``BLOCK4_BATCH_BLOCK_THRESHOLD=8``, the transpose isn't amortized and
+this path measures SLOWER than the old scalar path (0.1-0.6x at
+batch=1), so it stays gated off below threshold.
+
+Rolled out in three rounds, tracked task-by-task in
+``TODO_BATCH_BLOCKING.md`` at the repo root while in progress (that file
+is the working queue; this section is the settled record once a round
+landed).
+
+**Round 1 -- wide (column-partitioned) path.** Each thread gets a
+private column-major accumulator sized to just its OWN column range
+(threads already own disjoint output-column ranges, see
+:ref:`disldo_forward.column_partitioned_threading` above), flushed
+(transposed back, ``+=``) into ``output`` once at the end -- still zero
+cross-thread writes. A first implementation copied a standalone PoC's
+inner loop verbatim, including a per-lane broadcast-fill loop
+(``for(k) wv[k]=w4[li]``) INSIDE the hot batch-chunk loop -- the exact
+anti-pattern ``block4_vec_broadcast``'s own docstring already warns
+about (defeats the compiler's ability to keep a loop-invariant broadcast
+in a register). First real-kernel A/B showed ZERO speedup, even a
+regression at large batch, until this was caught and fixed by hoisting
+the broadcast out of the loop. Lesson: a PoC validates the algorithmic
+shape, not its own code -- re-measure the real shipped kernel, don't
+trust the PoC's numbers to transfer.
+
+**Round 2 -- narrow (tree-reduction) path.** Same primitive, applied to
+the narrow path's private per-thread buffer -- but here a thread's items
+aren't column-owned (row-major chunking, see
+:ref:`disldo_forward.narrow_layer_tree_reduction`), so the buffer must
+cover the FULL ``n_out`` range, column-major instead of row-major so
+``block4_batch_accumulate`` still gets contiguous accesses. Landed with
+zero measurable win at first -- see
+:ref:`disldo_forward.narrow_path_barrier_reduction` and
+:ref:`disldo_forward.persistent_scratch_buffers` below for the two
+follow-up rounds that actually explain and fix that.
+
+.. _disldo_forward.narrow_path_barrier_reduction:
+
+Narrow-path barrier reduction: only one barrier is load-bearing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.narrow_path_barrier_reduction``
+
+The narrow path's ``log2(num_cpus)``-round tree reduction originally
+re-dispatched a fresh ``#pragma omp for`` every round -- 4 barrier
+crossings per call (item-processing, 2 reduction rounds, final flush).
+None of the inter-round barriers are actually required: the reduction
+only ever combines buffer copies at a FIXED index, never across indices,
+so if one thread claims a static column range for the ENTIRE reduction
++flush (computed once via ``omp_get_thread_num()``, GPU-``global_id``
+style, not redispatched), round N+1 for that thread's range only ever
+depends on a value that SAME thread wrote in round N -- zero cross-
+thread dependency once past the one barrier that genuinely is required
+(between item-processing, which can write anywhere, and the start of
+reduction). Cuts 4 barrier crossings down to 1.
+
+A first version of this fix nested the column/batch loop OUTSIDE the
+stride/round loop, meaning every single ``(col, b)`` element jumped
+between up to ``num_cpus`` buffer copies ``ost`` elements (hundreds of
+KB) apart on every iteration instead of doing one sequential sweep per
+round -- measured 2-13% SLOWER than no fix at all until the loop
+nesting was corrected back to stride-outermost (matching the original
+code's nesting, just with a static per-thread range instead of a
+redispatched one).
+
+Once correctly implemented: STILL no measurable wall-clock win
+(before/after within noise, 4 interleaved pairs). Real lesson: callgrind
+attributed ~52% of instructions to ``gomp_*_barrier_wait_end`` on this
+shape, and that was read as "barriers are half the real cost" -- but
+instruction-count share is not time share. A spin-wait loop is
+instruction-DENSE (tight poll, no memory stalls) but cheap per
+instruction, so a large fraction of *instructions* spent spinning does
+not imply a large fraction of *wall-clock time*. Kept anyway
+(correctness-verified, objectively fewer synchronization points, never
+measured worse) but did not, on its own, explain the narrow path's null
+result -- see the next section for what did.
+
+.. _disldo_forward.persistent_scratch_buffers:
+
+Persistent scratch buffers: the fix that actually worked
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.persistent_scratch_buffers``
+
+Both the wide path's ``thread_buf`` and the narrow path's ``b4_out``/
+``b4_out_T`` were a fresh ``std::vector<value_type>(size, 0)``
+constructed on EVERY call -- unlike ``scratch_input_T`` (persistent,
+resized not reallocated), these paid a real malloc plus a zero-fill of a
+multi-MB region on every single ``disldo_forward`` invocation. The
+narrow path's version did this ONCE, serially, before the parallel
+region opened; the wide path's version was WORSE -- a SEPARATE
+allocation per thread, done CONCURRENTLY inside the parallel region
+(``num_cpus`` threads all hitting malloc's lock at once).
+
+Fix: persistent members (``Block4Store``/``Store8``/``Store32``'s
+``scratch_b4_out`` for the narrow path, ``scratch_thread_buf`` for the
+wide path -- one shared buffer sized ``n_out * batch``, not
+``num_cpus * n_out * batch``, since wide-path threads own disjoint
+contiguous column ranges that exactly tile ``[0, n_out)`` and can
+address their own sub-range via a ``col_lo * batch`` offset), resized
+(not reallocated once warm) instead of freshly constructed, with the
+zero-fill moved to per-thread INSIDE the parallel region -- each thread
+zeros only its own slice, in parallel, instead of one thread zeroing
+everything (wide path) or the constructor zeroing everything serially
+up-front (narrow path).
+
+This was the actual fix, in both places. Real-kernel A/B, arch-sandbox,
+num_cpus=4, ``taskset -c 0-3`` (4 real physical cores confirmed via
+``lscpu -e``), before = genuinely pre-fix code via a pinned git
+worktree, several interleaved pairs each:
+
+- **Narrow path** (n_in=n_out=128): ~1.0x at batch<=64 (buffer too
+  small to matter), **~1.1-1.3x at batch=256-1024**.
+- **Wide path** (n_in=n_out=288): grows from **~1.3x at batch=8** up to
+  **~5.0-5.1x at batch=1024** -- and this also resolves an open question
+  from Round 1 above ("why does the batch-blocking gain shrink at
+  batch>=256?"): it wasn't a fundamental limit, it was this exact same
+  per-call allocation tax masking the real win the whole time. With it
+  fixed, the speedup GROWS with batch instead of tapering off, as
+  expected once a fixed per-call cost stops eating a growing share of an
+  otherwise-shrinking per-sample cost.
+
+Open: the wide path's num_cpus=8 case (spanning this box's two L3/CCX
+domains, arch-sandbox's documented "worst" 5-9 num_cpus bracket for
+cross-CCX traffic) showed a large apparent win too after this fix, but
+the "before"
+baseline measured inconsistently across different points in the same
+session (3.2-3.4M ns/call vs an earlier 516K ns/call at the identical
+shape, with no live CPU hog found via ``ps aux`` but a nonzero
+``uptime`` load average at measurement time) -- not yet confirmed on an
+idle machine, so the precise ratio there isn't trusted yet even though
+the fix never measured worse.
+
 .. _disldo_forward.hoisted_tile_count:
 
 Hoisting ``tile_br.size()`` -- measured instruction-count win, no

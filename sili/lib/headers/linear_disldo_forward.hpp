@@ -113,44 +113,13 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
     // lets this SIMD where the scattered loop above can't. See
     // disldo_forward.tile_coord_collection in docs/research/linear_disldo.rst.
     if (weights.block4.n_tiles() > 0) {
-        // disldo_forward.column_partitioned_threading: two strategies,
-        // chosen per call by layer width relative to num_cpus. Both start
-        // from the SAME flat, row-major item list (leader tile, or
-        // leader+consecutive-follower pair within a row -- unchanged
-        // pairing rule, no ownership concept yet):
-        //
-        //  - WIDE (>= COLUMN_PARTITION_MIN_COLS_PER_THREAD output
-        //    column-blocks per thread): re-bucket the flat list by which
-        //    thread owns each item's output column-block range, then
-        //    every thread writes straight into `output` -- zero
-        //    cross-thread writes, zero reduction. This is what the
-        //    O(num_cpus * batch * n_out) alloc+reduce tax measured at
-        //    large batch/wide layers (see disldo_forward.
-        //    per_thread_output_buffers in docs/research/linear_disldo.
-        //    rst) gets replaced with.
-        //  - NARROW: process the flat list directly via `#pragma omp for
-        //    schedule(static)` (each thread gets a CONTIGUOUS chunk of
-        //    row-major tiles, same locality as the pre-this-session
-        //    scheme) into a private per-thread buffer, then combine the
-        //    num_cpus private buffers with a PARALLEL tree reduction
-        //    inside this same parallel region -- O(log2(num_cpus)) more
-        //    barriers, but the combine work itself is split across every
-        //    thread each round instead of one thread doing it serially.
-        //
-        // The wide path alone regresses badly for narrow layers: measured
-        // directly (standalone A/B, arch-sandbox, CCX-pinned) at n_out=64/
-        // num_cpus=4 (4 output column-blocks per thread), efficiency
-        // crashed to ~0.21-0.26 at batch>=256 (worse than doing NOTHING
-        // in parallel) vs ~0.86-0.88 for the old row-partitioned+serial-
-        // reduce scheme -- root cause: with few column-blocks per thread,
-        // a thread's work items jump to a DIFFERENT row-block's input
-        // slice every 1-2 items instead of reusing one row-block's slice
-        // across many consecutive items, so input reads stay cold instead
-        // of warm in cache. Row-major chunking never has this problem
-        // (that's what the narrow path restores), which is why the two
-        // strategies are split on layer width, not just accepted as a
-        // blanket tradeoff. "Few outputs, many inputs" (embedding/readout-
-        // shaped layers) is a real, not hypothetical, network shape.
+        // Two threading strategies, chosen per call by layer width
+        // relative to num_cpus -- see
+        // disldo_forward.column_partitioned_threading and
+        // disldo_forward.narrow_layer_tree_reduction in
+        // docs/research/linear_disldo.rst for why one scheme alone
+        // isn't enough (each regresses badly for the shape the other
+        // handles).
         const auto& BL4 = weights.block4.block_layout;
         const std::size_t n_bc_total = BL4.cols;
 
@@ -549,26 +518,19 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             process_pair.template operator()<2>();
         };
 
+        // See disldo_forward.batch_blocked_threshold in
+        // docs/research/linear_disldo.rst -- shared by the wide and
+        // narrow dispatch below.
+        constexpr SIZE_TYPE BLOCK4_BATCH_BLOCK_THRESHOLD = 8;
+
         if (use_column_partition) {
             // Wide path: thread_items[tid] was already assigned to this
             // exact thread during collection, by output column-block
             // ownership -- that's what makes writing directly into
             // `output` safe with zero cross-thread writes, zero
-            // reduction.
-            //
-            // disldo_forward.batch_blocked_wide_path (Phase 1, see
-            // TODO_BATCH_BLOCKING.md): below BLOCK4_BATCH_BLOCK_THRESHOLD,
-            // the transpose isn't amortized and this path measured
-            // SLOWER than the plain per-item scalar path (0.1-0.6x at
-            // batch=1) -- so it stays off below threshold, matching the
-            // existing per-item call exactly. At/above threshold, build
-            // input_T once (shared, read-only, transposed to
-            // [row, batch]), give each thread a PRIVATE column-major
-            // accumulator sized to just its own column range, and flush
-            // (transpose back, +=) into `output` once at the end --
-            // still zero cross-thread writes, same safety property as
-            // today's direct-to-`output` writes.
-            constexpr SIZE_TYPE BLOCK4_BATCH_BLOCK_THRESHOLD = 8;
+            // reduction. At/above threshold, see
+            // disldo_forward.batch_blocked_threshold in
+            // docs/research/linear_disldo.rst.
             if (batch >= BLOCK4_BATCH_BLOCK_THRESHOLD) {
                 std::vector<value_type>& input_T = weights.block4.scratch_input_T;
                 input_T.resize(n_in * static_cast<std::size_t>(batch));
@@ -579,6 +541,10 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         dst[b] = input[static_cast<std::size_t>(b) * in_cols + r];
                 }
 
+                // See disldo_forward.persistent_scratch_buffers in
+                // docs/research/linear_disldo.rst.
+                std::vector<value_type>& thread_buf_all = weights.block4.scratch_thread_buf;
+                thread_buf_all.resize(n_out * static_cast<std::size_t>(batch));
 #pragma omp parallel num_threads(num_cpus)
                 {
                     const int tid = omp_get_thread_num();
@@ -592,18 +558,20 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
                         thread_bc_start_[static_cast<std::size_t>(tid) + 1] * BLOCK4_TILE, n_out);
                     if (col_hi > col_lo) {
                         const std::size_t thread_ncols = col_hi - col_lo;
-                        std::vector<value_type> thread_buf(
-                            thread_ncols * static_cast<std::size_t>(batch), value_type(0));
+                        value_type* thread_buf =
+                            thread_buf_all.data() + col_lo * static_cast<std::size_t>(batch);
+                        std::fill(thread_buf,
+                                  thread_buf + thread_ncols * static_cast<std::size_t>(batch),
+                                  value_type(0));
                         for (const Block4WorkItem& item :
                              thread_items[static_cast<std::size_t>(tid)])
-                            process_block4_item(item, thread_buf.data(), row_scale_cache.data(),
+                            process_block4_item(item, thread_buf, row_scale_cache.data(),
                                                 col_scale_cache.data(), input_T.data(), col_lo);
                         // Transpose-back flush: this thread's columns
                         // only, so no cross-thread writes here either.
                         for (std::size_t col = col_lo; col < col_hi; ++col) {
                             const value_type* src =
-                                thread_buf.data() +
-                                (col - col_lo) * static_cast<std::size_t>(batch);
+                                thread_buf + (col - col_lo) * static_cast<std::size_t>(batch);
                             for (SIZE_TYPE b = 0; b < batch; ++b)
                                 output[static_cast<std::size_t>(b) * n_out + col] += src[b];
                         }
@@ -636,31 +604,122 @@ void disldo_forward(const typename ValueAccessor<VALUES_TYPE>::value_type* input
             // since it's parallelized every round instead of serialized
             // once. See disldo_forward.per_thread_output_buffers in
             // docs/research/linear_disldo.rst.
-            std::vector<value_type> b4_out(static_cast<std::size_t>(num_cpus) * ost, value_type(0));
-            const int64_t n_items_local = int64_t(flat_items.size());
-#pragma omp parallel num_threads(num_cpus)
-            {
-                const int tid = omp_get_thread_num();
-                value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
-                std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
-                std::vector<value_type> col_scale_cache(2 * scale_rank);
-#pragma omp for schedule(static)
-                for (int64_t idx = 0; idx < n_items_local; ++idx)
-                    process_block4_item(flat_items[static_cast<std::size_t>(idx)], mo,
-                                        row_scale_cache.data(), col_scale_cache.data());
+            //
+            // Unlike the wide path, items here are NOT column-
+            // partitioned, so at/above threshold the per-thread buffer
+            // is column-major [n_out, batch] (full range, not just an
+            // owned slice) -- see disldo_forward.batch_blocked_threshold
+            // in docs/research/linear_disldo.rst.
+            if (batch >= BLOCK4_BATCH_BLOCK_THRESHOLD) {
+                std::vector<value_type>& input_T = weights.block4.scratch_input_T;
+                input_T.resize(n_in * static_cast<std::size_t>(batch));
+#pragma omp parallel for num_threads(num_cpus) schedule(static)
+                for (std::size_t r = 0; r < n_in; ++r) {
+                    value_type* dst = input_T.data() + r * static_cast<std::size_t>(batch);
+                    for (SIZE_TYPE b = 0; b < batch; ++b)
+                        dst[b] = input[static_cast<std::size_t>(b) * in_cols + r];
+                }
 
-                for (int stride = 1; stride < num_cpus; stride *= 2) {
-                    const int step = stride * 2;
+                // See disldo_forward.persistent_scratch_buffers in
+                // docs/research/linear_disldo.rst.
+                std::vector<value_type>& b4_out_T = weights.block4.scratch_b4_out;
+                b4_out_T.resize(static_cast<std::size_t>(num_cpus) * ost);
+                const int64_t n_items_local = int64_t(flat_items.size());
+#pragma omp parallel num_threads(num_cpus)
+                {
+                    const int tid = omp_get_thread_num();
+                    // Column-major [n_out, batch] for this thread's slice.
+                    value_type* mo = b4_out_T.data() + static_cast<std::size_t>(tid) * ost;
+                    std::fill(mo, mo + ost, value_type(0));
+                    std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                    std::vector<value_type> col_scale_cache(2 * scale_rank);
 #pragma omp for schedule(static)
-                    for (std::size_t i = 0; i < ost; ++i) {
-                        for (int base = 0; base + stride < num_cpus; base += step)
-                            b4_out[static_cast<std::size_t>(base) * ost + i] +=
-                                b4_out[static_cast<std::size_t>(base + stride) * ost + i];
+                    for (int64_t idx = 0; idx < n_items_local; ++idx)
+                        process_block4_item(flat_items[static_cast<std::size_t>(idx)], mo,
+                                            row_scale_cache.data(), col_scale_cache.data(),
+                                            input_T.data(), std::size_t(0));
+                    // The ONE barrier this reduction genuinely needs: a
+                    // thread's own column range below may hold data
+                    // written by ANY other thread's items above (item
+                    // ownership above is by flat-list position, not by
+                    // column) -- so every write above must be visible
+                    // before any thread starts reducing. Implicit at the
+                    // end of the `#pragma omp for` above; kept. See
+                    // disldo_forward.narrow_path_barrier_reduction in
+                    // docs/research/linear_disldo.rst: below, each thread
+                    // claims a FIXED static column range (GPU-global-id
+                    // style) and does ALL reduction rounds + the flush
+                    // for it sequentially, no further barriers -- correct
+                    // because round N+1 for a column only ever depends on
+                    // a value THIS thread wrote in round N. Loop order
+                    // matters: stride MUST stay outermost (not
+                    // column/batch), or every element thrashes between
+                    // widely-separated buffer copies every iteration --
+                    // see the docs section for the regression that
+                    // caused before it was caught.
+                    const std::size_t col_lo = (static_cast<std::size_t>(tid) * n_out) /
+                                               static_cast<std::size_t>(num_cpus);
+                    const std::size_t col_hi = (static_cast<std::size_t>(tid + 1) * n_out) /
+                                               static_cast<std::size_t>(num_cpus);
+                    const std::size_t i_lo = col_lo * static_cast<std::size_t>(batch);
+                    const std::size_t i_hi = col_hi * static_cast<std::size_t>(batch);
+                    for (int stride = 1; stride < num_cpus; stride *= 2) {
+                        const int step = stride * 2;
+                        for (std::size_t i = i_lo; i < i_hi; ++i) {
+                            for (int base = 0; base + stride < num_cpus; base += step)
+                                b4_out_T[static_cast<std::size_t>(base) * ost + i] +=
+                                    b4_out_T[static_cast<std::size_t>(base + stride) * ost + i];
+                        }
+                    }
+                    // Transpose-back flush: b4_out_T[0*ost + col*batch + b]
+                    // now holds the fully-reduced value for (col, b) --
+                    // same column range this thread already owns above,
+                    // still zero cross-thread reads.
+                    for (std::size_t col = col_lo; col < col_hi; ++col) {
+                        const value_type* src =
+                            b4_out_T.data() + col * static_cast<std::size_t>(batch);
+                        for (SIZE_TYPE b = 0; b < batch; ++b)
+                            output[static_cast<std::size_t>(b) * n_out + col] += src[b];
                     }
                 }
+            } else {
+                // Same persistent-scratch + barrier-reduction treatment
+                // as the blocked branch above -- see
+                // disldo_forward.persistent_scratch_buffers and
+                // disldo_forward.narrow_path_barrier_reduction in
+                // docs/research/linear_disldo.rst. Row-major layout
+                // here means any contiguous flat-index range works (no
+                // column alignment needed) and the flush is a trivial
+                // 1:1 copy, no transpose.
+                std::vector<value_type>& b4_out = weights.block4.scratch_b4_out;
+                b4_out.resize(static_cast<std::size_t>(num_cpus) * ost);
+                const int64_t n_items_local = int64_t(flat_items.size());
+#pragma omp parallel num_threads(num_cpus)
+                {
+                    const int tid = omp_get_thread_num();
+                    value_type* mo = b4_out.data() + static_cast<std::size_t>(tid) * ost;
+                    std::fill(mo, mo + ost, value_type(0));
+                    std::vector<value_type> row_scale_cache(BLOCK4_TILE * scale_rank);
+                    std::vector<value_type> col_scale_cache(2 * scale_rank);
 #pragma omp for schedule(static)
-                for (std::size_t i = 0; i < ost; ++i)
-                    output[i] += b4_out[i];
+                    for (int64_t idx = 0; idx < n_items_local; ++idx)
+                        process_block4_item(flat_items[static_cast<std::size_t>(idx)], mo,
+                                            row_scale_cache.data(), col_scale_cache.data());
+                    const std::size_t i_lo =
+                        (static_cast<std::size_t>(tid) * ost) / static_cast<std::size_t>(num_cpus);
+                    const std::size_t i_hi = (static_cast<std::size_t>(tid + 1) * ost) /
+                                             static_cast<std::size_t>(num_cpus);
+                    for (int stride = 1; stride < num_cpus; stride *= 2) {
+                        const int step = stride * 2;
+                        for (std::size_t i = i_lo; i < i_hi; ++i) {
+                            for (int base = 0; base + stride < num_cpus; base += step)
+                                b4_out[static_cast<std::size_t>(base) * ost + i] +=
+                                    b4_out[static_cast<std::size_t>(base + stride) * ost + i];
+                        }
+                    }
+                    for (std::size_t i = i_lo; i < i_hi; ++i)
+                        output[i] += b4_out[i];
+                }
             }
         }
     }
