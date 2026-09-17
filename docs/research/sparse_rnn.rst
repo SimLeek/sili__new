@@ -994,8 +994,61 @@ engine_select.hpp``, ``group_a_forward_use_sisldo`` /
 ``.backward()`` and ``DIDLDOLayerV.forward()``/``.backward()`` actually
 call -- ``forward_dense``/``forward_sparse``/``backward_dense``/
 ``backward_sparse`` remain on both classes as the explicit, no-decision
-escape hatch. The rules themselves are coarse first cuts, not a full
-surface fit (that's separate, larger future work -- see below):
+escape hatch.
+
+**Redone 2026-09-17** (superseding the original coarse ``batch``/
+``density``-only rules below): the original rules were fit on 336 cells
+covering only 2 widths for Group A and 1 width (n=288) for Group B --
+"a lot more detailed [testing existed] than this with more crossover
+points, and they only tested a few layer sizes," per direct instruction.
+Re-swept both groups across 7 widths (64, 128, 288, 512, 1024, 2048,
+4096) -- 1176 Group A rows (also adding a synapse/weight-density axis,
+``syn`` in {0.1, 1.0} -- see below) and 735 Group B rows (first-ever
+width coverage beyond n=288) -- and refit each rule as a decision tree
+in log-space over width/batch/density (and, for Group A backward,
+synapse density) via ``scripts/fit_engine_select_rules.py`` +
+``scripts/engine_select_bench_data.json``. Hyperparameters were chosen
+by k-fold cross-validation, not training accuracy -- an initial more
+aggressive fit reached 92-96% training accuracy but on leaves of 4-8
+samples at 50-75% leaf accuracy, i.e. fitting measurement noise, not
+real crossover structure. Thresholds in the generated C++ are the exact
+fitted values, not rounded for legibility -- direct instruction:
+prefer a more accurate rule even if more complicated.
+
+Measured accuracy (cross-validated, i.e. held out, not training-set):
+
+- Group A forward: 92.6% (majority-class baseline 59.2%). ``syn_density``
+  (the WEIGHT matrix's own sparsity, not this call's activation/gradient
+  density) turned out unused -- the tree never selected it as a useful
+  split for forward, only backward.
+- Group A backward: 91.6% (baseline 63.0%). ``syn_density`` IS a real,
+  previously-uncaptured driver here: at ``density > ~0.16`` sisldo stays
+  competitive far longer when the weight matrix itself is sparse
+  (``syn_density <= ~0.32``) than when it's dense, because dense-weight
+  disldo's inner loop has nothing to skip. This resolves the earlier
+  version's documented "real, unresolved gap" (a width/synapse
+  combination that inexplicably preferred sisldo past the density
+  threshold) -- it wasn't unresolved, it was a missing feature.
+- Group B forward: 93.9% (baseline 70.6%).
+- Group B backward: 86.5% (baseline 64.9%) -- independently fit from
+  real bwd0/bwdX data across all 7 widths (previously only n=288 was
+  ever tested, and even then the rule was a placeholder reusing
+  forward's). The remaining error here is a genuine measurement-noise
+  floor, not underfitting -- confirmed by pushing the fit far more
+  aggressively without moving the ceiling, consistent with many
+  near-1.0 time-ratio cells seen by hand in this specific op/region.
+
+``n`` (layer width) is the geometric mean ``sqrt(n_inputs * n_outputs)``
+at asymmetric-layer call sites -- every benchmark row was gathered on a
+SQUARE layer (``n_inputs == n_outputs``), so this is the least-wrong
+single-number proxy, not a validated case. Also unvalidated: everything
+was measured on one machine (AMD Ryzen 7 3800XT, 8 threads, oneAPI MKL),
+and Group A's ``syn_density`` axis was only measured at two points (0.1,
+1.0), not swept continuously. Re-run ``scripts/
+fit_engine_select_rules.py`` after gathering more data (more widths, a
+continuous ``syn_density`` sweep, another machine) to refit.
+
+Original (superseded 2026-09-17) rules, for reference:
 
 - Group A forward: ``batch == 1`` always picks sisldo, regardless of
   density; otherwise ``density < 0.05`` picks sisldo, else disldo. 100%
@@ -1003,23 +1056,16 @@ surface fit (that's separate, larger future work -- see below):
   Bench dataset (336 cells) at every tested point but one.
 - Group A backward: same shape, but the ``density >= 0.05`` branch only
   agreed 3/4 of the time in that same dataset (one width/synapse combo
-  consistently preferred sisldo there too) -- a real, unresolved gap,
-  not smoothed over.
+  consistently preferred sisldo there too) -- see ``syn_density`` above
+  for the resolution.
 - Group B forward: two-tier threshold (0.1 at ``batch <= 1``, 0.02
   otherwise) from a dedicated DIDLDO-vs-SIDLDO A/B, ONE width tested
   (n=288), 100% agreement at every point tested there.
-- Group B backward: **independently measured (2026-09-16)**, real A/B,
-  n=288, 4 densities x 7 batches, 28/28 tested points match the rule:
-  ``batch == 1`` picks sidldo unless density is near-full (``< 0.9``);
-  ``batch > 1`` only picks sidldo at low density AND modest batch
-  together (``density < 0.02 AND batch <= 128``) -- once the batch grows
-  past that even at low density, didldo wins, matching
-  ``sidldo_backward``'s own documented high-batch weakness at high
-  density/width (``TODO_BATCH_BLOCKING.md``, the row-major-gather fix
-  section) showing up here too, just gated by batch instead of width.
-  Replaced the earlier placeholder (reused forward's rule), which was
-  independently confirmed wrong on 2 of these 28 points once real data
-  existed.
+- Group B backward: real A/B, n=288, 4 densities x 7 batches, 28/28
+  tested points match the rule: ``batch == 1`` picks sidldo unless
+  density is near-full (``< 0.9``); ``batch > 1`` only picks sidldo at
+  low density AND modest batch together (``density < 0.02 AND batch <=
+  128``).
 
 **Crossing groups is NOT a real-time decision** -- it means an actual
 weight-storage relayout (sparse/block4 <-> dense), real work, not
@@ -1027,9 +1073,11 @@ something to do per-call. No automatic recommender for this exists yet;
 picking Group A vs Group B is a manual, design-time choice today
 (expected weight density and whether synaptogenesis/pruning will ever
 run against this layer are the likely deciding factors, not yet
-formalized). A real recommender, and the fuller multi-dimensional
-surface the coarse rules above are standing in for, are both scoped as
-separate future work in ``TODO_BATCH_BLOCKING.md`` ("Also queued").
+formalized) -- a real recommender for THIS choice is still scoped as
+separate future work in ``TODO_BATCH_BLOCKING.md`` ("Also queued"). The
+within-group surface fit above is no longer a stand-in for that
+future work -- it's the real multi-dimensional fit now, not a coarser
+placeholder for one.
 
 .. _sparse_rnn.didldo_same_optimizer_as_disldo:
 

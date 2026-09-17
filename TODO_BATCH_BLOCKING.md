@@ -623,7 +623,12 @@ range -- do not consider a phase done on PoC evidence alone.
 - Sweep input density more finely (0.5, 0.4, 0.3, 0.2, 0.1 between the
   already-tested 0.05 and 0.5) to find the actual sisldo/disldo crossover
   density for automatic engine switching, rather than just bracketing it
-  between 0.05 (sisldo wins) and 0.5 (disldo wins).
+  between 0.05 (sisldo wins) and 0.5 (disldo wins). **Partially addressed
+  (2026-09-17)**: the engine_select.hpp redo (see below) swept 7 widths
+  and added a synapse-density axis, substantially improving crossover
+  accuracy, but reused the same 4-point density grid ({0.005, 0.05, 0.5,
+  1.0}) -- the finer density resolution this bullet asks for specifically
+  is still open.
 
 - **DIDLDO / SIDLDO -- a second 2x2 grid, dense-weight-storage siblings
   of DISLDO/SISLDO.** Raised 2026-09-15/16, refined into a concrete
@@ -1556,10 +1561,11 @@ range -- do not consider a phase done on PoC evidence alone.
 
   **Not done**: the design-time Group-A-vs-Group-B recommender (still
   needs the "rule of thumb" itself derived, not just documented as
-  missing); the fuller multi-dimensional engine-selection surface both
-  real-time dispatchers are coarse stand-ins for; the FP4/FP8 dense-
-  weight kernel peridot's actual MiniCPM5 FP4 path would need (separate,
-  unscoped, bigger effort -- flagged, not started).
+  missing); the FP4/FP8 dense-weight kernel peridot's actual MiniCPM5
+  FP4 path would need (separate, unscoped, bigger effort -- flagged, not
+  started). The fuller multi-dimensional within-group engine-selection
+  surface (the item this bullet used to list as not-done) is now DONE --
+  see the "engine_select.hpp redone" entry below (2026-09-17).
 
 - [x] **`scripts/` triage + real perf-gating CI (2026-09-16).** This
   branch's own `scripts/` accumulated 17 files over its lifetime; per
@@ -1617,3 +1623,159 @@ range -- do not consider a phase done on PoC evidence alone.
     and commit it -- this session couldn't trigger real GH Actions
     infrastructure); doc-generation-on-every-PR (the other half of the
     README's CI roadmap item, not requested this pass).
+
+- [x] **`engine_select.hpp` redone from a real multi-dimensional surface
+  fit (2026-09-17).** Direct instruction: the committed 4 dispatch rules
+  (`group_a_forward_use_sisldo` etc.) were unacceptable -- "The results I
+  saw from the most detailed perf tests were a lot more detailed than
+  this with more crossover points, and they only tested a few layer
+  sizes." The originals were fit on 336 cells covering only 2 widths for
+  Group A (288, 1024) and literally 1 width for Group B (288), collapsing
+  real crossover structure into crude `(batch, density)`-only thresholds.
+
+  **New data**: re-swept both groups across 7 widths (64, 128, 288, 512,
+  1024, 2048, 4096) on arch-sandbox (AMD Ryzen 7 3800XT, 8 threads,
+  oneAPI MKL) -- 840 new Group A rows (combined with the original 336 =
+  1176 total, now also spanning `syn` (weight/synapse density) in {0.1,
+  1.0}, a previously entirely-untested axis) and 735 new Group B rows
+  (first-ever width coverage beyond n=288). Data committed at
+  `scripts/engine_select_bench_data.json`.
+
+  **Real, previously-missing signal found**: Group A backward's fitted
+  accuracy plateaued at exactly 85.7% regardless of tree depth using only
+  width/batch/density -- diagnosed (not guessed) by directly querying the
+  raw data for a `syn`-conditioned breakdown, which confirmed synapse/
+  weight density (a property of the WEIGHT matrix, distinct from the
+  activation/gradient density already measured per-call) is a real,
+  large, width-dependent driver: at `batch>=32, density>=0.5`,
+  `syn=1.0` gives sisldo_frac~0.012 (almost never wins) vs `syn=0.1`
+  gives sisldo_frac~0.464, with a highly non-monotonic per-width
+  breakdown at syn=0.1. Adding it as a 4th feature moved Group A forward
+  90.3%->94.1% and Group A backward 85.7%->92.6% (both training-set
+  numbers at that point in the investigation, since revised down after
+  the CV pass below found those specific settings were overfit).
+
+  **Fitting method**: hand-rolled CART-style greedy binary decision tree
+  (no sklearn available/installable in this environment), features
+  `log2(width)`, `log2(batch)`, `log10(density)`, and for Group A
+  `log10(syn_density)` -- these axes are naturally multiplicative/
+  geometric. **Caught a real overfitting mistake before committing it**:
+  an initial pass (`min_leaf=3`) reached 92-96% TRAINING accuracy, but
+  inspection showed many leaves with only 4-8 samples at 50-75% leaf
+  accuracy -- fitting measurement noise, not real crossover structure.
+  Redone with k-fold cross-validation (5-fold) to select hyperparameters
+  by HELD-OUT accuracy instead, which picked much smaller, honest trees
+  (8/9/5/7 leaves vs the noise-fit 31/64/17/37) at genuinely comparable
+  or better accuracy. A lossless post-fit pruning pass then collapsed any
+  split whose two children both predicted the same class (zero accuracy
+  cost, pure code-size reduction) -- e.g. Group A backward went from 16
+  fitted leaves to 9 with IDENTICAL training accuracy.
+
+  Final cross-validated (held-out) accuracy: Group A forward 92.6%
+  (baseline 59.2%), Group A backward 91.6% (baseline 63.0%), Group B
+  forward 93.9% (baseline 70.6%), Group B backward 86.5% (baseline
+  64.9% -- confirmed via aggressive-setting tests to be a genuine
+  measurement-noise floor, not underfitting).
+
+  **Direct instruction on style**: "You don't need to hand simplify. You
+  can, but I'd prefer a more accurate rule even if it's more
+  complicated." -- an earlier attempt to hand-round the fitted thresholds
+  into human-legible nested-ifs measurably lost accuracy (90.3%/85.5%/
+  96.3%/86.5% vs the fitted trees' real numbers above) and was abandoned;
+  the final `engine_select.hpp` uses the EXACT fitted thresholds (4-6
+  significant figures), generated mechanically by `to_cpp()`, not
+  hand-rounded.
+
+  **Reusable tooling, not a one-off**: the whole fit/CV/prune/codegen
+  pipeline lives at `scripts/fit_engine_select_rules.py` (a generator,
+  not a test -- per direct instruction it belongs in `scripts/`) --
+  re-run it after gathering more data (finer density grid, more widths,
+  a continuous `syn_density` sweep, another machine) to refit and
+  reprint the header content.
+
+  **New plumbing**: `group_a_forward_use_sisldo`/`group_b_forward_use_
+  sidldo`/`group_b_backward_use_sidldo` now take `(n, batch, density)`
+  and `group_a_backward_use_sisldo` takes `(n, batch, density,
+  syn_density)`. `n` is `sqrt(n_inputs * n_outputs)` (new `_dispatch_n()`
+  helper on both `DISLDOLayerV` and `DIDLDOLayerV`) -- every benchmark
+  row was gathered on a SQUARE layer, so this is the least-wrong single-
+  number proxy for an asymmetric layer, not a validated case.
+  `syn_density` (`_dispatch_syn_density()` on `DISLDOLayerV`) is `nnz() /
+  (n_inputs() * n_outputs())`, computed fresh on every Group A backward
+  dispatch call rather than cached -- `weights.block4.live_synapses()`
+  is a per-row scan ("cold-path reporting" per its own comment, not
+  O(1)), and there's no existing structure-version counter to invalidate
+  a cache against (growth/pruning/`load_*` all mutate nnz); its cost is
+  bounded by `nnz/BLOCK4_TILE_SLOTS + n_inputs`, well under the O(nnz)
+  cost of the actual forward/backward it's gating. Flagged, not
+  resolved: if this ever shows up as real per-call overhead, a proper
+  structure-version-counter cache is the fix, not a magic-number
+  recompute-every-N-calls heuristic.
+
+  **Verification**: full local `pytest` (192 passed, 4 skipped) and
+  `ctest` (171/171 passed, includes `test_didldo_kernel`/
+  `test_sidldo_kernel`/`test_disldo_backward_group_reduction`) both green
+  against a from-scratch MKL rebuild after the header/call-site changes;
+  manual smoke test of both `DISLDOLayerV` and `DIDLDOLayerV` forward/
+  backward through the new dispatch signatures.
+
+  **Not done**: arch-sandbox real-machine re-verification of the rebuilt
+  extension (this pass built/tested locally only); the finer density
+  grid and continuous `syn_density` sweep noted above; the design-time
+  Group-A-vs-Group-B recommender (separate, pre-existing "Not done"
+  item, unaffected by this pass).
+
+- [x] **Oblique-split test for engine_select.hpp -- negative result, kept
+  as an opt-in alternative (2026-09-17).** Motivated by the fitted trees'
+  crossover boundaries looking "a little bit diagonal" in a plotted
+  report: tested whether linear-combination (oblique) splits -- e.g.
+  `0.2*log(batch) + 0.8*log(width) <= c` instead of a single-feature
+  threshold -- would fit the real crossover surface better than the
+  committed axis-aligned trees. Implemented in `scripts/
+  fit_engine_select_rules.py` (`compare_oblique`, `--compare-oblique`
+  flag): standardizes features (z-score) so mixing weights are a fair
+  geometric blend, then at each CART node also searches every feature
+  pair x 9 mixing weights x threshold, in addition to the normal
+  single-feature search.
+
+  **Caught and fixed a real methodology error before trusting the first
+  result**: an initial comparison reused the axis-only model's CV-tuned
+  `(max_depth, min_leaf, min_gain)` for the oblique-enabled fit too --
+  an unfair comparison, since oblique splits carve more precisely per
+  node and need their own, typically heavier, regularization at the
+  same nominal depth/leaf settings. Fixed by running the exact same CV
+  grid search independently for each model class (including a much
+  wider `min_leaf` range, up to 64, to check whether oblique was simply
+  leaf-count-starved -- it wasn't; its selected optimum never left the
+  original 6-24 range).
+
+  **Result** (CV/held-out accuracy, axis-only best vs oblique best, own
+  independently-tuned hyperparameters each): Group A forward 92.6% ->
+  90.3% (-2.3pp), Group A backward 91.6% -> 91.3% (-0.3pp), Group B
+  forward 93.9% -> 94.3% (+0.4pp), Group B backward 86.5% -> 84.5%
+  (-2.0pp). Net: one marginal, plausibly-noise gain (CV accuracy alone
+  shifted 0.4-0.8pp earlier this session just from a different fold-
+  shuffle RNG seed, same axis-only algorithm), three real losses -- even
+  though training-set accuracy rose in every rule when oblique was
+  enabled (confirming the greedy optimizer worked correctly: an oblique
+  split is a strict superset of axis-aligned candidates at each node, so
+  greedy Gini-gain search can never fit training data worse). This is
+  the known, textbook cost of oblique/multivariate decision trees on
+  small-to-medium datasets (245-784 rows here) -- a strictly richer
+  per-node candidate search is a higher-variance fitting PROCEDURE than
+  `(max_depth, min_leaf, min_gain)` alone controls for, which is exactly
+  why oblique trees never displaced axis-aligned CART generally, despite
+  being strictly more expressive (goes back to Breiman's original CART
+  work). Not a bug -- audited the split/CV/fold-assignment code
+  specifically looking for one, given how specific and repeatable the
+  regression was, and found none; the explanation is the standard
+  bias-variance cost of a larger hypothesis class on finite data.
+
+  **engine_select.hpp is unchanged** -- the axis-aligned trees already
+  committed stay as the real rules. The oblique-split code is kept in
+  `scripts/fit_engine_select_rules.py` (opt-in, `--compare-oblique`,
+  does not affect the default axis-only path or the generated header)
+  as a working alternative to re-test if a future re-fit gathers
+  substantially more data -- oblique's disadvantage here is a small-
+  sample variance cost, which could plausibly shrink or flip with a
+  much larger dataset.

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -1519,12 +1520,31 @@ class DISLDOLayerV {
     // argument types. forward_dense/forward_sparse/backward_dense/
     // backward_sparse above remain the explicit, no-decision-making
     // calls for anyone who wants to force one.
+    //
+    // _dispatch_n(): geometric mean of n_inputs/n_outputs -- the rules
+    // were fit on square (n_inputs == n_outputs) benchmark layers only,
+    // so this is the least-wrong single-width proxy for an asymmetric
+    // layer, not a validated case (see engine_select.hpp's own comment).
+    float _dispatch_n() const { return std::sqrt(float(n_inputs()) * float(n_outputs())); }
+
+    // syn_density: the WEIGHT matrix's own sparsity (nnz / n_inputs /
+    // n_outputs), needed by group_a_backward_use_sisldo. weights.block4.
+    // live_synapses() is a per-row scan ("cold-path reporting" per its own
+    // comment, not O(1)) -- recomputed fresh on every dispatch call rather
+    // than cached, since there's no existing structure-version counter to
+    // invalidate a cache against (growth/pruning/load_* all mutate nnz).
+    // Its cost is bounded by nnz/BLOCK4_TILE_SLOTS + n_inputs, well under
+    // the O(nnz) cost of the actual forward/backward it's gating.
+    float _dispatch_syn_density() const {
+        return float(nnz()) / (float(n_inputs()) * float(n_outputs()));
+    }
+
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf = x.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         const float density = _measure_density((const float*)xbuf.ptr, std::size_t(batch) * cols);
-        if (group_a_forward_use_sisldo(batch, density)) {
+        if (group_a_forward_use_sisldo(_dispatch_n(), batch, density)) {
             std::vector<int> ptrs, idx;
             std::vector<float> vals;
             _dense_to_csr((const float*)xbuf.ptr, batch, cols, ptrs, idx, vals);
@@ -1543,7 +1563,7 @@ class DISLDOLayerV {
                            S batch) {
         auto ib = indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_inputs());
-        if (group_a_forward_use_sisldo(batch, density))
+        if (group_a_forward_use_sisldo(_dispatch_n(), batch, density))
             return forward_sparse(ptrs, indices, values, batch);
         auto pb = ptrs.request(), vb = values.request();
         std::vector<float> dense;
@@ -1566,7 +1586,7 @@ class DISLDOLayerV {
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         const float density =
             _measure_density((const float*)dybuf.ptr, std::size_t(batch) * n_outputs());
-        if (group_a_backward_use_sisldo(batch, density)) {
+        if (group_a_backward_use_sisldo(_dispatch_n(), batch, density, _dispatch_syn_density())) {
             std::vector<int> ptrs, idx;
             std::vector<float> vals;
             _dense_to_csr((const float*)dybuf.ptr, batch, n_outputs(), ptrs, idx, vals);
@@ -1594,7 +1614,7 @@ class DISLDOLayerV {
                             bool scale_invariant = kSynapsePolicyScaleInvariant) {
         auto ib = dy_indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
-        if (group_a_backward_use_sisldo(batch, density))
+        if (group_a_backward_use_sisldo(_dispatch_n(), batch, density, _dispatch_syn_density()))
             return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
                                    lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
                                    max_abs_delta, max_ci, scale_invariant);
@@ -1865,15 +1885,19 @@ class DIDLDOLayerV {
     // See DISLDOLayerV's identical-shaped forward/backward for the full
     // rationale -- same idea, group_b_forward_use_sidldo/
     // group_b_backward_use_sidldo (engine_select.hpp) instead of the
-    // group_a_* rules. group_b_backward_use_sidldo is a placeholder
-    // (reuses forward's rule, not independently measured) -- see that
-    // function's own comment.
+    // group_a_* rules. group_b_backward_use_sidldo is now independently
+    // fit from real bwd0/bwdX data (previously a forward-rule placeholder).
+    //
+    // _dispatch_n(): see DISLDOLayerV's identical helper -- geometric mean
+    // of n_inputs/n_outputs, the rules were only validated on square layers.
+    float _dispatch_n() const { return std::sqrt(float(n_inputs()) * float(n_outputs())); }
+
     py::array_t<V> forward(py::array_t<V> x) {
         auto xbuf = x.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         const float density = _measure_density((const float*)xbuf.ptr, std::size_t(batch) * cols);
-        if (group_b_forward_use_sidldo(batch, density)) {
+        if (group_b_forward_use_sidldo(_dispatch_n(), batch, density)) {
             std::vector<int> ptrs, idx;
             std::vector<float> vals;
             _dense_to_csr((const float*)xbuf.ptr, batch, cols, ptrs, idx, vals);
@@ -1892,7 +1916,7 @@ class DIDLDOLayerV {
                            S batch) {
         auto ib = indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_inputs());
-        if (group_b_forward_use_sidldo(batch, density))
+        if (group_b_forward_use_sidldo(_dispatch_n(), batch, density))
             return forward_sparse(ptrs, indices, values, batch);
         auto pb = ptrs.request(), vb = values.request();
         std::vector<float> dense;
@@ -1917,7 +1941,7 @@ class DIDLDOLayerV {
         const S batch = (dybuf.ndim == 2) ? (S)dybuf.shape[0] : 1;
         const float density =
             _measure_density((const float*)dybuf.ptr, std::size_t(batch) * n_outputs());
-        if (group_b_backward_use_sidldo(batch, density)) {
+        if (group_b_backward_use_sidldo(_dispatch_n(), batch, density)) {
             std::vector<int> ptrs, idx;
             std::vector<float> vals;
             _dense_to_csr((const float*)dybuf.ptr, batch, n_outputs(), ptrs, idx, vals);
@@ -1943,7 +1967,7 @@ class DIDLDOLayerV {
                             bool scale_invariant = false) {
         auto ib = dy_indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
-        if (group_b_backward_use_sidldo(batch, density))
+        if (group_b_backward_use_sidldo(_dispatch_n(), batch, density))
             return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
                                    lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
                                    max_abs_delta, max_ci, scale_invariant);
