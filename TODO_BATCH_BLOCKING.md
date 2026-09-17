@@ -1560,3 +1560,60 @@ range -- do not consider a phase done on PoC evidence alone.
   real-time dispatchers are coarse stand-ins for; the FP4/FP8 dense-
   weight kernel peridot's actual MiniCPM5 FP4 path would need (separate,
   unscoped, bigger effort -- flagged, not started).
+
+- [x] **`scripts/` triage + real perf-gating CI (2026-09-16).** This
+  branch's own `scripts/` accumulated 17 files over its lifetime; per
+  direct instruction, audited and reclassified all of them rather than
+  leaving them as-is. See
+  docs/research/sparse_rnn.rst:sparse_rnn.didldo_same_optimizer_as_disldo
+  for the DIDLDO/SIDLDO optimizer fix found DURING this triage (a stale
+  standalone bench had drifted from the real header's formula).
+
+  - **Deleted (10)**: one-off "Phase N" A/B harnesses (Phases 1/4/5/6/7),
+    probes (`probe_didldo_sgemv.cpp`, `probe_mixed_engine_handoff.cpp`),
+    profiling drivers (Phase 2 null-result, Phase 7.5) -- every finding
+    confirmed already recorded in this file before deleting.
+  - **Converted to a real unit test (1)**:
+    `verify_disldo_backward_group_reduction.cpp` (printed a sum for a
+    human to eyeball) -> `tests/unit/test_disldo_backward_group_reduction.cpp`
+    (real max-abs-diff assertion, num_cpus=1 vs 4/8/16), wired into
+    `CMakeLists.txt`'s `SILI_STANDALONE_TESTS`.
+  - **Migrated to `tests/integration/` as real gated perf tests (6)**:
+    `_bench_stats.py`, `bench_sili_vs_torch.py` ->
+    `test_perf_disldo_vs_torch.py`, `bench_sili_vs_torch_matrix.py` ->
+    `test_perf_matrix_vs_torch.py`, `bench_didldo_kernel.cpp`,
+    `bench_sidldo_forward.cpp`, `bench_sidldo_backward.cpp`. Follows
+    `tests/integration/`'s existing standalone-script convention
+    (`python -m tests.integration.<name>`, `--quiet`), NOT pytest --
+    confirmed against real precedent (`test_mandelbrot_rl.py`), not
+    assumed.
+  - **Real bug found migrating `bench_didldo_kernel.cpp`**: it was a
+    stale standalone reimplementation predating `linear_didldo.hpp`
+    entirely -- own hand-rolled kernels linking scipy's bundled OpenBLAS
+    (not MKL), still the OLD vanilla-RMSprop formula this branch already
+    replaced in the real header. Rewritten to call the actual
+    `linear_didldo.hpp` functions.
+  - **Real perf-gating CI, `.github/workflows/ci.yml`** (this repo's own
+    README already listed CI as the next roadmap step): `unit-tests`,
+    `integration-correctness`, `perf-gate` jobs, all GH-hosted
+    `ubuntu-latest` (self-hosted ruled out -- public repo, GitHub itself
+    warns against self-hosted runners there). `perf-gate` fails on a
+    statistically significant regression (Welch z-test + practical-
+    magnitude floor, `_bench_stats.py`'s `gate()`) against a COMMITTED
+    per-runner baseline (`tests/integration/perf_baselines/
+    <machine_uid>.json`); override = re-run with `--save-baseline` and
+    commit the regenerated file, a normal visible PR diff. This
+    explicitly supersedes the earlier "informational, not a merge gate"
+    guidance (memory updated to match).
+  - **Real bug found designing the CI job**: GH Actions VMs get a fresh
+    `/etc/machine-id` every run, so the naive per-machine baseline key
+    would never persist across CI runs -- `machine_info()` now uses a
+    stable synthetic id (keyed by the runner image label) under
+    `GITHUB_ACTIONS=true`.
+  - **Not done**: marking the three jobs as required status checks
+    (Settings -> Branches, only the user can do this); the first real
+    perf-gate baseline on GH's actual runner image (needs a human to
+    download the perf-gate job's uploaded artifact after a real CI run
+    and commit it -- this session couldn't trigger real GH Actions
+    infrastructure); doc-generation-on-every-PR (the other half of the
+    README's CI roadmap item, not requested this pass).
