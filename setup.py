@@ -106,7 +106,8 @@ setup(
     install_requires=reqs,
     # `pip install sili[mkl]` enables DIDLDO/SIDLDO; reliable path is
     # `pip install mkl mkl-include` first, then `pip install .`.
-    extras_require={"mkl": ["mkl", "mkl-include"]},
+    # `sili[test]`: torch, needed only by tests/integration/test_perf_*_vs_torch.py.
+    extras_require={"mkl": ["mkl", "mkl-include"], "test": ["torch"]},
     include_package_data=True,
     classifiers=[
         "Programming Language :: C++",

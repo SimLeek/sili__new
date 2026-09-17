@@ -3,7 +3,7 @@
 // major-CSR path internally) across both the low- and high-batch range,
 // for direct comparison against sisldo_ms/torch_ms already recorded in
 // the Block4 Bench dataset at matching shapes.
-#include "../sili/lib/headers/linear_sidldo.hpp"
+#include "../../sili/lib/headers/linear_sidldo.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>

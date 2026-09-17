@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Coverage matrix: sili (disldo dense + sisldo sparse) vs torch, across
-op x batch x density.
+op x batch x density. Gates CI -- see .github/workflows/ci.yml's perf-gate
+job; a statistically significant regression (gate(), _bench_stats.py) fails
+this script's exit code.
 
 Answers three separate questions that a single fixed-shape benchmark
 conflates:
 
 1. Which op (fwd / bwd-compute-only / bwd+RMSprop-update) is furthest
-   behind torch, and at which batch size -- see bench_sili_vs_torch.py for
-   the deeper single-shape version of this.
+   behind torch, and at which batch size -- see test_perf_disldo_vs_torch.py
+   for the deeper single-shape version of this.
 2. Does sili's OWN sparse engine (sisldo) actually run faster than its own
    dense engine (disldo) at a given density, and at what density does that
    crossover happen (batch-size-dependent -- see docs/research/sisldo_ops.rst).
@@ -21,29 +23,30 @@ Both disldo and sisldo share the SAME underlying weights (load_dense_values
 onto one DISLDOLayerV instance's storage) for a true apples-to-apples
 comparison -- not separately-initialized layers. torch's backward always
 computes dx (x.requires_grad_(True)) for the same reason
-bench_sili_vs_torch.py does: sili's disldo_backward/sisldo backward_sparse
-always compute dx regardless of learning_rate, so a fair comparison must
-not let torch skip it.
+test_perf_disldo_vs_torch.py does: sili's disldo_backward/sisldo
+backward_sparse always compute dx regardless of learning_rate, so a fair
+comparison must not let torch skip it.
 
 Every measurement is repeated --repeats times (see _bench_stats.py) so
-mean/std are real, not single-sample noise. Pass --save-baseline to record
-this run as the new reference point (JSON, default under /tmp -- these
-numbers are machine-specific, not meant to be committed); subsequent runs
-against the same --baseline-path report IMPROVED/REGRESSED/noise per cell
-via a two-sample z-test, not just a raw percentage.
+mean/std are real, not single-sample noise, then compared against a
+COMMITTED per-machine baseline (perf_baselines/<machine_uid>.json) via
+gate(). Run standalone: `python -m tests.integration.test_perf_matrix_vs_torch`
+(add --quiet for pass/fail-only output). Accepting a real regression:
+re-run with --save-baseline and commit the regenerated baseline file.
 """
 
 import argparse
 import os
-import tempfile
+import sys
 
 import numpy as np
 import torch
-from _bench_stats import bench_repeated, compare, load_baseline, machine_info, save_baseline
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from _bench_stats import bench_repeated, gate, machine_info, update_baseline
 
 from sili import _cpu
-
-DEFAULT_BASELINE_PATH = os.path.join(tempfile.gettempdir(), "sili_bench_matrix_baseline.json")
 
 
 def n_calls_for(batch, calls_base):
@@ -249,43 +252,7 @@ def flatten_results(results, repeats):
     return flat
 
 
-def print_baseline_comparison(flat, baseline_path, meta):
-    baseline_doc = load_baseline(baseline_path)
-    if baseline_doc is None:
-        print(f"(no baseline at {baseline_path} -- nothing to compare against)")
-        return
-    baseline = baseline_doc.get("results", baseline_doc)  # tolerate old flat-only format
-    old_meta = baseline_doc.get("_meta")
-    if old_meta and old_meta.get("machine_uid") != meta["machine_uid"]:
-        print(
-            f"WARNING: baseline was recorded on a different machine "
-            f"({old_meta.get('cpu_model')}, uid={old_meta.get('machine_uid')}) -- "
-            f"absolute times are not comparable across machines. Verdicts below are "
-            f"unreliable; re-run with --save-baseline on THIS machine instead."
-        )
-    if old_meta and old_meta.get("num_cpus") != meta.get("num_cpus"):
-        print(
-            f"WARNING: baseline was recorded with num_cpus={old_meta.get('num_cpus')}, this "
-            f"run used num_cpus={meta.get('num_cpus')} -- a thread-count change will show up "
-            f"as fake REGRESSED/IMPROVED verdicts below, not a real code change."
-        )
-    print(f"\n=== Compared against baseline: {baseline_path} ===")
-    print(f"{'key':>32} | {'baseline':>10} {'now':>10} | {'change':>8} {'verdict':>10}")
-    any_regressed = False
-    for key in sorted(flat):
-        if key not in baseline:
-            continue
-        new, old = flat[key], baseline[key]
-        pct, verdict = compare(new["mean"], new["std"], new["n"], old["mean"], old["std"], old["n"])
-        if verdict == "REGRESSED":
-            any_regressed = True
-        if verdict in ("REGRESSED", "IMPROVED"):
-            print(f"{key:>32} | {old['mean']:>9.4f}ms {new['mean']:>9.4f}ms | {pct:>+7.1f}% {verdict:>10}")
-    if not any_regressed:
-        print("(no statistically significant regressions; unlisted cells were noise or n/a)")
-
-
-def main():
+def main():  # noqa: C901, PLR0912 -- CLI plumbing (argparse + gate/save branches), reads clearer flat
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n-in", type=int, default=288)
     ap.add_argument("--n-out", type=int, default=288)
@@ -311,13 +278,28 @@ def main():
     )
     ap.add_argument("--calls-base", type=int, default=1000)
     ap.add_argument("--repeats", type=int, default=5, help="independent timed loops per cell")
-    ap.add_argument("--baseline-path", default=DEFAULT_BASELINE_PATH)
-    ap.add_argument("--save-baseline", action="store_true", help="write this run as the new baseline")
-    ap.add_argument("--no-compare", action="store_true", help="skip comparing against an existing baseline")
+    ap.add_argument("--baseline-dir", default=None, help="defaults to tests/integration/perf_baselines/")
+    ap.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="overwrite this machine's committed baseline with this run -- use to accept "
+        "a real, intentional regression; commit the resulting file change",
+    )
+    ap.add_argument("--no-gate", action="store_true", help="skip comparing against the committed baseline")
+    ap.add_argument(
+        "--min-regression-pct",
+        type=float,
+        default=5.0,
+        help="practical-magnitude floor for a REGRESSED verdict (see compare() in "
+        "_bench_stats.py) -- CI raises this on shared/noisier GH-hosted runners; a "
+        "quiet dedicated machine can use the default",
+    )
+    ap.add_argument("--quiet", action="store_true", help="pass/fail-only output")
     args = ap.parse_args()
     if args.num_cpus is None:
         args.num_cpus = torch.get_num_threads()
-    print(f"sili num_cpus={args.num_cpus}, torch.get_num_threads()={torch.get_num_threads()}")
+    if not args.quiet:
+        print(f"sili num_cpus={args.num_cpus}, torch.get_num_threads()={torch.get_num_threads()}")
 
     rng_master = np.random.default_rng(0)
     if args.synapse_density >= 1.0:
@@ -353,20 +335,30 @@ def main():
                 sparse_synapses=(args.synapse_density < 1.0),
             )
 
-    print_raw_tables(results, args.batches, args.densities, args.n_in, args.synapse_density)
-    print_summary_table(results, args.batches, args.densities, args.synapse_density)
+    if not args.quiet:
+        print_raw_tables(results, args.batches, args.densities, args.n_in, args.synapse_density)
+        print_summary_table(results, args.batches, args.densities, args.synapse_density)
 
     flat = flatten_results(results, args.repeats)
     meta = machine_info()
     meta["num_cpus"] = args.num_cpus
-    print(f"\nMachine: {meta['cpu_model']} [{','.join(meta['simd_flags'])}] uid={meta['machine_uid']}")
-
-    if not args.no_compare:
-        print_baseline_comparison(flat, args.baseline_path, meta)
+    if not args.quiet:
+        print(f"\nMachine: {meta['cpu_model']} [{','.join(meta['simd_flags'])}] uid={meta['machine_uid']}")
 
     if args.save_baseline:
-        save_baseline(args.baseline_path, {"_meta": meta, "results": flat})
-        print(f"\nSaved baseline to {args.baseline_path}")
+        path = update_baseline(flat, meta, args.baseline_dir)
+        if not args.quiet:
+            print(f"\nSaved baseline to {path}")
+        return
+
+    if not args.no_gate:
+        ok, regressions = gate(flat, meta, args.baseline_dir, min_pct=args.min_regression_pct, quiet=args.quiet)
+        if not ok:
+            if args.quiet:
+                print(f"FAIL: {len(regressions)} statistically significant regression(s)")
+            sys.exit(1)
+    if args.quiet:
+        print("PASS")
 
 
 if __name__ == "__main__":

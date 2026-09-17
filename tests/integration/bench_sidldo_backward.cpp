@@ -3,7 +3,7 @@
 // variant yet) across the batch range, for direct comparison against
 // sisldo_ms/torch_ms bwd0/bwdX already recorded in the Block4 Bench
 // dataset at matching (n, density) points.
-#include "../sili/lib/headers/linear_sidldo.hpp"
+#include "../../sili/lib/headers/linear_sidldo.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>

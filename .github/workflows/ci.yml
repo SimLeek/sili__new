@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    # No mkl/mkl-include extra here -- SILI_MKL_FOUND is naturally false,
+    # so DIDLDO/SIDLDO and their tests gracefully compile out (same design
+    # setup.py's own _find_mkl() uses everywhere else). torch not needed
+    # either -- tests/unit/python is torch-free.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake catch2 libomp-dev
+      - name: Install sili (editable, no extras)
+        run: pip install -e .
+      - name: C++ unit tests (ctest via run_cpp_tests.sh)
+        run: bash tests/unit/run_cpp_tests.sh
+      - name: Python unit tests
+        run: pytest tests/unit/python -v
+
+  integration-correctness:
+    # torch IS needed here -- several pre-existing tests/integration/*.py
+    # files import it at module level (see collection check in the PR that
+    # added this job); without it pytest fails to even COLLECT those
+    # files, not just skips them.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install sili (editable, test extra)
+        run: pip install -e ".[test]"
+      - name: Integration correctness tests
+        # tests/integration/ is deliberately NOT in pyproject.toml's
+        # testpaths (it mixes pytest-collectible correctness tests with
+        # standalone argparse-driven experiment/training scripts meant for
+        # manual/occasional runs, e.g. test_mandelbrot_rl.py's 150k-step
+        # RL training) -- pytest only ever collects real `test_*`
+        # functions/classes regardless of directory, so pointing it at the
+        # whole directory is safe: the standalone scripts contribute zero
+        # collected tests (confirmed directly, not assumed) and never run
+        # their own main().
+        run: pytest tests/integration -v
+
+  perf-gate:
+    # GH-hosted (not self-hosted): this repo is public, and GitHub itself
+    # warns against self-hosted runners on public repos (any PR's workflow
+    # code would execute on that machine). Accepted tradeoff: shared/
+    # noisier infra than a dedicated benchmark machine, so this job uses
+    # more repeats and a wider practical-magnitude regression floor
+    # (--min-regression-pct) than the tool's own quiet-machine defaults.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install sili (editable, mkl + test extras)
+        run: pip install mkl mkl-include && pip install -e ".[mkl,test]"
+      - name: sili vs torch (single shape)
+        run: |
+          python -m tests.integration.test_perf_disldo_vs_torch \
+            --repeats 8 --min-regression-pct 15 --quiet
+      - name: sili vs torch (coverage matrix)
+        run: |
+          python -m tests.integration.test_perf_matrix_vs_torch \
+            --repeats 8 --min-regression-pct 15 --quiet
+      - name: DIDLDO/SIDLDO kernels
+        run: |
+          python -m tests.integration.test_perf_didldo_sidldo_kernels \
+            --repeats 8 --min-regression-pct 15 --quiet
+      - name: Upload updated baselines (first run on this runner generation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-baselines
+          path: tests/integration/perf_baselines/
+          if-no-files-found: ignore
