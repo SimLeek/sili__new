@@ -126,17 +126,311 @@ stores.
 
 .. _disldo_forward.per_thread_output_buffers:
 
-block4 forward compute: per-thread output buffers
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+block4 forward compute: two threading strategies, chosen by layer width
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 *ID:* ``disldo_forward.per_thread_output_buffers``
 
-Same pattern as the scattered path's ``t_out`` above, and necessary, not
-optional: two tiles that share a block-COLUMN (different block-rows,
-i.e. different input rows feeding the same output columns) write to the
-same output positions, so parallelizing freely over tiles without this
-would race exactly the way the scattered path's own scatter-write would
-without ``t_out``.
+Two tiles that share a block-COLUMN (different block-rows, i.e.
+different input rows feeding the same output columns) write to the same
+output positions, so parallelizing freely over tiles needs either
+private per-thread output buffers + a reduction (same shape as the
+scattered path's ``t_out`` above), or a partitioning of work that makes
+cross-thread writes structurally impossible. Both are used here, chosen
+per call by layer width -- see
+:ref:`disldo_forward.column_partitioned_threading` below for why one
+scheme alone isn't enough.
+
+The ORIGINAL version of this scheme (every thread gets a full
+``num_cpus``-way private output-sized buffer, one thread sums them all
+serially after the parallel region closes) is what the two strategies
+below replaced. It has a real, measured flaw: the serial reduction is
+O(num_cpus * batch * n_out) work done by ONE thread, and that cost
+GROWS with batch and layer width -- exactly the sizes that should
+amortize a fixed per-call overhead, not make it worse. Measured directly
+via a standalone probe matching the exact reduction code: at
+n_out=288/batch=1024/num_cpus=4 this reduction alone cost ~491us (out of
+the ORIGINAL scheme's ~14.8ms per real forward() call there); the real
+matrix benchmark showed per-call efficiency (speedup/num_cpus) actually
+PEAKING mid-batch and then declining again at the largest batch tested
+for several layer widths, the opposite of the expected "more work
+amortizes fixed overhead" shape.
+
+.. _disldo_forward.column_partitioned_threading:
+
+Wide layers: column-block-partitioned threading, zero cross-thread writes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.column_partitioned_threading``
+
+Every tile (or leader+follower tile-pair) is bucketed, during the same
+sequential row-major collection walk, into whichever thread owns its
+output COLUMN-block range -- contiguous, disjoint ranges of block4
+column-blocks, split as evenly as possible across ``num_cpus`` threads.
+Since ownership is by output column and disjoint, every thread can write
+straight into the real ``output`` array with zero cross-thread
+aggregation of any kind -- no private buffer, no reduction, serial or
+parallel.
+
+This alone is NOT a strict improvement over the old per-thread-buffer
+scheme, though: it trades the old scheme's reduction-tax problem for a
+different one. With a NARROW layer relative to ``num_cpus`` (few
+column-blocks per thread), a single thread's work items span MANY
+different row-blocks (since with dense-ish data every row-block touches
+every thread's narrow column range), so it revisits a fresh, cold
+row-block's input slice every 1-2 work items instead of reusing one
+row-block's slice across many consecutive items the way row-major
+chunking naturally does. Measured directly (standalone A/B, arch-sandbox
+CCX-pinned, num_cpus=4): at n_out=64 (4 output column-blocks/thread),
+efficiency (speedup/num_cpus) CRASHED to ~0.21-0.26 at batch>=256 --
+worse than not parallelizing at all -- vs ~0.86-0.88 for the old
+row-partitioned+serial-reduce scheme at the same shape. "Few outputs,
+many inputs" (embedding/readout-shaped layers) is a real network shape,
+not a hypothetical edge case, so this couldn't be shipped as the only
+strategy.
+
+.. _disldo_forward.narrow_layer_tree_reduction:
+
+Narrow layers: row-major chunking + parallel tree reduction
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.narrow_layer_tree_reduction``
+
+For layers below the column-partitioning threshold, the SAME flat,
+row-major item list is instead processed via a real ``#pragma omp for
+schedule(static)`` -- each thread gets a CONTIGUOUS chunk of row-major
+tiles, restoring the old scheme's good input-row locality -- into a
+private per-thread buffer (``num_cpus`` copies of the ``[batch x
+n_out]`` output, same shape as the old scheme). The combine step is
+where this differs from the old scheme: instead of one thread summing
+all ``num_cpus`` buffers serially, ``log2(num_cpus)`` rounds of a
+PARALLEL tree reduction run inside the SAME parallel region (an explicit
+``#pragma omp for schedule(static)`` over the ``[batch x n_out]`` index
+range per round, not a bare ``#pragma omp for`` over tiles) -- each
+round halves the number of "active" buffers, and every round's own
+combine work is itself split across all ``num_cpus`` threads rather than
+done by whichever thread owns that round's pair. Total addition work is
+still O(ost * num_cpus), same as the old serial reduction, but
+wall-clock drops to O(ost * log2(num_cpus)) since every round is
+parallelized instead of one round being serialized ``num_cpus`` times.
+Final combine into the real ``output`` array is a last ``#pragma omp
+for`` too, not a single-thread pass.
+
+**Threshold**: ``COLUMN_PARTITION_MIN_COLS_PER_THREAD = 12`` (output
+column-blocks per thread; ``n_bc_total / num_cpus``). Chosen from a
+direct sweep (arch-sandbox, CCX-pinned, num_cpus=4) straddling the
+boundary (6/8/10/12/14 cols/thread, batch 1-1024): efficiency was smooth
+and good on BOTH sides of 12 (0.66-0.92 throughout, no cliff), so the
+exact cutoff isn't hypersensitive -- 12 was picked as a round number
+inside that flat zone, not fitted to a sharp transition. The full width
+sweep (32/64/144/288/576, num_cpus=4) confirmed no regression anywhere
+with this threshold: narrow layers (32/64/144, all routed to the tree-
+reduction path) climbed smoothly from ~0.35-0.73 at batch=1 to
+~0.57-0.90 at batch=1024 with no turnover; wide layers (288/576, routed
+to column-partitioning) reached 0.82-0.93 at batch=1024, also with no
+turnover -- the old scheme's large-batch decline is gone on both paths.
+
+.. _disldo_forward.batch_blocked_threshold:
+
+Batch-blocked accumulation: transposed input + register-blocked accumulate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.batch_blocked_threshold``
+
+Profiled via callgrind (batch=1024, num_cpus=1): the per-sample
+horizontal-reduce-and-scalar-store inside ``process_block4_item``
+(``mo[...] += prod[0]+prod[1]+prod[2]+prod[3]``) was ~74% of real
+compute, vs ~4% for the actual useful SIMD multiply. Fix: transpose the
+input once per call to ``[row, batch]`` (``scratch_input_T``, shared,
+read-only across threads), then accumulate ``BLOCK4_BATCH_BLOCK_B=8``
+batch samples at a time via ``block4_batch_accumulate`` (``block4.hpp``)
+-- both the input gather and the accumulator write become genuine wide
+SIMD loads/stores instead of a per-sample horizontal reduce. Below
+``BLOCK4_BATCH_BLOCK_THRESHOLD=8``, the transpose isn't amortized and
+this path measures SLOWER than the old scalar path (0.1-0.6x at
+batch=1), so it stays gated off below threshold.
+
+Rolled out in three rounds, tracked task-by-task in
+``TODO_BATCH_BLOCKING.md`` at the repo root while in progress (that file
+is the working queue; this section is the settled record once a round
+landed).
+
+**Round 1 -- wide (column-partitioned) path.** Each thread gets a
+private column-major accumulator sized to just its OWN column range
+(threads already own disjoint output-column ranges, see
+:ref:`disldo_forward.column_partitioned_threading` above), flushed
+(transposed back, ``+=``) into ``output`` once at the end -- still zero
+cross-thread writes. A first implementation copied a standalone PoC's
+inner loop verbatim, including a per-lane broadcast-fill loop
+(``for(k) wv[k]=w4[li]``) INSIDE the hot batch-chunk loop -- the exact
+anti-pattern ``block4_vec_broadcast``'s own docstring already warns
+about (defeats the compiler's ability to keep a loop-invariant broadcast
+in a register). First real-kernel A/B showed ZERO speedup, even a
+regression at large batch, until this was caught and fixed by hoisting
+the broadcast out of the loop. Lesson: a PoC validates the algorithmic
+shape, not its own code -- re-measure the real shipped kernel, don't
+trust the PoC's numbers to transfer.
+
+**Round 2 -- narrow (tree-reduction) path.** Same primitive, applied to
+the narrow path's private per-thread buffer -- but here a thread's items
+aren't column-owned (row-major chunking, see
+:ref:`disldo_forward.narrow_layer_tree_reduction`), so the buffer must
+cover the FULL ``n_out`` range, column-major instead of row-major so
+``block4_batch_accumulate`` still gets contiguous accesses. Landed with
+zero measurable win at first -- see
+:ref:`disldo_forward.narrow_path_barrier_reduction` and
+:ref:`disldo_forward.persistent_scratch_buffers` below for the two
+follow-up rounds that actually explain and fix that.
+
+.. _disldo_forward.narrow_path_barrier_reduction:
+
+Narrow-path barrier reduction: only one barrier is load-bearing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.narrow_path_barrier_reduction``
+
+The narrow path's ``log2(num_cpus)``-round tree reduction originally
+re-dispatched a fresh ``#pragma omp for`` every round -- 4 barrier
+crossings per call (item-processing, 2 reduction rounds, final flush).
+None of the inter-round barriers are actually required: the reduction
+only ever combines buffer copies at a FIXED index, never across indices,
+so if one thread claims a static column range for the ENTIRE reduction
++flush (computed once via ``omp_get_thread_num()``, GPU-``global_id``
+style, not redispatched), round N+1 for that thread's range only ever
+depends on a value that SAME thread wrote in round N -- zero cross-
+thread dependency once past the one barrier that genuinely is required
+(between item-processing, which can write anywhere, and the start of
+reduction). Cuts 4 barrier crossings down to 1.
+
+A first version of this fix nested the column/batch loop OUTSIDE the
+stride/round loop, meaning every single ``(col, b)`` element jumped
+between up to ``num_cpus`` buffer copies ``ost`` elements (hundreds of
+KB) apart on every iteration instead of doing one sequential sweep per
+round -- measured 2-13% SLOWER than no fix at all until the loop
+nesting was corrected back to stride-outermost (matching the original
+code's nesting, just with a static per-thread range instead of a
+redispatched one).
+
+Once correctly implemented: STILL no measurable wall-clock win
+(before/after within noise, 4 interleaved pairs). Real lesson: callgrind
+attributed ~52% of instructions to ``gomp_*_barrier_wait_end`` on this
+shape, and that was read as "barriers are half the real cost" -- but
+instruction-count share is not time share. A spin-wait loop is
+instruction-DENSE (tight poll, no memory stalls) but cheap per
+instruction, so a large fraction of *instructions* spent spinning does
+not imply a large fraction of *wall-clock time*. Kept anyway
+(correctness-verified, objectively fewer synchronization points, never
+measured worse) but did not, on its own, explain the narrow path's null
+result -- see the next section for what did.
+
+.. _disldo_forward.persistent_scratch_buffers:
+
+Persistent scratch buffers: the fix that actually worked
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.persistent_scratch_buffers``
+
+Both the wide path's ``thread_buf`` and the narrow path's ``b4_out``/
+``b4_out_T`` were a fresh ``std::vector<value_type>(size, 0)``
+constructed on EVERY call -- unlike ``scratch_input_T`` (persistent,
+resized not reallocated), these paid a real malloc plus a zero-fill of a
+multi-MB region on every single ``disldo_forward`` invocation. The
+narrow path's version did this ONCE, serially, before the parallel
+region opened; the wide path's version was WORSE -- a SEPARATE
+allocation per thread, done CONCURRENTLY inside the parallel region
+(``num_cpus`` threads all hitting malloc's lock at once).
+
+Fix: persistent members (``Block4Store``/``Store8``/``Store32``'s
+``scratch_b4_out`` for the narrow path, ``scratch_thread_buf`` for the
+wide path -- one shared buffer sized ``n_out * batch``, not
+``num_cpus * n_out * batch``, since wide-path threads own disjoint
+contiguous column ranges that exactly tile ``[0, n_out)`` and can
+address their own sub-range via a ``col_lo * batch`` offset), resized
+(not reallocated once warm) instead of freshly constructed, with the
+zero-fill moved to per-thread INSIDE the parallel region -- each thread
+zeros only its own slice, in parallel, instead of one thread zeroing
+everything (wide path) or the constructor zeroing everything serially
+up-front (narrow path).
+
+This was the actual fix, in both places. Real-kernel A/B, arch-sandbox,
+num_cpus=4, ``taskset -c 0-3`` (4 real physical cores confirmed via
+``lscpu -e``), before = genuinely pre-fix code via a pinned git
+worktree, several interleaved pairs each:
+
+- **Narrow path** (n_in=n_out=128): ~1.0x at batch<=64 (buffer too
+  small to matter), **~1.1-1.3x at batch=256-1024**.
+- **Wide path** (n_in=n_out=288): grows from **~1.3x at batch=8** up to
+  **~5.0-5.1x at batch=1024** -- and this also resolves an open question
+  from Round 1 above ("why does the batch-blocking gain shrink at
+  batch>=256?"): it wasn't a fundamental limit, it was this exact same
+  per-call allocation tax masking the real win the whole time. With it
+  fixed, the speedup GROWS with batch instead of tapering off, as
+  expected once a fixed per-call cost stops eating a growing share of an
+  otherwise-shrinking per-sample cost.
+
+Open: the wide path's num_cpus=8 case (spanning this box's two L3/CCX
+domains, arch-sandbox's documented "worst" 5-9 num_cpus bracket for
+cross-CCX traffic) showed a large apparent win too after this fix, but
+the "before"
+baseline measured inconsistently across different points in the same
+session (3.2-3.4M ns/call vs an earlier 516K ns/call at the identical
+shape, with no live CPU hog found via ``ps aux`` but a nonzero
+``uptime`` load average at measurement time) -- not yet confirmed on an
+idle machine, so the precise ratio there isn't trusted yet even though
+the fix never measured worse.
+
+**Scattered (non-block4) path**: the same persistent-buffer +
+static-per-thread-range-reduction treatment was also ported to the
+``!dc.empty()`` scattered CSR path (which had the SAME two issues in
+their original form -- a fresh ``std::vector`` every call, and a fully
+SERIAL final reduction). Real-kernel A/B (10%-density pure-scattered
+layer, num_cpus=4, n_in=n_out=288): before == after within noise at
+every batch size. A real negative result, not a bug -- this path's
+compute was already the dominant cost. At the time this was first
+written, that was attributed to CSR traversal/decode overhead ("scalar,
+strided per-synapse access... gather/scatter-bound") -- **this
+explanation turned out to be wrong**, corrected below in
+:ref:`disldo_forward.scattered_batch_blocked` once it was actually
+profiled rather than assumed.
+
+.. _disldo_forward.scattered_batch_blocked:
+
+Scattered path, corrected: it WAS the batch loop, not CSR traversal
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*ID:* ``disldo_forward.scattered_batch_blocked``
+
+Profiled directly (callgrind, num_cpus=1, batch=1024, 10% density, so no
+GOMP-region artifact) before implementing anything, prompted by a
+request to verify the claim above rather than build on it unchecked.
+Result: the per-batch-sample accumulate loop itself
+(``for(b) mo[...]+=w*iv``) was ~92% of the function's real instructions
+(57.8% loop overhead + 34.6% the strided store), with CSR
+traversal/decode (``row_cursor``, ``cursor.advance()``, weight/scale
+lookup) a negligible ~0.02%. The real bottleneck was never CSR
+traversal -- it was this loop being STRIDED on both sides
+(``input[b*in_cols+r]`` and ``mo[b*n_out+col]``), structurally identical
+to block4's own original pre-:ref:`disldo_forward.batch_blocked_threshold`
+problem, just with one weight per synapse instead of four.
+
+Fix: ``scalar_batch_accumulate`` (block4.hpp, single-weight sibling of
+``block4_batch_accumulate``), gated on the same
+``BLOCK4_BATCH_BLOCK_THRESHOLD`` (hoisted to the top of
+``disldo_forward``, shared with the block4 dispatch). Transposes input
+to ``[row, batch]`` (reuses ``scratch_input_T``) and accumulates into
+``scratch_scattered_out`` reinterpreted column-major ``[n_out, batch]``
+per thread -- same dual-layout reuse of one field
+:ref:`disldo_forward.persistent_scratch_buffers` already established for
+block4's own blocked/unblocked buffers.
+
+Real-kernel A/B (10% density, num_cpus=4, n_in=n_out=288, 2 interleaved
+pairs): clean and consistent, growing from **~1.08x at batch=8** up to
+**~3.22x at batch=1024** (~1.2-2.0x through the middle of the range).
+One of the largest wins in the whole batch-blocking rollout, on a path
+that looked like a dead end after the first (buffer-allocation-only)
+attempt. Lesson kept for next time: a plausible explanation attached to
+a negative result still needs its own verification before the next
+decision is built on it.
 
 .. _disldo_forward.hoisted_tile_count:
 
@@ -2068,3 +2362,119 @@ both explicitly out of scope here. ``disldo_backward_sparse_grad``
 deliberately not touched in this pass -- offered as options and
 declined in favor of shipping the one function actually flagged,
 faster; revisit as a follow-up if wanted.
+
+.. _disldo_backward.batch_stride_transpose:
+
+``disldo_backward``: batch-major stride in the block4 backward inner loop
+---------------------------------------------------------------------------
+
+*ID:* ``disldo_backward.batch_stride_transpose``
+
+sili-vs-torch benchmarking (fp32 dense 288x288, batch swept 1/4/16/64/256)
+found sili's backward+update cost growing super-linearly with batch
+(16x batch -> 35x slower) while torch's stayed nearly flat. Root cause:
+``block4_backward_process_{single_row,row_pair,tile_pair}`` read
+``input``/``output_grad`` (stored ``[batch, features]``, batch-major)
+with a stride of ``in_cols``/``n_out`` floats inside the per-row/tile
+batch-aggregation loop -- one 64-byte cache line fetched per sample, 4
+bytes used, repeated once per (row, tile) visited (~72x redundancy at
+288-wide). Fix: ``Block4BackwardParams::input_T``/``output_grad_T``
+(see block4_codec.hpp), built once per ``disldo_backward`` call.
+``output_grad_T`` is a BLOCK transpose to
+``[ceil(n_out/BLOCK4_TILE), batch, BLOCK4_TILE]`` rather than a flat
+transpose, so the existing 4-wide SIMD load per sample stays contiguous
+*and* the batch loop becomes contiguous (stride 4 floats instead of
+n_out) -- no tradeoff between the two access patterns. Zero-padded past
+``n_out`` so boundary tiles read 0 without an extra bounds check.
+Shared template code across ``VALUES_TYPE``, so the fix (and the two
+new scratch fields added to all three ``Block4Store``/``Store8``/
+``Store32`` structs) applies to fp8/fp4 too, not just fp32.
+
+Verified via the full local ``ctest`` suite (163/163, including both
+dequant-equality bit-exact gates) and the Python suite (215/215) --
+numerically correct.
+
+**Did not close the measured gap**: batch=256 backward+update cost was
+unchanged (53.4ms before -> 54.9ms after). ``Block4BackwardAccumulators::
+mdx`` (the dx accumulator write-back) has the identical batch-major
+strided pattern at the same call frequency and was deliberately left
+untouched in this pass -- leading hypothesis for why a numerically
+verified fix produced no measured speedup is that it's now the
+dominant remaining cost. Not yet confirmed; re-profiling or applying
+the same block-transpose treatment to the dx accumulator is the
+natural next step.
+
+.. _disldo_backward.batch_hsum_deferral:
+
+``disldo_backward``: per-sample rank-loop redundancy (the real bottleneck)
+-----------------------------------------------------------------------------
+
+*ID:* ``disldo_backward.batch_hsum_deferral``
+
+A third hypothesis was tried on top of ``batch_stride_transpose`` above:
+transposing the ``mdx`` write-back to feature-major too. Also numerically
+correct (163/163 + 215/215), also made things WORSE (54.9ms -> 63.2ms at
+batch=256) -- rejected, pure overhead with no offsetting benefit.
+
+**Real fix #1 (modest)**: inside ``block4_backward_process_single_row`` and
+``_row_pair``, the ``mrow_local_k``/``mgamma_local_k`` (+contrib variants)
+accumulators called ``block4_vec_hsum`` (horizontal SIMD reduction, slow on
+AVX2) up to ``4*rank`` times PER BATCH SAMPLE. Every factor besides
+``g_v``/``contrib_v`` (``quant_floor_v``, ``out_scale_k_v``, ``value_scale_k``,
+``gamma_k_arr``) is batch-invariant inside a tile visit, so
+``sum_b(hsum(C*x_b)) == hsum(C*sum_b(x_b))`` -- deferred these accumulators
+onto the already-existing ``g_agg_v``/``contrib_agg_v`` vectors (which the
+``ci``/``cw`` synapse update already accumulated the same way) and hsum once
+per tile instead of once per sample. ``block4_backward_process_tile_pair``
+was skipped in this round: its loop is pure scalar with no ``hsum`` call, so
+it looked unaffected by the same pattern. Result: batch=256 went from 53.4ms
+to ~50ms -- real but modest (~6-7%), and did **not** close the ~25-30x gap
+to torch.
+
+**Real fix #2 (the actual bottleneck)**: `callgrind` (perf isn't installed on
+this machine) on a single-threaded batch=256 probe, annotated with
+``callgrind_annotate``, showed the compiled extension is LTO-inlined into one
+giant ``disldo_backward<...>::_omp_fn.2`` clone (88.89% of all instructions),
+erasing per-function attribution -- but line-level annotation inside that
+blob showed roughly 58% of ALL backward-pass instructions concentrated in
+~15 lines, all inside ``block4_backward_process_tile_pair``'s per-batch-sample
+loop (``out_scale_k_i`` alone was 22.48%). The rank-loop computing
+``mrow_local_k``/``mgamma_local_k``/``mcol_local8`` was still nested inside
+the ``for (b...)`` batch loop -- the exact same batch-invariant-factor
+redundancy as fix #1, just without an ``hsum`` call in the middle, which is
+why it had been wrongly assumed safe. ``g_agg8``/``contrib_agg8`` were
+already being accumulated per-sample (feeding the ``ci``/``cw`` update) but
+unused for this purpose. Deferred the whole ``for (i) for (k)`` block to run
+once per tile after the batch loop closes, reading ``g_agg8[i]``/
+``contrib_agg8[i]`` instead of per-sample ``g``/``contrib`` -- same algebraic
+identity as fix #1, applied to the one place it had been missed.
+
+**Result**: batch=256 backward-at-lr0 (pure compute, no optimizer step) went
+from ~25-30x slower than torch down to **3.1-3.5x**, confirmed reproducible
+across two independent full-sweep runs (NUM_CPUS=4):
+
+.. code-block:: text
+
+    batch | sili bwd lr0  torch bwd   ratio  (run 1 / run 2)
+        1 |     0.90ms      0.19ms    4.88x  /  0.82ms  0.18ms  4.62x
+        4 |     0.68ms      0.19ms    3.50x  /  0.64ms  0.24ms  2.68x
+       16 |     0.90ms      0.24ms    3.78x  /  0.75ms  0.23ms  3.26x
+       64 |     1.43ms      0.37ms    3.89x  /  1.59ms  0.38ms  4.20x
+      256 |     3.90ms      1.11ms    3.52x  /  3.48ms  1.12ms  3.10x
+
+Per-sample cost at batch=256 also stopped scaling super-linearly: sili's
+backward-at-lr0 per-sample cost drops from ~1.25ms (batch=1) to ~0.028ms
+(batch=256), a ~44x improvement with batch size -- close to torch's own
+~83x (0.47ms -> 0.0056ms), rather than the previous near-flat/worse scaling.
+
+Verified via the full local ``ctest`` suite (163/163, incl. both bit-exact
+dequant-equality gates) and Python suite (215/215). Shared template code
+(``block4_backward_process_tile_pair`` is templated on ``VALUES_TYPE``, one
+call site inside ``disldo_backward`` itself), so both fixes apply to fp8/fp4
+automatically -- no separate per-precision work needed.
+
+**Still open**: fwd-only and batch=1 backward ratios (still ~4-24x for
+forward, ~4.6-4.9x for backward at batch=1) were not targeted by this round
+and remain a smaller, separate gap -- likely genuine per-call Python/pybind
+and per-synapse-update overhead rather than a batch-scaling artifact. Not
+yet investigated.

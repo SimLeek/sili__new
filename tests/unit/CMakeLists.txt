@@ -98,6 +98,37 @@ add_executable(
 # installed, on any machine, without editing this file per-environment.
 find_package(Python3 COMPONENTS Development REQUIRED)
 
+# Optional MKL detection for DIDLDO/SIDLDO (TODO_BATCH_BLOCKING.md, "Also
+# queued"), mirroring setup.py's `_find_mkl()`: `pip install mkl
+# mkl-include` into whatever Python environment this build is configured
+# against installs the payload under that interpreter's `sys.prefix`
+# (`lib/libmkl_*.so.N`, `include/mkl*.h`) -- confirmed by direct install
+# and inspection, not assumed. The Development-only find_package(Python3)
+# above does NOT populate Python3_EXECUTABLE (only Interpreter does) --
+# found directly (it silently produced an empty sys.prefix the first time
+# this was written) -- so resolve the interpreter separately, NOT
+# REQUIRED since MKL support itself is optional; no interpreter found
+# just means no MKL detection attempted.
+find_package(Python3 COMPONENTS Interpreter)
+set(SILI_MKL_FOUND FALSE)
+if(Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import sys; print(sys.prefix)"
+        OUTPUT_VARIABLE SILI_PY_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    set(SILI_MKL_LIB_DIR "${SILI_PY_PREFIX}/lib")
+    set(SILI_MKL_INCLUDE_DIR "${SILI_PY_PREFIX}/include")
+    if(EXISTS "${SILI_MKL_LIB_DIR}/libmkl_gnu_thread.so.3" AND EXISTS "${SILI_MKL_INCLUDE_DIR}/mkl_cblas.h")
+        set(SILI_MKL_FOUND TRUE)
+        message("Found MKL (mkl/mkl-include pip packages) under ${SILI_PY_PREFIX} -- building test_didldo_kernel")
+    else()
+        message("MKL not found under ${SILI_PY_PREFIX} (pip install mkl mkl-include to enable) -- skipping test_didldo_kernel")
+    endif()
+else()
+    message("No Python3 interpreter found for MKL detection -- skipping test_didldo_kernel")
+endif()
+
 
 # currently, torch is broken in arch linux. Package is marked out of date. Should be fixed in a week or so.
 # pacman -S python-pytorch-opt-cuda
@@ -150,10 +181,13 @@ set(SILI_STANDALONE_TESTS
     test_disldo_block4_backward
     test_disldo_block4_promotion
     test_block4_load_dense
+    test_block4_load_sparse_fp32
+    test_sisldo_sparse_load_backward_stability
     test_block4_scattered_divergence
     test_sisldo_disldo_parity
     test_sisldo_disldo_parity_fp32
     test_sisldo_disldo_parity_fp8
+    test_sisldo_disldo_multibatch_parity
     test_fp8_block4_scattered_divergence
     test_synapse_policy_dispatch
     test_synapse_policy_long_horizon
@@ -185,6 +219,8 @@ set(SILI_STANDALONE_TESTS
     test_fp32_block4_store
     test_disldo_block4_fp32
     test_disldo_block4_fp32_wide_simd
+    test_disldo_block4_fp32_batch_blocked
+    test_disldo_scattered_batch_blocked
     test_disldo_block4_fp32_backward_wide_simd
     test_disldo_block4_promotion_fp32
     test_never_zero_live_quantize
@@ -204,6 +240,7 @@ set(SILI_STANDALONE_TESTS
     test_dequant_equality_fp4_vs_fp8
     test_dequant_equality_fp8_vs_fp32
     test_block4_codec
+    test_disldo_backward_group_reduction
 )
 foreach(t ${SILI_STANDALONE_TESTS})
     add_executable(${t} ${t}.cpp)
@@ -212,3 +249,22 @@ foreach(t ${SILI_STANDALONE_TESTS})
     set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# MKL-dependent tests need its headers/direct-linked GNU-threading-layer
+# libs (not just OpenMP::OpenMP_CXX like every other test above), so
+# they're kept out of the uniform SILI_STANDALONE_TESTS loop and only
+# built when SILI_MKL_FOUND -- same graceful compile-out setup.py uses.
+set(SILI_MKL_TESTS test_didldo_kernel test_sidldo_kernel)
+if(SILI_MKL_FOUND)
+    foreach(t ${SILI_MKL_TESTS})
+        add_executable(${t} ${t}.cpp)
+        target_include_directories(${t} PRIVATE "../../sili/" "../../sili/lib/headers" "../../sili/lib/src" "${SILI_MKL_INCLUDE_DIR}")
+        target_link_directories(${t} PRIVATE "${SILI_MKL_LIB_DIR}")
+        target_compile_definitions(${t} PRIVATE SILI_HAVE_MKL=1)
+        target_link_libraries(${t} OpenMP::OpenMP_CXX
+            "-l:libmkl_intel_lp64.so.3" "-l:libmkl_gnu_thread.so.3" "-l:libmkl_core.so.3"
+            "-Wl,-rpath,${SILI_MKL_LIB_DIR}")
+        set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
+endif()

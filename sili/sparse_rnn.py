@@ -562,6 +562,38 @@ def _nucleus_top_k_csr(
     return ptrs, indices, values
 
 
+def _record_grad_selection_stats(layer, dy2d: np.ndarray, dp: np.ndarray, di: np.ndarray, dv: np.ndarray) -> None:
+    """Real per-call GRADIENT-axis R/k stats for a dy_r_target nucleus
+    selection, mirroring sili_peridot's own x-axis
+    _update_input_selection_stats -- overwritten each call, not
+    accumulated. Exposed as layer.last_grad_selection so callers can log
+    achieved dy-axis density the same way x_r_target's achieved density
+    is already logged; previously the gradient axis only ever had its
+    setpoint available (r_bar), never a measured R/k, so a caller had no
+    way to tell how much the nucleus selection actually sparsified the
+    gradient at a given setpoint. di/dv are unused directly (k_per_row is
+    derived from dp's row-pointer diffs instead) but kept as parameters
+    so call sites can pass the exact CSR triple they just computed
+    without re-deriving it."""
+    del di
+    rows, cols = dy2d.shape
+    row_sq_total = np.sum(dy2d.astype(np.float64) ** 2, axis=1)
+    kept_sq = np.zeros(rows, dtype=np.float64)
+    k_per_row = np.zeros(rows, dtype=np.int64)
+    for row in range(rows):
+        start, end = int(dp[row]), int(dp[row + 1])
+        kept_sq[row] = np.sum(dv[start:end].astype(np.float64) ** 2)
+        k_per_row[row] = end - start
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_per_row = np.where(row_sq_total > 0, kept_sq / row_sq_total, 1.0)
+    layer.last_grad_selection = {
+        "R_mean": float(np.mean(r_per_row)),
+        "k_mean": float(np.mean(k_per_row)),
+        "rows": int(rows),
+        "cols": int(cols),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISLDOLayer — Dense Input, Sparse Linear, Dense Output
 # ══════════════════════════════════════════════════════════════════════════════
@@ -706,6 +738,7 @@ class DISLDOLayer(_SparseLayerBase):
                     # gradient energy, not a fixed fraction.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
                     dx = self._c.backward_sparse(
                         x_dense,
                         dp,
@@ -930,7 +963,14 @@ class DISLDOLayer32(_SparseLayerBase):
     into block4 (not the scattered CSR path `_preseed_dense_scattered`
     used before task #350) -- max_weights is still expanded automatically
     to cover every (input, output) pair. See
-    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history."""
+    docs/research/sparse_rnn.rst:disldo_layer_variants.diagnostic_history.
+
+    forward()/backward() (via self._c) auto-pick disldo vs sisldo per
+    call based on measured density -- see docs/research/sparse_rnn.rst:
+    sparse_rnn.engine_select_two_groups. If your weights genuinely never
+    need synaptogenesis/pruning (stay fully dense), DIDLDOLayer32 avoids
+    this class's CSR/block4 bookkeeping overhead entirely -- same file,
+    dense weight storage instead."""
 
     def __init__(
         self,
@@ -975,7 +1015,13 @@ class DISLDOLayer32(_SparseLayerBase):
             csr = x.data
             was_1d = csr.rows == 1
             x_dense = csr.to_dense()
-            out_np = self._c.forward_sparse(csr.ptrs, csr.indices, csr.values, csr.rows)
+            # forward() not forward_sparse(): the CSR overload of the
+            # real-time engine dispatcher (engine_select.hpp) -- even
+            # though the caller handed over CSR data, the underlying
+            # engine may still decide densifying-and-using-disldo is
+            # faster for this call's actual density/batch. Sending
+            # forward_sparse explicitly would force sisldo regardless.
+            out_np = self._c.forward(csr.ptrs, csr.indices, csr.values, csr.rows)
         else:
             x_np = np.asarray(x.data, dtype=np.float32)
             was_1d = x_np.ndim == 1
@@ -1004,6 +1050,7 @@ class DISLDOLayer32(_SparseLayerBase):
                     # See DISLDOLayer.forward's own dy_r_target comment.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
                     dx = self._c.backward_sparse(
                         x_dense,
                         dp,
@@ -1045,6 +1092,172 @@ class DISLDOLayer32(_SparseLayerBase):
 
         out._backward = _bwd
         return out
+
+
+class DIDLDOLayer32(Module):
+    """Group B sibling of DISLDOLayer32: DIDLDO<->SIDLDO over dense
+    weight storage (_cpu.DIDLDOLayerV, linear_didldo.hpp/
+    linear_sidldo.hpp) instead of sparse/block4 storage -- for layers
+    whose weights are genuinely dense (no synaptogenesis/pruning
+    expected), where DISLDO/SISLDO pay real CSR/block4 bookkeeping
+    overhead for no benefit. `forward()`/`backward()` are real-time
+    engine dispatchers (`engine_select.hpp`'s group_b_forward_use_sidldo/
+    group_b_backward_use_sidldo) -- DIDLDO vs SIDLDO per call based on
+    measured density, identical results either way, only speed differs.
+    `forward_dense`/`forward_sparse`/`backward_dense`/`backward_sparse`
+    remain on `self._c` directly for an explicit, no-decision-making call.
+
+    No block4/CSR growth, probes, or rank-N-scale machinery here --
+    DenseLinearWeights is just a plain [n_in x n_out] float array, no
+    growth to grow into. It DOES carry per-weight importance (`ci`) and
+    use the same BoundedRMSpropSynapsePolicy update as DISLDOLayer32
+    (see DenseLinearWeights/didldo_backward's own docstring,
+    linear_didldo.hpp) -- importance IS the optimizer
+    (feedback_importance_is_already_the_optimizer memory), so dense
+    storage needs the same one DISLDO uses, not a different one, or
+    DIDLDO's results would silently diverge from DISLDO's on the same
+    weights and break the "same group, interchangeable" invariant.
+    fp32 only (BLAS is inherently single-precision); see DIDLDOLayer8/
+    DIDLDOLayer4 below for the not-yet-implemented fp8/fp4 siblings,
+    same per-precision-class convention DISLDOLayer32/8/etc. already use."""
+
+    def parameters(self) -> list:
+        return []
+
+    @property
+    def in_features(self) -> int:
+        return self._c.n_inputs
+
+    @property
+    def out_features(self) -> int:
+        return self._c.n_outputs
+
+    @property
+    def num_cpus(self) -> int:
+        return self._c.num_cpus
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self._c.weights_vals
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        max_weights: int | None = None,
+        num_cpus: int = 4,
+        rng: np.random.Generator | None = None,
+        dense: bool = False,
+    ):
+        # max_weights/dense: accepted-and-ignored so this class is a
+        # drop-in disldo_cls for callers built against DISLDOLayer32's
+        # positional convention (e.g. sili_peridot's ToyTileRecurrenceRMT)
+        # -- DenseLinearWeights has no CSR budget to size and is already
+        # unconditionally fully dense, so neither concept applies here.
+        del max_weights, dense
+        self._c = _cpu.DIDLDOLayerV(in_features, out_features, num_cpus)
+        # Same fan-in-normalized Gaussian init as _preseed_dense_fp32
+        # (DISLDOLayerV's own dense-init helper) -- no output_scale
+        # correction needed here either, same reasoning: nothing to
+        # correct a quantization floor for at fp32.
+        if rng is None:
+            rng = np.random.default_rng()
+        scale = 1.0 / np.sqrt(max(1, in_features))
+        w = (rng.standard_normal((in_features, out_features)).astype(np.float32) * scale).flatten()
+        self._c.load_dense_values(w)
+
+    def forward(
+        self,
+        x,
+        learning_rate: float = 0.0,
+        lr_per_row_nnz: bool = True,
+        damp_by_importance: bool = True,
+        min_decay_frac: float | None = None,
+        max_abs_delta: float | None = None,
+        max_ci: float | None = None,
+        scale_invariant: bool = False,
+        requires_grad: bool = True,
+    ) -> Tensor:
+        # Same call convention as DISLDOLayer32.forward (lr_per_row_nnz
+        # default True included) -- ci IS honored here now (Bounded
+        # RMSprop importance, see DenseLinearWeights/didldo_backward's own
+        # docstring, linear_didldo.hpp) via self._c.backward, not a
+        # separate optimizer. scale_invariant accepted for signature
+        # parity only -- no value_scale/output_scale concept exists on
+        # dense storage for it to normalize against, so it has no effect.
+        if not isinstance(x, Tensor):
+            x = Tensor(np.asarray(x, dtype=np.float32))
+        if x.is_csr:
+            csr = x.data
+            was_1d = csr.rows == 1
+            x_dense = csr.to_dense()
+            # forward(), not forward_sparse() -- see DISLDOLayer32's
+            # identical comment on its own CSR branch.
+            out_np = self._c.forward(csr.ptrs, csr.indices, csr.values, csr.rows)
+        else:
+            x_np = np.asarray(x.data, dtype=np.float32)
+            was_1d = x_np.ndim == 1
+            x_dense = x_np if x_np.ndim == 2 else x_np[np.newaxis, :]
+            out_np = self._c.forward(x_np)
+        if was_1d:
+            out_np = out_np.squeeze(0)
+        if not requires_grad:
+            return Tensor(out_np, backend=x.backend)
+        out = Tensor(out_np, _children=(x,), _op="didldo32", backend=x.backend)
+
+        def _bwd():
+            if out.grad is not None:
+                dy = np.asarray(out.grad, dtype=np.float32)
+                dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                extra = {}
+                if min_decay_frac is not None:
+                    extra["min_decay_frac"] = min_decay_frac
+                if max_abs_delta is not None:
+                    extra["max_abs_delta"] = max_abs_delta
+                if max_ci is not None:
+                    extra["max_ci"] = max_ci
+                if scale_invariant:
+                    extra["scale_invariant"] = True
+                dx = self._c.backward(
+                    x_dense,
+                    dy2d,
+                    learning_rate,
+                    lr_per_row_nnz=lr_per_row_nnz,
+                    damp_by_importance=damp_by_importance,
+                    **extra,
+                )
+                if was_1d:
+                    dx = dx.squeeze(0)
+                _acc(x, dx)
+
+        out._backward = _bwd
+        return out
+
+
+class DIDLDOLayer8(Module):
+    """Not implemented yet. DIDLDO/SIDLDO kernels are fp32-only at the
+    C++ level (BLAS is inherently single-precision) -- there is no fp8
+    variant of linear_didldo.hpp/linear_sidldo.hpp to wrap, unlike
+    DISLDOLayer8's real SparseLinearLayer8 backing. Raises immediately on
+    construction, matching this file's per-precision-class convention
+    (DISLDOLayer32/DISLDOLayer8/etc.) rather than silently behaving like
+    DIDLDOLayer32 or failing confusingly later inside a training loop."""
+
+    def __init__(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "DIDLDOLayer8 does not exist -- DIDLDO/SIDLDO kernels are fp32-only "
+            "(BLAS is inherently single-precision). Use DIDLDOLayer32."
+        )
+
+
+class DIDLDOLayer4(Module):
+    """Not implemented yet -- see DIDLDOLayer8's docstring, same reason."""
+
+    def __init__(self, *_args, **_kwargs):
+        raise NotImplementedError(
+            "DIDLDOLayer4 does not exist -- DIDLDO/SIDLDO kernels are fp32-only "
+            "(BLAS is inherently single-precision). Use DIDLDOLayer32."
+        )
 
 
 class DISLDOLayer8(_SparseLayerBase):
@@ -1568,7 +1781,7 @@ class FoldedLayer(Module):
             )
 
             # Each suffix layer gets the same dy_raw; accumulate dx.
-            dx_parts = [layer.backward_dense(dy_raw, lr, lr_per_row_nnz=True) for layer in _layers]
+            dx_parts = [layer.backward_dense(x_np, dy_raw, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(_batch, -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)
@@ -1759,7 +1972,7 @@ class FoldedColumnLayer(FoldedLayer):
             dy_np = np.asarray(out.grad, dtype=np.float32)
             if dy_np.ndim == 1:
                 dy_np = dy_np[np.newaxis, :]
-            dx_parts = [layer.backward_dense(dy_np, lr, lr_per_row_nnz=True) for layer in _layers]
+            dx_parts = [layer.backward_dense(x_np, dy_np, lr, lr_per_row_nnz=True) for layer in _layers]
             dx_np = sum(dx_parts).reshape(dy_np.shape[0], -1)
             if _sq:
                 dx_np = dx_np.squeeze(0)

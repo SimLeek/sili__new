@@ -521,6 +521,33 @@ selection already computed, so a clamped row degrades to plain top-k rather
 than picking arbitrarily; an all-zero row can't manufacture ``k_min``
 entries out of nothing and stays at ``k=0`` regardless.
 
+.. _record_grad_selection_stats.design:
+
+``_record_grad_selection_stats``: achieved R/k for the GRAD axis, mirroring the X axis
+------------------------------------------------------------------------------------------
+
+*ID:* ``record_grad_selection_stats.design``
+
+Before this (2026-09), only the input axis (``x_r_target``, via
+sili_peridot's own ``_update_input_selection_stats``) had a measured
+achieved-density stat -- the gradient axis's own trajectory logging only
+ever echoed the ``dy_r_target`` setpoint, never what the nucleus selection
+actually kept. Called right after ``_nucleus_top_k_csr`` in both
+``DISLDOLayer.forward`` (FP4) and ``DISLDOLayer32.forward`` (fp32)'s
+``dy_r_target`` branches, writing ``layer.last_grad_selection`` (overwritten
+each call, not accumulated) -- ``DISLDOLayer8`` has no ``dy_r_target``
+support at all, so it has no counterpart call site. Real measurement at
+wide288 scale (embed_width=36, state_width=288) showed the grad axis is
+FAR less sparse than the x axis at the same nominal setpoint -- e.g. at
+``r_target=0.9``, x's q/k/v achieved ``k~=58/288`` (~20%) while dy's
+achieved ``k~=128-133/288`` (~45%), consistent with gradients being much
+more diffusely distributed across dims than forward activations (which
+concentrate into a small nucleus). This means the two axes do NOT compound
+multiplicatively the way a naive "density_x * density_dy" estimate would
+assume -- the achieved dy density needs to be measured continuously (not
+assumed) to reason about the real effective sparsification a training run
+is getting.
+
 .. _disldo_layer_forward.design_notes:
 
 ``DISLDOLayer.forward``: five small design decisions bundled into one call site
@@ -936,3 +963,204 @@ connectivity almost immediately rather than growing gradually. ``k=4``
 (default) or smaller is far more sane for continuous per-step growth; only
 raise this if you've checked the resulting per-step ``nnz`` growth against
 your actual ``max_weights`` budget and step rate.
+
+.. _sparse_rnn.engine_select_two_groups:
+
+Two engine groups, real-time dispatch, and the design-time choice still to make
+------------------------------------------------------------------------------------------
+
+*ID:* ``sparse_rnn.engine_select_two_groups``
+
+Every ``*LayerV`` class belongs to one of two storage GROUPS, and this
+matters for which layer type to reach for:
+
+- **Group A** (``DISLDOLayerV``, ``SISLDOLayerV``): sparse/block4 weight
+  storage (``SparseLinearWeightsDelta``, ``sili/lib/headers/block4.hpp``).
+  Built for weights that genuinely change shape over training --
+  synaptogenesis and pruning both assume this storage.
+- **Group B** (``DIDLDOLayerV``): plain dense weight storage
+  (``DenseLinearWeights``, ``sili/lib/headers/linear_didldo.hpp``). Built
+  for weights that stay fully dense -- no synaptogenesis/pruning support
+  at all, by design; Group A pays real CSR/block4 bookkeeping overhead
+  for weights that never actually use it, which is exactly the case
+  ``sili_peridot``'s current dense layers are in.
+
+**Within a group, engine choice is a real-time, per-call, zero-cost
+decision** -- both members of a pair share the SAME weight storage, so
+switching costs nothing but a runtime branch (``sili/lib/headers/
+engine_select.hpp``, ``group_a_forward_use_sisldo`` /
+``group_a_backward_use_sisldo`` / ``group_b_forward_use_sidldo`` /
+``group_b_backward_use_sidldo``). This is what ``DISLDOLayerV.forward()``/
+``.backward()`` and ``DIDLDOLayerV.forward()``/``.backward()`` actually
+call -- ``forward_dense``/``forward_sparse``/``backward_dense``/
+``backward_sparse`` remain on both classes as the explicit, no-decision
+escape hatch.
+
+**Redone 2026-09-17** (superseding the original coarse ``batch``/
+``density``-only rules below): the original rules were fit on 336 cells
+covering only 2 widths for Group A and 1 width (n=288) for Group B --
+"a lot more detailed [testing existed] than this with more crossover
+points, and they only tested a few layer sizes," per direct instruction.
+Re-swept both groups across 7 widths (64, 128, 288, 512, 1024, 2048,
+4096) -- 1176 Group A rows (also adding a synapse/weight-density axis,
+``syn`` in {0.1, 1.0} -- see below) and 735 Group B rows (first-ever
+width coverage beyond n=288) -- and refit each rule as a decision tree
+in log-space over width/batch/density (and, for Group A backward,
+synapse density) via ``scripts/fit_engine_select_rules.py`` +
+``scripts/engine_select_bench_data.json``. Hyperparameters were chosen
+by k-fold cross-validation, not training accuracy -- an initial more
+aggressive fit reached 92-96% training accuracy but on leaves of 4-8
+samples at 50-75% leaf accuracy, i.e. fitting measurement noise, not
+real crossover structure. Thresholds in the generated C++ are the exact
+fitted values, not rounded for legibility -- direct instruction:
+prefer a more accurate rule even if more complicated.
+
+Measured accuracy (cross-validated, i.e. held out, not training-set):
+
+- Group A forward: 92.6% (majority-class baseline 59.2%). ``syn_density``
+  (the WEIGHT matrix's own sparsity, not this call's activation/gradient
+  density) turned out unused -- the tree never selected it as a useful
+  split for forward, only backward.
+- Group A backward: 91.6% (baseline 63.0%). ``syn_density`` IS a real,
+  previously-uncaptured driver here: at ``density > ~0.16`` sisldo stays
+  competitive far longer when the weight matrix itself is sparse
+  (``syn_density <= ~0.32``) than when it's dense, because dense-weight
+  disldo's inner loop has nothing to skip. This resolves the earlier
+  version's documented "real, unresolved gap" (a width/synapse
+  combination that inexplicably preferred sisldo past the density
+  threshold) -- it wasn't unresolved, it was a missing feature.
+- Group B forward: 93.9% (baseline 70.6%).
+- Group B backward: 86.5% (baseline 64.9%) -- independently fit from
+  real bwd0/bwdX data across all 7 widths (previously only n=288 was
+  ever tested, and even then the rule was a placeholder reusing
+  forward's). The remaining error here is a genuine measurement-noise
+  floor, not underfitting -- confirmed by pushing the fit far more
+  aggressively without moving the ceiling, consistent with many
+  near-1.0 time-ratio cells seen by hand in this specific op/region.
+
+``n`` (layer width) is the geometric mean ``sqrt(n_inputs * n_outputs)``
+at asymmetric-layer call sites -- every benchmark row was gathered on a
+SQUARE layer (``n_inputs == n_outputs``), so this is the least-wrong
+single-number proxy, not a validated case. Also unvalidated: everything
+was measured on one machine (AMD Ryzen 7 3800XT, 8 threads, oneAPI MKL),
+and Group A's ``syn_density`` axis was only measured at two points (0.1,
+1.0), not swept continuously. Re-run ``scripts/
+fit_engine_select_rules.py`` after gathering more data (more widths, a
+continuous ``syn_density`` sweep, another machine) to refit.
+
+Original (superseded 2026-09-17) rules, for reference:
+
+- Group A forward: ``batch == 1`` always picks sisldo, regardless of
+  density; otherwise ``density < 0.05`` picks sisldo, else disldo. 100%
+  agreement across 4 width/synapse-density combinations in the Block4
+  Bench dataset (336 cells) at every tested point but one.
+- Group A backward: same shape, but the ``density >= 0.05`` branch only
+  agreed 3/4 of the time in that same dataset (one width/synapse combo
+  consistently preferred sisldo there too) -- see ``syn_density`` above
+  for the resolution.
+- Group B forward: two-tier threshold (0.1 at ``batch <= 1``, 0.02
+  otherwise) from a dedicated DIDLDO-vs-SIDLDO A/B, ONE width tested
+  (n=288), 100% agreement at every point tested there.
+- Group B backward: real A/B, n=288, 4 densities x 7 batches, 28/28
+  tested points match the rule: ``batch == 1`` picks sidldo unless
+  density is near-full (``< 0.9``); ``batch > 1`` only picks sidldo at
+  low density AND modest batch together (``density < 0.02 AND batch <=
+  128``).
+
+**Crossing groups is NOT a real-time decision** -- it means an actual
+weight-storage relayout (sparse/block4 <-> dense), real work, not
+something to do per-call. No automatic recommender for this exists yet;
+picking Group A vs Group B is a manual, design-time choice today
+(expected weight density and whether synaptogenesis/pruning will ever
+run against this layer are the likely deciding factors, not yet
+formalized) -- a real recommender for THIS choice is still scoped as
+separate future work in ``TODO_BATCH_BLOCKING.md`` ("Also queued"). The
+within-group surface fit above is no longer a stand-in for that
+future work -- it's the real multi-dimensional fit now, not a coarser
+placeholder for one.
+
+.. _sparse_rnn.didldo_same_optimizer_as_disldo:
+
+DIDLDO/SIDLDO must use DISLDO's real optimizer, not vanilla RMSprop
+------------------------------------------------------------------------------------------
+
+*ID:* ``sparse_rnn.didldo_same_optimizer_as_disldo``
+
+``didldo_backward``/``sidldo_backward`` (``linear_didldo.hpp``/
+``linear_sidldo.hpp``) originally used a hand-rolled plain RMSprop
+update. That is a DIFFERENT optimizer than ``disldo_backward``/
+``disldo_backward_sparse_grad`` (``sisldo_ops.hpp``) actually run --
+per the ``feedback_importance_is_already_the_optimizer`` memory,
+DISLDO's per-synapse "importance" (``ci``) already IS the adaptive
+optimizer state (``BoundedRMSpropSynapsePolicy``, ``delta_csr_types.
+hpp``), not a separate bookkeeping value alongside one. Dense storage
+still needs the identical optimizer, or DIDLDO/SIDLDO silently diverge
+from DISLDO/SISLDO on identical weights/inputs -- breaking the "same
+group, interchangeable, only speed differs" invariant every real-time
+dispatcher above depends on. Fixed 2026-09-16.
+
+**The real formula** (``BoundedRMSpropSynapsePolicy::update_ci``/
+``update_cw``): ``ci = clip(beta2*ci + (1-beta2)*(g^2+contrib^2),
+min_decay_frac*ci, max_ci)``, where ``contrib = x * w_start`` (the
+synapse's actual output contribution this call, not just its
+gradient) and ``w_start`` is the weight value snapshotted at the START
+of the batch (never the mid-update value). The weight delta clips the
+RAW (pre-lr) update to ``+/-max_abs_delta`` BEFORE multiplying by
+``effective_lr`` -- clipping after would make ``max_abs_delta`` an
+absolute cap independent of ``lr``, a real bug fixed once already on
+the scattered/block4 side (``synapse_policy.clip_order_and_lr_ceiling``).
+
+**Dense-dy contrib** (``didldo_backward``): every batch sample "touches"
+every column (dy is fully materialized even where its value is 0), so
+``contrib_agg[i,j] = w[i,j] * sum_b(x[b,i])`` -- one MKL sgemv
+(``ones^T @ x``) gives the column-sum, then a per-row broadcast
+multiply against ``w``.
+
+**Sparse-dy contrib** (``sidldo_backward``) is NOT the same reduction --
+this was a real bug caught by the cross-group test below, not just a
+formula port. ``disldo_backward_sparse_grad`` only accumulates
+``contrib`` for ``(row, col, sample)`` triples where the sparse dy
+actually HAS that explicit entry (its merge-scan gates
+``contrib_sum[e] += in_val * w_buf[e]`` inside the "found a matching
+index" branch) -- a sample that simply doesn't touch a column
+contributes nothing to that column's contrib either, unlike the
+dense-dy case where an absent contribution just means a stored 0.
+First attempt used a plain global column-sum of ``x`` (matching the
+dense-dy formula), which measurably diverged from DISLDO's real update
+(~1% on some elements, a handful of synapses per call, at
+n_in=6/n_out=5/batch=4/density=0.5). Fixed via a
+``mask_compact[batch,num_active]`` matrix (1.0 at explicit dy
+positions, built during the same gather pass as ``dy_compact``) and an
+sgemm (``x^T @ mask_compact``) giving the correctly-gated per-(row,
+active-column) sum, elementwise-multiplied by ``w_masked`` afterward.
+
+**Float-vs-double accumulation caveat**: this is algorithm-exact, not
+bit-exact down to the last ULP. ``disldo_backward`` sums ``g``/
+``contrib`` in DOUBLE per synapse across the batch loop before casting
+to float for the update; DIDLDO/SIDLDO's ``g``/``contrib`` come from
+MKL sgemm/sgemv, which accumulate internally in float. Same formula,
+different summation precision/order -- verified equal within
+``atol=1e-3, rtol=1e-3`` (``tests/unit/python/
+test_group_b_engine_select.py``'s ``TestGroupACrossGroupBSameOptimizer``),
+not exact equality. Getting true bit-exactness would mean abandoning
+BLAS for the ``dw``/``contrib`` reduction (a manual double-accumulating
+loop), which would give up most of DIDLDO's own reason to exist --
+not done, and not expected to be needed (the two-group architecture's
+"interchangeable" premise is about training dynamics being
+equivalent, not about literal bit-for-bit replay).
+
+**Verification**: cross-group tests build a DISLDOLayerV and a
+DIDLDOLayerV from the SAME initial weights (``load_dense_values``, ``ci``
+0 both sides), apply the SAME ``x``/``dy``/hyperparameters via each
+class's ``backward_dense``/``backward_sparse``, and compare the
+resulting TRUE dense weight matrix (via
+``layer.forward_dense(np.eye(n_in))``, sidestepping the need to know
+either class's internal storage layout) -- covers the dense-dy path,
+the sparse-dy path (what caught the contrib-gating bug above),
+non-default hyperparameters, and DIDLDOLayerV's own dense-vs-sparse
+dispatch agreement at ``lr != 0`` (the pre-existing dispatch-match
+tests only ever exercised ``lr=0``, the gradient-only path, so never
+exercised the optimizer formula at all). Plus C++-level
+``test_didldo_kernel.cpp``/``test_sidldo_kernel.cpp`` reference-formula
+fixes -- the old vanilla-RMSprop reference would have hidden this
+exact bug class since it never modeled ``contrib`` at all.

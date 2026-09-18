@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <numeric>
 #include <omp.h>
 #include <stdexcept>
@@ -349,6 +350,27 @@ template <typename T> struct DeltaCSRBiValues {
     std::vector<T> weights;
     std::vector<T> importance;
 };
+
+// Rank-N scale (value_scale_k/output_scale_k/scale_gamma_k, see
+// SparseLinearWeightsDelta::get_scale below) exists to compensate for LOW-
+// BIT quantization error (FP8/FP4's coarse grid) -- it has nothing to
+// contribute for a full-precision store, where there's no quantization
+// error to compensate. Defaulting it ON for every precision (the prior
+// behavior) was a real BDD divergence: fp32/fp64 layers paid its full
+// per-cell compute cost (a redundant sum-of-products, dominant cost
+// measured via callgrind -- see disldo_forward.get_scale_row_col_cache in
+// docs/research/linear_disldo.rst) for a mechanism that's a mathematical
+// no-op there by construction (S=1 whenever value_scale/output_scale/gamma
+// are all untrained, which they always are unless a caller explicitly
+// opts in). is_full_precision_values<VALUES_TYPE> lets
+// SparseLinearWeightsDelta pick scale_enabled's default per-VALUES_TYPE:
+// off for DeltaCSRBiValues<T> (any T -- fp32 today, fp64 if ever used),
+// on for FP8BiValues/FP4BiPacked. Always explicitly overridable via
+// set_scale_enabled() regardless of default -- see
+// docs/research/delta_csr_types.rst:
+// sparse_linear_weights_delta.scale_enabled_precision_default.
+template <typename VALUES_TYPE> struct is_full_precision_values : std::false_type {};
+template <typename T> struct is_full_precision_values<DeltaCSRBiValues<T>> : std::true_type {};
 
 template <typename T> struct ValueAccessor<DeltaCSRBiValues<T>> {
     using value_type = T;
@@ -1123,7 +1145,62 @@ struct SparseLinearWeightsDelta {
             mcol_acc_raw; // [thread][k][tile_width] -- Block4Vec accumulator backing
         std::vector<value_type> mcol_acc_raw_contrib; // [thread][k][tile_width]
 
+        // block4_backward_process_row_pair/tile_pair-only fields -- these
+        // process TWO rows or TWO tile-halves (A/B) at once, so they need
+        // genuinely double-width scratch, unlike the single-row-shaped
+        // fields above (which row_pair/tile_pair also use directly, for
+        // their own single-row-shaped locals -- see docs/research/
+        // delta_csr_types.rst:sparse_linear_weights_delta.scale_rank_scratch_pair_task).
+        // Replaces what used to be a fresh heap std::vector allocation on
+        // EVERY row-pair/tile-pair call -- measured via callgrind as ~33%
+        // of disldo_backward's total instructions at batch=1 (malloc/free/
+        // operator new dominating over actual arithmetic).
+        std::vector<value_type> value_scale_k_pair;      // [thread][row0_or_1][k]
+        std::vector<double> mrow_local_k_pair;           // [thread][row0_or_1][k]
+        std::vector<double> mrow_local_k_pair_contrib;   // [thread][row0_or_1][k]
+        std::vector<value_type> out_scale_k_pair;        // [thread][A_or_B][k][tile_width]
+        std::vector<value_type> mcol_local_pair;         // [thread][k][2*tile_width]
+        std::vector<value_type> mcol_local_pair_contrib; // [thread][k][2*tile_width]
+
         std::size_t cap_threads = 0, cap_rank = 0, cap_tile_width = 0;
+
+        // Per-thread STRIDES (in elements, one per distinct element-type/
+        // shape combination below), each padded so a thread's slice never
+        // shares a cache line with an adjacent thread's slice in the SAME
+        // vector. Without this, every real (lr!=0) write through
+        // block4_backward_process_row_pair/tile_pair -- which route the
+        // MAJORITY of disldo_backward's work once density is high enough
+        // that rows pair up -- causes cross-core cache-line ping-pong
+        // between threads whose per-thread blocks are smaller than 64
+        // bytes (e.g. rank=8 floats = 32B, well under a cache line).
+        // Measured: at width=288/rank=8/num_cpus=8 on the dual-CCX
+        // Ryzen 3800XT remote box, this alone made disldo_backward's
+        // TRAINING path (bwdX, lr!=0) 5-30x SLOWER after task #295-style
+        // scratch reuse was extended to row_pair/tile_pair, despite a
+        // clean single-threaded instruction-count IMPROVEMENT (callgrind:
+        // 7.8B vs 11.5B Ir for the same 300 calls) -- a classic false-
+        // sharing signature: fewer instructions, much higher wall time
+        // under concurrent writers. See docs/research/delta_csr_types.rst:
+        // sparse_linear_weights_delta.scale_rank_scratch_false_sharing.
+        std::size_t thread_stride_v = 0;           // value_type, rank elements
+        std::size_t thread_stride_v_tile = 0;      // value_type, rank*tile_width elements
+        std::size_t thread_stride_d = 0;           // double, rank elements
+        std::size_t thread_stride_v_pair = 0;      // value_type, 2*rank elements
+        std::size_t thread_stride_v_tile_pair = 0; // value_type, 2*rank*tile_width elements
+        std::size_t thread_stride_d_pair = 0;      // double, 2*rank elements
+
+        static constexpr std::size_t CACHE_LINE_BYTES = 64;
+
+        // Rounds elems up so elems*sizeof(T) is a whole multiple of a
+        // cache line -- the actual per-thread DATA stays at `elems`
+        // (only indices [0, elems) are ever read/written), the extra
+        // slots are pure padding that separates adjacent threads' blocks.
+        template <typename T> static std::size_t pad_elems(std::size_t elems) {
+            const std::size_t bytes = elems * sizeof(T);
+            const std::size_t padded_bytes =
+                ((bytes + CACHE_LINE_BYTES - 1) / CACHE_LINE_BYTES) * CACHE_LINE_BYTES;
+            return padded_bytes / sizeof(T);
+        }
 
         // Grow-only (never shrinks) -- called automatically at the top of
         // every disldo_backward call, a cheap no-op once large enough.
@@ -1140,18 +1217,28 @@ struct SparseLinearWeightsDelta {
             cap_threads = threads;
             cap_rank = rank;
             cap_tile_width = tile_width;
-            const std::size_t flat = threads * rank;
-            const std::size_t flat_tiled = flat * tile_width;
-            value_scale_k.resize(flat);
-            out_scale_k.resize(flat_tiled);
-            mcol_rank.resize(flat_tiled);
-            mrow_local_k.resize(flat);
-            mcol_rank_contrib.resize(flat_tiled);
-            mrow_local_k_contrib.resize(flat);
-            mgamma_local_k.resize(flat);
-            mgamma_local_k_contrib.resize(flat);
-            mcol_acc_raw.resize(flat_tiled);
-            mcol_acc_raw_contrib.resize(flat_tiled);
+            thread_stride_v = pad_elems<value_type>(rank);
+            thread_stride_v_tile = pad_elems<value_type>(rank * tile_width);
+            thread_stride_d = pad_elems<double>(rank);
+            thread_stride_v_pair = pad_elems<value_type>(2 * rank);
+            thread_stride_v_tile_pair = pad_elems<value_type>(2 * rank * tile_width);
+            thread_stride_d_pair = pad_elems<double>(2 * rank);
+            value_scale_k.resize(threads * thread_stride_v);
+            out_scale_k.resize(threads * thread_stride_v_tile);
+            mcol_rank.resize(threads * thread_stride_v_tile);
+            mrow_local_k.resize(threads * thread_stride_d);
+            mcol_rank_contrib.resize(threads * thread_stride_v_tile);
+            mrow_local_k_contrib.resize(threads * thread_stride_d);
+            mgamma_local_k.resize(threads * thread_stride_d);
+            mgamma_local_k_contrib.resize(threads * thread_stride_d);
+            mcol_acc_raw.resize(threads * thread_stride_v_tile);
+            mcol_acc_raw_contrib.resize(threads * thread_stride_v_tile);
+            value_scale_k_pair.resize(threads * thread_stride_v_pair);
+            mrow_local_k_pair.resize(threads * thread_stride_d_pair);
+            mrow_local_k_pair_contrib.resize(threads * thread_stride_d_pair);
+            out_scale_k_pair.resize(threads * thread_stride_v_tile_pair);
+            mcol_local_pair.resize(threads * thread_stride_v_tile_pair);
+            mcol_local_pair_contrib.resize(threads * thread_stride_v_tile_pair);
         }
     };
     ScaleRankScratch scale_rank_scratch;
@@ -1177,37 +1264,63 @@ struct SparseLinearWeightsDelta {
     // ScaleRankScratch) only zero NEWLY appended elements on growth, not
     // the whole buffer every time.
     struct DisldoBackwardScratch {
-        std::vector<value_type> t_dx;                 // [thread][batch][in_cols], stride cap_dst
+        std::vector<value_type> t_dx; // [thread][batch][in_cols], stride cap_dst
+        // block4's own dx accumulator, transposed ([thread][n_in][batch],
+        // same stride cap_dst since in_cols==n_in) to avoid the batch-major
+        // stride block4's row/tile loop would otherwise hit -- merged into
+        // t_dx once per disldo_backward call. See
+        // disldo_backward.batch_stride_transpose in
+        // docs/research/linear_disldo.rst.
+        std::vector<value_type> t_dx_T;
         std::vector<value_type> t_col_grad;           // [thread][col][k], stride cap_out_rank
         std::vector<value_type> t_col_grad_contrib;   // [thread][col][k], stride cap_out_rank
         std::vector<value_type> t_gamma_grad;         // [thread][k], stride cap_rank
         std::vector<value_type> t_gamma_grad_contrib; // [thread][k], stride cap_rank
 
-        std::size_t cap_threads = 0, cap_dst = 0, cap_out_rank = 0, cap_rank = 0;
+        // disldo_forward.persistent_scratch_buffers (see
+        // docs/research/linear_disldo.rst): group_dx/group_col_grad/
+        // group_col_grad_contrib were a fresh std::vector every call in
+        // disldo_backward's CCX-group-aware reduction
+        // (disldo_backward.ccx_aware_reduction) -- much smaller and
+        // batch-INdependent unlike this session's other buffer fixes
+        // (sized by num_groups, not batch), so expect a small effect,
+        // but it's the same proven-safe pattern.
+        std::vector<value_type> group_dx;       // [group][dst], stride cap_dst
+        std::vector<value_type> group_col_grad; // [group][col][k], stride cap_out_rank
+        std::vector<value_type> group_col_grad_contrib;
+
+        std::size_t cap_threads = 0, cap_dst = 0, cap_out_rank = 0, cap_rank = 0, cap_groups = 0;
 
         // Grow-only (never shrinks) -- called automatically at the top of
         // every disldo_backward call, a cheap no-op once large enough.
-        void ensure(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank) {
+        void ensure(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank,
+                    std::size_t groups) {
             if (threads <= cap_threads && dst <= cap_dst && out_rank <= cap_out_rank &&
-                rank <= cap_rank)
+                rank <= cap_rank && groups <= cap_groups)
                 return;
             resize_to(std::max(cap_threads, threads), std::max(cap_dst, dst),
-                      std::max(cap_out_rank, out_rank), std::max(cap_rank, rank));
+                      std::max(cap_out_rank, out_rank), std::max(cap_rank, rank),
+                      std::max(cap_groups, groups));
         }
 
         // Explicit, caller-driven resize -- unlike ensure(), CAN shrink.
         // Caller must not pass below what's currently in use.
-        void resize_to(std::size_t threads, std::size_t dst, std::size_t out_rank,
-                       std::size_t rank) {
+        void resize_to(std::size_t threads, std::size_t dst, std::size_t out_rank, std::size_t rank,
+                       std::size_t groups) {
             cap_threads = threads;
             cap_dst = dst;
             cap_out_rank = out_rank;
             cap_rank = rank;
+            cap_groups = groups;
             t_dx.resize(cap_threads * cap_dst);
+            t_dx_T.resize(cap_threads * cap_dst);
             t_col_grad.resize(cap_threads * cap_out_rank);
             t_col_grad_contrib.resize(cap_threads * cap_out_rank);
             t_gamma_grad.resize(cap_threads * cap_rank);
             t_gamma_grad_contrib.resize(cap_threads * cap_rank);
+            group_dx.resize(cap_groups * cap_dst);
+            group_col_grad.resize(cap_groups * cap_out_rank);
+            group_col_grad_contrib.resize(cap_groups * cap_out_rank);
         }
     };
     DisldoBackwardScratch disldo_backward_scratch;
@@ -1241,7 +1354,27 @@ struct SparseLinearWeightsDelta {
     // for why rank>1 is needed at all (conflicting per-column gradient
     // demand within one row), the scattered/block4 scope note, and the
     // known DeferredScaleWrite rank-1-only limitation.
-    std::size_t scale_rank = 1;
+    // Default per-precision, not a single global default -- see
+    // is_full_precision_values above for the rationale: rank-N scale
+    // exists to compensate LOW-BIT quantization error, so a full-precision
+    // store (fp32/fp64) starts with NO scale channels at all (rank 0 --
+    // matching additive_rank's own existing "0 = branch doesn't exist"
+    // convention below, not a separate on/off flag layered on top of a
+    // still-populated rank). get_scale() treats rank==0 as identity (S=1);
+    // every rank-bounded loop elsewhere (forward's row/col scale cache,
+    // backward's mrow_local/mcol_local/mgamma_local scale-TRAINING
+    // gradient accumulation) naturally becomes a 0-iteration no-op at
+    // rank==0 too, so a disabled-by-default fp32 layer's backward pass
+    // never touches value_scale_k/output_scale_k/gamma_k at all -- not
+    // frozen-but-present, genuinely absent, so there's nothing to drift
+    // out of sync with the core weight matrix while scale sits unused.
+    // Explicitly settable to something >0 via set_scale_rank() (also
+    // raises scale_rank_max below if needed) for an fp32 layer that
+    // genuinely wants trained rank-N scale from the start -- NOT meant to
+    // be toggled on/off mid-training (equivalent to restructuring a
+    // pretrained network -- unsupported, same as changing additive_rank
+    // mid-training already is).
+    std::size_t scale_rank = is_full_precision_values<VALUES_TYPE>::value ? 0 : 1;
 
     // AQRS dynamic rank control (task #292 fix): calls since the LAST
     // rank mutation of EITHER kind on this branch -- a real 60k-step MQAR
@@ -1478,6 +1611,8 @@ struct SparseLinearWeightsDelta {
     // Hadamard-multiplied against quant in disldo_forward/backward. See
     // docs/research/delta_csr_types.rst:sparse_linear_weights_delta.get_scale_formula.
     inline value_type get_scale(std::size_t row, std::size_t col) const {
+        if (scale_rank == 0)
+            return value_type(1);
         value_type s = value_type(0);
         for (std::size_t k = 0; k < scale_rank; ++k)
             s += get_scale_gamma_k(k) * get_value_scale_k(row, k) * get_output_scale_k(col, k);
@@ -1675,8 +1810,14 @@ struct SparseLinearWeightsDelta {
     // Runtime-settable POLICY cap (task #295 -- was a compile-time
     // SCALE_RANK_MAX=4 forced by block4's now-gone fixed-size stack
     // arrays). Independent of scale_rank_scratch's memory sizing; default
-    // 4 matches the old compile-time constant.
-    std::size_t scale_rank_max = 4;
+    // 4 matches the old compile-time constant for FP8/FP4. Full-precision
+    // types default this to 0 too (alongside scale_rank itself, see
+    // above) so AQRS dynamic rank control can never silently grow scale
+    // into existence on an fp32/fp64 layer -- set_scale_rank's own
+    // exceeds-scale_rank_max check (below) already throws a clear error in
+    // that case, same explicit-opt-in path as raising it for any other
+    // reason.
+    std::size_t scale_rank_max = is_full_precision_values<VALUES_TYPE>::value ? 0 : 4;
     std::size_t additive_rank_max = 4;
     inline std::size_t get_scale_rank_max() const { return scale_rank_max; }
     // Lowering below the CURRENT scale_rank is allowed -- just blocks

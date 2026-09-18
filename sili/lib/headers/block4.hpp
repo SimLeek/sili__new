@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -25,6 +26,28 @@
 constexpr uint32_t BLOCK4_TILE = SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_TILE_SLOTS = SILI_BLOCK4_TILE_SIZE * SILI_BLOCK4_TILE_SIZE;
 constexpr uint32_t BLOCK4_PROMOTE_MIN_LIVE = SILI_BLOCK4_PROMOTE_MIN_LIVE;
+
+// disldo_forward.column_partitioned_threading: one tile (or one
+// leader+follower tile-pair, same br, consecutive in row order) pre-
+// assigned to whichever thread owns its output column-block range. See
+// disldo_forward.per_thread_output_buffers in docs/research/
+// linear_disldo.rst for why this replaced the earlier "every thread gets
+// a full private output-sized buffer, reduce serially at the end" scheme
+// -- that reduction was O(num_cpus * batch * n_out) and grew *worse* at
+// exactly the large-batch/large-layer sizes that should have amortized
+// it. Column-block ownership is disjoint per thread, so a thread holding
+// this item can write directly into the shared output array with zero
+// cross-thread aggregation.
+struct Block4WorkItem {
+    uint32_t br = 0;
+    uint32_t bcA = 0;
+    std::size_t elemA = 0;
+    std::size_t byteA = 0;
+    bool has_partner = false;
+    uint32_t bcB = 0;
+    std::size_t elemB = 0;
+    std::size_t byteB = 0;
+};
 
 // block4 4-wide SIMD helpers
 //
@@ -137,6 +160,97 @@ inline Block4Vec block4_vec_abs(Block4Vec x) {
 // This one function was 12.16% of all instructions in a disldo_backward run.
 inline float block4_vec_hsum(Block4Vec x) {
     return x[0] + x[1] + x[2] + x[3];
+}
+
+// disldo_forward.batch_blocked_accumulate (Phase 1, batch-blocked
+// accumulation rollout -- see TODO_BATCH_BLOCKING.md): register-blocked
+// multiply-accumulate of BLOCK4_TILE input rows into ONE output column,
+// against BLOCK4_BATCH_BLOCK_B batch samples at a time. Requires BOTH
+// sides pre-transposed to batch-contiguous layout: `row_ptrs[li]` each
+// point to `batch` CONTIGUOUS values (disldo_forward's shared, read-only
+// `input_T[row*batch+b]`, built once per call), and `out_col` points to
+// `batch` contiguous values in a per-thread PRIVATE column-major
+// accumulator (never the real shared `output`, which stays row-major and
+// gets one transpose-back pass per thread at the very end -- see the wide
+// path in disldo_forward). Both the load of `row_ptrs[li]` and the
+// load/store of `out_col` are then genuine wide SIMD instead of, on the
+// input side, a per-sample 4-lane gather, and on the output side, a
+// per-sample horizontal reduce-and-scalar-store
+// (out[b]+=prod[0]+prod[1]+prod[2]+prod[3], measured via callgrind as
+// ~74% of disldo_forward's real per-sample work at batch=1024). Confirmed
+// via a standalone multi-threaded PoC (num_cpus=8, real OpenMP
+// contention, not just single-thread isolation) that writing into a
+// PRIVATE per-thread buffer like this beats writing the transposed
+// accumulate straight into a SHARED buffer by an additional, consistent
+// 10-20% on top of the transpose's own 2.2-3.8x -- see
+// TODO_BATCH_BLOCKING.md for the actual measured table. LOSES below
+// roughly batch=8 (transpose overhead not amortized) -- gated by
+// BLOCK4_BATCH_BLOCK_THRESHOLD at the disldo_forward call site, not
+// inside this function.
+constexpr int BLOCK4_BATCH_BLOCK_B = 8;
+using Block4BatchVec = float __attribute__((__vector_size__(BLOCK4_BATCH_BLOCK_B * sizeof(float))));
+
+inline void block4_batch_accumulate(const float w4[BLOCK4_TILE],
+                                    const float* const row_ptrs[BLOCK4_TILE], std::size_t batch,
+                                    float* out_col) {
+    // Hoist the per-row weight broadcast OUT of the batch-chunk loop: it's
+    // loop-invariant (constant across b), but a per-lane fill loop like
+    // `for(k) wv[k]=w4[li]` INSIDE the loop defeats GCC's ability to keep
+    // it in a register -- same lesson block4_vec_broadcast's own
+    // docstring above already documents from disldo_backward (7.6% of a
+    // whole profiled run was that exact anti-pattern). Aggregate-init
+    // instead, once, before the loop.
+    Block4BatchVec wv[BLOCK4_TILE];
+    for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+        wv[li] = Block4BatchVec{w4[li], w4[li], w4[li], w4[li], w4[li], w4[li], w4[li], w4[li]};
+
+    std::size_t b = 0;
+    for (; b + BLOCK4_BATCH_BLOCK_B <= batch; b += BLOCK4_BATCH_BLOCK_B) {
+        Block4BatchVec acc;
+        std::memcpy(&acc, out_col + b, sizeof(acc));
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            Block4BatchVec iv;
+            std::memcpy(&iv, row_ptrs[li] + b, sizeof(iv));
+            acc += wv[li] * iv;
+        }
+        std::memcpy(out_col + b, &acc, sizeof(acc));
+    }
+    for (; b < batch; ++b) {
+        float s = 0;
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            s += w4[li] * row_ptrs[li][b];
+        out_col[b] += s;
+    }
+}
+
+// disldo_forward.scattered_batch_blocked (Phase 7.5, see
+// TODO_BATCH_BLOCKING.md): single-weight sibling of
+// block4_batch_accumulate above, for the SCATTERED (non-block4) path --
+// a CSR row's columns aren't grouped into fixed 4-wide tiles, so there's
+// only ever ONE weight per (row, column) synapse here, not four. Same
+// requirements and rationale as block4_batch_accumulate (transposed,
+// batch-contiguous `in_row`; batch-contiguous `out_col` in a per-thread
+// PRIVATE column-major accumulator) -- profiled via callgrind
+// (num_cpus=1, batch=1024, 10% density) that this exact per-sample
+// scalar accumulate was ~92% of the scattered path's real instructions
+// (57.8% loop overhead + 34.6% the strided `mo[...]+=w*iv` store itself)
+// with CSR traversal/decode a negligible ~0.02% -- so, unlike Phase 4's
+// buffer-allocation fix (which found this path NOT allocation-bound),
+// THIS is the real bottleneck the same transpose treatment already
+// fixed for block4 addresses.
+inline void scalar_batch_accumulate(float w, const float* in_row, std::size_t batch,
+                                    float* out_col) {
+    const Block4BatchVec wv{w, w, w, w, w, w, w, w};
+    std::size_t b = 0;
+    for (; b + BLOCK4_BATCH_BLOCK_B <= batch; b += BLOCK4_BATCH_BLOCK_B) {
+        Block4BatchVec acc, iv;
+        std::memcpy(&acc, out_col + b, sizeof(acc));
+        std::memcpy(&iv, in_row + b, sizeof(iv));
+        acc += wv * iv;
+        std::memcpy(out_col + b, &acc, sizeof(acc));
+    }
+    for (; b < batch; ++b)
+        out_col[b] += w * in_row[b];
 }
 
 // Elementwise sqrt -- GCC vector-extension types have no built-in sqrt.
@@ -1144,6 +1258,35 @@ block4_resize_tile_in_row(const DeltaCSRLayout& L, std::vector<std::size_t>& tby
         }
     }
     const std::size_t shift_from = tbyte_pos + old_len;
+    // Defense in depth: shift_from should never exceed tbyte_end[row] --
+    // that would mean `old_len` (the caller's belief about this tile's
+    // CURRENT stored length) disagrees with the row's own recorded content
+    // size, which should be mathematically impossible after the
+    // disldo_backward_sparse_grad.stale_local_pos_after_commit fix
+    // (sisldo_ops.hpp) that this guard was added alongside -- that bug let
+    // a caller pass a stale `old_len` for a tile whose real position had
+    // shifted after an EARLIER tile in the same row changed its stored
+    // encoding (sparse<->dense), and the resulting negative-size memmove
+    // was reproduced directly (ASan: negative-size-param) before the fix.
+    // If this ever fires again (a different bug, a future caller), warn
+    // and skip the shift rather than computing a wrapped-around size and
+    // corrupting/crashing -- same "detect, clamp, count, never crash"
+    // shape as row_merge_overflow_events elsewhere in this file.
+    if (shift_from > tbyte_end[row]) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "WARNING: block4_resize_tile_in_row: tile position/length invariant "
+                         "violated (row=%zu tbyte_pos=%zu old_len=%zu shift_from=%zu > "
+                         "tbyte_end[row]=%zu) -- skipping this tile's shift to avoid memory "
+                         "corruption. This should not happen; please report.\n",
+                         row, tbyte_pos, old_len, shift_from, tbyte_end[row]);
+            std::fflush(stderr);
+        }
+        std::memcpy(tile_data.data() + tbyte_pos, new_bytes, new_len);
+        tbyte_end[row] = std::size_t(std::ptrdiff_t(tbyte_end[row]) + delta);
+        return;
+    }
     const std::size_t shift_len = tbyte_end[row] - shift_from;
     if (shift_len > 0)
         std::memmove(tile_data.data() + tbyte_pos + new_len, tile_data.data() + shift_from,
@@ -1310,16 +1453,84 @@ struct Block4Store {
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
     // Persistent scratch buffers for disldo_forward/disldo_backward
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count; // backward only
     std::vector<double> scratch_row_grad;         // backward only
     // backward only:
     std::vector<std::size_t> scratch_row_ti_start;
-    // disldo_forward cross-tile pairing scratch -- currently only used by
-    // the FP32 block4 store; harmless unused field here (shared collection
-    // loop in disldo_forward populates it for every VALUES_TYPE).
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_backward.batch_stride_transpose: pre-transposed input/
+    // output_grad, built once per disldo_backward call -- see
+    // Block4BackwardParams's own comment (block4_codec.hpp).
+    // Shared, read-only [row, batch] transpose of the input, reused
+    // call to call so no fresh allocation happens on the hot path.
+    // Originally backward-only; disldo_forward's wide (column-partitioned)
+    // path now reuses it too at batch >= BLOCK4_BATCH_BLOCK_THRESHOLD --
+    // see disldo_forward.batch_blocked_wide_path in linear_disldo_forward.hpp.
+    std::vector<float> scratch_input_T;
+    std::vector<float> scratch_output_grad_T; // backward only
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
+    // disldo_forward.column_partitioned_threading: per-thread work-item
+    // lists (see Block4WorkItem above) plus the column-block partition
+    // boundaries used to build them, reused call to call so no fresh
+    // allocation happens on the hot path.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    // Per-row lookahead buffer used while deciding tile-pairing +
+    // thread ownership (cleared and refilled each row).
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     // Sizes an empty store for a layer of n_in x n_out real (not block) dimensions.
     void init(std::size_t n_in, std::size_t n_out) {
@@ -1876,15 +2087,73 @@ struct Block4Store8 {
     std::uint64_t row_merge_overflow_events = 0;
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
-    // disldo_forward cross-tile pairing scratch -- currently only used by
-    // the FP32 block4 store; harmless unused field here (shared collection
-    // loop in disldo_forward populates it for every VALUES_TYPE).
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_backward.batch_stride_transpose: see the FP4 store's
+    // identical fields above.
+    std::vector<float> scratch_input_T;
+    std::vector<float> scratch_output_grad_T;
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
+    // disldo_forward.column_partitioned_threading: see the FP4 store's
+    // identical fields above.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};
@@ -2598,17 +2867,73 @@ struct Block4Store32 {
     std::uint64_t row_merge_overflow_events = 0;
     std::uint64_t row_merge_overflow_bytes_dropped = 0;
 
-    std::vector<uint32_t> scratch_tile_br, scratch_tile_bc;
-    std::vector<std::size_t> scratch_tile_elem, scratch_tile_byte;
     std::vector<uint32_t> scratch_row_live_count;
     std::vector<double> scratch_row_grad;
     std::vector<std::size_t> scratch_row_ti_start;
-    // disldo_forward.fp32_block4_cross_tile_pairing: marks every SECOND
-    // tile of a same-br run in scratch_tile_br/bc (bc-ascending order) as
-    // already-consumed by its leader (the immediately preceding flat
-    // index) -- lets the forward parallel loop pair two DIFFERENT tiles
-    // sharing a block-row with zero extra indexing, just a skip-check.
-    std::vector<uint8_t> scratch_tile_is_follower;
+    // disldo_backward.batch_stride_transpose: see the FP4 store's
+    // identical fields above.
+    std::vector<float> scratch_input_T;
+    std::vector<float> scratch_output_grad_T;
+    // disldo_forward.narrow_path_persistent_buffer: the narrow
+    // path's per-thread reduction buffer (row-major below
+    // BLOCK4_BATCH_BLOCK_THRESHOLD, column-major at/above it --
+    // reused call to call for either layout, raw floats
+    // reinterpreted each time same as scratch_input_T already is
+    // between forward/backward). Was a fresh local
+    // std::vector(size, 0) constructed on EVERY call -- a real
+    // malloc plus a single-threaded zero-fill of a multi-MB
+    // region before the parallel region even opened. Now
+    // persistent + resized (no realloc once warm), and the
+    // zero-fill moved to per-thread inside the parallel region
+    // (each thread zeros only its own slice, in parallel) --
+    // see disldo_forward.batch_blocked_narrow_path in
+    // linear_disldo_forward.hpp and TODO_BATCH_BLOCKING.md.
+    std::vector<float> scratch_b4_out;
+    // disldo_forward.wide_path_persistent_buffer: same treatment
+    // as scratch_b4_out above, for the WIDE (column-partitioned)
+    // path's per-thread accumulator. Was a separate fresh
+    // std::vector per thread, allocated INSIDE the parallel region
+    // (num_cpus threads all mallocing concurrently -- allocator
+    // lock contention on top of the same per-call cost the narrow
+    // path had). Threads own DISJOINT, CONTIGUOUS column ranges
+    // that exactly tile [0,n_out), so one shared buffer sized
+    // n_out*batch (not num_cpus*n_out*batch) suffices -- each
+    // thread addresses its own sub-range via a col_lo*batch offset,
+    // zeroed per-thread inside the parallel region same as
+    // scratch_b4_out.
+    std::vector<float> scratch_thread_buf;
+    // disldo_forward.scattered_path_persistent_buffer (Phase 4, see
+    // TODO_BATCH_BLOCKING.md): same persistent-scratch treatment as
+    // scratch_b4_out/scratch_thread_buf above, for the SCATTERED
+    // (non-block4, dc.empty()==false) path's per-thread accumulator.
+    std::vector<float> scratch_scattered_out;
+    // sisldo_forward.persistent_buffers (Phase 5, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo_forward's
+    // (sisldo_ops.hpp) per-thread accumulators -- scattered branch
+    // output + optional original-contributions buffer, and the
+    // separate block4 branch's output buffer.
+    std::vector<float> scratch_sisldo_out;
+    std::vector<float> scratch_sisldo_contrib;
+    std::vector<float> scratch_sisldo_b4_out;
+    // disldo_backward_sparse_grad.persistent_buffers (Phase 7, see
+    // TODO_BATCH_BLOCKING.md): same treatment for sisldo's OWN
+    // backward (sisldo_ops.hpp) -- small, batch-independent
+    // (out_cols/rank-scaled) accumulators, same shape as
+    // disldo_backward's group_dx/group_col_grad (Phase 6), kept
+    // separate rather than reused to avoid coupling sisldo's and
+    // disldo's backward scratch lifetimes together.
+    std::vector<float> scratch_sisldo_bwd_col_grad;
+    std::vector<float> scratch_sisldo_bwd_col_grad_contrib;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad;
+    std::vector<float> scratch_sisldo_bwd_gamma_grad_contrib;
+    // disldo_forward.column_partitioned_threading: see the FP4 store's
+    // identical fields above.
+    std::vector<std::vector<Block4WorkItem>> scratch_thread_items;
+    std::vector<std::size_t> scratch_thread_bc_start;
+    std::vector<int32_t> scratch_bc_owner_table;
+    std::vector<Block4WorkItem> scratch_flat_items;
+    std::vector<uint32_t> scratch_row_bc_lookahead;
+    std::vector<std::size_t> scratch_row_elem_lookahead, scratch_row_byte_lookahead;
 
     void init(std::size_t n_in, std::size_t n_out) {
         block_layout = DeltaCSRLayout{};

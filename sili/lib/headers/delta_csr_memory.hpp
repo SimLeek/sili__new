@@ -796,26 +796,31 @@ void block4_maybe_promote(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_T
 // exactly like the scattered path already does, is the same tradeoff this
 // codebase already made once and validated (delta_csr_from_absolute/
 // expand_headroom), not a new policy invented here.
-// FP4-only for now (block4_stored_tile_len is FP4's tile-length formula;
-// FP8's Block4Store8 needs block4_stored_tile_len8 and its own pass --
+// FP4 and FP32 (DeltaCSRBiValues<float>) are both supported; FP8's
+// Block4Store8 still needs its own pass (block4_stored_tile_len8) --
 // same scoping as this session's other block4 rank-N/chain-rule work,
 // since the real toy/test model uses FP4, not FP8. A no-op for FP8 rather
 // than a silent miscompile.
 // min_slack_bytes: a floor added to EVERY row's blank space regardless of
-// blank_fraction -- default BLOCK4_TILE_SLOTS (one full FP4 dense tile) so
-// a row whose entire current content is a single empty sparse tile (1
-// byte) still gets enough room for that ONE tile to go fully dense
-// without immediately re-triggering eviction (blank_fraction alone rounds
-// to 0 extra bytes at that scale: 1 byte * 0.2 truncates to 0). Pass 0
-// (alongside blank_fraction=0) for a true tight compact -- see
-// block4_compact below, the opposite operation of this function, mirroring
-// compact()/expand_headroom()'s existing pairing on the scattered-CSR
-// side.
+// blank_fraction -- default BLOCK4_TILE_SLOTS (one full FP4 dense tile,
+// 16 bytes) so a row whose entire current content is a single empty
+// sparse tile (1 byte) still gets enough room for that ONE tile to go
+// fully dense without immediately re-triggering eviction (blank_fraction
+// alone rounds to 0 extra bytes at that scale: 1 byte * 0.2 truncates to
+// 0). This default is FP4-sized -- a caller instantiating this for FP32
+// should pass BLOCK4_TILE_SLOTS32_BYTES (128 bytes, FP32's own full-dense-
+// tile size) explicitly rather than relying on the FP4 default; load_
+// sparse_values (cpu_backend.cpp) does this. Pass 0 (alongside
+// blank_fraction=0) for a true tight compact -- see block4_compact below,
+// the opposite operation of this function, mirroring compact()/
+// expand_headroom()'s existing pairing on the scattered-CSR side.
 template <typename SIZE_TYPE, typename VALUES_TYPE = FP4BiPacked, typename COL_TYPE = uint32_t>
 void block4_expand_headroom(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& weights,
                             float blank_fraction = 0.2f,
                             std::size_t min_slack_bytes = BLOCK4_TILE_SLOTS) {
-    if constexpr (!std::is_same_v<VALUES_TYPE, FP4BiPacked>) {
+    constexpr bool is_fp4 = std::is_same_v<VALUES_TYPE, FP4BiPacked>;
+    constexpr bool is_fp32 = std::is_same_v<VALUES_TYPE, DeltaCSRBiValues<float>>;
+    if constexpr (!is_fp4 && !is_fp32) {
         (void)weights;
         (void)blank_fraction;
         (void)min_slack_bytes;
@@ -826,16 +831,21 @@ void block4_expand_headroom(SparseLinearWeightsDelta<SIZE_TYPE, VALUES_TYPE, COL
             return;
 
         // Each row's CURRENT content length -- same per-tile length accessor
-        // merge_row_workspace itself walks (block4_stored_tile_len), so this
-        // is exactly what's live today, no assumption about dense-vs-sparse.
+        // merge_row_workspace itself walks (block4_stored_tile_len/_len32),
+        // so this is exactly what's live today, no assumption about
+        // dense-vs-sparse.
         std::vector<std::size_t> row_bytes(rows, 0);
         for (std::size_t br = 0; br < rows; ++br) {
             std::size_t pos = store.tile_byte_start[br];
             const std::size_t n_bc = store.block_layout.row_nnz(br);
             std::size_t elem_pos = store.block_layout.elem_start[br];
             for (std::size_t k = 0; k < n_bc; ++k, ++elem_pos) {
-                pos +=
-                    block4_stored_tile_len(store.tile_is_sparse[elem_pos], &store.tile_data[pos]);
+                if constexpr (is_fp4)
+                    pos += block4_stored_tile_len(store.tile_is_sparse[elem_pos],
+                                                  &store.tile_data[pos]);
+                else
+                    pos += block4_stored_tile_len32(store.tile_is_sparse[elem_pos],
+                                                    &store.tile_data[pos]);
             }
             row_bytes[br] = pos - store.tile_byte_start[br];
         }
@@ -1049,6 +1059,75 @@ void block4_load_dense_fp32(
             // tile's destructor (scope end) commits scratch_ back to the
             // store, choosing dense vs sparse-packed encoding -- see
             // block4_load_dense's identical comment.
+        }
+    }
+}
+
+// FP32 counterpart to block4_load_dense_fp32 that actually produces a
+// SPARSE block4 structure: block4_load_dense_fp32 calls get_or_create()
+// for EVERY (br,bc) unconditionally, so a weight matrix with mostly-zero
+// content still allocates every tile (confirmed directly: a 10%-density
+// banded weight matrix loaded via block4_load_dense_fp32 ran forward()
+// only ~11% faster than a fully dense matrix of the same shape -- noise-
+// level, not the real ~10x a genuinely sparse structure should show).
+// This function instead checks each (br,bc) block for ANY live content
+// (nonzero weight OR importance, matching block4_count_live's own "live
+// iff weight OR importance nonzero" convention used elsewhere in this
+// file) BEFORE calling get_or_create(), so weights.block4.n_tiles() and
+// every row's BL4.row_nnz() genuinely reflect the sparse pattern instead
+// of always covering the whole layer.
+//
+// Same "FP32-only for now, no growth headroom reserved" scoping as
+// block4_load_dense_fp32 -- see its docstring. A layer loaded this way
+// that later needs new tiles via synaptogenesis would need
+// block4_expand_headroom() extended to support FP32 first (currently a
+// no-op for anything but FP4BiPacked); out of scope here, which is about
+// making a genuinely sparse STATIC structure loadable/benchmarkable, not
+// about growing one afterward.
+template <typename SIZE_TYPE, typename COL_TYPE = uint32_t>
+void block4_load_sparse_fp32(
+    SparseLinearWeightsDelta<SIZE_TYPE, DeltaCSRBiValues<float>, COL_TYPE>& weights,
+    const float* weight_values, const float* importance_values, std::size_t n_in,
+    std::size_t n_out) {
+    const uint32_t block_rows = uint32_t((n_in + BLOCK4_TILE - 1) / BLOCK4_TILE);
+    const uint32_t block_cols = uint32_t((n_out + BLOCK4_TILE - 1) / BLOCK4_TILE);
+
+    weights.block4.init(n_in, n_out);
+    const std::size_t idx_budget = std::size_t(block_rows) * block_cols * 16;
+    const std::size_t tile_budget =
+        std::size_t(block_rows) * block_cols * BLOCK4_TILE_SLOTS32_BYTES;
+    weights.block4.set_limits(idx_budget, tile_budget);
+
+    for (uint32_t br = 0; br < block_rows; ++br) {
+        const std::size_t row_lo = std::size_t(br) * BLOCK4_TILE;
+        const std::size_t row_hi = std::min(row_lo + BLOCK4_TILE, n_in);
+        for (uint32_t bc = 0; bc < block_cols; ++bc) {
+            const std::size_t col_lo = std::size_t(bc) * BLOCK4_TILE;
+            const std::size_t col_hi = std::min(col_lo + BLOCK4_TILE, n_out);
+
+            bool any_live = false;
+            for (std::size_t row = row_lo; row < row_hi && !any_live; ++row) {
+                for (std::size_t col = col_lo; col < col_hi; ++col) {
+                    const std::size_t idx = row * n_out + col;
+                    if (weight_values[idx] != 0.0f || importance_values[idx] != 0.0f) {
+                        any_live = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_live)
+                continue;
+
+            auto tile = weights.block4.get_or_create(br, bc);
+            for (std::size_t row = row_lo; row < row_hi; ++row) {
+                const uint32_t li = uint32_t(row - row_lo);
+                for (std::size_t col = col_lo; col < col_hi; ++col) {
+                    const uint32_t lj = uint32_t(col - col_lo);
+                    const std::size_t idx = row * n_out + col;
+                    tile.set_weight(li, lj, weight_values[idx]);
+                    tile.set_importance(li, lj, importance_values[idx]);
+                }
+            }
         }
     }
 }

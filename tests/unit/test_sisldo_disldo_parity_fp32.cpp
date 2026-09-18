@@ -59,6 +59,7 @@ static Weights make_weights(const std::vector<float>& dense_w, std::size_t n_in,
     w.connections = delta_csr_from_absolute<SIZE_TYPE, VT, COL_TYPE>(
         ptrs, idx, wv, imp, n_in, n_out, n_in * n_out * 2, n_in * n_out * 2);
     w.out_degree.assign(n_out, SIZE_TYPE(n_in));
+    w.set_scale_rank_max(1); // fp32 defaults this cap to 0, deliberately opting in here
     w.set_scale_rank(1);
     w.output_scale_is_trainable = true;
     return w;
@@ -184,6 +185,7 @@ static Weights make_weights_block4(const std::vector<float>& dense_w, std::size_
     block4_load_dense_fp32<SIZE_TYPE, COL_TYPE>(w, dense_w.data(), importance_values.data(), n_in,
                                                 n_out);
     w.out_degree.assign(n_out, SIZE_TYPE(n_in));
+    w.set_scale_rank_max(1); // fp32 defaults this cap to 0, deliberately opting in here
     w.set_scale_rank(1);
     w.output_scale_is_trainable = true;
     return w;

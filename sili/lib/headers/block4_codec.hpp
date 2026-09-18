@@ -229,6 +229,11 @@ template <typename SIZE_TYPE, typename VALUES_TYPE, typename COL_TYPE> struct Bl
     bool lr_per_row_nnz;
     const value_type* gamma_k_arr;  // [rank]
     const uint32_t* row_live_count; // [n_in]
+    // Pre-transposed input/output_grad, avoiding batch-major stride in the
+    // per-row/tile inner loop -- see disldo_backward.batch_stride_transpose
+    // in docs/research/linear_disldo.rst.
+    const value_type* input_T;       // [n_in, batch]
+    const value_type* output_grad_T; // [ceil(n_out/BLOCK4_TILE), batch, BLOCK4_TILE], zero-padded
 };
 
 // Per-thread mutable output accumulators -- replaces the mcol_at/mrow_at/
