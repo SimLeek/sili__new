@@ -1164,3 +1164,40 @@ exercised the optimizer formula at all). Plus C++-level
 ``test_didldo_kernel.cpp``/``test_sidldo_kernel.cpp`` reference-formula
 fixes -- the old vanilla-RMSprop reference would have hidden this
 exact bug class since it never modeled ``contrib`` at all.
+
+.. _disldo_layer_forward.last_grad_norm_sq_polyak_hook:
+
+``_last_grad_norm_sq``: per-layer gradient-norm hook for Polyak-style LR
+-----------------------------------------------------------------------------------
+
+*ID:* ``disldo_layer_forward.last_grad_norm_sq_polyak_hook``
+
+2026-09-18, ``sili_peridot``'s dense-vs-sparse-mqar-300k investigation
+needed a per-LAYER (not per-network) gradient-norm signal to drive a
+per-layer Stochastic-Polyak-Step-size-style dynamic learning rate
+(``lr_layer = (loss - f*) / grad_norm_sq_layer``), without exposing raw
+per-synapse gradient detail to the caller -- direct instruction:
+per-neuron detail would be "too much even if we did want to expose it."
+``DISLDOLayer32._bwd()`` now computes ``self._last_grad_norm_sq =
+sum(dy**2)`` as the very first thing inside the grad-available branch,
+ahead of every sparsification branch (``dy_gate_mask``/``dy_r_target``/
+``dy_sparsity_p``/dense) -- same value, same cost (``dy`` is already a
+realized numpy array at that point regardless of path), populated
+identically no matter which backward-axis mechanism is active this
+step. ``None`` until the first backward call.
+
+Scoped to ``DISLDOLayer32`` only (matches the Arm C
+``dy_gate_mask`` hook's own scoping precedent) -- not yet ported to
+``DISLDOLayer``/fp4 or ``DIDLDOLayerV``.
+
+**TODO, not yet built**: a PER-NEURON (per-row of ``dy2d``, i.e.
+``(dy2d**2).sum(axis=1)`` instead of a single scalar) version of this
+same hook. Direct reasoning for why this would matter: structural
+sparsity (``max_weights``) and gradient sparsity (nucleus top-k,
+``dy_gate_mask``) both act ROW-WISE already -- a layer-wide scalar
+smears together neurons with very different realized fan-in/update
+frequency this step, which a per-neuron Polyak lr would naturally
+adapt to and a per-layer one can't. Deferred: real extra work (a
+per-row Polyak controller, not just a per-row grad-norm array), and
+per-layer is the first thing to try -- pick this up if per-layer
+doesn't adapt well, or as its own later test.

@@ -1000,6 +1000,7 @@ class DISLDOLayer32(_SparseLayerBase):
         if dense:
             max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
+        self._last_grad_norm_sq: float | None = None
         if dense:
             self._max_row_weights = _preseed_dense_fp32(self._c, in_features, out_features, rng)
         else:
@@ -1060,6 +1061,10 @@ class DISLDOLayer32(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                # See docs/research/sparse_rnn.rst:disldo_layer_forward.last_grad_norm_sq_polyak_hook
+                # -- universal hook point, ahead of the sparsification branches below, so it's
+                # populated the same way regardless of which (if any) is active.
+                self._last_grad_norm_sq = float(np.sum(np.square(dy, dtype=np.float64)))
                 extra = {}
                 if min_decay_frac is not None:
                     extra["min_decay_frac"] = min_decay_frac
