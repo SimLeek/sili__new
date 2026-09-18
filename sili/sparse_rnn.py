@@ -562,6 +562,22 @@ def _nucleus_top_k_csr(
     return ptrs, indices, values
 
 
+def _gated_columns_to_csr(dy2d: np.ndarray, gate_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build (ptrs, indices, values) selecting the SAME fixed set of
+    columns (where gate_mask is True) for every row, regardless of
+    magnitude -- unlike _nucleus_top_k_csr's per-row variable-k
+    selection, this is an externally-determined, shared column mask
+    (e.g. a per-neuron time-based trainability gate, not a measured
+    signal). gate_mask: bool array, shape [cols]."""
+    rows, _cols = dy2d.shape
+    sel_cols = np.nonzero(gate_mask)[0].astype(np.int32)
+    k = len(sel_cols)
+    ptrs = (np.arange(rows + 1) * k).astype(np.int32)
+    indices = np.tile(sel_cols, rows)
+    values = dy2d[:, sel_cols].astype(np.float32).flatten()
+    return ptrs, indices, values
+
+
 def _record_grad_selection_stats(layer, dy2d: np.ndarray, dp: np.ndarray, di: np.ndarray, dv: np.ndarray) -> None:
     """Real per-call GRADIENT-axis R/k stats for a dy_r_target nucleus
     selection, mirroring sili_peridot's own x-axis
@@ -1004,7 +1020,14 @@ class DISLDOLayer32(_SparseLayerBase):
         dy_r_target=None,
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
+        dy_gate_mask: np.ndarray | None = None,
     ) -> Tensor:
+        # dy_gate_mask: an externally-determined, shared (same for every
+        # row this call) boolean column mask -- e.g. a per-neuron time-
+        # based trainability gate, not a measured-magnitude selection.
+        # Takes priority over dy_r_target/dy_sparsity_p when given (see
+        # _bwd below). See _gated_columns_to_csr's own docstring.
+        #
         # CSR-typed input / dy_sparsity_p: mirrors DISLDOLayer.forward's
         # x.is_csr dispatch -- DISLDOLayerV uses the same DeltaCSRBiValues
         # storage family, so forward_sparse/backward_sparse unify dense+
@@ -1046,7 +1069,22 @@ class DISLDOLayer32(_SparseLayerBase):
                     extra["max_ci"] = max_ci
                 if scale_invariant:
                     extra["scale_invariant"] = True
-                if dy_r_target is not None:
+                if dy_gate_mask is not None:
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _gated_columns_to_csr(dy2d, dy_gate_mask)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **extra,
+                    )
+                elif dy_r_target is not None:
                     # See DISLDOLayer.forward's own dy_r_target comment.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
