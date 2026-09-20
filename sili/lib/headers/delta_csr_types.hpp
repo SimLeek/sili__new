@@ -491,6 +491,54 @@ AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t
     return out;
 }
 
+// Flat-array sibling of apply_amortized_decay_stats above, for genuinely
+// dense storage (DenseLinearWeights -- DIDLDO/SIDLDO's shared `w`/`ci`
+// vectors, no CSR/block4 packing, no separate weight+importance pairing
+// per index needed since caller passes exactly the ONE vector to decay).
+// Same amortized/chunked-cursor shape, same AmortizedDecayStats return
+// type, for interface consistency with the CSR/block4 versions.
+template <typename V>
+AmortizedDecayStats apply_amortized_flat_decay_stats(std::vector<V>& values, std::size_t& cursor,
+                                                     double& sum_abs, double& sum_sq,
+                                                     double& max_abs, std::size_t& n,
+                                                     std::size_t chunk_size, V decay_factor) {
+    const std::size_t total = values.size();
+    bool cycle_complete = false;
+    if (total > 0) {
+        for (std::size_t i = 0; i < chunk_size; ++i) {
+            if (cursor >= total)
+                cursor = 0;
+            values[cursor] = static_cast<V>(values[cursor] * decay_factor);
+            const double av = std::abs(static_cast<double>(values[cursor]));
+            sum_abs += av;
+            sum_sq += av * av;
+            if (av > max_abs)
+                max_abs = av;
+            ++n;
+            ++cursor;
+            if (cursor >= total) {
+                cycle_complete = true;
+                cursor = 0;
+            }
+        }
+    } else {
+        cycle_complete = true;
+    }
+    AmortizedDecayStats out;
+    out.cycle_complete = cycle_complete;
+    if (cycle_complete && n > 0) {
+        out.mean_abs = sum_abs / static_cast<double>(n);
+        out.rms = std::sqrt(sum_sq / static_cast<double>(n));
+        out.max_abs = max_abs;
+        out.n = n;
+        sum_abs = 0.0;
+        sum_sq = 0.0;
+        max_abs = 0.0;
+        n = 0;
+    }
+    return out;
+}
+
 // ── Scale-update policies ─────────────────────────────────────────────────────
 // Swappable in-place optimizer for value_scale/output_scale (disldo_backward's
 // scattered path, linear_disldo.hpp). Template parameter, not a runtime flag.

@@ -1874,6 +1874,22 @@ class DIDLDOLayerV {
     SidldoBackwardScratch bwd_scratch;
     int num_cpus;
 
+    // Amortized decoupled decay + stats, flat-array version -- see
+    // apply_amortized_flat_decay_stats's own comment (delta_csr_types.hpp).
+    // Shared by DIDLDO and SIDLDO since both dispatch through this one
+    // class over the same DenseLinearWeights. Own separate cursor/stats
+    // per channel (weight vs importance) so they can run independently.
+    std::size_t _decay_cursor = 0;
+    double _decay_sum_abs = 0.0;
+    double _decay_sum_sq = 0.0;
+    double _decay_max_abs = 0.0;
+    std::size_t _decay_n = 0;
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
+
     DIDLDOLayerV(S n_inputs, S n_outputs, int cpus = 4) : num_cpus(cpus) {
         weights.resize(std::size_t(n_inputs), std::size_t(n_outputs));
     }
@@ -1935,6 +1951,44 @@ class DIDLDOLayerV {
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // Amortized decoupled decay + stats -- flat-array version, see
+    // apply_amortized_flat_decay_stats's own comment (delta_csr_types.hpp).
+    // Same interface (chunk_size/decay_factor -> stats dict) as
+    // DISLDOLayerV's apply_amortized_l2_decay, for consistency across
+    // storage types.
+    py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_flat_decay_stats<V>(
+            weights.w, _decay_cursor, _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity), decays `ci` (this
+    // storage's own RMSprop-style accumulator, DenseLinearWeights' name for
+    // what DISLDO/SISLDO call "importance") instead of `w`. Own separate
+    // cursor/stats from the weight-decay path above. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_flat_decay_stats<V>(
+            weights.ci, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
     }
 
     // ── real-time engine dispatch ───────────────────────────────────────────
@@ -4407,6 +4461,10 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("apply_amortized_l2_decay", &DIDLDOLayerV::apply_amortized_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay", &DIDLDOLayerV::apply_amortized_importance_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("forward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
                  py::array_t<DIDLDOLayerV::V>)>(&DIDLDOLayerV::forward),

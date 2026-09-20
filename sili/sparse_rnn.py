@@ -1195,6 +1195,24 @@ class DIDLDOLayer32(Module):
     def weights(self) -> np.ndarray:
         return self._c.weights_vals
 
+    def apply_amortized_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """Passthrough to the real C++ apply_amortized_l2_decay (amortized
+        decoupled weight decay + rolling health stats via a persistent
+        per-layer cursor), flat-array version over DenseLinearWeights'
+        `w`. decay_factor is derived by the caller from a target half-life
+        and this layer's own element count."""
+        return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
+
+    def apply_amortized_importance_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting
+        hypothesis (critical-learning-periods/loss-of-plasticity
+        literature). Same amortized/chunked mechanism as
+        apply_amortized_l2_decay, own separate cursor, decays `ci`
+        (DenseLinearWeights' RMSprop-style accumulator, this storage's
+        analog of DISLDO/SISLDO's "importance") instead of `w`. May be
+        removed if testing doesn't show benefit."""
+        return self._c.apply_amortized_importance_decay(chunk_size, decay_factor)
+
     def __init__(
         self,
         in_features: int,
