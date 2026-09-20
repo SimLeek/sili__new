@@ -1018,6 +1018,32 @@ class DISLDOLayer32(_SparseLayerBase):
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
 
+    def apply_amortized_block4_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- block4-storage counterpart to
+        apply_amortized_l2_decay (which only covers weights.connections,
+        the scattered CSR side). synaptogenesis can promote/demote a
+        layer's synapses into block4 packed-tile storage (task #350); a
+        complete decay pass needs both this and the inherited scattered
+        method, since a single layer's synapses can be split across both
+        simultaneously. Own separate cursor
+        (sili/lib/headers/block4_decay_TODO_DELETE.hpp), touches whole
+        tiles per chunk rather than individual synapses. Only bound on
+        DISLDOLayerV (fp32); not applicable to FP4/FP8 layer classes.
+        May be removed if testing doesn't show benefit."""
+        return self._c.apply_amortized_block4_l2_decay(chunk_size, decay_factor)
+
+    def apply_amortized_block4_importance_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- block4-storage counterpart to
+        apply_amortized_importance_decay, same loss-of-plasticity
+        motivation (see that method's docstring and
+        docs/research/delta_csr_types.rst:amortized_decay.chunked_cursor).
+        Decays IMPORTANCE instead of weight for cells living in block4
+        packed-tile storage; pair with apply_amortized_importance_decay
+        (inherited, scattered-only) for full layer coverage. Own separate
+        cursor. Only bound on DISLDOLayerV (fp32). May be removed if
+        testing doesn't show benefit."""
+        return self._c.apply_amortized_block4_importance_decay(chunk_size, decay_factor)
+
     def forward(
         self,
         x,

@@ -11,6 +11,7 @@
 
 #include "linear_sisldo.hpp"
 #include "linear_disldo.hpp"
+#include "block4_decay_TODO_DELETE.hpp"
 #include "engine_select.hpp"
 #ifdef SILI_HAVE_MKL
 #include "linear_didldo.hpp"
@@ -1393,6 +1394,21 @@ class DISLDOLayerV {
     double _importance_decay_sum_sq = 0.0;
     double _importance_decay_max_abs = 0.0;
     std::size_t _importance_decay_n = 0;
+    // block4 decay cursor/stats -- see block4_decay_TODO_DELETE.hpp.
+    // SEPARATE from the scattered ones above: a layer's synapses can be
+    // split across BOTH scattered and block4 storage simultaneously
+    // (synaptogenesis promotes/demotes between them), so covering only
+    // one would silently miss the other.
+    Block4DecayCursor _block4_decay_cursor;
+    double _block4_decay_sum_abs = 0.0;
+    double _block4_decay_sum_sq = 0.0;
+    double _block4_decay_max_abs = 0.0;
+    std::size_t _block4_decay_n = 0;
+    Block4DecayCursor _block4_importance_decay_cursor;
+    double _block4_importance_decay_sum_abs = 0.0;
+    double _block4_importance_decay_sum_sq = 0.0;
+    double _block4_importance_decay_max_abs = 0.0;
+    std::size_t _block4_importance_decay_n = 0;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1706,6 +1722,58 @@ class DISLDOLayerV {
         out["max_abs"] = stats.max_abs;
         out["n"] = stats.n;
         out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // block4-storage counterparts of the two methods above -- see
+    // block4_decay_TODO_DELETE.hpp. fp32 (VT=DeltaCSRBiValues<float>)
+    // only; a no-op (all-zero stats, cycle_complete=true) for FP4/FP8
+    // instantiations of this same template, since Block4DecayCursor/
+    // apply_amortized_block4_decay_stats are fp32-specific
+    // (Block4Store32/Block4TileHandle32) and this class is generic over
+    // VT. EXPERIMENTAL, same as the scattered versions -- may be removed.
+    py::dict apply_amortized_block4_l2_decay(S chunk_size, V decay_factor) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_decay_stats(
+                weights.block4, _block4_decay_cursor, _block4_decay_sum_abs, _block4_decay_sum_sq,
+                _block4_decay_max_abs, _block4_decay_n, static_cast<std::size_t>(chunk_size),
+                decay_factor, false);
+            out["mean_abs"] = stats.mean_abs;
+            out["rms"] = stats.rms;
+            out["max_abs"] = stats.max_abs;
+            out["n"] = stats.n;
+            out["cycle_complete"] = stats.cycle_complete;
+        } else {
+            out["mean_abs"] = 0.0;
+            out["rms"] = 0.0;
+            out["max_abs"] = 0.0;
+            out["n"] = std::size_t(0);
+            out["cycle_complete"] = true;
+        }
+        return out;
+    }
+
+    py::dict apply_amortized_block4_importance_decay(S chunk_size, V decay_factor) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_decay_stats(
+                weights.block4, _block4_importance_decay_cursor, _block4_importance_decay_sum_abs,
+                _block4_importance_decay_sum_sq, _block4_importance_decay_max_abs,
+                _block4_importance_decay_n, static_cast<std::size_t>(chunk_size), decay_factor,
+                true);
+            out["mean_abs"] = stats.mean_abs;
+            out["rms"] = stats.rms;
+            out["max_abs"] = stats.max_abs;
+            out["n"] = stats.n;
+            out["cycle_complete"] = stats.cycle_complete;
+        } else {
+            out["mean_abs"] = 0.0;
+            out["rms"] = 0.0;
+            out["max_abs"] = 0.0;
+            out["n"] = std::size_t(0);
+            out["cycle_complete"] = true;
+        }
         return out;
     }
 
@@ -4389,6 +4457,11 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("chunk_size"), py::arg("decay_factor"))
         .def("apply_amortized_importance_decay", &DISLDOLayerV::apply_amortized_importance_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_block4_l2_decay", &DISLDOLayerV::apply_amortized_block4_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_block4_importance_decay",
+             &DISLDOLayerV::apply_amortized_block4_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))

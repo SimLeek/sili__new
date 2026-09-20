@@ -108,6 +108,44 @@ nothing in that case, but callers should gate on ``cycle_complete`` rather
 than reading the numeric fields, which are stale/undefined until it flips
 true.
 
+**Three storage types, three functions, added 2026-09-20**: this
+project's synapses live in three genuinely distinct storage layouts, and
+a given layer can straddle more than one simultaneously (synaptogenesis
+promotes/demotes between scattered and block4). ``apply_amortized_decay_stats``
+above covers scattered CSR (``weights.connections.values``, generic over
+``VALUES_TYPE`` via ``ValueAccessor`` -- fp32/FP4/FP8 all share it).
+``apply_amortized_flat_decay_stats`` (same file, same chunked-cursor
+shape and ``AmortizedDecayStats`` return type) is the dense/SIDLDO-DIDLDO
+counterpart: ``DenseLinearWeights`` has no packing at all, just flat
+``std::vector<float> w``/``ci``, so it takes a plain ``std::vector<V>&``
+and decays it directly -- one call for ``w`` (weight), a second for
+``ci`` (importance), each with its own cursor/accumulator state, mirroring
+the weight/importance separation the scattered version gets via
+``decay_importance``. ``apply_amortized_block4_decay_stats`` (a
+DELIBERATELY SEPARATE file, ``sili/lib/headers/block4_decay_TODO_DELETE.hpp``
+-- see that file's own header comment) is the block4 packed-tile
+counterpart: touches whole TILES per chunk (not individual synapses,
+since a tile is block4's natural atomic unit), builds entirely on
+``Block4TileHandle32``'s existing safe per-cell accessors rather than
+re-deriving the sparse/dense tile-packing logic itself. That file is a
+temporary copy of the traversal pattern rather than a refactor of the
+real block4 forward/backward kernels into something pluggable, per
+direct instruction ("I think the block4 should probably have a copy of
+the main block4 kernel... and be in its own file... 'todo: delete me
+later'") -- to be deleted once those kernels are decomposed into a
+reusable tile-walk + pluggable per-cell callback.
+
+Tested in ``tests/unit/test_amortized_decay_stats.cpp`` (scattered +
+flat, including ``decay_importance`` isolation for fp32/FP4/FP8 and flat
+weight/importance channel independence) and
+``tests/unit/test_block4_amortized_decay.cpp`` (block4: weight/importance
+isolation, sparse-tile format stability under repeated decay, dense-tile
+correctness, cursor row-skip/wrap across an empty row, the
+live-iff-weight-or-importance-nonzero definition, and BIT-EQUIVALENCE
+against the scattered path for the same logical values -- decay is a
+per-cell ``v * decay_factor`` multiply with no cross-cell reduction, so
+the two storage formats must agree exactly, not just approximately).
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

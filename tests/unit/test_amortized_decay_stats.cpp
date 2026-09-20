@@ -130,6 +130,95 @@ static void test_fp32_multi_cycle_half_life() {
     }
 }
 
+static void test_fp32_decay_importance_isolation() {
+    // decay_importance=true (EXPERIMENTAL, 2026-09-20 loss-of-plasticity
+    // mechanism): must decay importance only, leave weight byte-identical,
+    // and its own stats (mean_abs/rms/max_abs) must reflect the DECAYED
+    // IMPORTANCE values, not the untouched weights.
+    using VT = DeltaCSRBiValues<float>;
+    VT values;
+    values.weights = {1.0f, 2.0f, 3.0f};
+    values.importance = {10.0f, 20.0f, 30.0f};
+    DecayState st;
+    auto r = apply_amortized_decay_stats<VT, float>(values, st.cursor, st.sum_abs, st.sum_sq,
+                                                    st.max_abs, st.n, 3, 0.5f,
+                                                    /*decay_importance=*/true);
+    CHECK(r.cycle_complete, "fp32 decay_importance: full pass should complete a cycle");
+    CHECK(values.weights[0] == 1.0f && values.weights[1] == 2.0f && values.weights[2] == 3.0f,
+          "fp32 decay_importance=true: weights must be byte-identical to input, untouched");
+    CHECK(values.importance[0] == 5.0f && values.importance[1] == 10.0f &&
+              values.importance[2] == 15.0f,
+          "fp32 decay_importance=true: importance should have decayed by 0.5 each");
+    const double expect_mean = (5.0 + 10.0 + 15.0) / 3.0;
+    CHECK(std::abs(r.mean_abs - expect_mean) < 1e-6,
+          "fp32 decay_importance: mean_abs should reflect decayed IMPORTANCE (%.6f), got %.6f",
+          expect_mean, r.mean_abs);
+    CHECK(std::abs(r.max_abs - 15.0) < 1e-6,
+          "fp32 decay_importance: max_abs should be 15.0, got %.6f", r.max_abs);
+}
+
+static void test_fp32_decay_importance_default_false_unchanged() {
+    // Default-argument sanity: omitting decay_importance must reproduce
+    // the exact original weight-only behavior (no accidental behavior
+    // change from adding the new parameter).
+    using VT = DeltaCSRBiValues<float>;
+    VT values;
+    values.weights = {2.0f};
+    values.importance = {6.0f};
+    DecayState st;
+    auto r = apply_amortized_decay_stats<VT, float>(values, st.cursor, st.sum_abs, st.sum_sq,
+                                                    st.max_abs, st.n, 1, 0.5f);
+    CHECK(r.cycle_complete, "single-element cycle should complete");
+    CHECK(values.weights[0] == 1.0f, "default call should still decay weight to 1.0, got %f",
+          values.weights[0]);
+    CHECK(values.importance[0] == 6.0f, "default call must leave importance untouched");
+}
+
+// ── apply_amortized_flat_decay_stats (DenseLinearWeights' w/ci) ────────────
+
+static void test_flat_decay_basic_and_cycle() {
+    std::vector<float> w = {1.0f, 2.0f, 3.0f, 4.0f};
+    DecayState st;
+    auto r1 = apply_amortized_flat_decay_stats<float>(w, st.cursor, st.sum_abs, st.sum_sq,
+                                                      st.max_abs, st.n, 2, 0.5f);
+    CHECK(!r1.cycle_complete, "flat: 2/4 touched should not complete a cycle");
+    CHECK(w[0] == 0.5f && w[1] == 1.0f, "flat: first 2 elements should have decayed");
+    CHECK(w[2] == 3.0f && w[3] == 4.0f, "flat: untouched elements must be unchanged so far");
+
+    auto r2 = apply_amortized_flat_decay_stats<float>(w, st.cursor, st.sum_abs, st.sum_sq,
+                                                      st.max_abs, st.n, 2, 0.5f);
+    CHECK(r2.cycle_complete, "flat: 2+2=4 should complete the cycle");
+    CHECK(w[2] == 1.5f && w[3] == 2.0f, "flat: remaining elements should have decayed");
+    const double expect_mean = (0.5 + 1.0 + 1.5 + 2.0) / 4.0;
+    CHECK(std::abs(r2.mean_abs - expect_mean) < 1e-6, "flat: mean_abs=%.6f expected %.6f",
+          r2.mean_abs, expect_mean);
+    CHECK(r2.n == 4, "flat: n should be 4, got %zu", r2.n);
+}
+
+static void test_flat_decay_empty() {
+    std::vector<float> w; // empty -- e.g. an unallocated ci vector
+    DecayState st;
+    auto r = apply_amortized_flat_decay_stats<float>(w, st.cursor, st.sum_abs, st.sum_sq,
+                                                     st.max_abs, st.n, 4, 0.5f);
+    CHECK(r.cycle_complete, "flat: empty vector should report cycle_complete=true immediately");
+    CHECK(r.n == 0, "flat: empty vector should report n=0");
+}
+
+static void test_flat_decay_independent_from_weights_channel() {
+    // Simulates DIDLDOLayerV's real usage: separate cursor/accumulator
+    // state per channel (w vs ci), each its own apply_amortized_flat_decay_stats
+    // call on its own vector -- verifies decaying one vector never touches
+    // the other's storage (they're just two independent std::vector<float>,
+    // but this is the actual invariant the C++ layer methods rely on).
+    std::vector<float> w = {4.0f, 4.0f};
+    std::vector<float> ci = {8.0f, 8.0f};
+    DecayState w_st, ci_st;
+    apply_amortized_flat_decay_stats<float>(w, w_st.cursor, w_st.sum_abs, w_st.sum_sq, w_st.max_abs,
+                                            w_st.n, 2, 0.5f);
+    CHECK(w[0] == 2.0f && w[1] == 2.0f, "flat: w channel should have decayed");
+    CHECK(ci[0] == 8.0f && ci[1] == 8.0f, "flat: ci channel must be untouched by decaying w");
+}
+
 // ── FP4 (FP4BiPacked) ───────────────────────────────────────────────────────
 
 static void test_fp4_decay_and_stats() {
@@ -186,6 +275,27 @@ static void test_fp4_never_zero_after_decay() {
           "fp4: decayed weight[1] must never hit exact 0");
 }
 
+static void test_fp4_decay_importance_isolation() {
+    using VT = FP4BiPacked;
+    VT values;
+    values.resize(2);
+    values.set_live(0, 1.0f, 1.0f);
+    values.set_live(1, -1.0f, 0.5f);
+    DecayState st;
+    auto r = apply_amortized_decay_stats<VT, float>(values, st.cursor, st.sum_abs, st.sum_sq,
+                                                    st.max_abs, st.n, 2, 0.5f,
+                                                    /*decay_importance=*/true);
+    CHECK(r.cycle_complete, "fp4 decay_importance: full pass should complete");
+    // FP4 quantizes both channels through the same table -- check via the
+    // accessor (round-trip through quantization) same as the weight test.
+    CHECK(std::abs(ValueAccessor<VT>::get_w(values, 0) - 1.0f) < 0.2f,
+          "fp4 decay_importance=true: weight[0] must be untouched, got %.4f",
+          ValueAccessor<VT>::get_w(values, 0));
+    CHECK(std::abs(ValueAccessor<VT>::get_imp(values, 0) - 0.5f) < 0.2f,
+          "fp4 decay_importance=true: importance[0] should have decayed toward 0.5, got %.4f",
+          ValueAccessor<VT>::get_imp(values, 0));
+}
+
 // ── FP8 (FP8BiValues) ───────────────────────────────────────────────────────
 
 static void test_fp8_decay_and_stats() {
@@ -216,13 +326,43 @@ static void test_fp8_decay_and_stats() {
     CHECK(r.max_abs > 1.9 && r.max_abs < 2.1, "fp8: max_abs should be ~2.0, got %.4f", r.max_abs);
 }
 
+static void test_fp8_decay_importance_isolation() {
+    using VT = FP8BiValues;
+    VT values;
+    values.weights.resize(2);
+    values.importance.resize(2);
+    ValueAccessor<VT>::set_live(values, 0, 4.0f, 8.0f);
+    ValueAccessor<VT>::set_live(values, 1, -4.0f, 2.0f);
+    DecayState st;
+    auto r = apply_amortized_decay_stats<VT, float>(values, st.cursor, st.sum_abs, st.sum_sq,
+                                                    st.max_abs, st.n, 2, 0.5f,
+                                                    /*decay_importance=*/true);
+    CHECK(r.cycle_complete, "fp8 decay_importance: full pass should complete");
+    CHECK(std::abs(ValueAccessor<VT>::get_w(values, 0) - 4.0f) < 1e-3f,
+          "fp8 decay_importance=true: weight[0] must be untouched, got %.4f",
+          ValueAccessor<VT>::get_w(values, 0));
+    CHECK(std::abs(ValueAccessor<VT>::get_imp(values, 0) - 4.0f) < 1e-3f,
+          "fp8 decay_importance=true: importance[0] should decay to 4.0, got %.4f",
+          ValueAccessor<VT>::get_imp(values, 0));
+    CHECK(std::abs(ValueAccessor<VT>::get_imp(values, 1) - 1.0f) < 1e-3f,
+          "fp8 decay_importance=true: importance[1] should decay to 1.0, got %.4f",
+          ValueAccessor<VT>::get_imp(values, 1));
+}
+
 int main() {
     test_fp32_basic_decay_and_cycle();
     test_fp32_empty_layer();
     test_fp32_multi_cycle_half_life();
+    test_fp32_decay_importance_isolation();
+    test_fp32_decay_importance_default_false_unchanged();
+    test_flat_decay_basic_and_cycle();
+    test_flat_decay_empty();
+    test_flat_decay_independent_from_weights_channel();
     test_fp4_decay_and_stats();
     test_fp4_never_zero_after_decay();
+    test_fp4_decay_importance_isolation();
     test_fp8_decay_and_stats();
+    test_fp8_decay_importance_isolation();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

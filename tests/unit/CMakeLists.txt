@@ -235,6 +235,7 @@ set(SILI_STANDALONE_TESTS
     test_top_k_csr_small_array_fast_path
     test_aqrs_grad_norm_dy_density
     test_amortized_decay_stats
+    test_block4_amortized_decay
     test_top_k_csr_nucleus
     test_cpu_topology
     test_dequant_equality_fp4_vs_fp8
