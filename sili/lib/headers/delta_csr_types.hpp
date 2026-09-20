@@ -435,11 +435,20 @@ struct AmortizedDecayStats {
     bool cycle_complete = false;
 };
 
+// decay_importance: EXPERIMENTAL, added 2026-09-20 for the loss-adjusted
+// forgetting hypothesis (critical-learning-periods/loss-of-plasticity
+// literature -- an over-large importance/second-moment accumulator can
+// "freeze" a synapse against further updates; decaying it selectively may
+// restore plasticity after a curriculum-transition stall). false (default):
+// decays weight only, byte-identical to the original behavior. true: decays
+// importance only, weight passed through unchanged. May be removed if
+// testing doesn't show benefit -- see docs/research/delta_csr_types.rst:
+// amortized_decay.chunked_cursor.
 template <typename VALUES_TYPE, typename V>
 AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t& cursor,
                                                 double& sum_abs, double& sum_sq, double& max_abs,
                                                 std::size_t& n, std::size_t chunk_size,
-                                                V decay_factor) {
+                                                V decay_factor, bool decay_importance = false) {
     using VA = ValueAccessor<VALUES_TYPE>;
     const std::size_t total = VA::size(values);
     bool cycle_complete = false;
@@ -449,9 +458,10 @@ AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t
                 cursor = 0;
             const V w = static_cast<V>(VA::get_w(values, cursor));
             const V imp = static_cast<V>(VA::get_imp(values, cursor));
-            const V new_w = static_cast<V>(w * decay_factor);
-            VA::set_live(values, cursor, new_w, imp);
-            const double aw = std::abs(static_cast<double>(new_w));
+            const V new_w = decay_importance ? w : static_cast<V>(w * decay_factor);
+            const V new_imp = decay_importance ? static_cast<V>(imp * decay_factor) : imp;
+            VA::set_live(values, cursor, new_w, new_imp);
+            const double aw = std::abs(static_cast<double>(decay_importance ? new_imp : new_w));
             sum_abs += aw;
             sum_sq += aw * aw;
             if (aw > max_abs)

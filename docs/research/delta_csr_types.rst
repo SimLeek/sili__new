@@ -71,16 +71,34 @@ job to derive (Python side): ``2^(-cycle_length/H)`` for a chosen half-life
 since a given synapse is only actually touched once per ``cycle_length``
 steps.
 
-Decays the WEIGHT only, via ``get_imp``+``set_live`` (importance is a
-significance signal, not a magnitude to shrink), preserving each
-``VALUES_TYPE``'s own never-0 live-quantize invariant where one exists
-(FP4/FP8) and passing through unchanged where it's meaningless (fp32). For
-FP4/FP8 this decay is lower marginal value than for fp32: raw codes are
-already magnitude-bounded by a small fixed decode table and can't blow up
-the way a plain float can -- the real FP4/FP8 blow-up path is the SCALE
-vector (covered by the scale policies' own NaN/Inf guards below), not the
-per-synapse code. The running stats remain useful regardless, for uniform
-health monitoring across all three storage types.
+Decays the WEIGHT only by default, via ``get_imp``+``set_live`` (importance
+is a significance signal, not a magnitude to shrink -- the original
+rationale here), preserving each ``VALUES_TYPE``'s own never-0 live-quantize
+invariant where one exists (FP4/FP8) and passing through unchanged where
+it's meaningless (fp32). For FP4/FP8 this decay is lower marginal value than
+for fp32: raw codes are already magnitude-bounded by a small fixed decode
+table and can't blow up the way a plain float can -- the real FP4/FP8
+blow-up path is the SCALE vector (covered by the scale policies' own
+NaN/Inf guards below), not the per-synapse code. The running stats remain
+useful regardless, for uniform health monitoring across all three storage
+types.
+
+**EXPERIMENTAL, added 2026-09-20**: ``decay_importance=true`` flips which
+channel gets decayed -- importance instead of weight, weight passed
+through unchanged. Motivation: critical-learning-periods/loss-of-plasticity
+research (Achille et al. 2019; Dohare et al., *Nature* 2024) finds
+adaptive optimizers' own accumulated second-moment state can "freeze"
+heavily-used units against further updates, and that decaying that state
+is one candidate mitigation (though not sufficient alone in at least one
+study -- full unit resets did better). This project's per-synapse
+``importance`` plays the same role as an RMSprop/Adam second-moment
+accumulator (see ``project_dense_vs_sparse_mqar_confusion_matrix``/
+``feedback_importance_is_already_the_optimizer`` in sili_peridot's own
+memory) -- testing whether selectively decaying it, triggered by
+sustained-high-loss (a training-stall signal) rather than a fixed
+schedule, restores plasticity after a curriculum-transition stall. Own
+separate cursor/stats from the weight-decay path so both can run
+independently. May be removed if testing doesn't show benefit.
 
 Stats fields (``mean_abs``/``rms``/``max_abs``/``n``) are only meaningful
 for a just-FINISHED cycle -- accumulators reset after being read via the

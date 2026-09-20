@@ -417,6 +417,15 @@ class SparseLinearLayerImpl {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
 
     SparseLinearLayerImpl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -808,6 +817,25 @@ class SparseLinearLayerImpl {
         auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
             weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
             _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
         py::dict out;
         out["mean_abs"] = stats.mean_abs;
         out["rms"] = stats.rms;
@@ -1356,6 +1384,15 @@ class DISLDOLayerV {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1644,6 +1681,25 @@ class DISLDOLayerV {
         auto stats = apply_amortized_decay_stats<VT, V>(
             weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
             _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<VT, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
         py::dict out;
         out["mean_abs"] = stats.mean_abs;
         out["rms"] = stats.rms;
@@ -2056,6 +2112,15 @@ class SparseLinearLayer8Impl {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
 
     SparseLinearLayer8Impl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -2324,6 +2389,25 @@ class SparseLinearLayer8Impl {
         auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
             weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
             _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
         py::dict out;
         out["mean_abs"] = stats.mean_abs;
         out["rms"] = stats.rms;
@@ -2664,6 +2748,9 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay",
+             &SparseLinearLayer::apply_amortized_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
         .def("build_probes", &SparseLinearLayer::build_probes, py::arg("k"),
              py::arg("per_row") = false)
         .def("synap_row_step", &SparseLinearLayer::synap_row_step, py::arg("current_row"),
@@ -4246,6 +4333,8 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &DISLDOLayerV::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay", &DISLDOLayerV::apply_amortized_importance_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))
@@ -4408,6 +4497,9 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer8::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay",
+             &SparseLinearLayer8::apply_amortized_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
         .def("build_probes", &SparseLinearLayer8::build_probes, py::arg("k"),
              py::arg("per_row") = false)
         .def("synap_row_step", &SparseLinearLayer8::synap_row_step, py::arg("current_row"),
