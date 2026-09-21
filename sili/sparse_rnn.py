@@ -1053,8 +1053,8 @@ class DISLDOLayer32(_SparseLayerBase):
         eta_fast: float,
         blend: float,
         reset_fraction: float,
-        dead_fraction: float,
         k: float,
+        eta_var: float = 0.9,
     ) -> dict:
         """EXPERIMENTAL, added 2026-09-20 -- per-neuron utility-based
         plasticity reset (Continual-Backprop-inspired, Dohare et al.
@@ -1062,16 +1062,19 @@ class DISLDOLayer32(_SparseLayerBase):
         scattered (.connections) arm. See
         docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
         for the full derivation -- NOT a decay mechanism: top-K-by-
-        importance FROZEN pool (gated by a LOCAL per-column
-        gradient-activity deviation, itself derived from col_importance's
-        own per-cycle delta, never a real backward-kernel hook or any
-        loss value) plus a separate bottom-K-by-importance*|weight| DEAD
-        pool. NO loss argument anywhere in this call. Pair with
+        importance FROZEN pool, gated by a LOCAL per-column
+        gradient-activity z-score (col_grad_fast/slow/var, itself
+        derived from col_importance's own per-cycle delta, never a real
+        backward-kernel hook or any loss value; k is std-devs above
+        baseline, not a ratio). NO loss argument anywhere in this call.
+        The dead pool (bottom-K by importance*|weight|) was PRUNED after
+        a real relaunch showed it caused a self-reinforcing spiral --
+        see the design doc's dead_pool_pruned section. Pair with
         apply_amortized_block4_plasticity_reset (block4-storage arm) for
         full layer coverage. May be removed if testing doesn't show
         benefit."""
         return self._c.apply_amortized_plasticity_reset(
-            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var
         )
 
     def apply_amortized_block4_plasticity_reset(
@@ -1083,8 +1086,8 @@ class DISLDOLayer32(_SparseLayerBase):
         eta_fast: float,
         blend: float,
         reset_fraction: float,
-        dead_fraction: float,
         k: float,
+        eta_var: float = 0.9,
     ) -> dict:
         """block4-storage counterpart to apply_amortized_plasticity_reset
         -- see that method's own docstring. chunk_size counts TILES here
@@ -1092,7 +1095,7 @@ class DISLDOLayer32(_SparseLayerBase):
         bound on DISLDOLayerV (fp32). May be removed if testing doesn't
         show benefit."""
         return self._c.apply_amortized_block4_plasticity_reset(
-            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var
         )
 
     def forward(

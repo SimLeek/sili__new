@@ -16,9 +16,11 @@
 //
 // See docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
 // for the full mechanism derivation (top-K-by-importance FROZEN pool
-// gated by a local per-column gradient-activity deviation, a separate
-// bottom-K-by-importance*|weight| DEAD pool, several rounds of direct
-// correction) -- this file mirrors
+// gated by a local per-column gradient-activity deviation -- the ONLY
+// pool now, the dead pool was pruned after being identified as the
+// likely cause of a real-run performance regression; see
+// delta_csr_types.hpp's own file-header comment for the full
+// derivation) -- this file mirrors
 // tests/unit/test_amortized_plasticity_reset.cpp's (scattered)
 // SAME per-cell logic and cycle-boundary selection
 // (plasticity_select_cycle_boundary, delta_csr_types.hpp -- SHARED
@@ -42,7 +44,7 @@ struct Block4PlasticityCursor {
 inline PlasticityStats apply_amortized_block4_plasticity_step(
     Block4Store32& store, std::size_t n_out, PlasticityState& state, Block4PlasticityCursor& cursor,
     std::size_t chunk_size, float eta, float eta_slow, float eta_slow_catchup, float eta_fast,
-    float blend, float reset_fraction, float dead_fraction, float k) {
+    float blend, float reset_fraction, float k, float eta_var = 0.9f) {
     state.ensure_sized(n_out);
     const auto& BL = store.block_layout;
     const std::size_t n_rows = BL.rows;
@@ -110,8 +112,6 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
                         continue; // padding column beyond the real n_out (last tile may overhang)
 
                     state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
-                    state.col_util_dead[j] =
-                        eta * state.col_util_dead[j] + (1.0f - eta) * (imp * std::abs(w));
 
                     if (state.col_reset_active[j]) {
                         const float strength = blend * state.col_plasticity_boost[j];
@@ -121,13 +121,6 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
                         const float fresh = fp4_stochastic_normal01() * fan_in_scale;
                         handle.set_weight(li, lj, (1.0f - strength) * w + strength * fresh);
                         handle.set_importance(li, lj, (1.0f - strength) * imp);
-                    } else if (state.col_dead_active[j]) {
-                        const float fan_in_scale =
-                            1.0f /
-                            std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_in_this_row)));
-                        const float fresh = fp4_stochastic_normal01() * fan_in_scale;
-                        handle.set_weight(li, lj, (1.0f - blend) * w + blend * fresh);
-                        handle.set_importance(li, lj, (1.0f - blend) * imp);
                     }
                 }
             }
@@ -165,6 +158,6 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
     out.cycle_complete = cycle_complete;
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
-                                         reset_fraction, dead_fraction, k, out);
+                                         reset_fraction, k, eta_var, blend, out);
     return out;
 }

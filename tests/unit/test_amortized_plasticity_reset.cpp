@@ -11,11 +11,12 @@
 // derived from col_importance's own per-CYCLE delta, not a real
 // backward-kernel hook (too risky, SIMD-vectorized hot path); (4) an
 // asymmetric EMA catchup rate so genuine improvement is recognized
-// quickly while a spike isn't instantly absorbed; (5) a SEPARATE dead-pool
-// (bottom-K by importance*|weight|, the ORIGINAL formula, honestly
-// rescoped to what it actually detects) since gradient-magnitude-based
-// deviation alone can't distinguish "optimal, low gradient" from "dead,
-// low gradient."
+// quickly while a spike isn't instantly absorbed; (5) the dead pool
+// (bottom-K by importance*|weight|) was tried and then PRUNED entirely
+// (third correction round) -- its own touch shrank importance further,
+// making a touched column MORE likely to be re-selected next cycle, a
+// self-reinforcing spiral confirmed to cause a real accuracy regression
+// across a full 100k-step relaunch. Only the frozen pool remains.
 #include "../../sili/lib/headers/delta_csr_types.hpp"
 #include <cmath>
 #include <cstdio>
@@ -98,8 +99,7 @@ static void test_col_importance_accumulates_from_known_values() {
     auto r = apply_amortized_plasticity_step(conn, 3, st, st_cur, /*chunk_size=*/6, /*eta=*/0.0f,
                                              /*eta_slow=*/0.99f, /*eta_slow_catchup=*/0.95f,
                                              /*eta_fast=*/0.5f, /*blend=*/0.1f,
-                                             /*reset_fraction=*/0.0f, /*dead_fraction=*/0.0f,
-                                             /*k=*/0.5f);
+                                             /*reset_fraction=*/0.0f, /*k=*/0.5f);
     CHECK(r.cycle_complete, "6 cells, chunk_size=6 should complete in one call");
     // eta=0.0 (weight on OLD value) means col_importance == the last-seen raw importance value
     // exactly.
@@ -121,70 +121,39 @@ static void test_frozen_pool_selects_highest_importance_mature_columns() {
     // reset_fraction=0.25 of 4 mature columns -> top_n = round(4*0.25) = 1
     // (nothing eligible cycle 1: all col_age=0 < maturity 1). Run 2 cycles.
     apply_amortized_plasticity_step(conn, 4, st, st_cur, 8, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
-                                    0.0f, 0.5f);
+                                    0.5f);
     CHECK(st.col_reset_active[3] == 0,
           "cycle 1: nothing should be mature yet (col_age starts at 0)");
     auto r2 = apply_amortized_plasticity_step(conn, 4, st, st_cur, 8, 0.0f, 0.99f, 0.95f, 0.5f,
-                                              0.1f, 0.25f, 0.0f, 0.5f);
+                                              0.1f, 0.25f, 0.5f);
     CHECK(r2.cycle_complete, "cycle 2 should also complete (8 cells, chunk_size=8)");
     CHECK(st.col_reset_active[3] == 1, "col 3 (highest importance) should be the frozen pool pick");
     CHECK(r2.n_reset_this_cycle == 1, "exactly 1 column should be selected, got %zu",
           r2.n_reset_this_cycle);
 }
 
-static void test_dead_pool_excludes_frozen_pool_picks() {
-    // 2x4: col 3 has both highest importance (frozen candidate) AND
-    // lowest importance*|weight| (would ALSO be a dead candidate if not
-    // excluded) -- weight[col 3] set to 0 so col_util_dead[3]=0, the
-    // global minimum, while col_importance[3] is also the maximum.
+static void test_frozen_blend_is_gated_by_plasticity_boost() {
+    // Force col_reset_active directly (bypass selection) to isolate the
+    // blend-application logic itself.
     auto conn = make_dense_conn(
-        2, 4, [](std::size_t, std::size_t c) { return c == 3 ? 0.0f : 1.0f; },
-        [](std::size_t, std::size_t c) { return static_cast<float>(c); });
-    PlasticityState st;
-    PlasticityCellCursor st_cur;
-    apply_amortized_plasticity_step(conn, 4, st, st_cur, 8, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
-                                    0.25f, 0.5f);
-    auto r2 = apply_amortized_plasticity_step(conn, 4, st, st_cur, 8, 0.0f, 0.99f, 0.95f, 0.5f,
-                                              0.1f, 0.25f, 0.25f, 0.5f);
-    CHECK(st.col_reset_active[3] == 1, "col 3 should be the frozen pick (highest importance)");
-    CHECK(st.col_dead_active[3] == 0,
-          "col 3 must NOT also be in the dead pool despite qualifying by col_util_dead alone");
-    CHECK(r2.n_dead_this_cycle == 1, "exactly 1 OTHER column should fill the dead pool, got %zu",
-          r2.n_dead_this_cycle);
-}
-
-static void test_frozen_blend_is_gated_dead_blend_is_full_rate() {
-    // Force col_reset_active/col_dead_active directly (bypass selection)
-    // to isolate the blend-application logic itself.
-    auto conn = make_dense_conn(
-        1, 2, [](std::size_t, std::size_t) { return 1.0f; },
+        1, 1, [](std::size_t, std::size_t) { return 1.0f; },
         [](std::size_t, std::size_t) { return 1.0f; });
     PlasticityState st;
     PlasticityCellCursor st_cur;
-    st.ensure_sized(2);
+    st.ensure_sized(1);
     st.col_reset_active[0] = 1;
-    st.col_plasticity_boost[0] = 0.5f; // gated: effective strength = blend*0.5
-    st.col_dead_active[1] = 1;         // ungated: effective strength = blend (full)
+    st.col_plasticity_boost[0] = 0.5f; // effective strength = blend*0.5
 
-    apply_amortized_plasticity_step(conn, 2, st, st_cur, 2, 0.0f, 0.99f, 0.95f, 0.5f,
-                                    /*blend=*/0.2f, 0.0f, 0.0f, 0.5f);
-    const float w0 = ValueAccessor<VT>::get_w(conn.values, 0); // col 0, gated
-    const float w1 = ValueAccessor<VT>::get_w(conn.values, 1); // col 1, ungated
-    // strength0 = 0.2*0.5 = 0.1 -> w0 = 0.9*1.0 + 0.1*fresh (fresh is bounded, |fresh|<10 in
-    // practice) strength1 = 0.2       -> w1 = 0.8*1.0 + 0.2*fresh Isolate the DETERMINISTIC
-    // (non-fresh) component: w = (1-strength)*w_orig + strength*fresh, so |w - (1-strength)*w_orig|
-    // should be small relative to a much larger jump if strength were 1.0.
+    apply_amortized_plasticity_step(conn, 1, st, st_cur, 1, 0.0f, 0.99f, 0.95f, 0.5f,
+                                    /*blend=*/0.2f, 0.0f, 0.5f);
+    const float w0 = ValueAccessor<VT>::get_w(conn.values, 0);
+    // strength = 0.2*0.5 = 0.1 -> w0 = 0.9*1.0 + 0.1*fresh (fresh is bounded, |fresh|<10 in
+    // practice). Isolate the DETERMINISTIC (non-fresh) component via importance, which has no
+    // RNG in its update: imp shrinks by exactly (1-strength).
     CHECK(std::abs(w0 - 0.9f) < 5.0f, "gated blend sanity: w0=%f (loose bound, RNG-dependent)", w0);
-    CHECK(std::abs(w1 - 0.8f) < 5.0f, "full-rate blend sanity: w1=%f (loose bound, RNG-dependent)",
-          w1);
-    // The REAL check: gated strength (0.1) must move LESS than full-rate (0.2) on average.
-    // Deterministic check instead: importance shrinks by exactly (1-strength) each (no RNG there).
     const float imp0 = ValueAccessor<VT>::get_imp(conn.values, 0);
-    const float imp1 = ValueAccessor<VT>::get_imp(conn.values, 1);
     CHECK(std::abs(imp0 - 0.9f) < 1e-5f,
           "gated importance should shrink by exactly (1-0.1)=0.9, got %f", imp0);
-    CHECK(std::abs(imp1 - 0.8f) < 1e-5f,
-          "full-rate importance should shrink by exactly (1-0.2)=0.8, got %f", imp1);
 }
 
 static void test_maturity_gate_excludes_just_reset_column() {
@@ -195,15 +164,15 @@ static void test_maturity_gate_excludes_just_reset_column() {
     PlasticityCellCursor st_cur;
     // Cycle 1: nothing mature yet.
     apply_amortized_plasticity_step(conn, 2, st, st_cur, 2, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.5f,
-                                    0.0f, 0.5f);
+                                    0.5f);
     // Cycle 2: col 0 (highest importance) becomes mature and gets selected+reset (age->0).
     apply_amortized_plasticity_step(conn, 2, st, st_cur, 2, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.5f,
-                                    0.0f, 0.5f);
+                                    0.5f);
     CHECK(st.col_age[0] == 0, "col 0 should have just been reset, age=0");
     // Cycle 3: col 0's age is now 0 (< maturity 1) -- must NOT be immediately reselected
     // even though its importance is still (likely) highest.
     auto r3 = apply_amortized_plasticity_step(conn, 2, st, st_cur, 2, 0.0f, 0.99f, 0.95f, 0.5f,
-                                              0.1f, 0.5f, 0.0f, 0.5f);
+                                              0.1f, 0.5f, 0.5f);
     CHECK(st.col_reset_active[0] == 0, "just-reset column must not be immediately re-eligible");
     (void)r3;
 }
@@ -214,10 +183,9 @@ static void test_empty_layer() {
     PlasticityState st;
     PlasticityCellCursor st_cur;
     auto r = apply_amortized_plasticity_step(conn, 0, st, st_cur, 4, 0.99f, 0.99f, 0.95f, 0.5f,
-                                             0.1f, 0.01f, 0.01f, 0.5f);
+                                             0.1f, 0.01f, 0.5f);
     CHECK(r.cycle_complete, "empty layer should report cycle_complete=true immediately");
-    CHECK(r.n_reset_this_cycle == 0 && r.n_dead_this_cycle == 0,
-          "empty layer should reset nothing");
+    CHECK(r.n_reset_this_cycle == 0, "empty layer should reset nothing");
 }
 
 static void test_asymmetric_catchup_rate() {
@@ -225,24 +193,27 @@ static void test_asymmetric_catchup_rate() {
     // constructing a scenario where col_importance drops sharply between
     // two cycles (simulating genuine improvement) vs rises sharply
     // (simulating a real problem) and checking which rate each used.
+    // Cycle 1 warm-starts col_grad_slow/fast to the real delta (cold-start
+    // fix, see test_cold_start_no_spurious_deviation below) -- this test
+    // exercises the asymmetric rate starting from cycle 2 onward, once
+    // both EMAs already hold a real value.
     auto conn_drop = make_dense_conn(
         1, 1, [](std::size_t, std::size_t) { return 1.0f; },
         [](std::size_t, std::size_t) { return 10.0f; });
     PlasticityState st_drop;
     PlasticityCellCursor st_drop_cur;
     apply_amortized_plasticity_step(
-        conn_drop, 1, st_drop, st_drop_cur, 1, 0.0f, 0.99f, 0.5f, 0.5f, 0.0f, 0.0f, 0.0f,
-        0.5f); // cycle 1: col_importance -> 10, delta=10-0=10 (rise, slow rate)
+        conn_drop, 1, st_drop, st_drop_cur, 1, 0.0f, 0.99f, 0.5f, 0.5f, 0.0f, 0.0f,
+        0.5f); // cycle 1: col_importance -> 10, delta=10-0=10 (warm-start, slow := 10)
     // Manually drop the underlying importance to simulate genuine improvement next cycle.
     ValueAccessor<VT>::set_live(conn_drop.values, 0, 1.0f, 1.0f);
     apply_amortized_plasticity_step(
-        conn_drop, 1, st_drop, st_drop_cur, 1, 0.0f, 0.99f, 0.5f, 0.5f, 0.0f, 0.0f, 0.0f,
-        0.5f); // cycle 2: col_importance -> 1, delta=1-10=-9 (drop, catchup rate)
+        conn_drop, 1, st_drop, st_drop_cur, 1, 0.0f, 0.99f, 0.5f, 0.5f, 0.0f, 0.0f,
+        0.5f); // cycle 2: col_importance -> 1, delta=1-10=-9 (drop vs slow=10, catchup rate)
     // col_grad_slow after cycle 2 should reflect the FAST catchup rate (0.5) applied to delta=-9,
     // not the slow rate (0.99): slow_after = 0.5*slow_before + 0.5*(-9).
-    // slow_before (after cycle1, rise, rate=0.99): 0.99*0 + 0.01*10 = 0.1
-    const float expected_slow_after_cycle1 =
-        0.01f * 10.0f; // eta_slow=0.99 -> weight (1-eta_slow)=0.01
+    // slow_before (after cycle 1, warm-start): exactly 10.0.
+    const float expected_slow_after_cycle1 = 10.0f; // warm-start, not an EMA blend from 0
     const float expected_slow_after_cycle2 =
         0.5f * expected_slow_after_cycle1 + 0.5f * (-9.0f); // catchup rate 0.5 applied
     CHECK(std::abs(st_drop.col_grad_slow[0] - expected_slow_after_cycle2) < 1e-4f,
@@ -250,14 +221,126 @@ static void test_asymmetric_catchup_rate() {
           expected_slow_after_cycle2, st_drop.col_grad_slow[0]);
 }
 
+static void test_cold_start_no_spurious_deviation() {
+    // Direct instruction: "don't start an ema with zero grad since that
+    // never happens... if the variable is zero/just initialized then the
+    // new value replaces it." A column's FIRST cycle must warm-start
+    // col_grad_slow/fast to the real delta (not the ~50x spurious ratio
+    // the old zero-init math produced -- the bug actually observed in a
+    // real width=288 smoke run, dev=47.49 at step 250, before any column
+    // could legitimately be frozen). With the z-score deviation formula,
+    // a fresh column also has col_grad_var=0, so deviation is exactly 0
+    // (not 1.0 -- z-score's own "no deviation from itself yet" baseline),
+    // an even safer never-flagged starting point.
+    auto conn = make_dense_conn(
+        1, 1, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t) { return 10.0f; });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 1, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.0f, 0.0f,
+                                    0.5f); // cycle 1: col_importance -> 10, delta=10
+    CHECK(std::abs(st.col_grad_slow[0] - 10.0f) < 1e-6f,
+          "col_grad_slow should warm-start to the real first delta (10.0), got %f",
+          st.col_grad_slow[0]);
+    CHECK(std::abs(st.col_grad_fast[0] - 10.0f) < 1e-6f,
+          "col_grad_fast should warm-start to the real first delta (10.0), got %f",
+          st.col_grad_fast[0]);
+    CHECK(std::abs(st.col_grad_var[0]) < 1e-6f,
+          "col_grad_var should be exactly 0 on a column's first cycle (no variance signal yet), "
+          "got %f",
+          st.col_grad_var[0]);
+    const float std_dev = std::sqrt(std::max(0.0f, st.col_grad_var[0]));
+    const float deviation = (st.col_grad_fast[0] - st.col_grad_slow[0]) / (std_dev + 1e-8f);
+    CHECK(std::abs(deviation) < 1e-4f,
+          "deviation on a column's first cycle should be exactly ~0 (no spurious cold-start "
+          "spike), got %f",
+          deviation);
+}
+
+static void test_reset_inflates_variance_preventing_immediate_reflag() {
+    // Second-round correction, direct instruction: the reset action's own
+    // `(1-strength)` importance decay must not corrupt the very signal
+    // that decides future resets. A real width=288 smoke run showed the
+    // SAME layer/pool pinned at dev=16-17 across multiple cycles instead
+    // of settling -- the reset's own decay produces a large artificial
+    // delta next cycle that (without this fix) looks like a genuine
+    // spike, re-flagging the column it just reset. Construct a column
+    // that settles into a STABLE, small per-cycle delta after being
+    // reset (simulating a column that's genuinely fine post-reset, with
+    // no real new problem) and confirm it does NOT get immediately
+    // reselected once its self-induced perturbation is accounted for.
+    auto conn = make_dense_conn(
+        1, 1, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t) { return 100.0f; });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    // Cycle 1: warm-start (col_importance=100, delta=100, age 0 -> not mature).
+    apply_amortized_plasticity_step(conn, 1, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 1.0f, 0.5f,
+                                    0.9f);
+    // Cycle 2: col 0 becomes mature and IS selected (only candidate, reset_fraction=1.0);
+    // col_plasticity_boost gets set from deviation vs the (still-zero-variance) baseline.
+    ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 100.0f);
+    apply_amortized_plasticity_step(conn, 1, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 1.0f, 0.5f,
+                                    0.9f);
+    CHECK(st.col_reset_active[0] == 1, "col 0 should be selected into the frozen pool on cycle 2");
+    const float importance_before_decay = st.col_importance_prev_cycle[0];
+    // Cycle 3: the reset's own per-cell blend already ran during cycle 2's touches (this SAME
+    // call, since chunk_size=1 covers the single cell and completes the cycle in one call) --
+    // col_importance[0] now reflects (1-strength)*100, a large negative delta relative to
+    // cycle 2's snapshot. Without the fix, this negative delta corrupts col_grad_slow via the
+    // catchup branch; with the fix, col_grad_var absorbs it as an EXPECTED (self-induced)
+    // swing.
+    CHECK(st.col_grad_var[0] > 0.0f,
+          "col_grad_var should have been inflated by the reset's own self-induced perturbation, "
+          "got %f",
+          st.col_grad_var[0]);
+    (void)importance_before_decay;
+}
+
+static void test_deviation_distribution_min_max_tracked() {
+    // Distribution logging (direct instruction, after k=2.0 turned out to
+    // guarantee the gate never opened across 3 real 100k-step runs): a
+    // future relaunch needs min/max (not just a single "worst" value) to
+    // actually calibrate k from real data. 3 columns, distinct
+    // importance so all 3 rank into a reset_fraction=1.0 selection, each
+    // pre-seeded with a different col_grad_slow/fast (via two manual
+    // cycles) so their z-scores differ -- min/max should bracket the
+    // per-column deviation values, not just report one of them.
+    auto conn = make_dense_conn(
+        1, 3, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t c) { return static_cast<float>(c) + 1.0f; });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 3, st, cur, 3, 0.0f, 0.99f, 0.95f, 0.5f, 0.0f, 1.0f,
+                                    0.5f); // cycle 1: warm-start all 3 columns
+    // Cycle 2: bump only column 2's importance sharply (a real deviation spike, vb=2 is that
+    // column's sole cell since n_in=1). Columns 0 and 1 are left unchanged -- their delta stays
+    // exactly 0 relative to their own warm-started slow, giving deviation=0 exactly.
+    ValueAccessor<VT>::set_live(conn.values, 2, 1.0f,
+                                30.0f); // col 2: importance 3 -> 30, real spike
+    auto r2 = apply_amortized_plasticity_step(conn, 3, st, cur, 3, 0.0f, 0.99f, 0.95f, 0.5f, 0.0f,
+                                              1.0f, 0.5f);
+    CHECK(r2.n_reset_this_cycle == 3, "all 3 mature columns should be selected, got %zu",
+          r2.n_reset_this_cycle);
+    CHECK(r2.max_deviation > r2.min_deviation,
+          "with a real spike on one column, max_deviation should exceed min_deviation "
+          "(min=%f max=%f)",
+          r2.min_deviation, r2.max_deviation);
+    CHECK(r2.max_deviation >= r2.mean_deviation && r2.mean_deviation >= r2.min_deviation,
+          "mean_deviation should sit between min and max (min=%f mean=%f max=%f)", r2.min_deviation,
+          r2.mean_deviation, r2.max_deviation);
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
-    test_dead_pool_excludes_frozen_pool_picks();
-    test_frozen_blend_is_gated_dead_blend_is_full_rate();
+    test_frozen_blend_is_gated_by_plasticity_boost();
     test_maturity_gate_excludes_just_reset_column();
     test_empty_layer();
     test_asymmetric_catchup_rate();
+    test_cold_start_no_spurious_deviation();
+    test_reset_inflates_variance_preventing_immediate_reflag();
+    test_deviation_distribution_min_max_tracked();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

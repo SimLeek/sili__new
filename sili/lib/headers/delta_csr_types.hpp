@@ -1027,43 +1027,74 @@ struct DeltaCSRWeights {
 //      distribution quickly") but only SLOWLY on a rise (so a real spike
 //      isn't instantly absorbed into the baseline, which would defeat
 //      detecting it at all).
-//   5. A SEPARATE, independent DEAD pool (bottom-K by
-//      `importance*|weight|`, the ORIGINAL formula, honestly rescoped to
-//      what it actually detects: genuinely idle columns, a different
-//      pathology from FROZEN ones -- gradient-magnitude-based deviation
-//      alone can't tell "optimal, low activity" from "dead, low
-//      activity," so this pool exists precisely to catch the dead case
-//      the frozen pool's gate structurally cannot).
-// Both pools share the SAME amortized cell-touch traversal (chunk_size
-// cells per call, same shape as apply_amortized_decay_stats above) and
-// the same gradual-blend-toward-a-fresh-sample mechanics -- amortized on
-// two axes (which cells get touched, and how much they move when
-// touched), never a sudden full swap.
+//   5. DEAD pool REMOVED (third correction round, direct instruction):
+//      it selected bottom-K by `importance*|weight|`, ungated, full
+//      blend strength every touch. But its own touch shrinks importance
+//      (`new_imp = (1-blend)*imp`) as a side effect -- so a column it
+//      just touched comes out with EVEN LOWER importance, making it
+//      MORE likely to qualify as "dead" again next cycle, with only a
+//      single-cycle maturity gate (~100 calls) as protection. For a
+//      column that's genuinely useful but only intermittently active --
+//      exactly what MQAR-style associative recall produces, a pathway
+//      silent except when its specific key is queried -- one cycle
+//      isn't enough time to re-earn importance before the next round of
+//      "who's lowest now." A real width=288 relaunch confirmed the
+//      symptom: accuracy kept declining through an entire flat plateau
+//      (dense/arm_c) instead of settling into a stable floor like the
+//      true historical stall did, while the frozen pool (see below) was
+//      independently confirmed inert (`dev` never crossed its threshold
+//      in any of 3 full 100k-step runs) -- ruling the frozen pool out
+//      and leaving the dead pool's self-reinforcing spiral as the only
+//      plausible source of the ongoing damage. Pruned entirely rather
+//      than patched (e.g. a longer cooldown) -- see
+//      docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+//      for the historical-vs-plasticity_reset accuracy-trend comparison
+//      that motivated this.
+//   6. Frozen pool's `k` threshold recalibrated: default was a blind
+//      "standard z-score" guess (k=2.0) made before any real deviation
+//      distribution existed. The 3 finished 100k-step runs showed `dev`
+//      topping out at 1.82 and mostly sitting 0.6-1.5 -- meaning k=2.0
+//      guaranteed the gate NEVER opened, the entire run, confirmed via
+//      `grep dev= | awk '$1>2.0'` returning zero matches across all
+//      three full logs. Recalibrated down into the observed operating
+//      range (k=1.0) so it can actually fire on a real fraction of
+//      ticks instead of being silently a permanent no-op. This is a
+//      best estimate from tick-level maxima, not the full per-cycle
+//      distribution (which wasn't logged) -- `min_deviation`/
+//      `max_deviation` added to PlasticityStats (distribution logging,
+//      computed over the actual candidate set each cycle, not just the
+//      single worst) so a future relaunch can recalibrate from real
+//      data instead of guessing again.
+// The amortized cell-touch traversal (chunk_size cells per call, same
+// shape as apply_amortized_decay_stats above) and the gradual-blend-
+// toward-a-fresh-sample mechanics are unchanged -- amortized on two
+// axes (which cells get touched, and how much they move when touched),
+// never a sudden full swap.
 
 struct PlasticityState {
     std::vector<float> col_importance;            // FROZEN-pool ranking signal
-    std::vector<float> col_util_dead;             // DEAD-pool ranking signal (importance*|weight|)
     std::vector<float> col_grad_slow;             // long-run gradient-activity baseline
     std::vector<float> col_grad_fast;             // recent gradient-activity reading
+    std::vector<float> col_grad_var;              // running variance of delta around col_grad_slow
+    std::vector<uint8_t> col_grad_initialized;    // has col_grad_slow/fast seen a real delta yet?
     std::vector<float> col_importance_prev_cycle; // snapshot at the last cycle boundary
     std::vector<float> col_plasticity_boost; // computed at selection time, held for the next cycle
     std::vector<uint32_t> col_age;           // cycles since this column was last flagged
     std::vector<uint8_t> col_reset_active;   // FROZEN pool flag for the current cycle
-    std::vector<uint8_t> col_dead_active;    // DEAD pool flag for the current cycle
     bool sized = false;
 
     void ensure_sized(std::size_t n_out) {
         if (sized)
             return;
         col_importance.assign(n_out, 0.0f);
-        col_util_dead.assign(n_out, 0.0f);
         col_grad_slow.assign(n_out, 0.0f);
         col_grad_fast.assign(n_out, 0.0f);
+        col_grad_var.assign(n_out, 0.0f);
+        col_grad_initialized.assign(n_out, 0);
         col_importance_prev_cycle.assign(n_out, 0.0f);
         col_plasticity_boost.assign(n_out, 0.0f);
         col_age.assign(n_out, 0);
         col_reset_active.assign(n_out, 0);
-        col_dead_active.assign(n_out, 0);
         sized = true;
     }
 };
@@ -1071,10 +1102,11 @@ struct PlasticityState {
 struct PlasticityStats {
     bool cycle_complete = false;
     std::size_t n_reset_this_cycle = 0; // FROZEN pool
-    std::size_t n_dead_this_cycle = 0;  // DEAD pool
     double mean_col_importance = 0.0;
-    double mean_deviation = 0.0;     // among FROZEN-pool columns this cycle
-    double mean_col_util_dead = 0.0; // among DEAD-pool columns this cycle
+    double mean_deviation = 0.0; // among FROZEN-pool candidate columns this cycle
+    double min_deviation = 0.0;  // distribution logging: lets k be calibrated from real data
+    double max_deviation =
+        0.0; // instead of a blind guess (see plasticity_reset_design.k_recalibration)
 };
 
 // Storage-agnostic cell-walk cursor -- (row, absolute position within
@@ -1098,8 +1130,8 @@ struct PlasticityCellCursor {
 // completed (out.cycle_complete already true).
 inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t n_out,
                                              float eta_slow, float eta_slow_catchup, float eta_fast,
-                                             float reset_fraction, float dead_fraction, float k,
-                                             PlasticityStats& out) {
+                                             float reset_fraction, float k, float eta_var,
+                                             float blend, PlasticityStats& out) {
     constexpr std::size_t maturity_cycles = 1;
     std::vector<std::size_t> mature;
     mature.reserve(n_out);
@@ -1109,21 +1141,71 @@ inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t
 
     // Update col_grad_slow/fast from this cycle's col_importance delta
     // BEFORE selection, so plasticity_boost reflects the freshest read.
+    // Cold-start correction (direct instruction): an EMA should never
+    // start by blending a real reading against a zero sentinel -- a real
+    // gradient-activity delta is never actually zero, so seeding from 0
+    // makes col_grad_slow (eta_slow=0.99, only inches off 0) trail WAY
+    // behind col_grad_fast (eta_fast=0.5, nearly at the real value after
+    // one cycle) for many cycles, producing a spuriously huge deviation
+    // ratio that has nothing to do with a genuinely frozen column -- it's
+    // measuring cold start, not staleness. On a column's first cycle,
+    // replace both EMAs with the real first delta directly instead of
+    // blending from 0, so deviation starts at exactly 1.0 (never flagged)
+    // and only rises once a REAL divergence between recent and
+    // established activity appears.
     for (std::size_t j = 0; j < n_out; ++j) {
         const float delta = state.col_importance[j] - state.col_importance_prev_cycle[j];
-        state.col_grad_fast[j] = eta_fast * state.col_grad_fast[j] + (1.0f - eta_fast) * delta;
-        if (delta < state.col_grad_slow[j])
-            state.col_grad_slow[j] =
-                eta_slow_catchup * state.col_grad_slow[j] + (1.0f - eta_slow_catchup) * delta;
-        else
-            state.col_grad_slow[j] = eta_slow * state.col_grad_slow[j] + (1.0f - eta_slow) * delta;
+        if (!state.col_grad_initialized[j]) {
+            state.col_grad_fast[j] = delta;
+            state.col_grad_slow[j] = delta;
+            state.col_grad_var[j] = 0.0f; // no variance signal yet on the very first reading
+            state.col_grad_initialized[j] = 1;
+        } else {
+            const float diff = delta - state.col_grad_slow[j]; // vs the OLD (pre-update) baseline
+            state.col_grad_var[j] =
+                eta_var * state.col_grad_var[j] + (1.0f - eta_var) * diff * diff;
+            state.col_grad_fast[j] = eta_fast * state.col_grad_fast[j] + (1.0f - eta_fast) * delta;
+            if (delta < state.col_grad_slow[j])
+                state.col_grad_slow[j] =
+                    eta_slow_catchup * state.col_grad_slow[j] + (1.0f - eta_slow_catchup) * delta;
+            else
+                state.col_grad_slow[j] =
+                    eta_slow * state.col_grad_slow[j] + (1.0f - eta_slow) * delta;
+        }
+        // Reset-induced perturbation (direct instruction, second correction
+        // round): if this column was actively being reset/revived during
+        // the cycle that just completed, `delta` above is dominated by our
+        // OWN `(1-strength)` importance decay, not real new gradient
+        // signal -- left unaccounted, that self-induced swing corrupts
+        // col_grad_slow via the asymmetric-catchup branch and then swings
+        // back as the column re-learns, causing a self-sustaining
+        // reset -> corrupt-baseline -> re-flag loop (confirmed via a real
+        // width=288 smoke run: dev pinned at ~16-17 on the same
+        // layer/pool across cycles instead of settling). Pre-account for
+        // it by inflating variance proportional to the SIZE of our own
+        // decay (strength * the importance we're about to remove), so the
+        // artificial delta lands inside an already-widened uncertainty
+        // band instead of looking like a surprising real spike. Not a
+        // reset-to-zero of col_grad_slow/fast (the underlying importance
+        // itself was only diminished, not deleted, by the same
+        // `(1-strength)` line -- resetting the mean outright would be
+        // inconsistent with that).
+        if (state.col_reset_active[j]) {
+            const float strength = blend * state.col_plasticity_boost[j];
+            const float perturbation = strength * state.col_importance_prev_cycle[j];
+            state.col_grad_var[j] += perturbation * perturbation;
+        }
         state.col_importance_prev_cycle[j] = state.col_importance[j];
     }
 
     std::fill(state.col_reset_active.begin(), state.col_reset_active.end(), 0);
-    std::fill(state.col_dead_active.begin(), state.col_dead_active.end(), 0);
 
-    // FROZEN pool: top reset_fraction of mature by col_importance.
+    // FROZEN pool: top reset_fraction of mature by col_importance. This
+    // is now the ONLY pool -- the dead pool was pruned (see file header
+    // comment above for why: its own touch shrank importance further,
+    // making a touched column MORE likely to be re-selected, a
+    // self-reinforcing spiral with no real protection against wiping
+    // genuinely-useful-but-intermittently-active columns).
     std::vector<std::size_t> by_importance = mature;
     std::sort(by_importance.begin(), by_importance.end(), [&](std::size_t a, std::size_t b) {
         return state.col_importance[a] > state.col_importance[b];
@@ -1131,38 +1213,39 @@ inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t
     const std::size_t top_n =
         static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * reset_fraction));
     double sum_deviation = 0.0;
+    double min_deviation = 0.0;
+    double max_deviation = 0.0;
     for (std::size_t idx = 0; idx < top_n && idx < by_importance.size(); ++idx) {
         const std::size_t j = by_importance[idx];
         state.col_reset_active[j] = 1;
+        // Signed z-score, not a ratio: how many of this column's OWN
+        // estimated std-devs is recent activity above its established
+        // baseline. Naturally direction-aware (a genuine drop can never
+        // boost plasticity, unlike a ratio which is always >=0) and
+        // self-normalizing against how volatile this column's own history
+        // has been -- including any self-induced volatility from its own
+        // past resets, accounted for via col_grad_var's inflation above.
+        // k is now literally "k std-devs above baseline", not "k above a
+        // ratio of 1" -- see docs/research/toy_tile_recurrence_rmt.rst:
+        // plasticity_reset_design for the units-change note and the
+        // k_recalibration section documenting how k=1.0 was chosen.
         const float slow = state.col_grad_slow[j];
-        const float deviation = state.col_grad_fast[j] / (std::abs(slow) + 1e-8f);
-        state.col_plasticity_boost[j] = std::max(0.0f, deviation - (1.0f + k));
+        const float std_dev = std::sqrt(std::max(0.0f, state.col_grad_var[j]));
+        const float deviation = (state.col_grad_fast[j] - slow) / (std_dev + 1e-8f);
+        state.col_plasticity_boost[j] = std::max(0.0f, deviation - k);
         sum_deviation += deviation;
+        if (idx == 0) {
+            min_deviation = deviation;
+            max_deviation = deviation;
+        } else {
+            min_deviation = std::min(min_deviation, static_cast<double>(deviation));
+            max_deviation = std::max(max_deviation, static_cast<double>(deviation));
+        }
         ++out.n_reset_this_cycle;
     }
 
-    // DEAD pool: bottom dead_fraction of mature by col_util_dead,
-    // EXCLUDING anything already in the FROZEN pool.
-    std::vector<std::size_t> by_util_dead;
-    by_util_dead.reserve(mature.size());
-    for (std::size_t j : mature)
-        if (!state.col_reset_active[j])
-            by_util_dead.push_back(j);
-    std::sort(by_util_dead.begin(), by_util_dead.end(), [&](std::size_t a, std::size_t b) {
-        return state.col_util_dead[a] < state.col_util_dead[b];
-    });
-    const std::size_t dead_n =
-        static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * dead_fraction));
-    double sum_util_dead = 0.0;
-    for (std::size_t idx = 0; idx < dead_n && idx < by_util_dead.size(); ++idx) {
-        const std::size_t j = by_util_dead[idx];
-        state.col_dead_active[j] = 1;
-        sum_util_dead += state.col_util_dead[j];
-        ++out.n_dead_this_cycle;
-    }
-
     for (std::size_t j = 0; j < n_out; ++j) {
-        if (state.col_reset_active[j] || state.col_dead_active[j])
+        if (state.col_reset_active[j])
             state.col_age[j] = 0;
         else
             ++state.col_age[j];
@@ -1175,9 +1258,8 @@ inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t
     out.mean_deviation = out.n_reset_this_cycle > 0
                              ? sum_deviation / static_cast<double>(out.n_reset_this_cycle)
                              : 0.0;
-    out.mean_col_util_dead = out.n_dead_this_cycle > 0
-                                 ? sum_util_dead / static_cast<double>(out.n_dead_this_cycle)
-                                 : 0.0;
+    out.min_deviation = min_deviation;
+    out.max_deviation = max_deviation;
 }
 
 template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
@@ -1186,7 +1268,7 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
                                 std::size_t n_out, PlasticityState& state,
                                 PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
                                 float eta_slow, float eta_slow_catchup, float eta_fast, float blend,
-                                float reset_fraction, float dead_fraction, float k) {
+                                float reset_fraction, float k, float eta_var = 0.9f) {
     using VA = ValueAccessor<VALUES_TYPE>;
     state.ensure_sized(n_out);
     const auto& L = conn.layout;
@@ -1239,7 +1321,6 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
         const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
 
         state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
-        state.col_util_dead[j] = eta * state.col_util_dead[j] + (1.0f - eta) * (imp * std::abs(w));
 
         if (state.col_reset_active[j]) {
             const float strength = blend * state.col_plasticity_boost[j];
@@ -1248,14 +1329,6 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
             const float fresh = fp4_stochastic_normal01() * fan_in_scale;
             const float new_w = (1.0f - strength) * w + strength * fresh;
             const float new_imp = (1.0f - strength) * imp;
-            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
-                         static_cast<typename VA::value_type>(new_imp));
-        } else if (state.col_dead_active[j]) {
-            const float fan_in_scale =
-                1.0f / std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_rows)));
-            const float fresh = fp4_stochastic_normal01() * fan_in_scale;
-            const float new_w = (1.0f - blend) * w + blend * fresh;
-            const float new_imp = (1.0f - blend) * imp;
             VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
                          static_cast<typename VA::value_type>(new_imp));
         }
@@ -1276,7 +1349,7 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
     out.cycle_complete = cycle_complete;
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
-                                         reset_fraction, dead_fraction, k, out);
+                                         reset_fraction, k, eta_var, blend, out);
     return out;
 }
 

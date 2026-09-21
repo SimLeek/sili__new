@@ -1799,18 +1799,18 @@ class DISLDOLayerV {
     // whole-network signal passed in from the caller.
     py::dict apply_amortized_plasticity_reset(S chunk_size, float eta, float eta_slow,
                                               float eta_slow_catchup, float eta_fast, float blend,
-                                              float reset_fraction, float dead_fraction, float k) {
+                                              float reset_fraction, float k, float eta_var = 0.9f) {
         auto stats = apply_amortized_plasticity_step(
             weights.connections, static_cast<std::size_t>(n_outputs()), _plasticity_state,
             _plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
-            eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k);
+            eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var);
         py::dict out;
         out["cycle_complete"] = stats.cycle_complete;
         out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
-        out["n_dead_this_cycle"] = stats.n_dead_this_cycle;
         out["mean_col_importance"] = stats.mean_col_importance;
         out["mean_deviation"] = stats.mean_deviation;
-        out["mean_col_util_dead"] = stats.mean_col_util_dead;
+        out["min_deviation"] = stats.min_deviation;
+        out["max_deviation"] = stats.max_deviation;
         return out;
     }
 
@@ -1819,27 +1819,27 @@ class DISLDOLayerV {
     // this same template.
     py::dict apply_amortized_block4_plasticity_reset(S chunk_size, float eta, float eta_slow,
                                                      float eta_slow_catchup, float eta_fast,
-                                                     float blend, float reset_fraction,
-                                                     float dead_fraction, float k) {
+                                                     float blend, float reset_fraction, float k,
+                                                     float eta_var = 0.9f) {
         py::dict out;
         if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
             auto stats = apply_amortized_block4_plasticity_step(
                 weights.block4, static_cast<std::size_t>(n_outputs()), _block4_plasticity_state,
                 _block4_plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
-                eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k);
+                eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var);
             out["cycle_complete"] = stats.cycle_complete;
             out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
-            out["n_dead_this_cycle"] = stats.n_dead_this_cycle;
             out["mean_col_importance"] = stats.mean_col_importance;
             out["mean_deviation"] = stats.mean_deviation;
-            out["mean_col_util_dead"] = stats.mean_col_util_dead;
+            out["min_deviation"] = stats.min_deviation;
+            out["max_deviation"] = stats.max_deviation;
         } else {
             out["cycle_complete"] = true;
             out["n_reset_this_cycle"] = std::size_t(0);
-            out["n_dead_this_cycle"] = std::size_t(0);
             out["mean_col_importance"] = 0.0;
             out["mean_deviation"] = 0.0;
-            out["mean_col_util_dead"] = 0.0;
+            out["min_deviation"] = 0.0;
+            out["max_deviation"] = 0.0;
         }
         return out;
     }
@@ -4532,11 +4532,11 @@ PYBIND11_MODULE(_cpu, m) {
         .def("apply_amortized_plasticity_reset", &DISLDOLayerV::apply_amortized_plasticity_reset,
              py::arg("chunk_size"), py::arg("eta"), py::arg("eta_slow"),
              py::arg("eta_slow_catchup"), py::arg("eta_fast"), py::arg("blend"),
-             py::arg("reset_fraction"), py::arg("dead_fraction"), py::arg("k"))
+             py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f)
         .def("apply_amortized_block4_plasticity_reset",
              &DISLDOLayerV::apply_amortized_block4_plasticity_reset, py::arg("chunk_size"),
              py::arg("eta"), py::arg("eta_slow"), py::arg("eta_slow_catchup"), py::arg("eta_fast"),
-             py::arg("blend"), py::arg("reset_fraction"), py::arg("dead_fraction"), py::arg("k"))
+             py::arg("blend"), py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f)
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))
