@@ -146,6 +146,63 @@ against the scattered path for the same logical values -- decay is a
 per-cell ``v * decay_factor`` multiply with no cross-cell reduction, so
 the two storage formats must agree exactly, not just approximately).
 
+.. _plasticity_reset.per_neuron_utility:
+
+Per-neuron utility-based plasticity reset
+--------------------------------------------
+
+*ID:* ``plasticity_reset.per_neuron_utility``
+
+Sibling mechanism to the decay work above, sharing the SAME amortized
+cell-touch traversal shape but a materially different trigger and
+action -- see ``sili_peridot``'s
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design``
+for the full derivation (Continual-Backprop-inspired, Dohare et al.
+2024 *Nature* "Loss of plasticity in deep continual learning"; several
+rounds of direct correction that materially changed the design from its
+first draft). Engine-level summary:
+
+``PlasticityState`` (``delta_csr_types.hpp``) tracks, per OUTPUT column:
+``col_importance`` (EMA of ``importance`` alone -- the FROZEN-pool
+ranking signal, TOP-K selected, not bottom-K: a worked-through
+worst-case-timing question showed a bottom-K
+``importance*|weight|`` criterion can never detect a genuinely frozen
+column, since that value can't fall while the column stays stuck
+receiving real error signal), ``col_util_dead`` (EMA of
+``importance*|weight|``, the ORIGINAL formula, honestly rescoped as a
+SEPARATE DEAD-pool bottom-K signal for genuinely idle columns -- a
+different pathology gradient-magnitude deviation alone cannot
+distinguish from "optimal, low activity"), and ``col_grad_slow``/
+``col_grad_fast`` (two EMAs, asymmetric catchup rate, of
+``col_importance``'s own per-CYCLE delta -- NOT a real backward-kernel
+hook: that kernel has 6+ SIMD-vectorized per-synapse update sites, too
+risky to touch correctly, so the gate is derived from a signal already
+safely available at this traversal's own cadence instead).
+
+``apply_amortized_plasticity_step`` (scattered) and
+``apply_amortized_block4_plasticity_step``
+(``block4_plasticity_TODO_DELETE.hpp``, same temporary-copy rationale as
+the block4 decay file) share ``plasticity_select_cycle_boundary`` for
+the actual TOP-K/BOTTOM-K selection math -- the per-column state doesn't
+care which storage format produced it, only each storage's own CELL
+traversal differs (block4's ``chunk_size`` counts TILES, matching the
+decay file's own convention; scattered counts individual cells).
+Reset/blend is gradual (``blend * plasticity_boost`` for the gated
+FROZEN pool, full ``blend`` rate for the ungated DEAD pool) via
+``fp4_stochastic_normal01()`` (``fp4quant.hpp``, Box-Muller off the
+existing thread-local xorshift64* stochastic-rounding RNG) toward a
+fan-in-scaled fresh sample -- never a sudden full swap.
+
+Tested in ``tests/unit/test_fp4_stochastic_normal.cpp`` (the new RNG
+helper), ``tests/unit/test_amortized_plasticity_reset.cpp`` (scattered:
+``col_importance`` accumulation, TOP-K frozen selection, DEAD-pool
+mutual exclusion with the frozen pool, gated-vs-ungated blend rate,
+maturity gate, the asymmetric ``eta_slow_catchup`` rate, empty-layer
+handling), and ``tests/unit/test_block4_plasticity_reset.cpp`` (the
+block4 mirror of all of the above, plus BIT-EQUIVALENCE against the
+scattered path for the same logical values -- same standard this
+project's every scattered/block4 pair is held to).
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

@@ -12,6 +12,7 @@
 #include "linear_sisldo.hpp"
 #include "linear_disldo.hpp"
 #include "block4_decay_TODO_DELETE.hpp"
+#include "block4_plasticity_TODO_DELETE.hpp"
 #include "engine_select.hpp"
 #ifdef SILI_HAVE_MKL
 #include "linear_didldo.hpp"
@@ -1409,6 +1410,18 @@ class DISLDOLayerV {
     double _block4_importance_decay_sum_sq = 0.0;
     double _block4_importance_decay_max_abs = 0.0;
     std::size_t _block4_importance_decay_n = 0;
+    // Per-neuron utility-based plasticity reset -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // SEPARATE state per storage type, same "a layer's synapses can be
+    // split across BOTH scattered and block4" reasoning as the decay
+    // cursors above (each storage type's own PlasticityState tracks
+    // per-column signals only from what IT sees -- a known limitation
+    // for a genuinely mixed-storage layer, not yet unified across
+    // storage types).
+    PlasticityState _plasticity_state;
+    PlasticityCellCursor _plasticity_cursor;
+    PlasticityState _block4_plasticity_state;
+    Block4PlasticityCursor _block4_plasticity_cursor;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1773,6 +1786,60 @@ class DISLDOLayerV {
             out["max_abs"] = 0.0;
             out["n"] = std::size_t(0);
             out["cycle_complete"] = true;
+        }
+        return out;
+    }
+
+    // Per-neuron utility-based plasticity reset -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // Scattered (.connections) arm -- NO loss argument anywhere: the
+    // gradient-activity gate is entirely local, derived from
+    // col_importance's own per-cycle delta (engine-safety correction,
+    // see the design doc), not a real backward-kernel hook or any
+    // whole-network signal passed in from the caller.
+    py::dict apply_amortized_plasticity_reset(S chunk_size, float eta, float eta_slow,
+                                              float eta_slow_catchup, float eta_fast, float blend,
+                                              float reset_fraction, float dead_fraction, float k) {
+        auto stats = apply_amortized_plasticity_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _plasticity_state,
+            _plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
+            eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
+        out["n_dead_this_cycle"] = stats.n_dead_this_cycle;
+        out["mean_col_importance"] = stats.mean_col_importance;
+        out["mean_deviation"] = stats.mean_deviation;
+        out["mean_col_util_dead"] = stats.mean_col_util_dead;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay work already established for FP4/FP8 instantiations of
+    // this same template.
+    py::dict apply_amortized_block4_plasticity_reset(S chunk_size, float eta, float eta_slow,
+                                                     float eta_slow_catchup, float eta_fast,
+                                                     float blend, float reset_fraction,
+                                                     float dead_fraction, float k) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_plasticity_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_plasticity_state,
+                _block4_plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
+                eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
+            out["n_dead_this_cycle"] = stats.n_dead_this_cycle;
+            out["mean_col_importance"] = stats.mean_col_importance;
+            out["mean_deviation"] = stats.mean_deviation;
+            out["mean_col_util_dead"] = stats.mean_col_util_dead;
+        } else {
+            out["cycle_complete"] = true;
+            out["n_reset_this_cycle"] = std::size_t(0);
+            out["n_dead_this_cycle"] = std::size_t(0);
+            out["mean_col_importance"] = 0.0;
+            out["mean_deviation"] = 0.0;
+            out["mean_col_util_dead"] = 0.0;
         }
         return out;
     }
@@ -4462,6 +4529,14 @@ PYBIND11_MODULE(_cpu, m) {
         .def("apply_amortized_block4_importance_decay",
              &DISLDOLayerV::apply_amortized_block4_importance_decay, py::arg("chunk_size"),
              py::arg("decay_factor"))
+        .def("apply_amortized_plasticity_reset", &DISLDOLayerV::apply_amortized_plasticity_reset,
+             py::arg("chunk_size"), py::arg("eta"), py::arg("eta_slow"),
+             py::arg("eta_slow_catchup"), py::arg("eta_fast"), py::arg("blend"),
+             py::arg("reset_fraction"), py::arg("dead_fraction"), py::arg("k"))
+        .def("apply_amortized_block4_plasticity_reset",
+             &DISLDOLayerV::apply_amortized_block4_plasticity_reset, py::arg("chunk_size"),
+             py::arg("eta"), py::arg("eta_slow"), py::arg("eta_slow_catchup"), py::arg("eta_fast"),
+             py::arg("blend"), py::arg("reset_fraction"), py::arg("dead_fraction"), py::arg("k"))
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))

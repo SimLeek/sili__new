@@ -996,6 +996,289 @@ struct DeltaCSRWeights {
         ValueAccessor<VALUES_TYPE>::reserve(values, target_nnz);
     }
 };
+// ── Per-neuron utility-based plasticity reset ────────────────────────────────
+// Continual-Backprop-inspired (Dohare et al. 2024, Nature "Loss of
+// plasticity in deep continual learning"), adapted per direct
+// instruction/correction across several rounds of discussion -- see
+// docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design for
+// the full derivation:
+//   1. Top-K-by-`col_importance`, NOT bottom-K-by-`importance*|weight|`,
+//      selection for the FROZEN pool. A direct worked-through question
+//      ("how long, worst case, before a historically-high-importance
+//      column that's now wrong becomes eligible?") showed the original
+//      bottom-K design could structurally NEVER detect a genuinely
+//      frozen-and-now-wrong column -- importance*|weight| can only fall
+//      if the underlying values fall, and a frozen column's importance
+//      stays high (or grows) precisely BECAUSE it's stuck receiving real
+//      error signal. Worst case: never, not "a long time."
+//   2. A LOCAL per-column gradient-ACTIVITY deviation gate
+//      (`col_grad_fast`/`col_grad_slow`), not a global loss signal --
+//      "we're backpropagating through the whole model, loss is as local
+//      as we need it to be... a much better signal than global loss."
+//   3. Engine-safety correction: that gate is derived from
+//      `col_importance`'s own per-CYCLE delta (this traversal's own
+//      cadence), NOT a real backward-kernel hook -- the real kernel has
+//      6+ SIMD-vectorized per-synapse update sites, too risky to touch
+//      correctly. `importance` is already EMA(g^2) and only grows from
+//      real gradient activity, so its own trajectory is a safe, already-
+//      available proxy at this traversal's natural granularity.
+//   4. Asymmetric EMA rate on `col_grad_slow` -- catches up FAST on a
+//      genuine drop (improvement, "the distribution can update its
+//      distribution quickly") but only SLOWLY on a rise (so a real spike
+//      isn't instantly absorbed into the baseline, which would defeat
+//      detecting it at all).
+//   5. A SEPARATE, independent DEAD pool (bottom-K by
+//      `importance*|weight|`, the ORIGINAL formula, honestly rescoped to
+//      what it actually detects: genuinely idle columns, a different
+//      pathology from FROZEN ones -- gradient-magnitude-based deviation
+//      alone can't tell "optimal, low activity" from "dead, low
+//      activity," so this pool exists precisely to catch the dead case
+//      the frozen pool's gate structurally cannot).
+// Both pools share the SAME amortized cell-touch traversal (chunk_size
+// cells per call, same shape as apply_amortized_decay_stats above) and
+// the same gradual-blend-toward-a-fresh-sample mechanics -- amortized on
+// two axes (which cells get touched, and how much they move when
+// touched), never a sudden full swap.
+
+struct PlasticityState {
+    std::vector<float> col_importance;            // FROZEN-pool ranking signal
+    std::vector<float> col_util_dead;             // DEAD-pool ranking signal (importance*|weight|)
+    std::vector<float> col_grad_slow;             // long-run gradient-activity baseline
+    std::vector<float> col_grad_fast;             // recent gradient-activity reading
+    std::vector<float> col_importance_prev_cycle; // snapshot at the last cycle boundary
+    std::vector<float> col_plasticity_boost; // computed at selection time, held for the next cycle
+    std::vector<uint32_t> col_age;           // cycles since this column was last flagged
+    std::vector<uint8_t> col_reset_active;   // FROZEN pool flag for the current cycle
+    std::vector<uint8_t> col_dead_active;    // DEAD pool flag for the current cycle
+    bool sized = false;
+
+    void ensure_sized(std::size_t n_out) {
+        if (sized)
+            return;
+        col_importance.assign(n_out, 0.0f);
+        col_util_dead.assign(n_out, 0.0f);
+        col_grad_slow.assign(n_out, 0.0f);
+        col_grad_fast.assign(n_out, 0.0f);
+        col_importance_prev_cycle.assign(n_out, 0.0f);
+        col_plasticity_boost.assign(n_out, 0.0f);
+        col_age.assign(n_out, 0);
+        col_reset_active.assign(n_out, 0);
+        col_dead_active.assign(n_out, 0);
+        sized = true;
+    }
+};
+
+struct PlasticityStats {
+    bool cycle_complete = false;
+    std::size_t n_reset_this_cycle = 0; // FROZEN pool
+    std::size_t n_dead_this_cycle = 0;  // DEAD pool
+    double mean_col_importance = 0.0;
+    double mean_deviation = 0.0;     // among FROZEN-pool columns this cycle
+    double mean_col_util_dead = 0.0; // among DEAD-pool columns this cycle
+};
+
+// Storage-agnostic cell-walk cursor -- (row, absolute position within
+// that row's live element range). Block4 storage needs an ADDITIONAL
+// byte_pos field on top of this shape (tile byte-packing offset) -- see
+// block4_plasticity_TODO_DELETE.hpp's own Block4PlasticityCursor, which
+// wraps one of these rather than duplicating row/elem_pos.
+struct PlasticityCellCursor {
+    std::size_t row = 0;
+    std::size_t elem_pos = 0;
+    bool initialized = false;
+};
+
+// Cycle-boundary selection, SHARED between the scattered and block4
+// traversals (both only need the per-column PlasticityState -- neither
+// storage format's own cursor shape matters here) -- see the file
+// header comment above for the full derivation of why this selects
+// TOP-K-by-col_importance (FROZEN pool, gated by gradient deviation)
+// plus a separate BOTTOM-K-by-col_util_dead (DEAD pool, ungated).
+// Callers: run this ONLY when a full cell-touch cycle has just
+// completed (out.cycle_complete already true).
+inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t n_out,
+                                             float eta_slow, float eta_slow_catchup, float eta_fast,
+                                             float reset_fraction, float dead_fraction, float k,
+                                             PlasticityStats& out) {
+    constexpr std::size_t maturity_cycles = 1;
+    std::vector<std::size_t> mature;
+    mature.reserve(n_out);
+    for (std::size_t j = 0; j < n_out; ++j)
+        if (state.col_age[j] >= maturity_cycles)
+            mature.push_back(j);
+
+    // Update col_grad_slow/fast from this cycle's col_importance delta
+    // BEFORE selection, so plasticity_boost reflects the freshest read.
+    for (std::size_t j = 0; j < n_out; ++j) {
+        const float delta = state.col_importance[j] - state.col_importance_prev_cycle[j];
+        state.col_grad_fast[j] = eta_fast * state.col_grad_fast[j] + (1.0f - eta_fast) * delta;
+        if (delta < state.col_grad_slow[j])
+            state.col_grad_slow[j] =
+                eta_slow_catchup * state.col_grad_slow[j] + (1.0f - eta_slow_catchup) * delta;
+        else
+            state.col_grad_slow[j] = eta_slow * state.col_grad_slow[j] + (1.0f - eta_slow) * delta;
+        state.col_importance_prev_cycle[j] = state.col_importance[j];
+    }
+
+    std::fill(state.col_reset_active.begin(), state.col_reset_active.end(), 0);
+    std::fill(state.col_dead_active.begin(), state.col_dead_active.end(), 0);
+
+    // FROZEN pool: top reset_fraction of mature by col_importance.
+    std::vector<std::size_t> by_importance = mature;
+    std::sort(by_importance.begin(), by_importance.end(), [&](std::size_t a, std::size_t b) {
+        return state.col_importance[a] > state.col_importance[b];
+    });
+    const std::size_t top_n =
+        static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * reset_fraction));
+    double sum_deviation = 0.0;
+    for (std::size_t idx = 0; idx < top_n && idx < by_importance.size(); ++idx) {
+        const std::size_t j = by_importance[idx];
+        state.col_reset_active[j] = 1;
+        const float slow = state.col_grad_slow[j];
+        const float deviation = state.col_grad_fast[j] / (std::abs(slow) + 1e-8f);
+        state.col_plasticity_boost[j] = std::max(0.0f, deviation - (1.0f + k));
+        sum_deviation += deviation;
+        ++out.n_reset_this_cycle;
+    }
+
+    // DEAD pool: bottom dead_fraction of mature by col_util_dead,
+    // EXCLUDING anything already in the FROZEN pool.
+    std::vector<std::size_t> by_util_dead;
+    by_util_dead.reserve(mature.size());
+    for (std::size_t j : mature)
+        if (!state.col_reset_active[j])
+            by_util_dead.push_back(j);
+    std::sort(by_util_dead.begin(), by_util_dead.end(), [&](std::size_t a, std::size_t b) {
+        return state.col_util_dead[a] < state.col_util_dead[b];
+    });
+    const std::size_t dead_n =
+        static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * dead_fraction));
+    double sum_util_dead = 0.0;
+    for (std::size_t idx = 0; idx < dead_n && idx < by_util_dead.size(); ++idx) {
+        const std::size_t j = by_util_dead[idx];
+        state.col_dead_active[j] = 1;
+        sum_util_dead += state.col_util_dead[j];
+        ++out.n_dead_this_cycle;
+    }
+
+    for (std::size_t j = 0; j < n_out; ++j) {
+        if (state.col_reset_active[j] || state.col_dead_active[j])
+            state.col_age[j] = 0;
+        else
+            ++state.col_age[j];
+    }
+
+    double sum_importance = 0.0;
+    for (std::size_t j = 0; j < n_out; ++j)
+        sum_importance += state.col_importance[j];
+    out.mean_col_importance = n_out > 0 ? sum_importance / static_cast<double>(n_out) : 0.0;
+    out.mean_deviation = out.n_reset_this_cycle > 0
+                             ? sum_deviation / static_cast<double>(out.n_reset_this_cycle)
+                             : 0.0;
+    out.mean_col_util_dead = out.n_dead_this_cycle > 0
+                                 ? sum_util_dead / static_cast<double>(out.n_dead_this_cycle)
+                                 : 0.0;
+}
+
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+PlasticityStats
+apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn,
+                                std::size_t n_out, PlasticityState& state,
+                                PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
+                                float eta_slow, float eta_slow_catchup, float eta_fast, float blend,
+                                float reset_fraction, float dead_fraction, float k) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    PlasticityStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0)
+            ++cursor.row;
+        if (cursor.row < n_rows)
+            cursor.elem_pos = L.elem_start[cursor.row];
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        // Walk the row's own column cursor forward to local_e -- cheap
+        // relative to the actual work, re-created fresh each touch
+        // rather than persisted (same convention the block4 decay
+        // traversal already established).
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
+        state.col_util_dead[j] = eta * state.col_util_dead[j] + (1.0f - eta) * (imp * std::abs(w));
+
+        if (state.col_reset_active[j]) {
+            const float strength = blend * state.col_plasticity_boost[j];
+            const float fan_in_scale =
+                1.0f / std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_rows)));
+            const float fresh = fp4_stochastic_normal01() * fan_in_scale;
+            const float new_w = (1.0f - strength) * w + strength * fresh;
+            const float new_imp = (1.0f - strength) * imp;
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
+                         static_cast<typename VA::value_type>(new_imp));
+        } else if (state.col_dead_active[j]) {
+            const float fan_in_scale =
+                1.0f / std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_rows)));
+            const float fresh = fp4_stochastic_normal01() * fan_in_scale;
+            const float new_w = (1.0f - blend) * w + blend * fresh;
+            const float new_imp = (1.0f - blend) * imp;
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
+                         static_cast<typename VA::value_type>(new_imp));
+        }
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    out.cycle_complete = cycle_complete;
+    if (cycle_complete)
+        plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
+                                         reset_fraction, dead_fraction, k, out);
+    return out;
+}
 
 // ── SparseLinearWeightsDelta ─────────────────────────────────────────────────
 

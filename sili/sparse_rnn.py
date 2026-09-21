@@ -1044,6 +1044,57 @@ class DISLDOLayer32(_SparseLayerBase):
         testing doesn't show benefit."""
         return self._c.apply_amortized_block4_importance_decay(chunk_size, decay_factor)
 
+    def apply_amortized_plasticity_reset(
+        self,
+        chunk_size: int,
+        eta: float,
+        eta_slow: float,
+        eta_slow_catchup: float,
+        eta_fast: float,
+        blend: float,
+        reset_fraction: float,
+        dead_fraction: float,
+        k: float,
+    ) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- per-neuron utility-based
+        plasticity reset (Continual-Backprop-inspired, Dohare et al.
+        2024 Nature "Loss of plasticity in deep continual learning"),
+        scattered (.connections) arm. See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+        for the full derivation -- NOT a decay mechanism: top-K-by-
+        importance FROZEN pool (gated by a LOCAL per-column
+        gradient-activity deviation, itself derived from col_importance's
+        own per-cycle delta, never a real backward-kernel hook or any
+        loss value) plus a separate bottom-K-by-importance*|weight| DEAD
+        pool. NO loss argument anywhere in this call. Pair with
+        apply_amortized_block4_plasticity_reset (block4-storage arm) for
+        full layer coverage. May be removed if testing doesn't show
+        benefit."""
+        return self._c.apply_amortized_plasticity_reset(
+            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+        )
+
+    def apply_amortized_block4_plasticity_reset(
+        self,
+        chunk_size: int,
+        eta: float,
+        eta_slow: float,
+        eta_slow_catchup: float,
+        eta_fast: float,
+        blend: float,
+        reset_fraction: float,
+        dead_fraction: float,
+        k: float,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_plasticity_reset
+        -- see that method's own docstring. chunk_size counts TILES here
+        (block4's natural atomic unit), not individual synapses. Only
+        bound on DISLDOLayerV (fp32). May be removed if testing doesn't
+        show benefit."""
+        return self._c.apply_amortized_block4_plasticity_reset(
+            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, dead_fraction, k
+        )
+
     def forward(
         self,
         x,

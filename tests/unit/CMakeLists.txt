@@ -204,6 +204,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_sparse_input_backward
     test_fp4_bitshift
     test_fp4_stochastic
+    test_fp4_stochastic_normal
     test_disldo_block4_fp4_wide_simd
     test_disldo_block4_fp4_backward_wide_simd
     test_fp8_bitshift
@@ -236,6 +237,8 @@ set(SILI_STANDALONE_TESTS
     test_aqrs_grad_norm_dy_density
     test_amortized_decay_stats
     test_block4_amortized_decay
+    test_amortized_plasticity_reset
+    test_block4_plasticity_reset
     test_top_k_csr_nucleus
     test_cpu_topology
     test_dequant_equality_fp4_vs_fp8
