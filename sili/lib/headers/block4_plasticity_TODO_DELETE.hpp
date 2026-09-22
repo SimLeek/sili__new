@@ -45,7 +45,8 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
     Block4Store32& store, std::size_t n_out, PlasticityState& state, Block4PlasticityCursor& cursor,
     std::size_t chunk_size, float eta, float eta_slow, float eta_slow_catchup, float eta_fast,
     float blend, float reset_fraction, float k, float eta_var = 0.9f, float l2_decay_lambda = 0.0f,
-    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
+    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f,
+    bool select_by_deviation = false) {
     state.ensure_sized(n_out);
     const auto& BL = store.block_layout;
     const std::size_t n_rows = BL.rows;
@@ -182,6 +183,6 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
                                          reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
-                                         l2_decay_temperature, max_ci);
+                                         l2_decay_temperature, max_ci, select_by_deviation);
     return out;
 }

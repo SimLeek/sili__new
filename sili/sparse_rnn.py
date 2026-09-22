@@ -1059,21 +1059,22 @@ class DISLDOLayer32(_SparseLayerBase):
         l2_decay_threshold: float = 0.9,
         l2_decay_temperature: float = 0.05,
         max_ci: float = 100.0,
+        select_by_deviation: bool = False,
     ) -> dict:
         """EXPERIMENTAL, added 2026-09-20 -- per-neuron utility-based
         plasticity reset (Continual-Backprop-inspired, Dohare et al.
         2024 Nature "Loss of plasticity in deep continual learning"),
         scattered (.connections) arm. See
         docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
-        for the full derivation -- NOT a decay mechanism: top-K-by-
-        importance FROZEN pool, gated by a LOCAL per-column
-        gradient-activity z-score (col_grad_fast/slow/var, itself
-        derived from col_importance's own per-cycle delta, never a real
-        backward-kernel hook or any loss value; k is std-devs above
-        baseline, not a ratio). NO loss argument anywhere in this call.
-        The dead pool (bottom-K by importance*|weight|) was PRUNED after
-        a real relaunch showed it caused a self-reinforcing spiral --
-        see the design doc's dead_pool_pruned section. Pair with
+        for the full derivation -- NOT a decay mechanism: top-K FROZEN
+        pool, gated by a LOCAL per-column gradient-activity z-score
+        (col_grad_fast/slow/var, itself derived from col_importance's
+        own per-cycle delta, never a real backward-kernel hook or any
+        loss value; k is std-devs above baseline, not a ratio). NO loss
+        argument anywhere in this call. The dead pool (bottom-K by
+        importance*|weight|) was PRUNED after a real relaunch showed it
+        caused a self-reinforcing spiral -- see the design doc's
+        dead_pool_pruned section. Pair with
         apply_amortized_block4_plasticity_reset (block4-storage arm) for
         full layer coverage. May be removed if testing doesn't show
         benefit.
@@ -1083,7 +1084,14 @@ class DISLDOLayer32(_SparseLayerBase):
         importance (not just the frozen-pool picks), gated by a soft
         sigmoid on how close the population's L2 norm sits to the
         max_ci ceiling -- see
-        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay."""
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+
+        select_by_deviation=False (default) ranks candidates by
+        col_importance (absolute LEVEL). True ranks by deviation
+        (growth RATE) instead -- catches a column accelerating fast
+        while its absolute level is still low, which top-K-by-level can
+        never see. See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.select_by_deviation_early_detection."""
         return self._c.apply_amortized_plasticity_reset(
             chunk_size,
             eta,
@@ -1098,6 +1106,7 @@ class DISLDOLayer32(_SparseLayerBase):
             l2_decay_threshold,
             l2_decay_temperature,
             max_ci,
+            select_by_deviation,
         )
 
     def apply_amortized_block4_plasticity_reset(
@@ -1115,6 +1124,7 @@ class DISLDOLayer32(_SparseLayerBase):
         l2_decay_threshold: float = 0.9,
         l2_decay_temperature: float = 0.05,
         max_ci: float = 100.0,
+        select_by_deviation: bool = False,
     ) -> dict:
         """block4-storage counterpart to apply_amortized_plasticity_reset
         -- see that method's own docstring. chunk_size counts TILES here
@@ -1135,6 +1145,7 @@ class DISLDOLayer32(_SparseLayerBase):
             l2_decay_threshold,
             l2_decay_temperature,
             max_ci,
+            select_by_deviation,
         )
 
     def plasticity_column_state(self) -> dict:

@@ -1138,7 +1138,8 @@ struct PlasticityCellCursor {
 inline void plasticity_select_cycle_boundary(
     PlasticityState& state, std::size_t n_out, float eta_slow, float eta_slow_catchup,
     float eta_fast, float reset_fraction, float k, float eta_var, float blend, PlasticityStats& out,
-    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
+    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f,
+    bool select_by_deviation = false) {
     constexpr std::size_t maturity_cycles = 1;
     std::vector<std::size_t> mature;
     mature.reserve(n_out);
@@ -1207,38 +1208,65 @@ inline void plasticity_select_cycle_boundary(
 
     std::fill(state.col_reset_active.begin(), state.col_reset_active.end(), 0);
 
-    // FROZEN pool: top reset_fraction of mature by col_importance. This
-    // is now the ONLY pool -- the dead pool was pruned (see file header
-    // comment above for why: its own touch shrank importance further,
-    // making a touched column MORE likely to be re-selected, a
-    // self-reinforcing spiral with no real protection against wiping
+    // Signed z-score, not a ratio: how many of this column's OWN
+    // estimated std-devs is recent activity above its established
+    // baseline. Naturally direction-aware (a genuine drop can never
+    // boost plasticity, unlike a ratio which is always >=0) and
+    // self-normalizing against how volatile this column's own history
+    // has been -- including any self-induced volatility from its own
+    // past resets, accounted for via col_grad_var's inflation above.
+    // Computed for EVERY mature column up front (not just whichever end
+    // up selected) -- needed either as the SELECTION criterion itself
+    // (select_by_deviation=true) or just for blend-gating stats (the
+    // default top-K-by-importance mode).
+    std::vector<float> deviation_by_col(n_out, 0.0f);
+    for (std::size_t j : mature) {
+        const float slow = state.col_grad_slow[j];
+        const float std_dev = std::sqrt(std::max(0.0f, state.col_grad_var[j]));
+        deviation_by_col[j] = (state.col_grad_fast[j] - slow) / (std_dev + 1e-8f);
+    }
+
+    // FROZEN pool: top reset_fraction of mature, ranked either by
+    // col_importance (default -- absolute LEVEL) or by deviation
+    // (select_by_deviation=true -- growth RATE). This is now the ONLY
+    // pool -- the dead pool was pruned (see file header comment above
+    // for why: its own touch shrank importance further, making a
+    // touched column MORE likely to be re-selected, a self-reinforcing
+    // spiral with no real protection against wiping
     // genuinely-useful-but-intermittently-active columns).
-    std::vector<std::size_t> by_importance = mature;
-    std::sort(by_importance.begin(), by_importance.end(), [&](std::size_t a, std::size_t b) {
-        return state.col_importance[a] > state.col_importance[b];
-    });
+    //
+    // select_by_deviation exists because top-K-by-importance can
+    // structurally never catch a column that's accelerating fast but
+    // hasn't yet reached a high absolute level -- confirmed by directly
+    // comparing a real run that graduated against a real run that got
+    // stuck: the stuck run's importance was already growing 17-147x
+    // faster than the graduated run's from early in training, well
+    // before either run's importance reached a high absolute level. See
+    // docs/research/toy_tile_recurrence_rmt.rst:
+    // plasticity_reset_design.select_by_deviation_early_detection.
+    std::vector<std::size_t> candidates = mature;
+    if (select_by_deviation) {
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) {
+            return deviation_by_col[a] > deviation_by_col[b];
+        });
+    } else {
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) {
+            return state.col_importance[a] > state.col_importance[b];
+        });
+    }
     const std::size_t top_n =
         static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * reset_fraction));
     double sum_deviation = 0.0;
     double min_deviation = 0.0;
     double max_deviation = 0.0;
-    for (std::size_t idx = 0; idx < top_n && idx < by_importance.size(); ++idx) {
-        const std::size_t j = by_importance[idx];
+    for (std::size_t idx = 0; idx < top_n && idx < candidates.size(); ++idx) {
+        const std::size_t j = candidates[idx];
         state.col_reset_active[j] = 1;
-        // Signed z-score, not a ratio: how many of this column's OWN
-        // estimated std-devs is recent activity above its established
-        // baseline. Naturally direction-aware (a genuine drop can never
-        // boost plasticity, unlike a ratio which is always >=0) and
-        // self-normalizing against how volatile this column's own history
-        // has been -- including any self-induced volatility from its own
-        // past resets, accounted for via col_grad_var's inflation above.
-        // k is now literally "k std-devs above baseline", not "k above a
+        // k is literally "k std-devs above baseline", not "k above a
         // ratio of 1" -- see docs/research/toy_tile_recurrence_rmt.rst:
         // plasticity_reset_design for the units-change note and the
         // k_recalibration section documenting how k=1.0 was chosen.
-        const float slow = state.col_grad_slow[j];
-        const float std_dev = std::sqrt(std::max(0.0f, state.col_grad_var[j]));
-        const float deviation = (state.col_grad_fast[j] - slow) / (std_dev + 1e-8f);
+        const float deviation = deviation_by_col[j];
         state.col_plasticity_boost[j] = std::max(0.0f, deviation - k);
         sum_deviation += deviation;
         if (idx == 0) {
@@ -1301,7 +1329,7 @@ PlasticityStats apply_amortized_plasticity_step(
     PlasticityState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
     float eta_slow, float eta_slow_catchup, float eta_fast, float blend, float reset_fraction,
     float k, float eta_var = 0.9f, float l2_decay_lambda = 0.0f, float l2_decay_threshold = 0.9f,
-    float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
+    float l2_decay_temperature = 0.05f, float max_ci = 100.0f, bool select_by_deviation = false) {
     using VA = ValueAccessor<VALUES_TYPE>;
     state.ensure_sized(n_out);
     const auto& L = conn.layout;
@@ -1402,7 +1430,7 @@ PlasticityStats apply_amortized_plasticity_step(
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
                                          reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
-                                         l2_decay_temperature, max_ci);
+                                         l2_decay_temperature, max_ci, select_by_deviation);
     return out;
 }
 

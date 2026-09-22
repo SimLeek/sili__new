@@ -475,6 +475,103 @@ static void test_l2_decay_ramp_is_smooth_not_a_hard_step() {
     CHECK(d_high - d_mid < 0.5, "mid->high step should be gradual, got jump of %f", d_high - d_mid);
 }
 
+// select_by_deviation: growth-RATE-based selection instead of
+// absolute-LEVEL selection -- direct instruction, after comparing a
+// graduated real run against a stuck real run's collected column data:
+// the stuck run's importance was already growing 17-147x faster than
+// the graduated run's from early in training (steps ~9000-18000),
+// well before EITHER run's importance reached a high absolute level --
+// but the existing top-K-by-importance selection can never catch a
+// column in that state, since a fast-accelerating-but-still-low column
+// never ranks in the top-K by raw level until it's already deep into
+// the pathological regime. col_grad_fast/slow/var (and thus deviation)
+// are already tracked for EVERY mature column each cycle (not just the
+// ones selected by importance) -- this just changes what SELECTS the
+// top-K, not the reset/blend action itself. See
+// docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.select_by_deviation_early_detection.
+
+static void test_select_by_deviation_off_matches_existing_importance_selection() {
+    // Regression: default (select_by_deviation=false) must reproduce
+    // the exact existing top-K-by-importance behavior.
+    auto conn = make_dense_conn(
+        1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t c) { return static_cast<float>(c); });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
+                                    0.5f);
+    auto r2 = apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                              0.25f, 0.5f);
+    CHECK(r2.cycle_complete, "cycle 2 should complete");
+    CHECK(st.col_reset_active[3] == 1, "default mode should still pick col 3 (highest importance)");
+    CHECK(r2.n_reset_this_cycle == 1, "exactly 1 column should be selected, got %zu",
+          r2.n_reset_this_cycle);
+}
+
+// 2-column setup: col 0 has HIGH absolute importance but a STABLE,
+// unremarkable per-cycle delta (low deviation); col 1 has LOW absolute
+// importance but a SUDDEN spike on the final cycle (high deviation).
+// reset_fraction=0.0 during warm-up (top_n=0, nothing selected yet,
+// but col_grad_slow/fast/var still update normally every cycle) avoids
+// any earlier selection perturbing the controlled construction; the
+// final cycle uses reset_fraction=0.5 (top_n=1) to force exactly one
+// pick, and is run TWICE on freshly-warmed-up state -- once per mode.
+static void run_warmup_cycles(Conn& conn, PlasticityState& st, PlasticityCellCursor& cur) {
+    ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 50.0f); // col 0
+    ValueAccessor<VT>::set_live(conn.values, 1, 1.0f, 1.0f);  // col 1
+    apply_amortized_plasticity_step(conn, 2, st, cur, 2, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.0f,
+                                    0.5f);
+    ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 51.0f); // delta +1
+    ValueAccessor<VT>::set_live(conn.values, 1, 1.0f, 1.0f);  // delta 0
+    apply_amortized_plasticity_step(conn, 2, st, cur, 2, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.0f,
+                                    0.5f);
+    ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 52.0f); // delta +1
+    ValueAccessor<VT>::set_live(conn.values, 1, 1.0f, 1.0f);  // delta 0
+    apply_amortized_plasticity_step(conn, 2, st, cur, 2, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.0f,
+                                    0.5f);
+}
+
+static void test_select_by_deviation_picks_growth_rate_not_absolute_level() {
+    // default mode (select_by_deviation=false): must pick col 0, the
+    // higher-IMPORTANCE column (53 > 21), ignoring col 1's spike.
+    {
+        auto conn = make_dense_conn(
+            1, 2, [](std::size_t, std::size_t) { return 1.0f; },
+            [](std::size_t, std::size_t) { return 0.0f; });
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        run_warmup_cycles(conn, st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 53.0f); // delta +1, unremarkable
+        ValueAccessor<VT>::set_live(conn.values, 1, 1.0f, 21.0f); // delta +20, a real spike
+        auto r = apply_amortized_plasticity_step(conn, 2, st, cur, 2, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                 0.1f, 0.5f, 0.5f, 0.9f, 0.0f, 0.9f, 0.05f, 100.0f,
+                                                 /*select_by_deviation=*/false);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[0] == 1 && st.col_reset_active[1] == 0,
+              "default mode should pick col 0 (importance 53>21), got col0=%d col1=%d",
+              st.col_reset_active[0], st.col_reset_active[1]);
+    }
+    // select_by_deviation=true: must pick col 1, the SPIKING column,
+    // even though its absolute importance (21) is far below col 0's (53).
+    {
+        auto conn = make_dense_conn(
+            1, 2, [](std::size_t, std::size_t) { return 1.0f; },
+            [](std::size_t, std::size_t) { return 0.0f; });
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        run_warmup_cycles(conn, st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 0, 1.0f, 53.0f);
+        ValueAccessor<VT>::set_live(conn.values, 1, 1.0f, 21.0f);
+        auto r = apply_amortized_plasticity_step(conn, 2, st, cur, 2, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                 0.1f, 0.5f, 0.5f, 0.9f, 0.0f, 0.9f, 0.05f, 100.0f,
+                                                 /*select_by_deviation=*/true);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[1] == 1 && st.col_reset_active[0] == 0,
+              "select_by_deviation=true should pick col 1 (the spike), got col0=%d col1=%d",
+              st.col_reset_active[0], st.col_reset_active[1]);
+    }
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -490,6 +587,8 @@ int main() {
     test_l2_decay_strong_when_fully_saturated();
     test_l2_decay_touches_every_cell_not_just_reset_pool();
     test_l2_decay_ramp_is_smooth_not_a_hard_step();
+    test_select_by_deviation_off_matches_existing_importance_selection();
+    test_select_by_deviation_picks_growth_rate_not_absolute_level();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

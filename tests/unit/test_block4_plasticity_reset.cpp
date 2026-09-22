@@ -265,6 +265,84 @@ static void test_l2_decay_strong_when_fully_saturated_block4() {
     CHECK(std::abs(w - 5.0f) < 1e-5f, "L2 decay must never touch block4 weight, got w=%f", w);
 }
 
+// select_by_deviation -- block4 mirror of the scattered coverage in
+// test_amortized_plasticity_reset.cpp (see that file's header comment
+// for the full derivation). Single 4x4 tile: column 0 has high
+// absolute importance with stable +1/cycle growth; column 1 has low
+// absolute importance, flat for 3 warm-up cycles then a sudden spike --
+// the growth-RATE anomaly the mechanism should catch under
+// select_by_deviation=true even though its absolute level stays far
+// below column 0's. Columns 2/3 stay at 0 (dead, never compete).
+// reset_fraction=0.25 with 4 mature columns gives top_n=1 exactly, so
+// the outcome unambiguously shows which single column won.
+static void run_warmup_cycles_block4(Block4Store32& store, PlasticityState& st,
+                                     Block4PlasticityCursor& cur) {
+    auto set_col = [&](uint32_t lj, float w, float imp) {
+        auto h = store.get_or_create(0, 0);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            h.set_weight(li, lj, w);
+            h.set_importance(li, lj, imp);
+        }
+    };
+    set_col(0, 1.0f, 50.0f);
+    set_col(1, 1.0f, 1.0f);
+    apply_amortized_block4_plasticity_step(store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                           0.0f, 0.5f);
+    set_col(0, 1.0f, 51.0f);
+    set_col(1, 1.0f, 1.0f);
+    apply_amortized_block4_plasticity_step(store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                           0.0f, 0.5f);
+    set_col(0, 1.0f, 52.0f);
+    set_col(1, 1.0f, 1.0f);
+    apply_amortized_block4_plasticity_step(store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                           0.0f, 0.5f);
+}
+
+static void test_select_by_deviation_picks_growth_rate_not_absolute_level_block4() {
+    // default mode: must pick col 0 (importance 53 > 21).
+    {
+        Block4Store32 store;
+        store.init(4, 4);
+        store.switch_point = 0;
+        PlasticityState st;
+        Block4PlasticityCursor cur;
+        run_warmup_cycles_block4(store, st, cur);
+        auto h = store.get_or_create(0, 0);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            h.set_importance(li, 0, 53.0f); // delta +1, unremarkable
+            h.set_importance(li, 1, 21.0f); // delta +20, a real spike
+        }
+        auto r = apply_amortized_block4_plasticity_step(
+            store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f, 0.5f, 0.9f, 0.0f, 0.9f,
+            0.05f, 100.0f, /*select_by_deviation=*/false);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[0] == 1 && st.col_reset_active[1] == 0,
+              "default mode should pick col 0 (importance 53>21), got col0=%d col1=%d",
+              st.col_reset_active[0], st.col_reset_active[1]);
+    }
+    // select_by_deviation=true: must pick col 1 (the spike).
+    {
+        Block4Store32 store;
+        store.init(4, 4);
+        store.switch_point = 0;
+        PlasticityState st;
+        Block4PlasticityCursor cur;
+        run_warmup_cycles_block4(store, st, cur);
+        auto h = store.get_or_create(0, 0);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li) {
+            h.set_importance(li, 0, 53.0f);
+            h.set_importance(li, 1, 21.0f);
+        }
+        auto r = apply_amortized_block4_plasticity_step(
+            store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f, 0.5f, 0.9f, 0.0f, 0.9f,
+            0.05f, 100.0f, /*select_by_deviation=*/true);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[1] == 1 && st.col_reset_active[0] == 0,
+              "select_by_deviation=true should pick col 1 (the spike), got col0=%d col1=%d",
+              st.col_reset_active[0], st.col_reset_active[1]);
+    }
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -274,6 +352,7 @@ int main() {
     test_bit_equivalence_vs_scattered();
     test_l2_decay_default_is_noop_block4();
     test_l2_decay_strong_when_fully_saturated_block4();
+    test_select_by_deviation_picks_growth_rate_not_absolute_level_block4();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

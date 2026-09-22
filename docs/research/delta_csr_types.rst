@@ -317,6 +317,56 @@ touched cell (not just the frozen pool) while never touching weight;
 and the ramp is smooth (checked at 4 saturation levels, no single step
 close to the full 0-to-1 range).
 
+.. _plasticity_reset.select_by_deviation_early_detection:
+
+select_by_deviation: growth-RATE selection, found by comparing a graduated run against a stuck run
+-----------------------------------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.select_by_deviation_early_detection``
+
+Direct instruction, after a real run using the L2-saturation decay
+above graduated early (step 18366) while the original v3 comparison
+run never did (stuck at vocab=126/k=2 for ~88k steps): "let's see if we
+can get a run that doesn't graduate... and investigate the difference
+between runs with what we have." Comparing the two runs' collected
+column-log data at MATCHED step counts (not matched wall-clock or
+matched outcome) found the stuck run's `col_importance` was already
+growing 17-147x faster than the graduated run's across every q/k/v/
+o_proj pool, visible from as early as step 5000-8000 -- well before
+EITHER run's `l2_sat_ratio`/`l2_decay_strength` had done anything at
+all, and long before the absolute importance LEVEL itself became
+distinguishable in any way a level-based criterion could use.
+
+This exposed a structural gap in the existing top-K-by-importance
+selection: `col_grad_fast`/`col_grad_slow`/`col_grad_var` (and thus
+deviation, the z-score already used to gate blend strength) are
+already tracked for EVERY mature column each cycle, not just the ones
+selected -- but deviation was only ever COMPUTED for whichever columns
+already ranked in the top-K by raw `col_importance` LEVEL. A column
+accelerating dangerously fast while its absolute level is still low
+(exactly what the stuck run's pools looked like for the first several
+thousand steps) can never enter the candidate pool under the existing
+criterion, no matter how anomalous its growth rate is -- selection
+happens too late by construction.
+
+**Fix**: `select_by_deviation` (default `false`, exact byte-identical
+no-op preserving the existing top-K-by-importance selection) flips the
+FROZEN pool's ranking key from `col_importance` (absolute LEVEL) to
+deviation (growth RATE) when `true`. Deviation is now computed for the
+full mature population up front (previously only for the
+already-selected top-K), so the sort/select step can rank by either
+signal without duplicating the z-score computation. The reset/blend
+ACTION on a selected column is unchanged -- only what gets selected.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp`` and
+``tests/unit/test_block4_plasticity_reset.cpp``: default mode is
+byte-identical to the pre-existing top-K-by-importance behavior; a
+2-column scenario (one column with high absolute importance but a
+stable, unremarkable per-cycle delta; one with low absolute importance
+but a sudden large spike) confirms the default mode picks the
+high-level column while ``select_by_deviation=true`` picks the
+spiking column instead, even though its absolute level is far lower.
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

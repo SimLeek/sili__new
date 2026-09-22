@@ -1814,12 +1814,13 @@ class DISLDOLayerV {
                                               float l2_decay_lambda = 0.0f,
                                               float l2_decay_threshold = 0.9f,
                                               float l2_decay_temperature = 0.05f,
-                                              float max_ci = kSynapsePolicyMaxCi) {
+                                              float max_ci = kSynapsePolicyMaxCi,
+                                              bool select_by_deviation = false) {
         auto stats = apply_amortized_plasticity_step(
             weights.connections, static_cast<std::size_t>(n_outputs()), _plasticity_state,
             _plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
             eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var, l2_decay_lambda,
-            l2_decay_threshold, l2_decay_temperature, max_ci);
+            l2_decay_threshold, l2_decay_temperature, max_ci, select_by_deviation);
         py::dict out;
         out["cycle_complete"] = stats.cycle_complete;
         out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
@@ -1839,14 +1840,15 @@ class DISLDOLayerV {
         S chunk_size, float eta, float eta_slow, float eta_slow_catchup, float eta_fast,
         float blend, float reset_fraction, float k, float eta_var = 0.9f,
         float l2_decay_lambda = 0.0f, float l2_decay_threshold = 0.9f,
-        float l2_decay_temperature = 0.05f, float max_ci = kSynapsePolicyMaxCi) {
+        float l2_decay_temperature = 0.05f, float max_ci = kSynapsePolicyMaxCi,
+        bool select_by_deviation = false) {
         py::dict out;
         if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
             auto stats = apply_amortized_block4_plasticity_step(
                 weights.block4, static_cast<std::size_t>(n_outputs()), _block4_plasticity_state,
                 _block4_plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
                 eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var, l2_decay_lambda,
-                l2_decay_threshold, l2_decay_temperature, max_ci);
+                l2_decay_threshold, l2_decay_temperature, max_ci, select_by_deviation);
             out["cycle_complete"] = stats.cycle_complete;
             out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
             out["mean_col_importance"] = stats.mean_col_importance;
@@ -4627,13 +4629,15 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("eta_slow_catchup"), py::arg("eta_fast"), py::arg("blend"),
              py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f,
              py::arg("l2_decay_lambda") = 0.0f, py::arg("l2_decay_threshold") = 0.9f,
-             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("select_by_deviation") = false)
         .def("apply_amortized_block4_plasticity_reset",
              &DISLDOLayerV::apply_amortized_block4_plasticity_reset, py::arg("chunk_size"),
              py::arg("eta"), py::arg("eta_slow"), py::arg("eta_slow_catchup"), py::arg("eta_fast"),
              py::arg("blend"), py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f,
              py::arg("l2_decay_lambda") = 0.0f, py::arg("l2_decay_threshold") = 0.9f,
-             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi)
+             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("select_by_deviation") = false)
         .def("plasticity_column_state", &DISLDOLayerV::plasticity_column_state)
         .def("plasticity_column_state_block4", &DISLDOLayerV::plasticity_column_state_block4)
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
