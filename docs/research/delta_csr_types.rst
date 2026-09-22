@@ -367,6 +367,80 @@ but a sudden large spike) confirms the default mode picks the
 high-level column while ``select_by_deviation=true`` picks the
 spiking column instead, even though its absolute level is far lower.
 
+.. _plasticity_reset.select_by_deviation_early_detection.k_derivation:
+
+select_by_deviation's gate was defeated by construction; fixed with an equation-derived threshold, not a guessed one
+-------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.select_by_deviation_early_detection.k_derivation``
+
+A real 100k-step comparison run using ``select_by_deviation=True``
+(``sili_peridot``'s v5 launcher) got stuck at vocab=16/k=3 for
+37,750+ steps -- far worse than every other comparison arm, including
+the plain unmodified baseline. Direct instruction after the finding:
+"How ... did you think that would not harm the base model?"
+
+**Root cause, confirmed via direct log analysis, not guessed**:
+``select_by_deviation`` selects the TOP ``reset_fraction`` of the
+mature population's deviations every cycle -- by construction, the
+selected value(s) are the population's own extreme order statistics.
+The gate (``plasticity_boost = max(0, deviation - k)``) used the SAME
+fixed ``k`` that had been calibrated for the *default* top-importance
+mode's deviation distribution -- a totally different, non-maximal
+subpopulation. Grepping the ``dev=`` value logged for the "worst"
+column each cycle in both a real ``select_by_deviation=True`` run and
+a real top-importance run: 177/182 cycles (97.25%) exceeded ``k=1.0``
+under ``select_by_deviation``, vs only 89/400 (22.25%) under
+top-importance selection. The gate was open almost every single cycle
+-- near-full-strength resets fired continuously regardless of whether
+anything was actually pathological, the opposite of the mechanism's
+entire "only intervene on genuine anomalies" purpose.
+
+**Fix, equation-derived rather than a new guessed constant** (direct
+instruction: "unless you can actually find a k value based on an
+equation and not a guess. I vastly prefer not to add guessed
+hyperparameters"): ``deviation_by_col[j]`` is constructed as a z-score
+-- under the "nothing pathological" null hypothesis, each mature
+column's deviation is approximately an independent standard-normal
+draw. Selecting the top order statistics of ``N`` such draws each
+cycle means the relevant question isn't "is this deviation big" but
+"is it bigger than what pure chance among ``N`` columns would already
+produce, even with nothing wrong." That's exactly the classical
+Gaussian extreme-value asymptotic (Fisher-Tippett-Gnedenko): the
+expected value of the MAXIMUM of ``N`` i.i.d. standard normals is
+
+.. math::
+
+   E[\\max_N] \\approx \\sqrt{2 \\ln N}
+
+a closed-form function of the population size alone -- no calibration
+against observed data, no free constant to pick. ``k_effective =
+sqrt(2*ln(mature.size()))`` replaces the passed-in ``k`` ONLY when
+``select_by_deviation=true``; ``k`` is used unchanged (its own,
+separately-calibrated meaning) when ``select_by_deviation=false``, so
+the default mode's existing behavior is untouched. This also has the
+right qualitative shape for free: wider layers (more candidates) get a
+correspondingly higher threshold, matching the standard
+Bonferroni-style correction for implicitly running ``N`` simultaneous
+comparisons every cycle -- exactly the property a fixed constant could
+never have.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp``
+(``test_select_by_deviation_gate_uses_evt_k_not_passed_k``) and
+``tests/unit/test_block4_plasticity_reset.cpp``
+(``test_select_by_deviation_gate_uses_evt_k_not_passed_k_block4``): a
+4-mature-column scenario (N=4, expected threshold
+:math:`\\sqrt{2\\ln 4} \\approx 1.665`) confirms (a) the passed-in
+``k`` has NO effect on the resulting ``plasticity_boost`` under
+``select_by_deviation=true`` (re-run with ``k=0`` vs ``k=1000``,
+identical result), and (b) the resulting boost exactly matches
+``max(0, deviation - sqrt(2*ln(N)))`` computed independently from the
+engine's own post-call ``col_grad_fast``/``col_grad_slow``/
+``col_grad_var`` state -- not merely "some different number," the
+literal EVT formula. A companion regression test confirms the default
+(``select_by_deviation=false``) mode still uses the passed ``k``
+directly, unaffected by this change.
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

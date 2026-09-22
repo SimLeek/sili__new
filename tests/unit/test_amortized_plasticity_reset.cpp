@@ -572,6 +572,119 @@ static void test_select_by_deviation_picks_growth_rate_not_absolute_level() {
     }
 }
 
+// select_by_deviation's gate: EVT-derived k, not a guessed constant --
+// direct correction after a real 100k-step comparison run
+// (select_by_deviation=True) got stuck far worse than any other
+// comparison arm. Root cause, confirmed via direct log analysis: this
+// mode always SELECTS the population's own MAXIMUM deviation each
+// cycle, so gating that against a FIXED k (calibrated for the
+// unrelated top-importance mode's own, non-maximal deviation
+// distribution) opened the gate 97.25% of cycles vs only 22.25% under
+// top-importance selection -- the gate was defeated by construction,
+// not by a badly-chosen constant. Fix: deviation is built as a
+// z-score, so under the "nothing pathological" null hypothesis it's
+// approximately standard-normal per column; the expected value of the
+// MAXIMUM of N such draws is the classical Gaussian extreme-value
+// asymptotic E[max_N] ~ sqrt(2*ln(N)) (Fisher-Tippett-Gnedenko) --
+// closed-form in the population size alone, no calibration against
+// real data needed, and it scales UP automatically for wider layers
+// (more candidates -> a larger expected maximum by pure chance, a
+// Bonferroni-style correction for the N simultaneous comparisons this
+// mode implicitly runs every cycle). See
+// docs/research/toy_tile_recurrence_rmt.rst:
+// plasticity_reset_design.select_by_deviation_early_detection.k_derivation.
+static void test_select_by_deviation_gate_uses_evt_k_not_passed_k() {
+    // 4 mature columns (N=4) -- expected threshold sqrt(2*ln(4)).
+    const float k_expected = std::sqrt(2.0f * std::log(4.0f));
+
+    auto make_and_warm = [](PlasticityState& st, PlasticityCellCursor& cur) {
+        auto conn = make_dense_conn(
+            1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+            [](std::size_t, std::size_t) { return 10.0f; });
+        for (int cycle = 0; cycle < 3; ++cycle)
+            apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                            0.0f, 0.5f);
+        return conn;
+    };
+
+    float boost_low_k = 0.0f, boost_high_k = 0.0f, deviation_readback = 0.0f;
+    {
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        auto conn = make_and_warm(st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 3, 1.0f, 60.0f); // col 3: delta +50, a real spike
+        auto r = apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                 0.1f, 0.25f, /*k=*/0.0f, 0.9f, 0.0f, 0.9f, 0.05f,
+                                                 100.0f, /*select_by_deviation=*/true);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[3] == 1, "col 3 (the spike) should be selected, got %d",
+              st.col_reset_active[3]);
+        const float std_dev = std::sqrt(std::max(0.0f, st.col_grad_var[3]));
+        deviation_readback = (st.col_grad_fast[3] - st.col_grad_slow[3]) / (std_dev + 1e-8f);
+        boost_low_k = st.col_plasticity_boost[3];
+    }
+    {
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        auto conn = make_and_warm(st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 3, 1.0f, 60.0f);
+        apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
+                                        /*k=*/1000.0f, 0.9f, 0.0f, 0.9f, 0.05f, 100.0f,
+                                        /*select_by_deviation=*/true);
+        boost_high_k = st.col_plasticity_boost[3];
+    }
+    CHECK(std::abs(boost_low_k - boost_high_k) < 1e-5f,
+          "passed-in k must be IGNORED under select_by_deviation=true (gate uses an "
+          "EVT-derived threshold instead) -- got %f (k=0) vs %f (k=1000)",
+          boost_low_k, boost_high_k);
+    const float expected_boost = std::max(0.0f, deviation_readback - k_expected);
+    CHECK(std::abs(boost_low_k - expected_boost) < 1e-3f,
+          "plasticity_boost should equal max(0, deviation - sqrt(2*ln(N))) = %f, got %f",
+          expected_boost, boost_low_k);
+}
+
+static void test_default_mode_gate_still_uses_passed_k() {
+    // Regression: select_by_deviation=false must still use the PASSED k
+    // unchanged -- only the deviation-selection mode's gate is replaced
+    // by the EVT-derived threshold. Same 4-column fixture, but ranked
+    // (and gated) by importance, not deviation -- col 3 (imp=60) still
+    // wins on importance alone.
+    auto make_and_warm = [](PlasticityState& st, PlasticityCellCursor& cur) {
+        auto conn = make_dense_conn(
+            1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+            [](std::size_t, std::size_t) { return 10.0f; });
+        for (int cycle = 0; cycle < 3; ++cycle)
+            apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                            0.0f, 0.5f);
+        return conn;
+    };
+    float boost_k0 = 0.0f, boost_k_big = 0.0f;
+    {
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        auto conn = make_and_warm(st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 3, 1.0f, 60.0f);
+        apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
+                                        /*k=*/0.0f, 0.9f, 0.0f, 0.9f, 0.05f, 100.0f,
+                                        /*select_by_deviation=*/false);
+        boost_k0 = st.col_plasticity_boost[3];
+    }
+    {
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        auto conn = make_and_warm(st, cur);
+        ValueAccessor<VT>::set_live(conn.values, 3, 1.0f, 60.0f);
+        apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f,
+                                        /*k=*/1000.0f, 0.9f, 0.0f, 0.9f, 0.05f, 100.0f,
+                                        /*select_by_deviation=*/false);
+        boost_k_big = st.col_plasticity_boost[3];
+    }
+    CHECK(boost_k0 > boost_k_big + 500.0f || (boost_k0 > 0.0f && boost_k_big == 0.0f),
+          "default mode must still use the PASSED k (k=0 -> boost=%f, k=1000 -> boost=%f "
+          "should have collapsed to 0)",
+          boost_k0, boost_k_big);
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -589,6 +702,8 @@ int main() {
     test_l2_decay_ramp_is_smooth_not_a_hard_step();
     test_select_by_deviation_off_matches_existing_importance_selection();
     test_select_by_deviation_picks_growth_rate_not_absolute_level();
+    test_select_by_deviation_gate_uses_evt_k_not_passed_k();
+    test_default_mode_gate_still_uses_passed_k();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

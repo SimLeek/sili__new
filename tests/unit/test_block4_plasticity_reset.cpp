@@ -343,6 +343,77 @@ static void test_select_by_deviation_picks_growth_rate_not_absolute_level_block4
     }
 }
 
+// select_by_deviation's gate: EVT-derived k, not a guessed constant --
+// block4 mirror of the scattered coverage (see that file's header
+// comment for the full derivation: since deviation is a z-score, the
+// expected maximum of N approximately-standard-normal draws is
+// sqrt(2*ln(N)), a closed-form function of population size, replacing
+// the fixed k that was defeated by construction once selection always
+// returns the population's own maximum). Single 4x4 tile -> N=4
+// mature columns, same as the scattered test, for the same expected
+// threshold sqrt(2*ln(4)).
+static void test_select_by_deviation_gate_uses_evt_k_not_passed_k_block4() {
+    const float k_expected = std::sqrt(2.0f * std::log(4.0f));
+
+    auto make_and_warm = [](PlasticityState& st, Block4PlasticityCursor& cur) {
+        Block4Store32 store;
+        store.init(4, 4);
+        store.switch_point = 0;
+        auto set_all = [&]() {
+            auto h = store.get_or_create(0, 0);
+            for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+                for (uint32_t lj = 0; lj < BLOCK4_TILE; ++lj) {
+                    h.set_weight(li, lj, 1.0f);
+                    h.set_importance(li, lj, 10.0f);
+                }
+        };
+        set_all();
+        for (int cycle = 0; cycle < 3; ++cycle)
+            apply_amortized_block4_plasticity_step(store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                   0.1f, 0.0f, 0.5f);
+        return store;
+    };
+
+    float boost_low_k = 0.0f, boost_high_k = 0.0f, deviation_readback = 0.0f;
+    {
+        PlasticityState st;
+        Block4PlasticityCursor cur;
+        auto store = make_and_warm(st, cur);
+        auto h = store.get_or_create(0, 0);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            h.set_importance(li, 3, 60.0f); // col 3: delta +50, a real spike
+        auto r = apply_amortized_block4_plasticity_step(
+            store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f, 0.25f, /*k=*/0.0f, 0.9f, 0.0f,
+            0.9f, 0.05f, 100.0f, /*select_by_deviation=*/true);
+        CHECK(r.cycle_complete, "cycle should complete");
+        CHECK(st.col_reset_active[3] == 1, "col 3 (the spike) should be selected, got %d",
+              st.col_reset_active[3]);
+        const float std_dev = std::sqrt(std::max(0.0f, st.col_grad_var[3]));
+        deviation_readback = (st.col_grad_fast[3] - st.col_grad_slow[3]) / (std_dev + 1e-8f);
+        boost_low_k = st.col_plasticity_boost[3];
+    }
+    {
+        PlasticityState st;
+        Block4PlasticityCursor cur;
+        auto store = make_and_warm(st, cur);
+        auto h = store.get_or_create(0, 0);
+        for (uint32_t li = 0; li < BLOCK4_TILE; ++li)
+            h.set_importance(li, 3, 60.0f);
+        apply_amortized_block4_plasticity_step(store, 4, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.1f,
+                                               0.25f, /*k=*/1000.0f, 0.9f, 0.0f, 0.9f, 0.05f,
+                                               100.0f, /*select_by_deviation=*/true);
+        boost_high_k = st.col_plasticity_boost[3];
+    }
+    CHECK(std::abs(boost_low_k - boost_high_k) < 1e-5f,
+          "passed-in k must be IGNORED under select_by_deviation=true -- got %f (k=0) vs "
+          "%f (k=1000)",
+          boost_low_k, boost_high_k);
+    const float expected_boost = std::max(0.0f, deviation_readback - k_expected);
+    CHECK(std::abs(boost_low_k - expected_boost) < 1e-3f,
+          "plasticity_boost should equal max(0, deviation - sqrt(2*ln(N))) = %f, got %f",
+          expected_boost, boost_low_k);
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -353,6 +424,7 @@ int main() {
     test_l2_decay_default_is_noop_block4();
     test_l2_decay_strong_when_fully_saturated_block4();
     test_select_by_deviation_picks_growth_rate_not_absolute_level_block4();
+    test_select_by_deviation_gate_uses_evt_k_not_passed_k_block4();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }
