@@ -203,6 +203,48 @@ block4 mirror of all of the above, plus BIT-EQUIVALENCE against the
 scattered path for the same logical values -- same standard this
 project's every scattered/block4 pair is held to).
 
+.. _plasticity_reset.plasticity_column_state:
+
+Per-column state snapshot accessors (offline data collection)
+--------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.plasticity_column_state``
+
+``DISLDOLayerV::plasticity_column_state()``/``_block4()`` (``cpu_backend.cpp``)
+expose read-only, zero-copy views of ``PlasticityState``'s own arrays
+(``col_importance``, ``col_grad_slow``/``col_grad_fast``/``col_grad_var``,
+``col_age``, ``col_reset_active``) -- same
+``get_weights_vals``/``get_importance`` precedent, no new state or
+computation. Added so a training run can log real per-column state at
+every completed cycle, toward later fitting a reset-selection equation
+from actual data instead of a hand-derived heuristic. Deliberately
+COLUMN granularity, not per-synapse: the mechanism above only ever
+selects at column granularity, so that's the only granularity a
+selection equation needs.
+
+The Python model layer (``ToyTileRecurrenceRMT.apply_plasticity_reset``,
+sili_peridot) copies these views into plain numpy arrays
+(``include_column_state=True``) only for a pool whose cycle just
+completed, and only when writing to disk (``plasticity_column_log_dir``
+in ``train_mqar_curriculum.py``, one small ``.npz`` per completed
+cycle per layer/pool, including ``step``/``loss_ema``/``acc_ema``).
+
+**Real bug found via smoke-testing the actual logging wiring (not
+planning):** a dense-loaded real layer's content lives ENTIRELY in
+block4 (``load_dense_values`` routes through ``block4_load_dense_fp32``
+only) -- its SCATTERED arm has 0 nnz for the whole run, so
+``apply_amortized_plasticity_step``'s early-return path
+(``nnz()==0``) reports ``cycle_complete=true`` on literally every
+single call, with ``col_importance`` etc. still at their
+zero-initialized values. Logging that naively would have written a
+stream of degenerate all-zero snapshots -- confirmed on a real
+500-step smoke run: 3036 files written, the vast majority pure noise.
+Fixed with ``DISLDOLayerV::scattered_nnz()`` (distinct from the
+existing combined ``nnz()``), gating column-state attachment to arms
+that actually have real content -- verified via a regression re-run of
+the same smoke test: 36 files (only under the real ``*.block4``
+directories), each holding genuine non-zero, varying values.
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

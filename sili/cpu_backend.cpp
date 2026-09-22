@@ -1464,6 +1464,17 @@ class DISLDOLayerV {
     S nnz() const {
         return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
     }
+    // Scattered-arm-only nnz -- `nnz()` above is the COMBINED total
+    // (scattered + block4), which doesn't distinguish "this layer has no
+    // live content at all" from "this layer's content all lives in
+    // block4, scattered is empty" (the common case for a dense-loaded
+    // real layer -- load_dense_values() routes entirely through
+    // block4_load_dense_fp32, scattered stays at 0 nnz for the whole
+    // run). Added so callers (e.g. plasticity-reset column-state
+    // logging) can skip a storage arm that will NEVER have real content
+    // for this run's config, instead of writing a stream of degenerate
+    // all-zero snapshots.
+    S scattered_nnz() const { return static_cast<S>(weights.connections.nnz()); }
     Block4View32 block4() { return Block4View32(weights.block4); }
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
@@ -1840,6 +1851,75 @@ class DISLDOLayerV {
             out["mean_deviation"] = 0.0;
             out["min_deviation"] = 0.0;
             out["max_deviation"] = 0.0;
+        }
+        return out;
+    }
+
+    // Read-only per-column snapshot of apply_amortized_plasticity_reset's
+    // internal PlasticityState -- zero-copy views into the SAME arrays
+    // the mechanism already maintains (get_weights_vals/get_importance
+    // precedent), no new state or computation. Added to support offline
+    // data collection for fitting a reset-selection equation from real
+    // training data: the mechanism only ever selects at COLUMN
+    // granularity (col_importance/deviation/age are per-column
+    // aggregates, never per-synapse), so this is the natural and only
+    // granularity needed -- see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // Empty arrays before the state is sized (i.e. before the first
+    // apply_amortized_plasticity_reset call), matching
+    // PlasticityState::ensure_sized's own lazy-sizing convention.
+    py::dict plasticity_column_state() {
+        py::dict out;
+        out["col_importance"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_importance.size()}, {sizeof(float)},
+            _plasticity_state.col_importance.data(), py::cast(this));
+        out["col_grad_slow"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_slow.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_slow.data(), py::cast(this));
+        out["col_grad_fast"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_fast.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_fast.data(), py::cast(this));
+        out["col_grad_var"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_var.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_var.data(), py::cast(this));
+        out["col_age"] = py::array_t<uint32_t>({(py::ssize_t)_plasticity_state.col_age.size()},
+                                               {sizeof(uint32_t)}, _plasticity_state.col_age.data(),
+                                               py::cast(this));
+        out["col_reset_active"] = py::array_t<uint8_t>(
+            {(py::ssize_t)_plasticity_state.col_reset_active.size()}, {sizeof(uint8_t)},
+            _plasticity_state.col_reset_active.data(), py::cast(this));
+        return out;
+    }
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // apply_amortized_block4_plasticity_reset already established.
+    py::dict plasticity_column_state_block4() {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            out["col_importance"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_importance.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_importance.data(), py::cast(this));
+            out["col_grad_slow"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_slow.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_slow.data(), py::cast(this));
+            out["col_grad_fast"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_fast.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_fast.data(), py::cast(this));
+            out["col_grad_var"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_var.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_var.data(), py::cast(this));
+            out["col_age"] = py::array_t<uint32_t>(
+                {(py::ssize_t)_block4_plasticity_state.col_age.size()}, {sizeof(uint32_t)},
+                _block4_plasticity_state.col_age.data(), py::cast(this));
+            out["col_reset_active"] = py::array_t<uint8_t>(
+                {(py::ssize_t)_block4_plasticity_state.col_reset_active.size()}, {sizeof(uint8_t)},
+                _block4_plasticity_state.col_reset_active.data(), py::cast(this));
+        } else {
+            out["col_importance"] = py::array_t<float>(0);
+            out["col_grad_slow"] = py::array_t<float>(0);
+            out["col_grad_fast"] = py::array_t<float>(0);
+            out["col_grad_var"] = py::array_t<float>(0);
+            out["col_age"] = py::array_t<uint32_t>(0);
+            out["col_reset_active"] = py::array_t<uint8_t>(0);
         }
         return out;
     }
@@ -4537,6 +4617,8 @@ PYBIND11_MODULE(_cpu, m) {
              &DISLDOLayerV::apply_amortized_block4_plasticity_reset, py::arg("chunk_size"),
              py::arg("eta"), py::arg("eta_slow"), py::arg("eta_slow_catchup"), py::arg("eta_fast"),
              py::arg("blend"), py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f)
+        .def("plasticity_column_state", &DISLDOLayerV::plasticity_column_state)
+        .def("plasticity_column_state_block4", &DISLDOLayerV::plasticity_column_state_block4)
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))
@@ -4583,6 +4665,7 @@ PYBIND11_MODULE(_cpu, m) {
         .def_property_readonly("n_inputs", &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz", &DISLDOLayerV::nnz)
+        .def_property_readonly("scattered_nnz", &DISLDOLayerV::scattered_nnz)
         .def_property_readonly("block4",
                                py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 

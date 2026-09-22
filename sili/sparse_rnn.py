@@ -1098,6 +1098,22 @@ class DISLDOLayer32(_SparseLayerBase):
             chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var
         )
 
+    def plasticity_column_state(self) -> dict:
+        """Read-only per-column snapshot (scattered arm), zero-copy view.
+        Empty arrays before the first apply call. See
+        docs/research/delta_csr_types.rst:plasticity_column_state."""
+        return self._c.plasticity_column_state()
+
+    def plasticity_column_state_block4(self) -> dict:
+        """block4 counterpart to plasticity_column_state."""
+        return self._c.plasticity_column_state_block4()
+
+    @property
+    def scattered_nnz(self) -> int:
+        """Scattered-arm-only nnz (unlike combined `.nnz`) -- see
+        docs/research/delta_csr_types.rst:plasticity_column_state."""
+        return self._c.scattered_nnz
+
     def forward(
         self,
         x,
