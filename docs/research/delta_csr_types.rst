@@ -245,6 +245,78 @@ that actually have real content -- verified via a regression re-run of
 the same smoke test: 36 files (only under the real ``*.block4``
 directories), each holding genuine non-zero, varying values.
 
+.. _plasticity_reset.l2_saturation_decay:
+
+L2-saturation-gated decay on col_importance
+--------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.l2_saturation_decay``
+
+Found via offline replay of a real 100k-step run's collected per-column
+data (``plasticity_column_state``, above): ``col_importance`` climbs
+from near-zero to the ci accumulator's ``max_ci=100`` clamp by roughly
+step 20k-50k, and by a run's end most of some pools' populations sit
+tied at that ceiling (``v_proj`` 288/288, ``k_proj`` 285/288,
+``input_proj`` 280/288 in the observed run). Population std of raw
+``col_importance`` collapses from real spread (e.g. 4.73 at step 21k)
+to the fp32 noise floor (0.0001) by late training in those pools --
+once most of a pool is tied, top-K-by-importance selection stops
+discriminating "at-risk" columns and just picks whatever a sort's
+tie-break lands on (very likely the source of a previously-flagged,
+never-diagnosed pattern: the exact same ``dev=X.XX[X.XX,X.XX],imp=Y``
+line repeating verbatim across many consecutive log ticks).
+
+**A uniform post-hoc re-scoring of the already-logged trajectory is a
+mathematically guaranteed no-op for selection**, tried and rejected
+first: ``top_k(importance) == top_k(c*importance)`` for any positive
+scalar ``c``, so multiplying a population's importance by the same
+per-cycle scalar (whatever function of population state produced it)
+can never change which columns rank highest. Confirmed empirically:
+an offline replay applying exactly this shape reproduced ``raw``'s
+selection in every single row, 100% identical. Real decay has to act
+on the REAL underlying ``importance`` accumulator during training, not
+a fixed historical log.
+
+**Design, direct instruction** ("soft threshold if we can not hard...
+the entire network saturating at max importance doesn't seem to be
+good since loss plateaus and the model fails to advance"): a
+population-level L2-norm saturation ratio, current-state ONLY --
+``sat_ratio = ||col_importance||_2 / (max_ci * sqrt(n_out))``, 1.0
+exactly when every column sits at the clamp. A first attempt used
+``col_age`` (cycles since last reset) as the gating counter and was
+explicitly rejected: "If col_age is steps, time, or some other
+counter, that counter will eventually hit an overflow error or have
+other numerical instability, so we want to avoid it since we're
+targeting long term learning" -- this mechanism's other EMA-based knobs
+are already held to that same infinite-horizon-safe standard (see the
+scale-invariance discussion in
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design``),
+and ``sat_ratio`` is a pure function of the CURRENT ``col_importance``
+vector, never elapsed time.
+
+``sat_ratio`` is passed through a soft sigmoid, not a hard cutoff:
+``decay_strength = sigmoid((sat_ratio - l2_decay_threshold) /
+l2_decay_temperature)`` -- near-zero comfortably below threshold,
+ramping smoothly toward 1 as the population saturates, continuous
+everywhere (no discontinuity at the threshold). Computed once per
+cycle boundary (``plasticity_select_cycle_boundary``), stored on
+``PlasticityState`` and applied during the SAME per-cell touch
+traversal the frozen-pool reset already uses -- but to EVERY touched
+cell, not just the top-K reset candidates (a separate, population-wide
+signal): ``importance *= (1 - l2_decay_lambda * decay_strength)``.
+Never touches weight, only importance. ``l2_decay_lambda=0.0``
+(default) is an exact no-op (new-shared-parameter backward-compat
+convention). ``l2_sat_ratio``/``l2_decay_strength`` are always reported
+on ``PlasticityStats`` (even at ``lambda=0``) for visibility.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp`` and
+``tests/unit/test_block4_plasticity_reset.cpp``: default is a byte-exact
+no-op; ``decay_strength`` stays near-zero far below threshold and
+becomes substantial once fully saturated; the decay touches EVERY
+touched cell (not just the frozen pool) while never touching weight;
+and the ramp is smooth (checked at 4 saturation levels, no single step
+close to the full 0-to-1 range).
+
 .. _scale_policy.nan_inf_guard:
 
 Scale-update policies: why every one guards against NaN/Inf

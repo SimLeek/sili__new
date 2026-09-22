@@ -203,6 +203,68 @@ static void test_bit_equivalence_vs_scattered() {
     }
 }
 
+// L2-saturation-gated decay -- block4 mirror of the scattered coverage
+// in test_amortized_plasticity_reset.cpp (see that file's header
+// comment for the full derivation). Same shared cycle-boundary function
+// computes l2_sat_ratio/l2_decay_strength; only the per-cell application
+// differs (block4's tile handle vs scattered's ValueAccessor).
+
+static Block4Store32 make_uniform_store(float w_value, float imp_value) {
+    Block4Store32 store;
+    store.init(8, 8);
+    store.switch_point = 0; // force dense tiles, simplest case
+    for (uint32_t br = 0; br < 2; ++br) {
+        for (uint32_t bc = 0; bc < 2; ++bc) {
+            auto h = store.get_or_create(br, bc);
+            for (uint32_t li = 0; li < 4; ++li) {
+                for (uint32_t lj = 0; lj < 4; ++lj) {
+                    h.set_weight(li, lj, w_value);
+                    h.set_importance(li, lj, imp_value);
+                }
+            }
+        }
+    }
+    return store;
+}
+
+static void test_l2_decay_default_is_noop_block4() {
+    auto store = make_uniform_store(1.0f, 100.0f); // already at max_ci
+    PlasticityState st;
+    Block4PlasticityCursor cur;
+    apply_amortized_block4_plasticity_step(store, 8, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                           0.0f, 0.5f);
+    apply_amortized_block4_plasticity_step(store, 8, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                           0.0f, 0.5f);
+    auto h = store.get_or_create(0, 0);
+    const float imp = h.get_importance(0, 0);
+    CHECK(std::abs(imp - 100.0f) < 1e-4f,
+          "default l2_decay_lambda=0 must not touch block4 importance at all, got %f", imp);
+}
+
+static void test_l2_decay_strong_when_fully_saturated_block4() {
+    auto store = make_uniform_store(5.0f, 100.0f);
+    PlasticityState st;
+    Block4PlasticityCursor cur;
+    apply_amortized_block4_plasticity_step(store, 8, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                           0.0f, 0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    auto r2 = apply_amortized_block4_plasticity_step(store, 8, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                     0.5f, 0.0f, 0.5f, 0.9f,
+                                                     /*l2_decay_lambda=*/1.0f);
+    CHECK(r2.l2_sat_ratio > 0.99,
+          "sat_ratio should be ~1.0 for a fully-saturated block4 population, got %f",
+          r2.l2_sat_ratio);
+    apply_amortized_block4_plasticity_step(store, 8, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                           0.0f, 0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    auto h = store.get_or_create(0, 0);
+    const float imp = h.get_importance(0, 0);
+    const float w = h.get_weight(0, 0);
+    CHECK(imp < 99.0f,
+          "block4 importance should visibly shrink once population is saturated and lambda>0, "
+          "got %f",
+          imp);
+    CHECK(std::abs(w - 5.0f) < 1e-5f, "L2 decay must never touch block4 weight, got w=%f", w);
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -210,6 +272,8 @@ int main() {
     test_maturity_gate_excludes_just_reset_column();
     test_empty_store();
     test_bit_equivalence_vs_scattered();
+    test_l2_decay_default_is_noop_block4();
+    test_l2_decay_strong_when_fully_saturated_block4();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }

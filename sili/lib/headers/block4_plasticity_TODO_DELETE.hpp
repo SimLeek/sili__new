@@ -44,7 +44,8 @@ struct Block4PlasticityCursor {
 inline PlasticityStats apply_amortized_block4_plasticity_step(
     Block4Store32& store, std::size_t n_out, PlasticityState& state, Block4PlasticityCursor& cursor,
     std::size_t chunk_size, float eta, float eta_slow, float eta_slow_catchup, float eta_fast,
-    float blend, float reset_fraction, float k, float eta_var = 0.9f) {
+    float blend, float reset_fraction, float k, float eta_var = 0.9f, float l2_decay_lambda = 0.0f,
+    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
     state.ensure_sized(n_out);
     const auto& BL = store.block_layout;
     const std::size_t n_rows = BL.rows;
@@ -113,14 +114,36 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
 
                     state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
 
+                    float new_w = w;
+                    float new_imp = imp;
+                    bool cell_written = false;
+
                     if (state.col_reset_active[j]) {
                         const float strength = blend * state.col_plasticity_boost[j];
                         const float fan_in_scale =
                             1.0f /
                             std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_in_this_row)));
                         const float fresh = fp4_stochastic_normal01() * fan_in_scale;
-                        handle.set_weight(li, lj, (1.0f - strength) * w + strength * fresh);
-                        handle.set_importance(li, lj, (1.0f - strength) * imp);
+                        new_w = (1.0f - strength) * w + strength * fresh;
+                        new_imp = (1.0f - strength) * imp;
+                        cell_written = true;
+                    }
+
+                    // L2-saturation-gated decay -- see
+                    // delta_csr_types.hpp's plasticity_select_cycle_boundary
+                    // and test_amortized_plasticity_reset.cpp's header
+                    // comment for the full derivation. Same population-
+                    // level, current-state-only signal as the scattered
+                    // path; l2_decay_lambda=0.0 (default) is an exact
+                    // no-op.
+                    if (l2_decay_lambda > 0.0f && state.l2_decay_strength > 0.0f) {
+                        new_imp *= (1.0f - l2_decay_lambda * state.l2_decay_strength);
+                        cell_written = true;
+                    }
+
+                    if (cell_written) {
+                        handle.set_weight(li, lj, new_w);
+                        handle.set_importance(li, lj, new_imp);
                     }
                 }
             }
@@ -158,6 +181,7 @@ inline PlasticityStats apply_amortized_block4_plasticity_step(
     out.cycle_complete = cycle_complete;
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
-                                         reset_fraction, k, eta_var, blend, out);
+                                         reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
+                                         l2_decay_temperature, max_ci);
     return out;
 }

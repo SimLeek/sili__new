@@ -1055,6 +1055,10 @@ class DISLDOLayer32(_SparseLayerBase):
         reset_fraction: float,
         k: float,
         eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
     ) -> dict:
         """EXPERIMENTAL, added 2026-09-20 -- per-neuron utility-based
         plasticity reset (Continual-Backprop-inspired, Dohare et al.
@@ -1072,9 +1076,28 @@ class DISLDOLayer32(_SparseLayerBase):
         see the design doc's dead_pool_pruned section. Pair with
         apply_amortized_block4_plasticity_reset (block4-storage arm) for
         full layer coverage. May be removed if testing doesn't show
-        benefit."""
+        benefit.
+
+        l2_decay_lambda=0.0 (default) is an exact no-op. When >0, a
+        SEPARATE population-level decay shrinks EVERY touched column's
+        importance (not just the frozen-pool picks), gated by a soft
+        sigmoid on how close the population's L2 norm sits to the
+        max_ci ceiling -- see
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay."""
         return self._c.apply_amortized_plasticity_reset(
-            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var
+            chunk_size,
+            eta,
+            eta_slow,
+            eta_slow_catchup,
+            eta_fast,
+            blend,
+            reset_fraction,
+            k,
+            eta_var,
+            l2_decay_lambda,
+            l2_decay_threshold,
+            l2_decay_temperature,
+            max_ci,
         )
 
     def apply_amortized_block4_plasticity_reset(
@@ -1088,6 +1111,10 @@ class DISLDOLayer32(_SparseLayerBase):
         reset_fraction: float,
         k: float,
         eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
     ) -> dict:
         """block4-storage counterpart to apply_amortized_plasticity_reset
         -- see that method's own docstring. chunk_size counts TILES here
@@ -1095,7 +1122,19 @@ class DISLDOLayer32(_SparseLayerBase):
         bound on DISLDOLayerV (fp32). May be removed if testing doesn't
         show benefit."""
         return self._c.apply_amortized_block4_plasticity_reset(
-            chunk_size, eta, eta_slow, eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var
+            chunk_size,
+            eta,
+            eta_slow,
+            eta_slow_catchup,
+            eta_fast,
+            blend,
+            reset_fraction,
+            k,
+            eta_var,
+            l2_decay_lambda,
+            l2_decay_threshold,
+            l2_decay_temperature,
+            max_ci,
         )
 
     def plasticity_column_state(self) -> dict:

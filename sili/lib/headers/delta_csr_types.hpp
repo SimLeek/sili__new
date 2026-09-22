@@ -1081,6 +1081,9 @@ struct PlasticityState {
     std::vector<float> col_plasticity_boost; // computed at selection time, held for the next cycle
     std::vector<uint32_t> col_age;           // cycles since this column was last flagged
     std::vector<uint8_t> col_reset_active;   // FROZEN pool flag for the current cycle
+    float l2_decay_strength = 0.0f;          // persisted from the last cycle boundary (see
+    // l2_saturation_decay below); applied to every touched cell until the next boundary
+    // recomputes it. Starts at 0 -- no decay before any cycle has completed.
     bool sized = false;
 
     void ensure_sized(std::size_t n_out) {
@@ -1107,6 +1110,10 @@ struct PlasticityStats {
     double min_deviation = 0.0;  // distribution logging: lets k be calibrated from real data
     double max_deviation =
         0.0; // instead of a blind guess (see plasticity_reset_design.k_recalibration)
+    double l2_sat_ratio = 0.0; // ||col_importance||_2 / (max_ci*sqrt(n_out)), current state
+    // only -- 1.0 means the whole population sits at the ci accumulator's clamp. See
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+    double l2_decay_strength = 0.0; // soft-sigmoid gate on l2_sat_ratio, in [0,1)
 };
 
 // Storage-agnostic cell-walk cursor -- (row, absolute position within
@@ -1128,10 +1135,10 @@ struct PlasticityCellCursor {
 // plus a separate BOTTOM-K-by-col_util_dead (DEAD pool, ungated).
 // Callers: run this ONLY when a full cell-touch cycle has just
 // completed (out.cycle_complete already true).
-inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t n_out,
-                                             float eta_slow, float eta_slow_catchup, float eta_fast,
-                                             float reset_fraction, float k, float eta_var,
-                                             float blend, PlasticityStats& out) {
+inline void plasticity_select_cycle_boundary(
+    PlasticityState& state, std::size_t n_out, float eta_slow, float eta_slow_catchup,
+    float eta_fast, float reset_fraction, float k, float eta_var, float blend, PlasticityStats& out,
+    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
     constexpr std::size_t maturity_cycles = 1;
     std::vector<std::size_t> mature;
     mature.reserve(n_out);
@@ -1260,15 +1267,41 @@ inline void plasticity_select_cycle_boundary(PlasticityState& state, std::size_t
                              : 0.0;
     out.min_deviation = min_deviation;
     out.max_deviation = max_deviation;
+
+    // L2-saturation-gated decay signal (direct instruction, see file
+    // header comment for the full derivation): a pure function of the
+    // population's CURRENT col_importance vector, never a step/age
+    // counter, so it stays well-defined at any horizon. sat_ratio is
+    // ||col_importance||_2 relative to the fully-saturated ceiling
+    // ||max_ci*ones(n)||_2 = max_ci*sqrt(n) -- 1.0 exactly when every
+    // column sits at the ci accumulator's own clamp. Passed through a
+    // SOFT sigmoid (not a hard threshold): near 0 while comfortably
+    // below l2_decay_threshold, ramping smoothly toward 1 as the
+    // population saturates, with no discontinuity at the threshold
+    // itself.
+    double sum_sq = 0.0;
+    for (std::size_t j = 0; j < n_out; ++j) {
+        const double v = static_cast<double>(state.col_importance[j]);
+        sum_sq += v * v;
+    }
+    const double l2_norm = std::sqrt(sum_sq);
+    const double ceiling_norm = static_cast<double>(max_ci) * std::sqrt(static_cast<double>(n_out));
+    const double sat_ratio = ceiling_norm > 0.0 ? l2_norm / ceiling_norm : 0.0;
+    const double decay_strength =
+        1.0 / (1.0 + std::exp(-(sat_ratio - static_cast<double>(l2_decay_threshold)) /
+                              static_cast<double>(l2_decay_temperature)));
+    out.l2_sat_ratio = sat_ratio;
+    out.l2_decay_strength = decay_strength;
+    state.l2_decay_strength = static_cast<float>(decay_strength);
 }
 
 template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
-PlasticityStats
-apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn,
-                                std::size_t n_out, PlasticityState& state,
-                                PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
-                                float eta_slow, float eta_slow_catchup, float eta_fast, float blend,
-                                float reset_fraction, float k, float eta_var = 0.9f) {
+PlasticityStats apply_amortized_plasticity_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    PlasticityState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
+    float eta_slow, float eta_slow_catchup, float eta_fast, float blend, float reset_fraction,
+    float k, float eta_var = 0.9f, float l2_decay_lambda = 0.0f, float l2_decay_threshold = 0.9f,
+    float l2_decay_temperature = 0.05f, float max_ci = 100.0f) {
     using VA = ValueAccessor<VALUES_TYPE>;
     state.ensure_sized(n_out);
     const auto& L = conn.layout;
@@ -1322,16 +1355,35 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
 
         state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
 
+        float new_w = w;
+        float new_imp = imp;
+        bool cell_written = false;
+
         if (state.col_reset_active[j]) {
             const float strength = blend * state.col_plasticity_boost[j];
             const float fan_in_scale =
                 1.0f / std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_rows)));
             const float fresh = fp4_stochastic_normal01() * fan_in_scale;
-            const float new_w = (1.0f - strength) * w + strength * fresh;
-            const float new_imp = (1.0f - strength) * imp;
+            new_w = (1.0f - strength) * w + strength * fresh;
+            new_imp = (1.0f - strength) * imp;
+            cell_written = true;
+        }
+
+        // L2-saturation-gated decay: a SEPARATE, population-level signal
+        // from the frozen-pool reset above -- applies to EVERY touched
+        // cell this cycle, not just the top-K reset candidates, and only
+        // ever shrinks importance (never weight). state.l2_decay_strength
+        // was computed once at the LAST cycle boundary from
+        // col_importance's own L2 norm; l2_decay_lambda=0.0 (the default)
+        // is an exact no-op.
+        if (l2_decay_lambda > 0.0f && state.l2_decay_strength > 0.0f) {
+            new_imp *= (1.0f - l2_decay_lambda * state.l2_decay_strength);
+            cell_written = true;
+        }
+
+        if (cell_written)
             VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
                          static_cast<typename VA::value_type>(new_imp));
-        }
 
         ++cursor.elem_pos;
         if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
@@ -1349,7 +1401,8 @@ apply_amortized_plasticity_step(DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE
     out.cycle_complete = cycle_complete;
     if (cycle_complete)
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
-                                         reset_fraction, k, eta_var, blend, out);
+                                         reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
+                                         l2_decay_temperature, max_ci);
     return out;
 }
 

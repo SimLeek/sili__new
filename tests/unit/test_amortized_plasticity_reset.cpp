@@ -331,6 +331,150 @@ static void test_deviation_distribution_min_max_tracked() {
           r2.mean_deviation, r2.max_deviation);
 }
 
+// L2-saturation-gated decay on col_importance (direct instruction, after
+// offline replay of a real 100k-step run's per-column logs showed raw
+// importance saturates at max_ci=100 for most of a saturated pool's
+// population by late training, collapsing the frozen-pool's ranking
+// signal to numerical noise -- see
+// docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design's
+// l2_saturation_decay section). Deliberately NOT gated on col_age or any
+// other elapsed-time/step counter -- a counter-based decay exponent
+// eventually overflows or silently changes meaning at large step counts,
+// which this mechanism must never do (infinite-horizon target). The
+// gate is instead a pure function of CURRENT state: the population's L2
+// norm relative to the fully-saturated ceiling (||max_ci*ones(n)||_2),
+// passed through a SOFT sigmoid ramp (direct instruction: "soft
+// threshold if we can not hard") so it stays near-zero comfortably below
+// threshold and only really engages once the population is genuinely
+// saturated, with no discontinuity at the threshold itself.
+
+static void test_l2_decay_default_is_noop() {
+    // l2_decay_lambda defaults to 0.0 -- exact no-op, byte-identical to
+    // pre-L2-decay behavior, even for a fully-saturated population
+    // (feedback_new_shared_parameter_backward_compat).
+    auto conn = make_dense_conn(
+        1, 1, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t) { return 100.0f; }); // already at max_ci
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 1, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f,
+                                    0.5f);
+    // cycle boundary just ran; cycle 2 touch should leave importance untouched by L2 decay.
+    apply_amortized_plasticity_step(conn, 1, st, cur, 1, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f,
+                                    0.5f);
+    const float imp = ValueAccessor<VT>::get_imp(conn.values, 0);
+    CHECK(std::abs(imp - 100.0f) < 1e-4f,
+          "default l2_decay_lambda=0 must not touch importance at all, got %f", imp);
+}
+
+static void test_l2_decay_near_zero_far_below_threshold() {
+    // Population importance is tiny relative to max_ci=100 -- sat_ratio
+    // should be ~0, and decay_strength should be near-zero ("not
+    // activating much when it actually is below it", direct wording).
+    auto conn = make_dense_conn(
+        1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t) { return 0.01f; });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f, 0.5f,
+                                    0.9f, /*l2_decay_lambda=*/1.0f);
+    auto r2 = apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                              0.0f, 0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    CHECK(r2.l2_sat_ratio < 0.01, "sat_ratio should be ~0 for a near-empty population, got %f",
+          r2.l2_sat_ratio);
+    CHECK(r2.l2_decay_strength < 0.01,
+          "decay_strength should be near-zero far below threshold, got %f", r2.l2_decay_strength);
+}
+
+static void test_l2_decay_strong_when_fully_saturated() {
+    // Every column pinned at max_ci=100 -- sat_ratio should be ~1.0, and
+    // with lambda=1.0 decay should visibly shrink importance on the very
+    // next touch (population-level signal, applies even to a column that
+    // is NOT in the frozen pool this cycle).
+    auto conn = make_dense_conn(
+        1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+        [](std::size_t, std::size_t) { return 100.0f; });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f, 0.5f,
+                                    0.9f, /*l2_decay_lambda=*/1.0f);
+    auto r2 = apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f,
+                                              0.0f, 0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    CHECK(r2.l2_sat_ratio > 0.99,
+          "sat_ratio should be ~1.0 for a fully-saturated population, got %f", r2.l2_sat_ratio);
+    CHECK(r2.l2_decay_strength > 0.5,
+          "decay_strength should be substantial once fully saturated, got %f",
+          r2.l2_decay_strength);
+    // cycle 3: touch cells again, importance should have visibly shrunk from 100.
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f, 0.5f,
+                                    0.9f, /*l2_decay_lambda=*/1.0f);
+    const float imp_col0 = ValueAccessor<VT>::get_imp(conn.values, 0);
+    CHECK(imp_col0 < 99.0f,
+          "importance should visibly shrink once population is saturated and lambda>0, got %f",
+          imp_col0);
+}
+
+static void test_l2_decay_touches_every_cell_not_just_reset_pool() {
+    // 4 columns, reset_fraction small enough that only 1 column lands in
+    // the frozen pool -- L2 decay must still shrink the OTHER columns'
+    // importance too (it's a population-level gate, not scoped to the
+    // frozen-pool selection), while leaving their WEIGHT untouched
+    // (L2 decay only ever acts on importance, never weight).
+    auto conn = make_dense_conn(
+        1, 4, [](std::size_t, std::size_t) { return 5.0f; },
+        [](std::size_t, std::size_t c) { return 100.0f - static_cast<float>(c); });
+    PlasticityState st;
+    PlasticityCellCursor cur;
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.25f,
+                                    0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.25f,
+                                    0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    CHECK(st.col_reset_active[3] == 0,
+          "col 3 (lowest importance) should not be in the frozen pool");
+    apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.25f,
+                                    0.5f, 0.9f, /*l2_decay_lambda=*/1.0f);
+    const float imp_col3 = ValueAccessor<VT>::get_imp(conn.values, 3);
+    const float w_col3 = ValueAccessor<VT>::get_w(conn.values, 3);
+    CHECK(imp_col3 < 97.0f,
+          "a non-frozen-pool column should still be shrunk by the population-level L2 decay, "
+          "got %f",
+          imp_col3);
+    CHECK(std::abs(w_col3 - 5.0f) < 1e-5f,
+          "L2 decay must never touch weight, only importance, got w=%f", w_col3);
+}
+
+static void test_l2_decay_ramp_is_smooth_not_a_hard_step() {
+    // Direct instruction: "soft threshold if we can not hard". Build 3
+    // populations at increasing average importance (well below, near,
+    // and at the threshold*max_ci scale) and confirm decay_strength
+    // increases smoothly/monotonically rather than jumping straight
+    // from ~0 to ~1 at the threshold.
+    auto make_and_measure = [](float imp_value) {
+        auto conn = make_dense_conn(
+            1, 4, [](std::size_t, std::size_t) { return 1.0f; },
+            [imp_value](std::size_t, std::size_t) { return imp_value; });
+        PlasticityState st;
+        PlasticityCellCursor cur;
+        apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f, 0.5f, 0.0f,
+                                        0.5f, 0.9f, 1.0f);
+        auto r2 = apply_amortized_plasticity_step(conn, 4, st, cur, 4, 0.0f, 0.99f, 0.95f, 0.5f,
+                                                  0.5f, 0.0f, 0.5f, 0.9f, 1.0f);
+        return r2.l2_decay_strength;
+    };
+    const double d_low = make_and_measure(60.0f);   // sat_ratio 0.6, well below threshold 0.9
+    const double d_mid = make_and_measure(88.0f);   // sat_ratio 0.88, just below threshold
+    const double d_high = make_and_measure(92.0f);  // sat_ratio 0.92, just above threshold
+    const double d_full = make_and_measure(100.0f); // sat_ratio 1.0, fully saturated
+    CHECK(d_low < d_mid && d_mid < d_high && d_high < d_full,
+          "decay_strength should increase monotonically with saturation, got %f, %f, %f, %f", d_low,
+          d_mid, d_high, d_full);
+    // No single step should be a near-total jump from ~0 to ~1 -- each
+    // consecutive gap should be a fraction of the total range, not the
+    // whole range at once (the defining property of a SOFT threshold).
+    CHECK(d_mid - d_low < 0.5, "low->mid step should be gradual, got jump of %f", d_mid - d_low);
+    CHECK(d_high - d_mid < 0.5, "mid->high step should be gradual, got jump of %f", d_high - d_mid);
+}
+
 int main() {
     test_col_importance_accumulates_from_known_values();
     test_frozen_pool_selects_highest_importance_mature_columns();
@@ -341,6 +485,11 @@ int main() {
     test_cold_start_no_spurious_deviation();
     test_reset_inflates_variance_preventing_immediate_reflag();
     test_deviation_distribution_min_max_tracked();
+    test_l2_decay_default_is_noop();
+    test_l2_decay_near_zero_far_below_threshold();
+    test_l2_decay_strong_when_fully_saturated();
+    test_l2_decay_touches_every_cell_not_just_reset_pool();
+    test_l2_decay_ramp_is_smooth_not_a_hard_step();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }
