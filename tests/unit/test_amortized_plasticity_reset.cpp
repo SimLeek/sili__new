@@ -572,31 +572,32 @@ static void test_select_by_deviation_picks_growth_rate_not_absolute_level() {
     }
 }
 
-// select_by_deviation's gate: EVT-derived k, not a guessed constant --
-// direct correction after a real 100k-step comparison run
-// (select_by_deviation=True) got stuck far worse than any other
-// comparison arm. Root cause, confirmed via direct log analysis: this
-// mode always SELECTS the population's own MAXIMUM deviation each
-// cycle, so gating that against a FIXED k (calibrated for the
-// unrelated top-importance mode's own, non-maximal deviation
-// distribution) opened the gate 97.25% of cycles vs only 22.25% under
-// top-importance selection -- the gate was defeated by construction,
-// not by a badly-chosen constant. Fix: deviation is built as a
-// z-score, so under the "nothing pathological" null hypothesis it's
-// approximately standard-normal per column; the expected value of the
-// MAXIMUM of N such draws is the classical Gaussian extreme-value
-// asymptotic E[max_N] ~ sqrt(2*ln(N)) (Fisher-Tippett-Gnedenko) --
-// closed-form in the population size alone, no calibration against
-// real data needed, and it scales UP automatically for wider layers
-// (more candidates -> a larger expected maximum by pure chance, a
-// Bonferroni-style correction for the N simultaneous comparisons this
-// mode implicitly runs every cycle). See
+// select_by_deviation's gate: EVT-derived k tried first, then found by
+// direct log analysis of a real 100k-step run (v6) to be a near-total
+// no-op -- gate_open_frac was EXACTLY 0.000 in every one of 6 pools,
+// across the ENTIRE run (both the early climbing phase and the later
+// plateau). Real per-column deviation never approached the theoretical
+// sqrt(2*ln(N))~=3.1-3.4 threshold (observed max ~1.0-1.8 throughout),
+// meaning the EMA-lag structure of col_grad_fast/slow doesn't actually
+// produce iid-standard-normal statistics the way the EVT derivation
+// assumed -- the fix that stopped v5's over-triggering over-corrected
+// into permanent inertness. Replaced with a threshold derived from the
+// population's OWN empirical distribution instead of a theoretical
+// asymptotic: k = the linear-interpolated percentile of the mature
+// population's ACTUAL deviation values this cycle, at percentile
+// 100*(1-reset_fraction) -- still equation-derived (an order statistic
+// of real data, no new guessed constant), reusing the EXISTING
+// reset_fraction knob rather than introducing one, and self-calibrating
+// to whatever the real spread happens to be instead of assuming
+// normality. Validated against v6's own real log data before
+// implementing: this percentile rule would have opened the gate
+// 47-100% of the time in the late-plateau phase across all 6 pools,
+// vs 0% for the EVT rule and 97.25% for the original fixed k=1.0. See
 // docs/research/toy_tile_recurrence_rmt.rst:
 // plasticity_reset_design.select_by_deviation_early_detection.k_derivation.
-static void test_select_by_deviation_gate_uses_evt_k_not_passed_k() {
-    // 4 mature columns (N=4) -- expected threshold sqrt(2*ln(4)).
-    const float k_expected = std::sqrt(2.0f * std::log(4.0f));
-
+static void test_select_by_deviation_gate_uses_population_percentile_not_passed_k() {
+    // 4 mature columns (N=4), reset_fraction=0.25 -> top_n=1,
+    // percentile = 100*(1-0.25) = 75.
     auto make_and_warm = [](PlasticityState& st, PlasticityCellCursor& cur) {
         auto conn = make_dense_conn(
             1, 4, [](std::size_t, std::size_t) { return 1.0f; },
@@ -607,7 +608,23 @@ static void test_select_by_deviation_gate_uses_evt_k_not_passed_k() {
         return conn;
     };
 
-    float boost_low_k = 0.0f, boost_high_k = 0.0f, deviation_readback = 0.0f;
+    auto compute_deviation = [](const PlasticityState& st, std::size_t j) {
+        const float std_dev = std::sqrt(std::max(0.0f, st.col_grad_var[j]));
+        return (st.col_grad_fast[j] - st.col_grad_slow[j]) / (std_dev + 1e-8f);
+    };
+    // Same linear-interpolation percentile numpy's default uses --
+    // must match what was validated against the real v6 log data.
+    auto percentile = [](std::vector<float> v, double p) {
+        std::sort(v.begin(), v.end());
+        const double idx = (static_cast<double>(v.size()) - 1.0) * (p / 100.0);
+        const std::size_t lo = static_cast<std::size_t>(std::floor(idx));
+        const std::size_t hi = static_cast<std::size_t>(std::ceil(idx));
+        const double frac = idx - static_cast<double>(lo);
+        return static_cast<float>(v[lo] + frac * (v[hi] - v[lo]));
+    };
+
+    float boost_low_k = 0.0f, boost_high_k = 0.0f;
+    std::vector<float> devs;
     {
         PlasticityState st;
         PlasticityCellCursor cur;
@@ -619,8 +636,8 @@ static void test_select_by_deviation_gate_uses_evt_k_not_passed_k() {
         CHECK(r.cycle_complete, "cycle should complete");
         CHECK(st.col_reset_active[3] == 1, "col 3 (the spike) should be selected, got %d",
               st.col_reset_active[3]);
-        const float std_dev = std::sqrt(std::max(0.0f, st.col_grad_var[3]));
-        deviation_readback = (st.col_grad_fast[3] - st.col_grad_slow[3]) / (std_dev + 1e-8f);
+        for (std::size_t j = 0; j < 4; ++j)
+            devs.push_back(compute_deviation(st, j));
         boost_low_k = st.col_plasticity_boost[3];
     }
     {
@@ -634,12 +651,14 @@ static void test_select_by_deviation_gate_uses_evt_k_not_passed_k() {
         boost_high_k = st.col_plasticity_boost[3];
     }
     CHECK(std::abs(boost_low_k - boost_high_k) < 1e-5f,
-          "passed-in k must be IGNORED under select_by_deviation=true (gate uses an "
-          "EVT-derived threshold instead) -- got %f (k=0) vs %f (k=1000)",
+          "passed-in k must be IGNORED under select_by_deviation=true (gate uses the "
+          "population's own percentile instead) -- got %f (k=0) vs %f (k=1000)",
           boost_low_k, boost_high_k);
-    const float expected_boost = std::max(0.0f, deviation_readback - k_expected);
+    const float k_expected = percentile(devs, 75.0);
+    const float expected_boost = std::max(0.0f, devs[3] - k_expected);
     CHECK(std::abs(boost_low_k - expected_boost) < 1e-3f,
-          "plasticity_boost should equal max(0, deviation - sqrt(2*ln(N))) = %f, got %f",
+          "plasticity_boost should equal max(0, deviation - percentile(mature_devs, 75)) = "
+          "%f, got %f",
           expected_boost, boost_low_k);
 }
 
@@ -702,7 +721,7 @@ int main() {
     test_l2_decay_ramp_is_smooth_not_a_hard_step();
     test_select_by_deviation_off_matches_existing_importance_selection();
     test_select_by_deviation_picks_growth_rate_not_absolute_level();
-    test_select_by_deviation_gate_uses_evt_k_not_passed_k();
+    test_select_by_deviation_gate_uses_population_percentile_not_passed_k();
     test_default_mode_gate_still_uses_passed_k();
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

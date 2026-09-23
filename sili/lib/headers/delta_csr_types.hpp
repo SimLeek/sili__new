@@ -1268,28 +1268,66 @@ inline void plasticity_select_cycle_boundary(
     // select_by_deviation vs 22.25% under top-importance selection,
     // explaining why it kept disrupting an otherwise-healthy
     // population instead of only intervening on genuine anomalies.
-    // Fixed by deriving the threshold from the population size itself,
-    // via extreme value theory, instead of guessing a new constant.
-    // deviation_by_col[j] is constructed as (fast-slow)/std_dev -- under
-    // the "nothing pathological" null hypothesis it's approximately a
-    // standard-normal z-score per column. For N i.i.d. standard
-    // normals, the classical Fisher-Tippett-Gnedenko Gaussian
-    // extreme-value asymptotic gives the expected value of their
-    // MAXIMUM as E[max_N] ~ sqrt(2*ln(N)) -- closed-form in N alone, no
-    // calibration against observed data required, and it automatically
-    // scales UP for wider layers (more candidates -> a larger expected
-    // maximum by pure chance, the same correction a Bonferroni-style
-    // threshold applies for running N implicit simultaneous comparisons
-    // each cycle). Only replaces k in THIS mode -- k is used unchanged
-    // when select_by_deviation=false, so the existing top-K-by-
-    // importance behavior (and its own k calibration) is untouched. See
-    // docs/research/toy_tile_recurrence_rmt.rst:
+    //
+    // First fix tried: derive the threshold from population size via
+    // extreme value theory (E[max_N] of N iid standard normals ~
+    // sqrt(2*ln(N)), Fisher-Tippett-Gnedenko), reasoning that
+    // deviation_by_col[j] is a z-score so should behave like one under
+    // the "nothing pathological" null. FOUND WRONG by direct log
+    // analysis of a real 100k-step run using that fix (v6):
+    // gate_open_frac was EXACTLY 0.000 in every one of 6 pools across
+    // the ENTIRE run -- real deviation never approached the theoretical
+    // ~3.1-3.4 threshold (observed max ~1.0-1.8 throughout), meaning
+    // the EMA-lag structure of col_grad_fast/slow (and the asymmetric
+    // catchup rate) doesn't actually produce iid-standard-normal
+    // statistics the way the derivation assumed. The fix that stopped
+    // v5's over-triggering over-corrected into permanent inertness --
+    // v6's own early progress turned out to owe nothing to the
+    // mechanism, which never fired a single real reset.
+    //
+    // Fixed instead with a threshold derived from the population's OWN
+    // empirical distribution, not a theoretical asymptotic: k = the
+    // linear-interpolated percentile of the MATURE population's ACTUAL
+    // deviation values this cycle, at percentile 100*(1-reset_fraction)
+    // -- still equation-derived (an order statistic of real data, no
+    // new guessed constant), reuses the EXISTING reset_fraction knob
+    // (the percentile directly matches how many candidates get
+    // selected each cycle) rather than introducing a new one, and
+    // self-calibrates to whatever the real spread happens to be
+    // instead of assuming normality. Validated against v6's own real
+    // log data before implementing: this percentile rule would have
+    // opened the gate 47-100% of the time in the late-plateau phase
+    // across all 6 pools, vs 0% for the EVT rule and 97.25% for the
+    // original fixed k=1.0. Only replaces k in THIS mode -- k is used
+    // unchanged when select_by_deviation=false, so the existing
+    // top-K-by-importance behavior (and its own k calibration) is
+    // untouched. See docs/research/toy_tile_recurrence_rmt.rst:
     // plasticity_reset_design.select_by_deviation_early_detection.k_derivation.
-    const float k_effective =
-        select_by_deviation
-            ? static_cast<float>(std::sqrt(
-                  2.0 * std::log(static_cast<double>(std::max<std::size_t>(1, mature.size())))))
-            : k;
+    float k_effective = k;
+    if (select_by_deviation) {
+        std::vector<float> mature_devs;
+        mature_devs.reserve(mature.size());
+        for (std::size_t j : mature)
+            mature_devs.push_back(deviation_by_col[j]);
+        std::sort(mature_devs.begin(), mature_devs.end());
+        const std::size_t n_mature = mature_devs.size();
+        if (n_mature == 0) {
+            k_effective = 0.0f;
+        } else if (n_mature == 1) {
+            k_effective = mature_devs[0];
+        } else {
+            const double p = 100.0 * (1.0 - static_cast<double>(reset_fraction));
+            const double idx_raw = (static_cast<double>(n_mature) - 1.0) * (p / 100.0);
+            const double idx =
+                std::max(0.0, std::min(static_cast<double>(n_mature) - 1.0, idx_raw));
+            const std::size_t lo = static_cast<std::size_t>(std::floor(idx));
+            const std::size_t hi = static_cast<std::size_t>(std::ceil(idx));
+            const double frac = idx - static_cast<double>(lo);
+            const float v_lo = mature_devs[lo];
+            const float v_hi = mature_devs[hi];
+            k_effective = static_cast<float>(v_lo + frac * (v_hi - v_lo));
+        }
+    }
 
     double sum_deviation = 0.0;
     double min_deviation = 0.0;

@@ -396,18 +396,18 @@ top-importance selection. The gate was open almost every single cycle
 anything was actually pathological, the opposite of the mechanism's
 entire "only intervene on genuine anomalies" purpose.
 
-**Fix, equation-derived rather than a new guessed constant** (direct
-instruction: "unless you can actually find a k value based on an
-equation and not a guess. I vastly prefer not to add guessed
-hyperparameters"): ``deviation_by_col[j]`` is constructed as a z-score
--- under the "nothing pathological" null hypothesis, each mature
-column's deviation is approximately an independent standard-normal
-draw. Selecting the top order statistics of ``N`` such draws each
-cycle means the relevant question isn't "is this deviation big" but
-"is it bigger than what pure chance among ``N`` columns would already
-produce, even with nothing wrong." That's exactly the classical
-Gaussian extreme-value asymptotic (Fisher-Tippett-Gnedenko): the
-expected value of the MAXIMUM of ``N`` i.i.d. standard normals is
+**First fix tried, equation-derived rather than a new guessed
+constant** (direct instruction: "unless you can actually find a k
+value based on an equation and not a guess. I vastly prefer not to add
+guessed hyperparameters"): ``deviation_by_col[j]`` is constructed as a
+z-score -- under the "nothing pathological" null hypothesis, each
+mature column's deviation is approximately an independent
+standard-normal draw. Selecting the top order statistics of ``N`` such
+draws each cycle means the relevant question isn't "is this deviation
+big" but "is it bigger than what pure chance among ``N`` columns would
+already produce, even with nothing wrong." That's exactly the
+classical Gaussian extreme-value asymptotic (Fisher-Tippett-Gnedenko):
+the expected value of the MAXIMUM of ``N`` i.i.d. standard normals is
 
 .. math::
 
@@ -415,31 +415,77 @@ expected value of the MAXIMUM of ``N`` i.i.d. standard normals is
 
 a closed-form function of the population size alone -- no calibration
 against observed data, no free constant to pick. ``k_effective =
-sqrt(2*ln(mature.size()))`` replaces the passed-in ``k`` ONLY when
-``select_by_deviation=true``; ``k`` is used unchanged (its own,
-separately-calibrated meaning) when ``select_by_deviation=false``, so
-the default mode's existing behavior is untouched. This also has the
-right qualitative shape for free: wider layers (more candidates) get a
-correspondingly higher threshold, matching the standard
-Bonferroni-style correction for implicitly running ``N`` simultaneous
-comparisons every cycle -- exactly the property a fixed constant could
-never have.
+sqrt(2*ln(mature.size()))`` was implemented replacing the passed-in
+``k`` ONLY when ``select_by_deviation=true``, tested (4-mature-column
+scenario, N=4, expected threshold :math:`\\sqrt{2\\ln 4} \\approx
+1.665`, confirming both that the passed-in ``k`` has no effect and
+that the boost exactly matches the EVT formula computed independently
+from the engine's own post-call state), and launched as a full
+100k-step comparison run (v6).
+
+**Found wrong, by direct log analysis of that same v6 run, before
+trusting it further** (direct instruction: "check what happened with
+v6 when it stalled and what updates to the equation would fix it, and
+test those on the log a bit if we can before trying another run"):
+v6's own collected column snapshots (recorded every cycle, all 6
+pools, the full 100k steps) show ``gate_open_frac`` was **EXACTLY
+0.000** in every single pool, across the ENTIRE run -- not just during
+its later plateau. Real per-column deviation never approached the
+theoretical :math:`\\sqrt{2\\ln N}\\approx 3.1\\text{-}3.4` threshold;
+the observed maximum anywhere in the run was only ~1.0-1.8. The
+EMA-lag structure of ``col_grad_fast``/``col_grad_slow`` (compounded
+by the asymmetric catchup rate) does not actually produce
+iid-standard-normal statistics the way the EVT derivation assumed --
+the fix that stopped v5's over-triggering over-corrected into a
+**permanent no-op**: every "selected" column got
+``plasticity_boost=0`` for the whole run, so v6's own early progress
+(clearing vocab=16/k=3, the exact point v5 got stuck at) turned out to
+owe nothing to the mechanism actually doing anything -- it never fired
+a single real reset. A sound theoretical derivation, invalidated by
+what the real data showed once checked, rather than assumed correct
+because the algebra was clean.
+
+**Second fix, still equation-derived, this time calibrated against the
+population's OWN empirical distribution rather than a theoretical
+asymptotic**: instead of assuming deviation is standard-normal, use
+the population's own observed distribution directly. ``k = the
+linear-interpolated percentile of the MATURE population's ACTUAL
+deviation values this cycle, at percentile 100*(1 - reset_fraction)``
+-- still a genuine order statistic of real data (no new guessed
+constant), and it reuses the EXISTING ``reset_fraction`` knob rather
+than introducing a new one (the percentile directly matches how many
+candidates get selected each cycle: with ``reset_fraction=0.01``, the
+threshold sits at the population's own 99th percentile). Because it's
+computed fresh from the actual current spread every cycle, it
+self-calibrates automatically regardless of whether the real
+distribution matches the idealized normal assumption -- it cannot
+reproduce either failure: it is never a fixed external constant
+(defeating v5's problem), and it is never systematically unreachable
+by the real data (defeating v6's problem), since it is defined as a
+literal point IN that data's own distribution.
+
+Validated against v6's real log data BEFORE implementing (the same
+snapshots that exposed the EVT rule's failure): recomputing what this
+percentile rule would have done on the exact recorded late-plateau
+deviations shows it would have opened the gate 47-100% of the time
+across all 6 pools -- a sane middle ground between the EVT rule's 0%
+and the original fixed ``k=1.0``'s 97.25%.
 
 Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp``
-(``test_select_by_deviation_gate_uses_evt_k_not_passed_k``) and
-``tests/unit/test_block4_plasticity_reset.cpp``
-(``test_select_by_deviation_gate_uses_evt_k_not_passed_k_block4``): a
-4-mature-column scenario (N=4, expected threshold
-:math:`\\sqrt{2\\ln 4} \\approx 1.665`) confirms (a) the passed-in
-``k`` has NO effect on the resulting ``plasticity_boost`` under
+(``test_select_by_deviation_gate_uses_population_percentile_not_passed_k``)
+and ``tests/unit/test_block4_plasticity_reset.cpp``
+(``test_select_by_deviation_gate_uses_population_percentile_not_passed_k_block4``):
+a 4-mature-column scenario (``reset_fraction=0.25`` -> percentile 75)
+confirms (a) the passed-in ``k`` has no effect under
 ``select_by_deviation=true`` (re-run with ``k=0`` vs ``k=1000``,
 identical result), and (b) the resulting boost exactly matches
-``max(0, deviation - sqrt(2*ln(N)))`` computed independently from the
-engine's own post-call ``col_grad_fast``/``col_grad_slow``/
-``col_grad_var`` state -- not merely "some different number," the
-literal EVT formula. A companion regression test confirms the default
-(``select_by_deviation=false``) mode still uses the passed ``k``
-directly, unaffected by this change.
+``max(0, deviation - percentile(mature_devs, 75))``, computed
+independently in the test via the same linear-interpolation formula
+(matching ``numpy.percentile``'s default method) from the engine's own
+post-call ``col_grad_fast``/``col_grad_slow``/``col_grad_var`` state
+for ALL 4 mature columns, not just the selected one. A companion
+regression test confirms the default (``select_by_deviation=false``)
+mode still uses the passed ``k`` directly, unaffected by this change.
 
 .. _scale_policy.nan_inf_guard:
 
