@@ -1754,3 +1754,56 @@ the SAME column-level ``k[c]`` -- since ``S/k[c] = sum_ki(vs_ki*(os_ki/
 k[c])) = (sum_ki vs_ki*os_ki)/k[c]`` (distributive law), this generalizes
 cleanly to any ``scale_rank``; at ``scale_rank==1`` it's identical to the
 original single-component form.
+
+.. _plasticity_reset.l2_init:
+
+L2 Init -- regularize weight toward its own initial value, not toward zero
+-----------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.l2_init``
+
+EXPERIMENTAL, genuinely new mechanism (did not exist before this
+commit). Built after the sili_peridot offline Python sandbox
+(``scripts/plasticity_sim.py``) tested it against real recorded
+training data and found ``rate=0.0001`` avoided importance saturation
+while keeping real accumulated importance -- see
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox``
+(sili_peridot side) for the full sandbox derivation and citation: Kumar,
+Marklund & Van Roy, "Maintaining Plasticity in Continual Learning via
+Regenerative Regularization", CoLLAs 2025, arXiv:2308.11958. Direct
+instruction to build this for real: "let's try both of them and record
+while seeing if it helps reliably beat mqar rather than randomly
+stalling."
+
+``apply_amortized_l2_init``/``apply_amortized_block4_l2_init``
+(``delta_csr_types.hpp``/``block4_l2_init_TODO_DELETE.hpp``): same
+amortized/chunked-cursor shape as ``apply_amortized_decay_stats``. A
+cell's FIRST touch only captures its CURRENT weight as the reference
+"initial" value (no modification -- nothing to regularize toward yet);
+every touch after that pulls ``rate`` of the way back toward the
+captured reference: ``new_w = w + rate*(initial_weight - w)``.
+Importance is never touched -- L2 Init targets trainable weight, not
+this project's own ``ci`` accumulator. Block4 indexes its
+``initial_weight``/``captured`` reference arrays by a stable per-tile
+visit order (``tile_index*16 + li*4+lj``) -- deterministic across
+cycles as long as the store's own tile layout doesn't change mid-run
+(true for a dense-loaded, non-synaptogenesis run, which is what this
+was built for; a genuinely dynamic tile layout would need a different
+indexing scheme, not yet needed).
+
+Independent of ``apply_amortized_plasticity_reset`` -- separate
+cursor/reference-value state per storage type, can run alongside it or
+alone (v10's real validation run does exactly that: plasticity_reset
+enabled with ``reset_fraction=0.0``, a deliberate no-op kept only to
+reuse its existing column-log capture pathway, while L2 Init is the
+only mechanism actually touching weights).
+
+Tested in ``tests/unit/test_amortized_l2_init.cpp`` and
+``tests/unit/test_block4_l2_init.cpp``: first touch captures without
+modifying; second touch pulls exactly toward the captured reference
+(verified with hand-computed expected values); a weight already AT its
+initial value stays there (pull toward itself is a no-op); cursor
+wraps and reports ``cycle_complete`` correctly; an empty layer reports
+completion immediately with zero touches. Full regression: 182 total
+(177 passed, same 5 pre-existing ``pre_existing_failure`` failures, no
+new regressions).

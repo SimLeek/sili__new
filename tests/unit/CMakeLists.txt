@@ -239,6 +239,8 @@ set(SILI_STANDALONE_TESTS
     test_block4_amortized_decay
     test_amortized_plasticity_reset
     test_block4_plasticity_reset
+    test_amortized_l2_init
+    test_block4_l2_init
     test_top_k_csr_nucleus
     test_cpu_topology
     test_dequant_equality_fp4_vs_fp8

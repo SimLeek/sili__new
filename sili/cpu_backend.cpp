@@ -13,6 +13,7 @@
 #include "linear_disldo.hpp"
 #include "block4_decay_TODO_DELETE.hpp"
 #include "block4_plasticity_TODO_DELETE.hpp"
+#include "block4_l2_init_TODO_DELETE.hpp"
 #include "engine_select.hpp"
 #ifdef SILI_HAVE_MKL
 #include "linear_didldo.hpp"
@@ -1422,6 +1423,17 @@ class DISLDOLayerV {
     PlasticityCellCursor _plasticity_cursor;
     PlasticityState _block4_plasticity_state;
     Block4PlasticityCursor _block4_plasticity_cursor;
+    // L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
+    // -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    // SEPARATE cursor/reference-value state per storage type, same
+    // reasoning as the plasticity/decay cursors above.
+    std::size_t _l2_init_cursor = 0;
+    std::vector<V> _l2_init_initial_weight;
+    std::vector<uint8_t> _l2_init_captured;
+    Block4L2InitCursor _block4_l2_init_cursor;
+    std::vector<V> _block4_l2_init_initial_weight;
+    std::vector<uint8_t> _block4_l2_init_captured;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1866,6 +1878,42 @@ class DISLDOLayerV {
             out["max_deviation"] = 0.0;
             out["l2_sat_ratio"] = 0.0;
             out["l2_decay_strength"] = 0.0;
+        }
+        return out;
+    }
+
+    // L2 Init (Kumar, Marklund & Van Roy, "Maintaining Plasticity in
+    // Continual Learning via Regenerative Regularization", CoLLAs 2025,
+    // arXiv:2308.11958) -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    // Scattered (.connections) arm. A cell's first touch only captures
+    // its current weight as the "initial" reference; every touch after
+    // that pulls `rate` of the way back toward it. Independent of
+    // apply_amortized_plasticity_reset -- separate cursor, can run
+    // alongside it or alone.
+    py::dict apply_amortized_l2_init(S chunk_size, float rate) {
+        auto stats = ::apply_amortized_l2_init<VT, float>(
+            weights.connections.values, _l2_init_cursor, _l2_init_initial_weight, _l2_init_captured,
+            static_cast<std::size_t>(chunk_size), rate);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["n_touched"] = stats.n_touched;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity-reset work already established.
+    py::dict apply_amortized_block4_l2_init(S chunk_size, float rate) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = ::apply_amortized_block4_l2_init<float>(
+                weights.block4, _block4_l2_init_cursor, _block4_l2_init_initial_weight,
+                _block4_l2_init_captured, static_cast<std::size_t>(chunk_size), rate);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["n_touched"] = stats.n_touched;
+        } else {
+            out["cycle_complete"] = true;
+            out["n_touched"] = std::size_t(0);
         }
         return out;
     }
@@ -4640,6 +4688,10 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("select_by_deviation") = false)
         .def("plasticity_column_state", &DISLDOLayerV::plasticity_column_state)
         .def("plasticity_column_state_block4", &DISLDOLayerV::plasticity_column_state_block4)
+        .def("apply_amortized_l2_init", &DISLDOLayerV::apply_amortized_l2_init,
+             py::arg("chunk_size"), py::arg("rate"))
+        .def("apply_amortized_block4_l2_init", &DISLDOLayerV::apply_amortized_block4_l2_init,
+             py::arg("chunk_size"), py::arg("rate"))
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))

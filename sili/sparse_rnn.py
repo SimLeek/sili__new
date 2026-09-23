@@ -1148,6 +1148,16 @@ class DISLDOLayer32(_SparseLayerBase):
             select_by_deviation,
         )
 
+    def apply_amortized_l2_init(self, chunk_size: int, rate: float) -> dict:
+        """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
+        2025, arXiv:2308.11958), scattered arm. See
+        docs/research/delta_csr_types.rst:plasticity_reset.l2_init."""
+        return self._c.apply_amortized_l2_init(chunk_size, rate)
+
+    def apply_amortized_block4_l2_init(self, chunk_size: int, rate: float) -> dict:
+        """block4 counterpart -- chunk_size counts TILES. fp32 only."""
+        return self._c.apply_amortized_block4_l2_init(chunk_size, rate)
+
     def plasticity_column_state(self) -> dict:
         """Read-only per-column snapshot (scattered arm), zero-copy view.
         Empty arrays before the first apply call. See

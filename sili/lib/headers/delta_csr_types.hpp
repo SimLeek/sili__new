@@ -491,6 +491,63 @@ AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t
     return out;
 }
 
+// L2 Init (Kumar, Marklund & Van Roy, "Maintaining Plasticity in
+// Continual Learning via Regenerative Regularization", CoLLAs 2025,
+// arXiv:2308.11958): regularize weights toward their OWN initial
+// value, not toward zero -- found in the paper to mitigate loss of
+// plasticity more consistently than Shrink-and-Perturb or plain L2.
+// Same amortized/chunked-cursor shape as apply_amortized_decay_stats.
+// A cell's FIRST touch only captures its current weight as the
+// reference "initial" (no modification -- nothing to regularize
+// toward yet); every touch after that pulls `rate` of the way back
+// toward the captured reference. Importance is never touched -- this
+// targets trainable weight, not this project's own ci accumulator.
+struct AmortizedL2InitStats {
+    bool cycle_complete = false;
+    std::size_t n_touched = 0;
+};
+
+template <typename VALUES_TYPE, typename V>
+AmortizedL2InitStats
+apply_amortized_l2_init(VALUES_TYPE& values, std::size_t& cursor, std::vector<V>& initial_weight,
+                        std::vector<uint8_t>& captured, std::size_t chunk_size, V rate) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    const std::size_t total = VA::size(values);
+    if (initial_weight.size() != total) {
+        initial_weight.assign(total, V(0));
+        captured.assign(total, 0);
+    }
+    bool cycle_complete = false;
+    std::size_t n_touched = 0;
+    if (total > 0) {
+        for (std::size_t i = 0; i < chunk_size; ++i) {
+            if (cursor >= total)
+                cursor = 0;
+            const V w = static_cast<V>(VA::get_w(values, cursor));
+            if (!captured[cursor]) {
+                initial_weight[cursor] = w;
+                captured[cursor] = 1;
+            } else {
+                const V imp = static_cast<V>(VA::get_imp(values, cursor));
+                const V new_w = static_cast<V>(w + rate * (initial_weight[cursor] - w));
+                VA::set_live(values, cursor, new_w, imp);
+            }
+            ++n_touched;
+            ++cursor;
+            if (cursor >= total) {
+                cycle_complete = true;
+                cursor = 0;
+            }
+        }
+    } else {
+        cycle_complete = true;
+    }
+    AmortizedL2InitStats out;
+    out.cycle_complete = cycle_complete;
+    out.n_touched = n_touched;
+    return out;
+}
+
 // Flat-array sibling of apply_amortized_decay_stats above, for genuinely
 // dense storage (DenseLinearWeights -- DIDLDO/SIDLDO's shared `w`/`ci`
 // vectors, no CSR/block4 packing, no separate weight+importance pairing
