@@ -234,6 +234,12 @@ template <typename SIZE_TYPE, typename VALUES_TYPE, typename COL_TYPE> struct Bl
     // in docs/research/linear_disldo.rst.
     const value_type* input_T;       // [n_in, batch]
     const value_type* output_grad_T; // [ceil(n_out/BLOCK4_TILE), batch, BLOCK4_TILE], zero-padded
+    // max_abs_grad: clip g/contrib before they enter ci's EMA -- see
+    // synapse_policy.max_abs_grad_clip in docs/research/delta_csr_types.rst.
+    // LAST field, with a default member initializer, so the one existing
+    // aggregate-init construction site (disldo_backward) stays valid
+    // whether or not it's updated to set a real value.
+    value_type max_abs_grad = value_type(1e30);
 };
 
 // Per-thread mutable output accumulators -- replaces the mcol_at/mrow_at/

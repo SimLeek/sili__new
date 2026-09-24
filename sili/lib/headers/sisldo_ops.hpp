@@ -556,7 +556,11 @@ void disldo_backward_sparse_grad(
     typename ValueAccessor<VALUES_TYPE>::value_type eps = 1e-8f,
     typename ValueAccessor<VALUES_TYPE>::value_type min_decay_frac = 0.0f,
     typename ValueAccessor<VALUES_TYPE>::value_type max_abs_delta = 1e30f,
-    typename ValueAccessor<VALUES_TYPE>::value_type max_ci = 1e30f, bool scale_invariant = false) {
+    typename ValueAccessor<VALUES_TYPE>::value_type max_ci = 1e30f, bool scale_invariant = false,
+    // max_abs_grad: clip g/contrib before they enter ci's EMA. 1e30
+    // (default) is a true no-op. See
+    // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+    typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
@@ -801,7 +805,8 @@ void disldo_backward_sparse_grad(
                     const value_type grad = static_cast<value_type>(grad_sum[e]);
                     const value_type contrib = static_cast<value_type>(contrib_sum[e]);
                     value_type ci = ci_orig_buf[e] * combined_imp_scale; // -> true units
-                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci,
+                                                  max_abs_grad);
                     value_type quant = cw_orig_buf[e]; // code-space accumulator
                     quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], effective_lr, eps,
                                                       damp_by_importance, max_abs_delta,
@@ -1236,7 +1241,8 @@ void disldo_backward_sparse_grad(
                                         static_cast<value_type>(contrib_sum[idx]);
                                     value_type ci = imp_decoded * combined_imp_scale;
                                     ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
-                                                                  min_decay_frac, max_ci);
+                                                                  min_decay_frac, max_ci,
+                                                                  max_abs_grad);
                                     value_type quant = w_decoded; // code-space accumulator,
                                                                   // matches disldo_backward
                                     quant += SynapsePolicy::update_cw(

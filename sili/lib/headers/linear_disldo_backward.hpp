@@ -58,6 +58,7 @@ void block4_backward_process_single_row(
     const value_type min_decay_frac = params.min_decay_frac;
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
+    const value_type max_abs_grad = params.max_abs_grad;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -252,7 +253,7 @@ void block4_backward_process_single_row(
                 const value_type g_agg = static_cast<value_type>(g_agg4[lj]);
                 const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
                 ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2,
-                                                   min_decay_frac, max_ci);
+                                                   min_decay_frac, max_ci, max_abs_grad);
                 quant4[lj] =
                     quant_start4[lj] + SynapsePolicy::update_cw(g_agg, ci4[lj], S, effective_lr,
                                                                 eps, damp_by_importance,
@@ -269,6 +270,7 @@ void block4_backward_process_single_row(
             const Block4Vec min_decay_frac_v = block4_vec_broadcast(min_decay_frac);
             const Block4Vec max_ci_v = block4_vec_broadcast(max_ci);
             const Block4Vec max_abs_delta_v = block4_vec_broadcast(max_abs_delta);
+            const Block4Vec max_abs_grad_v = block4_vec_broadcast(max_abs_grad);
             const Block4Vec combined_scale_v = block4_vec_load(combined_scale4);
             // quant_start_v: FIXED for the whole batch loop
             // -- see the scattered path's identical
@@ -356,7 +358,7 @@ void block4_backward_process_single_row(
             Block4Vec quant_v = quant_start_v;
             if (training) {
                 ci_v = SynapsePolicyVec::update_ci(ci_v, g_agg_v, contrib_agg_v, beta2_v,
-                                                   min_decay_frac_v, max_ci_v);
+                                                   min_decay_frac_v, max_ci_v, max_abs_grad_v);
                 // dL/d(quant) = g*S -- proper chain rule on
                 // true_w=quant*S (multiply, not divide --
                 // see disldo_backward's scattered-path
@@ -440,6 +442,7 @@ void block4_backward_process_row_pair(
     const value_type min_decay_frac = params.min_decay_frac;
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
+    const value_type max_abs_grad = params.max_abs_grad;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -644,10 +647,11 @@ void block4_backward_process_row_pair(
         const Block4Vec min_decay_frac_v4 = block4_vec_broadcast(min_decay_frac);
         const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
         const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+        const Block4Vec max_abs_grad_v4 = block4_vec_broadcast(max_abs_grad);
         ci_v0 = SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0, beta2_v4,
-                                            min_decay_frac_v4, max_ci_v4);
+                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
         ci_v1 = SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1, beta2_v4,
-                                            min_decay_frac_v4, max_ci_v4);
+                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
         const Block4Vec delta_v0 =
             SynapsePolicyVec::update_cw(g_agg_v0, ci_v0, S_v0, effective_lr_v0, eps_v4,
                                         damp_by_importance, max_abs_delta_v4, scale_invariant);
@@ -779,6 +783,7 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
     const value_type min_decay_frac = params.min_decay_frac;
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
+    const value_type max_abs_grad = params.max_abs_grad;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -996,10 +1001,11 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
             const Block4Vec min_decay_frac_v4 = block4_vec_broadcast(min_decay_frac);
             const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
             const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
+            const Block4Vec max_abs_grad_v4 = block4_vec_broadcast(max_abs_grad);
             ci_v0 = SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0, beta2_v4,
-                                                min_decay_frac_v4, max_ci_v4);
+                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
             ci_v1 = SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1, beta2_v4,
-                                                min_decay_frac_v4, max_ci_v4);
+                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
             const Block4Vec delta_v0 =
                 SynapsePolicyVec::update_cw(g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4,
                                             damp_by_importance, max_abs_delta_v4, scale_invariant);
@@ -1098,7 +1104,12 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                      // AQRS gamma's L1 penalty coefficient (task #273/#283, Theorem 8).
                      // 0 (default) disables it. Appended LAST for positional-arg safety
                      // -- see this function's own docstring above.
-                     typename ValueAccessor<VALUES_TYPE>::value_type l1_coef = 0.0f) {
+                     typename ValueAccessor<VALUES_TYPE>::value_type l1_coef = 0.0f,
+                     // max_abs_grad: clip g/contrib before they enter ci's EMA. 1e30
+                     // (default) is a true no-op. Appended LAST, same positional-arg
+                     // safety reasoning as l1_coef above. See
+                     // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+                     typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     using SynapsePolicyVec = SynapsePolicyT<Block4Vec>;
@@ -1412,7 +1423,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                             // ONE update, using the batch-aggregated g/contrib.
                             ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
                                                           static_cast<value_type>(contrib_agg),
-                                                          beta2, min_decay_frac, max_ci);
+                                                          beta2, min_decay_frac, max_ci,
+                                                          max_abs_grad);
                             cw += SynapsePolicy::update_cw(
                                 static_cast<value_type>(g_agg), ci, value_type(1), effective_lr,
                                 eps, damp_by_importance, max_abs_delta, scale_invariant);
@@ -1502,7 +1514,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                         if (learning_rate != value_type(0)) {
                             ci = SynapsePolicy::update_ci(ci, static_cast<value_type>(g_agg),
                                                           static_cast<value_type>(contrib_agg),
-                                                          beta2, min_decay_frac, max_ci);
+                                                          beta2, min_decay_frac, max_ci,
+                                                          max_abs_grad);
                             quant += SynapsePolicy::update_cw(static_cast<value_type>(g_agg), ci, S,
                                                               effective_lr, eps, damp_by_importance,
                                                               max_abs_delta, scale_invariant);
@@ -1689,7 +1702,8 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                                              gamma_k_arr.data(),
                                                                              row_live_count.data(),
                                                                              input_T.data(),
-                                                                             output_grad_T.data()};
+                                                                             output_grad_T.data(),
+                                                                             max_abs_grad};
 
         const auto sili_t_tileloop_start = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(num_cpus)

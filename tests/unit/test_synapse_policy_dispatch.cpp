@@ -48,9 +48,10 @@ template <typename VALUE_TYPE> struct SentinelSynapsePolicy {
     // Plain formula so ci stays finite/sane and doesn't itself become the
     // reason something looks wrong.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
-                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
-        return PlainRMSpropSynapsePolicy<VALUE_TYPE>::update_ci(ci, g, contrib, beta2,
-                                                                min_decay_frac, max_ci);
+                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci,
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
+        return PlainRMSpropSynapsePolicy<VALUE_TYPE>::update_ci(
+            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad);
     }
     static VALUE_TYPE update_cw(VALUE_TYPE g, VALUE_TYPE /*ci*/, VALUE_TYPE /*S*/,
                                 VALUE_TYPE /*eff_lr*/, VALUE_TYPE /*eps*/,
@@ -62,9 +63,10 @@ template <typename VALUE_TYPE> struct SentinelSynapsePolicy {
 
 template <> struct SentinelSynapsePolicy<Block4Vec> {
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
-                               Block4Vec min_decay_frac, Block4Vec max_ci) {
-        return PlainRMSpropSynapsePolicy<Block4Vec>::update_ci(ci, g, contrib, beta2,
-                                                               min_decay_frac, max_ci);
+                               Block4Vec min_decay_frac, Block4Vec max_ci,
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
+        return PlainRMSpropSynapsePolicy<Block4Vec>::update_ci(
+            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad);
     }
     static Block4Vec update_cw(Block4Vec g, Block4Vec /*ci*/, Block4Vec /*S*/, Block4Vec /*eff_lr*/,
                                Block4Vec /*eps*/, bool /*damp_by_importance*/,

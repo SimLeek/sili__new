@@ -1183,6 +1183,7 @@ class DISLDOLayer32(_SparseLayerBase):
         min_decay_frac: float | None = None,
         max_abs_delta: float | None = None,
         max_ci: float | None = None,
+        max_abs_grad: float | None = None,
         scale_invariant: bool = False,
         requires_grad: bool = True,
         dy_sparsity_p: float | None = None,
@@ -1240,6 +1241,8 @@ class DISLDOLayer32(_SparseLayerBase):
                     extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None:
                     extra["max_ci"] = max_ci
+                if max_abs_grad is not None:
+                    extra["max_abs_grad"] = max_abs_grad
                 if scale_invariant:
                     extra["scale_invariant"] = True
                 if dy_gate_mask is not None:

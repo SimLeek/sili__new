@@ -1016,12 +1016,58 @@ spike first occurs, a much smaller blast radius than ``ci``'s
 hundreds-of-steps poisoning. Left as a smaller, secondary
 consideration, not built this pass.
 
-**Not yet threaded to Python/real training runs** -- this is the
-engine-level primitive only, with a default that's a true no-op. Next
-step (not done): expose ``max_abs_grad`` through
-``cpu_backend.cpp``'s bindings, ``sili/sparse_rnn.py``, and
-sili_peridot's ``train_mqar_curriculum.py`` ``synapse_kwargs``, so a
-real MQAR run can actually opt into it.
+**Update -- threaded through to real training runs, real default set**:
+direct instruction, "Let's set a default, thread it through, and then
+run a real mqar run with it, v14." Two-tier default pattern, matching
+``max_ci``/``max_abs_delta``'s own existing precedent:
+
+- **Engine template layer** (``disldo_backward``,
+  ``disldo_backward_sparse_grad``, ``Block4BackwardParams``): default
+  stays ``1e30`` (true no-op) -- every existing call site across all 8
+  real ``update_ci`` call sites (scattered scalar + block4/SIMD, both
+  the row-pair AND tile-pair AVX2 variants) picked up the new parameter
+  with zero behavior change, confirmed by two full 182-test regression
+  runs (before and after this layer's changes).
+- **``DISLDOLayerV`` (``cpu_backend.cpp``) binding layer**: new
+  ``kSynapsePolicyMaxAbsGrad = 8.0f`` constant, joining
+  ``kSynapsePolicyMaxCi``/``kSynapsePolicyMaxAbsDelta`` as a THIRD
+  always-on-by-default synapse-policy safety clamp at this layer (not
+  an opt-in experimental flag) -- data-derived, not guessed: computed
+  from sili_peridot's v13 real recorded gradient-scale distribution
+  (``sqrt(raw_importance)`` across all 6 pools, p99.9~=6.34,
+  p99.99~=9.85) -- 8.0 sits comfortably above the healthy range while
+  staying under ``max_ci``'s own ``sqrt(100)=10`` ceiling. Threaded
+  through ``backward_dense``/``backward_sparse``/both ``backward``
+  overloads and their pybind bindings (4 sites total).
+- **``sili/sparse_rnn.py``**: ``DISLDOLayer32.forward`` gets a new
+  ``max_abs_grad: float | None = None`` kwarg, following the EXACT
+  existing ``min_decay_frac``/``max_abs_delta``/``max_ci`` pattern
+  (only added to the internal ``extra`` dict -- and thus only
+  overrides the C++ default -- when explicitly set). Scoped to
+  ``DISLDOLayer32`` (fp32/dense, the class real MQAR training uses)
+  only this pass -- FP4/FP8 layer classes (``DISLDOLayer``,
+  ``DISLDOLayer8``) were not touched, so their own callers are
+  unaffected and don't yet have this knob.
+- **Real, end-to-end verification** (not assumed): a deliberate
+  ``g=50`` outlier gradient fed through a real ``DISLDOLayerV``
+  instance produced finite output both with an explicit
+  ``max_abs_grad=1.0`` override and with the new ``8.0`` default
+  omitted -- confirmed via direct Python smoke test before touching
+  any launcher script. A real dispatch-coverage test
+  (``test_synapse_policy_dispatch.cpp``, built specifically to prove a
+  template parameter reaches EVERY real call site) caught two
+  test-local mock ``SynapsePolicy`` stand-ins
+  (``SentinelSynapsePolicy``, ``DebugBoundedPolicy`` in
+  ``test_ci_ceiling.cpp``) that also needed the new parameter added to
+  stay duck-type-compatible -- fixed, full 182-test suite passes clean.
+- **sili_peridot side**: ``NOCAPS_KWARGS_FP32`` (the module-level dict
+  already supplying ``max_abs_delta``/``max_ci`` for every fp32
+  training run) gets ``max_abs_grad: 8.0`` added directly -- makes it
+  active by default for real MQAR training going forward, the same way
+  the other two caps already are, rather than a per-launcher opt-in
+  flag. See sili_peridot's own
+  ``docs/research/train_mqar_curriculum.rst`` and JOURNAL.md for the
+  v14 real-run result.
 
 .. _synapse_policy.block4vec_specializations:
 

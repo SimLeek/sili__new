@@ -46,6 +46,14 @@ constexpr float kSynapsePolicyBeta1 = 0.9f;
 constexpr float kSynapsePolicyMinDecayFrac = 0.0f; // true no-op (<=beta2)
 constexpr float kSynapsePolicyMaxAbsDelta = 2.0f;  // raw-space (pre-lr-multiply)
 constexpr float kSynapsePolicyMaxCi = 100.0f;
+// max_abs_grad: clip g/contrib before they enter ci's EMA. Data-derived
+// (not guessed) from real MQAR recorded gradient-scale distribution
+// (v13's sqrt(raw_importance) across all 6 pools): p99.9~=6.34,
+// p99.99~=9.85 -- 8.0 sits comfortably above the healthy range while
+// staying well under max_ci's own sqrt(100)=10 ceiling. See
+// docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip
+// and sili_peridot's JOURNAL.md 2026-09-24 entries.
+constexpr float kSynapsePolicyMaxAbsGrad = 8.0f;
 constexpr float kSynapsePolicyZeroEscapeEps = 0.1f;
 constexpr bool kSynapsePolicyScaleInvariant =
     false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
@@ -1521,7 +1529,8 @@ class DISLDOLayerV {
                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                                   V max_ci = kSynapsePolicyMaxCi,
-                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                                  bool scale_invariant = kSynapsePolicyScaleInvariant,
+                                  V max_abs_grad = kSynapsePolicyMaxAbsGrad) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto dybuf = dy.request();
@@ -1532,7 +1541,7 @@ class DISLDOLayerV {
             (V*)xbuf.ptr, batch, cols, (V*)dybuf.ptr, weights, dx.data(), neuron_input_accum.data(),
             neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
             beta2, eps, kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
-            kSynapsePolicyZeroEscapeEps, scale_invariant);
+            kSynapsePolicyZeroEscapeEps, scale_invariant, /*l1_coef=*/0.0f, max_abs_grad);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1583,7 +1592,8 @@ class DISLDOLayerV {
                                    V min_decay_frac = kSynapsePolicyMinDecayFrac,
                                    V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                                    V max_ci = kSynapsePolicyMaxCi,
-                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                                   bool scale_invariant = kSynapsePolicyScaleInvariant,
+                                   V max_abs_grad = kSynapsePolicyMaxAbsGrad) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
@@ -1591,7 +1601,7 @@ class DISLDOLayerV {
         disldo_backward_sparse_grad<S, VT, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(), neuron_input_accum.data(),
             neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
-            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1669,7 +1679,8 @@ class DISLDOLayerV {
                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                             V max_ci = kSynapsePolicyMaxCi,
-                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                            bool scale_invariant = kSynapsePolicyScaleInvariant,
+                            V max_abs_grad = kSynapsePolicyMaxAbsGrad) {
         auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1687,10 +1698,10 @@ class DISLDOLayerV {
             std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
             return backward_sparse(x, p, i, v, batch, learning_rate, lr_per_row_nnz,
                                    damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta,
-                                   max_ci, scale_invariant);
+                                   max_ci, scale_invariant, max_abs_grad);
         }
         return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
-                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad);
     }
 
     py::array_t<V> backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
@@ -1700,13 +1711,14 @@ class DISLDOLayerV {
                             V min_decay_frac = kSynapsePolicyMinDecayFrac,
                             V max_abs_delta = kSynapsePolicyMaxAbsDelta,
                             V max_ci = kSynapsePolicyMaxCi,
-                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+                            bool scale_invariant = kSynapsePolicyScaleInvariant,
+                            V max_abs_grad = kSynapsePolicyMaxAbsGrad) {
         auto ib = dy_indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
         if (group_a_backward_use_sisldo(_dispatch_n(), batch, density, _dispatch_syn_density()))
             return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
                                    lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
-                                   max_abs_delta, max_ci, scale_invariant);
+                                   max_abs_delta, max_ci, scale_invariant, max_abs_grad);
         auto pb = dy_ptrs.request(), vb = dy_values.request();
         std::vector<float> dense;
         _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_outputs(),
@@ -1714,7 +1726,7 @@ class DISLDOLayerV {
         py::array_t<V> dy({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
         std::copy(dense.begin(), dense.end(), (V*)dy.request().ptr);
         return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
-                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad);
     }
 
     // Amortized decoupled L2 decay + stats -- see member state's own
@@ -4614,7 +4626,8 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad)
         .def("forward_sparse", &DISLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
              py::arg("values"), py::arg("batch"))
         .def("backward_sparse", &DISLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
@@ -4624,7 +4637,8 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad)
         // Real-time engine dispatch -- picks disldo vs sisldo per call
         // (engine_select.hpp); identical results either way, only speed
         // differs. Two overloads each, resolved by pybind from the
@@ -4642,27 +4656,29 @@ PYBIND11_MODULE(_cpu, m) {
              static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
                  py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::V, bool,
                  bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
-                 DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+                 DISLDOLayerV::V, bool, DISLDOLayerV::V)>(&DISLDOLayerV::backward),
              py::arg("x"), py::arg("dy"), py::arg("learning_rate"),
              py::arg("lr_per_row_nnz") = false, py::arg("damp_by_importance") = true,
              py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad)
         .def("backward",
              static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
                  py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::S>,
                  py::array_t<DISLDOLayerV::S>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::S,
                  DISLDOLayerV::V, bool, bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
-                 DISLDOLayerV::V, DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+                 DISLDOLayerV::V, DISLDOLayerV::V, bool, DISLDOLayerV::V)>(&DISLDOLayerV::backward),
              py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad)
         .def("apply_amortized_l2_decay", &DISLDOLayerV::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
         .def("apply_amortized_importance_decay", &DISLDOLayerV::apply_amortized_importance_decay,
