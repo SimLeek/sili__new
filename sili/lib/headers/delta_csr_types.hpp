@@ -781,12 +781,20 @@ template <typename VALUE_TYPE> struct PlainRMSpropSynapsePolicy {
     // default) was checked against. NaN/Inf guard closes a coverage gap
     // an earlier commit (ba4af42) left. See
     // docs/research/delta_csr_types.rst:synapse_policy.plain_reference.
+    // max_abs_grad: clip g/contrib to [-max_abs_grad, max_abs_grad] BEFORE
+    // squaring into the EMA -- default (1e30) is a true no-op for any
+    // finite input, so every existing call site (which omits this
+    // argument) stays bit-identical. See
+    // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
-                                VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/) {
+                                VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/,
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
+        const VALUE_TYPE g_c = std::min(std::max(g, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
         const VALUE_TYPE new_ci =
-            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g_c * g_c + contrib_c * contrib_c);
         return std::isfinite(new_ci) ? new_ci : ci;
     }
 
@@ -825,11 +833,17 @@ template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
     // Same NaN/Inf guard convention as PlainRMSpropSynapsePolicy::update_ci,
     // checked BEFORE the floor/max_ci clamps (std::min/max's NaN behavior
     // is comparison-order-dependent, not a reliable filter on its own).
+    // max_abs_grad: same clip-before-squaring semantics and no-op default
+    // as PlainRMSpropSynapsePolicy::update_ci above -- see its docstring.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
-                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
+                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci,
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
-        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        const VALUE_TYPE g_c = std::min(std::max(g, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE ema =
+            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g_c * g_c + contrib_c * contrib_c);
         if (!std::isfinite(ema))
             return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
@@ -950,10 +964,16 @@ template <typename COL_TYPE = uint32_t> struct DeltaCSRRowCursor {
 template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
     // Same NaN/Inf guard as the scalar update_ci, per-lane via
     // block4_vec_select_finite (block4.hpp has no whole-vector isfinite).
+    // max_abs_grad: same clip-before-squaring semantics as the scalar
+    // version, via block4_vec_clip_abs -- default (1e30 broadcast) is a
+    // true no-op, so every existing call site stays bit-identical.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
-                               Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/) {
+                               Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/,
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec g_c = block4_vec_clip_abs(g, max_abs_grad);
+        const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
+        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g_c * g_c + contrib_c * contrib_c);
         return block4_vec_select_finite(new_ci, ci);
     }
 
@@ -977,11 +997,16 @@ template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
 
 template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // Same min_decay_frac semantics and NaN/Inf guard as the scalar
-    // update_ci (checked before the floor/max_ci clamps).
+    // update_ci (checked before the floor/max_ci clamps). max_abs_grad:
+    // same clip-before-squaring semantics as the scalar version, see
+    // PlainRMSpropSynapsePolicy<Block4Vec>::update_ci above.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
-                               Block4Vec min_decay_frac, Block4Vec max_ci) {
+                               Block4Vec min_decay_frac, Block4Vec max_ci,
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec g_c = block4_vec_clip_abs(g, max_abs_grad);
+        const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
+        const Block4Vec ema = beta2 * ci + (one - beta2) * (g_c * g_c + contrib_c * contrib_c);
         const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
         const Block4Vec floor = min_decay_frac * ci;
         return block4_vec_min(block4_vec_max(ema_safe, floor), max_ci);

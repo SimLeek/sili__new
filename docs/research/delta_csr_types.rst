@@ -937,6 +937,92 @@ not the ceiling. Measured at the production default
 print a one-time stderr warning if called with ``learning_rate > 0.2`` for
 exactly this reason.
 
+.. _synapse_policy.max_abs_grad_clip:
+
+``max_abs_grad``: clip g/contrib BEFORE they enter the ci EMA
+------------------------------------------------------------------
+
+*ID:* ``synapse_policy.max_abs_grad_clip``
+
+Direct question in sili_peridot, confirming ``ci`` really is Adam/
+RMSprop's own second-moment state (not just analogous -- same formula,
+same ``beta2=0.999`` default): "It seems to be the importance
+saturating for those specifically, right? ... it would be the
+optimizer state for rmsprop and the second optimizer state for adam
+iirc." Followed by a direct instruction to fix the resulting gap: "I
+think we should actually fix the clip grad norm thing first, and use a
+test in sili to demonstrate its importance... it seems like it could
+be a unit test that completes in a few milliseconds rather than an
+integration test."
+
+**The gap**: every real per-synapse call site
+(``sisldo_ops.hpp``/``linear_disldo_backward.hpp``) fed raw, UNCLIPPED
+``g``/``contrib`` straight into ``update_ci``'s EMA. Standard Adam/
+RMSprop practice clips BEFORE squaring into the second-moment
+accumulator specifically to stop a transient outlier gradient from
+getting permanently baked into a slow EMA. Web-researched exactly when
+this matters (not assumed): Zhang et al., "Why are Adaptive Methods
+Good for Attention Models?" (NeurIPS 2020, arXiv:1912.03194) found
+attention architectures produce HEAVY-TAILED gradient noise
+INDEPENDENT of input data -- occasional gradients far larger than the
+typical one, a general property of this project's own attention-based
+architecture, not a hypothetical edge case.
+
+**Demonstrated, not assumed, with a real unit test** -- direct
+correction mid-implementation, from a first pass that only confirmed a
+missing-parameter compile error (RED for the wrong reason -- see
+``tests/unit/test_synapse_policy_grad_clip.cpp``'s own leading
+docstring). The test that actually matters is the FIRST TEST_CASE in
+that file, which calls ONLY ``update_ci``'s pre-existing 6-argument
+signature (no ``max_abs_grad`` anywhere) -- verified standalone via a
+throwaway ``g++`` compile against the header with the fix stashed out,
+proving the failure mode is real in this codebase's actual formula
+before any fix existed:
+
+.. code-block:: text
+
+    ci_start=0.000453 ci_baseline=0.000905 ci_spiked=1.949572 ratio=2155.0
+    predicted ci_spiked=1.949618 (analytic decay formula)
+    PROBLEM TEST PASSED: unclipped g=50 spike poisons ci by 2155.0x after 249 steps
+
+A single ``g=50`` gradient spike (beta2=0.999) injects
+``(1-beta2)*50^2=2.5`` into ``ci`` -- 1000x what a normal ``g=0.05``
+step contributes. After 249 more EMA steps that excess has only decayed
+by ``0.999^249~=0.78``, so ~78% of it is STILL present -- a 2155x
+elevated ``ci`` relative to a no-spike baseline, matching the analytic
+prediction almost exactly. Same fix, verified to resolve it: clipping
+the spike to ``max_abs_grad=1.0`` leaves ``ci`` at only 1.86x baseline
+(vs 2155x unclipped) -- also confirmed via a standalone probe before
+the full test suite ran.
+
+**Fix**: new ``max_abs_grad`` parameter on ``update_ci`` (both
+``PlainRMSpropSynapsePolicy`` and ``BoundedRMSpropSynapsePolicy``,
+scalar AND ``Block4Vec``) -- clips ``g`` and ``contrib`` independently
+to ``[-max_abs_grad, max_abs_grad]`` before squaring into the EMA.
+Default ``1e30`` (scalar) / ``block4_vec_broadcast(1e30f)`` (SIMD) is a
+true no-op for any finite input, so every existing call site (which
+omits this argument) is bit-identical -- confirmed by the full 182-test
+regression passing clean with the fix applied, and confirmed genuinely
+broken (real compile failure, not just a lint hint) with the fix
+stashed out. Block4Vec reuses the already-existing
+``block4_vec_clip_abs`` helper (previously only used by
+``update_cw``'s own delta clip).
+
+**Scoped deliberately to ``update_ci`` only, not ``update_cw``** --
+once ``ci`` reflects a large gradient (after the EMA update), the
+weight-update delta already self-limits via ``sqrt(ci)`` in the
+denominator; the only exposure there is the single step where the
+spike first occurs, a much smaller blast radius than ``ci``'s
+hundreds-of-steps poisoning. Left as a smaller, secondary
+consideration, not built this pass.
+
+**Not yet threaded to Python/real training runs** -- this is the
+engine-level primitive only, with a default that's a true no-op. Next
+step (not done): expose ``max_abs_grad`` through
+``cpu_backend.cpp``'s bindings, ``sili/sparse_rnn.py``, and
+sili_peridot's ``train_mqar_curriculum.py`` ``synapse_kwargs``, so a
+real MQAR run can actually opt into it.
+
 .. _synapse_policy.block4vec_specializations:
 
 ``Block4Vec`` SIMD specializations of the synapse policies
