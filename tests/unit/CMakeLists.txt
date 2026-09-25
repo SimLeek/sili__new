@@ -68,6 +68,7 @@ add_executable(
     test_scale_handling.cpp
     test_synapse_update_policy.cpp
     test_synapse_policy_grad_clip.cpp
+    test_synapse_policy_centering.cpp
     test_attention.cpp
     test_csr_union.cpp
 

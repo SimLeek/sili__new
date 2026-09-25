@@ -1069,6 +1069,168 @@ run a real mqar run with it, v14." Two-tier default pattern, matching
   ``docs/research/train_mqar_curriculum.rst`` and JOURNAL.md for the
   v14 real-run result.
 
+.. _synapse_policy.adabelief_centering:
+
+AdaBelief-style centering: ``ci = EMA((g-m)^2)`` instead of ``EMA(g^2)``
+------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.adabelief_centering``
+
+**Motivation, distinct from ``max_abs_grad`` above**: v14 (``max_abs_grad``
+threaded through and validated on sili_peridot's real MQAR training,
+seed=1001) fixed the literal ``ci=100`` saturation ceiling but regressed
+curriculum progress vs v13b. Direct question, prompted by that result:
+"how would we actually get per column clipping? Would per column
+adabelief work?" ``max_abs_grad`` and AdaBelief-style centering fix
+DIFFERENT failure modes, not competing fixes for the same one:
+
+- **``max_abs_grad`` (clipping)** defends against a genuine ONE-OFF
+  outlier spike -- ``m`` (the tracked baseline) hasn't adapted yet, so
+  ``residual = g - m ~= g``, and the hard clip is the only real defense.
+- **Centering** defends against a SUSTAINED, consistent large gradient --
+  a column stuck with real, persistent error signal. Clipping alone
+  still lets ``ci`` settle at ``max_abs_grad^2`` and stay stuck high
+  there; centering lets ``m`` track the new baseline so
+  ``residual = g - m -> 0`` and ``ci`` stops accumulating.
+
+Verified directly (not hand-derived), ``tests/unit/test_synapse_policy_
+centering.cpp``'s first two ``TEST_CASE``\ s: a sustained ``g=10``
+gradient under clip-only (``max_abs_grad=8``) gives ``ci=16.594574``
+after 300 steps (beta2=0.999's ~1000-step time constant means 300 steps
+only reaches ~26% of the true 64.0 steady state -- NOT the naively-
+guessed asymptote). Under centering (``m`` converges to 10.0 within 300
+steps at beta1=0.9), ``ci=0.303643`` -- a real, verified 54.65x
+reduction. A genuine one-off spike (``g=50``, fresh ``m=0``) is
+confirmed algebraically NOT rescued: ``m`` only moves 10% of the way on
+one touch, residual stays >40.
+
+**Design decision, direct instruction**: "I'd say rowxcolumn since that
+includes per column and we may be able to use some of the low rank
+stuff to implement it which may allow us to expand it if needed."
+Row-only vs column-only vs row+column was weighed; row+column (a
+per-(row,column) baseline ``m[i,j]`` built from two much smaller
+per-axis trackers, ``m_row[i]`` size ``n_in`` and ``m_col[j]`` size
+``n_out``) was chosen over column-only alone specifically because it
+generalizes toward this project's existing AQRS rank-N scale-tracking
+pattern (the same row-times-column factorization already used for
+``value_scale``/``output_scale``), leaving room to expand to a real
+low-rank factorization later if a single row+column term proves
+insufficient.
+
+**Additive, not Adafactor-style multiplicative -- a real mathematical
+subtlety, caught before implementing, not after**: Adafactor's own
+row/column reconstruction (``R[i]*C[j]/sum(R)``) is the
+I-divergence-minimizing solution for reconstructing a NONNEGATIVE
+target (it tracks ``g^2``). This project's ``m`` tracks the SIGNED
+gradient ``g`` itself (an EMA of ``g``, not ``g^2`` -- needed so
+``residual = g - m`` can actually cancel a sustained SIGNED bias, not
+just a magnitude). Applying Adafactor's multiplicative formula to a
+signed quantity risks division instability (near-zero or sign-flipping
+denominators) with no corresponding benefit, since its optimality proof
+doesn't transfer. Direct confirmation: "Hmm, good catch. Yeah, sounds
+good, let's write it up and build it." Fixed design:
+``m[i,j] = m_row[i] + m_col[j]``, each axis an INDEPENDENT
+``FirstMomentTracker`` EMA (below) -- no division anywhere.
+
+**``FirstMomentTracker<VALUE_TYPE>``** (``delta_csr_types.hpp``, scalar +
+``Block4Vec`` specializations): ``static VALUE_TYPE update(VALUE_TYPE m,
+VALUE_TYPE g, VALUE_TYPE beta1)`` -> ``beta1*m + (1-beta1)*g``, NaN/Inf
+guarded. A deliberately separate, tiny policy from
+Plain/BoundedRMSpropSynapsePolicy -- it tracks a pure statistic, not a
+gradient-descent-optimized parameter, so it has no ``update_cw``
+counterpart. Its own EMA rate is named ``centering_beta1`` throughout
+(engine parameter and ``kSynapsePolicyCenteringBeta1 = 0.9f`` in
+``cpu_backend.cpp``) to avoid collision with ``disldo_backward``'s
+existing, UNRELATED ``beta1`` parameter (used only for
+``value_scale_momentum``'s dead-row-bootstrap Adam-style update, a
+completely separate mechanism).
+
+**A real double-counting bug, found via an end-to-end smoke test, not
+caught by unit tests alone**: the first implementation had each axis
+(``m_row[i]``, ``m_col[j]``) independently fit the RAW gradient ``g``.
+When row and column effects are confounded -- e.g. constant ``x``/``dy``
+across every synapse of a dense layer, exactly what a real smoke test
+against ``sili.sparse_rnn.DISLDOLayer32(dense=True)`` used -- BOTH axes
+independently converge toward tracking the FULL ``g`` on their own, so
+``m[i,j] = m_row[i] + m_col[j]`` overshoots toward ``2g`` instead of
+``g``. Measured directly, sustained ``g=25`` (x=2.5, dy=10.0 constant),
+300 steps: no centering -> mean importance=16.9364; column-only ->
+0.5327 (correct, dramatic reduction); row+column (buggy) -> 16.8844
+(barely different from NO centering at all -- ``residual`` clips to
+``-max_abs_grad`` almost every step, reproducing the uncentered case).
+
+**Fix**: each axis fits the RESIDUAL after subtracting the OTHER axis's
+OLD (pre-this-touch) value, not raw ``g`` -- ``m_row``'s update uses
+``g - m_col_old``, ``m_col``'s update uses ``g - m_row_old``, both read
+from the SAME snapshot of the other axis taken before either write
+(avoiding update-order dependence). Verified by hand-calculation and by
+a dedicated unit test (``test_synapse_policy_centering.cpp``'s
+"REGRESSION: row+column additive centering..." ``TEST_CASE``, both a
+"buggy" section confirming the raw-``g`` formula genuinely converges to
+``2g`` and a "fixed" section confirming the residual formula converges
+to ``g``) that this converges correctly: from ``m_row=m_col=0``, touch 1
+gives both ``~=2.5``; touch 2 gives both ``~=4.5``; converges toward
+``m_row+m_col -> 25`` (exactly matching ``g``, no overshoot). Re-run of
+the same smoke test after the fix: row+column mean importance=0.4407 --
+on par with column-only's 0.5327, confirming the fix resolves the
+overshoot (down from the buggy 16.8844).
+
+**Per-SIMD-call ``m_row`` aggregation**: a single ``Block4Vec``
+``update_ci`` call touches ONE row against 4 (or, in the row-pair/
+tile-pair AVX2 variants, up to 8) columns simultaneously.
+``m_row[row]``'s own update uses the MEAN of the touched ``g_agg``
+values across however many columns were touched this call (via
+``block4_vec_hsum(g_agg_v)/BLOCK4_TILE``), treating the whole SIMD call
+as "one row touch" -- and, symmetrically, the residual subtracted from
+each axis's own update uses the MEAN of the OTHER axis's old lanes over
+the same touched set (e.g. row-pair's shared ``m_col`` update subtracts
+``(m_row_v0+m_row_v1)*0.5``; tile-pair's ``m_row`` update subtracts the
+mean of ``m_colA_v``/``m_colB_v`` across all 8 touched cells).
+
+**Scoped to the BLOCK4 path only this pass, scattered branches left
+unwired**: ``dense=True`` layers (used by all real MQAR training via
+``DISLDOLayer32``) store 100% of weights in block4 storage, making
+``disldo_backward``'s own scattered branch and
+``disldo_backward_sparse_grad``'s scattered branch dead code for this
+scenario. Both were left calling ``update_ci`` WITHOUT the new ``m``
+argument (defaulting to 0, a true no-op) -- a deliberate, documented
+scoping decision matching ``max_abs_grad``'s own initial-rollout
+precedent above. All BLOCK4-touching call sites (the 3 helper functions
+in ``linear_disldo_backward.hpp`` -- ``block4_backward_process_
+single_row``, ``_row_pair``, ``_tile_pair`` -- plus
+``sisldo_ops.hpp``'s ``disldo_backward_sparse_grad`` block4 branch) are
+fully wired.
+
+**New ``DISLDOLayerV`` state and API**: persistent
+``std::vector<V> m_row, m_col`` member fields (sized ``n_inputs``/
+``n_outputs``, zero-initialized, persisted across calls like ``ci``/
+weight storage itself -- NOT exposed via pybind, so not directly
+Python-readable). New Python-facing kwargs on ``backward_dense``/
+``backward_sparse``/both ``backward`` overloads: ``centering_row_enable:
+bool = false``, ``centering_col_enable: bool = false``,
+``centering_beta1: V = kSynapsePolicyCenteringBeta1``. Inside each C++
+method: ``V* m_row_ptr = centering_row_enable ? m_row.data() :
+nullptr;`` (same for ``col``), matching the existing nullable-pointer
+no-op-when-absent convention already used by ``Block4BackwardParams``.
+
+**Full 191-test regression passes clean** (up from 190 before this
+test's addition -- the new row+column double-counting regression test
+above) after the block4-path threading; a real ``pip install -e .``
+rebuild + the 3-way smoke test (no centering / column-only / row+column,
+via ``sili.sparse_rnn.DISLDOLayer32(dense=True)``, sustained large
+gradient, ``learning_rate=1e-9`` since ``disldo_backward``'s whole
+per-synapse update block -- including ``ci`` itself -- is gated behind
+``learning_rate != 0``) confirms the numbers above.
+
+**Not yet built** (see sili_peridot's own JOURNAL.md/train_mqar_
+curriculum.rst for status): Python-level threading of
+``centering_row_enable``/``centering_col_enable``/``centering_beta1``
+through ``sili/sparse_rnn.py``'s ``DISLDOLayer32.forward`` wrapper
+(mirroring ``max_abs_grad``'s own ``float | None = None`` pattern), and
+the actual column-only-vs-row+column real MQAR comparison runs --
+"Agreed on the proper design, eventually leading to new mqar versions
+with column-only vs rowxcolumn."
+
 .. _synapse_policy.block4vec_specializations:
 
 ``Block4Vec`` SIMD specializations of the synapse policies

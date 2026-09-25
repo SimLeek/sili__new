@@ -59,6 +59,9 @@ void block4_backward_process_single_row(
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
     const value_type max_abs_grad = params.max_abs_grad;
+    value_type* m_row = params.m_row;
+    value_type* m_col = params.m_col;
+    const value_type centering_beta1 = params.centering_beta1;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -252,8 +255,22 @@ void block4_backward_process_single_row(
                 const value_type S = combined_scale4[lj];
                 const value_type g_agg = static_cast<value_type>(g_agg4[lj]);
                 const value_type contrib_agg = static_cast<value_type>(contrib_agg4[lj]);
+                const value_type m_r = m_row ? m_row[row] : value_type(0);
+                const value_type m_c = m_col ? m_col[col4[lj]] : value_type(0);
                 ci4[lj] = SynapsePolicy::update_ci(ci4[lj], g_agg, contrib_agg, beta2,
-                                                   min_decay_frac, max_ci, max_abs_grad);
+                                                   min_decay_frac, max_ci, max_abs_grad, m_r + m_c);
+                // Each axis fits the RESIDUAL after the OTHER axis's OLD
+                // (pre-this-touch) estimate, not raw g -- avoids double-
+                // counting when row/column effects are confounded (both
+                // independently chasing the full g would converge to
+                // m_row+m_col overshooting g by ~2x). See
+                // docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+                if (m_row)
+                    m_row[row] = FirstMomentTracker<value_type>::update(m_row[row], g_agg - m_c,
+                                                                        centering_beta1);
+                if (m_col)
+                    m_col[col4[lj]] = FirstMomentTracker<value_type>::update(
+                        m_col[col4[lj]], g_agg - m_r, centering_beta1);
                 quant4[lj] =
                     quant_start4[lj] + SynapsePolicy::update_cw(g_agg, ci4[lj], S, effective_lr,
                                                                 eps, damp_by_importance,
@@ -357,8 +374,35 @@ void block4_backward_process_single_row(
             // ONE update, using the batch-aggregated g/contrib.
             Block4Vec quant_v = quant_start_v;
             if (training) {
+                // col4[0..3] are contiguous (col_base..col_base+3) in this
+                // full-tile branch -- m_col loads/stores as one 4-wide
+                // slice. m_row is ONE scalar (single row, broadcast to all
+                // 4 lanes); its own update uses the mean of this touch's 4
+                // per-column g_agg values as "this row's typical gradient."
+                const Block4Vec m_col_v =
+                    m_col ? block4_vec_load(m_col + col4[0]) : block4_vec_broadcast(0.0f);
+                const Block4Vec m_row_v = block4_vec_broadcast(m_row ? m_row[row] : value_type(0));
                 ci_v = SynapsePolicyVec::update_ci(ci_v, g_agg_v, contrib_agg_v, beta2_v,
-                                                   min_decay_frac_v, max_ci_v, max_abs_grad_v);
+                                                   min_decay_frac_v, max_ci_v, max_abs_grad_v,
+                                                   m_row_v + m_col_v);
+                if (m_col) {
+                    // Residual vs the OTHER axis's OLD (pre-this-touch)
+                    // value (m_row_v, snapshotted above) -- avoids
+                    // double-counting when row/column effects are
+                    // confounded, see block4_backward_process_single_row's
+                    // scalar branch for the derivation.
+                    const Block4Vec beta1_v = block4_vec_broadcast(centering_beta1);
+                    block4_vec_store(m_col + col4[0], FirstMomentTracker<Block4Vec>::update(
+                                                          m_col_v, g_agg_v - m_row_v, beta1_v));
+                }
+                if (m_row) {
+                    const value_type g_row_mean =
+                        block4_vec_hsum(g_agg_v) / value_type(BLOCK4_TILE);
+                    const value_type m_col_mean =
+                        block4_vec_hsum(m_col_v) / value_type(BLOCK4_TILE);
+                    m_row[row] = FirstMomentTracker<value_type>::update(
+                        m_row[row], g_row_mean - m_col_mean, centering_beta1);
+                }
                 // dL/d(quant) = g*S -- proper chain rule on
                 // true_w=quant*S (multiply, not divide --
                 // see disldo_backward's scattered-path
@@ -443,6 +487,9 @@ void block4_backward_process_row_pair(
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
     const value_type max_abs_grad = params.max_abs_grad;
+    value_type* m_row = params.m_row;
+    value_type* m_col = params.m_col;
+    const value_type centering_beta1 = params.centering_beta1;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -648,10 +695,39 @@ void block4_backward_process_row_pair(
         const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
         const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
         const Block4Vec max_abs_grad_v4 = block4_vec_broadcast(max_abs_grad);
+        // row0/row1 share the SAME 4 columns (col4[0..3], contiguous) --
+        // m_col read ONCE (both rows center against the same baseline),
+        // written ONCE after using the pair's averaged g (one "touch" per
+        // column this call, not two sequential ones). m_row is independent
+        // per row, using its own 4-lane mean.
+        const Block4Vec m_col_v =
+            m_col ? block4_vec_load(m_col + col4[0]) : block4_vec_broadcast(0.0f);
+        const Block4Vec m_row_v0 = block4_vec_broadcast(m_row ? m_row[row0] : value_type(0));
+        const Block4Vec m_row_v1 = block4_vec_broadcast(m_row ? m_row[row1] : value_type(0));
         ci_v0 = SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0, beta2_v4,
-                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
+                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4,
+                                            m_row_v0 + m_col_v);
         ci_v1 = SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1, beta2_v4,
-                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
+                                            min_decay_frac_v4, max_ci_v4, max_abs_grad_v4,
+                                            m_row_v1 + m_col_v);
+        // Residual vs the OTHER axis's OLD (pre-this-touch) value -- same
+        // double-counting fix as block4_backward_process_single_row.
+        if (m_col) {
+            const Block4Vec beta1_v = block4_vec_broadcast(centering_beta1);
+            const Block4Vec g_col_mean = (g_agg_v0 + g_agg_v1) * block4_vec_broadcast(0.5f);
+            const Block4Vec m_row_mean = (m_row_v0 + m_row_v1) * block4_vec_broadcast(0.5f);
+            block4_vec_store(m_col + col4[0], FirstMomentTracker<Block4Vec>::update(
+                                                  m_col_v, g_col_mean - m_row_mean, beta1_v));
+        }
+        if (m_row) {
+            const value_type g_row0_mean = block4_vec_hsum(g_agg_v0) / value_type(BLOCK4_TILE);
+            const value_type g_row1_mean = block4_vec_hsum(g_agg_v1) / value_type(BLOCK4_TILE);
+            const value_type m_col_mean = block4_vec_hsum(m_col_v) / value_type(BLOCK4_TILE);
+            m_row[row0] = FirstMomentTracker<value_type>::update(
+                m_row[row0], g_row0_mean - m_col_mean, centering_beta1);
+            m_row[row1] = FirstMomentTracker<value_type>::update(
+                m_row[row1], g_row1_mean - m_col_mean, centering_beta1);
+        }
         const Block4Vec delta_v0 =
             SynapsePolicyVec::update_cw(g_agg_v0, ci_v0, S_v0, effective_lr_v0, eps_v4,
                                         damp_by_importance, max_abs_delta_v4, scale_invariant);
@@ -784,6 +860,9 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
     const value_type max_ci = params.max_ci;
     const value_type max_abs_delta = params.max_abs_delta;
     const value_type max_abs_grad = params.max_abs_grad;
+    value_type* m_row = params.m_row;
+    value_type* m_col = params.m_col;
+    const value_type centering_beta1 = params.centering_beta1;
     const bool damp_by_importance = params.damp_by_importance;
     const bool scale_invariant = params.scale_invariant;
     const value_type zero_escape_eps = params.zero_escape_eps;
@@ -1002,10 +1081,40 @@ Block4TileDirtyPair block4_backward_process_tile_pair(
             const Block4Vec max_ci_v4 = block4_vec_broadcast(max_ci);
             const Block4Vec max_abs_delta_v4 = block4_vec_broadcast(max_abs_delta);
             const Block4Vec max_abs_grad_v4 = block4_vec_broadcast(max_abs_grad);
+            // colA/colB are each contiguous 4-wide slices (different
+            // tiles); row is the SAME single row for both -- m_row read
+            // ONCE (both column groups center against the same baseline),
+            // written ONCE using the mean across all 8 touched cells.
+            const Block4Vec m_colA_v =
+                m_col ? block4_vec_load(m_col + colA[0]) : block4_vec_broadcast(0.0f);
+            const Block4Vec m_colB_v =
+                m_col ? block4_vec_load(m_col + colB[0]) : block4_vec_broadcast(0.0f);
+            const Block4Vec m_row_v = block4_vec_broadcast(m_row ? m_row[row] : value_type(0));
             ci_v0 = SynapsePolicyVec::update_ci(ci_v0, g_agg_v0, contrib_agg_v0, beta2_v4,
-                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
+                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4,
+                                                m_row_v + m_colA_v);
             ci_v1 = SynapsePolicyVec::update_ci(ci_v1, g_agg_v1, contrib_agg_v1, beta2_v4,
-                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4);
+                                                min_decay_frac_v4, max_ci_v4, max_abs_grad_v4,
+                                                m_row_v + m_colB_v);
+            // Residual vs the OTHER axis's OLD (pre-this-touch) value --
+            // same double-counting fix as block4_backward_process_single_row.
+            if (m_col) {
+                const Block4Vec beta1_v = block4_vec_broadcast(centering_beta1);
+                block4_vec_store(m_col + colA[0], FirstMomentTracker<Block4Vec>::update(
+                                                      m_colA_v, g_agg_v0 - m_row_v, beta1_v));
+                block4_vec_store(m_col + colB[0], FirstMomentTracker<Block4Vec>::update(
+                                                      m_colB_v, g_agg_v1 - m_row_v, beta1_v));
+            }
+            if (m_row) {
+                const value_type g_row_mean =
+                    (block4_vec_hsum(g_agg_v0) + block4_vec_hsum(g_agg_v1)) /
+                    value_type(2 * BLOCK4_TILE);
+                const value_type m_col_mean =
+                    (block4_vec_hsum(m_colA_v) + block4_vec_hsum(m_colB_v)) /
+                    value_type(2 * BLOCK4_TILE);
+                m_row[row] = FirstMomentTracker<value_type>::update(
+                    m_row[row], g_row_mean - m_col_mean, centering_beta1);
+            }
             const Block4Vec delta_v0 =
                 SynapsePolicyVec::update_cw(g_agg_v0, ci_v0, S_v0, effective_lr_v, eps_v4,
                                             damp_by_importance, max_abs_delta_v4, scale_invariant);
@@ -1109,7 +1218,16 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                      // (default) is a true no-op. Appended LAST, same positional-arg
                      // safety reasoning as l1_coef above. See
                      // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
-                     typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f) {
+                     typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f,
+                     // m_row/m_col: AdaBelief-style centering (BLOCK4 path
+                     // only this pass -- the scattered branch below stays
+                     // uncentered, since dense=True's scattered storage is
+                     // always empty in practice; see
+                     // docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering).
+                     // nullptr (default) on either disables that axis.
+                     typename ValueAccessor<VALUES_TYPE>::value_type* m_row = nullptr,
+                     typename ValueAccessor<VALUES_TYPE>::value_type* m_col = nullptr,
+                     typename ValueAccessor<VALUES_TYPE>::value_type centering_beta1 = 0.9f) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     using SynapsePolicyVec = SynapsePolicyT<Block4Vec>;
@@ -1703,7 +1821,10 @@ void disldo_backward(const typename ValueAccessor<VALUES_TYPE>::value_type* inpu
                                                                              row_live_count.data(),
                                                                              input_T.data(),
                                                                              output_grad_T.data(),
-                                                                             max_abs_grad};
+                                                                             max_abs_grad,
+                                                                             m_row,
+                                                                             m_col,
+                                                                             centering_beta1};
 
         const auto sili_t_tileloop_start = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(num_cpus)

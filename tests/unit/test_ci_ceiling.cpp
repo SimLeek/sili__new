@@ -73,9 +73,10 @@ static std::size_t g_call_count = 0;
 template <typename VALUE_TYPE> struct DebugBoundedPolicy {
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
                                 VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci,
-                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30),
+                                VALUE_TYPE m = VALUE_TYPE(0)) {
         const VALUE_TYPE result = BoundedRMSpropSynapsePolicy<VALUE_TYPE>::update_ci(
-            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad);
+            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad, m);
         ++g_call_count;
         if (result > g_max_ci_ever) {
             g_max_ci_ever = result;
@@ -98,9 +99,10 @@ template <typename VALUE_TYPE> struct DebugBoundedPolicy {
 template <> struct DebugBoundedPolicy<Block4Vec> {
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
                                Block4Vec min_decay_frac, Block4Vec max_ci,
-                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f),
+                               Block4Vec m = block4_vec_broadcast(0.0f)) {
         const Block4Vec result = BoundedRMSpropSynapsePolicy<Block4Vec>::update_ci(
-            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad);
+            ci, g, contrib, beta2, min_decay_frac, max_ci, max_abs_grad, m);
         ++g_call_count;
         for (int i = 0; i < SILI_BLOCK4_TILE_SIZE; ++i) {
             if (result[i] > g_max_ci_ever) {

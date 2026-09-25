@@ -236,10 +236,22 @@ template <typename SIZE_TYPE, typename VALUES_TYPE, typename COL_TYPE> struct Bl
     const value_type* output_grad_T; // [ceil(n_out/BLOCK4_TILE), batch, BLOCK4_TILE], zero-padded
     // max_abs_grad: clip g/contrib before they enter ci's EMA -- see
     // synapse_policy.max_abs_grad_clip in docs/research/delta_csr_types.rst.
-    // LAST field, with a default member initializer, so the one existing
-    // aggregate-init construction site (disldo_backward) stays valid
-    // whether or not it's updated to set a real value.
     value_type max_abs_grad = value_type(1e30);
+    // m_row/m_col: AdaBelief-style centering, per-row/per-column additive
+    // first-moment baseline (m_row[row]+m_col[col], NOT a multiplicative
+    // factorization -- see synapse_policy.adabelief_centering). Nullable
+    // -- nullptr means that axis contributes 0 (disabled); both null
+    // reproduces today's uncentered formula exactly. Mutable (read AND
+    // written per touched synapse), unlike every other field here.
+    // centering_beta1: EMA rate for m_row/m_col's own update -- separate
+    // parameter from the unrelated pre-existing `beta1` (disldo_backward's
+    // OWN value_scale-momentum dead-row bootstrap, a different mechanism
+    // entirely) to avoid confusing the two. LAST fields, with default
+    // member initializers, so the one existing aggregate-init construction
+    // site (disldo_backward) stays valid whether or not it's updated.
+    value_type* m_row = nullptr;
+    value_type* m_col = nullptr;
+    value_type centering_beta1 = value_type(0.9);
 };
 
 // Per-thread mutable output accumulators -- replaces the mcol_at/mrow_at/

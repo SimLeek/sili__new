@@ -786,15 +786,21 @@ template <typename VALUE_TYPE> struct PlainRMSpropSynapsePolicy {
     // finite input, so every existing call site (which omits this
     // argument) stays bit-identical. See
     // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+    // m: AdaBelief-style centering -- clip(g-m, ...) instead of clip(g, ...).
+    // Default 0 makes residual==g, so this is a true no-op for every
+    // existing call site. See
+    // docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
                                 VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/,
-                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30),
+                                VALUE_TYPE m = VALUE_TYPE(0)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
-        const VALUE_TYPE g_c = std::min(std::max(g, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE residual = g - m;
+        const VALUE_TYPE residual_c = std::min(std::max(residual, -max_abs_grad), max_abs_grad);
         const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
-        const VALUE_TYPE new_ci =
-            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g_c * g_c + contrib_c * contrib_c);
+        const VALUE_TYPE new_ci = beta2 * ci + (VALUE_TYPE(1) - beta2) * (residual_c * residual_c +
+                                                                          contrib_c * contrib_c);
         return std::isfinite(new_ci) ? new_ci : ci;
     }
 
@@ -835,15 +841,19 @@ template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
     // is comparison-order-dependent, not a reliable filter on its own).
     // max_abs_grad: same clip-before-squaring semantics and no-op default
     // as PlainRMSpropSynapsePolicy::update_ci above -- see its docstring.
+    // m: AdaBelief-style centering, same clip(g-m,...) semantics and 0
+    // (true no-op) default as PlainRMSpropSynapsePolicy::update_ci above.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
                                 VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci,
-                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30)) {
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30),
+                                VALUE_TYPE m = VALUE_TYPE(0)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
-        const VALUE_TYPE g_c = std::min(std::max(g, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE residual = g - m;
+        const VALUE_TYPE residual_c = std::min(std::max(residual, -max_abs_grad), max_abs_grad);
         const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
-        const VALUE_TYPE ema =
-            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g_c * g_c + contrib_c * contrib_c);
+        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) *
+                                                (residual_c * residual_c + contrib_c * contrib_c);
         if (!std::isfinite(ema))
             return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
@@ -877,6 +887,22 @@ template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
             raw = -max_abs_delta;
         const VALUE_TYPE delta = scale_invariant ? (eff_lr * raw / S) : (eff_lr * raw);
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
+    }
+};
+
+// Plain EMA of the SIGNED gradient g itself (not g^2) -- the additive
+// row+column baseline AdaBelief-style centering (update_ci's `m` param)
+// needs. Deliberately a separate, tiny policy (not folded into
+// Plain/BoundedRMSpropSynapsePolicy): it tracks a pure statistic, not a
+// gradient-descent-optimized parameter, so it has no update_cw
+// counterpart. See
+// docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+template <typename VALUE_TYPE> struct FirstMomentTracker {
+    static VALUE_TYPE update(VALUE_TYPE m, VALUE_TYPE g, VALUE_TYPE beta1) {
+        if (!std::isfinite(g))
+            return m;
+        const VALUE_TYPE new_m = beta1 * m + (VALUE_TYPE(1) - beta1) * g;
+        return std::isfinite(new_m) ? new_m : m;
     }
 };
 
@@ -967,13 +993,16 @@ template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
     // max_abs_grad: same clip-before-squaring semantics as the scalar
     // version, via block4_vec_clip_abs -- default (1e30 broadcast) is a
     // true no-op, so every existing call site stays bit-identical.
+    // m: AdaBelief-style centering, same semantics as the scalar version.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
                                Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/,
-                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f),
+                               Block4Vec m = block4_vec_broadcast(0.0f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec g_c = block4_vec_clip_abs(g, max_abs_grad);
+        const Block4Vec residual_c = block4_vec_clip_abs(g - m, max_abs_grad);
         const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
-        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g_c * g_c + contrib_c * contrib_c);
+        const Block4Vec new_ci =
+            beta2 * ci + (one - beta2) * (residual_c * residual_c + contrib_c * contrib_c);
         return block4_vec_select_finite(new_ci, ci);
     }
 
@@ -1000,13 +1029,16 @@ template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // update_ci (checked before the floor/max_ci clamps). max_abs_grad:
     // same clip-before-squaring semantics as the scalar version, see
     // PlainRMSpropSynapsePolicy<Block4Vec>::update_ci above.
+    // m: AdaBelief-style centering, same semantics as the scalar version.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
                                Block4Vec min_decay_frac, Block4Vec max_ci,
-                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f)) {
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f),
+                               Block4Vec m = block4_vec_broadcast(0.0f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec g_c = block4_vec_clip_abs(g, max_abs_grad);
+        const Block4Vec residual_c = block4_vec_clip_abs(g - m, max_abs_grad);
         const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
-        const Block4Vec ema = beta2 * ci + (one - beta2) * (g_c * g_c + contrib_c * contrib_c);
+        const Block4Vec ema =
+            beta2 * ci + (one - beta2) * (residual_c * residual_c + contrib_c * contrib_c);
         const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
         const Block4Vec floor = min_decay_frac * ci;
         return block4_vec_min(block4_vec_max(ema_safe, floor), max_ci);
@@ -1031,6 +1063,16 @@ template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
         const Block4Vec clipped = block4_vec_clip_abs(raw_safe, max_abs_delta);
         const Block4Vec delta = scale_invariant ? (eff_lr * clipped) / S : (eff_lr * clipped);
         return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
+    }
+};
+
+// Block4Vec specialization of FirstMomentTracker -- see the scalar version's
+// own docstring above.
+template <> struct FirstMomentTracker<Block4Vec> {
+    static Block4Vec update(Block4Vec m, Block4Vec g, Block4Vec beta1) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        const Block4Vec new_m = beta1 * m + (one - beta1) * g;
+        return block4_vec_select_finite(new_m, m);
     }
 };
 

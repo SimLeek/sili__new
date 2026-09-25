@@ -560,7 +560,15 @@ void disldo_backward_sparse_grad(
     // max_abs_grad: clip g/contrib before they enter ci's EMA. 1e30
     // (default) is a true no-op. See
     // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
-    typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f) {
+    typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f,
+    // m_row/m_col: AdaBelief-style centering, BLOCK4 branch only this
+    // pass (see docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering
+    // and disldo_backward's own identical scoping note). nullptr (default)
+    // on either disables that axis; the scattered branch below stays
+    // uncentered.
+    typename ValueAccessor<VALUES_TYPE>::value_type* m_row = nullptr,
+    typename ValueAccessor<VALUES_TYPE>::value_type* m_col = nullptr,
+    typename ValueAccessor<VALUES_TYPE>::value_type centering_beta1 = 0.9f) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
@@ -1240,9 +1248,23 @@ void disldo_backward_sparse_grad(
                                     const value_type contrib =
                                         static_cast<value_type>(contrib_sum[idx]);
                                     value_type ci = imp_decoded * combined_imp_scale;
+                                    const value_type m_r = m_row ? m_row[row] : value_type(0);
+                                    const value_type m_c = m_col ? m_col[col] : value_type(0);
                                     ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
                                                                   min_decay_frac, max_ci,
-                                                                  max_abs_grad);
+                                                                  max_abs_grad, m_r + m_c);
+                                    // Residual vs the OTHER axis's OLD
+                                    // (pre-this-touch) value -- avoids
+                                    // double-counting, see
+                                    // block4_backward_process_single_row's
+                                    // scalar branch (linear_disldo_backward.hpp)
+                                    // for the derivation.
+                                    if (m_row)
+                                        m_row[row] = FirstMomentTracker<value_type>::update(
+                                            m_row[row], grad - m_c, centering_beta1);
+                                    if (m_col)
+                                        m_col[col] = FirstMomentTracker<value_type>::update(
+                                            m_col[col], grad - m_r, centering_beta1);
                                     value_type quant = w_decoded; // code-space accumulator,
                                                                   // matches disldo_backward
                                     quant += SynapsePolicy::update_cw(
