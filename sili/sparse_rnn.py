@@ -1185,6 +1185,9 @@ class DISLDOLayer32(_SparseLayerBase):
         max_ci: float | None = None,
         max_abs_grad: float | None = None,
         scale_invariant: bool = False,
+        centering_row_enable: bool = False,
+        centering_col_enable: bool = False,
+        centering_beta1: float | None = None,
         requires_grad: bool = True,
         dy_sparsity_p: float | None = None,
         dy_r_target=None,
@@ -1245,6 +1248,12 @@ class DISLDOLayer32(_SparseLayerBase):
                     extra["max_abs_grad"] = max_abs_grad
                 if scale_invariant:
                     extra["scale_invariant"] = True
+                if centering_row_enable:
+                    extra["centering_row_enable"] = True
+                if centering_col_enable:
+                    extra["centering_col_enable"] = True
+                if centering_beta1 is not None:
+                    extra["centering_beta1"] = centering_beta1
                 if dy_gate_mask is not None:
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _gated_columns_to_csr(dy2d, dy_gate_mask)
