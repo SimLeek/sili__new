@@ -1251,6 +1251,132 @@ struct PlasticityCellCursor {
     bool initialized = false;
 };
 
+// ── CiRenorm: full-diff amortized correction toward a target ci mean/std,
+// applied DIRECTLY to the real per-synapse ci (not a side-channel copy).
+// Distinct from PlasticityState above (top-K reset to fresh weights):
+// never touches weight, never singles out columns -- same correction
+// shape applied to every column, every lap. See
+// docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+enum class CiRenormMode : uint8_t {
+    Off = 0,          // exact no-op
+    TrustRatio = 1,   // Arm A: LAMB-derived multiplicative rescale
+    StableRegion = 2, // Arm B: affine renormalize toward empirical (mean,std) targets
+};
+
+struct CiRenormState {
+    // Finalized stats from the PREVIOUS lap -- what THIS lap corrects
+    // toward. Unfinalized on lap 1 (has_finalized_stats=false): no-op.
+    std::vector<float> col_ci_mean;
+    std::vector<float> col_ci_std;
+    std::vector<float> col_w_norm; // sqrt(sum w^2 over the column) -- TrustRatio only
+    // Exact double-precision accumulators for the CURRENT lap.
+    std::vector<double> col_ci_sum;
+    std::vector<double> col_ci_sumsq;
+    std::vector<double> col_w_sumsq;
+    std::vector<uint32_t> col_touch_count;
+    bool has_finalized_stats = false;
+    bool sized = false;
+
+    void ensure_sized(std::size_t n_out) {
+        if (sized)
+            return;
+        col_ci_mean.assign(n_out, 0.0f);
+        col_ci_std.assign(n_out, 0.0f);
+        col_w_norm.assign(n_out, 0.0f);
+        col_ci_sum.assign(n_out, 0.0);
+        col_ci_sumsq.assign(n_out, 0.0);
+        col_w_sumsq.assign(n_out, 0.0);
+        col_touch_count.assign(n_out, 0);
+        sized = true;
+    }
+};
+
+struct CiRenormStats {
+    bool cycle_complete = false;
+    double mean_col_ci_mean = 0.0;
+    double mean_col_ci_std = 0.0;
+};
+
+// Accumulates this lap's exact stats, then (if a PREVIOUS lap already
+// finalized target stats) applies the FULL corrective diff immediately
+// -- not a partial nudge (that failed, see synapse_policy.ci_renorm's
+// "v3 lesson"). Staleness bounded to one lap's worth of real growth.
+inline float ci_renorm_touch_cell(CiRenormState& state, std::size_t j, float ci_val, float w_val,
+                                  CiRenormMode mode, float target_mean_j, float target_std_j,
+                                  float eff_lr, float max_ci_ref = 100.0f,
+                                  float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f) {
+    float new_ci = ci_val; // default: no correction (Off, or first lap -- no reference yet)
+
+    if (mode != CiRenormMode::Off && state.has_finalized_stats) {
+        if (mode == CiRenormMode::TrustRatio) {
+            // LAMB-inspired (You et al. 2019). w_norm compared against
+            // a FIXED implied-target ci (not the column's own current
+            // ci -- that's circular, see RST), renormalizing the MEAN
+            // toward it for a stable fixed point (a raw per-touch scale
+            // has none -- also see RST). max_ci_ref currently unused,
+            // kept for interface stability.
+            const float w_over_lr = state.col_w_norm[j] / std::max(eff_lr, 1e-8f);
+            const float ci_implied = w_over_lr * w_over_lr;
+            const float cur_mean = std::max(state.col_ci_mean[j], 1e-6f);
+            float scale = ci_implied / cur_mean;
+            scale = std::min(std::max(scale, trust_ratio_min * trust_ratio_min),
+                             trust_ratio_max * trust_ratio_max);
+            new_ci = ci_val * scale;
+        } else {
+            // StableRegion: positive-affine z-score renormalize toward
+            // (target_mean_j, target_std_j) -- preserves rank order.
+            const float cur_mean = state.col_ci_mean[j];
+            const float cur_std = std::max(state.col_ci_std[j], 1e-6f);
+            new_ci = target_mean_j + (ci_val - cur_mean) * (target_std_j / cur_std);
+            new_ci = std::max(new_ci, 0.0f);
+        }
+        if (!std::isfinite(new_ci))
+            new_ci = ci_val;
+    }
+
+    // Accumulate from the RESULTING (post-correction) value, not the
+    // raw input -- using the pre-correction value is a real bug (see
+    // RST's "stale-reference convergence bug"). w_norm still uses raw
+    // w_val (weight is never touched here).
+    state.col_ci_sum[j] += double(new_ci);
+    state.col_ci_sumsq[j] += double(new_ci) * double(new_ci);
+    state.col_w_sumsq[j] += double(w_val) * double(w_val);
+    state.col_touch_count[j] += 1;
+
+    return new_ci;
+}
+
+// Cycle-boundary: finalize THIS lap's exact (mean, std, weight-norm)
+// into the state that the NEXT lap's touches will correct toward, then
+// reset accumulators for the next lap. Call ONLY when a full cell-touch
+// cycle has just completed.
+inline void ci_renorm_cycle_boundary(CiRenormState& state, std::size_t n_out, CiRenormStats& out) {
+    double sum_mean = 0.0, sum_std = 0.0;
+    std::size_t n_touched_cols = 0;
+    for (std::size_t j = 0; j < n_out; ++j) {
+        if (state.col_touch_count[j] > 0) {
+            const double count = double(state.col_touch_count[j]);
+            const double mean = state.col_ci_sum[j] / count;
+            double var = state.col_ci_sumsq[j] / count - mean * mean;
+            var = std::max(var, 0.0);
+            state.col_ci_mean[j] = float(mean);
+            state.col_ci_std[j] = float(std::sqrt(var));
+            state.col_w_norm[j] = float(std::sqrt(state.col_w_sumsq[j]));
+            sum_mean += mean;
+            sum_std += std::sqrt(var);
+            ++n_touched_cols;
+        }
+        state.col_ci_sum[j] = 0.0;
+        state.col_ci_sumsq[j] = 0.0;
+        state.col_w_sumsq[j] = 0.0;
+        state.col_touch_count[j] = 0;
+    }
+    state.has_finalized_stats = true;
+    out.cycle_complete = true;
+    out.mean_col_ci_mean = n_touched_cols > 0 ? sum_mean / double(n_touched_cols) : 0.0;
+    out.mean_col_ci_std = n_touched_cols > 0 ? sum_std / double(n_touched_cols) : 0.0;
+}
+
 // Cycle-boundary selection, SHARED between the scattered and block4
 // traversals (both only need the per-column PlasticityState -- neither
 // storage format's own cursor shape matters here) -- see the file
@@ -1544,6 +1670,13 @@ PlasticityStats apply_amortized_plasticity_step(
         cursor.elem_pos = 0;
         cursor.initialized = true;
     }
+    // TODO: BUG, DELETE-CANDIDATE -- skip_empty_rows() unconditionally
+    // resets elem_pos even when resuming mid-row, double-touching a cell
+    // per chunk boundary. Fixed version in apply_amortized_ci_renorm_step
+    // below; see docs/research/delta_csr_types.rst:synapse_policy.
+    // ci_renorm's "cursor resume bug". Not fixed here: reset_fraction
+    // (this mechanism's top-K reset-to-random-weights half) is being
+    // removed entirely, making this traversal a deletion candidate.
     auto skip_empty_rows = [&]() {
         while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0)
             ++cursor.row;
@@ -1629,6 +1762,110 @@ PlasticityStats apply_amortized_plasticity_step(
         plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
                                          reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
                                          l2_decay_temperature, max_ci, select_by_deviation);
+    return out;
+}
+
+// Same monotonic, full-coverage "raster scan" cursor shape as
+// apply_amortized_plasticity_step above (never retries, never skips,
+// wraps cleanly at row boundaries) -- reused here for CiRenorm instead
+// of duplicating the walk. Writes the corrected ci directly into the
+// REAL storage (conn.values), same as apply_amortized_plasticity_step's
+// own l2_decay_lambda branch -- this is what makes the correction
+// actually reach update_cw's denominator on every subsequent real step,
+// no kernel changes needed.
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+CiRenormStats apply_amortized_ci_renorm_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    CiRenormState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, CiRenormMode mode,
+    const float* target_mean, const float* target_std, float eff_lr, float max_ci_ref = 100.0f,
+    float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    CiRenormStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    // IMPORTANT: only advance elem_pos to a row's start when cursor.row
+    // ITSELF just changed (either just below, or at the wrap site inside
+    // the touch loop) -- NEVER unconditionally. A version that resets
+    // elem_pos every time this helper runs (even when the current row is
+    // already non-empty) silently discards a resumed mid-row position on
+    // every call after the first, double-touching whatever cell the
+    // cursor was sitting on and shifting every subsequent cell in that
+    // lap -- a real bug, found via this file's own "coverage" test
+    // (chunk_size not a divisor of nnz, spanning a row boundary across
+    // calls). See docs/research/delta_csr_types.rst:ci_renorm.cursor_resume_bug.
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
+        }
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        const float new_imp =
+            ci_renorm_touch_cell(state, j, imp, w, mode, target_mean ? target_mean[j] : 0.0f,
+                                 target_std ? target_std[j] : 0.0f, eff_lr, max_ci_ref,
+                                 trust_ratio_min, trust_ratio_max);
+        if (new_imp != imp)
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(w),
+                         static_cast<typename VA::value_type>(new_imp));
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row]; // explicit: row just changed
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                cursor.elem_pos = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    if (cycle_complete)
+        ci_renorm_cycle_boundary(state, n_out, out);
+    else
+        out.cycle_complete = false;
     return out;
 }
 

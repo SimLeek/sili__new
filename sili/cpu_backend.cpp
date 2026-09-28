@@ -13,6 +13,7 @@
 #include "linear_disldo.hpp"
 #include "block4_decay_TODO_DELETE.hpp"
 #include "block4_plasticity_TODO_DELETE.hpp"
+#include "block4_ci_renorm_TODO_DELETE.hpp"
 #include "block4_l2_init_TODO_DELETE.hpp"
 #include "engine_select.hpp"
 #ifdef SILI_HAVE_MKL
@@ -1438,6 +1439,17 @@ class DISLDOLayerV {
     PlasticityCellCursor _plasticity_cursor;
     PlasticityState _block4_plasticity_state;
     Block4PlasticityCursor _block4_plasticity_cursor;
+    // CiRenorm -- see docs/research/delta_csr_types.rst:ci_renorm.design_and_v3_lesson.
+    // A SEPARATE mechanism from plasticity_reset above: never touches
+    // weight, never singles out specific columns -- applies the same
+    // correction shape (multiplicative trust-ratio rescale, or affine
+    // mean+std renormalize) to EVERY column, every lap. Own separate
+    // state/cursor per storage type, same reasoning as the decay/
+    // plasticity cursors above.
+    CiRenormState _ci_renorm_state;
+    PlasticityCellCursor _ci_renorm_cursor;
+    CiRenormState _block4_ci_renorm_state;
+    Block4CiRenormCursor _block4_ci_renorm_cursor;
     // L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
     // -- EXPERIMENTAL, see
     // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
@@ -1916,6 +1928,65 @@ class DISLDOLayerV {
             out["max_deviation"] = 0.0;
             out["l2_sat_ratio"] = 0.0;
             out["l2_decay_strength"] = 0.0;
+        }
+        return out;
+    }
+
+    // CiRenorm -- see docs/research/delta_csr_types.rst:ci_renorm.design_and_v3_lesson
+    // for the full derivation, including why v3's own earlier
+    // once-per-cycle proportional decay (l2_decay_lambda above) failed
+    // (growth vs decay tied almost exactly -- too weak/infrequent
+    // relative to the real per-STEP ci accumulator), and why THIS
+    // mechanism applies the FULL corrective diff at touch time instead
+    // of a partial nudge. mode: 0=Off (exact no-op), 1=TrustRatio
+    // (LAMB-derived multiplicative rescale, target_mean/target_std
+    // unused), 2=StableRegion (affine renormalize toward the given
+    // per-column target_mean/target_std, e.g. derived from real
+    // graduated-run data). target_mean/target_std: length n_outputs
+    // arrays (only read when mode=StableRegion; pass empty arrays for
+    // TrustRatio). Scattered (.connections) arm.
+    py::dict apply_amortized_ci_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                       py::array_t<V> target_std, V eff_lr,
+                                       V max_ci_ref = kSynapsePolicyMaxCi, V trust_ratio_min = 0.1f,
+                                       V trust_ratio_max = 10.0f) {
+        auto mb = target_mean.request(), sb = target_std.request();
+        const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+        const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+        auto stats = apply_amortized_ci_renorm_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _ci_renorm_state,
+            _ci_renorm_cursor, static_cast<std::size_t>(chunk_size),
+            static_cast<CiRenormMode>(mode), mean_ptr, std_ptr, eff_lr, max_ci_ref, trust_ratio_min,
+            trust_ratio_max);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+        out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity work already established.
+    py::dict apply_amortized_block4_ci_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                              py::array_t<V> target_std, V eff_lr,
+                                              V max_ci_ref = kSynapsePolicyMaxCi,
+                                              V trust_ratio_min = 0.1f, V trust_ratio_max = 10.0f) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto mb = target_mean.request(), sb = target_std.request();
+            const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+            const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+            auto stats = apply_amortized_block4_ci_renorm_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_ci_renorm_state,
+                _block4_ci_renorm_cursor, static_cast<std::size_t>(chunk_size),
+                static_cast<CiRenormMode>(mode), mean_ptr, std_ptr, eff_lr, max_ci_ref,
+                trust_ratio_min, trust_ratio_max);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+            out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        } else {
+            out["cycle_complete"] = true;
+            out["mean_col_ci_mean"] = 0.0;
+            out["mean_col_ci_std"] = 0.0;
         }
         return out;
     }
@@ -4740,6 +4811,14 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("select_by_deviation") = false)
         .def("plasticity_column_state", &DISLDOLayerV::plasticity_column_state)
         .def("plasticity_column_state_block4", &DISLDOLayerV::plasticity_column_state_block4)
+        .def("apply_amortized_ci_renorm", &DISLDOLayerV::apply_amortized_ci_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"),
+             py::arg("eff_lr"), py::arg("max_ci_ref") = kSynapsePolicyMaxCi,
+             py::arg("trust_ratio_min") = 0.1f, py::arg("trust_ratio_max") = 10.0f)
+        .def("apply_amortized_block4_ci_renorm", &DISLDOLayerV::apply_amortized_block4_ci_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"),
+             py::arg("eff_lr"), py::arg("max_ci_ref") = kSynapsePolicyMaxCi,
+             py::arg("trust_ratio_min") = 0.1f, py::arg("trust_ratio_max") = 10.0f)
         .def("apply_amortized_l2_init", &DISLDOLayerV::apply_amortized_l2_init,
              py::arg("chunk_size"), py::arg("rate"))
         .def("apply_amortized_block4_l2_init", &DISLDOLayerV::apply_amortized_block4_l2_init,

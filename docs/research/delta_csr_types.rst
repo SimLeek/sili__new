@@ -1222,14 +1222,197 @@ gradient, ``learning_rate=1e-9`` since ``disldo_backward``'s whole
 per-synapse update block -- including ``ci`` itself -- is gated behind
 ``learning_rate != 0``) confirms the numbers above.
 
-**Not yet built** (see sili_peridot's own JOURNAL.md/train_mqar_
-curriculum.rst for status): Python-level threading of
-``centering_row_enable``/``centering_col_enable``/``centering_beta1``
-through ``sili/sparse_rnn.py``'s ``DISLDOLayer32.forward`` wrapper
-(mirroring ``max_abs_grad``'s own ``float | None = None`` pattern), and
-the actual column-only-vs-row+column real MQAR comparison runs --
-"Agreed on the proper design, eventually leading to new mqar versions
-with column-only vs rowxcolumn."
+**Update -- threaded through and launched (v15/v15b/v15c/v16)**: Python
+threading of ``centering_row_enable``/``centering_col_enable``/
+``centering_beta1`` through ``sili/sparse_rnn.py``'s ``DISLDOLayer32.
+forward`` wrapper (mirroring ``max_abs_grad``'s own ``float | None =
+None`` pattern) and sili_peridot's ``train_mqar_curriculum.py`` is done.
+Real MQAR results (v15=column-only GRADUATED at step 15063; v15b same-
+seed repeat and v15c new-seed repeat both stalled at (126,3); v16=row+
+column stalled at (126,3)) are in sili_peridot's own JOURNAL.md and
+``docs/research/train_mqar_curriculum.rst`` -- centering alone did not
+reliably prevent v/o/input_proj saturation. See
+``synapse_policy.ci_renorm`` below for the follow-up mechanism this
+motivated: centering changes what feeds ``ci``'s growth, but has no way
+to pull a layer's ci back down once it's already saturated.
+
+.. _synapse_policy.ci_renorm:
+
+CiRenorm: rescaling a layer's ci back toward a healthy region, not resetting it
+--------------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.ci_renorm``
+
+**Motivation, distinct from centering above**: the deep statistical pass
+over v12-v16's real recorded per-column data (sili_peridot's own
+JOURNAL.md) found a consistent pattern -- graduated runs keep ``v_proj``/
+``o_proj``/``input_proj``'s AVERAGE ``ci`` low (medians ~0.1-1.5 on the
+scale these logs use); every stalled run's average ``ci`` in those same
+layers climbs toward the ``max_ci=100`` ceiling and, once there, NEVER
+recovers within 100k steps (checked explicitly: zero spontaneous
+"slingshot"-style plateau exits across 5 stalled runs). Direct
+instruction, after establishing this: "the average ci of a layer is
+literally inversely proportional to the average plasticity of that
+layer... lowering the average importance values [is the fix]. Removing
+the top at-100-importance 'stuck' values would just be removing the
+actual, mathematically defined, 'most important', synapses. Importance
+was not a misnomer." This directly RULES OUT the per-neuron
+utility-based plasticity reset mechanism's own top-K-reset-to-random-
+weights action (``plasticity_reset_reset_fraction``, see
+``plasticity_reset.per_neuron_utility`` above) as a fix for THIS failure
+mode -- that mechanism targets specific columns believed to be
+wrongly-frozen; here, the highest-``ci`` columns are genuinely the most
+important ones, and discarding their weights would be a straightforward
+information loss, not a repair. The fix has to RESCALE the population's
+ci back into a workable range while preserving which synapses rank as
+more/less important -- never discard/reset any of them.
+
+**Two arms, one shared primitive**, per direct instruction to try both
+and compare empirically (mirroring the project's own column-only-vs-
+row+column precedent for centering):
+
+- **TrustRatio** (Arm A): a multiplicative rescale, LAMB-inspired (You
+  et al. 2019, ``https://arxiv.org/abs/1904.00962`` -- Adam extended
+  with a per-layer "trust ratio" ``||w||/||update||``, clipped to
+  ``[0.1, 10]``, used to scale each layer's step at BERT-scale). Chosen
+  over AMSGrad (Reddi et al. 2018 -- takes a running MAX of past ``v_t``,
+  which would make a saturation problem strictly WORSE, not better) and
+  found more directly portable than Adafactor's increasing-beta2
+  schedule (targets general long-run staleness, not a hard-capped
+  accumulator already pinned at its ceiling).
+- **StableRegion** (Arm B): an affine (z-score) renormalize toward an
+  EMPIRICALLY-DERIVED per-layer ``(target_mean, target_std)``, pulled
+  directly from graduated runs' (v13/v15) own real recorded data
+  (medians over each run's step>=3000 window): ``q_proj``
+  (0.09, 0.18), ``k_proj`` (0.10, 0.13), ``v_proj`` (0.40, 0.35),
+  ``input_proj`` (1.05, 1.47), ``o_proj`` (0.20, 0.67), ``lm_head``
+  (0.09, 0.03). Direct instruction, after the design was refined to also
+  control variance, not just mean: "stable average and variance too."
+
+Both are implemented as ONE new primitive, ``ci_renorm_touch_cell`` +
+``ci_renorm_cycle_boundary`` (``delta_csr_types.hpp``), differing only
+in how the per-column target is computed, applied via the SAME
+monotonic full-coverage cursor shape already established for the decay/
+plasticity work (never retries, never skips, wraps cleanly -- direct
+instruction: "you need to keep a cursor that has an exact position in
+the entire array that always iterates and doesn't retry or go back,
+like the cathode ray on a crt always scanning"). Writes the corrected
+value DIRECTLY into the real per-synapse ``ci`` storage (not a
+side-channel copy), the same way ``l2_decay_lambda``'s own action does
+-- reaches ``update_cw``'s denominator on every subsequent real step
+with zero kernel changes needed.
+
+**Why v3's own similar-looking mechanism (``l2_decay_lambda``,
+plasticity_reset.l2_saturation_decay above) isn't reused directly**: v3
+launched with a real ``lambda=0.05`` and the result was decay tying
+almost exactly with growth (net delta statistically indistinguishable
+from zero, confirmed against real per-cycle column data). Root cause,
+directly diagnosed: v3's correction only touches each synapse ONCE per
+amortized cycle (~1% of cells/call, ~100 real steps between touches per
+cell) using a WEAK proportional shrink, while the real per-synapse
+``ci`` accumulator grows every SINGLE real step -- the correction could
+never catch up. Direct correction to this diagnosis, mid-design: "I
+think v3 was just applied incorrectly. You should be able to apply the
+correction in an amortized way as well, you just need to apply it as a
+correction or a general diff." Fix: when a cell IS touched (still only
+once per lap, same amortized cadence as before), apply the FULL
+corrective diff to target immediately, not a small nudge -- staleness is
+then bounded to exactly "one lap's worth of real growth since last
+correction" (a precise, stated guarantee: ``ceil(n/chunk_size)`` calls),
+not an asymptotic race a weak nudge can never win.
+
+**Real bugs found via this file's own TDD tests and an end-to-end smoke
+test, not caught by inline reasoning alone**:
+
+1. *Cursor resume bug* (``ci_renorm.cursor_resume_bug``) -- found via a
+   coverage test using a ``chunk_size`` that doesn't evenly divide
+   ``nnz``, spanning a row boundary across multiple calls. The
+   PRE-EXISTING scattered ``skip_empty_rows()`` lambda (copied from
+   ``apply_amortized_plasticity_step``, used unmodified since v2/v3)
+   unconditionally resets ``cursor.elem_pos`` to the current row's start
+   EVERY time it runs, even when resuming mid-row from a previous call
+   (the common case) -- silently discarding the resumed position,
+   double-touching whatever cell the cursor was sitting on, and
+   shifting every later cell in that lap. Confirmed via a standalone
+   probe: a 3x4 grid, ``chunk_size=5`` (not a divisor of 12), showed
+   column 0's measured mean off by exactly one extra touch (4.8 instead
+   of the correct 4.0). Fixed in CiRenorm's OWN scattered traversal
+   (only reassign ``elem_pos`` when ``cursor.row`` itself just changed,
+   never unconditionally). NOT fixed in the pre-existing
+   ``apply_amortized_plasticity_step`` -- flagged with a ``TODO: BUG,
+   DELETE-CANDIDATE`` comment there instead, since that mechanism's own
+   top-K reset action is being retired (see the "Motivation" section
+   above), making it a deletion candidate rather than a maintenance
+   target. The block4 side's own cursor (``block4_plasticity_TODO_
+   DELETE.hpp``) does NOT have this bug -- its ``elem_pos``/``byte_pos``
+   reassignment already lives inside the while loop, only firing on an
+   actual row advance, confirmed by direct inspection before assuming
+   parity.
+2. *TrustRatio circularity* (``ci_renorm.trust_ratio_circularity_fix``)
+   -- the first implementation approximated LAMB's ``||update||`` by
+   substituting ``g ~= sqrt(ci)`` (a converged accumulator's own
+   definition), giving ``||update|| ~= eff_lr*sqrt(ci)`` -- but then
+   dividing THAT by ``sqrt(ci)`` again (the correction target) makes
+   ``ci`` cancel out algebraically, carrying no information regardless
+   of its actual value. Caught before implementing further by direct
+   derivation, not by testing. Fixed by comparing ``||w||`` against a
+   FIXED reference instead -- the update scale implied by the ci CEILING
+   itself (``max_ci_ref``, independent of this column's own current/
+   lagged ci).
+3. *Stale-reference convergence bug*
+   (``ci_renorm.stale_reference_convergence_bug``) -- found via an
+   end-to-end smoke test (``DISLDOLayerV``, StableRegion,
+   ``target_mean=5``, sustained ``ci=50``): expected convergence to 5.0,
+   observed instead 50 -> 50 -> 5.0 -> **0.0** across 3 laps -- a
+   collapse, not a convergence. Root cause: stats were accumulated from
+   the PRE-correction value at touch time, so a lap's own finalized
+   ``(mean, std)`` described the population as it was BEFORE that same
+   lap's own touches had already overwritten it in storage -- the NEXT
+   lap's correction then compared freshly-corrected values (already at
+   5.0) against a STALE reference (the OLD population's mean of 50),
+   producing a huge, wrong residual and clamping toward 0. Fixed by
+   accumulating stats from the RESULTING (post-correction) value instead
+   -- what's actually left in storage, and what the next lap will
+   actually read. Verified: the identical smoke test now shows 50 -> 5.0
+   -> 5.0 -- converges immediately and stays stable.
+4. *TrustRatio had no equilibrium*
+   (``ci_renorm.trust_ratio_no_equilibrium_bug``) -- found via the SAME
+   smoke test's TrustRatio arm: 90 -> 1.96 -> 0.045, still visibly
+   shrinking lap over lap, not settling anywhere. Root cause: the raw
+   per-touch multiplicative scale (``ci_val * scale``) depended only on
+   FIXED external quantities (``||w||``, ``eff_lr``, the ceiling
+   reference) -- never on ``ci`` itself -- so the identical scale factor
+   reapplies every single lap, producing unbounded geometric decay (or
+   growth, depending on sign) with no natural stopping point. Fixed by
+   deriving a FIXED implied target ci from the weight norm (the ci value
+   at which ``trust_ratio`` would be exactly 1, i.e. no correction
+   needed: ``ci_implied = (||w|| / eff_lr)^2``) and renormalizing the
+   population MEAN toward THAT target (scale-only, no std change,
+   preserving relative spread) -- giving TrustRatio the same kind of
+   stable fixed point StableRegion already has by construction. Verified
+   via a dedicated regression test (8 laps, converges to and holds
+   exactly the derived ``ci_implied``) and re-confirmed via the smoke
+   test (now stabilizes at a fixed value between consecutive laps
+   instead of continuing to shrink).
+
+**Scope**: block4 AND scattered arms both wired (unlike ``max_abs_grad``/
+centering's initial block4-only rollout) -- the scattered traversal is a
+genuinely separate, small addition (not touching the buggy pre-existing
+plasticity cursor), so there was no reason to defer it. ``DISLDOLayerV``
+bindings: ``apply_amortized_ci_renorm``/``apply_amortized_block4_ci_
+renorm(chunk_size, mode, target_mean, target_std, eff_lr, max_ci_ref=100,
+trust_ratio_min=0.1, trust_ratio_max=10) -> dict`` -- ``mode``: 0=Off
+(exact no-op), 1=TrustRatio, 2=StableRegion. ``target_mean``/
+``target_std`` are length-``n_outputs`` arrays, only read when
+``mode=StableRegion`` (pass empty arrays for TrustRatio).
+
+**Verification**: 211/211 C++ tests pass (10 new: core arithmetic
+no-op/first-lap/cycle-boundary/rank-preservation/clamp cases, the 2
+regression tests above, scattered coverage+bit-writes, block4 coverage
++bit-equivalence). Full ``pip install -e .`` rebuild + a real end-to-end
+smoke test via ``_cpu.DISLDOLayerV`` confirms both arms converge and
+hold stable (StableRegion: 50->5.0->5.0; TrustRatio: stabilizes at its
+derived ``ci_implied`` and stops moving between laps).
 
 .. _synapse_policy.block4vec_specializations:
 
