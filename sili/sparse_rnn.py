@@ -1148,6 +1148,62 @@ class DISLDOLayer32(_SparseLayerBase):
             select_by_deviation,
         )
 
+    def apply_amortized_ci_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+        eff_lr: float,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales this layer's real per-synapse ci back
+        toward a healthy region (never resets/prunes any synapse, only
+        rescales, preserving relative ranking). Scattered (.connections)
+        arm. See
+        docs/research/delta_csr_types.rst:synapse_policy.ci_renorm for
+        the full derivation. mode: 0=Off, 1=TrustRatio (LAMB-inspired
+        multiplicative rescale, target_mean/target_std unused -- pass
+        empty arrays), 2=StableRegion (affine renormalize toward
+        target_mean/target_std, length n_outputs arrays)."""
+        return self._c.apply_amortized_ci_renorm(
+            chunk_size,
+            mode,
+            target_mean,
+            target_std,
+            eff_lr,
+            max_ci_ref,
+            trust_ratio_min,
+            trust_ratio_max,
+        )
+
+    def apply_amortized_block4_ci_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+        eff_lr: float,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_ci_renorm -- see
+        that method's own docstring. chunk_size counts TILES here. Only
+        bound on DISLDOLayerV (fp32)."""
+        return self._c.apply_amortized_block4_ci_renorm(
+            chunk_size,
+            mode,
+            target_mean,
+            target_std,
+            eff_lr,
+            max_ci_ref,
+            trust_ratio_min,
+            trust_ratio_max,
+        )
+
     def apply_amortized_l2_init(self, chunk_size: int, rate: float) -> dict:
         """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
         2025, arXiv:2308.11958), scattered arm. See
