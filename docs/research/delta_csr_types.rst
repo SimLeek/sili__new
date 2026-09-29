@@ -1414,6 +1414,88 @@ smoke test via ``_cpu.DISLDOLayerV`` confirms both arms converge and
 hold stable (StableRegion: 50->5.0->5.0; TrustRatio: stabilizes at its
 derived ``ci_implied`` and stops moving between laps).
 
+.. _synapse_policy.weight_renorm:
+
+WeightRenorm: CiRenorm's own trade-off needed a second, matching fix
+------------------------------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.weight_renorm``
+
+**Real runaway found by launching v18's own repeat, not by inline
+reasoning**: v18 (StableRegion) graduated; its same-seed repeat (v18b)
+did not, landing at ``(64,3)``. Statistical comparison of the two
+runs' recorded ``raw_weight``/``raw_importance`` matrices found ``ci``
+itself was held correctly near the StableRegion target in BOTH runs
+throughout training -- CiRenorm was working exactly as designed, even
+in the run that stalled. But v18b's ``v_proj``/``o_proj``/
+``input_proj`` weight norm was NOT bounded at all: bucketed every 5000
+steps, it climbs smoothly from ~17 (matching v18/v18c's own healthy
+range) to 360 by step 95000 -- a genuine, continuously-compounding
+runaway, not a step-change. v18c (a NEW seed, also graduated) shows
+the SAME direction of drift but far more gently (17.0 -> 18.0 over
+40000 steps) -- the underlying tendency is present in every run,
+only its GROWTH RATE differs.
+
+**Mechanism**: StableRegion forcibly holds ``ci`` near a FIXED
+empirical target every lap, regardless of what the true gradient
+magnitude is currently doing. That is exactly right when the target
+matches the real variance -- but ``v_proj``/``o_proj``/``input_proj``'s
+genuine gradient magnitude legitimately GROWS over training (this
+entire investigation's own recurring finding). Pinning ``ci`` low
+while true signal grows keeps the effective step
+(``eff_lr*g*S/sqrt(ci)``) large, letting weight grow faster than
+warranted -- and a larger weight can itself drive larger downstream
+gradients, which the fixed ``ci`` target still refuses to track. A
+genuine positive-feedback loop, confirmed by matched-pair analysis:
+v18 vs v18b (same seed, same config) already show real ``ci``
+divergence by step 5000-8000, well before the runaway is visible in
+absolute weight-norm terms -- a small early difference (the same
+threading-order sensitivity flagged throughout this investigation) is
+what the feedback loop then amplifies.
+
+**Fix, direct instruction**: "I guess we have to do a weight renorm in
+addition to the ci renorm. Exact same method would probably be fine."
+``WeightRenorm`` reuses ``ci_renorm_touch_cell``/
+``ci_renorm_cycle_boundary``/``CiRenormState`` VERBATIM (not
+duplicated) -- the arithmetic is identical, only which field gets
+touched differs, so the SAME 4-bug-tested core (see
+``synapse_policy.ci_renorm`` above) applies directly. The one real
+change needed: a new ``clamp_nonnegative`` parameter on
+``ci_renorm_touch_cell`` (default ``true``, byte-identical for every
+existing ``ci`` call site), set ``false`` for weight -- weight is
+signed, unlike ``ci``. Only ``mode=StableRegion`` is meaningful for
+weight (``TrustRatio``'s own formula is DERIVED FROM weight norm, so
+applying it to renormalize weight itself would be circular).
+
+**Targets, same discipline as CiRenorm's own ci targets**: per-column
+weight mean/std pulled from v18/v18c's own real recorded data, step<8000
+(before either run's own drift became meaningful) -- weight mean is
+essentially 0 everywhere (fan-in-scaled, zero-mean by construction), so
+only the std varies by layer: ``q_proj``/``k_proj``/``v_proj``/
+``o_proj`` ~0.059, ``input_proj``/``lm_head`` ~0.16 (matching their
+different fan-in).
+
+**New primitives**: ``apply_amortized_weight_renorm_step``/
+``apply_amortized_block4_weight_renorm_step`` (scattered + block4,
+mirroring CiRenorm's own traversal functions structurally but touching
+``weight``/``set_weight`` instead of ``ci``/``set_importance``) --
+own separate cursor/state per storage type (a layer can run CiRenorm
+and WeightRenorm simultaneously, touching different fields, no
+interaction). ``DISLDOLayerV`` bindings:
+``apply_amortized_weight_renorm``/``apply_amortized_block4_weight_
+renorm(chunk_size, mode, target_mean, target_std) -> dict`` -- no
+``eff_lr``/``max_ci_ref``/``trust_ratio_*`` (not applicable without a
+TrustRatio arm).
+
+**Verification**: 216/216 C++ tests pass (5 new: the
+``clamp_nonnegative`` parameter's default-preserves-behavior +
+negative-result cases, scattered no-op/signed-renormalize, block4
+no-op/signed-renormalize). Smoke-tested via ``_cpu.DISLDOLayerV``: a
+layer seeded with weights 20x a healthy scale (mean=-5.3, std=17.6)
+converges in ONE lap to exactly the target (mean=0.0, std=0.5) and
+holds there stably across further laps, with ``importance`` completely
+untouched throughout.
+
 .. _synapse_policy.block4vec_specializations:
 
 ``Block4Vec`` SIMD specializations of the synapse policies

@@ -1450,6 +1450,15 @@ class DISLDOLayerV {
     PlasticityCellCursor _ci_renorm_cursor;
     CiRenormState _block4_ci_renorm_state;
     Block4CiRenormCursor _block4_ci_renorm_cursor;
+    // WeightRenorm -- same mechanism as CiRenorm above, applied to
+    // weight instead of ci. See
+    // docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    // Own separate state/cursor (never shares CiRenorm's -- a layer can
+    // have BOTH mechanisms active at once, touching different fields).
+    CiRenormState _weight_renorm_state;
+    PlasticityCellCursor _weight_renorm_cursor;
+    CiRenormState _block4_weight_renorm_state;
+    Block4CiRenormCursor _block4_weight_renorm_cursor;
     // L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
     // -- EXPERIMENTAL, see
     // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
@@ -1980,6 +1989,57 @@ class DISLDOLayerV {
                 _block4_ci_renorm_cursor, static_cast<std::size_t>(chunk_size),
                 static_cast<CiRenormMode>(mode), mean_ptr, std_ptr, eff_lr, max_ci_ref,
                 trust_ratio_min, trust_ratio_max);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+            out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        } else {
+            out["cycle_complete"] = true;
+            out["mean_col_ci_mean"] = 0.0;
+            out["mean_col_ci_std"] = 0.0;
+        }
+        return out;
+    }
+
+    // WeightRenorm -- same mechanism as CiRenorm above, applied to
+    // weight instead of ci. Direct instruction, after CiRenorm's
+    // StableRegion arm let a weight-growth feedback loop run away while
+    // ci itself stayed correctly bounded: "I guess we have to do a
+    // weight renorm in addition to the ci renorm. Exact same method
+    // would probably be fine." Only mode=StableRegion is meaningful
+    // here (TrustRatio's own formula is derived FROM weight norm, so
+    // using it to renormalize weight would be circular). See
+    // docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    // Scattered (.connections) arm.
+    py::dict apply_amortized_weight_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                           py::array_t<V> target_std) {
+        auto mb = target_mean.request(), sb = target_std.request();
+        const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+        const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+        auto stats = apply_amortized_weight_renorm_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _weight_renorm_state,
+            _weight_renorm_cursor, static_cast<std::size_t>(chunk_size),
+            static_cast<CiRenormMode>(mode), mean_ptr, std_ptr);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+        out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity/CiRenorm work already established.
+    py::dict apply_amortized_block4_weight_renorm(S chunk_size, int mode,
+                                                  py::array_t<V> target_mean,
+                                                  py::array_t<V> target_std) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto mb = target_mean.request(), sb = target_std.request();
+            const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+            const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+            auto stats = apply_amortized_block4_weight_renorm_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_weight_renorm_state,
+                _block4_weight_renorm_cursor, static_cast<std::size_t>(chunk_size),
+                static_cast<CiRenormMode>(mode), mean_ptr, std_ptr);
             out["cycle_complete"] = stats.cycle_complete;
             out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
             out["mean_col_ci_std"] = stats.mean_col_ci_std;
@@ -4819,6 +4879,11 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"),
              py::arg("eff_lr"), py::arg("max_ci_ref") = kSynapsePolicyMaxCi,
              py::arg("trust_ratio_min") = 0.1f, py::arg("trust_ratio_max") = 10.0f)
+        .def("apply_amortized_weight_renorm", &DISLDOLayerV::apply_amortized_weight_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"))
+        .def("apply_amortized_block4_weight_renorm",
+             &DISLDOLayerV::apply_amortized_block4_weight_renorm, py::arg("chunk_size"),
+             py::arg("mode"), py::arg("target_mean"), py::arg("target_std"))
         .def("apply_amortized_l2_init", &DISLDOLayerV::apply_amortized_l2_init,
              py::arg("chunk_size"), py::arg("rate"))
         .def("apply_amortized_block4_l2_init", &DISLDOLayerV::apply_amortized_block4_l2_init,

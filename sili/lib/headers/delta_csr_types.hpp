@@ -1301,10 +1301,16 @@ struct CiRenormStats {
 // finalized target stats) applies the FULL corrective diff immediately
 // -- not a partial nudge (that failed, see synapse_policy.ci_renorm's
 // "v3 lesson"). Staleness bounded to one lap's worth of real growth.
+// clamp_nonnegative=true (default, exact existing behavior for every
+// ci call site): StableRegion's result is clamped >=0, matching ci's
+// own always-nonnegative semantics. false: no clamp -- reused as-is
+// for WeightRenorm (see synapse_policy.weight_renorm), where the
+// touched quantity is a signed weight, not ci.
 inline float ci_renorm_touch_cell(CiRenormState& state, std::size_t j, float ci_val, float w_val,
                                   CiRenormMode mode, float target_mean_j, float target_std_j,
                                   float eff_lr, float max_ci_ref = 100.0f,
-                                  float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f) {
+                                  float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f,
+                                  bool clamp_nonnegative = true) {
     float new_ci = ci_val; // default: no correction (Off, or first lap -- no reference yet)
 
     if (mode != CiRenormMode::Off && state.has_finalized_stats) {
@@ -1328,7 +1334,8 @@ inline float ci_renorm_touch_cell(CiRenormState& state, std::size_t j, float ci_
             const float cur_mean = state.col_ci_mean[j];
             const float cur_std = std::max(state.col_ci_std[j], 1e-6f);
             new_ci = target_mean_j + (ci_val - cur_mean) * (target_std_j / cur_std);
-            new_ci = std::max(new_ci, 0.0f);
+            if (clamp_nonnegative)
+                new_ci = std::max(new_ci, 0.0f);
         }
         if (!std::isfinite(new_ci))
             new_ci = ci_val;
@@ -1851,6 +1858,105 @@ CiRenormStats apply_amortized_ci_renorm_step(
             ++cursor.row;
             if (cursor.row < n_rows)
                 cursor.elem_pos = L.elem_start[cursor.row]; // explicit: row just changed
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                cursor.elem_pos = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    if (cycle_complete)
+        ci_renorm_cycle_boundary(state, n_out, out);
+    else
+        out.cycle_complete = false;
+    return out;
+}
+
+// WeightRenorm: same mechanism as CiRenorm above (identical arithmetic,
+// same struct/cursor shapes -- reused directly, not duplicated), applied
+// to WEIGHT instead of ci. Direct instruction, after CiRenorm's
+// StableRegion arm was found to let a weight-growth positive-feedback
+// loop run away in v/o/input_proj (ci held near its healthy target, but
+// weight itself was left completely unconstrained and could still
+// diverge): "I guess we have to do a weight renorm in addition to the
+// ci renorm. Exact same method would probably be fine." Only
+// StableRegion makes sense here (TrustRatio's own formula is DERIVED
+// FROM weight norm, so using it to renormalize weight itself would be
+// circular) -- callers should always pass CiRenormMode::StableRegion.
+// clamp_nonnegative=false: weight is signed, unlike ci. See
+// docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+CiRenormStats apply_amortized_weight_renorm_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    CiRenormState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, CiRenormMode mode,
+    const float* target_mean, const float* target_std) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    CiRenormStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    // Same cursor-resume-bug-free shape as apply_amortized_ci_renorm_step
+    // above (elem_pos only reassigned when cursor.row itself changes).
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
+        }
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        const float new_w =
+            ci_renorm_touch_cell(state, j, w, 0.0f, mode, target_mean ? target_mean[j] : 0.0f,
+                                 target_std ? target_std[j] : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false);
+        if (new_w != w)
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
+                         static_cast<typename VA::value_type>(imp));
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
             skip_empty_rows();
             if (cursor.row >= n_rows) {
                 cycle_complete = true;

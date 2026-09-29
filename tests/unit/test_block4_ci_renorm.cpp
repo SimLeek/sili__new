@@ -157,3 +157,47 @@ TEST_CASE("CiRenorm scattered vs block4: bit-equivalent StableRegion correction 
         CHECK(block4_state.col_ci_std[j] == Catch::Approx(scattered_state.col_ci_std[j]));
     }
 }
+
+// ── WeightRenorm block4 traversal ──────────────────────────────────────────
+
+TEST_CASE("WeightRenorm block4: mode=Off is an exact no-op, importance untouched",
+          "[weight_renorm][block4]") {
+    auto store = ci_renorm_make_block4_dense(
+        4, 4, [](uint32_t r, uint32_t c) { return float(r) - float(c); },
+        [](uint32_t, uint32_t) { return 9.0f; });
+    CiRenormState state;
+    Block4CiRenormCursor cursor;
+    const auto stats = apply_amortized_block4_weight_renorm_step(
+        store, 4, state, cursor, 1, CiRenormMode::Off, nullptr, nullptr);
+    CHECK(stats.cycle_complete);
+    for (uint32_t r = 0; r < 4; ++r)
+        for (uint32_t c = 0; c < 4; ++c) {
+            auto h = store.get_or_create(r / 4, c / 4);
+            CHECK(h.get_weight(r % 4, c % 4) == Catch::Approx(float(r) - float(c)));
+            CHECK(h.get_importance(r % 4, c % 4) == Catch::Approx(9.0f));
+        }
+}
+
+TEST_CASE("WeightRenorm block4: SECOND lap renormalizes weight toward target, allows negative "
+          "result, importance unaffected",
+          "[weight_renorm][block4][stable_region]") {
+    auto store = ci_renorm_make_block4_dense(
+        4, 4, [](uint32_t, uint32_t c) { return c % 2 == 0 ? -2.0f : 2.0f; },
+        [](uint32_t, uint32_t) { return 9.0f; });
+    CiRenormState state;
+    Block4CiRenormCursor cursor;
+    const float target_mean[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float target_std[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    apply_amortized_block4_weight_renorm_step(store, 4, state, cursor, 1,
+                                              CiRenormMode::StableRegion, target_mean, target_std);
+    apply_amortized_block4_weight_renorm_step(store, 4, state, cursor, 1,
+                                              CiRenormMode::StableRegion, target_mean, target_std);
+
+    auto h = store.get_or_create(0, 0);
+    for (uint32_t li = 0; li < 4; ++li)
+        for (uint32_t lj = 0; lj < 4; ++lj) {
+            CHECK(h.get_weight(li, lj) == Catch::Approx(0.0f).margin(1e-3));
+            CHECK(h.get_importance(li, lj) == Catch::Approx(9.0f));
+        }
+}

@@ -407,3 +407,82 @@ TEST_CASE("CiRenorm scattered: REGRESSION -- corrections CONVERGE to the target 
     CHECK(ValueAccessor<CiRenormVT>::get_imp(conn.values, 0) == Catch::Approx(5.0f).margin(0.01));
     CHECK(ValueAccessor<CiRenormVT>::get_imp(conn.values, 1) == Catch::Approx(5.0f).margin(0.01));
 }
+
+TEST_CASE("CiRenorm: clamp_nonnegative defaults to true (byte-identical to omitting it), and "
+          "false allows a negative result -- needed to reuse this same primitive for "
+          "WeightRenorm, where the touched quantity is signed",
+          "[ci_renorm][weight_renorm]") {
+    CiRenormState state;
+    state.ensure_sized(1);
+    for (float v : {10.0f, 10.0f, 10.0f}) // mean=10, std=0
+        ci_renorm_touch_cell(state, 0, v, 1.0f, CiRenormMode::StableRegion, 1.0f, 0.5f, 0.01f);
+    CiRenormStats stats;
+    ci_renorm_cycle_boundary(state, 1, stats);
+
+    // A value far BELOW the lap-1 mean maps to a deeply negative
+    // pre-clamp result (target=1.0 + (0-10)*(0.5/1e-6) is hugely
+    // negative).
+    const float default_result =
+        ci_renorm_touch_cell(state, 0, 0.0f, 1.0f, CiRenormMode::StableRegion, 1.0f, 0.5f, 0.01f);
+    CHECK(default_result >= 0.0f); // default clamp_nonnegative=true
+
+    const float explicit_true_result =
+        ci_renorm_touch_cell(state, 0, 0.0f, 1.0f, CiRenormMode::StableRegion, 1.0f, 0.5f, 0.01f,
+                             100.0f, 0.1f, 10.0f, true);
+    CHECK(default_result == Catch::Approx(explicit_true_result));
+
+    const float unclamped_result =
+        ci_renorm_touch_cell(state, 0, 0.0f, 1.0f, CiRenormMode::StableRegion, 1.0f, 0.5f, 0.01f,
+                             100.0f, 0.1f, 10.0f, false);
+    CHECK(unclamped_result < 0.0f);
+    CHECK(std::isfinite(unclamped_result));
+}
+
+// ── WeightRenorm scattered traversal (apply_amortized_weight_renorm_step) ──
+
+TEST_CASE("WeightRenorm scattered: mode=Off is an exact no-op on weight, importance untouched",
+          "[weight_renorm][scattered]") {
+    auto conn = ci_renorm_make_dense_conn(
+        2, 3, [](std::size_t r, std::size_t c) { return float(r * 3 + c) - 3.0f; },
+        [](std::size_t, std::size_t) { return 7.0f; });
+    CiRenormState state;
+    PlasticityCellCursor cursor;
+    const auto stats = apply_amortized_weight_renorm_step<CiRenormVT, std::size_t, uint32_t>(
+        conn, 3, state, cursor, 6, CiRenormMode::Off, nullptr, nullptr);
+    CHECK(stats.cycle_complete);
+    for (std::size_t r = 0; r < 2; ++r)
+        for (std::size_t c = 0; c < 3; ++c) {
+            const std::size_t vb = r * 3 + c;
+            CHECK(ValueAccessor<CiRenormVT>::get_w(conn.values, vb) ==
+                  Catch::Approx(float(r * 3 + c) - 3.0f));
+            CHECK(ValueAccessor<CiRenormVT>::get_imp(conn.values, vb) == Catch::Approx(7.0f));
+        }
+}
+
+TEST_CASE("WeightRenorm scattered: SECOND lap renormalizes WEIGHT (not importance) toward the "
+          "target, and allows a negative result",
+          "[weight_renorm][scattered][stable_region]") {
+    // 1 input x 2 outputs -- negative weight values, to confirm signed
+    // values are handled (unlike CiRenorm's own always-nonnegative ci).
+    auto conn = ci_renorm_make_dense_conn(
+        1, 2, [](std::size_t, std::size_t c) { return c == 0 ? -4.0f : 4.0f; },
+        [](std::size_t, std::size_t) { return 42.0f; });
+    CiRenormState state;
+    PlasticityCellCursor cursor;
+    const float target_mean[2] = {0.0f, 0.0f};
+    const float target_std[2] = {1.0f, 1.0f};
+
+    apply_amortized_weight_renorm_step<CiRenormVT, std::size_t, uint32_t>(
+        conn, 2, state, cursor, 2, CiRenormMode::StableRegion, target_mean, target_std);
+    apply_amortized_weight_renorm_step<CiRenormVT, std::size_t, uint32_t>(
+        conn, 2, state, cursor, 2, CiRenormMode::StableRegion, target_mean, target_std);
+
+    // Column 0 had a single sample (-4.0) -> its own lap-1 mean -> lands
+    // EXACTLY at target_mean=0.0 (the affine fixed point), NOT clamped
+    // to >=0 (weight is signed).
+    CHECK(ValueAccessor<CiRenormVT>::get_w(conn.values, 0) == Catch::Approx(0.0f).margin(1e-3));
+    CHECK(ValueAccessor<CiRenormVT>::get_w(conn.values, 1) == Catch::Approx(0.0f).margin(1e-3));
+    // Importance is completely unaffected.
+    CHECK(ValueAccessor<CiRenormVT>::get_imp(conn.values, 0) == Catch::Approx(42.0f));
+    CHECK(ValueAccessor<CiRenormVT>::get_imp(conn.values, 1) == Catch::Approx(42.0f));
+}
