@@ -5,7 +5,10 @@ caller owns batch iteration; do not pass batched tensors here. See
 PROOFS.md for the full mathematical treatment, CITATIONS.md (repo
 root) for external work referenced by name below, and
 docs/research/energy.rst for the design-tradeoff research narrative.
-"""
+
+Not to be confused with csr.hpp's top_k_csr_nucleus "energy" (signal
+magnitude, sum-of-squares) -- this is a per-neuron homeostatic state,
+anti-correlated with recent activity."""
 
 from __future__ import annotations
 

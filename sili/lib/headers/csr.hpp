@@ -618,9 +618,10 @@ top_k_csr_graded(VALUE_TYPE* values, size_t rows, size_t cols, const SIZE_TYPE* 
                                                  std::move(indices), std::move(out_values));
 }
 
-// Nucleus/energy-threshold top-k: row r independently keeps the SMALLEST
-// number of its own largest-magnitude entries whose captured squared-
-// magnitude ratio
+// Nucleus/energy-threshold top-k (signal-processing energy, NOT
+// EnergyDynamics -- see energy.py's own note): row r independently
+// keeps the SMALLEST number of its own largest-magnitude entries whose
+// captured squared-magnitude ratio
 //     R(v, k) = sum(v_topk^2) / sum(v^2)
 // is >= r_target_per_row[r]. k is a CONSEQUENCE of r_target and the row's
 // actual data, not a fixed constant -- same math as Eckart-Young truncated-

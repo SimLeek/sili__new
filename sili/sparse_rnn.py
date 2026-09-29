@@ -763,7 +763,8 @@ class DISLDOLayer(_SparseLayerBase):
                 elif dy_r_target is not None:
                     # Nucleus/energy-threshold grad sparsification -- k is
                     # a CONSEQUENCE of dy_r_target and this step's actual
-                    # gradient energy, not a fixed fraction.
+                    # gradient energy (magnitude, not EnergyDynamics'
+                    # per-neuron state), not a fixed fraction.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
                     _record_grad_selection_stats(self, dy2d, dp, di, dv)
