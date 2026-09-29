@@ -443,6 +443,54 @@ class EnergyDynamics(Module):
         return h_out, self.aux_loss, self.actual_p
 
 
+class GradSelectionEnergy:
+    """Lightweight per-neuron energy accumulator for grad-selection
+    fairness (Arm G in the MQAR energy investigation) -- NOT
+    EnergyDynamics (no fire/shutoff clamp, no forward-value
+    intervention, just accumulate+decay to rank neurons for a top-k
+    grad-selection mask) and NOT top_k_csr_nucleus's signal energy
+    (this is anti-correlated with recent activity, not a magnitude
+    proxy). See docs/research/energy.rst:grad_selection_energy_design.
+
+    update(output) feeds this layer's own forward output (energy rises
+    for quiet neurons, drains for loud ones, same decay-mean-reversion
+    math as EnergyDynamics.decay); top_k_mask(k) returns which k
+    neurons currently have the highest (quietest) energy, for use as a
+    dy_gate_mask.
+    """
+
+    def __init__(self, drive: float, activation_cost: float, decay: float, n_out: int):
+        assert activation_cost > 0.0, "activation_cost must be positive"
+        assert decay >= 0.0, "decay must be non-negative"
+        if decay > 0.0:
+            assert drive > 2.0 * decay, (
+                f"drive ({drive}) must exceed 2*decay ({2.0 * decay}) or a "
+                f"permanently-loud (never-quiet) neuron's energy fixed point "
+                f"never clears a permanently-quiet one's -- no coverage "
+                f"guarantee. See docs/research/energy.rst:decay_mean_reversion."
+            )
+        self.drive = float(drive)
+        self.activation_cost = float(activation_cost)
+        self.decay = float(decay)
+        self.energy = np.zeros(n_out, dtype=np.float32)
+
+    def update(self, output: np.ndarray) -> None:
+        out_abs = np.abs(np.asarray(output, dtype=np.float32))
+        if out_abs.ndim == 2:
+            out_abs = out_abs.mean(axis=0)
+        self.energy = self.energy * (1.0 - self.decay) + self.drive - self.activation_cost * out_abs
+
+    def top_k_mask(self, k: int) -> np.ndarray:
+        n = len(self.energy)
+        k = max(0, min(k, n))
+        mask = np.zeros(n, dtype=bool)
+        if k == 0:
+            return mask
+        idx = np.argpartition(self.energy, -k)[-k:]
+        mask[idx] = True
+        return mask
+
+
 class BranchingRatioTracker:
     """Estimate the branching ratio m of a self-propagating activity
     process from a scalar activity count fed in once per step. Feed it
