@@ -1204,6 +1204,37 @@ class DISLDOLayer32(_SparseLayerBase):
             trust_ratio_max,
         )
 
+    def apply_amortized_weight_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales this layer's real per-synapse WEIGHT
+        back toward a healthy region (never touches importance).
+        Scattered (.connections) arm. See
+        docs/research/delta_csr_types.rst:synapse_policy.weight_renorm --
+        companion to apply_amortized_ci_renorm, built after CiRenorm's
+        StableRegion arm was found to let weight itself run away even
+        while ci stayed correctly bounded. mode: 0=Off, 2=StableRegion
+        (only mode meaningful here -- TrustRatio's own formula is
+        derived FROM weight norm, applying it to weight would be
+        circular)."""
+        return self._c.apply_amortized_weight_renorm(chunk_size, mode, target_mean, target_std)
+
+    def apply_amortized_block4_weight_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_weight_renorm --
+        see that method's own docstring. chunk_size counts TILES here.
+        Only bound on DISLDOLayerV (fp32)."""
+        return self._c.apply_amortized_block4_weight_renorm(chunk_size, mode, target_mean, target_std)
+
     def apply_amortized_l2_init(self, chunk_size: int, rate: float) -> dict:
         """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
         2025, arXiv:2308.11958), scattered arm. See
