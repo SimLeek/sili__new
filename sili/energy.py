@@ -36,6 +36,7 @@ def _apply_energy_dynamics(
     rng: np.random.Generator | None = None,
     wake_gate_steps: int | None = None,
     steps_since_fired: np.ndarray | None = None,
+    decay: float = 0.0,
 ) -> tuple[Tensor, np.ndarray, Tensor, float, np.ndarray, np.ndarray]:
     """Apply continuous energy dynamics, returning an updated Tensor in
     the autograd graph. See docs/research/energy.rst for the full design
@@ -69,6 +70,12 @@ def _apply_energy_dynamics(
     stagger_wake_init : opt-in, randomizes initial steps_since_fired
     (``apply_energy_dynamics.stagger_wake_init``). steps_since_fired :
     caller-owned recency counter, required if wake_gate_steps is set.
+    decay : opt-in mean-reversion rate pulling energy toward 0 each
+    step, default 0.0 (exact no-op). Fixes a random-walk-drift bug --
+    "neutral" calibration alone doesn't stop energy wandering to a
+    clamp by chance. Requires ``drive > 2*decay`` (asserted in
+    ``EnergyDynamics.__init__``). See
+    ``apply_energy_dynamics.decay_mean_reversion``.
 
     Returns
     -------
@@ -105,7 +112,7 @@ def _apply_energy_dynamics(
         else np.zeros(n, dtype=np.int64)
     )
     stale = (ssf_flat >= wake_gate_steps) if wake_gate_steps is not None else np.ones(n, dtype=bool)
-    new_energy = energy_flat + drive + noise - activation_cost * np.abs(h_dz)
+    new_energy = energy_flat * (1.0 - decay) + drive + noise - activation_cost * np.abs(h_dz)
 
     # ── 3. Hard thresholds (integrate-and-fire) ──────────────────────
     # Shutoff resolved first -- frees budget slots before fire claims
@@ -290,16 +297,28 @@ class EnergyDynamics(Module):
         rng: np.random.Generator | None = None,
         wake_gate_steps: int | None = None,
         stagger_wake_init: bool = False,
+        decay: float = 0.0,
     ):
         """Same parameters as _apply_energy_dynamics (drive=delta,
         activation_cost=gamma, precision=lambda_kl, density=beta,
         exploration=sigma, setpoint=tau, reactivity=alpha) -- see that
-        function's docstring for full semantics."""
+        function's docstring for full semantics, including
+        ``decay_mean_reversion``."""
         assert np.finfo(np.float32).eps * 2 <= activation_cost <= 4.0, (
             "activation_cost (gamma) must be positive and <= 4.0"
         )
         assert 0.0 < density < 1.0, "density (beta) must be in (0, 1)"
         assert 0.0 < p <= 1.0, "p must be in (0, 1]"
+        assert decay >= 0.0, "decay must be non-negative"
+        if decay > 0.0:
+            assert drive > 2.0 * decay, (
+                f"drive ({drive}) must exceed 2*decay ({2.0 * decay}) or a "
+                f"permanently-quiet neuron (|h|=0 always -- the zero-init/"
+                f"dead-neuron case this class exists to escape) converges "
+                f"to a fixed point of drive/decay = {drive / decay:.4f} < "
+                f"2.0 and can never reach the fire threshold. See "
+                f"docs/research/energy.rst:apply_energy_dynamics.decay_mean_reversion."
+            )
         # See docs/research/energy.rst:apply_energy_dynamics.p_vs_density.
         assert density <= p * 0.8, (
             f"density ({density}) must stay comfortably below p ({p}) -- "
@@ -329,6 +348,7 @@ class EnergyDynamics(Module):
         self.rng = rng
         self.wake_gate_steps = None if wake_gate_steps is None else int(wake_gate_steps)
         self.stagger_wake_init = bool(stagger_wake_init)
+        self.decay = float(decay)
 
         # Running state -- numpy, not a Tensor, not a learned parameter
         self.energy: np.ndarray | None = None
@@ -414,6 +434,7 @@ class EnergyDynamics(Module):
                 self.rng,
                 self.wake_gate_steps,
                 self.steps_since_fired,
+                self.decay,
             )
         )
         return h_out, self.aux_loss, self.actual_p
