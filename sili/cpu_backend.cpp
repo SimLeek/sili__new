@@ -1633,18 +1633,30 @@ class DISLDOLayerV {
         V max_abs_delta = kSynapsePolicyMaxAbsDelta, V max_ci = kSynapsePolicyMaxCi,
         bool scale_invariant = kSynapsePolicyScaleInvariant,
         V max_abs_grad = kSynapsePolicyMaxAbsGrad, bool centering_row_enable = false,
-        bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1) {
+        bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1,
+        // Arm H: per-OUTPUT-neuron post-clip learning-rate multiplier
+        // (size n_outputs(), energy-derived on the Python side). Empty
+        // array (default): exact no-op, see disldo_backward_sparse_grad's
+        // own energy_lr_scale docstring in sisldo_ops.hpp.
+        py::array_t<V> energy_lr_scale = py::array_t<V>()) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
         V* m_row_ptr = centering_row_enable ? m_row.data() : nullptr;
         V* m_col_ptr = centering_col_enable ? m_col.data() : nullptr;
+        auto els_buf = energy_lr_scale.request();
+        if (els_buf.size != 0 && els_buf.size != (py::ssize_t)n_outputs()) {
+            throw std::invalid_argument("energy_lr_scale length (" + std::to_string(els_buf.size) +
+                                        ") must be 0 (disabled) or match n_outputs (" +
+                                        std::to_string(n_outputs()) + ")");
+        }
+        const V* energy_lr_scale_ptr = els_buf.size != 0 ? (const V*)els_buf.ptr : nullptr;
         disldo_backward_sparse_grad<S, VT, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(), neuron_input_accum.data(),
             neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
             beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad,
-            m_row_ptr, m_col_ptr, centering_beta1);
+            m_row_ptr, m_col_ptr, centering_beta1, energy_lr_scale_ptr);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -4799,7 +4811,8 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
              py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad,
              py::arg("centering_row_enable") = false, py::arg("centering_col_enable") = false,
-             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1)
+             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1,
+             py::arg("energy_lr_scale") = py::array_t<DISLDOLayerV::V>())
         // Real-time engine dispatch -- picks disldo vs sisldo per call
         // (engine_select.hpp); identical results either way, only speed
         // differs. Two overloads each, resolved by pybind from the

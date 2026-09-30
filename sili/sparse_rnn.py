@@ -1282,12 +1282,32 @@ class DISLDOLayer32(_SparseLayerBase):
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
         dy_gate_mask: np.ndarray | None = None,
+        energy_lr_scale: np.ndarray | None = None,
     ) -> Tensor:
         # dy_gate_mask: an externally-determined, shared (same for every
         # row this call) boolean column mask -- e.g. a per-neuron time-
         # based trainability gate, not a measured-magnitude selection.
         # Takes priority over dy_r_target/dy_sparsity_p when given (see
         # _bwd below). See _gated_columns_to_csr's own docstring.
+        #
+        # energy_lr_scale: Arm H -- per-OUTPUT-neuron post-clip learning-
+        # rate multiplier (size n_outputs, energy-derived by the caller),
+        # threaded to _cpu.DISLDOLayerV.backward_sparse's own
+        # energy_lr_scale param. Only wired on the backward_sparse-routed
+        # branches below (dy_gate_mask/dy_r_target/dy_sparsity_p set) --
+        # NOT the plain dense self._c.backward() branch, which has no
+        # such parameter. Using energy_lr_scale with dy_sparsity_p=None
+        # (the dense-backward default) raises rather than silently
+        # ignoring it -- pass dy_sparsity_p=1.0 (a functional no-op
+        # sparsification, still routes through backward_sparse) to use
+        # energy_lr_scale standalone, without also gating selection.
+        if energy_lr_scale is not None and dy_gate_mask is None and dy_r_target is None and dy_sparsity_p is None:
+            raise ValueError(
+                "energy_lr_scale requires routing through backward_sparse -- set "
+                "dy_gate_mask, dy_r_target, or dy_sparsity_p (e.g. 1.0 for a "
+                "functional no-op) alongside it; dy_sparsity_p=None routes to the "
+                "plain dense backward() path, which does not support energy_lr_scale."
+            )
         #
         # CSR-typed input / dy_sparsity_p: mirrors DISLDOLayer.forward's
         # x.is_csr dispatch -- DISLDOLayerV uses the same DeltaCSRBiValues
@@ -1342,6 +1362,13 @@ class DISLDOLayer32(_SparseLayerBase):
                     extra["centering_col_enable"] = True
                 if centering_beta1 is not None:
                     extra["centering_beta1"] = centering_beta1
+                # energy_lr_scale only applies on backward_sparse-routed
+                # branches -- see forward()'s own energy_lr_scale docstring
+                # for why the plain dense backward() branch below stays on
+                # the unmodified `extra`.
+                sparse_extra = dict(extra)
+                if energy_lr_scale is not None:
+                    sparse_extra["energy_lr_scale"] = energy_lr_scale
                 if dy_gate_mask is not None:
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _gated_columns_to_csr(dy2d, dy_gate_mask)
@@ -1355,7 +1382,7 @@ class DISLDOLayer32(_SparseLayerBase):
                         learning_rate,
                         lr_per_row_nnz=lr_per_row_nnz,
                         damp_by_importance=damp_by_importance,
-                        **extra,
+                        **sparse_extra,
                     )
                 elif dy_r_target is not None:
                     # See DISLDOLayer.forward's own dy_r_target comment.
@@ -1371,7 +1398,7 @@ class DISLDOLayer32(_SparseLayerBase):
                         learning_rate,
                         lr_per_row_nnz=lr_per_row_nnz,
                         damp_by_importance=damp_by_importance,
-                        **extra,
+                        **sparse_extra,
                     )
                 elif dy_sparsity_p is None:
                     dx = self._c.backward(
@@ -1395,7 +1422,7 @@ class DISLDOLayer32(_SparseLayerBase):
                         learning_rate,
                         lr_per_row_nnz=lr_per_row_nnz,
                         damp_by_importance=damp_by_importance,
-                        **extra,
+                        **sparse_extra,
                     )
                 if was_1d:
                     dx = dx.squeeze(0)

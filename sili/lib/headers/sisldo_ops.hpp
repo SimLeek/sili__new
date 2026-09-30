@@ -568,7 +568,14 @@ void disldo_backward_sparse_grad(
     // uncentered.
     typename ValueAccessor<VALUES_TYPE>::value_type* m_row = nullptr,
     typename ValueAccessor<VALUES_TYPE>::value_type* m_col = nullptr,
-    typename ValueAccessor<VALUES_TYPE>::value_type centering_beta1 = 0.9f) {
+    typename ValueAccessor<VALUES_TYPE>::value_type centering_beta1 = 0.9f,
+    // Arm H: per-OUTPUT-neuron post-clip learning-rate multiplier
+    // (energy-derived elsewhere), applied at each update_cw call site as
+    // effective_lr * energy_lr_scale[col] -- indexed by col (n_out axis),
+    // NOT row (n_in axis, where effective_lr itself is computed). nullptr
+    // (default): exact no-op, see
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.energy_lr_scale.
+    const typename ValueAccessor<VALUES_TYPE>::value_type* energy_lr_scale = nullptr) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
@@ -815,8 +822,10 @@ void disldo_backward_sparse_grad(
                     value_type ci = ci_orig_buf[e] * combined_imp_scale; // -> true units
                     ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci,
                                                   max_abs_grad);
+                    const value_type col_eff_lr =
+                        energy_lr_scale ? effective_lr * energy_lr_scale[col] : effective_lr;
                     value_type quant = cw_orig_buf[e]; // code-space accumulator
-                    quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], effective_lr, eps,
+                    quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], col_eff_lr, eps,
                                                       damp_by_importance, max_abs_delta,
                                                       scale_invariant);
                     if constexpr (StochasticRounding) {
@@ -1265,10 +1274,13 @@ void disldo_backward_sparse_grad(
                                     if (m_col)
                                         m_col[col] = FirstMomentTracker<value_type>::update(
                                             m_col[col], grad - m_r, centering_beta1);
+                                    const value_type col_eff_lr =
+                                        energy_lr_scale ? effective_lr * energy_lr_scale[col]
+                                                        : effective_lr;
                                     value_type quant = w_decoded; // code-space accumulator,
                                                                   // matches disldo_backward
                                     quant += SynapsePolicy::update_cw(
-                                        grad, ci, S, effective_lr, eps, damp_by_importance,
+                                        grad, ci, S, col_eff_lr, eps, damp_by_importance,
                                         max_abs_delta, scale_invariant);
                                     // was_live gate -- computed from the PRE-update (snapshotted)
                                     // weight/importance, matching disldo_backward's own

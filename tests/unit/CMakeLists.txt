@@ -190,6 +190,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_scattered_divergence
     test_sisldo_disldo_parity
     test_sisldo_disldo_parity_fp32
+    test_disldo_backward_sparse_grad_energy_lr_scale
     test_sisldo_disldo_parity_fp8
     test_sisldo_disldo_multibatch_parity
     test_fp8_block4_scattered_divergence
