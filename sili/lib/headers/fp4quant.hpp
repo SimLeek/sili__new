@@ -200,6 +200,25 @@ inline float fp4_stochastic_uniform01() {
     return static_cast<float>((r >> 40) * (1.0 / 16777216.0)); // top 24 bits -> [0,1)
 }
 
+/// Standard-normal (mean 0, std 1) sample off the SAME thread-local
+/// xorshift64* state fp4_stochastic_uniform01() uses -- Box-Muller from
+/// two independent uniform draws. Caller applies any target scale
+/// (e.g. 1/sqrt(fan_in)) themselves; this returns a raw N(0,1) draw. Used
+/// by the per-neuron plasticity-reset mechanism's fresh-value resampling
+/// -- see docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+/// u1 is floored away from exactly 0 (std::log(0) is -inf) via the same
+/// "never land on the excluded endpoint" trick fp4_stochastic_uniform01's
+/// own [0,1) range already needs elsewhere in this codebase.
+inline float fp4_stochastic_normal01() {
+    float u1 = fp4_stochastic_uniform01();
+    if (u1 <= 0.0f)
+        u1 = 1e-7f;
+    const float u2 = fp4_stochastic_uniform01();
+    const float r = std::sqrt(-2.0f * std::log(u1));
+    constexpr float kTwoPi = 6.283185307179586f;
+    return r * std::cos(kTwoPi * u2);
+}
+
 /// Stochastic quantize @p v to a 4-bit FP4 index -- unbiased (E[result] == v
 /// for v within [-6,6]; clamps deterministically outside it). Bit-shift/
 /// dithered-rounding, not FP4_SORTED_IDX's linear bracket scan (kept for

@@ -208,6 +208,18 @@ class _SparseLayerBase(Module):
         by the caller from a target half-life and this layer's nnz."""
         return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
 
+    def apply_amortized_importance_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting
+        hypothesis (critical-learning-periods/loss-of-plasticity
+        literature). Same amortized/chunked mechanism as
+        apply_amortized_l2_decay, own separate cursor, decays each
+        synapse's IMPORTANCE (the per-synapse RMSprop-style accumulator)
+        instead of its weight -- see apply_amortized_decay_stats's own
+        decay_importance comment (sili/lib/headers/delta_csr_types.hpp).
+        Bound on every backend. May be removed if testing doesn't show
+        benefit."""
+        return self._c.apply_amortized_importance_decay(chunk_size, decay_factor)
+
     def state_dict(self) -> dict:
         return {
             "ptrs": np.array(self.ptrs),
@@ -562,6 +574,22 @@ def _nucleus_top_k_csr(
     return ptrs, indices, values
 
 
+def _gated_columns_to_csr(dy2d: np.ndarray, gate_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build (ptrs, indices, values) selecting the SAME fixed set of
+    columns (where gate_mask is True) for every row, regardless of
+    magnitude -- unlike _nucleus_top_k_csr's per-row variable-k
+    selection, this is an externally-determined, shared column mask
+    (e.g. a per-neuron time-based trainability gate, not a measured
+    signal). gate_mask: bool array, shape [cols]."""
+    rows, _cols = dy2d.shape
+    sel_cols = np.nonzero(gate_mask)[0].astype(np.int32)
+    k = len(sel_cols)
+    ptrs = (np.arange(rows + 1) * k).astype(np.int32)
+    indices = np.tile(sel_cols, rows)
+    values = dy2d[:, sel_cols].astype(np.float32).flatten()
+    return ptrs, indices, values
+
+
 def _record_grad_selection_stats(layer, dy2d: np.ndarray, dp: np.ndarray, di: np.ndarray, dv: np.ndarray) -> None:
     """Real per-call GRADIENT-axis R/k stats for a dy_r_target nucleus
     selection, mirroring sili_peridot's own x-axis
@@ -735,7 +763,8 @@ class DISLDOLayer(_SparseLayerBase):
                 elif dy_r_target is not None:
                     # Nucleus/energy-threshold grad sparsification -- k is
                     # a CONSEQUENCE of dy_r_target and this step's actual
-                    # gradient energy, not a fixed fraction.
+                    # gradient energy (magnitude, not EnergyDynamics'
+                    # per-neuron state), not a fixed fraction.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
                     _record_grad_selection_stats(self, dy2d, dp, di, dv)
@@ -984,10 +1013,254 @@ class DISLDOLayer32(_SparseLayerBase):
         if dense:
             max_weights = max(max_weights, in_features * out_features)
         self._c = _cpu.DISLDOLayerV(in_features, out_features, max_weights, num_cpus)
+        self._last_grad_norm_sq: float | None = None
         if dense:
             self._max_row_weights = _preseed_dense_fp32(self._c, in_features, out_features, rng)
         else:
             self._max_row_weights = _preseed_random_sparse(self._c, in_features, out_features, max_weights, rng)
+
+    def apply_amortized_block4_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- block4-storage counterpart to
+        apply_amortized_l2_decay (which only covers weights.connections,
+        the scattered CSR side). synaptogenesis can promote/demote a
+        layer's synapses into block4 packed-tile storage (task #350); a
+        complete decay pass needs both this and the inherited scattered
+        method, since a single layer's synapses can be split across both
+        simultaneously. Own separate cursor
+        (sili/lib/headers/block4_decay_TODO_DELETE.hpp), touches whole
+        tiles per chunk rather than individual synapses. Only bound on
+        DISLDOLayerV (fp32); not applicable to FP4/FP8 layer classes.
+        May be removed if testing doesn't show benefit."""
+        return self._c.apply_amortized_block4_l2_decay(chunk_size, decay_factor)
+
+    def apply_amortized_block4_importance_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- block4-storage counterpart to
+        apply_amortized_importance_decay, same loss-of-plasticity
+        motivation (see that method's docstring and
+        docs/research/delta_csr_types.rst:amortized_decay.chunked_cursor).
+        Decays IMPORTANCE instead of weight for cells living in block4
+        packed-tile storage; pair with apply_amortized_importance_decay
+        (inherited, scattered-only) for full layer coverage. Own separate
+        cursor. Only bound on DISLDOLayerV (fp32). May be removed if
+        testing doesn't show benefit."""
+        return self._c.apply_amortized_block4_importance_decay(chunk_size, decay_factor)
+
+    def apply_amortized_plasticity_reset(
+        self,
+        chunk_size: int,
+        eta: float,
+        eta_slow: float,
+        eta_slow_catchup: float,
+        eta_fast: float,
+        blend: float,
+        reset_fraction: float,
+        k: float,
+        eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
+        select_by_deviation: bool = False,
+    ) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- per-neuron utility-based
+        plasticity reset (Continual-Backprop-inspired, Dohare et al.
+        2024 Nature "Loss of plasticity in deep continual learning"),
+        scattered (.connections) arm. See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+        for the full derivation -- NOT a decay mechanism: top-K FROZEN
+        pool, gated by a LOCAL per-column gradient-activity z-score
+        (col_grad_fast/slow/var, itself derived from col_importance's
+        own per-cycle delta, never a real backward-kernel hook or any
+        loss value; k is std-devs above baseline, not a ratio). NO loss
+        argument anywhere in this call. The dead pool (bottom-K by
+        importance*|weight|) was PRUNED after a real relaunch showed it
+        caused a self-reinforcing spiral -- see the design doc's
+        dead_pool_pruned section. Pair with
+        apply_amortized_block4_plasticity_reset (block4-storage arm) for
+        full layer coverage. May be removed if testing doesn't show
+        benefit.
+
+        l2_decay_lambda=0.0 (default) is an exact no-op. When >0, a
+        SEPARATE population-level decay shrinks EVERY touched column's
+        importance (not just the frozen-pool picks), gated by a soft
+        sigmoid on how close the population's L2 norm sits to the
+        max_ci ceiling -- see
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+
+        select_by_deviation=False (default) ranks candidates by
+        col_importance (absolute LEVEL). True ranks by deviation
+        (growth RATE) instead -- catches a column accelerating fast
+        while its absolute level is still low, which top-K-by-level can
+        never see. See
+        docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.select_by_deviation_early_detection."""
+        return self._c.apply_amortized_plasticity_reset(
+            chunk_size,
+            eta,
+            eta_slow,
+            eta_slow_catchup,
+            eta_fast,
+            blend,
+            reset_fraction,
+            k,
+            eta_var,
+            l2_decay_lambda,
+            l2_decay_threshold,
+            l2_decay_temperature,
+            max_ci,
+            select_by_deviation,
+        )
+
+    def apply_amortized_block4_plasticity_reset(
+        self,
+        chunk_size: int,
+        eta: float,
+        eta_slow: float,
+        eta_slow_catchup: float,
+        eta_fast: float,
+        blend: float,
+        reset_fraction: float,
+        k: float,
+        eta_var: float = 0.9,
+        l2_decay_lambda: float = 0.0,
+        l2_decay_threshold: float = 0.9,
+        l2_decay_temperature: float = 0.05,
+        max_ci: float = 100.0,
+        select_by_deviation: bool = False,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_plasticity_reset
+        -- see that method's own docstring. chunk_size counts TILES here
+        (block4's natural atomic unit), not individual synapses. Only
+        bound on DISLDOLayerV (fp32). May be removed if testing doesn't
+        show benefit."""
+        return self._c.apply_amortized_block4_plasticity_reset(
+            chunk_size,
+            eta,
+            eta_slow,
+            eta_slow_catchup,
+            eta_fast,
+            blend,
+            reset_fraction,
+            k,
+            eta_var,
+            l2_decay_lambda,
+            l2_decay_threshold,
+            l2_decay_temperature,
+            max_ci,
+            select_by_deviation,
+        )
+
+    def apply_amortized_ci_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+        eff_lr: float,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales this layer's real per-synapse ci back
+        toward a healthy region (never resets/prunes any synapse, only
+        rescales, preserving relative ranking). Scattered (.connections)
+        arm. See
+        docs/research/delta_csr_types.rst:synapse_policy.ci_renorm for
+        the full derivation. mode: 0=Off, 1=TrustRatio (LAMB-inspired
+        multiplicative rescale, target_mean/target_std unused -- pass
+        empty arrays), 2=StableRegion (affine renormalize toward
+        target_mean/target_std, length n_outputs arrays)."""
+        return self._c.apply_amortized_ci_renorm(
+            chunk_size,
+            mode,
+            target_mean,
+            target_std,
+            eff_lr,
+            max_ci_ref,
+            trust_ratio_min,
+            trust_ratio_max,
+        )
+
+    def apply_amortized_block4_ci_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+        eff_lr: float,
+        max_ci_ref: float = 100.0,
+        trust_ratio_min: float = 0.1,
+        trust_ratio_max: float = 10.0,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_ci_renorm -- see
+        that method's own docstring. chunk_size counts TILES here. Only
+        bound on DISLDOLayerV (fp32)."""
+        return self._c.apply_amortized_block4_ci_renorm(
+            chunk_size,
+            mode,
+            target_mean,
+            target_std,
+            eff_lr,
+            max_ci_ref,
+            trust_ratio_min,
+            trust_ratio_max,
+        )
+
+    def apply_amortized_weight_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+    ) -> dict:
+        """EXPERIMENTAL -- rescales this layer's real per-synapse WEIGHT
+        back toward a healthy region (never touches importance).
+        Scattered (.connections) arm. See
+        docs/research/delta_csr_types.rst:synapse_policy.weight_renorm --
+        companion to apply_amortized_ci_renorm, built after CiRenorm's
+        StableRegion arm was found to let weight itself run away even
+        while ci stayed correctly bounded. mode: 0=Off, 2=StableRegion
+        (only mode meaningful here -- TrustRatio's own formula is
+        derived FROM weight norm, applying it to weight would be
+        circular)."""
+        return self._c.apply_amortized_weight_renorm(chunk_size, mode, target_mean, target_std)
+
+    def apply_amortized_block4_weight_renorm(
+        self,
+        chunk_size: int,
+        mode: int,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+    ) -> dict:
+        """block4-storage counterpart to apply_amortized_weight_renorm --
+        see that method's own docstring. chunk_size counts TILES here.
+        Only bound on DISLDOLayerV (fp32)."""
+        return self._c.apply_amortized_block4_weight_renorm(chunk_size, mode, target_mean, target_std)
+
+    def apply_amortized_l2_init(self, chunk_size: int, rate: float) -> dict:
+        """EXPERIMENTAL -- L2 Init (Kumar, Marklund & Van Roy, CoLLAs
+        2025, arXiv:2308.11958), scattered arm. See
+        docs/research/delta_csr_types.rst:plasticity_reset.l2_init."""
+        return self._c.apply_amortized_l2_init(chunk_size, rate)
+
+    def apply_amortized_block4_l2_init(self, chunk_size: int, rate: float) -> dict:
+        """block4 counterpart -- chunk_size counts TILES. fp32 only."""
+        return self._c.apply_amortized_block4_l2_init(chunk_size, rate)
+
+    def plasticity_column_state(self) -> dict:
+        """Read-only per-column snapshot (scattered arm), zero-copy view.
+        Empty arrays before the first apply call. See
+        docs/research/delta_csr_types.rst:plasticity_column_state."""
+        return self._c.plasticity_column_state()
+
+    def plasticity_column_state_block4(self) -> dict:
+        """block4 counterpart to plasticity_column_state."""
+        return self._c.plasticity_column_state_block4()
+
+    @property
+    def scattered_nnz(self) -> int:
+        """Scattered-arm-only nnz (unlike combined `.nnz`) -- see
+        docs/research/delta_csr_types.rst:plasticity_column_state."""
+        return self._c.scattered_nnz
 
     def forward(
         self,
@@ -998,13 +1271,44 @@ class DISLDOLayer32(_SparseLayerBase):
         min_decay_frac: float | None = None,
         max_abs_delta: float | None = None,
         max_ci: float | None = None,
+        max_abs_grad: float | None = None,
         scale_invariant: bool = False,
+        centering_row_enable: bool = False,
+        centering_col_enable: bool = False,
+        centering_beta1: float | None = None,
         requires_grad: bool = True,
         dy_sparsity_p: float | None = None,
         dy_r_target=None,
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
+        dy_gate_mask: np.ndarray | None = None,
+        energy_lr_scale: np.ndarray | None = None,
     ) -> Tensor:
+        # dy_gate_mask: an externally-determined, shared (same for every
+        # row this call) boolean column mask -- e.g. a per-neuron time-
+        # based trainability gate, not a measured-magnitude selection.
+        # Takes priority over dy_r_target/dy_sparsity_p when given (see
+        # _bwd below). See _gated_columns_to_csr's own docstring.
+        #
+        # energy_lr_scale: Arm H -- per-OUTPUT-neuron post-clip learning-
+        # rate multiplier (size n_outputs, energy-derived by the caller),
+        # threaded to _cpu.DISLDOLayerV.backward_sparse's own
+        # energy_lr_scale param. Only wired on the backward_sparse-routed
+        # branches below (dy_gate_mask/dy_r_target/dy_sparsity_p set) --
+        # NOT the plain dense self._c.backward() branch, which has no
+        # such parameter. Using energy_lr_scale with dy_sparsity_p=None
+        # (the dense-backward default) raises rather than silently
+        # ignoring it -- pass dy_sparsity_p=1.0 (a functional no-op
+        # sparsification, still routes through backward_sparse) to use
+        # energy_lr_scale standalone, without also gating selection.
+        if energy_lr_scale is not None and dy_gate_mask is None and dy_r_target is None and dy_sparsity_p is None:
+            raise ValueError(
+                "energy_lr_scale requires routing through backward_sparse -- set "
+                "dy_gate_mask, dy_r_target, or dy_sparsity_p (e.g. 1.0 for a "
+                "functional no-op) alongside it; dy_sparsity_p=None routes to the "
+                "plain dense backward() path, which does not support energy_lr_scale."
+            )
+        #
         # CSR-typed input / dy_sparsity_p: mirrors DISLDOLayer.forward's
         # x.is_csr dispatch -- DISLDOLayerV uses the same DeltaCSRBiValues
         # storage family, so forward_sparse/backward_sparse unify dense+
@@ -1037,6 +1341,10 @@ class DISLDOLayer32(_SparseLayerBase):
         def _bwd():
             if out.grad is not None:
                 dy = np.asarray(out.grad, dtype=np.float32)
+                # See docs/research/sparse_rnn.rst:disldo_layer_forward.last_grad_norm_sq_polyak_hook
+                # -- universal hook point, ahead of the sparsification branches below, so it's
+                # populated the same way regardless of which (if any) is active.
+                self._last_grad_norm_sq = float(np.sum(np.square(dy, dtype=np.float64)))
                 extra = {}
                 if min_decay_frac is not None:
                     extra["min_decay_frac"] = min_decay_frac
@@ -1044,9 +1352,39 @@ class DISLDOLayer32(_SparseLayerBase):
                     extra["max_abs_delta"] = max_abs_delta
                 if max_ci is not None:
                     extra["max_ci"] = max_ci
+                if max_abs_grad is not None:
+                    extra["max_abs_grad"] = max_abs_grad
                 if scale_invariant:
                     extra["scale_invariant"] = True
-                if dy_r_target is not None:
+                if centering_row_enable:
+                    extra["centering_row_enable"] = True
+                if centering_col_enable:
+                    extra["centering_col_enable"] = True
+                if centering_beta1 is not None:
+                    extra["centering_beta1"] = centering_beta1
+                # energy_lr_scale only applies on backward_sparse-routed
+                # branches -- see forward()'s own energy_lr_scale docstring
+                # for why the plain dense backward() branch below stays on
+                # the unmodified `extra`.
+                sparse_extra = dict(extra)
+                if energy_lr_scale is not None:
+                    sparse_extra["energy_lr_scale"] = energy_lr_scale
+                if dy_gate_mask is not None:
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    dp, di, dv = _gated_columns_to_csr(dy2d, dy_gate_mask)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **sparse_extra,
+                    )
+                elif dy_r_target is not None:
                     # See DISLDOLayer.forward's own dy_r_target comment.
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _nucleus_top_k_csr(dy2d, dy_r_target, self._c.num_cpus, k_min=dy_k_min, k_max=dy_k_max)
@@ -1060,7 +1398,7 @@ class DISLDOLayer32(_SparseLayerBase):
                         learning_rate,
                         lr_per_row_nnz=lr_per_row_nnz,
                         damp_by_importance=damp_by_importance,
-                        **extra,
+                        **sparse_extra,
                     )
                 elif dy_sparsity_p is None:
                     dx = self._c.backward(
@@ -1084,7 +1422,7 @@ class DISLDOLayer32(_SparseLayerBase):
                         learning_rate,
                         lr_per_row_nnz=lr_per_row_nnz,
                         damp_by_importance=damp_by_importance,
-                        **extra,
+                        **sparse_extra,
                     )
                 if was_1d:
                     dx = dx.squeeze(0)
@@ -1139,6 +1477,24 @@ class DIDLDOLayer32(Module):
     @property
     def weights(self) -> np.ndarray:
         return self._c.weights_vals
+
+    def apply_amortized_l2_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """Passthrough to the real C++ apply_amortized_l2_decay (amortized
+        decoupled weight decay + rolling health stats via a persistent
+        per-layer cursor), flat-array version over DenseLinearWeights'
+        `w`. decay_factor is derived by the caller from a target half-life
+        and this layer's own element count."""
+        return self._c.apply_amortized_l2_decay(chunk_size, decay_factor)
+
+    def apply_amortized_importance_decay(self, chunk_size: int, decay_factor: float) -> dict:
+        """EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting
+        hypothesis (critical-learning-periods/loss-of-plasticity
+        literature). Same amortized/chunked mechanism as
+        apply_amortized_l2_decay, own separate cursor, decays `ci`
+        (DenseLinearWeights' RMSprop-style accumulator, this storage's
+        analog of DISLDO/SISLDO's "importance") instead of `w`. May be
+        removed if testing doesn't show benefit."""
+        return self._c.apply_amortized_importance_decay(chunk_size, decay_factor)
 
     def __init__(
         self,

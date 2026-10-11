@@ -223,6 +223,77 @@ eligibility across the first ``wake_gate_steps`` calls. Uses ``rng``
 if given, else ``RandomState(wake_seed)`` -- same convention as
 ``wake_sign``'s own seeded draw.
 
+.. _apply_energy_dynamics.decay_mean_reversion:
+
+``decay``: mean-reversion, fixing the random-walk-drift bug
+---------------------------------------------------------------
+
+*ID:* ``apply_energy_dynamics.decay_mean_reversion``
+
+Opt-in, default 0.0 (exact no-op, bit-identical to prior behavior).
+Found empirically in the sili_peridot dense-vs-sparse MQAR investigation:
+a "neutral" calibration (``drive == activation_cost * E[|h|]``) only
+zeroes the EXPECTED per-step drift -- it does not make energy sit near
+0. With no restoring force, ``new_energy = energy + drive + noise -
+activation_cost*|h|`` is a driftless random walk bounded only by the
++-2.0 clamps, which spreads out and gets absorbed at a boundary by
+chance, not because a neuron is actually behaving pathologically.
+Confirmed via direct simulation (2000 neurons, healthy i.i.d. |h| at a
+neutral calibration, no training pathology involved at all): the final
+energy histogram came out FLAT across the whole [-2,2] range (only
+~11% within [-0.2,0.2] -- exactly what a uniform distribution gives,
+i.e. zero real concentration near 0), and the resulting shutoff/fire
+event ratio was ~8x asymmetric purely from |h|'s right-skewed cost
+(an occasional large |h| spike costs far more than a typical quiet
+step gains) -- reproducing the real training run's measured 7.6-20%
+standing shutoff population vs a 0.02-0.03% fire trickle almost
+exactly.
+
+``decay`` adds a discrete OU-style relaxation term:
+
+.. code-block:: python
+
+   new_energy = energy * (1.0 - decay) + drive + noise - activation_cost * np.abs(h_dz)
+
+preserving "gain from quiet, lose from active" exactly (those terms
+are unchanged) while pulling a TYPICAL neuron back toward 0 instead of
+letting it randomly drift to a clamp. A neuron with a SUSTAINED bias
+(chronically quiet/dead, or chronically loud/saturated) still
+overcomes the pull and reaches fire/shutoff -- the escape guarantee
+this class exists for is preserved.
+
+**Required relationship between decay and drive**: a permanently-quiet
+neuron's (``|h|=0`` always, the literal zero-init/dead-neuron case)
+deterministic fixed point (ignoring noise) is ``E* = drive / decay``.
+For it to ever reach the fire threshold, the fixed point itself must
+clear it: ``drive / decay > 2.0``, i.e. ``drive > 2.0 * decay``. Below
+that, decay's pull permanently outweighs drive and a genuinely dead
+neuron can never escape. ``EnergyDynamics.__init__`` asserts this
+whenever ``decay > 0``.
+
+**Approximate per-step boundary-crossing rate** (order-of-magnitude
+only -- treats in-bounds dynamics as a linear AR(1) process, ignores
+the absorbing-boundary correction, assumes a symmetric Gaussian
+stationary distribution vs real |h|'s right skew): at a neutral
+calibration, ``Var(E) ~= (activation_cost**2 * Var(|h|) +
+exploration**2) / (2*decay)`` for small decay, and the per-step
+probability of crossing either boundary is approximately
+``2 * (1 - Phi(2.0 / sqrt(Var(E))))``. Real |h|'s skew means the true
+shutoff rate runs higher than this symmetric estimate and the true
+fire rate runs lower -- use it for an overall crossing-rate budget,
+not a fire/shutoff split. Validated against a real simulation with a
+known |h| distribution in
+``tests/unit/python/test_energy_decay.py::TestDecayApproximateFiringRate``
+(order-of-magnitude agreement, per the caveats above).
+
+See ``tests/unit/python/test_energy_decay.py`` for the full test suite:
+constructor-validation (rejects ``decay<0`` and ``drive<=2*decay``),
+backward-compatibility (``decay=0`` is bit-exact with prior behavior),
+both escape guarantees (permanently-quiet reaches fire, permanently
+-loud reaches shutoff), the healthy-population concentration fix
+(stationary std shrinks >2x under decay vs without, on the same
+i.i.d.-|h| population), and the approximate-rate validation above.
+
 .. _apply_energy_dynamics.aux_loss_zero_init_escape:
 
 ``aux_loss``: the zero-init escape proof

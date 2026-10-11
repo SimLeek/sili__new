@@ -435,11 +435,20 @@ struct AmortizedDecayStats {
     bool cycle_complete = false;
 };
 
+// decay_importance: EXPERIMENTAL, added 2026-09-20 for the loss-adjusted
+// forgetting hypothesis (critical-learning-periods/loss-of-plasticity
+// literature -- an over-large importance/second-moment accumulator can
+// "freeze" a synapse against further updates; decaying it selectively may
+// restore plasticity after a curriculum-transition stall). false (default):
+// decays weight only, byte-identical to the original behavior. true: decays
+// importance only, weight passed through unchanged. May be removed if
+// testing doesn't show benefit -- see docs/research/delta_csr_types.rst:
+// amortized_decay.chunked_cursor.
 template <typename VALUES_TYPE, typename V>
 AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t& cursor,
                                                 double& sum_abs, double& sum_sq, double& max_abs,
                                                 std::size_t& n, std::size_t chunk_size,
-                                                V decay_factor) {
+                                                V decay_factor, bool decay_importance = false) {
     using VA = ValueAccessor<VALUES_TYPE>;
     const std::size_t total = VA::size(values);
     bool cycle_complete = false;
@@ -449,13 +458,119 @@ AmortizedDecayStats apply_amortized_decay_stats(VALUES_TYPE& values, std::size_t
                 cursor = 0;
             const V w = static_cast<V>(VA::get_w(values, cursor));
             const V imp = static_cast<V>(VA::get_imp(values, cursor));
-            const V new_w = static_cast<V>(w * decay_factor);
-            VA::set_live(values, cursor, new_w, imp);
-            const double aw = std::abs(static_cast<double>(new_w));
+            const V new_w = decay_importance ? w : static_cast<V>(w * decay_factor);
+            const V new_imp = decay_importance ? static_cast<V>(imp * decay_factor) : imp;
+            VA::set_live(values, cursor, new_w, new_imp);
+            const double aw = std::abs(static_cast<double>(decay_importance ? new_imp : new_w));
             sum_abs += aw;
             sum_sq += aw * aw;
             if (aw > max_abs)
                 max_abs = aw;
+            ++n;
+            ++cursor;
+            if (cursor >= total) {
+                cycle_complete = true;
+                cursor = 0;
+            }
+        }
+    } else {
+        cycle_complete = true;
+    }
+    AmortizedDecayStats out;
+    out.cycle_complete = cycle_complete;
+    if (cycle_complete && n > 0) {
+        out.mean_abs = sum_abs / static_cast<double>(n);
+        out.rms = std::sqrt(sum_sq / static_cast<double>(n));
+        out.max_abs = max_abs;
+        out.n = n;
+        sum_abs = 0.0;
+        sum_sq = 0.0;
+        max_abs = 0.0;
+        n = 0;
+    }
+    return out;
+}
+
+// L2 Init (Kumar, Marklund & Van Roy, "Maintaining Plasticity in
+// Continual Learning via Regenerative Regularization", CoLLAs 2025,
+// arXiv:2308.11958): regularize weights toward their OWN initial
+// value, not toward zero -- found in the paper to mitigate loss of
+// plasticity more consistently than Shrink-and-Perturb or plain L2.
+// Same amortized/chunked-cursor shape as apply_amortized_decay_stats.
+// A cell's FIRST touch only captures its current weight as the
+// reference "initial" (no modification -- nothing to regularize
+// toward yet); every touch after that pulls `rate` of the way back
+// toward the captured reference. Importance is never touched -- this
+// targets trainable weight, not this project's own ci accumulator.
+struct AmortizedL2InitStats {
+    bool cycle_complete = false;
+    std::size_t n_touched = 0;
+};
+
+template <typename VALUES_TYPE, typename V>
+AmortizedL2InitStats
+apply_amortized_l2_init(VALUES_TYPE& values, std::size_t& cursor, std::vector<V>& initial_weight,
+                        std::vector<uint8_t>& captured, std::size_t chunk_size, V rate) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    const std::size_t total = VA::size(values);
+    if (initial_weight.size() != total) {
+        initial_weight.assign(total, V(0));
+        captured.assign(total, 0);
+    }
+    bool cycle_complete = false;
+    std::size_t n_touched = 0;
+    if (total > 0) {
+        for (std::size_t i = 0; i < chunk_size; ++i) {
+            if (cursor >= total)
+                cursor = 0;
+            const V w = static_cast<V>(VA::get_w(values, cursor));
+            if (!captured[cursor]) {
+                initial_weight[cursor] = w;
+                captured[cursor] = 1;
+            } else {
+                const V imp = static_cast<V>(VA::get_imp(values, cursor));
+                const V new_w = static_cast<V>(w + rate * (initial_weight[cursor] - w));
+                VA::set_live(values, cursor, new_w, imp);
+            }
+            ++n_touched;
+            ++cursor;
+            if (cursor >= total) {
+                cycle_complete = true;
+                cursor = 0;
+            }
+        }
+    } else {
+        cycle_complete = true;
+    }
+    AmortizedL2InitStats out;
+    out.cycle_complete = cycle_complete;
+    out.n_touched = n_touched;
+    return out;
+}
+
+// Flat-array sibling of apply_amortized_decay_stats above, for genuinely
+// dense storage (DenseLinearWeights -- DIDLDO/SIDLDO's shared `w`/`ci`
+// vectors, no CSR/block4 packing, no separate weight+importance pairing
+// per index needed since caller passes exactly the ONE vector to decay).
+// Same amortized/chunked-cursor shape, same AmortizedDecayStats return
+// type, for interface consistency with the CSR/block4 versions.
+template <typename V>
+AmortizedDecayStats apply_amortized_flat_decay_stats(std::vector<V>& values, std::size_t& cursor,
+                                                     double& sum_abs, double& sum_sq,
+                                                     double& max_abs, std::size_t& n,
+                                                     std::size_t chunk_size, V decay_factor) {
+    const std::size_t total = values.size();
+    bool cycle_complete = false;
+    if (total > 0) {
+        for (std::size_t i = 0; i < chunk_size; ++i) {
+            if (cursor >= total)
+                cursor = 0;
+            values[cursor] = static_cast<V>(values[cursor] * decay_factor);
+            const double av = std::abs(static_cast<double>(values[cursor]));
+            sum_abs += av;
+            sum_sq += av * av;
+            if (av > max_abs)
+                max_abs = av;
             ++n;
             ++cursor;
             if (cursor >= total) {
@@ -666,12 +781,26 @@ template <typename VALUE_TYPE> struct PlainRMSpropSynapsePolicy {
     // default) was checked against. NaN/Inf guard closes a coverage gap
     // an earlier commit (ba4af42) left. See
     // docs/research/delta_csr_types.rst:synapse_policy.plain_reference.
+    // max_abs_grad: clip g/contrib to [-max_abs_grad, max_abs_grad] BEFORE
+    // squaring into the EMA -- default (1e30) is a true no-op for any
+    // finite input, so every existing call site (which omits this
+    // argument) stays bit-identical. See
+    // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+    // m: AdaBelief-style centering -- clip(g-m, ...) instead of clip(g, ...).
+    // Default 0 makes residual==g, so this is a true no-op for every
+    // existing call site. See
+    // docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
-                                VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/) {
+                                VALUE_TYPE /*min_decay_frac*/, VALUE_TYPE /*max_ci*/,
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30),
+                                VALUE_TYPE m = VALUE_TYPE(0)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
-        const VALUE_TYPE new_ci =
-            beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        const VALUE_TYPE residual = g - m;
+        const VALUE_TYPE residual_c = std::min(std::max(residual, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE new_ci = beta2 * ci + (VALUE_TYPE(1) - beta2) * (residual_c * residual_c +
+                                                                          contrib_c * contrib_c);
         return std::isfinite(new_ci) ? new_ci : ci;
     }
 
@@ -710,11 +839,21 @@ template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
     // Same NaN/Inf guard convention as PlainRMSpropSynapsePolicy::update_ci,
     // checked BEFORE the floor/max_ci clamps (std::min/max's NaN behavior
     // is comparison-order-dependent, not a reliable filter on its own).
+    // max_abs_grad: same clip-before-squaring semantics and no-op default
+    // as PlainRMSpropSynapsePolicy::update_ci above -- see its docstring.
+    // m: AdaBelief-style centering, same clip(g-m,...) semantics and 0
+    // (true no-op) default as PlainRMSpropSynapsePolicy::update_ci above.
     static VALUE_TYPE update_ci(VALUE_TYPE ci, VALUE_TYPE g, VALUE_TYPE contrib, VALUE_TYPE beta2,
-                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci) {
+                                VALUE_TYPE min_decay_frac, VALUE_TYPE max_ci,
+                                VALUE_TYPE max_abs_grad = VALUE_TYPE(1e30),
+                                VALUE_TYPE m = VALUE_TYPE(0)) {
         if (!std::isfinite(g) || !std::isfinite(contrib))
             return ci;
-        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) * (g * g + contrib * contrib);
+        const VALUE_TYPE residual = g - m;
+        const VALUE_TYPE residual_c = std::min(std::max(residual, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE contrib_c = std::min(std::max(contrib, -max_abs_grad), max_abs_grad);
+        const VALUE_TYPE ema = beta2 * ci + (VALUE_TYPE(1) - beta2) *
+                                                (residual_c * residual_c + contrib_c * contrib_c);
         if (!std::isfinite(ema))
             return ci;
         const VALUE_TYPE floor = min_decay_frac * ci;
@@ -748,6 +887,22 @@ template <typename VALUE_TYPE> struct BoundedRMSpropSynapsePolicy {
             raw = -max_abs_delta;
         const VALUE_TYPE delta = scale_invariant ? (eff_lr * raw / S) : (eff_lr * raw);
         return std::isfinite(delta) ? delta : VALUE_TYPE(0);
+    }
+};
+
+// Plain EMA of the SIGNED gradient g itself (not g^2) -- the additive
+// row+column baseline AdaBelief-style centering (update_ci's `m` param)
+// needs. Deliberately a separate, tiny policy (not folded into
+// Plain/BoundedRMSpropSynapsePolicy): it tracks a pure statistic, not a
+// gradient-descent-optimized parameter, so it has no update_cw
+// counterpart. See
+// docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+template <typename VALUE_TYPE> struct FirstMomentTracker {
+    static VALUE_TYPE update(VALUE_TYPE m, VALUE_TYPE g, VALUE_TYPE beta1) {
+        if (!std::isfinite(g))
+            return m;
+        const VALUE_TYPE new_m = beta1 * m + (VALUE_TYPE(1) - beta1) * g;
+        return std::isfinite(new_m) ? new_m : m;
     }
 };
 
@@ -835,10 +990,19 @@ template <typename COL_TYPE = uint32_t> struct DeltaCSRRowCursor {
 template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
     // Same NaN/Inf guard as the scalar update_ci, per-lane via
     // block4_vec_select_finite (block4.hpp has no whole-vector isfinite).
+    // max_abs_grad: same clip-before-squaring semantics as the scalar
+    // version, via block4_vec_clip_abs -- default (1e30 broadcast) is a
+    // true no-op, so every existing call site stays bit-identical.
+    // m: AdaBelief-style centering, same semantics as the scalar version.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
-                               Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/) {
+                               Block4Vec /*min_decay_frac*/, Block4Vec /*max_ci*/,
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f),
+                               Block4Vec m = block4_vec_broadcast(0.0f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec new_ci = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec residual_c = block4_vec_clip_abs(g - m, max_abs_grad);
+        const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
+        const Block4Vec new_ci =
+            beta2 * ci + (one - beta2) * (residual_c * residual_c + contrib_c * contrib_c);
         return block4_vec_select_finite(new_ci, ci);
     }
 
@@ -862,11 +1026,19 @@ template <> struct PlainRMSpropSynapsePolicy<Block4Vec> {
 
 template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
     // Same min_decay_frac semantics and NaN/Inf guard as the scalar
-    // update_ci (checked before the floor/max_ci clamps).
+    // update_ci (checked before the floor/max_ci clamps). max_abs_grad:
+    // same clip-before-squaring semantics as the scalar version, see
+    // PlainRMSpropSynapsePolicy<Block4Vec>::update_ci above.
+    // m: AdaBelief-style centering, same semantics as the scalar version.
     static Block4Vec update_ci(Block4Vec ci, Block4Vec g, Block4Vec contrib, Block4Vec beta2,
-                               Block4Vec min_decay_frac, Block4Vec max_ci) {
+                               Block4Vec min_decay_frac, Block4Vec max_ci,
+                               Block4Vec max_abs_grad = block4_vec_broadcast(1e30f),
+                               Block4Vec m = block4_vec_broadcast(0.0f)) {
         const Block4Vec one = block4_vec_broadcast(1.0f);
-        const Block4Vec ema = beta2 * ci + (one - beta2) * (g * g + contrib * contrib);
+        const Block4Vec residual_c = block4_vec_clip_abs(g - m, max_abs_grad);
+        const Block4Vec contrib_c = block4_vec_clip_abs(contrib, max_abs_grad);
+        const Block4Vec ema =
+            beta2 * ci + (one - beta2) * (residual_c * residual_c + contrib_c * contrib_c);
         const Block4Vec ema_safe = block4_vec_select_finite(ema, ci);
         const Block4Vec floor = min_decay_frac * ci;
         return block4_vec_min(block4_vec_max(ema_safe, floor), max_ci);
@@ -891,6 +1063,16 @@ template <> struct BoundedRMSpropSynapsePolicy<Block4Vec> {
         const Block4Vec clipped = block4_vec_clip_abs(raw_safe, max_abs_delta);
         const Block4Vec delta = scale_invariant ? (eff_lr * clipped) / S : (eff_lr * clipped);
         return block4_vec_select_finite(delta, block4_vec_broadcast(0.0f));
+    }
+};
+
+// Block4Vec specialization of FirstMomentTracker -- see the scalar version's
+// own docstring above.
+template <> struct FirstMomentTracker<Block4Vec> {
+    static Block4Vec update(Block4Vec m, Block4Vec g, Block4Vec beta1) {
+        const Block4Vec one = block4_vec_broadcast(1.0f);
+        const Block4Vec new_m = beta1 * m + (one - beta1) * g;
+        return block4_vec_select_finite(new_m, m);
     }
 };
 
@@ -938,6 +1120,860 @@ struct DeltaCSRWeights {
         ValueAccessor<VALUES_TYPE>::reserve(values, target_nnz);
     }
 };
+// ── Per-neuron utility-based plasticity reset ────────────────────────────────
+// Continual-Backprop-inspired (Dohare et al. 2024, Nature "Loss of
+// plasticity in deep continual learning"), adapted per direct
+// instruction/correction across several rounds of discussion -- see
+// docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design for
+// the full derivation:
+//   1. Top-K-by-`col_importance`, NOT bottom-K-by-`importance*|weight|`,
+//      selection for the FROZEN pool. A direct worked-through question
+//      ("how long, worst case, before a historically-high-importance
+//      column that's now wrong becomes eligible?") showed the original
+//      bottom-K design could structurally NEVER detect a genuinely
+//      frozen-and-now-wrong column -- importance*|weight| can only fall
+//      if the underlying values fall, and a frozen column's importance
+//      stays high (or grows) precisely BECAUSE it's stuck receiving real
+//      error signal. Worst case: never, not "a long time."
+//   2. A LOCAL per-column gradient-ACTIVITY deviation gate
+//      (`col_grad_fast`/`col_grad_slow`), not a global loss signal --
+//      "we're backpropagating through the whole model, loss is as local
+//      as we need it to be... a much better signal than global loss."
+//   3. Engine-safety correction: that gate is derived from
+//      `col_importance`'s own per-CYCLE delta (this traversal's own
+//      cadence), NOT a real backward-kernel hook -- the real kernel has
+//      6+ SIMD-vectorized per-synapse update sites, too risky to touch
+//      correctly. `importance` is already EMA(g^2) and only grows from
+//      real gradient activity, so its own trajectory is a safe, already-
+//      available proxy at this traversal's natural granularity.
+//   4. Asymmetric EMA rate on `col_grad_slow` -- catches up FAST on a
+//      genuine drop (improvement, "the distribution can update its
+//      distribution quickly") but only SLOWLY on a rise (so a real spike
+//      isn't instantly absorbed into the baseline, which would defeat
+//      detecting it at all).
+//   5. DEAD pool REMOVED (third correction round, direct instruction):
+//      it selected bottom-K by `importance*|weight|`, ungated, full
+//      blend strength every touch. But its own touch shrinks importance
+//      (`new_imp = (1-blend)*imp`) as a side effect -- so a column it
+//      just touched comes out with EVEN LOWER importance, making it
+//      MORE likely to qualify as "dead" again next cycle, with only a
+//      single-cycle maturity gate (~100 calls) as protection. For a
+//      column that's genuinely useful but only intermittently active --
+//      exactly what MQAR-style associative recall produces, a pathway
+//      silent except when its specific key is queried -- one cycle
+//      isn't enough time to re-earn importance before the next round of
+//      "who's lowest now." A real width=288 relaunch confirmed the
+//      symptom: accuracy kept declining through an entire flat plateau
+//      (dense/arm_c) instead of settling into a stable floor like the
+//      true historical stall did, while the frozen pool (see below) was
+//      independently confirmed inert (`dev` never crossed its threshold
+//      in any of 3 full 100k-step runs) -- ruling the frozen pool out
+//      and leaving the dead pool's self-reinforcing spiral as the only
+//      plausible source of the ongoing damage. Pruned entirely rather
+//      than patched (e.g. a longer cooldown) -- see
+//      docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design
+//      for the historical-vs-plasticity_reset accuracy-trend comparison
+//      that motivated this.
+//   6. Frozen pool's `k` threshold recalibrated: default was a blind
+//      "standard z-score" guess (k=2.0) made before any real deviation
+//      distribution existed. The 3 finished 100k-step runs showed `dev`
+//      topping out at 1.82 and mostly sitting 0.6-1.5 -- meaning k=2.0
+//      guaranteed the gate NEVER opened, the entire run, confirmed via
+//      `grep dev= | awk '$1>2.0'` returning zero matches across all
+//      three full logs. Recalibrated down into the observed operating
+//      range (k=1.0) so it can actually fire on a real fraction of
+//      ticks instead of being silently a permanent no-op. This is a
+//      best estimate from tick-level maxima, not the full per-cycle
+//      distribution (which wasn't logged) -- `min_deviation`/
+//      `max_deviation` added to PlasticityStats (distribution logging,
+//      computed over the actual candidate set each cycle, not just the
+//      single worst) so a future relaunch can recalibrate from real
+//      data instead of guessing again.
+// The amortized cell-touch traversal (chunk_size cells per call, same
+// shape as apply_amortized_decay_stats above) and the gradual-blend-
+// toward-a-fresh-sample mechanics are unchanged -- amortized on two
+// axes (which cells get touched, and how much they move when touched),
+// never a sudden full swap.
+
+struct PlasticityState {
+    std::vector<float> col_importance;            // FROZEN-pool ranking signal
+    std::vector<float> col_grad_slow;             // long-run gradient-activity baseline
+    std::vector<float> col_grad_fast;             // recent gradient-activity reading
+    std::vector<float> col_grad_var;              // running variance of delta around col_grad_slow
+    std::vector<uint8_t> col_grad_initialized;    // has col_grad_slow/fast seen a real delta yet?
+    std::vector<float> col_importance_prev_cycle; // snapshot at the last cycle boundary
+    std::vector<float> col_plasticity_boost; // computed at selection time, held for the next cycle
+    std::vector<uint32_t> col_age;           // cycles since this column was last flagged
+    std::vector<uint8_t> col_reset_active;   // FROZEN pool flag for the current cycle
+    float l2_decay_strength = 0.0f;          // persisted from the last cycle boundary (see
+    // l2_saturation_decay below); applied to every touched cell until the next boundary
+    // recomputes it. Starts at 0 -- no decay before any cycle has completed.
+    bool sized = false;
+
+    void ensure_sized(std::size_t n_out) {
+        if (sized)
+            return;
+        col_importance.assign(n_out, 0.0f);
+        col_grad_slow.assign(n_out, 0.0f);
+        col_grad_fast.assign(n_out, 0.0f);
+        col_grad_var.assign(n_out, 0.0f);
+        col_grad_initialized.assign(n_out, 0);
+        col_importance_prev_cycle.assign(n_out, 0.0f);
+        col_plasticity_boost.assign(n_out, 0.0f);
+        col_age.assign(n_out, 0);
+        col_reset_active.assign(n_out, 0);
+        sized = true;
+    }
+};
+
+struct PlasticityStats {
+    bool cycle_complete = false;
+    std::size_t n_reset_this_cycle = 0; // FROZEN pool
+    double mean_col_importance = 0.0;
+    double mean_deviation = 0.0; // among FROZEN-pool candidate columns this cycle
+    double min_deviation = 0.0;  // distribution logging: lets k be calibrated from real data
+    double max_deviation =
+        0.0; // instead of a blind guess (see plasticity_reset_design.k_recalibration)
+    double l2_sat_ratio = 0.0; // ||col_importance||_2 / (max_ci*sqrt(n_out)), current state
+    // only -- 1.0 means the whole population sits at the ci accumulator's clamp. See
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.l2_saturation_decay.
+    double l2_decay_strength = 0.0; // soft-sigmoid gate on l2_sat_ratio, in [0,1)
+};
+
+// Storage-agnostic cell-walk cursor -- (row, absolute position within
+// that row's live element range). Block4 storage needs an ADDITIONAL
+// byte_pos field on top of this shape (tile byte-packing offset) -- see
+// block4_plasticity_TODO_DELETE.hpp's own Block4PlasticityCursor, which
+// wraps one of these rather than duplicating row/elem_pos.
+struct PlasticityCellCursor {
+    std::size_t row = 0;
+    std::size_t elem_pos = 0;
+    bool initialized = false;
+};
+
+// ── CiRenorm: full-diff amortized correction toward a target ci mean/std,
+// applied DIRECTLY to the real per-synapse ci (not a side-channel copy).
+// Distinct from PlasticityState above (top-K reset to fresh weights):
+// never touches weight, never singles out columns -- same correction
+// shape applied to every column, every lap. See
+// docs/research/delta_csr_types.rst:synapse_policy.ci_renorm.
+enum class CiRenormMode : uint8_t {
+    Off = 0,          // exact no-op
+    TrustRatio = 1,   // Arm A: LAMB-derived multiplicative rescale
+    StableRegion = 2, // Arm B: affine renormalize toward empirical (mean,std) targets
+};
+
+struct CiRenormState {
+    // Finalized stats from the PREVIOUS lap -- what THIS lap corrects
+    // toward. Unfinalized on lap 1 (has_finalized_stats=false): no-op.
+    std::vector<float> col_ci_mean;
+    std::vector<float> col_ci_std;
+    std::vector<float> col_w_norm; // sqrt(sum w^2 over the column) -- TrustRatio only
+    // Exact double-precision accumulators for the CURRENT lap.
+    std::vector<double> col_ci_sum;
+    std::vector<double> col_ci_sumsq;
+    std::vector<double> col_w_sumsq;
+    std::vector<uint32_t> col_touch_count;
+    bool has_finalized_stats = false;
+    bool sized = false;
+
+    void ensure_sized(std::size_t n_out) {
+        if (sized)
+            return;
+        col_ci_mean.assign(n_out, 0.0f);
+        col_ci_std.assign(n_out, 0.0f);
+        col_w_norm.assign(n_out, 0.0f);
+        col_ci_sum.assign(n_out, 0.0);
+        col_ci_sumsq.assign(n_out, 0.0);
+        col_w_sumsq.assign(n_out, 0.0);
+        col_touch_count.assign(n_out, 0);
+        sized = true;
+    }
+};
+
+struct CiRenormStats {
+    bool cycle_complete = false;
+    double mean_col_ci_mean = 0.0;
+    double mean_col_ci_std = 0.0;
+};
+
+// Accumulates this lap's exact stats, then (if a PREVIOUS lap already
+// finalized target stats) applies the FULL corrective diff immediately
+// -- not a partial nudge (that failed, see synapse_policy.ci_renorm's
+// "v3 lesson"). Staleness bounded to one lap's worth of real growth.
+// clamp_nonnegative=true (default, exact existing behavior for every
+// ci call site): StableRegion's result is clamped >=0, matching ci's
+// own always-nonnegative semantics. false: no clamp -- reused as-is
+// for WeightRenorm (see synapse_policy.weight_renorm), where the
+// touched quantity is a signed weight, not ci.
+inline float ci_renorm_touch_cell(CiRenormState& state, std::size_t j, float ci_val, float w_val,
+                                  CiRenormMode mode, float target_mean_j, float target_std_j,
+                                  float eff_lr, float max_ci_ref = 100.0f,
+                                  float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f,
+                                  bool clamp_nonnegative = true) {
+    float new_ci = ci_val; // default: no correction (Off, or first lap -- no reference yet)
+
+    if (mode != CiRenormMode::Off && state.has_finalized_stats) {
+        if (mode == CiRenormMode::TrustRatio) {
+            // LAMB-inspired (You et al. 2019). w_norm compared against
+            // a FIXED implied-target ci (not the column's own current
+            // ci -- that's circular, see RST), renormalizing the MEAN
+            // toward it for a stable fixed point (a raw per-touch scale
+            // has none -- also see RST). max_ci_ref currently unused,
+            // kept for interface stability.
+            const float w_over_lr = state.col_w_norm[j] / std::max(eff_lr, 1e-8f);
+            const float ci_implied = w_over_lr * w_over_lr;
+            const float cur_mean = std::max(state.col_ci_mean[j], 1e-6f);
+            float scale = ci_implied / cur_mean;
+            scale = std::min(std::max(scale, trust_ratio_min * trust_ratio_min),
+                             trust_ratio_max * trust_ratio_max);
+            new_ci = ci_val * scale;
+        } else {
+            // StableRegion: positive-affine z-score renormalize toward
+            // (target_mean_j, target_std_j) -- preserves rank order.
+            const float cur_mean = state.col_ci_mean[j];
+            const float cur_std = std::max(state.col_ci_std[j], 1e-6f);
+            new_ci = target_mean_j + (ci_val - cur_mean) * (target_std_j / cur_std);
+            if (clamp_nonnegative)
+                new_ci = std::max(new_ci, 0.0f);
+        }
+        if (!std::isfinite(new_ci))
+            new_ci = ci_val;
+    }
+
+    // Accumulate from the RESULTING (post-correction) value, not the
+    // raw input -- using the pre-correction value is a real bug (see
+    // RST's "stale-reference convergence bug"). w_norm still uses raw
+    // w_val (weight is never touched here).
+    state.col_ci_sum[j] += double(new_ci);
+    state.col_ci_sumsq[j] += double(new_ci) * double(new_ci);
+    state.col_w_sumsq[j] += double(w_val) * double(w_val);
+    state.col_touch_count[j] += 1;
+
+    return new_ci;
+}
+
+// Cycle-boundary: finalize THIS lap's exact (mean, std, weight-norm)
+// into the state that the NEXT lap's touches will correct toward, then
+// reset accumulators for the next lap. Call ONLY when a full cell-touch
+// cycle has just completed.
+inline void ci_renorm_cycle_boundary(CiRenormState& state, std::size_t n_out, CiRenormStats& out) {
+    double sum_mean = 0.0, sum_std = 0.0;
+    std::size_t n_touched_cols = 0;
+    for (std::size_t j = 0; j < n_out; ++j) {
+        if (state.col_touch_count[j] > 0) {
+            const double count = double(state.col_touch_count[j]);
+            const double mean = state.col_ci_sum[j] / count;
+            double var = state.col_ci_sumsq[j] / count - mean * mean;
+            var = std::max(var, 0.0);
+            state.col_ci_mean[j] = float(mean);
+            state.col_ci_std[j] = float(std::sqrt(var));
+            state.col_w_norm[j] = float(std::sqrt(state.col_w_sumsq[j]));
+            sum_mean += mean;
+            sum_std += std::sqrt(var);
+            ++n_touched_cols;
+        }
+        state.col_ci_sum[j] = 0.0;
+        state.col_ci_sumsq[j] = 0.0;
+        state.col_w_sumsq[j] = 0.0;
+        state.col_touch_count[j] = 0;
+    }
+    state.has_finalized_stats = true;
+    out.cycle_complete = true;
+    out.mean_col_ci_mean = n_touched_cols > 0 ? sum_mean / double(n_touched_cols) : 0.0;
+    out.mean_col_ci_std = n_touched_cols > 0 ? sum_std / double(n_touched_cols) : 0.0;
+}
+
+// Cycle-boundary selection, SHARED between the scattered and block4
+// traversals (both only need the per-column PlasticityState -- neither
+// storage format's own cursor shape matters here) -- see the file
+// header comment above for the full derivation of why this selects
+// TOP-K-by-col_importance (FROZEN pool, gated by gradient deviation)
+// plus a separate BOTTOM-K-by-col_util_dead (DEAD pool, ungated).
+// Callers: run this ONLY when a full cell-touch cycle has just
+// completed (out.cycle_complete already true).
+inline void plasticity_select_cycle_boundary(
+    PlasticityState& state, std::size_t n_out, float eta_slow, float eta_slow_catchup,
+    float eta_fast, float reset_fraction, float k, float eta_var, float blend, PlasticityStats& out,
+    float l2_decay_threshold = 0.9f, float l2_decay_temperature = 0.05f, float max_ci = 100.0f,
+    bool select_by_deviation = false) {
+    constexpr std::size_t maturity_cycles = 1;
+    std::vector<std::size_t> mature;
+    mature.reserve(n_out);
+    for (std::size_t j = 0; j < n_out; ++j)
+        if (state.col_age[j] >= maturity_cycles)
+            mature.push_back(j);
+
+    // Update col_grad_slow/fast from this cycle's col_importance delta
+    // BEFORE selection, so plasticity_boost reflects the freshest read.
+    // Cold-start correction (direct instruction): an EMA should never
+    // start by blending a real reading against a zero sentinel -- a real
+    // gradient-activity delta is never actually zero, so seeding from 0
+    // makes col_grad_slow (eta_slow=0.99, only inches off 0) trail WAY
+    // behind col_grad_fast (eta_fast=0.5, nearly at the real value after
+    // one cycle) for many cycles, producing a spuriously huge deviation
+    // ratio that has nothing to do with a genuinely frozen column -- it's
+    // measuring cold start, not staleness. On a column's first cycle,
+    // replace both EMAs with the real first delta directly instead of
+    // blending from 0, so deviation starts at exactly 1.0 (never flagged)
+    // and only rises once a REAL divergence between recent and
+    // established activity appears.
+    for (std::size_t j = 0; j < n_out; ++j) {
+        const float delta = state.col_importance[j] - state.col_importance_prev_cycle[j];
+        if (!state.col_grad_initialized[j]) {
+            state.col_grad_fast[j] = delta;
+            state.col_grad_slow[j] = delta;
+            state.col_grad_var[j] = 0.0f; // no variance signal yet on the very first reading
+            state.col_grad_initialized[j] = 1;
+        } else {
+            const float diff = delta - state.col_grad_slow[j]; // vs the OLD (pre-update) baseline
+            state.col_grad_var[j] =
+                eta_var * state.col_grad_var[j] + (1.0f - eta_var) * diff * diff;
+            state.col_grad_fast[j] = eta_fast * state.col_grad_fast[j] + (1.0f - eta_fast) * delta;
+            if (delta < state.col_grad_slow[j])
+                state.col_grad_slow[j] =
+                    eta_slow_catchup * state.col_grad_slow[j] + (1.0f - eta_slow_catchup) * delta;
+            else
+                state.col_grad_slow[j] =
+                    eta_slow * state.col_grad_slow[j] + (1.0f - eta_slow) * delta;
+        }
+        // Reset-induced perturbation (direct instruction, second correction
+        // round): if this column was actively being reset/revived during
+        // the cycle that just completed, `delta` above is dominated by our
+        // OWN `(1-strength)` importance decay, not real new gradient
+        // signal -- left unaccounted, that self-induced swing corrupts
+        // col_grad_slow via the asymmetric-catchup branch and then swings
+        // back as the column re-learns, causing a self-sustaining
+        // reset -> corrupt-baseline -> re-flag loop (confirmed via a real
+        // width=288 smoke run: dev pinned at ~16-17 on the same
+        // layer/pool across cycles instead of settling). Pre-account for
+        // it by inflating variance proportional to the SIZE of our own
+        // decay (strength * the importance we're about to remove), so the
+        // artificial delta lands inside an already-widened uncertainty
+        // band instead of looking like a surprising real spike. Not a
+        // reset-to-zero of col_grad_slow/fast (the underlying importance
+        // itself was only diminished, not deleted, by the same
+        // `(1-strength)` line -- resetting the mean outright would be
+        // inconsistent with that).
+        if (state.col_reset_active[j]) {
+            const float strength = blend * state.col_plasticity_boost[j];
+            const float perturbation = strength * state.col_importance_prev_cycle[j];
+            state.col_grad_var[j] += perturbation * perturbation;
+        }
+        state.col_importance_prev_cycle[j] = state.col_importance[j];
+    }
+
+    std::fill(state.col_reset_active.begin(), state.col_reset_active.end(), 0);
+
+    // Signed z-score, not a ratio: how many of this column's OWN
+    // estimated std-devs is recent activity above its established
+    // baseline. Naturally direction-aware (a genuine drop can never
+    // boost plasticity, unlike a ratio which is always >=0) and
+    // self-normalizing against how volatile this column's own history
+    // has been -- including any self-induced volatility from its own
+    // past resets, accounted for via col_grad_var's inflation above.
+    // Computed for EVERY mature column up front (not just whichever end
+    // up selected) -- needed either as the SELECTION criterion itself
+    // (select_by_deviation=true) or just for blend-gating stats (the
+    // default top-K-by-importance mode).
+    std::vector<float> deviation_by_col(n_out, 0.0f);
+    for (std::size_t j : mature) {
+        const float slow = state.col_grad_slow[j];
+        const float std_dev = std::sqrt(std::max(0.0f, state.col_grad_var[j]));
+        deviation_by_col[j] = (state.col_grad_fast[j] - slow) / (std_dev + 1e-8f);
+    }
+
+    // FROZEN pool: top reset_fraction of mature, ranked either by
+    // col_importance (default -- absolute LEVEL) or by deviation
+    // (select_by_deviation=true -- growth RATE). This is now the ONLY
+    // pool -- the dead pool was pruned (see file header comment above
+    // for why: its own touch shrank importance further, making a
+    // touched column MORE likely to be re-selected, a self-reinforcing
+    // spiral with no real protection against wiping
+    // genuinely-useful-but-intermittently-active columns).
+    //
+    // select_by_deviation exists because top-K-by-importance can
+    // structurally never catch a column that's accelerating fast but
+    // hasn't yet reached a high absolute level -- confirmed by directly
+    // comparing a real run that graduated against a real run that got
+    // stuck: the stuck run's importance was already growing 17-147x
+    // faster than the graduated run's from early in training, well
+    // before either run's importance reached a high absolute level. See
+    // docs/research/toy_tile_recurrence_rmt.rst:
+    // plasticity_reset_design.select_by_deviation_early_detection.
+    std::vector<std::size_t> candidates = mature;
+    if (select_by_deviation) {
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) {
+            return deviation_by_col[a] > deviation_by_col[b];
+        });
+    } else {
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) {
+            return state.col_importance[a] > state.col_importance[b];
+        });
+    }
+    const std::size_t top_n =
+        static_cast<std::size_t>(std::llround(static_cast<double>(mature.size()) * reset_fraction));
+
+    // select_by_deviation picks the TOP `top_n` order statistics out of
+    // `mature.size()` candidates every single cycle -- by construction
+    // the selected deviation is an extreme value, never a typical one.
+    // Gating that against a FIXED k (calibrated for the unrelated
+    // top-importance mode's own, non-maximal deviation distribution)
+    // opens the gate almost every cycle regardless of whether anything
+    // is actually pathological -- confirmed directly via log analysis
+    // of a real 100k-step run: 97.25% open-rate under
+    // select_by_deviation vs 22.25% under top-importance selection,
+    // explaining why it kept disrupting an otherwise-healthy
+    // population instead of only intervening on genuine anomalies.
+    //
+    // First fix tried: derive the threshold from population size via
+    // extreme value theory (E[max_N] of N iid standard normals ~
+    // sqrt(2*ln(N)), Fisher-Tippett-Gnedenko), reasoning that
+    // deviation_by_col[j] is a z-score so should behave like one under
+    // the "nothing pathological" null. FOUND WRONG by direct log
+    // analysis of a real 100k-step run using that fix (v6):
+    // gate_open_frac was EXACTLY 0.000 in every one of 6 pools across
+    // the ENTIRE run -- real deviation never approached the theoretical
+    // ~3.1-3.4 threshold (observed max ~1.0-1.8 throughout), meaning
+    // the EMA-lag structure of col_grad_fast/slow (and the asymmetric
+    // catchup rate) doesn't actually produce iid-standard-normal
+    // statistics the way the derivation assumed. The fix that stopped
+    // v5's over-triggering over-corrected into permanent inertness --
+    // v6's own early progress turned out to owe nothing to the
+    // mechanism, which never fired a single real reset.
+    //
+    // Fixed instead with a threshold derived from the population's OWN
+    // empirical distribution, not a theoretical asymptotic: k = the
+    // linear-interpolated percentile of the MATURE population's ACTUAL
+    // deviation values this cycle, at percentile 100*(1-reset_fraction)
+    // -- still equation-derived (an order statistic of real data, no
+    // new guessed constant), reuses the EXISTING reset_fraction knob
+    // (the percentile directly matches how many candidates get
+    // selected each cycle) rather than introducing a new one, and
+    // self-calibrates to whatever the real spread happens to be
+    // instead of assuming normality. Validated against v6's own real
+    // log data before implementing: this percentile rule would have
+    // opened the gate 47-100% of the time in the late-plateau phase
+    // across all 6 pools, vs 0% for the EVT rule and 97.25% for the
+    // original fixed k=1.0. Only replaces k in THIS mode -- k is used
+    // unchanged when select_by_deviation=false, so the existing
+    // top-K-by-importance behavior (and its own k calibration) is
+    // untouched. See docs/research/toy_tile_recurrence_rmt.rst:
+    // plasticity_reset_design.select_by_deviation_early_detection.k_derivation.
+    float k_effective = k;
+    if (select_by_deviation) {
+        std::vector<float> mature_devs;
+        mature_devs.reserve(mature.size());
+        for (std::size_t j : mature)
+            mature_devs.push_back(deviation_by_col[j]);
+        std::sort(mature_devs.begin(), mature_devs.end());
+        const std::size_t n_mature = mature_devs.size();
+        if (n_mature == 0) {
+            k_effective = 0.0f;
+        } else if (n_mature == 1) {
+            k_effective = mature_devs[0];
+        } else {
+            const double p = 100.0 * (1.0 - static_cast<double>(reset_fraction));
+            const double idx_raw = (static_cast<double>(n_mature) - 1.0) * (p / 100.0);
+            const double idx =
+                std::max(0.0, std::min(static_cast<double>(n_mature) - 1.0, idx_raw));
+            const std::size_t lo = static_cast<std::size_t>(std::floor(idx));
+            const std::size_t hi = static_cast<std::size_t>(std::ceil(idx));
+            const double frac = idx - static_cast<double>(lo);
+            const float v_lo = mature_devs[lo];
+            const float v_hi = mature_devs[hi];
+            k_effective = static_cast<float>(v_lo + frac * (v_hi - v_lo));
+        }
+    }
+
+    double sum_deviation = 0.0;
+    double min_deviation = 0.0;
+    double max_deviation = 0.0;
+    for (std::size_t idx = 0; idx < top_n && idx < candidates.size(); ++idx) {
+        const std::size_t j = candidates[idx];
+        state.col_reset_active[j] = 1;
+        // k_effective is literally "k std-devs above baseline", not "k
+        // above a ratio of 1" -- see docs/research/toy_tile_recurrence_rmt.rst:
+        // plasticity_reset_design for the units-change note and the
+        // k_recalibration section documenting how k=1.0 was chosen for
+        // the default (non-deviation-selection) mode.
+        const float deviation = deviation_by_col[j];
+        state.col_plasticity_boost[j] = std::max(0.0f, deviation - k_effective);
+        sum_deviation += deviation;
+        if (idx == 0) {
+            min_deviation = deviation;
+            max_deviation = deviation;
+        } else {
+            min_deviation = std::min(min_deviation, static_cast<double>(deviation));
+            max_deviation = std::max(max_deviation, static_cast<double>(deviation));
+        }
+        ++out.n_reset_this_cycle;
+    }
+
+    for (std::size_t j = 0; j < n_out; ++j) {
+        if (state.col_reset_active[j])
+            state.col_age[j] = 0;
+        else
+            ++state.col_age[j];
+    }
+
+    double sum_importance = 0.0;
+    for (std::size_t j = 0; j < n_out; ++j)
+        sum_importance += state.col_importance[j];
+    out.mean_col_importance = n_out > 0 ? sum_importance / static_cast<double>(n_out) : 0.0;
+    out.mean_deviation = out.n_reset_this_cycle > 0
+                             ? sum_deviation / static_cast<double>(out.n_reset_this_cycle)
+                             : 0.0;
+    out.min_deviation = min_deviation;
+    out.max_deviation = max_deviation;
+
+    // L2-saturation-gated decay signal (direct instruction, see file
+    // header comment for the full derivation): a pure function of the
+    // population's CURRENT col_importance vector, never a step/age
+    // counter, so it stays well-defined at any horizon. sat_ratio is
+    // ||col_importance||_2 relative to the fully-saturated ceiling
+    // ||max_ci*ones(n)||_2 = max_ci*sqrt(n) -- 1.0 exactly when every
+    // column sits at the ci accumulator's own clamp. Passed through a
+    // SOFT sigmoid (not a hard threshold): near 0 while comfortably
+    // below l2_decay_threshold, ramping smoothly toward 1 as the
+    // population saturates, with no discontinuity at the threshold
+    // itself.
+    double sum_sq = 0.0;
+    for (std::size_t j = 0; j < n_out; ++j) {
+        const double v = static_cast<double>(state.col_importance[j]);
+        sum_sq += v * v;
+    }
+    const double l2_norm = std::sqrt(sum_sq);
+    const double ceiling_norm = static_cast<double>(max_ci) * std::sqrt(static_cast<double>(n_out));
+    const double sat_ratio = ceiling_norm > 0.0 ? l2_norm / ceiling_norm : 0.0;
+    const double decay_strength =
+        1.0 / (1.0 + std::exp(-(sat_ratio - static_cast<double>(l2_decay_threshold)) /
+                              static_cast<double>(l2_decay_temperature)));
+    out.l2_sat_ratio = sat_ratio;
+    out.l2_decay_strength = decay_strength;
+    state.l2_decay_strength = static_cast<float>(decay_strength);
+}
+
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+PlasticityStats apply_amortized_plasticity_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    PlasticityState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, float eta,
+    float eta_slow, float eta_slow_catchup, float eta_fast, float blend, float reset_fraction,
+    float k, float eta_var = 0.9f, float l2_decay_lambda = 0.0f, float l2_decay_threshold = 0.9f,
+    float l2_decay_temperature = 0.05f, float max_ci = 100.0f, bool select_by_deviation = false) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    PlasticityStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    // TODO: BUG, DELETE-CANDIDATE -- skip_empty_rows() unconditionally
+    // resets elem_pos even when resuming mid-row, double-touching a cell
+    // per chunk boundary. Fixed version in apply_amortized_ci_renorm_step
+    // below; see docs/research/delta_csr_types.rst:synapse_policy.
+    // ci_renorm's "cursor resume bug". Not fixed here: reset_fraction
+    // (this mechanism's top-K reset-to-random-weights half) is being
+    // removed entirely, making this traversal a deletion candidate.
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0)
+            ++cursor.row;
+        if (cursor.row < n_rows)
+            cursor.elem_pos = L.elem_start[cursor.row];
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        // Walk the row's own column cursor forward to local_e -- cheap
+        // relative to the actual work, re-created fresh each touch
+        // rather than persisted (same convention the block4 decay
+        // traversal already established).
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        state.col_importance[j] = eta * state.col_importance[j] + (1.0f - eta) * imp;
+
+        float new_w = w;
+        float new_imp = imp;
+        bool cell_written = false;
+
+        if (state.col_reset_active[j]) {
+            const float strength = blend * state.col_plasticity_boost[j];
+            const float fan_in_scale =
+                1.0f / std::sqrt(static_cast<float>(std::max<std::size_t>(1, n_rows)));
+            const float fresh = fp4_stochastic_normal01() * fan_in_scale;
+            new_w = (1.0f - strength) * w + strength * fresh;
+            new_imp = (1.0f - strength) * imp;
+            cell_written = true;
+        }
+
+        // L2-saturation-gated decay: a SEPARATE, population-level signal
+        // from the frozen-pool reset above -- applies to EVERY touched
+        // cell this cycle, not just the top-K reset candidates, and only
+        // ever shrinks importance (never weight). state.l2_decay_strength
+        // was computed once at the LAST cycle boundary from
+        // col_importance's own L2 norm; l2_decay_lambda=0.0 (the default)
+        // is an exact no-op.
+        if (l2_decay_lambda > 0.0f && state.l2_decay_strength > 0.0f) {
+            new_imp *= (1.0f - l2_decay_lambda * state.l2_decay_strength);
+            cell_written = true;
+        }
+
+        if (cell_written)
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
+                         static_cast<typename VA::value_type>(new_imp));
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    out.cycle_complete = cycle_complete;
+    if (cycle_complete)
+        plasticity_select_cycle_boundary(state, n_out, eta_slow, eta_slow_catchup, eta_fast,
+                                         reset_fraction, k, eta_var, blend, out, l2_decay_threshold,
+                                         l2_decay_temperature, max_ci, select_by_deviation);
+    return out;
+}
+
+// Same monotonic, full-coverage "raster scan" cursor shape as
+// apply_amortized_plasticity_step above (never retries, never skips,
+// wraps cleanly at row boundaries) -- reused here for CiRenorm instead
+// of duplicating the walk. Writes the corrected ci directly into the
+// REAL storage (conn.values), same as apply_amortized_plasticity_step's
+// own l2_decay_lambda branch -- this is what makes the correction
+// actually reach update_cw's denominator on every subsequent real step,
+// no kernel changes needed.
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+CiRenormStats apply_amortized_ci_renorm_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    CiRenormState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, CiRenormMode mode,
+    const float* target_mean, const float* target_std, float eff_lr, float max_ci_ref = 100.0f,
+    float trust_ratio_min = 0.1f, float trust_ratio_max = 10.0f) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    CiRenormStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    // IMPORTANT: only advance elem_pos to a row's start when cursor.row
+    // ITSELF just changed (either just below, or at the wrap site inside
+    // the touch loop) -- NEVER unconditionally. A version that resets
+    // elem_pos every time this helper runs (even when the current row is
+    // already non-empty) silently discards a resumed mid-row position on
+    // every call after the first, double-touching whatever cell the
+    // cursor was sitting on and shifting every subsequent cell in that
+    // lap -- a real bug, found via this file's own "coverage" test
+    // (chunk_size not a divisor of nnz, spanning a row boundary across
+    // calls). See docs/research/delta_csr_types.rst:ci_renorm.cursor_resume_bug.
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
+        }
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        const float new_imp =
+            ci_renorm_touch_cell(state, j, imp, w, mode, target_mean ? target_mean[j] : 0.0f,
+                                 target_std ? target_std[j] : 0.0f, eff_lr, max_ci_ref,
+                                 trust_ratio_min, trust_ratio_max);
+        if (new_imp != imp)
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(w),
+                         static_cast<typename VA::value_type>(new_imp));
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row]; // explicit: row just changed
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                cursor.elem_pos = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    if (cycle_complete)
+        ci_renorm_cycle_boundary(state, n_out, out);
+    else
+        out.cycle_complete = false;
+    return out;
+}
+
+// WeightRenorm: same mechanism as CiRenorm above (identical arithmetic,
+// same struct/cursor shapes -- reused directly, not duplicated), applied
+// to WEIGHT instead of ci. Direct instruction, after CiRenorm's
+// StableRegion arm was found to let a weight-growth positive-feedback
+// loop run away in v/o/input_proj (ci held near its healthy target, but
+// weight itself was left completely unconstrained and could still
+// diverge): "I guess we have to do a weight renorm in addition to the
+// ci renorm. Exact same method would probably be fine." Only
+// StableRegion makes sense here (TrustRatio's own formula is DERIVED
+// FROM weight norm, so using it to renormalize weight itself would be
+// circular) -- callers should always pass CiRenormMode::StableRegion.
+// clamp_nonnegative=false: weight is signed, unlike ci. See
+// docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+template <typename VALUES_TYPE, typename SIZE_TYPE, typename COL_TYPE>
+CiRenormStats apply_amortized_weight_renorm_step(
+    DeltaCSRWeights<SIZE_TYPE, VALUES_TYPE, COL_TYPE>& conn, std::size_t n_out,
+    CiRenormState& state, PlasticityCellCursor& cursor, std::size_t chunk_size, CiRenormMode mode,
+    const float* target_mean, const float* target_std) {
+    using VA = ValueAccessor<VALUES_TYPE>;
+    state.ensure_sized(n_out);
+    const auto& L = conn.layout;
+    const std::size_t n_rows = L.rows;
+    CiRenormStats out;
+
+    if (n_rows == 0 || conn.nnz() == 0) {
+        out.cycle_complete = true;
+        return out;
+    }
+
+    if (!cursor.initialized) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        cursor.initialized = true;
+    }
+    // Same cursor-resume-bug-free shape as apply_amortized_ci_renorm_step
+    // above (elem_pos only reassigned when cursor.row itself changes).
+    auto skip_empty_rows = [&]() {
+        while (cursor.row < n_rows && L.row_nnz(cursor.row) == 0) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
+        }
+    };
+    skip_empty_rows();
+    if (cursor.row >= n_rows) {
+        cursor.row = 0;
+        cursor.elem_pos = 0;
+        skip_empty_rows();
+        if (cursor.row >= n_rows) {
+            out.cycle_complete = true;
+            return out;
+        }
+    }
+
+    bool cycle_complete = false;
+    for (std::size_t touched = 0; touched < chunk_size; ++touched) {
+        const std::size_t row = cursor.row;
+        const std::size_t row_elem_start = L.elem_start[row];
+        const std::size_t local_e = cursor.elem_pos - row_elem_start;
+        auto row_cur = conn.row_cursor(row);
+        COL_TYPE col = 0;
+        for (std::size_t i = 0; i <= local_e; ++i)
+            col = row_cur.advance();
+        const std::size_t vb = cursor.elem_pos;
+        const std::size_t j = static_cast<std::size_t>(col);
+
+        const float w = static_cast<float>(VA::get_w(conn.values, vb));
+        const float imp = static_cast<float>(VA::get_imp(conn.values, vb));
+
+        const float new_w =
+            ci_renorm_touch_cell(state, j, w, 0.0f, mode, target_mean ? target_mean[j] : 0.0f,
+                                 target_std ? target_std[j] : 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false);
+        if (new_w != w)
+            VA::set_live(conn.values, vb, static_cast<typename VA::value_type>(new_w),
+                         static_cast<typename VA::value_type>(imp));
+
+        ++cursor.elem_pos;
+        if (cursor.elem_pos >= L.elem_start[row] + L.row_nnz(row)) {
+            ++cursor.row;
+            if (cursor.row < n_rows)
+                cursor.elem_pos = L.elem_start[cursor.row];
+            skip_empty_rows();
+            if (cursor.row >= n_rows) {
+                cycle_complete = true;
+                cursor.row = 0;
+                cursor.elem_pos = 0;
+                skip_empty_rows();
+                break;
+            }
+        }
+    }
+
+    if (cycle_complete)
+        ci_renorm_cycle_boundary(state, n_out, out);
+    else
+        out.cycle_complete = false;
+    return out;
+}
 
 // ── SparseLinearWeightsDelta ─────────────────────────────────────────────────
 

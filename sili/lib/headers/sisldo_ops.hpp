@@ -556,7 +556,26 @@ void disldo_backward_sparse_grad(
     typename ValueAccessor<VALUES_TYPE>::value_type eps = 1e-8f,
     typename ValueAccessor<VALUES_TYPE>::value_type min_decay_frac = 0.0f,
     typename ValueAccessor<VALUES_TYPE>::value_type max_abs_delta = 1e30f,
-    typename ValueAccessor<VALUES_TYPE>::value_type max_ci = 1e30f, bool scale_invariant = false) {
+    typename ValueAccessor<VALUES_TYPE>::value_type max_ci = 1e30f, bool scale_invariant = false,
+    // max_abs_grad: clip g/contrib before they enter ci's EMA. 1e30
+    // (default) is a true no-op. See
+    // docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip.
+    typename ValueAccessor<VALUES_TYPE>::value_type max_abs_grad = 1e30f,
+    // m_row/m_col: AdaBelief-style centering, BLOCK4 branch only this
+    // pass (see docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering
+    // and disldo_backward's own identical scoping note). nullptr (default)
+    // on either disables that axis; the scattered branch below stays
+    // uncentered.
+    typename ValueAccessor<VALUES_TYPE>::value_type* m_row = nullptr,
+    typename ValueAccessor<VALUES_TYPE>::value_type* m_col = nullptr,
+    typename ValueAccessor<VALUES_TYPE>::value_type centering_beta1 = 0.9f,
+    // Arm H: per-OUTPUT-neuron post-clip learning-rate multiplier
+    // (energy-derived elsewhere), applied at each update_cw call site as
+    // effective_lr * energy_lr_scale[col] -- indexed by col (n_out axis),
+    // NOT row (n_in axis, where effective_lr itself is computed). nullptr
+    // (default): exact no-op, see
+    // docs/research/sisldo_ops.rst:disldo_backward_sparse_grad.energy_lr_scale.
+    const typename ValueAccessor<VALUES_TYPE>::value_type* energy_lr_scale = nullptr) {
     using value_type = typename ValueAccessor<VALUES_TYPE>::value_type;
     using SynapsePolicy = SynapsePolicyT<value_type>;
     auto& dc = weights.connections;
@@ -801,9 +820,12 @@ void disldo_backward_sparse_grad(
                     const value_type grad = static_cast<value_type>(grad_sum[e]);
                     const value_type contrib = static_cast<value_type>(contrib_sum[e]);
                     value_type ci = ci_orig_buf[e] * combined_imp_scale; // -> true units
-                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci);
+                    ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2, min_decay_frac, max_ci,
+                                                  max_abs_grad);
+                    const value_type col_eff_lr =
+                        energy_lr_scale ? effective_lr * energy_lr_scale[col] : effective_lr;
                     value_type quant = cw_orig_buf[e]; // code-space accumulator
-                    quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], effective_lr, eps,
+                    quant += SynapsePolicy::update_cw(grad, ci, S_buf[e], col_eff_lr, eps,
                                                       damp_by_importance, max_abs_delta,
                                                       scale_invariant);
                     if constexpr (StochasticRounding) {
@@ -1235,12 +1257,30 @@ void disldo_backward_sparse_grad(
                                     const value_type contrib =
                                         static_cast<value_type>(contrib_sum[idx]);
                                     value_type ci = imp_decoded * combined_imp_scale;
+                                    const value_type m_r = m_row ? m_row[row] : value_type(0);
+                                    const value_type m_c = m_col ? m_col[col] : value_type(0);
                                     ci = SynapsePolicy::update_ci(ci, grad, contrib, beta2,
-                                                                  min_decay_frac, max_ci);
+                                                                  min_decay_frac, max_ci,
+                                                                  max_abs_grad, m_r + m_c);
+                                    // Residual vs the OTHER axis's OLD
+                                    // (pre-this-touch) value -- avoids
+                                    // double-counting, see
+                                    // block4_backward_process_single_row's
+                                    // scalar branch (linear_disldo_backward.hpp)
+                                    // for the derivation.
+                                    if (m_row)
+                                        m_row[row] = FirstMomentTracker<value_type>::update(
+                                            m_row[row], grad - m_c, centering_beta1);
+                                    if (m_col)
+                                        m_col[col] = FirstMomentTracker<value_type>::update(
+                                            m_col[col], grad - m_r, centering_beta1);
+                                    const value_type col_eff_lr =
+                                        energy_lr_scale ? effective_lr * energy_lr_scale[col]
+                                                        : effective_lr;
                                     value_type quant = w_decoded; // code-space accumulator,
                                                                   // matches disldo_backward
                                     quant += SynapsePolicy::update_cw(
-                                        grad, ci, S, effective_lr, eps, damp_by_importance,
+                                        grad, ci, S, col_eff_lr, eps, damp_by_importance,
                                         max_abs_delta, scale_invariant);
                                     // was_live gate -- computed from the PRE-update (snapshotted)
                                     // weight/importance, matching disldo_backward's own

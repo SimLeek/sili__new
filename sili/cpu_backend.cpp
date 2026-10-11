@@ -11,6 +11,10 @@
 
 #include "linear_sisldo.hpp"
 #include "linear_disldo.hpp"
+#include "block4_decay_TODO_DELETE.hpp"
+#include "block4_plasticity_TODO_DELETE.hpp"
+#include "block4_ci_renorm_TODO_DELETE.hpp"
+#include "block4_l2_init_TODO_DELETE.hpp"
 #include "engine_select.hpp"
 #ifdef SILI_HAVE_MKL
 #include "linear_didldo.hpp"
@@ -43,6 +47,21 @@ constexpr float kSynapsePolicyBeta1 = 0.9f;
 constexpr float kSynapsePolicyMinDecayFrac = 0.0f; // true no-op (<=beta2)
 constexpr float kSynapsePolicyMaxAbsDelta = 2.0f;  // raw-space (pre-lr-multiply)
 constexpr float kSynapsePolicyMaxCi = 100.0f;
+// max_abs_grad: clip g/contrib before they enter ci's EMA. Data-derived
+// (not guessed) from real MQAR recorded gradient-scale distribution
+// (v13's sqrt(raw_importance) across all 6 pools): p99.9~=6.34,
+// p99.99~=9.85 -- 8.0 sits comfortably above the healthy range while
+// staying well under max_ci's own sqrt(100)=10 ceiling. See
+// docs/research/delta_csr_types.rst:synapse_policy.max_abs_grad_clip
+// and sili_peridot's JOURNAL.md 2026-09-24 entries.
+constexpr float kSynapsePolicyMaxAbsGrad = 8.0f;
+// AdaBelief-style centering's own first-moment EMA rate -- SEPARATE
+// constant from kSynapsePolicyBeta1 above (that one is disldo_backward's
+// UNRELATED value_scale dead-row-bootstrap momentum). 0.9 matches the
+// value already validated in the TDD centering test (unit/
+// test_synapse_policy_centering.cpp). See
+// docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+constexpr float kSynapsePolicyCenteringBeta1 = 0.9f;
 constexpr float kSynapsePolicyZeroEscapeEps = 0.1f;
 constexpr bool kSynapsePolicyScaleInvariant =
     false; // opt-in; see scale_invariant_chain_rule (sili_peridot)
@@ -417,6 +436,15 @@ class SparseLinearLayerImpl {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
 
     SparseLinearLayerImpl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -808,6 +836,25 @@ class SparseLinearLayerImpl {
         auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
             weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
             _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP4BiPacked, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
         py::dict out;
         out["mean_abs"] = stats.mean_abs;
         out["rms"] = stats.rms;
@@ -1356,6 +1403,82 @@ class DISLDOLayerV {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
+    // block4 decay cursor/stats -- see block4_decay_TODO_DELETE.hpp.
+    // SEPARATE from the scattered ones above: a layer's synapses can be
+    // split across BOTH scattered and block4 storage simultaneously
+    // (synaptogenesis promotes/demotes between them), so covering only
+    // one would silently miss the other.
+    Block4DecayCursor _block4_decay_cursor;
+    double _block4_decay_sum_abs = 0.0;
+    double _block4_decay_sum_sq = 0.0;
+    double _block4_decay_max_abs = 0.0;
+    std::size_t _block4_decay_n = 0;
+    Block4DecayCursor _block4_importance_decay_cursor;
+    double _block4_importance_decay_sum_abs = 0.0;
+    double _block4_importance_decay_sum_sq = 0.0;
+    double _block4_importance_decay_max_abs = 0.0;
+    std::size_t _block4_importance_decay_n = 0;
+    // Per-neuron utility-based plasticity reset -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // SEPARATE state per storage type, same "a layer's synapses can be
+    // split across BOTH scattered and block4" reasoning as the decay
+    // cursors above (each storage type's own PlasticityState tracks
+    // per-column signals only from what IT sees -- a known limitation
+    // for a genuinely mixed-storage layer, not yet unified across
+    // storage types).
+    PlasticityState _plasticity_state;
+    PlasticityCellCursor _plasticity_cursor;
+    PlasticityState _block4_plasticity_state;
+    Block4PlasticityCursor _block4_plasticity_cursor;
+    // CiRenorm -- see docs/research/delta_csr_types.rst:ci_renorm.design_and_v3_lesson.
+    // A SEPARATE mechanism from plasticity_reset above: never touches
+    // weight, never singles out specific columns -- applies the same
+    // correction shape (multiplicative trust-ratio rescale, or affine
+    // mean+std renormalize) to EVERY column, every lap. Own separate
+    // state/cursor per storage type, same reasoning as the decay/
+    // plasticity cursors above.
+    CiRenormState _ci_renorm_state;
+    PlasticityCellCursor _ci_renorm_cursor;
+    CiRenormState _block4_ci_renorm_state;
+    Block4CiRenormCursor _block4_ci_renorm_cursor;
+    // WeightRenorm -- same mechanism as CiRenorm above, applied to
+    // weight instead of ci. See
+    // docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    // Own separate state/cursor (never shares CiRenorm's -- a layer can
+    // have BOTH mechanisms active at once, touching different fields).
+    CiRenormState _weight_renorm_state;
+    PlasticityCellCursor _weight_renorm_cursor;
+    CiRenormState _block4_weight_renorm_state;
+    Block4CiRenormCursor _block4_weight_renorm_cursor;
+    // L2 Init (Kumar, Marklund & Van Roy, CoLLAs 2025, arXiv:2308.11958)
+    // -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    // SEPARATE cursor/reference-value state per storage type, same
+    // reasoning as the plasticity/decay cursors above.
+    std::size_t _l2_init_cursor = 0;
+    std::vector<V> _l2_init_initial_weight;
+    std::vector<uint8_t> _l2_init_captured;
+    Block4L2InitCursor _block4_l2_init_cursor;
+    std::vector<V> _block4_l2_init_initial_weight;
+    std::vector<uint8_t> _block4_l2_init_captured;
+
+    // ── AdaBelief-style centering (EXPERIMENTAL) ─────────────────────────────
+    // Per-row/per-column additive first-moment baseline, persisted across
+    // calls like ci/weight storage itself -- see
+    // docs/research/delta_csr_types.rst:synapse_policy.adabelief_centering.
+    // Zero-initialized (a true no-op start: m_row[i]+m_col[j]=0 until real
+    // touches accumulate some history).
+    std::vector<V> m_row;
+    std::vector<V> m_col;
 
     DISLDOLayerV(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -1391,6 +1514,8 @@ class DISLDOLayerV {
         neuron_input_accum.assign(n_inputs, V(0));
         neuron_grad_accum.assign(n_outputs, V(0));
         weights.out_degree.assign(n_outputs, S(0));
+        m_row.assign(n_inputs, V(0));
+        m_col.assign(n_outputs, V(0));
     }
 
     S n_inputs() const { return static_cast<S>(weights.connections.layout.rows); }
@@ -1398,6 +1523,17 @@ class DISLDOLayerV {
     S nnz() const {
         return static_cast<S>(weights.connections.nnz() + weights.block4.live_synapses());
     }
+    // Scattered-arm-only nnz -- `nnz()` above is the COMBINED total
+    // (scattered + block4), which doesn't distinguish "this layer has no
+    // live content at all" from "this layer's content all lives in
+    // block4, scattered is empty" (the common case for a dense-loaded
+    // real layer -- load_dense_values() routes entirely through
+    // block4_load_dense_fp32, scattered stays at 0 nnz for the whole
+    // run). Added so callers (e.g. plasticity-reset column-state
+    // logging) can skip a storage arm that will NEVER have real content
+    // for this run's config, instead of writing a stream of degenerate
+    // all-zero snapshots.
+    S scattered_nnz() const { return static_cast<S>(weights.connections.nnz()); }
     Block4View32 block4() { return Block4View32(weights.block4); }
 
     // See SparseLinearLayer::backward_dense's docstring on why `x` is an
@@ -1426,24 +1562,27 @@ class DISLDOLayerV {
     // and on why `x` is now an explicit argument.
     // Renamed from backward -- explicit, no-decision-making dense-dy call.
     // See backward() below for the real-time-dispatching entry point.
-    py::array_t<V> backward_dense(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                                  bool lr_per_row_nnz = false, bool damp_by_importance = true,
-                                  V beta2 = 0.999f, V eps = 1e-8f,
-                                  V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                                  V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                                  V max_ci = kSynapsePolicyMaxCi,
-                                  bool scale_invariant = kSynapsePolicyScaleInvariant) {
+    py::array_t<V> backward_dense(
+        py::array_t<V> x, py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+        bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+        V min_decay_frac = kSynapsePolicyMinDecayFrac, V max_abs_delta = kSynapsePolicyMaxAbsDelta,
+        V max_ci = kSynapsePolicyMaxCi, bool scale_invariant = kSynapsePolicyScaleInvariant,
+        V max_abs_grad = kSynapsePolicyMaxAbsGrad, bool centering_row_enable = false,
+        bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
         const S cols = (xbuf.ndim == 2) ? (S)xbuf.shape[1] : (S)xbuf.shape[0];
         std::vector<V> dx(batch * cols, V(0));
+        V* m_row_ptr = centering_row_enable ? m_row.data() : nullptr;
+        V* m_col_ptr = centering_col_enable ? m_col.data() : nullptr;
         disldo_backward<S, VT, COL_TYPE>(
             (V*)xbuf.ptr, batch, cols, (V*)dybuf.ptr, weights, dx.data(), neuron_input_accum.data(),
             neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
             beta2, eps, kSynapsePolicyBeta1, min_decay_frac, max_abs_delta, max_ci,
-            kSynapsePolicyZeroEscapeEps, scale_invariant);
+            kSynapsePolicyZeroEscapeEps, scale_invariant, /*l1_coef=*/0.0f, max_abs_grad, m_row_ptr,
+            m_col_ptr, centering_beta1);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)cols});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1486,23 +1625,38 @@ class DISLDOLayerV {
         return result;
     }
 
-    py::array_t<V> backward_sparse(py::array_t<V> x, // DENSE input -- see class comment for why
-                                   py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
-                                   py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
-                                   bool lr_per_row_nnz = false, bool damp_by_importance = true,
-                                   V beta2 = 0.999f, V eps = 1e-8f,
-                                   V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                                   V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                                   V max_ci = kSynapsePolicyMaxCi,
-                                   bool scale_invariant = kSynapsePolicyScaleInvariant) {
+    py::array_t<V> backward_sparse(
+        py::array_t<V> x, // DENSE input -- see class comment for why
+        py::array_t<S> dy_ptrs, py::array_t<S> dy_indices, py::array_t<V> dy_values, S batch,
+        V learning_rate = 0.01f, bool lr_per_row_nnz = false, bool damp_by_importance = true,
+        V beta2 = 0.999f, V eps = 1e-8f, V min_decay_frac = kSynapsePolicyMinDecayFrac,
+        V max_abs_delta = kSynapsePolicyMaxAbsDelta, V max_ci = kSynapsePolicyMaxCi,
+        bool scale_invariant = kSynapsePolicyScaleInvariant,
+        V max_abs_grad = kSynapsePolicyMaxAbsGrad, bool centering_row_enable = false,
+        bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1,
+        // Arm H: per-OUTPUT-neuron post-clip learning-rate multiplier
+        // (size n_outputs(), energy-derived on the Python side). Empty
+        // array (default): exact no-op, see disldo_backward_sparse_grad's
+        // own energy_lr_scale docstring in sisldo_ops.hpp.
+        py::array_t<V> energy_lr_scale = py::array_t<V>()) {
         warn_if_lr_exceeds_bounded_synapse_policy_safe_range((float)learning_rate);
         auto xbuf = x.request();
         auto out_grad = _numpy_to_csr_input(dy_ptrs, dy_indices, dy_values, batch, n_outputs());
         std::vector<V> dx(batch * n_inputs(), V(0));
+        V* m_row_ptr = centering_row_enable ? m_row.data() : nullptr;
+        V* m_col_ptr = centering_col_enable ? m_col.data() : nullptr;
+        auto els_buf = energy_lr_scale.request();
+        if (els_buf.size != 0 && els_buf.size != (py::ssize_t)n_outputs()) {
+            throw std::invalid_argument("energy_lr_scale length (" + std::to_string(els_buf.size) +
+                                        ") must be 0 (disabled) or match n_outputs (" +
+                                        std::to_string(n_outputs()) + ")");
+        }
+        const V* energy_lr_scale_ptr = els_buf.size != 0 ? (const V*)els_buf.ptr : nullptr;
         disldo_backward_sparse_grad<S, VT, COL_TYPE>(
             (V*)xbuf.ptr, batch, weights, out_grad, dx.data(), neuron_input_accum.data(),
             neuron_grad_accum.data(), learning_rate, num_cpus, lr_per_row_nnz, damp_by_importance,
-            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+            beta2, eps, min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad,
+            m_row_ptr, m_col_ptr, centering_beta1, energy_lr_scale_ptr);
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
@@ -1574,13 +1728,14 @@ class DISLDOLayerV {
         return forward_dense(x);
     }
 
-    py::array_t<V> backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate,
-                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
-                            V beta2 = 0.999f, V eps = 1e-8f,
-                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                            V max_ci = kSynapsePolicyMaxCi,
-                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+    py::array_t<V>
+    backward(py::array_t<V> x, py::array_t<V> dy, V learning_rate, bool lr_per_row_nnz = false,
+             bool damp_by_importance = true, V beta2 = 0.999f, V eps = 1e-8f,
+             V min_decay_frac = kSynapsePolicyMinDecayFrac,
+             V max_abs_delta = kSynapsePolicyMaxAbsDelta, V max_ci = kSynapsePolicyMaxCi,
+             bool scale_invariant = kSynapsePolicyScaleInvariant,
+             V max_abs_grad = kSynapsePolicyMaxAbsGrad, bool centering_row_enable = false,
+             bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1) {
         auto xbuf = x.request();
         auto dybuf = dy.request();
         const S batch = (xbuf.ndim == 2) ? (S)xbuf.shape[0] : 1;
@@ -1598,26 +1753,30 @@ class DISLDOLayerV {
             std::copy(vals.begin(), vals.end(), (V*)v.request().ptr);
             return backward_sparse(x, p, i, v, batch, learning_rate, lr_per_row_nnz,
                                    damp_by_importance, beta2, eps, min_decay_frac, max_abs_delta,
-                                   max_ci, scale_invariant);
+                                   max_ci, scale_invariant, max_abs_grad, centering_row_enable,
+                                   centering_col_enable, centering_beta1);
         }
         return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
-                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad,
+                              centering_row_enable, centering_col_enable, centering_beta1);
     }
 
-    py::array_t<V> backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
-                            py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
-                            bool lr_per_row_nnz = false, bool damp_by_importance = true,
-                            V beta2 = 0.999f, V eps = 1e-8f,
-                            V min_decay_frac = kSynapsePolicyMinDecayFrac,
-                            V max_abs_delta = kSynapsePolicyMaxAbsDelta,
-                            V max_ci = kSynapsePolicyMaxCi,
-                            bool scale_invariant = kSynapsePolicyScaleInvariant) {
+    py::array_t<V>
+    backward(py::array_t<V> x, py::array_t<S> dy_ptrs, py::array_t<S> dy_indices,
+             py::array_t<V> dy_values, S batch, V learning_rate = 0.01f,
+             bool lr_per_row_nnz = false, bool damp_by_importance = true, V beta2 = 0.999f,
+             V eps = 1e-8f, V min_decay_frac = kSynapsePolicyMinDecayFrac,
+             V max_abs_delta = kSynapsePolicyMaxAbsDelta, V max_ci = kSynapsePolicyMaxCi,
+             bool scale_invariant = kSynapsePolicyScaleInvariant,
+             V max_abs_grad = kSynapsePolicyMaxAbsGrad, bool centering_row_enable = false,
+             bool centering_col_enable = false, V centering_beta1 = kSynapsePolicyCenteringBeta1) {
         auto ib = dy_indices.request();
         const float density = float(ib.size) / float(std::size_t(batch) * n_outputs());
         if (group_a_backward_use_sisldo(_dispatch_n(), batch, density, _dispatch_syn_density()))
             return backward_sparse(x, dy_ptrs, dy_indices, dy_values, batch, learning_rate,
                                    lr_per_row_nnz, damp_by_importance, beta2, eps, min_decay_frac,
-                                   max_abs_delta, max_ci, scale_invariant);
+                                   max_abs_delta, max_ci, scale_invariant, max_abs_grad,
+                                   centering_row_enable, centering_col_enable, centering_beta1);
         auto pb = dy_ptrs.request(), vb = dy_values.request();
         std::vector<float> dense;
         _csr_to_dense((const S*)pb.ptr, (const S*)ib.ptr, (const V*)vb.ptr, batch, n_outputs(),
@@ -1625,7 +1784,8 @@ class DISLDOLayerV {
         py::array_t<V> dy({(py::ssize_t)batch, (py::ssize_t)n_outputs()});
         std::copy(dense.begin(), dense.end(), (V*)dy.request().ptr);
         return backward_dense(x, dy, learning_rate, lr_per_row_nnz, damp_by_importance, beta2, eps,
-                              min_decay_frac, max_abs_delta, max_ci, scale_invariant);
+                              min_decay_frac, max_abs_delta, max_ci, scale_invariant, max_abs_grad,
+                              centering_row_enable, centering_col_enable, centering_beta1);
     }
 
     // Amortized decoupled L2 decay + stats -- see member state's own
@@ -1650,6 +1810,361 @@ class DISLDOLayerV {
         out["max_abs"] = stats.max_abs;
         out["n"] = stats.n;
         out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<VT, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // block4-storage counterparts of the two methods above -- see
+    // block4_decay_TODO_DELETE.hpp. fp32 (VT=DeltaCSRBiValues<float>)
+    // only; a no-op (all-zero stats, cycle_complete=true) for FP4/FP8
+    // instantiations of this same template, since Block4DecayCursor/
+    // apply_amortized_block4_decay_stats are fp32-specific
+    // (Block4Store32/Block4TileHandle32) and this class is generic over
+    // VT. EXPERIMENTAL, same as the scattered versions -- may be removed.
+    py::dict apply_amortized_block4_l2_decay(S chunk_size, V decay_factor) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_decay_stats(
+                weights.block4, _block4_decay_cursor, _block4_decay_sum_abs, _block4_decay_sum_sq,
+                _block4_decay_max_abs, _block4_decay_n, static_cast<std::size_t>(chunk_size),
+                decay_factor, false);
+            out["mean_abs"] = stats.mean_abs;
+            out["rms"] = stats.rms;
+            out["max_abs"] = stats.max_abs;
+            out["n"] = stats.n;
+            out["cycle_complete"] = stats.cycle_complete;
+        } else {
+            out["mean_abs"] = 0.0;
+            out["rms"] = 0.0;
+            out["max_abs"] = 0.0;
+            out["n"] = std::size_t(0);
+            out["cycle_complete"] = true;
+        }
+        return out;
+    }
+
+    py::dict apply_amortized_block4_importance_decay(S chunk_size, V decay_factor) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_decay_stats(
+                weights.block4, _block4_importance_decay_cursor, _block4_importance_decay_sum_abs,
+                _block4_importance_decay_sum_sq, _block4_importance_decay_max_abs,
+                _block4_importance_decay_n, static_cast<std::size_t>(chunk_size), decay_factor,
+                true);
+            out["mean_abs"] = stats.mean_abs;
+            out["rms"] = stats.rms;
+            out["max_abs"] = stats.max_abs;
+            out["n"] = stats.n;
+            out["cycle_complete"] = stats.cycle_complete;
+        } else {
+            out["mean_abs"] = 0.0;
+            out["rms"] = 0.0;
+            out["max_abs"] = 0.0;
+            out["n"] = std::size_t(0);
+            out["cycle_complete"] = true;
+        }
+        return out;
+    }
+
+    // Per-neuron utility-based plasticity reset -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // Scattered (.connections) arm -- NO loss argument anywhere: the
+    // gradient-activity gate is entirely local, derived from
+    // col_importance's own per-cycle delta (engine-safety correction,
+    // see the design doc), not a real backward-kernel hook or any
+    // whole-network signal passed in from the caller.
+    py::dict apply_amortized_plasticity_reset(S chunk_size, float eta, float eta_slow,
+                                              float eta_slow_catchup, float eta_fast, float blend,
+                                              float reset_fraction, float k, float eta_var = 0.9f,
+                                              float l2_decay_lambda = 0.0f,
+                                              float l2_decay_threshold = 0.9f,
+                                              float l2_decay_temperature = 0.05f,
+                                              float max_ci = kSynapsePolicyMaxCi,
+                                              bool select_by_deviation = false) {
+        auto stats = apply_amortized_plasticity_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _plasticity_state,
+            _plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
+            eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var, l2_decay_lambda,
+            l2_decay_threshold, l2_decay_temperature, max_ci, select_by_deviation);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
+        out["mean_col_importance"] = stats.mean_col_importance;
+        out["mean_deviation"] = stats.mean_deviation;
+        out["min_deviation"] = stats.min_deviation;
+        out["max_deviation"] = stats.max_deviation;
+        out["l2_sat_ratio"] = stats.l2_sat_ratio;
+        out["l2_decay_strength"] = stats.l2_decay_strength;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay work already established for FP4/FP8 instantiations of
+    // this same template.
+    py::dict apply_amortized_block4_plasticity_reset(
+        S chunk_size, float eta, float eta_slow, float eta_slow_catchup, float eta_fast,
+        float blend, float reset_fraction, float k, float eta_var = 0.9f,
+        float l2_decay_lambda = 0.0f, float l2_decay_threshold = 0.9f,
+        float l2_decay_temperature = 0.05f, float max_ci = kSynapsePolicyMaxCi,
+        bool select_by_deviation = false) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = apply_amortized_block4_plasticity_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_plasticity_state,
+                _block4_plasticity_cursor, static_cast<std::size_t>(chunk_size), eta, eta_slow,
+                eta_slow_catchup, eta_fast, blend, reset_fraction, k, eta_var, l2_decay_lambda,
+                l2_decay_threshold, l2_decay_temperature, max_ci, select_by_deviation);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["n_reset_this_cycle"] = stats.n_reset_this_cycle;
+            out["mean_col_importance"] = stats.mean_col_importance;
+            out["mean_deviation"] = stats.mean_deviation;
+            out["min_deviation"] = stats.min_deviation;
+            out["max_deviation"] = stats.max_deviation;
+            out["l2_sat_ratio"] = stats.l2_sat_ratio;
+            out["l2_decay_strength"] = stats.l2_decay_strength;
+        } else {
+            out["cycle_complete"] = true;
+            out["n_reset_this_cycle"] = std::size_t(0);
+            out["mean_col_importance"] = 0.0;
+            out["mean_deviation"] = 0.0;
+            out["min_deviation"] = 0.0;
+            out["max_deviation"] = 0.0;
+            out["l2_sat_ratio"] = 0.0;
+            out["l2_decay_strength"] = 0.0;
+        }
+        return out;
+    }
+
+    // CiRenorm -- see docs/research/delta_csr_types.rst:ci_renorm.design_and_v3_lesson
+    // for the full derivation, including why v3's own earlier
+    // once-per-cycle proportional decay (l2_decay_lambda above) failed
+    // (growth vs decay tied almost exactly -- too weak/infrequent
+    // relative to the real per-STEP ci accumulator), and why THIS
+    // mechanism applies the FULL corrective diff at touch time instead
+    // of a partial nudge. mode: 0=Off (exact no-op), 1=TrustRatio
+    // (LAMB-derived multiplicative rescale, target_mean/target_std
+    // unused), 2=StableRegion (affine renormalize toward the given
+    // per-column target_mean/target_std, e.g. derived from real
+    // graduated-run data). target_mean/target_std: length n_outputs
+    // arrays (only read when mode=StableRegion; pass empty arrays for
+    // TrustRatio). Scattered (.connections) arm.
+    py::dict apply_amortized_ci_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                       py::array_t<V> target_std, V eff_lr,
+                                       V max_ci_ref = kSynapsePolicyMaxCi, V trust_ratio_min = 0.1f,
+                                       V trust_ratio_max = 10.0f) {
+        auto mb = target_mean.request(), sb = target_std.request();
+        const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+        const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+        auto stats = apply_amortized_ci_renorm_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _ci_renorm_state,
+            _ci_renorm_cursor, static_cast<std::size_t>(chunk_size),
+            static_cast<CiRenormMode>(mode), mean_ptr, std_ptr, eff_lr, max_ci_ref, trust_ratio_min,
+            trust_ratio_max);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+        out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity work already established.
+    py::dict apply_amortized_block4_ci_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                              py::array_t<V> target_std, V eff_lr,
+                                              V max_ci_ref = kSynapsePolicyMaxCi,
+                                              V trust_ratio_min = 0.1f, V trust_ratio_max = 10.0f) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto mb = target_mean.request(), sb = target_std.request();
+            const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+            const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+            auto stats = apply_amortized_block4_ci_renorm_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_ci_renorm_state,
+                _block4_ci_renorm_cursor, static_cast<std::size_t>(chunk_size),
+                static_cast<CiRenormMode>(mode), mean_ptr, std_ptr, eff_lr, max_ci_ref,
+                trust_ratio_min, trust_ratio_max);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+            out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        } else {
+            out["cycle_complete"] = true;
+            out["mean_col_ci_mean"] = 0.0;
+            out["mean_col_ci_std"] = 0.0;
+        }
+        return out;
+    }
+
+    // WeightRenorm -- same mechanism as CiRenorm above, applied to
+    // weight instead of ci. Direct instruction, after CiRenorm's
+    // StableRegion arm let a weight-growth feedback loop run away while
+    // ci itself stayed correctly bounded: "I guess we have to do a
+    // weight renorm in addition to the ci renorm. Exact same method
+    // would probably be fine." Only mode=StableRegion is meaningful
+    // here (TrustRatio's own formula is derived FROM weight norm, so
+    // using it to renormalize weight would be circular). See
+    // docs/research/delta_csr_types.rst:synapse_policy.weight_renorm.
+    // Scattered (.connections) arm.
+    py::dict apply_amortized_weight_renorm(S chunk_size, int mode, py::array_t<V> target_mean,
+                                           py::array_t<V> target_std) {
+        auto mb = target_mean.request(), sb = target_std.request();
+        const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+        const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+        auto stats = apply_amortized_weight_renorm_step(
+            weights.connections, static_cast<std::size_t>(n_outputs()), _weight_renorm_state,
+            _weight_renorm_cursor, static_cast<std::size_t>(chunk_size),
+            static_cast<CiRenormMode>(mode), mean_ptr, std_ptr);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+        out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity/CiRenorm work already established.
+    py::dict apply_amortized_block4_weight_renorm(S chunk_size, int mode,
+                                                  py::array_t<V> target_mean,
+                                                  py::array_t<V> target_std) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto mb = target_mean.request(), sb = target_std.request();
+            const float* mean_ptr = mb.size > 0 ? static_cast<const float*>(mb.ptr) : nullptr;
+            const float* std_ptr = sb.size > 0 ? static_cast<const float*>(sb.ptr) : nullptr;
+            auto stats = apply_amortized_block4_weight_renorm_step(
+                weights.block4, static_cast<std::size_t>(n_outputs()), _block4_weight_renorm_state,
+                _block4_weight_renorm_cursor, static_cast<std::size_t>(chunk_size),
+                static_cast<CiRenormMode>(mode), mean_ptr, std_ptr);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["mean_col_ci_mean"] = stats.mean_col_ci_mean;
+            out["mean_col_ci_std"] = stats.mean_col_ci_std;
+        } else {
+            out["cycle_complete"] = true;
+            out["mean_col_ci_mean"] = 0.0;
+            out["mean_col_ci_std"] = 0.0;
+        }
+        return out;
+    }
+
+    // L2 Init (Kumar, Marklund & Van Roy, "Maintaining Plasticity in
+    // Continual Learning via Regenerative Regularization", CoLLAs 2025,
+    // arXiv:2308.11958) -- EXPERIMENTAL, see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox.
+    // Scattered (.connections) arm. A cell's first touch only captures
+    // its current weight as the "initial" reference; every touch after
+    // that pulls `rate` of the way back toward it. Independent of
+    // apply_amortized_plasticity_reset -- separate cursor, can run
+    // alongside it or alone.
+    py::dict apply_amortized_l2_init(S chunk_size, float rate) {
+        auto stats = ::apply_amortized_l2_init<VT, float>(
+            weights.connections.values, _l2_init_cursor, _l2_init_initial_weight, _l2_init_captured,
+            static_cast<std::size_t>(chunk_size), rate);
+        py::dict out;
+        out["cycle_complete"] = stats.cycle_complete;
+        out["n_touched"] = stats.n_touched;
+        return out;
+    }
+
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // the decay/plasticity-reset work already established.
+    py::dict apply_amortized_block4_l2_init(S chunk_size, float rate) {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            auto stats = ::apply_amortized_block4_l2_init<float>(
+                weights.block4, _block4_l2_init_cursor, _block4_l2_init_initial_weight,
+                _block4_l2_init_captured, static_cast<std::size_t>(chunk_size), rate);
+            out["cycle_complete"] = stats.cycle_complete;
+            out["n_touched"] = stats.n_touched;
+        } else {
+            out["cycle_complete"] = true;
+            out["n_touched"] = std::size_t(0);
+        }
+        return out;
+    }
+
+    // Read-only per-column snapshot of apply_amortized_plasticity_reset's
+    // internal PlasticityState -- zero-copy views into the SAME arrays
+    // the mechanism already maintains (get_weights_vals/get_importance
+    // precedent), no new state or computation. Added to support offline
+    // data collection for fitting a reset-selection equation from real
+    // training data: the mechanism only ever selects at COLUMN
+    // granularity (col_importance/deviation/age are per-column
+    // aggregates, never per-synapse), so this is the natural and only
+    // granularity needed -- see
+    // docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design.
+    // Empty arrays before the state is sized (i.e. before the first
+    // apply_amortized_plasticity_reset call), matching
+    // PlasticityState::ensure_sized's own lazy-sizing convention.
+    py::dict plasticity_column_state() {
+        py::dict out;
+        out["col_importance"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_importance.size()}, {sizeof(float)},
+            _plasticity_state.col_importance.data(), py::cast(this));
+        out["col_grad_slow"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_slow.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_slow.data(), py::cast(this));
+        out["col_grad_fast"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_fast.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_fast.data(), py::cast(this));
+        out["col_grad_var"] = py::array_t<float>(
+            {(py::ssize_t)_plasticity_state.col_grad_var.size()}, {sizeof(float)},
+            _plasticity_state.col_grad_var.data(), py::cast(this));
+        out["col_age"] = py::array_t<uint32_t>({(py::ssize_t)_plasticity_state.col_age.size()},
+                                               {sizeof(uint32_t)}, _plasticity_state.col_age.data(),
+                                               py::cast(this));
+        out["col_reset_active"] = py::array_t<uint8_t>(
+            {(py::ssize_t)_plasticity_state.col_reset_active.size()}, {sizeof(uint8_t)},
+            _plasticity_state.col_reset_active.data(), py::cast(this));
+        return out;
+    }
+    // block4 counterpart -- fp32 only, same if constexpr no-op pattern
+    // apply_amortized_block4_plasticity_reset already established.
+    py::dict plasticity_column_state_block4() {
+        py::dict out;
+        if constexpr (std::is_same_v<VT, DeltaCSRBiValues<float>>) {
+            out["col_importance"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_importance.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_importance.data(), py::cast(this));
+            out["col_grad_slow"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_slow.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_slow.data(), py::cast(this));
+            out["col_grad_fast"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_fast.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_fast.data(), py::cast(this));
+            out["col_grad_var"] = py::array_t<float>(
+                {(py::ssize_t)_block4_plasticity_state.col_grad_var.size()}, {sizeof(float)},
+                _block4_plasticity_state.col_grad_var.data(), py::cast(this));
+            out["col_age"] = py::array_t<uint32_t>(
+                {(py::ssize_t)_block4_plasticity_state.col_age.size()}, {sizeof(uint32_t)},
+                _block4_plasticity_state.col_age.data(), py::cast(this));
+            out["col_reset_active"] = py::array_t<uint8_t>(
+                {(py::ssize_t)_block4_plasticity_state.col_reset_active.size()}, {sizeof(uint8_t)},
+                _block4_plasticity_state.col_reset_active.data(), py::cast(this));
+        } else {
+            out["col_importance"] = py::array_t<float>(0);
+            out["col_grad_slow"] = py::array_t<float>(0);
+            out["col_grad_fast"] = py::array_t<float>(0);
+            out["col_grad_var"] = py::array_t<float>(0);
+            out["col_age"] = py::array_t<uint32_t>(0);
+            out["col_reset_active"] = py::array_t<uint8_t>(0);
+        }
         return out;
     }
 
@@ -1818,6 +2333,22 @@ class DIDLDOLayerV {
     SidldoBackwardScratch bwd_scratch;
     int num_cpus;
 
+    // Amortized decoupled decay + stats, flat-array version -- see
+    // apply_amortized_flat_decay_stats's own comment (delta_csr_types.hpp).
+    // Shared by DIDLDO and SIDLDO since both dispatch through this one
+    // class over the same DenseLinearWeights. Own separate cursor/stats
+    // per channel (weight vs importance) so they can run independently.
+    std::size_t _decay_cursor = 0;
+    double _decay_sum_abs = 0.0;
+    double _decay_sum_sq = 0.0;
+    double _decay_max_abs = 0.0;
+    std::size_t _decay_n = 0;
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
+
     DIDLDOLayerV(S n_inputs, S n_outputs, int cpus = 4) : num_cpus(cpus) {
         weights.resize(std::size_t(n_inputs), std::size_t(n_outputs));
     }
@@ -1879,6 +2410,44 @@ class DIDLDOLayerV {
         py::array_t<V> result({(py::ssize_t)batch, (py::ssize_t)n_inputs()});
         std::copy(dx.begin(), dx.end(), (V*)result.request().ptr);
         return result;
+    }
+
+    // Amortized decoupled decay + stats -- flat-array version, see
+    // apply_amortized_flat_decay_stats's own comment (delta_csr_types.hpp).
+    // Same interface (chunk_size/decay_factor -> stats dict) as
+    // DISLDOLayerV's apply_amortized_l2_decay, for consistency across
+    // storage types.
+    py::dict apply_amortized_l2_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_flat_decay_stats<V>(
+            weights.w, _decay_cursor, _decay_sum_abs, _decay_sum_sq, _decay_max_abs, _decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity), decays `ci` (this
+    // storage's own RMSprop-style accumulator, DenseLinearWeights' name for
+    // what DISLDO/SISLDO call "importance") instead of `w`. Own separate
+    // cursor/stats from the weight-decay path above. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_flat_decay_stats<V>(
+            weights.ci, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
     }
 
     // ── real-time engine dispatch ───────────────────────────────────────────
@@ -2056,6 +2625,15 @@ class SparseLinearLayer8Impl {
     double _decay_sum_sq = 0.0;
     double _decay_max_abs = 0.0;
     std::size_t _decay_n = 0;
+    // Separate cursor/stats for importance decay -- EXPERIMENTAL, see
+    // apply_amortized_decay_stats's own decay_importance comment
+    // (delta_csr_types.hpp). Own cursor so weight- and importance-decay
+    // can run independently without fighting over the same position.
+    std::size_t _importance_decay_cursor = 0;
+    double _importance_decay_sum_abs = 0.0;
+    double _importance_decay_sum_sq = 0.0;
+    double _importance_decay_max_abs = 0.0;
+    std::size_t _importance_decay_n = 0;
 
     SparseLinearLayer8Impl(S n_inputs, S n_outputs, S max_weights, int cpus = 4)
         : num_cpus(cpus), _idx_budget_bytes(static_cast<std::size_t>(max_weights) * 8 + 4096),
@@ -2324,6 +2902,25 @@ class SparseLinearLayer8Impl {
         auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
             weights.connections.values, _decay_cursor, _decay_sum_abs, _decay_sum_sq,
             _decay_max_abs, _decay_n, static_cast<std::size_t>(chunk_size), decay_factor);
+        py::dict out;
+        out["mean_abs"] = stats.mean_abs;
+        out["rms"] = stats.rms;
+        out["max_abs"] = stats.max_abs;
+        out["n"] = stats.n;
+        out["cycle_complete"] = stats.cycle_complete;
+        return out;
+    }
+
+    // EXPERIMENTAL, added 2026-09-20 -- loss-adjusted forgetting hypothesis
+    // (critical-learning-periods/loss-of-plasticity). Same amortized/chunked
+    // mechanism as apply_amortized_l2_decay, decay_importance=true instead --
+    // see apply_amortized_decay_stats's own comment. May be removed if
+    // testing doesn't show benefit.
+    py::dict apply_amortized_importance_decay(S chunk_size, V decay_factor) {
+        auto stats = apply_amortized_decay_stats<FP8BiValues, V>(
+            weights.connections.values, _importance_decay_cursor, _importance_decay_sum_abs,
+            _importance_decay_sum_sq, _importance_decay_max_abs, _importance_decay_n,
+            static_cast<std::size_t>(chunk_size), decay_factor, true);
         py::dict out;
         out["mean_abs"] = stats.mean_abs;
         out["rms"] = stats.rms;
@@ -2664,6 +3261,9 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay",
+             &SparseLinearLayer::apply_amortized_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
         .def("build_probes", &SparseLinearLayer::build_probes, py::arg("k"),
              py::arg("per_row") = false)
         .def("synap_row_step", &SparseLinearLayer::synap_row_step, py::arg("current_row"),
@@ -4195,7 +4795,10 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad,
+             py::arg("centering_row_enable") = false, py::arg("centering_col_enable") = false,
+             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1)
         .def("forward_sparse", &DISLDOLayerV::forward_sparse, py::arg("ptrs"), py::arg("indices"),
              py::arg("values"), py::arg("batch"))
         .def("backward_sparse", &DISLDOLayerV::backward_sparse, py::arg("x"), py::arg("dy_ptrs"),
@@ -4205,7 +4808,11 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad,
+             py::arg("centering_row_enable") = false, py::arg("centering_col_enable") = false,
+             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1,
+             py::arg("energy_lr_scale") = py::array_t<DISLDOLayerV::V>())
         // Real-time engine dispatch -- picks disldo vs sisldo per call
         // (engine_select.hpp); identical results either way, only speed
         // differs. Two overloads each, resolved by pybind from the
@@ -4223,29 +4830,77 @@ PYBIND11_MODULE(_cpu, m) {
              static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
                  py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::V, bool,
                  bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
-                 DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+                 DISLDOLayerV::V, bool, DISLDOLayerV::V, bool, bool, DISLDOLayerV::V)>(
+                 &DISLDOLayerV::backward),
              py::arg("x"), py::arg("dy"), py::arg("learning_rate"),
              py::arg("lr_per_row_nnz") = false, py::arg("damp_by_importance") = true,
              py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f,
              py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad,
+             py::arg("centering_row_enable") = false, py::arg("centering_col_enable") = false,
+             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1)
         .def("backward",
              static_cast<py::array_t<DISLDOLayerV::V> (DISLDOLayerV::*)(
                  py::array_t<DISLDOLayerV::V>, py::array_t<DISLDOLayerV::S>,
                  py::array_t<DISLDOLayerV::S>, py::array_t<DISLDOLayerV::V>, DISLDOLayerV::S,
                  DISLDOLayerV::V, bool, bool, DISLDOLayerV::V, DISLDOLayerV::V, DISLDOLayerV::V,
-                 DISLDOLayerV::V, DISLDOLayerV::V, bool)>(&DISLDOLayerV::backward),
+                 DISLDOLayerV::V, DISLDOLayerV::V, bool, DISLDOLayerV::V, bool, bool,
+                 DISLDOLayerV::V)>(&DISLDOLayerV::backward),
              py::arg("x"), py::arg("dy_ptrs"), py::arg("dy_indices"), py::arg("dy_values"),
              py::arg("batch"), py::arg("learning_rate") = 0.01f, py::arg("lr_per_row_nnz") = false,
              py::arg("damp_by_importance") = true, py::arg("beta2") = 0.999f,
              py::arg("eps") = 1e-8f, py::arg("min_decay_frac") = kSynapsePolicyMinDecayFrac,
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
-             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+             py::arg("scale_invariant") = kSynapsePolicyScaleInvariant,
+             py::arg("max_abs_grad") = kSynapsePolicyMaxAbsGrad,
+             py::arg("centering_row_enable") = false, py::arg("centering_col_enable") = false,
+             py::arg("centering_beta1") = kSynapsePolicyCenteringBeta1)
         .def("apply_amortized_l2_decay", &DISLDOLayerV::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay", &DISLDOLayerV::apply_amortized_importance_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_block4_l2_decay", &DISLDOLayerV::apply_amortized_block4_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_block4_importance_decay",
+             &DISLDOLayerV::apply_amortized_block4_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
+        .def("apply_amortized_plasticity_reset", &DISLDOLayerV::apply_amortized_plasticity_reset,
+             py::arg("chunk_size"), py::arg("eta"), py::arg("eta_slow"),
+             py::arg("eta_slow_catchup"), py::arg("eta_fast"), py::arg("blend"),
+             py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f,
+             py::arg("l2_decay_lambda") = 0.0f, py::arg("l2_decay_threshold") = 0.9f,
+             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("select_by_deviation") = false)
+        .def("apply_amortized_block4_plasticity_reset",
+             &DISLDOLayerV::apply_amortized_block4_plasticity_reset, py::arg("chunk_size"),
+             py::arg("eta"), py::arg("eta_slow"), py::arg("eta_slow_catchup"), py::arg("eta_fast"),
+             py::arg("blend"), py::arg("reset_fraction"), py::arg("k"), py::arg("eta_var") = 0.9f,
+             py::arg("l2_decay_lambda") = 0.0f, py::arg("l2_decay_threshold") = 0.9f,
+             py::arg("l2_decay_temperature") = 0.05f, py::arg("max_ci") = kSynapsePolicyMaxCi,
+             py::arg("select_by_deviation") = false)
+        .def("plasticity_column_state", &DISLDOLayerV::plasticity_column_state)
+        .def("plasticity_column_state_block4", &DISLDOLayerV::plasticity_column_state_block4)
+        .def("apply_amortized_ci_renorm", &DISLDOLayerV::apply_amortized_ci_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"),
+             py::arg("eff_lr"), py::arg("max_ci_ref") = kSynapsePolicyMaxCi,
+             py::arg("trust_ratio_min") = 0.1f, py::arg("trust_ratio_max") = 10.0f)
+        .def("apply_amortized_block4_ci_renorm", &DISLDOLayerV::apply_amortized_block4_ci_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"),
+             py::arg("eff_lr"), py::arg("max_ci_ref") = kSynapsePolicyMaxCi,
+             py::arg("trust_ratio_min") = 0.1f, py::arg("trust_ratio_max") = 10.0f)
+        .def("apply_amortized_weight_renorm", &DISLDOLayerV::apply_amortized_weight_renorm,
+             py::arg("chunk_size"), py::arg("mode"), py::arg("target_mean"), py::arg("target_std"))
+        .def("apply_amortized_block4_weight_renorm",
+             &DISLDOLayerV::apply_amortized_block4_weight_renorm, py::arg("chunk_size"),
+             py::arg("mode"), py::arg("target_mean"), py::arg("target_std"))
+        .def("apply_amortized_l2_init", &DISLDOLayerV::apply_amortized_l2_init,
+             py::arg("chunk_size"), py::arg("rate"))
+        .def("apply_amortized_block4_l2_init", &DISLDOLayerV::apply_amortized_block4_l2_init,
+             py::arg("chunk_size"), py::arg("rate"))
         .def("build_probes", &DISLDOLayerV::build_probes, py::arg("k"), py::arg("per_row") = false)
         .def("synap_row_step", &DISLDOLayerV::synap_row_step, py::arg("current_row"),
              py::arg("importance_cutoff"), py::arg("max_row_weights"))
@@ -4292,6 +4947,7 @@ PYBIND11_MODULE(_cpu, m) {
         .def_property_readonly("n_inputs", &DISLDOLayerV::n_inputs)
         .def_property_readonly("n_outputs", &DISLDOLayerV::n_outputs)
         .def_property_readonly("nnz", &DISLDOLayerV::nnz)
+        .def_property_readonly("scattered_nnz", &DISLDOLayerV::scattered_nnz)
         .def_property_readonly("block4",
                                py::cpp_function(&DISLDOLayerV::block4, py::keep_alive<0, 1>()));
 
@@ -4318,6 +4974,10 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("max_abs_delta") = kSynapsePolicyMaxAbsDelta,
              py::arg("max_ci") = kSynapsePolicyMaxCi,
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
+        .def("apply_amortized_l2_decay", &DIDLDOLayerV::apply_amortized_l2_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay", &DIDLDOLayerV::apply_amortized_importance_decay,
+             py::arg("chunk_size"), py::arg("decay_factor"))
         .def("forward",
              static_cast<py::array_t<DIDLDOLayerV::V> (DIDLDOLayerV::*)(
                  py::array_t<DIDLDOLayerV::V>)>(&DIDLDOLayerV::forward),
@@ -4408,6 +5068,9 @@ PYBIND11_MODULE(_cpu, m) {
              py::arg("scale_invariant") = kSynapsePolicyScaleInvariant)
         .def("apply_amortized_l2_decay", &SparseLinearLayer8::apply_amortized_l2_decay,
              py::arg("chunk_size"), py::arg("decay_factor"))
+        .def("apply_amortized_importance_decay",
+             &SparseLinearLayer8::apply_amortized_importance_decay, py::arg("chunk_size"),
+             py::arg("decay_factor"))
         .def("build_probes", &SparseLinearLayer8::build_probes, py::arg("k"),
              py::arg("per_row") = false)
         .def("synap_row_step", &SparseLinearLayer8::synap_row_step, py::arg("current_row"),

@@ -67,6 +67,10 @@ add_executable(
     test_stats_thread_safety.cpp
     test_scale_handling.cpp
     test_synapse_update_policy.cpp
+    test_synapse_policy_grad_clip.cpp
+    test_synapse_policy_centering.cpp
+    test_ci_renorm.cpp
+    test_block4_ci_renorm.cpp
     test_attention.cpp
     test_csr_union.cpp
 
@@ -186,6 +190,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_scattered_divergence
     test_sisldo_disldo_parity
     test_sisldo_disldo_parity_fp32
+    test_disldo_backward_sparse_grad_energy_lr_scale
     test_sisldo_disldo_parity_fp8
     test_sisldo_disldo_multibatch_parity
     test_fp8_block4_scattered_divergence
@@ -204,6 +209,7 @@ set(SILI_STANDALONE_TESTS
     test_block4_sparse_input_backward
     test_fp4_bitshift
     test_fp4_stochastic
+    test_fp4_stochastic_normal
     test_disldo_block4_fp4_wide_simd
     test_disldo_block4_fp4_backward_wide_simd
     test_fp8_bitshift
@@ -235,6 +241,11 @@ set(SILI_STANDALONE_TESTS
     test_top_k_csr_small_array_fast_path
     test_aqrs_grad_norm_dy_density
     test_amortized_decay_stats
+    test_block4_amortized_decay
+    test_amortized_plasticity_reset
+    test_block4_plasticity_reset
+    test_amortized_l2_init
+    test_block4_l2_init
     test_top_k_csr_nucleus
     test_cpu_topology
     test_dequant_equality_fp4_vs_fp8

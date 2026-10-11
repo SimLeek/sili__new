@@ -185,6 +185,45 @@ SISLDOLayerV architecture fix).
 - **`csf.h`/`csf.cpp` (Compressed Sparse Fiber, cpu_sparse_io)** --
   backburner per direct guidance, not evaluated further.
 
+## GPU port of the block4/plasticity kernel-level work -- ELEVATED, next
+task (2026-10, not backburner, direct instruction)
+
+Motivation: sili_peridot's MQAR plasticity investigation (PR #26, branch
+`research/dense-vs-sparse-mqar-300k`) just landed a real result (sparse
+DISLDO + magnitude/directional plasticity reaching MQAR vocab=126/k=7,
+see that repo's JOURNAL.md/README.md) -- CPU-only training runs take
+hours per 100k-step config, which has been the actual bottleneck on how
+many configs/seeds/ablations could be tried this round. Getting this
+work onto GPU is explicitly the next task, to test faster, not a
+distant someday item.
+
+**What needs porting** (the real forward/backward kernels, not just the
+mechanisms layered on top):
+- `linear_disldo_forward.hpp`/`linear_disldo_backward.hpp` -- the core
+  block4 DISLDO kernels themselves.
+- The 4 `block4_*_TODO_DELETE.hpp` traversal files (`decay`,
+  `plasticity`, `ci_renorm`, `l2_init`) -- see their own file-header
+  comments and this session's direct Q&A confirming they're still live,
+  still the only block4 implementation of CiRenorm/WeightRenorm/decay/
+  plasticity_reset, called from `cpu_backend.cpp`.
+- `EnergyDynamics` (`sili/energy.py`) -- currently plain numpy, would
+  need a real GPU-side port (or at minimum confirm it's cheap enough
+  relative to the kernels above that it doesn't need one).
+
+**Worth doing properly this time**: the TODO_DELETE files exist because
+the CPU kernels were never decomposed into a reusable "walk every
+populated tile + pluggable per-cell callback" abstraction -- each
+mechanism got its own copy-pasted traversal instead. Designing the GPU
+kernels with that reusable structure from the start (one tile-walk,
+pluggable per-cell op) would let CiRenorm/decay/plasticity_reset/l2_init
+become callback swaps into ONE GPU traversal, avoiding reproducing the
+same 4-copies-of-the-same-traversal pattern on GPU too -- not required,
+but the natural moment to fix it given the kernels are being rewritten
+anyway.
+
+Not scoped/sized yet -- this is a recorded TODO, not a design, per
+direct instruction ("add it as todo for the next part of the work").
+
 ## GPU / vision (mixed priority -- see refactoring_todo.md for the elevated items)
 
 Most GPU/vision work from `sili_old` was confirmed worthless and dropped

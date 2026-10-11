@@ -71,16 +71,34 @@ job to derive (Python side): ``2^(-cycle_length/H)`` for a chosen half-life
 since a given synapse is only actually touched once per ``cycle_length``
 steps.
 
-Decays the WEIGHT only, via ``get_imp``+``set_live`` (importance is a
-significance signal, not a magnitude to shrink), preserving each
-``VALUES_TYPE``'s own never-0 live-quantize invariant where one exists
-(FP4/FP8) and passing through unchanged where it's meaningless (fp32). For
-FP4/FP8 this decay is lower marginal value than for fp32: raw codes are
-already magnitude-bounded by a small fixed decode table and can't blow up
-the way a plain float can -- the real FP4/FP8 blow-up path is the SCALE
-vector (covered by the scale policies' own NaN/Inf guards below), not the
-per-synapse code. The running stats remain useful regardless, for uniform
-health monitoring across all three storage types.
+Decays the WEIGHT only by default, via ``get_imp``+``set_live`` (importance
+is a significance signal, not a magnitude to shrink -- the original
+rationale here), preserving each ``VALUES_TYPE``'s own never-0 live-quantize
+invariant where one exists (FP4/FP8) and passing through unchanged where
+it's meaningless (fp32). For FP4/FP8 this decay is lower marginal value than
+for fp32: raw codes are already magnitude-bounded by a small fixed decode
+table and can't blow up the way a plain float can -- the real FP4/FP8
+blow-up path is the SCALE vector (covered by the scale policies' own
+NaN/Inf guards below), not the per-synapse code. The running stats remain
+useful regardless, for uniform health monitoring across all three storage
+types.
+
+**EXPERIMENTAL, added 2026-09-20**: ``decay_importance=true`` flips which
+channel gets decayed -- importance instead of weight, weight passed
+through unchanged. Motivation: critical-learning-periods/loss-of-plasticity
+research (Achille et al. 2019; Dohare et al., *Nature* 2024) finds
+adaptive optimizers' own accumulated second-moment state can "freeze"
+heavily-used units against further updates, and that decaying that state
+is one candidate mitigation (though not sufficient alone in at least one
+study -- full unit resets did better). This project's per-synapse
+``importance`` plays the same role as an RMSprop/Adam second-moment
+accumulator (see ``project_dense_vs_sparse_mqar_confusion_matrix``/
+``feedback_importance_is_already_the_optimizer`` in sili_peridot's own
+memory) -- testing whether selectively decaying it, triggered by
+sustained-high-loss (a training-stall signal) rather than a fixed
+schedule, restores plasticity after a curriculum-transition stall. Own
+separate cursor/stats from the weight-decay path so both can run
+independently. May be removed if testing doesn't show benefit.
 
 Stats fields (``mean_abs``/``rms``/``max_abs``/``n``) are only meaningful
 for a just-FINISHED cycle -- accumulators reset after being read via the
@@ -89,6 +107,385 @@ caller's own ``sum_abs``/``sum_sq``/``max_abs``/``n`` references.
 nothing in that case, but callers should gate on ``cycle_complete`` rather
 than reading the numeric fields, which are stale/undefined until it flips
 true.
+
+**Three storage types, three functions, added 2026-09-20**: this
+project's synapses live in three genuinely distinct storage layouts, and
+a given layer can straddle more than one simultaneously (synaptogenesis
+promotes/demotes between scattered and block4). ``apply_amortized_decay_stats``
+above covers scattered CSR (``weights.connections.values``, generic over
+``VALUES_TYPE`` via ``ValueAccessor`` -- fp32/FP4/FP8 all share it).
+``apply_amortized_flat_decay_stats`` (same file, same chunked-cursor
+shape and ``AmortizedDecayStats`` return type) is the dense/SIDLDO-DIDLDO
+counterpart: ``DenseLinearWeights`` has no packing at all, just flat
+``std::vector<float> w``/``ci``, so it takes a plain ``std::vector<V>&``
+and decays it directly -- one call for ``w`` (weight), a second for
+``ci`` (importance), each with its own cursor/accumulator state, mirroring
+the weight/importance separation the scattered version gets via
+``decay_importance``. ``apply_amortized_block4_decay_stats`` (a
+DELIBERATELY SEPARATE file, ``sili/lib/headers/block4_decay_TODO_DELETE.hpp``
+-- see that file's own header comment) is the block4 packed-tile
+counterpart: touches whole TILES per chunk (not individual synapses,
+since a tile is block4's natural atomic unit), builds entirely on
+``Block4TileHandle32``'s existing safe per-cell accessors rather than
+re-deriving the sparse/dense tile-packing logic itself. That file is a
+temporary copy of the traversal pattern rather than a refactor of the
+real block4 forward/backward kernels into something pluggable, per
+direct instruction ("I think the block4 should probably have a copy of
+the main block4 kernel... and be in its own file... 'todo: delete me
+later'") -- to be deleted once those kernels are decomposed into a
+reusable tile-walk + pluggable per-cell callback.
+
+Tested in ``tests/unit/test_amortized_decay_stats.cpp`` (scattered +
+flat, including ``decay_importance`` isolation for fp32/FP4/FP8 and flat
+weight/importance channel independence) and
+``tests/unit/test_block4_amortized_decay.cpp`` (block4: weight/importance
+isolation, sparse-tile format stability under repeated decay, dense-tile
+correctness, cursor row-skip/wrap across an empty row, the
+live-iff-weight-or-importance-nonzero definition, and BIT-EQUIVALENCE
+against the scattered path for the same logical values -- decay is a
+per-cell ``v * decay_factor`` multiply with no cross-cell reduction, so
+the two storage formats must agree exactly, not just approximately).
+
+.. _plasticity_reset.per_neuron_utility:
+
+Per-neuron utility-based plasticity reset
+--------------------------------------------
+
+*ID:* ``plasticity_reset.per_neuron_utility``
+
+Sibling mechanism to the decay work above, sharing the SAME amortized
+cell-touch traversal shape but a materially different trigger and
+action -- see ``sili_peridot``'s
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design``
+for the full derivation (Continual-Backprop-inspired, Dohare et al.
+2024 *Nature* "Loss of plasticity in deep continual learning"; several
+rounds of direct correction that materially changed the design from its
+first draft). Engine-level summary:
+
+``PlasticityState`` (``delta_csr_types.hpp``) tracks, per OUTPUT column:
+``col_importance`` (EMA of ``importance`` alone -- the FROZEN-pool
+ranking signal, TOP-K selected, not bottom-K: a worked-through
+worst-case-timing question showed a bottom-K
+``importance*|weight|`` criterion can never detect a genuinely frozen
+column, since that value can't fall while the column stays stuck
+receiving real error signal), ``col_util_dead`` (EMA of
+``importance*|weight|``, the ORIGINAL formula, honestly rescoped as a
+SEPARATE DEAD-pool bottom-K signal for genuinely idle columns -- a
+different pathology gradient-magnitude deviation alone cannot
+distinguish from "optimal, low activity"), and ``col_grad_slow``/
+``col_grad_fast`` (two EMAs, asymmetric catchup rate, of
+``col_importance``'s own per-CYCLE delta -- NOT a real backward-kernel
+hook: that kernel has 6+ SIMD-vectorized per-synapse update sites, too
+risky to touch correctly, so the gate is derived from a signal already
+safely available at this traversal's own cadence instead).
+
+``apply_amortized_plasticity_step`` (scattered) and
+``apply_amortized_block4_plasticity_step``
+(``block4_plasticity_TODO_DELETE.hpp``, same temporary-copy rationale as
+the block4 decay file) share ``plasticity_select_cycle_boundary`` for
+the actual TOP-K/BOTTOM-K selection math -- the per-column state doesn't
+care which storage format produced it, only each storage's own CELL
+traversal differs (block4's ``chunk_size`` counts TILES, matching the
+decay file's own convention; scattered counts individual cells).
+Reset/blend is gradual (``blend * plasticity_boost`` for the gated
+FROZEN pool, full ``blend`` rate for the ungated DEAD pool) via
+``fp4_stochastic_normal01()`` (``fp4quant.hpp``, Box-Muller off the
+existing thread-local xorshift64* stochastic-rounding RNG) toward a
+fan-in-scaled fresh sample -- never a sudden full swap.
+
+Tested in ``tests/unit/test_fp4_stochastic_normal.cpp`` (the new RNG
+helper), ``tests/unit/test_amortized_plasticity_reset.cpp`` (scattered:
+``col_importance`` accumulation, TOP-K frozen selection, DEAD-pool
+mutual exclusion with the frozen pool, gated-vs-ungated blend rate,
+maturity gate, the asymmetric ``eta_slow_catchup`` rate, empty-layer
+handling), and ``tests/unit/test_block4_plasticity_reset.cpp`` (the
+block4 mirror of all of the above, plus BIT-EQUIVALENCE against the
+scattered path for the same logical values -- same standard this
+project's every scattered/block4 pair is held to).
+
+.. _plasticity_reset.plasticity_column_state:
+
+Per-column state snapshot accessors (offline data collection)
+--------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.plasticity_column_state``
+
+``DISLDOLayerV::plasticity_column_state()``/``_block4()`` (``cpu_backend.cpp``)
+expose read-only, zero-copy views of ``PlasticityState``'s own arrays
+(``col_importance``, ``col_grad_slow``/``col_grad_fast``/``col_grad_var``,
+``col_age``, ``col_reset_active``) -- same
+``get_weights_vals``/``get_importance`` precedent, no new state or
+computation. Added so a training run can log real per-column state at
+every completed cycle, toward later fitting a reset-selection equation
+from actual data instead of a hand-derived heuristic. Deliberately
+COLUMN granularity, not per-synapse: the mechanism above only ever
+selects at column granularity, so that's the only granularity a
+selection equation needs.
+
+The Python model layer (``ToyTileRecurrenceRMT.apply_plasticity_reset``,
+sili_peridot) copies these views into plain numpy arrays
+(``include_column_state=True``) only for a pool whose cycle just
+completed, and only when writing to disk (``plasticity_column_log_dir``
+in ``train_mqar_curriculum.py``, one small ``.npz`` per completed
+cycle per layer/pool, including ``step``/``loss_ema``/``acc_ema``).
+
+**Real bug found via smoke-testing the actual logging wiring (not
+planning):** a dense-loaded real layer's content lives ENTIRELY in
+block4 (``load_dense_values`` routes through ``block4_load_dense_fp32``
+only) -- its SCATTERED arm has 0 nnz for the whole run, so
+``apply_amortized_plasticity_step``'s early-return path
+(``nnz()==0``) reports ``cycle_complete=true`` on literally every
+single call, with ``col_importance`` etc. still at their
+zero-initialized values. Logging that naively would have written a
+stream of degenerate all-zero snapshots -- confirmed on a real
+500-step smoke run: 3036 files written, the vast majority pure noise.
+Fixed with ``DISLDOLayerV::scattered_nnz()`` (distinct from the
+existing combined ``nnz()``), gating column-state attachment to arms
+that actually have real content -- verified via a regression re-run of
+the same smoke test: 36 files (only under the real ``*.block4``
+directories), each holding genuine non-zero, varying values.
+
+.. _plasticity_reset.l2_saturation_decay:
+
+L2-saturation-gated decay on col_importance
+--------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.l2_saturation_decay``
+
+Found via offline replay of a real 100k-step run's collected per-column
+data (``plasticity_column_state``, above): ``col_importance`` climbs
+from near-zero to the ci accumulator's ``max_ci=100`` clamp by roughly
+step 20k-50k, and by a run's end most of some pools' populations sit
+tied at that ceiling (``v_proj`` 288/288, ``k_proj`` 285/288,
+``input_proj`` 280/288 in the observed run). Population std of raw
+``col_importance`` collapses from real spread (e.g. 4.73 at step 21k)
+to the fp32 noise floor (0.0001) by late training in those pools --
+once most of a pool is tied, top-K-by-importance selection stops
+discriminating "at-risk" columns and just picks whatever a sort's
+tie-break lands on (very likely the source of a previously-flagged,
+never-diagnosed pattern: the exact same ``dev=X.XX[X.XX,X.XX],imp=Y``
+line repeating verbatim across many consecutive log ticks).
+
+**A uniform post-hoc re-scoring of the already-logged trajectory is a
+mathematically guaranteed no-op for selection**, tried and rejected
+first: ``top_k(importance) == top_k(c*importance)`` for any positive
+scalar ``c``, so multiplying a population's importance by the same
+per-cycle scalar (whatever function of population state produced it)
+can never change which columns rank highest. Confirmed empirically:
+an offline replay applying exactly this shape reproduced ``raw``'s
+selection in every single row, 100% identical. Real decay has to act
+on the REAL underlying ``importance`` accumulator during training, not
+a fixed historical log.
+
+**Design, direct instruction** ("soft threshold if we can not hard...
+the entire network saturating at max importance doesn't seem to be
+good since loss plateaus and the model fails to advance"): a
+population-level L2-norm saturation ratio, current-state ONLY --
+``sat_ratio = ||col_importance||_2 / (max_ci * sqrt(n_out))``, 1.0
+exactly when every column sits at the clamp. A first attempt used
+``col_age`` (cycles since last reset) as the gating counter and was
+explicitly rejected: "If col_age is steps, time, or some other
+counter, that counter will eventually hit an overflow error or have
+other numerical instability, so we want to avoid it since we're
+targeting long term learning" -- this mechanism's other EMA-based knobs
+are already held to that same infinite-horizon-safe standard (see the
+scale-invariance discussion in
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_reset_design``),
+and ``sat_ratio`` is a pure function of the CURRENT ``col_importance``
+vector, never elapsed time.
+
+``sat_ratio`` is passed through a soft sigmoid, not a hard cutoff:
+``decay_strength = sigmoid((sat_ratio - l2_decay_threshold) /
+l2_decay_temperature)`` -- near-zero comfortably below threshold,
+ramping smoothly toward 1 as the population saturates, continuous
+everywhere (no discontinuity at the threshold). Computed once per
+cycle boundary (``plasticity_select_cycle_boundary``), stored on
+``PlasticityState`` and applied during the SAME per-cell touch
+traversal the frozen-pool reset already uses -- but to EVERY touched
+cell, not just the top-K reset candidates (a separate, population-wide
+signal): ``importance *= (1 - l2_decay_lambda * decay_strength)``.
+Never touches weight, only importance. ``l2_decay_lambda=0.0``
+(default) is an exact no-op (new-shared-parameter backward-compat
+convention). ``l2_sat_ratio``/``l2_decay_strength`` are always reported
+on ``PlasticityStats`` (even at ``lambda=0``) for visibility.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp`` and
+``tests/unit/test_block4_plasticity_reset.cpp``: default is a byte-exact
+no-op; ``decay_strength`` stays near-zero far below threshold and
+becomes substantial once fully saturated; the decay touches EVERY
+touched cell (not just the frozen pool) while never touching weight;
+and the ramp is smooth (checked at 4 saturation levels, no single step
+close to the full 0-to-1 range).
+
+.. _plasticity_reset.select_by_deviation_early_detection:
+
+select_by_deviation: growth-RATE selection, found by comparing a graduated run against a stuck run
+-----------------------------------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.select_by_deviation_early_detection``
+
+Direct instruction, after a real run using the L2-saturation decay
+above graduated early (step 18366) while the original v3 comparison
+run never did (stuck at vocab=126/k=2 for ~88k steps): "let's see if we
+can get a run that doesn't graduate... and investigate the difference
+between runs with what we have." Comparing the two runs' collected
+column-log data at MATCHED step counts (not matched wall-clock or
+matched outcome) found the stuck run's `col_importance` was already
+growing 17-147x faster than the graduated run's across every q/k/v/
+o_proj pool, visible from as early as step 5000-8000 -- well before
+EITHER run's `l2_sat_ratio`/`l2_decay_strength` had done anything at
+all, and long before the absolute importance LEVEL itself became
+distinguishable in any way a level-based criterion could use.
+
+This exposed a structural gap in the existing top-K-by-importance
+selection: `col_grad_fast`/`col_grad_slow`/`col_grad_var` (and thus
+deviation, the z-score already used to gate blend strength) are
+already tracked for EVERY mature column each cycle, not just the ones
+selected -- but deviation was only ever COMPUTED for whichever columns
+already ranked in the top-K by raw `col_importance` LEVEL. A column
+accelerating dangerously fast while its absolute level is still low
+(exactly what the stuck run's pools looked like for the first several
+thousand steps) can never enter the candidate pool under the existing
+criterion, no matter how anomalous its growth rate is -- selection
+happens too late by construction.
+
+**Fix**: `select_by_deviation` (default `false`, exact byte-identical
+no-op preserving the existing top-K-by-importance selection) flips the
+FROZEN pool's ranking key from `col_importance` (absolute LEVEL) to
+deviation (growth RATE) when `true`. Deviation is now computed for the
+full mature population up front (previously only for the
+already-selected top-K), so the sort/select step can rank by either
+signal without duplicating the z-score computation. The reset/blend
+ACTION on a selected column is unchanged -- only what gets selected.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp`` and
+``tests/unit/test_block4_plasticity_reset.cpp``: default mode is
+byte-identical to the pre-existing top-K-by-importance behavior; a
+2-column scenario (one column with high absolute importance but a
+stable, unremarkable per-cycle delta; one with low absolute importance
+but a sudden large spike) confirms the default mode picks the
+high-level column while ``select_by_deviation=true`` picks the
+spiking column instead, even though its absolute level is far lower.
+
+.. _plasticity_reset.select_by_deviation_early_detection.k_derivation:
+
+select_by_deviation's gate was defeated by construction; fixed with an equation-derived threshold, not a guessed one
+-------------------------------------------------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.select_by_deviation_early_detection.k_derivation``
+
+A real 100k-step comparison run using ``select_by_deviation=True``
+(``sili_peridot``'s v5 launcher) got stuck at vocab=16/k=3 for
+37,750+ steps -- far worse than every other comparison arm, including
+the plain unmodified baseline. Direct instruction after the finding:
+"How ... did you think that would not harm the base model?"
+
+**Root cause, confirmed via direct log analysis, not guessed**:
+``select_by_deviation`` selects the TOP ``reset_fraction`` of the
+mature population's deviations every cycle -- by construction, the
+selected value(s) are the population's own extreme order statistics.
+The gate (``plasticity_boost = max(0, deviation - k)``) used the SAME
+fixed ``k`` that had been calibrated for the *default* top-importance
+mode's deviation distribution -- a totally different, non-maximal
+subpopulation. Grepping the ``dev=`` value logged for the "worst"
+column each cycle in both a real ``select_by_deviation=True`` run and
+a real top-importance run: 177/182 cycles (97.25%) exceeded ``k=1.0``
+under ``select_by_deviation``, vs only 89/400 (22.25%) under
+top-importance selection. The gate was open almost every single cycle
+-- near-full-strength resets fired continuously regardless of whether
+anything was actually pathological, the opposite of the mechanism's
+entire "only intervene on genuine anomalies" purpose.
+
+**First fix tried, equation-derived rather than a new guessed
+constant** (direct instruction: "unless you can actually find a k
+value based on an equation and not a guess. I vastly prefer not to add
+guessed hyperparameters"): ``deviation_by_col[j]`` is constructed as a
+z-score -- under the "nothing pathological" null hypothesis, each
+mature column's deviation is approximately an independent
+standard-normal draw. Selecting the top order statistics of ``N`` such
+draws each cycle means the relevant question isn't "is this deviation
+big" but "is it bigger than what pure chance among ``N`` columns would
+already produce, even with nothing wrong." That's exactly the
+classical Gaussian extreme-value asymptotic (Fisher-Tippett-Gnedenko):
+the expected value of the MAXIMUM of ``N`` i.i.d. standard normals is
+
+.. math::
+
+   E[\\max_N] \\approx \\sqrt{2 \\ln N}
+
+a closed-form function of the population size alone -- no calibration
+against observed data, no free constant to pick. ``k_effective =
+sqrt(2*ln(mature.size()))`` was implemented replacing the passed-in
+``k`` ONLY when ``select_by_deviation=true``, tested (4-mature-column
+scenario, N=4, expected threshold :math:`\\sqrt{2\\ln 4} \\approx
+1.665`, confirming both that the passed-in ``k`` has no effect and
+that the boost exactly matches the EVT formula computed independently
+from the engine's own post-call state), and launched as a full
+100k-step comparison run (v6).
+
+**Found wrong, by direct log analysis of that same v6 run, before
+trusting it further** (direct instruction: "check what happened with
+v6 when it stalled and what updates to the equation would fix it, and
+test those on the log a bit if we can before trying another run"):
+v6's own collected column snapshots (recorded every cycle, all 6
+pools, the full 100k steps) show ``gate_open_frac`` was **EXACTLY
+0.000** in every single pool, across the ENTIRE run -- not just during
+its later plateau. Real per-column deviation never approached the
+theoretical :math:`\\sqrt{2\\ln N}\\approx 3.1\\text{-}3.4` threshold;
+the observed maximum anywhere in the run was only ~1.0-1.8. The
+EMA-lag structure of ``col_grad_fast``/``col_grad_slow`` (compounded
+by the asymmetric catchup rate) does not actually produce
+iid-standard-normal statistics the way the EVT derivation assumed --
+the fix that stopped v5's over-triggering over-corrected into a
+**permanent no-op**: every "selected" column got
+``plasticity_boost=0`` for the whole run, so v6's own early progress
+(clearing vocab=16/k=3, the exact point v5 got stuck at) turned out to
+owe nothing to the mechanism actually doing anything -- it never fired
+a single real reset. A sound theoretical derivation, invalidated by
+what the real data showed once checked, rather than assumed correct
+because the algebra was clean.
+
+**Second fix, still equation-derived, this time calibrated against the
+population's OWN empirical distribution rather than a theoretical
+asymptotic**: instead of assuming deviation is standard-normal, use
+the population's own observed distribution directly. ``k = the
+linear-interpolated percentile of the MATURE population's ACTUAL
+deviation values this cycle, at percentile 100*(1 - reset_fraction)``
+-- still a genuine order statistic of real data (no new guessed
+constant), and it reuses the EXISTING ``reset_fraction`` knob rather
+than introducing a new one (the percentile directly matches how many
+candidates get selected each cycle: with ``reset_fraction=0.01``, the
+threshold sits at the population's own 99th percentile). Because it's
+computed fresh from the actual current spread every cycle, it
+self-calibrates automatically regardless of whether the real
+distribution matches the idealized normal assumption -- it cannot
+reproduce either failure: it is never a fixed external constant
+(defeating v5's problem), and it is never systematically unreachable
+by the real data (defeating v6's problem), since it is defined as a
+literal point IN that data's own distribution.
+
+Validated against v6's real log data BEFORE implementing (the same
+snapshots that exposed the EVT rule's failure): recomputing what this
+percentile rule would have done on the exact recorded late-plateau
+deviations shows it would have opened the gate 47-100% of the time
+across all 6 pools -- a sane middle ground between the EVT rule's 0%
+and the original fixed ``k=1.0``'s 97.25%.
+
+Tested in both ``tests/unit/test_amortized_plasticity_reset.cpp``
+(``test_select_by_deviation_gate_uses_population_percentile_not_passed_k``)
+and ``tests/unit/test_block4_plasticity_reset.cpp``
+(``test_select_by_deviation_gate_uses_population_percentile_not_passed_k_block4``):
+a 4-mature-column scenario (``reset_fraction=0.25`` -> percentile 75)
+confirms (a) the passed-in ``k`` has no effect under
+``select_by_deviation=true`` (re-run with ``k=0`` vs ``k=1000``,
+identical result), and (b) the resulting boost exactly matches
+``max(0, deviation - percentile(mature_devs, 75))``, computed
+independently in the test via the same linear-interpolation formula
+(matching ``numpy.percentile``'s default method) from the engine's own
+post-call ``col_grad_fast``/``col_grad_slow``/``col_grad_var`` state
+for ALL 4 mature columns, not just the selected one. A companion
+regression test confirms the default (``select_by_deviation=false``)
+mode still uses the passed ``k`` directly, unaffected by this change.
 
 .. _scale_policy.nan_inf_guard:
 
@@ -539,6 +936,565 @@ not the ceiling. Measured at the production default
 ``lr=1.0``. ``cpu_backend.cpp``'s ``backward_dense``/``backward`` wrappers
 print a one-time stderr warning if called with ``learning_rate > 0.2`` for
 exactly this reason.
+
+.. _synapse_policy.max_abs_grad_clip:
+
+``max_abs_grad``: clip g/contrib BEFORE they enter the ci EMA
+------------------------------------------------------------------
+
+*ID:* ``synapse_policy.max_abs_grad_clip``
+
+Direct question in sili_peridot, confirming ``ci`` really is Adam/
+RMSprop's own second-moment state (not just analogous -- same formula,
+same ``beta2=0.999`` default): "It seems to be the importance
+saturating for those specifically, right? ... it would be the
+optimizer state for rmsprop and the second optimizer state for adam
+iirc." Followed by a direct instruction to fix the resulting gap: "I
+think we should actually fix the clip grad norm thing first, and use a
+test in sili to demonstrate its importance... it seems like it could
+be a unit test that completes in a few milliseconds rather than an
+integration test."
+
+**The gap**: every real per-synapse call site
+(``sisldo_ops.hpp``/``linear_disldo_backward.hpp``) fed raw, UNCLIPPED
+``g``/``contrib`` straight into ``update_ci``'s EMA. Standard Adam/
+RMSprop practice clips BEFORE squaring into the second-moment
+accumulator specifically to stop a transient outlier gradient from
+getting permanently baked into a slow EMA. Web-researched exactly when
+this matters (not assumed): Zhang et al., "Why are Adaptive Methods
+Good for Attention Models?" (NeurIPS 2020, arXiv:1912.03194) found
+attention architectures produce HEAVY-TAILED gradient noise
+INDEPENDENT of input data -- occasional gradients far larger than the
+typical one, a general property of this project's own attention-based
+architecture, not a hypothetical edge case.
+
+**Demonstrated, not assumed, with a real unit test** -- direct
+correction mid-implementation, from a first pass that only confirmed a
+missing-parameter compile error (RED for the wrong reason -- see
+``tests/unit/test_synapse_policy_grad_clip.cpp``'s own leading
+docstring). The test that actually matters is the FIRST TEST_CASE in
+that file, which calls ONLY ``update_ci``'s pre-existing 6-argument
+signature (no ``max_abs_grad`` anywhere) -- verified standalone via a
+throwaway ``g++`` compile against the header with the fix stashed out,
+proving the failure mode is real in this codebase's actual formula
+before any fix existed:
+
+.. code-block:: text
+
+    ci_start=0.000453 ci_baseline=0.000905 ci_spiked=1.949572 ratio=2155.0
+    predicted ci_spiked=1.949618 (analytic decay formula)
+    PROBLEM TEST PASSED: unclipped g=50 spike poisons ci by 2155.0x after 249 steps
+
+A single ``g=50`` gradient spike (beta2=0.999) injects
+``(1-beta2)*50^2=2.5`` into ``ci`` -- 1000x what a normal ``g=0.05``
+step contributes. After 249 more EMA steps that excess has only decayed
+by ``0.999^249~=0.78``, so ~78% of it is STILL present -- a 2155x
+elevated ``ci`` relative to a no-spike baseline, matching the analytic
+prediction almost exactly. Same fix, verified to resolve it: clipping
+the spike to ``max_abs_grad=1.0`` leaves ``ci`` at only 1.86x baseline
+(vs 2155x unclipped) -- also confirmed via a standalone probe before
+the full test suite ran.
+
+**Fix**: new ``max_abs_grad`` parameter on ``update_ci`` (both
+``PlainRMSpropSynapsePolicy`` and ``BoundedRMSpropSynapsePolicy``,
+scalar AND ``Block4Vec``) -- clips ``g`` and ``contrib`` independently
+to ``[-max_abs_grad, max_abs_grad]`` before squaring into the EMA.
+Default ``1e30`` (scalar) / ``block4_vec_broadcast(1e30f)`` (SIMD) is a
+true no-op for any finite input, so every existing call site (which
+omits this argument) is bit-identical -- confirmed by the full 182-test
+regression passing clean with the fix applied, and confirmed genuinely
+broken (real compile failure, not just a lint hint) with the fix
+stashed out. Block4Vec reuses the already-existing
+``block4_vec_clip_abs`` helper (previously only used by
+``update_cw``'s own delta clip).
+
+**Scoped deliberately to ``update_ci`` only, not ``update_cw``** --
+once ``ci`` reflects a large gradient (after the EMA update), the
+weight-update delta already self-limits via ``sqrt(ci)`` in the
+denominator; the only exposure there is the single step where the
+spike first occurs, a much smaller blast radius than ``ci``'s
+hundreds-of-steps poisoning. Left as a smaller, secondary
+consideration, not built this pass.
+
+**Update -- threaded through to real training runs, real default set**:
+direct instruction, "Let's set a default, thread it through, and then
+run a real mqar run with it, v14." Two-tier default pattern, matching
+``max_ci``/``max_abs_delta``'s own existing precedent:
+
+- **Engine template layer** (``disldo_backward``,
+  ``disldo_backward_sparse_grad``, ``Block4BackwardParams``): default
+  stays ``1e30`` (true no-op) -- every existing call site across all 8
+  real ``update_ci`` call sites (scattered scalar + block4/SIMD, both
+  the row-pair AND tile-pair AVX2 variants) picked up the new parameter
+  with zero behavior change, confirmed by two full 182-test regression
+  runs (before and after this layer's changes).
+- **``DISLDOLayerV`` (``cpu_backend.cpp``) binding layer**: new
+  ``kSynapsePolicyMaxAbsGrad = 8.0f`` constant, joining
+  ``kSynapsePolicyMaxCi``/``kSynapsePolicyMaxAbsDelta`` as a THIRD
+  always-on-by-default synapse-policy safety clamp at this layer (not
+  an opt-in experimental flag) -- data-derived, not guessed: computed
+  from sili_peridot's v13 real recorded gradient-scale distribution
+  (``sqrt(raw_importance)`` across all 6 pools, p99.9~=6.34,
+  p99.99~=9.85) -- 8.0 sits comfortably above the healthy range while
+  staying under ``max_ci``'s own ``sqrt(100)=10`` ceiling. Threaded
+  through ``backward_dense``/``backward_sparse``/both ``backward``
+  overloads and their pybind bindings (4 sites total).
+- **``sili/sparse_rnn.py``**: ``DISLDOLayer32.forward`` gets a new
+  ``max_abs_grad: float | None = None`` kwarg, following the EXACT
+  existing ``min_decay_frac``/``max_abs_delta``/``max_ci`` pattern
+  (only added to the internal ``extra`` dict -- and thus only
+  overrides the C++ default -- when explicitly set). Scoped to
+  ``DISLDOLayer32`` (fp32/dense, the class real MQAR training uses)
+  only this pass -- FP4/FP8 layer classes (``DISLDOLayer``,
+  ``DISLDOLayer8``) were not touched, so their own callers are
+  unaffected and don't yet have this knob.
+- **Real, end-to-end verification** (not assumed): a deliberate
+  ``g=50`` outlier gradient fed through a real ``DISLDOLayerV``
+  instance produced finite output both with an explicit
+  ``max_abs_grad=1.0`` override and with the new ``8.0`` default
+  omitted -- confirmed via direct Python smoke test before touching
+  any launcher script. A real dispatch-coverage test
+  (``test_synapse_policy_dispatch.cpp``, built specifically to prove a
+  template parameter reaches EVERY real call site) caught two
+  test-local mock ``SynapsePolicy`` stand-ins
+  (``SentinelSynapsePolicy``, ``DebugBoundedPolicy`` in
+  ``test_ci_ceiling.cpp``) that also needed the new parameter added to
+  stay duck-type-compatible -- fixed, full 182-test suite passes clean.
+- **sili_peridot side**: ``NOCAPS_KWARGS_FP32`` (the module-level dict
+  already supplying ``max_abs_delta``/``max_ci`` for every fp32
+  training run) gets ``max_abs_grad: 8.0`` added directly -- makes it
+  active by default for real MQAR training going forward, the same way
+  the other two caps already are, rather than a per-launcher opt-in
+  flag. See sili_peridot's own
+  ``docs/research/train_mqar_curriculum.rst`` and JOURNAL.md for the
+  v14 real-run result.
+
+.. _synapse_policy.adabelief_centering:
+
+AdaBelief-style centering: ``ci = EMA((g-m)^2)`` instead of ``EMA(g^2)``
+------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.adabelief_centering``
+
+**Motivation, distinct from ``max_abs_grad`` above**: v14 (``max_abs_grad``
+threaded through and validated on sili_peridot's real MQAR training,
+seed=1001) fixed the literal ``ci=100`` saturation ceiling but regressed
+curriculum progress vs v13b. Direct question, prompted by that result:
+"how would we actually get per column clipping? Would per column
+adabelief work?" ``max_abs_grad`` and AdaBelief-style centering fix
+DIFFERENT failure modes, not competing fixes for the same one:
+
+- **``max_abs_grad`` (clipping)** defends against a genuine ONE-OFF
+  outlier spike -- ``m`` (the tracked baseline) hasn't adapted yet, so
+  ``residual = g - m ~= g``, and the hard clip is the only real defense.
+- **Centering** defends against a SUSTAINED, consistent large gradient --
+  a column stuck with real, persistent error signal. Clipping alone
+  still lets ``ci`` settle at ``max_abs_grad^2`` and stay stuck high
+  there; centering lets ``m`` track the new baseline so
+  ``residual = g - m -> 0`` and ``ci`` stops accumulating.
+
+Verified directly (not hand-derived), ``tests/unit/test_synapse_policy_
+centering.cpp``'s first two ``TEST_CASE``\ s: a sustained ``g=10``
+gradient under clip-only (``max_abs_grad=8``) gives ``ci=16.594574``
+after 300 steps (beta2=0.999's ~1000-step time constant means 300 steps
+only reaches ~26% of the true 64.0 steady state -- NOT the naively-
+guessed asymptote). Under centering (``m`` converges to 10.0 within 300
+steps at beta1=0.9), ``ci=0.303643`` -- a real, verified 54.65x
+reduction. A genuine one-off spike (``g=50``, fresh ``m=0``) is
+confirmed algebraically NOT rescued: ``m`` only moves 10% of the way on
+one touch, residual stays >40.
+
+**Design decision, direct instruction**: "I'd say rowxcolumn since that
+includes per column and we may be able to use some of the low rank
+stuff to implement it which may allow us to expand it if needed."
+Row-only vs column-only vs row+column was weighed; row+column (a
+per-(row,column) baseline ``m[i,j]`` built from two much smaller
+per-axis trackers, ``m_row[i]`` size ``n_in`` and ``m_col[j]`` size
+``n_out``) was chosen over column-only alone specifically because it
+generalizes toward this project's existing AQRS rank-N scale-tracking
+pattern (the same row-times-column factorization already used for
+``value_scale``/``output_scale``), leaving room to expand to a real
+low-rank factorization later if a single row+column term proves
+insufficient.
+
+**Additive, not Adafactor-style multiplicative -- a real mathematical
+subtlety, caught before implementing, not after**: Adafactor's own
+row/column reconstruction (``R[i]*C[j]/sum(R)``) is the
+I-divergence-minimizing solution for reconstructing a NONNEGATIVE
+target (it tracks ``g^2``). This project's ``m`` tracks the SIGNED
+gradient ``g`` itself (an EMA of ``g``, not ``g^2`` -- needed so
+``residual = g - m`` can actually cancel a sustained SIGNED bias, not
+just a magnitude). Applying Adafactor's multiplicative formula to a
+signed quantity risks division instability (near-zero or sign-flipping
+denominators) with no corresponding benefit, since its optimality proof
+doesn't transfer. Direct confirmation: "Hmm, good catch. Yeah, sounds
+good, let's write it up and build it." Fixed design:
+``m[i,j] = m_row[i] + m_col[j]``, each axis an INDEPENDENT
+``FirstMomentTracker`` EMA (below) -- no division anywhere.
+
+**``FirstMomentTracker<VALUE_TYPE>``** (``delta_csr_types.hpp``, scalar +
+``Block4Vec`` specializations): ``static VALUE_TYPE update(VALUE_TYPE m,
+VALUE_TYPE g, VALUE_TYPE beta1)`` -> ``beta1*m + (1-beta1)*g``, NaN/Inf
+guarded. A deliberately separate, tiny policy from
+Plain/BoundedRMSpropSynapsePolicy -- it tracks a pure statistic, not a
+gradient-descent-optimized parameter, so it has no ``update_cw``
+counterpart. Its own EMA rate is named ``centering_beta1`` throughout
+(engine parameter and ``kSynapsePolicyCenteringBeta1 = 0.9f`` in
+``cpu_backend.cpp``) to avoid collision with ``disldo_backward``'s
+existing, UNRELATED ``beta1`` parameter (used only for
+``value_scale_momentum``'s dead-row-bootstrap Adam-style update, a
+completely separate mechanism).
+
+**A real double-counting bug, found via an end-to-end smoke test, not
+caught by unit tests alone**: the first implementation had each axis
+(``m_row[i]``, ``m_col[j]``) independently fit the RAW gradient ``g``.
+When row and column effects are confounded -- e.g. constant ``x``/``dy``
+across every synapse of a dense layer, exactly what a real smoke test
+against ``sili.sparse_rnn.DISLDOLayer32(dense=True)`` used -- BOTH axes
+independently converge toward tracking the FULL ``g`` on their own, so
+``m[i,j] = m_row[i] + m_col[j]`` overshoots toward ``2g`` instead of
+``g``. Measured directly, sustained ``g=25`` (x=2.5, dy=10.0 constant),
+300 steps: no centering -> mean importance=16.9364; column-only ->
+0.5327 (correct, dramatic reduction); row+column (buggy) -> 16.8844
+(barely different from NO centering at all -- ``residual`` clips to
+``-max_abs_grad`` almost every step, reproducing the uncentered case).
+
+**Fix**: each axis fits the RESIDUAL after subtracting the OTHER axis's
+OLD (pre-this-touch) value, not raw ``g`` -- ``m_row``'s update uses
+``g - m_col_old``, ``m_col``'s update uses ``g - m_row_old``, both read
+from the SAME snapshot of the other axis taken before either write
+(avoiding update-order dependence). Verified by hand-calculation and by
+a dedicated unit test (``test_synapse_policy_centering.cpp``'s
+"REGRESSION: row+column additive centering..." ``TEST_CASE``, both a
+"buggy" section confirming the raw-``g`` formula genuinely converges to
+``2g`` and a "fixed" section confirming the residual formula converges
+to ``g``) that this converges correctly: from ``m_row=m_col=0``, touch 1
+gives both ``~=2.5``; touch 2 gives both ``~=4.5``; converges toward
+``m_row+m_col -> 25`` (exactly matching ``g``, no overshoot). Re-run of
+the same smoke test after the fix: row+column mean importance=0.4407 --
+on par with column-only's 0.5327, confirming the fix resolves the
+overshoot (down from the buggy 16.8844).
+
+**Per-SIMD-call ``m_row`` aggregation**: a single ``Block4Vec``
+``update_ci`` call touches ONE row against 4 (or, in the row-pair/
+tile-pair AVX2 variants, up to 8) columns simultaneously.
+``m_row[row]``'s own update uses the MEAN of the touched ``g_agg``
+values across however many columns were touched this call (via
+``block4_vec_hsum(g_agg_v)/BLOCK4_TILE``), treating the whole SIMD call
+as "one row touch" -- and, symmetrically, the residual subtracted from
+each axis's own update uses the MEAN of the OTHER axis's old lanes over
+the same touched set (e.g. row-pair's shared ``m_col`` update subtracts
+``(m_row_v0+m_row_v1)*0.5``; tile-pair's ``m_row`` update subtracts the
+mean of ``m_colA_v``/``m_colB_v`` across all 8 touched cells).
+
+**Scoped to the BLOCK4 path only this pass, scattered branches left
+unwired**: ``dense=True`` layers (used by all real MQAR training via
+``DISLDOLayer32``) store 100% of weights in block4 storage, making
+``disldo_backward``'s own scattered branch and
+``disldo_backward_sparse_grad``'s scattered branch dead code for this
+scenario. Both were left calling ``update_ci`` WITHOUT the new ``m``
+argument (defaulting to 0, a true no-op) -- a deliberate, documented
+scoping decision matching ``max_abs_grad``'s own initial-rollout
+precedent above. All BLOCK4-touching call sites (the 3 helper functions
+in ``linear_disldo_backward.hpp`` -- ``block4_backward_process_
+single_row``, ``_row_pair``, ``_tile_pair`` -- plus
+``sisldo_ops.hpp``'s ``disldo_backward_sparse_grad`` block4 branch) are
+fully wired.
+
+**New ``DISLDOLayerV`` state and API**: persistent
+``std::vector<V> m_row, m_col`` member fields (sized ``n_inputs``/
+``n_outputs``, zero-initialized, persisted across calls like ``ci``/
+weight storage itself -- NOT exposed via pybind, so not directly
+Python-readable). New Python-facing kwargs on ``backward_dense``/
+``backward_sparse``/both ``backward`` overloads: ``centering_row_enable:
+bool = false``, ``centering_col_enable: bool = false``,
+``centering_beta1: V = kSynapsePolicyCenteringBeta1``. Inside each C++
+method: ``V* m_row_ptr = centering_row_enable ? m_row.data() :
+nullptr;`` (same for ``col``), matching the existing nullable-pointer
+no-op-when-absent convention already used by ``Block4BackwardParams``.
+
+**Full 191-test regression passes clean** (up from 190 before this
+test's addition -- the new row+column double-counting regression test
+above) after the block4-path threading; a real ``pip install -e .``
+rebuild + the 3-way smoke test (no centering / column-only / row+column,
+via ``sili.sparse_rnn.DISLDOLayer32(dense=True)``, sustained large
+gradient, ``learning_rate=1e-9`` since ``disldo_backward``'s whole
+per-synapse update block -- including ``ci`` itself -- is gated behind
+``learning_rate != 0``) confirms the numbers above.
+
+**Update -- threaded through and launched (v15/v15b/v15c/v16)**: Python
+threading of ``centering_row_enable``/``centering_col_enable``/
+``centering_beta1`` through ``sili/sparse_rnn.py``'s ``DISLDOLayer32.
+forward`` wrapper (mirroring ``max_abs_grad``'s own ``float | None =
+None`` pattern) and sili_peridot's ``train_mqar_curriculum.py`` is done.
+Real MQAR results (v15=column-only GRADUATED at step 15063; v15b same-
+seed repeat and v15c new-seed repeat both stalled at (126,3); v16=row+
+column stalled at (126,3)) are in sili_peridot's own JOURNAL.md and
+``docs/research/train_mqar_curriculum.rst`` -- centering alone did not
+reliably prevent v/o/input_proj saturation. See
+``synapse_policy.ci_renorm`` below for the follow-up mechanism this
+motivated: centering changes what feeds ``ci``'s growth, but has no way
+to pull a layer's ci back down once it's already saturated.
+
+.. _synapse_policy.ci_renorm:
+
+CiRenorm: rescaling a layer's ci back toward a healthy region, not resetting it
+--------------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.ci_renorm``
+
+**Motivation, distinct from centering above**: the deep statistical pass
+over v12-v16's real recorded per-column data (sili_peridot's own
+JOURNAL.md) found a consistent pattern -- graduated runs keep ``v_proj``/
+``o_proj``/``input_proj``'s AVERAGE ``ci`` low (medians ~0.1-1.5 on the
+scale these logs use); every stalled run's average ``ci`` in those same
+layers climbs toward the ``max_ci=100`` ceiling and, once there, NEVER
+recovers within 100k steps (checked explicitly: zero spontaneous
+"slingshot"-style plateau exits across 5 stalled runs). Direct
+instruction, after establishing this: "the average ci of a layer is
+literally inversely proportional to the average plasticity of that
+layer... lowering the average importance values [is the fix]. Removing
+the top at-100-importance 'stuck' values would just be removing the
+actual, mathematically defined, 'most important', synapses. Importance
+was not a misnomer." This directly RULES OUT the per-neuron
+utility-based plasticity reset mechanism's own top-K-reset-to-random-
+weights action (``plasticity_reset_reset_fraction``, see
+``plasticity_reset.per_neuron_utility`` above) as a fix for THIS failure
+mode -- that mechanism targets specific columns believed to be
+wrongly-frozen; here, the highest-``ci`` columns are genuinely the most
+important ones, and discarding their weights would be a straightforward
+information loss, not a repair. The fix has to RESCALE the population's
+ci back into a workable range while preserving which synapses rank as
+more/less important -- never discard/reset any of them.
+
+**Two arms, one shared primitive**, per direct instruction to try both
+and compare empirically (mirroring the project's own column-only-vs-
+row+column precedent for centering):
+
+- **TrustRatio** (Arm A): a multiplicative rescale, LAMB-inspired (You
+  et al. 2019, ``https://arxiv.org/abs/1904.00962`` -- Adam extended
+  with a per-layer "trust ratio" ``||w||/||update||``, clipped to
+  ``[0.1, 10]``, used to scale each layer's step at BERT-scale). Chosen
+  over AMSGrad (Reddi et al. 2018 -- takes a running MAX of past ``v_t``,
+  which would make a saturation problem strictly WORSE, not better) and
+  found more directly portable than Adafactor's increasing-beta2
+  schedule (targets general long-run staleness, not a hard-capped
+  accumulator already pinned at its ceiling).
+- **StableRegion** (Arm B): an affine (z-score) renormalize toward an
+  EMPIRICALLY-DERIVED per-layer ``(target_mean, target_std)``, pulled
+  directly from graduated runs' (v13/v15) own real recorded data
+  (medians over each run's step>=3000 window): ``q_proj``
+  (0.09, 0.18), ``k_proj`` (0.10, 0.13), ``v_proj`` (0.40, 0.35),
+  ``input_proj`` (1.05, 1.47), ``o_proj`` (0.20, 0.67), ``lm_head``
+  (0.09, 0.03). Direct instruction, after the design was refined to also
+  control variance, not just mean: "stable average and variance too."
+
+Both are implemented as ONE new primitive, ``ci_renorm_touch_cell`` +
+``ci_renorm_cycle_boundary`` (``delta_csr_types.hpp``), differing only
+in how the per-column target is computed, applied via the SAME
+monotonic full-coverage cursor shape already established for the decay/
+plasticity work (never retries, never skips, wraps cleanly -- direct
+instruction: "you need to keep a cursor that has an exact position in
+the entire array that always iterates and doesn't retry or go back,
+like the cathode ray on a crt always scanning"). Writes the corrected
+value DIRECTLY into the real per-synapse ``ci`` storage (not a
+side-channel copy), the same way ``l2_decay_lambda``'s own action does
+-- reaches ``update_cw``'s denominator on every subsequent real step
+with zero kernel changes needed.
+
+**Why v3's own similar-looking mechanism (``l2_decay_lambda``,
+plasticity_reset.l2_saturation_decay above) isn't reused directly**: v3
+launched with a real ``lambda=0.05`` and the result was decay tying
+almost exactly with growth (net delta statistically indistinguishable
+from zero, confirmed against real per-cycle column data). Root cause,
+directly diagnosed: v3's correction only touches each synapse ONCE per
+amortized cycle (~1% of cells/call, ~100 real steps between touches per
+cell) using a WEAK proportional shrink, while the real per-synapse
+``ci`` accumulator grows every SINGLE real step -- the correction could
+never catch up. Direct correction to this diagnosis, mid-design: "I
+think v3 was just applied incorrectly. You should be able to apply the
+correction in an amortized way as well, you just need to apply it as a
+correction or a general diff." Fix: when a cell IS touched (still only
+once per lap, same amortized cadence as before), apply the FULL
+corrective diff to target immediately, not a small nudge -- staleness is
+then bounded to exactly "one lap's worth of real growth since last
+correction" (a precise, stated guarantee: ``ceil(n/chunk_size)`` calls),
+not an asymptotic race a weak nudge can never win.
+
+**Real bugs found via this file's own TDD tests and an end-to-end smoke
+test, not caught by inline reasoning alone**:
+
+1. *Cursor resume bug* (``ci_renorm.cursor_resume_bug``) -- found via a
+   coverage test using a ``chunk_size`` that doesn't evenly divide
+   ``nnz``, spanning a row boundary across multiple calls. The
+   PRE-EXISTING scattered ``skip_empty_rows()`` lambda (copied from
+   ``apply_amortized_plasticity_step``, used unmodified since v2/v3)
+   unconditionally resets ``cursor.elem_pos`` to the current row's start
+   EVERY time it runs, even when resuming mid-row from a previous call
+   (the common case) -- silently discarding the resumed position,
+   double-touching whatever cell the cursor was sitting on, and
+   shifting every later cell in that lap. Confirmed via a standalone
+   probe: a 3x4 grid, ``chunk_size=5`` (not a divisor of 12), showed
+   column 0's measured mean off by exactly one extra touch (4.8 instead
+   of the correct 4.0). Fixed in CiRenorm's OWN scattered traversal
+   (only reassign ``elem_pos`` when ``cursor.row`` itself just changed,
+   never unconditionally). NOT fixed in the pre-existing
+   ``apply_amortized_plasticity_step`` -- flagged with a ``TODO: BUG,
+   DELETE-CANDIDATE`` comment there instead, since that mechanism's own
+   top-K reset action is being retired (see the "Motivation" section
+   above), making it a deletion candidate rather than a maintenance
+   target. The block4 side's own cursor (``block4_plasticity_TODO_
+   DELETE.hpp``) does NOT have this bug -- its ``elem_pos``/``byte_pos``
+   reassignment already lives inside the while loop, only firing on an
+   actual row advance, confirmed by direct inspection before assuming
+   parity.
+2. *TrustRatio circularity* (``ci_renorm.trust_ratio_circularity_fix``)
+   -- the first implementation approximated LAMB's ``||update||`` by
+   substituting ``g ~= sqrt(ci)`` (a converged accumulator's own
+   definition), giving ``||update|| ~= eff_lr*sqrt(ci)`` -- but then
+   dividing THAT by ``sqrt(ci)`` again (the correction target) makes
+   ``ci`` cancel out algebraically, carrying no information regardless
+   of its actual value. Caught before implementing further by direct
+   derivation, not by testing. Fixed by comparing ``||w||`` against a
+   FIXED reference instead -- the update scale implied by the ci CEILING
+   itself (``max_ci_ref``, independent of this column's own current/
+   lagged ci).
+3. *Stale-reference convergence bug*
+   (``ci_renorm.stale_reference_convergence_bug``) -- found via an
+   end-to-end smoke test (``DISLDOLayerV``, StableRegion,
+   ``target_mean=5``, sustained ``ci=50``): expected convergence to 5.0,
+   observed instead 50 -> 50 -> 5.0 -> **0.0** across 3 laps -- a
+   collapse, not a convergence. Root cause: stats were accumulated from
+   the PRE-correction value at touch time, so a lap's own finalized
+   ``(mean, std)`` described the population as it was BEFORE that same
+   lap's own touches had already overwritten it in storage -- the NEXT
+   lap's correction then compared freshly-corrected values (already at
+   5.0) against a STALE reference (the OLD population's mean of 50),
+   producing a huge, wrong residual and clamping toward 0. Fixed by
+   accumulating stats from the RESULTING (post-correction) value instead
+   -- what's actually left in storage, and what the next lap will
+   actually read. Verified: the identical smoke test now shows 50 -> 5.0
+   -> 5.0 -- converges immediately and stays stable.
+4. *TrustRatio had no equilibrium*
+   (``ci_renorm.trust_ratio_no_equilibrium_bug``) -- found via the SAME
+   smoke test's TrustRatio arm: 90 -> 1.96 -> 0.045, still visibly
+   shrinking lap over lap, not settling anywhere. Root cause: the raw
+   per-touch multiplicative scale (``ci_val * scale``) depended only on
+   FIXED external quantities (``||w||``, ``eff_lr``, the ceiling
+   reference) -- never on ``ci`` itself -- so the identical scale factor
+   reapplies every single lap, producing unbounded geometric decay (or
+   growth, depending on sign) with no natural stopping point. Fixed by
+   deriving a FIXED implied target ci from the weight norm (the ci value
+   at which ``trust_ratio`` would be exactly 1, i.e. no correction
+   needed: ``ci_implied = (||w|| / eff_lr)^2``) and renormalizing the
+   population MEAN toward THAT target (scale-only, no std change,
+   preserving relative spread) -- giving TrustRatio the same kind of
+   stable fixed point StableRegion already has by construction. Verified
+   via a dedicated regression test (8 laps, converges to and holds
+   exactly the derived ``ci_implied``) and re-confirmed via the smoke
+   test (now stabilizes at a fixed value between consecutive laps
+   instead of continuing to shrink).
+
+**Scope**: block4 AND scattered arms both wired (unlike ``max_abs_grad``/
+centering's initial block4-only rollout) -- the scattered traversal is a
+genuinely separate, small addition (not touching the buggy pre-existing
+plasticity cursor), so there was no reason to defer it. ``DISLDOLayerV``
+bindings: ``apply_amortized_ci_renorm``/``apply_amortized_block4_ci_
+renorm(chunk_size, mode, target_mean, target_std, eff_lr, max_ci_ref=100,
+trust_ratio_min=0.1, trust_ratio_max=10) -> dict`` -- ``mode``: 0=Off
+(exact no-op), 1=TrustRatio, 2=StableRegion. ``target_mean``/
+``target_std`` are length-``n_outputs`` arrays, only read when
+``mode=StableRegion`` (pass empty arrays for TrustRatio).
+
+**Verification**: 211/211 C++ tests pass (10 new: core arithmetic
+no-op/first-lap/cycle-boundary/rank-preservation/clamp cases, the 2
+regression tests above, scattered coverage+bit-writes, block4 coverage
++bit-equivalence). Full ``pip install -e .`` rebuild + a real end-to-end
+smoke test via ``_cpu.DISLDOLayerV`` confirms both arms converge and
+hold stable (StableRegion: 50->5.0->5.0; TrustRatio: stabilizes at its
+derived ``ci_implied`` and stops moving between laps).
+
+.. _synapse_policy.weight_renorm:
+
+WeightRenorm: CiRenorm's own trade-off needed a second, matching fix
+------------------------------------------------------------------------------------------------
+
+*ID:* ``synapse_policy.weight_renorm``
+
+**Real runaway found by launching v18's own repeat, not by inline
+reasoning**: v18 (StableRegion) graduated; its same-seed repeat (v18b)
+did not, landing at ``(64,3)``. Statistical comparison of the two
+runs' recorded ``raw_weight``/``raw_importance`` matrices found ``ci``
+itself was held correctly near the StableRegion target in BOTH runs
+throughout training -- CiRenorm was working exactly as designed, even
+in the run that stalled. But v18b's ``v_proj``/``o_proj``/
+``input_proj`` weight norm was NOT bounded at all: bucketed every 5000
+steps, it climbs smoothly from ~17 (matching v18/v18c's own healthy
+range) to 360 by step 95000 -- a genuine, continuously-compounding
+runaway, not a step-change. v18c (a NEW seed, also graduated) shows
+the SAME direction of drift but far more gently (17.0 -> 18.0 over
+40000 steps) -- the underlying tendency is present in every run,
+only its GROWTH RATE differs.
+
+**Mechanism**: StableRegion forcibly holds ``ci`` near a FIXED
+empirical target every lap, regardless of what the true gradient
+magnitude is currently doing. That is exactly right when the target
+matches the real variance -- but ``v_proj``/``o_proj``/``input_proj``'s
+genuine gradient magnitude legitimately GROWS over training (this
+entire investigation's own recurring finding). Pinning ``ci`` low
+while true signal grows keeps the effective step
+(``eff_lr*g*S/sqrt(ci)``) large, letting weight grow faster than
+warranted -- and a larger weight can itself drive larger downstream
+gradients, which the fixed ``ci`` target still refuses to track. A
+genuine positive-feedback loop, confirmed by matched-pair analysis:
+v18 vs v18b (same seed, same config) already show real ``ci``
+divergence by step 5000-8000, well before the runaway is visible in
+absolute weight-norm terms -- a small early difference (the same
+threading-order sensitivity flagged throughout this investigation) is
+what the feedback loop then amplifies.
+
+**Fix, direct instruction**: "I guess we have to do a weight renorm in
+addition to the ci renorm. Exact same method would probably be fine."
+``WeightRenorm`` reuses ``ci_renorm_touch_cell``/
+``ci_renorm_cycle_boundary``/``CiRenormState`` VERBATIM (not
+duplicated) -- the arithmetic is identical, only which field gets
+touched differs, so the SAME 4-bug-tested core (see
+``synapse_policy.ci_renorm`` above) applies directly. The one real
+change needed: a new ``clamp_nonnegative`` parameter on
+``ci_renorm_touch_cell`` (default ``true``, byte-identical for every
+existing ``ci`` call site), set ``false`` for weight -- weight is
+signed, unlike ``ci``. Only ``mode=StableRegion`` is meaningful for
+weight (``TrustRatio``'s own formula is DERIVED FROM weight norm, so
+applying it to renormalize weight itself would be circular).
+
+**Targets, same discipline as CiRenorm's own ci targets**: per-column
+weight mean/std pulled from v18/v18c's own real recorded data, step<8000
+(before either run's own drift became meaningful) -- weight mean is
+essentially 0 everywhere (fan-in-scaled, zero-mean by construction), so
+only the std varies by layer: ``q_proj``/``k_proj``/``v_proj``/
+``o_proj`` ~0.059, ``input_proj``/``lm_head`` ~0.16 (matching their
+different fan-in).
+
+**New primitives**: ``apply_amortized_weight_renorm_step``/
+``apply_amortized_block4_weight_renorm_step`` (scattered + block4,
+mirroring CiRenorm's own traversal functions structurally but touching
+``weight``/``set_weight`` instead of ``ci``/``set_importance``) --
+own separate cursor/state per storage type (a layer can run CiRenorm
+and WeightRenorm simultaneously, touching different fields, no
+interaction). ``DISLDOLayerV`` bindings:
+``apply_amortized_weight_renorm``/``apply_amortized_block4_weight_
+renorm(chunk_size, mode, target_mean, target_std) -> dict`` -- no
+``eff_lr``/``max_ci_ref``/``trust_ratio_*`` (not applicable without a
+TrustRatio arm).
+
+**Verification**: 216/216 C++ tests pass (5 new: the
+``clamp_nonnegative`` parameter's default-preserves-behavior +
+negative-result cases, scattered no-op/signed-renormalize, block4
+no-op/signed-renormalize). Smoke-tested via ``_cpu.DISLDOLayerV``: a
+layer seeded with weights 20x a healthy scale (mean=-5.3, std=17.6)
+converges in ONE lap to exactly the target (mean=0.0, std=0.5) and
+holds there stably across further laps, with ``importance`` completely
+untouched throughout.
 
 .. _synapse_policy.block4vec_specializations:
 
@@ -1357,3 +2313,56 @@ the SAME column-level ``k[c]`` -- since ``S/k[c] = sum_ki(vs_ki*(os_ki/
 k[c])) = (sum_ki vs_ki*os_ki)/k[c]`` (distributive law), this generalizes
 cleanly to any ``scale_rank``; at ``scale_rank==1`` it's identical to the
 original single-component form.
+
+.. _plasticity_reset.l2_init:
+
+L2 Init -- regularize weight toward its own initial value, not toward zero
+-----------------------------------------------------------------------------
+
+*ID:* ``plasticity_reset.l2_init``
+
+EXPERIMENTAL, genuinely new mechanism (did not exist before this
+commit). Built after the sili_peridot offline Python sandbox
+(``scripts/plasticity_sim.py``) tested it against real recorded
+training data and found ``rate=0.0001`` avoided importance saturation
+while keeping real accumulated importance -- see
+``docs/research/toy_tile_recurrence_rmt.rst:plasticity_algorithm_sandbox``
+(sili_peridot side) for the full sandbox derivation and citation: Kumar,
+Marklund & Van Roy, "Maintaining Plasticity in Continual Learning via
+Regenerative Regularization", CoLLAs 2025, arXiv:2308.11958. Direct
+instruction to build this for real: "let's try both of them and record
+while seeing if it helps reliably beat mqar rather than randomly
+stalling."
+
+``apply_amortized_l2_init``/``apply_amortized_block4_l2_init``
+(``delta_csr_types.hpp``/``block4_l2_init_TODO_DELETE.hpp``): same
+amortized/chunked-cursor shape as ``apply_amortized_decay_stats``. A
+cell's FIRST touch only captures its CURRENT weight as the reference
+"initial" value (no modification -- nothing to regularize toward yet);
+every touch after that pulls ``rate`` of the way back toward the
+captured reference: ``new_w = w + rate*(initial_weight - w)``.
+Importance is never touched -- L2 Init targets trainable weight, not
+this project's own ``ci`` accumulator. Block4 indexes its
+``initial_weight``/``captured`` reference arrays by a stable per-tile
+visit order (``tile_index*16 + li*4+lj``) -- deterministic across
+cycles as long as the store's own tile layout doesn't change mid-run
+(true for a dense-loaded, non-synaptogenesis run, which is what this
+was built for; a genuinely dynamic tile layout would need a different
+indexing scheme, not yet needed).
+
+Independent of ``apply_amortized_plasticity_reset`` -- separate
+cursor/reference-value state per storage type, can run alongside it or
+alone (v10's real validation run does exactly that: plasticity_reset
+enabled with ``reset_fraction=0.0``, a deliberate no-op kept only to
+reuse its existing column-log capture pathway, while L2 Init is the
+only mechanism actually touching weights).
+
+Tested in ``tests/unit/test_amortized_l2_init.cpp`` and
+``tests/unit/test_block4_l2_init.cpp``: first touch captures without
+modifying; second touch pulls exactly toward the captured reference
+(verified with hand-computed expected values); a weight already AT its
+initial value stays there (pull toward itself is a no-op); cursor
+wraps and reports ``cycle_complete`` correctly; an empty layer reports
+completion immediately with zero touches. Full regression: 182 total
+(177 passed, same 5 pre-existing ``pre_existing_failure`` failures, no
+new regressions).

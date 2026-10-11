@@ -817,3 +817,58 @@ same computation, just walking the nonzero set directly):
 ``additive_gamma``'s own update is a direct port including its own EMA/
 dynamic-rank-control tracking call (``update_additive_gamma_ema_k``), same
 shared-method pattern as ``scale_gamma``'s above.
+
+.. _disldo_backward_sparse_grad.energy_lr_scale:
+
+``energy_lr_scale``: per-output-neuron post-clip learning-rate multiplier (Arm H)
+------------------------------------------------------------------------------------
+
+*ID:* ``disldo_backward_sparse_grad.energy_lr_scale``
+
+Opt-in, nullptr default (exact no-op). Applied at BOTH ``update_cw``
+call sites (scattered and block4 branches) as
+``effective_lr * energy_lr_scale[col]`` -- indexed by ``col`` (the
+OUTPUT/n_out axis, matching ``dy``'s own columns), NOT folded into the
+per-ROW ``effective_lr`` computed earlier in each branch (row = INPUT/
+n_in axis here -- traced directly from the code, not assumed, since
+``m_row``/``m_col`` in this same function already establish that
+row/col mean input/output respectively).
+
+Why this exists (MQAR energy investigation, 2026-09-29): an ADDITIVE
+per-neuron loss term competing with the task gradient was found
+mathematically unable to matter here -- ``max_abs_delta`` (default 2.0)
+clips the RMSprop-normalized update (``g/sqrt(ci)``) before ``eff_lr``
+is applied, and real measured task gradients run 4-5+ orders of
+magnitude past the point where that clip saturates, in both healthy
+and stuck training regimes. Past that clip, the update is sign-only;
+an additive competitor would need to match the task gradient's own
+raw magnitude to ever flip that sign, at which point it isn't a
+lever, it's a counterweight requiring an absurd coefficient.
+``energy_lr_scale`` sidesteps this by multiplying the ALREADY-CLIPPED,
+sign-decided step -- proportional to whatever the real update already
+is, not competing against it. A per-neuron energy-derived multiplier
+here (e.g. ``exp(kappa*(energy-setpoint))``, bounded automatically by
+energy's own clamped range) accelerates or dampens a specific neuron's
+learning rate without needing to fight for gradient-sign dominance.
+
+Only threaded through ``disldo_backward_sparse_grad`` (the
+``backward_sparse`` path) -- NOT ``disldo_backward`` (the plain dense
+path, ``linear_disldo_backward.hpp``). ``DISLDOLayerV``'s Python
+wrapper (``DISLDOLayer32.forward``) raises if ``energy_lr_scale`` is
+given without also routing through ``backward_sparse`` (``dy_gate_mask``,
+``dy_r_target``, or ``dy_sparsity_p`` set -- ``dy_sparsity_p=1.0`` is a
+functional no-op sparsification that still routes correctly, for using
+``energy_lr_scale`` standalone without also gating selection).
+
+Covers both the scattered (``DeferredScaleWrite`` and non-deferred)
+and block4 branches within this function -- confirmed this function is
+PURELY SCALAR (no ``Block4Vec``/SIMD path exists here at all, unlike
+``linear_disldo_backward.hpp``), so no vectorized counterpart needed.
+Tested directly: ``tests/unit/test_disldo_backward_sparse_grad_energy_lr_scale.cpp``
+(nullptr is an exact no-op; a real array proportionally scales the
+touched column's weight delta, verified against an untouched column's
+identical delta) and
+``tests/unit/python/test_disldo_layer32_energy_lr_scale.py`` (Python-level
+routing/guard behavior, and an end-to-end post-update forward-output
+check confirming the parameter isn't silently dropped anywhere in the
+Python wrapper).
