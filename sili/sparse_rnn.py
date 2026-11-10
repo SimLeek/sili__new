@@ -1278,6 +1278,7 @@ class DISLDOLayer32(_SparseLayerBase):
         centering_beta1: float | None = None,
         requires_grad: bool = True,
         dy_sparsity_p: float | None = None,
+        dy_sparsity_schedule: list[float] | None = None,
         dy_r_target=None,
         dy_k_min: int = 0,
         dy_k_max: int | None = None,
@@ -1287,8 +1288,16 @@ class DISLDOLayer32(_SparseLayerBase):
         # dy_gate_mask: an externally-determined, shared (same for every
         # row this call) boolean column mask -- e.g. a per-neuron time-
         # based trainability gate, not a measured-magnitude selection.
-        # Takes priority over dy_r_target/dy_sparsity_p when given (see
-        # _bwd below). See _gated_columns_to_csr's own docstring.
+        # Takes priority over dy_sparsity_schedule/dy_r_target/dy_sparsity_p
+        # when given (see _bwd below). See _gated_columns_to_csr's own
+        # docstring.
+        #
+        # dy_sparsity_schedule: per-row graded density (ported from
+        # DISLDOLayer.forward's identical mechanism -- same
+        # _graded_top_k_csr/top_k_csr_graded kernel, DISLDOLayer32 never
+        # had this kwarg). Overrides the scalar dy_sparsity_p when given,
+        # same priority DISLDOLayer.forward itself uses. See
+        # docs/research/sparse_rnn.rst:disldo_layer_forward.dy_sparsity_schedule_and_nucleus_grad.
         #
         # energy_lr_scale: Arm H -- per-OUTPUT-neuron post-clip learning-
         # rate multiplier (size n_outputs, energy-derived by the caller),
@@ -1301,12 +1310,19 @@ class DISLDOLayer32(_SparseLayerBase):
         # ignoring it -- pass dy_sparsity_p=1.0 (a functional no-op
         # sparsification, still routes through backward_sparse) to use
         # energy_lr_scale standalone, without also gating selection.
-        if energy_lr_scale is not None and dy_gate_mask is None and dy_r_target is None and dy_sparsity_p is None:
+        if (
+            energy_lr_scale is not None
+            and dy_gate_mask is None
+            and dy_sparsity_schedule is None
+            and dy_r_target is None
+            and dy_sparsity_p is None
+        ):
             raise ValueError(
                 "energy_lr_scale requires routing through backward_sparse -- set "
-                "dy_gate_mask, dy_r_target, or dy_sparsity_p (e.g. 1.0 for a "
-                "functional no-op) alongside it; dy_sparsity_p=None routes to the "
-                "plain dense backward() path, which does not support energy_lr_scale."
+                "dy_gate_mask, dy_sparsity_schedule, dy_r_target, or dy_sparsity_p "
+                "(e.g. 1.0 for a functional no-op) alongside it; dy_sparsity_p=None "
+                "routes to the plain dense backward() path, which does not support "
+                "energy_lr_scale."
             )
         #
         # CSR-typed input / dy_sparsity_p: mirrors DISLDOLayer.forward's
@@ -1372,6 +1388,29 @@ class DISLDOLayer32(_SparseLayerBase):
                 if dy_gate_mask is not None:
                     dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
                     dp, di, dv = _gated_columns_to_csr(dy2d, dy_gate_mask)
+                    _record_grad_selection_stats(self, dy2d, dp, di, dv)
+                    dx = self._c.backward_sparse(
+                        x_dense,
+                        dp,
+                        di,
+                        dv,
+                        dy2d.shape[0],
+                        learning_rate,
+                        lr_per_row_nnz=lr_per_row_nnz,
+                        damp_by_importance=damp_by_importance,
+                        **sparse_extra,
+                    )
+                elif dy_sparsity_schedule is not None:
+                    # Per-row graded density, overrides scalar dy_sparsity_p
+                    # -- ported from DISLDOLayer.forward's identical branch.
+                    dy2d = dy if dy.ndim == 2 else dy[np.newaxis, :]
+                    if len(dy_sparsity_schedule) != dy2d.shape[0]:
+                        raise ValueError(
+                            f"dy_sparsity_schedule has {len(dy_sparsity_schedule)} entries, "
+                            f"but dy has {dy2d.shape[0]} rows"
+                        )
+                    k_per_row = [max(1, int(dy2d.shape[1] * p)) for p in dy_sparsity_schedule]
+                    dp, di, dv = _graded_top_k_csr(dy2d, k_per_row, self._c.num_cpus)
                     _record_grad_selection_stats(self, dy2d, dp, di, dv)
                     dx = self._c.backward_sparse(
                         x_dense,
