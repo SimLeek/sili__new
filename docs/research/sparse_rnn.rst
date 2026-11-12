@@ -615,6 +615,25 @@ gradient energy, not a fixed fraction. See sili_peridot/JOURNAL.md's
 nucleus design note, and ``nucleus_top_k_csr.r_target_math`` above for the
 underlying math.
 
+**The ``if``/``elif`` chain selecting between these (and ``dy_sparsity_p``)
+in both ``DISLDOLayer.forward`` and ``DISLDOLayer32.forward``'s ``_bwd()``
+is a caller-side wiring choice for testing each mechanism in isolation,
+NOT an algorithmic conflict** (resolved, sili_peridot JOURNAL.md
+2026-11-10/11, "dy_sparsity_schedule/dy_r_target mutually exclusive"
+entry). ``_graded_top_k_csr(dy2d, k_per_row, num_cpus)`` is the one real
+generic mechanism underneath both ``dy_sparsity_schedule`` (caller-given
+``k_per_row``) and ``dy_sparsity_p`` (``np.full(n_rows, k_dy)`` -- a
+uniform scalar is just this kernel's degenerate case). ``dy_r_target``'s
+nucleus selection produces the same SHAPE of output (a per-row ``k``),
+just derived from each row's own gradient-energy profile instead of
+handed in externally. Composing "rows selected by a schedule, columns
+within those rows selected by the nucleus criterion instead of a fixed
+schedule value" is architecturally straightforward -- combine the
+schedule's row-eligibility with a nucleus-derived per-row ``k`` for
+eligible rows, feed the result into ``_graded_top_k_csr``. Not
+implemented -- noted for whenever this becomes the actual bottleneck,
+not for lack of a path to compose them.
+
 .. _disldo_layer.apply_dynamic_rank_control_theorem10:
 
 ``apply_dynamic_rank_control``: Theorem 10, and the biological basis for per-branch grace periods
