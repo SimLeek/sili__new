@@ -52,5 +52,17 @@ def Laws.kernel_age_monotone_without_forgetting(e, n):
   %Arith.add_zero(Laws.Kernel.w(1n, e, n)) : {Nat.add(Nat.add(Laws.Kernel.w(1n, e, n), 0n), Laws.Kernel.pow(e, 1n+n)) == Nat.add(_, Laws.Kernel.pow(e, 1n+n)) : Nat}
   {==}
 
+# LAW 5. Induction on n. The step rewrites w by the hypothesis, moves the
+# (n+1) factor past b with mul_swap_l, and finishes on add_comm -- so the
+# closed form is exactly what the one-tick recurrence does on the diagonal.
+def Laws.kernel_diagonal(b, n):
+  match n:
+    case 0n:
+      {==}
+    case 1n++p:
+      %Laws.kernel_diagonal(b, p) : {Nat.add(Nat.mul(b, Laws.Kernel.pow(b, p)), Nat.mul(1n+p, Nat.mul(b, Laws.Kernel.pow(b, p)))) == Nat.add(Nat.mul(b, _), Nat.mul(b, Laws.Kernel.pow(b, p))) : Nat}
+      %Arith.mul_swap_l(b, 1n+p, Laws.Kernel.pow(b, p)) : {Nat.add(Nat.mul(b, Laws.Kernel.pow(b, p)), _) == Nat.add(Nat.mul(b, Nat.mul(1n+p, Laws.Kernel.pow(b, p))), Nat.mul(b, Laws.Kernel.pow(b, p))) : Nat}
+      Arith.add_comm(Nat.mul(b, Laws.Kernel.pow(b, p)), Nat.mul(b, Nat.mul(1n+p, Laws.Kernel.pow(b, p))))
+
 def main() -> Nat:
   Laws.Kernel.w(1n, 2n, 3n)

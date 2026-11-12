@@ -98,3 +98,30 @@ law kernel_age_monotone_without_forgetting:
   for +e: Nat
   for +n: Nat
   {Kernel.w(1n, e, 1n+n) == Nat.add(Kernel.w(1n, e, n), Kernel.pow(e, 1n+n)) : Nat}
+
+# LAW 5 (the diagonal kernel, and the reason a knob-free rule exists). On the
+# DIAGONAL b = eta the kernel collapses to a closed form:
+#
+#     w(b, b, n) == (n + 1) * b^n
+#
+# This is the only setting with an INTERIOR PEAK. Either gate alone gives a
+# kernel that merely rises and saturates (alpha = 0, Law 4) or merely decays,
+# so neither can express "weight writes of age ~L most heavily". The diagonal
+# can: (n+1) b^n peaks at n* = -1/ln b - 1 ~= 1/(1 - b), and its total mass is
+# 1/(1 - b)^2.
+#
+# Inverting the peak against a MEASURED mean retrieval lag L therefore fixes
+# every gate with no hyperparameter left over:
+#     b = eta = 1 - 1/L   =>   alpha = 1/L,  theta_scale = (1-b)^2 = 1/L^2
+# L comes from the input stream (how far back its own queries reach), so this
+# is a derived rule rather than a tuned one -- which is the point, since the
+# previous lag-driven controller had merely traded two tuned gates for one
+# tuned horizon.
+#
+# Stated with the closed form on the LEFT so that w(b,b,n) is the rewritable
+# side, as with Law 1.
+law kernel_diagonal:
+  for +b: Nat
+  for n: Nat
+  {Nat.mul(1n+n, Kernel.pow(b, n)) == Kernel.w(b, b, n) : Nat}
+
