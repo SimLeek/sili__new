@@ -46,8 +46,10 @@ absorbs.
   uniform k-subset. That probabilistic step is not in the Bend file; the file
   proves the counting that makes it give equal coverage.
 - **Temporal persistence.** z drifts, so consecutive chunks keep mostly the same
-  dims. That changes the variance, not the expectation: marginally each chunk is
-  still a uniform k-subset. The persistence itself is not proved to help.
+  dims, copying biology (credit stays on similar inputs for a while). It is a
+  separate property from the unbiasedness above and does not change it: each
+  chunk is still marginally a uniform k-subset. Nothing here says what the
+  persistence itself does.
 - **Top-k by |G| is biased.** That is the contrast, not a theorem here: its kept
   set depends on G, so dims with persistently small |G| are kept less often and
   their credit is under-weighted every step. Stich, Cordonnier and Jaggi,
