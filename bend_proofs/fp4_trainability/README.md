@@ -69,7 +69,9 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
 
      The long-run mean is on target (within 0.022 in every run). The error is
      in units of the scale S, so it can only come down through smaller S,
-     averaging over more synapses (width), or something that anneals.
+     averaging over more synapses (width), or something that anneals. That is
+     what the Hadamard and additive LoRAs are for: they carry the low-rank part
+     in fp32 and set S, leaving the full-rank residual to width.
    - **Crossing zero.** Start +1, target -1, 1000 runs each at lr .1, .01 and
      .001: `fp4_quantize_stochastic` and `_stochastic_live` cross in 1000/1000,
      `fp4_quantize_live` (nearest) and
@@ -147,7 +149,10 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
     signs; not proved here.
   - It is an *exact emulation* bound: it shows that precision can be bought
     with width, never that it must be.
-- **The size that trains to equal quality is unknown.** The 1.29x first quoted
+- **There may be no single size equivalence.** Models split differently
+  between precise work and decision (if-then) work: the bound above is the
+  price of pure precision, and decision work can cost far less, so the ratio is
+  a per-task measurement. The 1.29x first quoted
   here is withdrawn. It came from Kumar et al.'s weight-precision fit
   (`N_eff = N(1 − e^(−P/2.6745))`), where only the forward pass is quantized,
   so it does not describe training with nothing but the 4-bit code stored.
