@@ -3,6 +3,11 @@
 Run `bend PROOF.bend --check-only` (prints `ALL PROOFS CHECK`; four laws). Nat
 arithmetic only, shared lemmas from `../lib/NAT.bend`.
 
+**Corrected 2026-11-22.** The first version of this README (PR #58) drew three
+conclusions the laws do not support: that stored-fp4 training converges as SGD
+does, that NVIDIA's NVFP4 result is evidence for it, and that it needs about
+1.29x the parameters. All three are withdrawn below. The laws are unchanged.
+
 Question (sili_quartz TODO 2b.1): can sili's fp4 setup (fp4 weights + fp4
 optimizer state, Hadamard-product scales and additive low-rank branches, with
 annealing) train and learn the recurrent MQAR? If low bits cannot match fp32
@@ -32,7 +37,7 @@ Per synapse, sili stores two fp4 codes (E2M1: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±
   Only weights and importance are 4-bit.
 
 That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
-48 with bf16 Adam moments.
+48 with bf16 Adam moments. These are per synapse, not at equal quality.
 
 ## What is proved
 
@@ -46,14 +51,35 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
 ## What it means for training
 
 1. **Stochastic learning is required, not optional.** Under round-to-nearest,
-   any update smaller than half the fp4 spacing is lost every time, so the
-   expected drift is zero and training stalls once steps get small. Under
-   stochastic rounding, the stored weight follows the fp32 trajectory in
-   expectation (`sr_unbiased`). Each step adds zero-mean noise of variance at
-   most `w²/4` (`sr_second_moment`). Unbiased plus bounded variance is the
-   standard SGD setting, so fp4 training converges as SGD does, only noisier.
-   (Gupta et al. 2015; NVIDIA's NVFP4 pretraining uses stochastic rounding on
-   gradients for the same reason.)
+   any update smaller than half the fp4 spacing is lost every time. Under
+   stochastic rounding each single update is kept in expectation
+   (`sr_unbiased`), with added variance `d·e ≤ w²/4` (`sr_second_moment`).
+   This is a one-step statement. The trajectory matches fp32 in expectation
+   only where the gradient is linear in the weight.
+   - **The noise floor.** With no high-precision copy, that variance does not
+     go away as lr shrinks (Li et al., NeurIPS 2017, Theorem 5). Measured with
+     the real `fp4_quantize_stochastic_live` on `dw = -lr·(w - target)`:
+
+     | target | rms error, lr .1 | .01 | .001 | .0001 | √(d·e) |
+     |---|---|---|---|---|---|
+     | 0.1 | 0.488 | 0.491 | 0.488 | 0.490 | 0.490 |
+     | 0.3 | 0.401 | 0.405 | 0.404 | 0.416 | 0.400 |
+     | 1.2 | 0.244 | 0.243 | 0.244 | 0.245 | 0.245 |
+     | 3.4 | 0.490 | 0.492 | 0.488 | 0.489 | 0.490 |
+
+     The long-run mean is on target (within 0.022 in every run). The error is
+     in units of the scale S, so it can only come down through smaller S,
+     averaging over more synapses (width), or something that anneals. That is
+     what the Hadamard and additive LoRAs are for: they carry the low-rank part
+     in fp32 and set S, leaving the full-rank residual to width.
+   - **Crossing zero.** Start +1, target -1, 1000 runs each at lr .1, .01 and
+     .001: `fp4_quantize_stochastic` and `_stochastic_live` cross in 1000/1000,
+     `fp4_quantize_live` (nearest) and
+     `block4_vec_quantize_stochastic_fp4_live` in 0/1000.
+   - **The SIMD live quantizer must not be used or ported.** Despite its name,
+     `block4_vec_quantize_stochastic_fp4_live` redirects to the value's own
+     sign, so for |v| < 0.5 it is deterministic and biased by up to 0.5. Only a
+     unit test calls it today: both kernels quantize with the scalar functions.
    - **Never-zero weights stay unbiased.** Below 0.5 in magnitude,
      `_live` rounds stochastically between −0.5 and +0.5 with
      `p(+0.5) = v + 0.5`. That is `sr_unbiased` on a cell of width 1 shifted
@@ -89,8 +115,9 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
        `ci`, which gives larger steps than RMSprop.
      - **Measure the fraction of `ci` at the floor (code 1) and at saturation
        (code 7) during training.**
-   - **Clips bias the step.** `max_abs_delta` caps the normalized step and
-     `max_abs_grad` caps g before the EMA. Clipped SGD is biased: it converges
+   - **Clips bias the step.** `max_abs_delta` (binding default 2) caps the
+     normalized step and `max_ci` (100) caps the EMA. `max_abs_grad` is a
+     no-op on the fp4 binding, which never passes it (1e30). Clipped SGD is biased: it converges
      to a neighbourhood whose size depends on the clip threshold against the
      gradient noise (Koloskova, Hendrikx & Stich, ICML 2023). So the clip
      needs its own check, not an assumption.
@@ -104,16 +131,17 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
    - Information theory bites in the state: N bindings over vocabulary V need
      `N·log₂V` bits held in `d_k·d_v` entries of M. Quantizing M (or a
      recurrent hybrid's linear-attention state) is the hard case.
-4. **Annealing is not needed for trainability.** It is needed for keeping
-   capacity over long training: rank collapse, and the forced-firing /
-   renorm results in sili_peridot.
+4. **Whether annealing is needed is open.** Lowering lr cannot remove the
+   noise floor, so annealing has to act on something else (scales, importance,
+   which synapses update). It is untested for this, and separately needed
+   against rank collapse.
 
 ## The comparative size
 
 - **Proved upper bound** (`encode_value`): a b-bit fixed-point weight is
   exactly ⌈b / log₂5⌉ = ⌈b / 2.32⌉ fp4 synapses. Each carries one digit, and
-  a rank-1 scale channel gives digit j the row scale 5^j. Sign uses a mirrored
-  copy.
+  a rank-1 scale channel gives digit j the row scale 5^j. The digit codes carry
+  the weight's sign.
   - 16-bit weights take 7 fp4 synapses, i.e. 28 bits of weight codes, 1.75×.
     This bound uses only 5 of the 15 codes.
   - Balanced signed digits −4…4 (9 codes, all exact in E2M1) give log₂9 =
@@ -121,27 +149,21 @@ That is 8 bits of state per synapse. bf16 weights with fp32 Adam use 80, or
     signs; not proved here.
   - It is an *exact emulation* bound: it shows that precision can be bought
     with width, never that it must be.
-- **Measured** (Kumar et al., "Scaling Laws for Precision", ICLR 2025; their
-  weight-only setting matches sili: weights 4-bit, activations high
-  precision):
-  `N_eff = N(1 − e^(−P/γ_w))`, with fitted γ_w = 2.6745 for integer training
-  precision (2.8111 for their floating-point fit).
-  - 4-bit weights: N_eff ≈ 0.776·N. 16-bit: 0.9975·N.
-  - So 4-bit-weight training needs ≈ **1.29× the parameters** for the same
-    loss.
-  - Caveats: that is quantization-aware transformer pretraining. The
-    constants depend on architecture and data. (The paper's "more than 4x
-    larger" warning is for 4-bit activations/KV too, which sili does not do.)
-- **Memory at equal quality.** sili's 8 bits/synapse × 1.29 ≈ 10.3 bits,
-  vs 48–80 for bf16 + Adam.
-  - The extra width can go to more units: more if-then (decision-type)
-    complexity in place of per-weight precision.
-  - Whether that beats the precision it replaces is the open empirical
-    question for 2b.2.
+- **There may be no single size equivalence.** Models split differently
+  between precise work and decision (if-then) work: the bound above is the
+  price of pure precision, and decision work can cost far less, so the ratio is
+  a per-task measurement. The 1.29x first quoted
+  here is withdrawn. It came from Kumar et al.'s weight-precision fit
+  (`N_eff = N(1 − e^(−P/2.6745))`), where only the forward pass is quantized,
+  so it does not describe training with nothing but the 4-bit code stored.
+  Extra width does average the rounding noise, and can buy more if-then
+  (decision-type) complexity. How much is needed has to be measured.
 
 ## Assumed, not proved
 
-- The real-valued convergence of SGD with unbiased bounded noise and a bounded
+- That the noise floor is low enough, at a given width and scale, for the
+  task. Nothing here proves end-to-end trainability of MQAR.
+- The real-valued behaviour of SGD under a bounded, gradient-dependent
   preconditioner.
 - Independent rounding draws. sili uses a per-thread xorshift64*, which is
   fine statistically but not cryptographic.
@@ -161,14 +183,13 @@ switch per arm:
 2. stochastic rounding allowing code 0 (`fp4_quantize_stochastic`): tests the
    never-zero choice (4× near-zero variance, no exact zero) against the
    dead-synapse problem it was added for;
-3. clips off (`max_abs_delta`, `max_abs_grad` at their no-op values): tests the
-   clip bias;
+3. clips off (`max_abs_delta`, `max_ci` at no-op values): tests the clip bias;
 4. fp32 reference.
 
-No round-to-nearest arm: its failure is already settled. `sr_unbiased` shows
-what it loses, low-precision training (Gupta et al., NVIDIA NVFP4) relies on
-stochastic rounding for that reason, and biology's synaptic changes are
-stochastic too.
+No round-to-nearest arm: `sr_unbiased` shows what it loses, and the
+zero-crossing measurement above shows the stall (0/1000). Biology's synaptic
+changes are stochastic too. NVFP4 is not evidence either way: it rounds weights
+to nearest over an fp32 master copy.
 
 Log the fraction of `ci` at the floor and at saturation, and the fraction of
 weights at ±0.5. If arm 1 fails, these logs and arms 2–3 say whether the cause
@@ -181,11 +202,12 @@ precision).
   Limited Numerical Precision", ICML 2015.
 - T. Kumar et al., "Scaling Laws for Precision", ICLR 2025,
   arXiv:2411.04330 (Table 2 constants).
-- NVIDIA, "Pretraining Large Language Models with NVFP4", arXiv:2509.25149
-  (12B hybrid Mamba-Transformer, 10T tokens. Stochastic rounding on gradients,
-  random Hadamard transforms on weight-gradient GEMM inputs, 2D block scaling.
-  They also keep ~15% of linear layers in BF16. sili does not plan to: biology
-  has no such high-precision layers.)
+- NVIDIA, "Pretraining Large Language Models with NVFP4", arXiv:2509.25149.
+  Master weights and optimizer state are fp32, weights round to nearest,
+  stochastic rounding is applied to gradients only (Sec. 4, 4.1, 4.4). So it
+  is not a result about stored fp4 weights.
+- H. Li, S. De, Z. Xu, C. Studer, H. Samet, T. Goldstein, "Training Quantized
+  Nets: A Deeper Understanding", NeurIPS 2017, arXiv:1706.02379.
 - B. Chmiel et al., "FP4 All the Way" (2025), the format sili's table follows.
 - A. Koloskova, H. Hendrikx, S. U. Stich, "Revisiting Gradient Clipping:
   Stochastic Bias and Tight Convergence Guarantees", ICML 2023.

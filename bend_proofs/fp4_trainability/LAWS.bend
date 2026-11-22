@@ -19,8 +19,9 @@ law sr_unbiased:
 
 # LAW 1b: the rounding noise. The error is -d with probability e/w and +e
 # with probability d/w, so w*E[err^2] = e*d^2 + d*e^2 = (d*e)*w: the variance is
-# d*e, at most w^2/4 (largest at the cell centre). Zero-mean (LAW 1) plus
-# bounded variance is what SGD needs: training stays unbiased, only noisier.
+# d*e, at most w^2/4 (largest at the cell centre). This does NOT shrink with
+# the learning rate: with only the code stored, SGD settles at rms error
+# sqrt(d*e) around its target however small lr is (README, "The noise floor").
 law sr_second_moment:
   for +d: Nat
   for +e: Nat
