@@ -158,18 +158,22 @@ Recurrent MQAR, sili fp4 weights + fp4 importance, activations fp32. One
 switch per arm:
 1. live stochastic rounding (the default): expected to train, slower than fp32
    by the noise;
-2. round-to-nearest on the update sites: expected to stall once steps fall
-   below half the spacing;
-3. stochastic rounding allowing code 0 (`fp4_quantize_stochastic`): tests the
+2. stochastic rounding allowing code 0 (`fp4_quantize_stochastic`): tests the
    never-zero choice (4× near-zero variance, no exact zero) against the
    dead-synapse problem it was added for;
-4. clips off (`max_abs_delta`, `max_abs_grad` at their no-op values): tests the
+3. clips off (`max_abs_delta`, `max_abs_grad` at their no-op values): tests the
    clip bias;
-5. fp32 reference.
+4. fp32 reference.
+
+No round-to-nearest arm: its failure is already settled. `sr_unbiased` shows
+what it loses, low-precision training (Gupta et al., NVIDIA NVFP4) relies on
+stochastic rounding for that reason, and biology's synaptic changes are
+stochastic too.
 
 Log the fraction of `ci` at the floor and at saturation, and the fraction of
-weights at ±0.5. If arm 1 fails while arm 2's failure looks the same, the cause
-is something other than rounding bias (range, clips, state precision).
+weights at ±0.5. If arm 1 fails, these logs and arms 2–3 say whether the cause
+is the never-zero choice, the clips, or something else (range, state
+precision).
 
 ## References
 
